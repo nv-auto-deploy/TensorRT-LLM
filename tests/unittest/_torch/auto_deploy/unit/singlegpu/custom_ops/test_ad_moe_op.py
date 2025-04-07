@@ -4,13 +4,14 @@ import sys
 import pytest
 import torch
 import torch.nn.functional as F
+from _torch_test_utils import fp8_compatible
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.modules.fused_moe import FusedMoE  # noqa: F401
-from _torch_test_utils import fp8_compatible
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 from helpers import reference_moe_torch
+
 
 def setup_moe_test(dtype, num_experts):
     SEQ_LEN = 8
@@ -52,15 +53,33 @@ def setup_moe_test(dtype, num_experts):
         fused_w3_w1_stacked_weight.data[expert_id].copy_(torch.cat([w3, w1], dim=-2))
         fused_w2_weight.data[expert_id].copy_(w2)
 
+    return (
+        x,
+        selected_experts,
+        final_scales,
+        w1_weight,
+        w2_weight,
+        w3_weight,
+        weights,
+        fused_w3_w1_stacked_weight,
+        fused_w2_weight,
+    )
 
-    return (x, selected_experts, final_scales, w1_weight, w2_weight, w3_weight,
-            weights, fused_w3_w1_stacked_weight, fused_w2_weight)
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_moe_op_run(dtype):
     num_experts = 3
-    (x, selected_experts, final_scales, w1_weight, w2_weight, w3_weight,
-     weights, fused_w3_w1_stacked_weight, fused_w2_weight) = setup_moe_test(dtype, num_experts)
+    (
+        x,
+        selected_experts,
+        final_scales,
+        w1_weight,
+        w2_weight,
+        w3_weight,
+        weights,
+        fused_w3_w1_stacked_weight,
+        fused_w2_weight,
+    ) = setup_moe_test(dtype, num_experts)
 
     with torch.inference_mode():
         output_torch_moe = torch.ops.moe.torch_moe(
@@ -98,8 +117,17 @@ def test_moe_op_run(dtype):
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
 def test_fp8_moe_op_run(dtype):
     num_experts = 3
-    (x, selected_experts, final_scales, w1_weight, w2_weight, w3_weight,
-     weights, fused_w3_w1_stacked_weight, fused_w2_weight) = setup_moe_test(dtype, num_experts)
+    (
+        x,
+        selected_experts,
+        final_scales,
+        w1_weight,
+        w2_weight,
+        w3_weight,
+        weights,
+        fused_w3_w1_stacked_weight,
+        fused_w2_weight,
+    ) = setup_moe_test(dtype, num_experts)
 
     with torch.inference_mode():
         output_torch_moe = torch.ops.moe.torch_moe(
@@ -110,12 +138,12 @@ def test_fp8_moe_op_run(dtype):
             w2_weight,
             w3_weight,
         )
-    
+
     w1_input_scale, w2_input_scale, w3_input_scale = [], [], []
     w1_weight_scale, w2_weight_scale, w3_weight_scale = [], [], []
     for i in range(num_experts):
         inp_scale_val = torch.tensor(1.0).float().cuda()
-        wt_scale_factor = 448 if dtype == torch.bfloat16 else 432 # float16 overflow with 448
+        wt_scale_factor = 448 if dtype == torch.bfloat16 else 432  # float16 overflow with 448
         wt_scale_val = (torch.max(torch.abs(w1_weight[i])) / wt_scale_factor).float().to("cuda")
         w1_input_scale.append(inp_scale_val)
         w2_input_scale.append(inp_scale_val)
@@ -127,9 +155,11 @@ def test_fp8_moe_op_run(dtype):
         w1_weight[i] = (w1_weight[i] / w1_weight_scale[i]).to(torch.float8_e4m3fn)
         w2_weight[i] = (w2_weight[i] / w2_weight_scale[i]).to(torch.float8_e4m3fn)
         w3_weight[i] = (w3_weight[i] / w3_weight_scale[i]).to(torch.float8_e4m3fn)
-        fused_w3_w1_stacked_weight[i] = (fused_w3_w1_stacked_weight[i] / w1_weight_scale[i]).to(torch.float8_e4m3fn)
+        fused_w3_w1_stacked_weight[i] = (fused_w3_w1_stacked_weight[i] / w1_weight_scale[i]).to(
+            torch.float8_e4m3fn
+        )
         fused_w2_weight[i] = (fused_w2_weight[i] / w2_weight_scale[i]).to(torch.float8_e4m3fn)
-    
+
     with torch.inference_mode():
         output_torch_fp8_moe = torch.ops.moe.torch_fp8_moe(
             x,

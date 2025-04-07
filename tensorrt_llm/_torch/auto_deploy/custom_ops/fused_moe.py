@@ -212,7 +212,9 @@ def torch_fp8_moe(
 
     final_hidden_states = torch.zeros_like(x)
     valid_mask = (selected_experts >= 0) & (selected_experts < num_experts)
-    selected_experts_fixed = torch.where(valid_mask, selected_experts, torch.full_like(selected_experts, num_experts))
+    selected_experts_fixed = torch.where(
+        valid_mask, selected_experts, torch.full_like(selected_experts, num_experts)
+    )
     one_hot = F.one_hot(selected_experts_fixed, num_classes=num_experts + 1)
     expert_mask = one_hot[..., :num_experts].permute(2, 1, 0)
 

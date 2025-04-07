@@ -20,8 +20,9 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
 
     for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         # Step 1: Identify Expert Compute pattern
-        (pattern_input_nodes, pattern_output_nodes,
-         expert_weights, expert_scales, weight_type) = _match_expert_compute_pattern(start_boundary, end_boundary)
+        (pattern_input_nodes, pattern_output_nodes, expert_weights, expert_scales, weight_type) = (
+            _match_expert_compute_pattern(start_boundary, end_boundary)
+        )
         if not expert_weights:
             continue
         # TODO: naming convention to verify the order of the weight nodes
@@ -257,14 +258,15 @@ def _find_lowest_common_ancessor(nodes: list[Node]) -> Optional[Node]:
 
     return common
 
+
 def _extract_linear_parameters(linear_node: Node) -> tuple[Node, torch.Tensor, Optional[dict], str]:
     """
     Given a linear op node, extract the input tensor node, weight tensor,
     any quantization scales (if the op is quantized), and return a weight type.
-    
+
     For a torch.ops.linear.simple.default op:
       - Returns (input_node, weight, None, "simple")
-    
+
     For a torch.ops.quant.fp8_linear op:
       - Returns (input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale}, "fp8")
     """
@@ -280,29 +282,30 @@ def _extract_linear_parameters(linear_node: Node) -> tuple[Node, torch.Tensor, O
     else:
         return None, None, None, ""
 
+
 def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
     """
     Match the expert compute pattern between the given boundaries.
-    
+
     The expert compute pattern corresponds to:
-    
+
         (F.silu(x @ w1.t()) * (x @ w3.t())) @ w2.t()
-    
+
     For each expert, the function extracts the input node from the w1 branch and
     collects the weight parameters from three linear ops (w1, w3, and w2 branches).
-    
+
     This function supports both:
       - torch.ops.linear.simple.default ops, and
       - torch.ops.quant.fp8_linear ops (in which case it also extracts quantization scales).
-    
+
     Returns:
         A tuple:
           (pattern_input_nodes, pattern_output_nodes, expert_weights, expert_scales, weight_type)
-          
+
           - pattern_input_nodes: List of input nodes (x) used for the expert compute.
           - pattern_output_nodes: List of final expert output nodes (the linear op with weight w2).
           - expert_weights: Dict with keys "w1", "w2", "w3" mapping to lists of weight tensors.
-          - expert_scales: Dict with keys "w1_input_scale", "w1_weight_scale", etc., containing scale tensors 
+          - expert_scales: Dict with keys "w1_input_scale", "w1_weight_scale", etc., containing scale tensors
                            (empty if weight_type is "simple").
           - weight_type: "fp8" if FP8 ops were used, "simple" otherwise.
     """
@@ -310,10 +313,10 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
     expert_weights = defaultdict(list)
     expert_scales = defaultdict(list)
     weight_type = "simple"  # default
-    
+
     nodes = list(start_boundary.graph.nodes)
     region_nodes = nodes[nodes.index(start_boundary) + 1 : nodes.index(end_boundary)]
-    
+
     for node in region_nodes:
         # Accept both simple and quantized linear ops.
         if not is_linear_op(node, include_quantization=True):
@@ -329,30 +332,40 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
 
         arg_a, arg_b = mul_node.args[:2]
         silu_node = (
-            arg_a if (isinstance(arg_a, Node) and is_op(arg_a, torch.ops.aten.silu))
-            else arg_b if (isinstance(arg_b, Node) and is_op(arg_b, torch.ops.aten.silu))
+            arg_a
+            if (isinstance(arg_a, Node) and is_op(arg_a, torch.ops.aten.silu))
+            else arg_b
+            if (isinstance(arg_b, Node) and is_op(arg_b, torch.ops.aten.silu))
             else None
         )
         if silu_node is None:
             continue
 
-        if not (silu_node.args and isinstance(silu_node.args[0], Node)
-                and is_linear_op(silu_node.args[0], include_quantization=True)):
+        if not (
+            silu_node.args
+            and isinstance(silu_node.args[0], Node)
+            and is_linear_op(silu_node.args[0], include_quantization=True)
+        ):
             continue
         linear_w1_node = silu_node.args[0]
 
         # The other branch should be a linear op (w3 branch).
         linear_w3_node = arg_b if arg_a is silu_node else arg_a
-        if not (isinstance(linear_w3_node, Node) and is_linear_op(linear_w3_node, include_quantization=True)):
+        if not (
+            isinstance(linear_w3_node, Node)
+            and is_linear_op(linear_w3_node, include_quantization=True)
+        ):
             continue
         if not (linear_w1_node.args and linear_w3_node.args):
             continue
 
         # Extract parameters from each linear op.
-        input_node_w1, weight_w1, quant_params_w1, wt_type_w1 = _extract_linear_parameters(linear_w1_node)
+        input_node_w1, weight_w1, quant_params_w1, wt_type_w1 = _extract_linear_parameters(
+            linear_w1_node
+        )
         _, weight_w3, quant_params_w3, wt_type_w3 = _extract_linear_parameters(linear_w3_node)
         _, weight_w2, quant_params_w2, wt_type_w2 = _extract_linear_parameters(final_linear)
-        
+
         if None in (weight_w1, weight_w3, weight_w2):
             continue
 
@@ -375,9 +388,8 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
             expert_scales["w3_weight_scale"].append(quant_params_w3["weight_scale"])
             expert_scales["w2_input_scale"].append(quant_params_w2["input_scale"])
             expert_scales["w2_weight_scale"].append(quant_params_w2["weight_scale"])
-    
-    return pattern_input_nodes, pattern_output_nodes, expert_weights, expert_scales, weight_type
 
+    return pattern_input_nodes, pattern_output_nodes, expert_weights, expert_scales, weight_type
 
 
 def _find_final_hidden_state_node(
