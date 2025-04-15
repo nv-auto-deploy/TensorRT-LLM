@@ -2,6 +2,7 @@
 
 from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
 
+from ..custom_ops.attention_interface import CacheConfig
 from .factory import ModelFactoryRegistry
 from .hf import HFFactory
 
@@ -26,3 +27,8 @@ class Llama4Factory(HFFactory):
     @property
     def automodel_from_config(self):
         return self._from_config
+
+    def get_cache_config(self):
+        """Setup cache information based on quantization information."""
+        kv_cache_dtype = None
+        return CacheConfig(dtype=kv_cache_dtype)
