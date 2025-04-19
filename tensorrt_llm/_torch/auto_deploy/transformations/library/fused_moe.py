@@ -271,12 +271,19 @@ def _extract_linear_parameters(linear_node: Node) -> tuple[Node, torch.Tensor, O
       - Returns (input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale}, "fp8")
     """
     input_node = linear_node.args[0]
-    if linear_node.target == torch.ops.quant.fp8_linear:
+    if is_op(linear_node, torch.ops.quant.fp8_linear):
         weight = linear_node.args[1]
         input_scale = linear_node.kwargs.get("input_scale", None)
         weight_scale = linear_node.kwargs.get("weight_scale", None)
+
+        # in case input_scale and weight_scale is not provided by kwargs
+        # args layout is (input, weight, bias, input_scale, weight_scale)
+        if input_scale is None and len(linear_node.args) >= 4:
+            input_scale = linear_node.args[3]
+        if weight_scale is None and len(linear_node.args) >= 5:
+            weight_scale = linear_node.args[4]
         return input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale}, "fp8"
-    elif linear_node.target == torch.ops.linear.simple.default:
+    elif is_op(linear_node, torch.ops.linear.simple):
         weight = linear_node.args[1]
         return input_node, weight, None, "simple"
     else:
