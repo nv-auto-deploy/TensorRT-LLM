@@ -50,11 +50,62 @@ from collections import defaultdict
 from typing import Any, DefaultDict, Dict, List, Optional
 
 import torch
+from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
 from ...utils.node_utils import bfs, extract_output_tuple, identify_regions_between_residuals, is_op
+from ...utils.pattern_matcher_utils import register_pattern
 from .._graph import canonicalize_graph
+
+
+def _rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _rope_pattern(q, k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def _rope_repl(q, k, cos, sin, unsqueeze_dim):
+    return torch.ops.rope.torch_apply_rope_with_explicit_cos_sin(q, k, cos, sin, unsqueeze_dim)
+
+
+def match_explicit_rope_with_pm(gm: GraphModule) -> GraphModule:
+    graph = gm.graph
+    patterns = PatternMatcherPass()
+
+    # dummy shapes: can be arbitrary
+    batch_size = 8
+    seq_len = 16
+    num_heads = 8
+    hidden_size = 512
+    head_dim = hidden_size // num_heads
+
+    dummy = [
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
+        torch.randn(batch_size, seq_len, head_dim, device="cuda", dtype=torch.float16),
+        torch.randn(batch_size, seq_len, head_dim, device="cuda", dtype=torch.float16),
+    ]
+    register_pattern(
+        search_fn=_rope_pattern,
+        replace_fn=_rope_repl,
+        patterns=patterns,
+        dummy_args=dummy,
+        op_ignore_types={torch.ops.aten.slice.Tensor: (int,)},
+        scalar_workaround={"unsqueeze_dim": 1},
+    )
+
+    patterns.apply(graph)
+    gm = canonicalize_graph(gm)
+    return gm
 
 
 def match_explicit_rope(gm: GraphModule) -> GraphModule:
