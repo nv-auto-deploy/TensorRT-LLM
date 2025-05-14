@@ -205,14 +205,20 @@ fused_moe.fuse_moe = fuse_moe_patch
 layerwise_nvtx_marker = LayerwiseNvtxMarker()
 module_prefix = "Model"
 try:
-    layerwise_nvtx_marker.register_hooks(
-        transformers.models.qwen3_moe.modeling_qwen3_moe, module_prefix
-    )
+    layerwise_nvtx_marker.register_hooks(transformers.models.qwen3_moe, module_prefix)
 except Exception as e:
     print(f"Error registering hooks: {e}")
 
 
 def main():
+    model_name = "Qwen/Qwen3-30B-A3B"
+
+    # load the tokenizer and the model
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype="auto", device_map="auto"
+    )
+    print(model)
+
     # Build Config
     build_config = BuildConfig(max_seq_len=2048, max_batch_size=4)
 
