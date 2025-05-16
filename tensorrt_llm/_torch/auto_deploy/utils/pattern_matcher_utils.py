@@ -71,6 +71,7 @@ def register_pattern(
     scalar_workaround: Optional[Any] = None,
     op_ignore_types: Optional[Mapping[Callable[..., Any], Sequence[type[Any]]]] = None,
     extra_check: Callable[[Match], bool] = _return_true,
+    skip_duplicates: bool = False,
 ) -> None:
     """
     Tracing a Python-level pattern into a GraphModule and registering its replacement.
@@ -108,7 +109,8 @@ def register_pattern(
         exclusive_arg_names=exclusive_arg_names,
         scalar_workaround=scalar_workaround,
     )
-
+    print(specific_gm)
+    print(pattern)
     register_replacement(
         search_fn=search_fn,
         replace_fn=replace_fn,
@@ -117,6 +119,7 @@ def register_pattern(
         pass_dicts=patterns,
         search_fn_pattern=pattern,
         extra_check=extra_check,
+        skip_duplicates=skip_duplicates,
     )
 
 

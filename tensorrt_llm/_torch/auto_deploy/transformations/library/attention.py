@@ -1,8 +1,9 @@
 """Pattern matching for detecting repeat_kv pattern from Huggingface models."""
 
-from typing import Dict, Optional, Type
+from typing import Any, Dict, List, Optional, Type
 
 import torch
+import torch.nn.functional as F
 from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch.fx import GraphModule, Node
 
@@ -32,6 +33,7 @@ def _repeat_kv_repl(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return torch.ops.attention.repeat_kv(hidden_states, n_rep)
 
 
+# TODO: Look into fake_mode matching??
 def match_repeat_kv(gm: GraphModule) -> GraphModule:
     """Match and replace the repeat_kv pattern in the graph.
 
@@ -73,7 +75,75 @@ def match_repeat_kv(gm: GraphModule) -> GraphModule:
     return gm
 
 
+def _sfdp_pattern_1(query, key, value, attention_mask, scaling, dropout):
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+    causal_mask = attention_mask[:, :, :, : key.shape[-2]]
+    attn_weights = attn_weights + causal_mask
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=False)
+    attn_output = torch.matmul(attn_weights, value)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output
+
+
+def _sfdp_replacement_1(query, key, value, attention_mask, scaling, dropout):
+    return torch.ops.attention.scaled_dot_product_attention.default(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        dropout_p=dropout,
+        is_causal=False,
+        scale=scaling,
+    )
+
+
+def _get_sfdp_patterns2() -> List[Dict[str, Any]]:
+    bs = 8
+    seq_len = 16
+    n_heads = 8
+    hidden_size = 512
+    head_dim = hidden_size // n_heads
+    return [
+        {
+            "search_fn": _sfdp_pattern_1,
+            "replace_fn": _sfdp_replacement_1,
+            "dummy_args": [
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, 1, 1, seq_len, device="cuda", dtype=torch.bfloat16),
+                0.1234743,
+                0.85849734,
+            ],
+            "scalar_workaround": {"dropout": 0.85849734, "scaling": 0.1234743},
+            "op_ignore_types": {
+                torch.ops.aten.slice.Tensor: (int,),
+                torch.ops.aten.expand.default: (int,),
+            },
+        }
+    ]
+
+
 def match_eager_attention(gm: GraphModule) -> GraphModule:
+    """Match and replace the eager attention pattern in fx graphs.
+
+    This is replaced with torch.ops.attention.scaled_dot_product_attention.
+    """
+    graph = gm.graph
+    patterns = PatternMatcherPass()
+
+    for pattern_config in _get_sfdp_patterns2():
+        register_pattern(**pattern_config, patterns=patterns)
+
+    # Apply patterns and clean-up
+    patterns.apply(graph)
+    gm = canonicalize_graph(gm)
+
+    return gm
+
+
+def match_eager_attention2(gm: GraphModule) -> GraphModule:
     """
     Match and replace the eager attention pattern in fx graphs.
 
