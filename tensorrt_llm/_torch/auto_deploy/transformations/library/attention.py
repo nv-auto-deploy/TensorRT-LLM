@@ -3,42 +3,73 @@
 from typing import Dict, Optional, Type
 
 import torch
+from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch.fx import GraphModule, Node
 
 from ...custom_ops.attention_interface import AttentionDescriptor
 from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
+from ...utils.pattern_matcher_utils import register_pattern
 from .._graph import canonicalize_graph
 
 
-def match_repeat_kv(gm: GraphModule) -> GraphModule:
-    """
-    Match and replace the repeat_kv pattern in fx graphs.
+def _repeat_kv_pattern1(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
-    The pattern is:
-    unsqueeze -> expand -> reshape -> [optional] contiguous
+
+def _repeat_kv_pattern2(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    # using the aten op directly will force the contiguous call to be inserted
+    return torch.ops.aten.contiguous.default(_repeat_kv_pattern1(hidden_states, n_rep))
+
+
+def _repeat_kv_repl(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    return torch.ops.attention.repeat_kv(hidden_states, n_rep)
+
+
+def match_repeat_kv(gm: GraphModule) -> GraphModule:
+    """Match and replace the repeat_kv pattern in the graph.
 
     This is replaced with torch.ops.attention.repeat_kv.
     """
     graph = gm.graph
+    patterns = PatternMatcherPass()
 
-    # Track replacements to avoid processing nodes multiple times
-    replacements_made = False
+    # dummy shapes: can be arbitrary
+    batch_size = 8
+    seq_len = 16
+    num_heads = 8
+    hidden_size = 512
+    head_dim = hidden_size // num_heads
 
-    # Iterate through nodes in the graph
-    for node in list(graph.nodes):
-        # Look for reshape nodes that could be the end of our pattern
-        if is_op(node, torch.ops.aten.reshape):
-            match_info = _match_repeat_kv_pattern(node)
-            if match_info:
-                ad_logger.debug(f"Found repeat_kv pattern at {node}")
-                _replace_with_repeat_kv(graph, match_info)
-                replacements_made = True
+    dummy_explicit = [
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
+        7,
+    ]
 
-    # Clean up the graph if we made any replacements
-    if replacements_made:
-        gm = canonicalize_graph(gm)
+    def _register(search_fn):
+        register_pattern(
+            search_fn=search_fn,
+            replace_fn=_repeat_kv_repl,
+            patterns=patterns,
+            dummy_args=dummy_explicit,
+            op_ignore_types={
+                torch.ops.aten.reshape.default: (int,),
+                torch.ops.aten.expand.default: (int,),
+            },
+            scalar_workaround={"n_rep": dummy_explicit[1]},
+        )
 
+    _register(_repeat_kv_pattern1)
+    _register(_repeat_kv_pattern2)
+
+    patterns.apply(graph)
+    gm = canonicalize_graph(gm)
     return gm
 
 
@@ -176,115 +207,6 @@ def match_causal_attn_mask(gm: GraphModule) -> GraphModule:
         gm = canonicalize_graph(gm)
 
     return gm
-
-
-def _match_repeat_kv_pattern(reshape_node: Node) -> Optional[Dict[str, Node]]:
-    """
-    Match the repeat_kv pattern starting from a reshape node.
-
-    The pattern is:
-    unsqueeze -> expand -> reshape -> [optional] contiguous
-
-    Returns a dictionary with information about the match or None if no match.
-    """
-    # Check that reshape_node is a reshape operation
-    if not is_op(reshape_node, torch.ops.aten.reshape):
-        return None
-
-    # The reshape should have expand as its first argument
-    if len(reshape_node.args) < 1:
-        return None
-
-    expand_node = reshape_node.args[0]
-    if not is_op(expand_node, torch.ops.aten.expand):
-        return None
-
-    # The expand should have unsqueeze as its first argument
-    if len(expand_node.args) < 1:
-        return None
-
-    unsqueeze_node = expand_node.args[0]
-    if not is_op(unsqueeze_node, torch.ops.aten.unsqueeze):
-        return None
-
-    # The unsqueeze should be inserting a dimension at position 2
-    if len(unsqueeze_node.args) < 2 or unsqueeze_node.args[1] != 2:
-        return None
-
-    # Get the input tensor to unsqueeze
-    if len(unsqueeze_node.args) < 1:
-        return None
-
-    input_tensor = unsqueeze_node.args[0]
-
-    # Check input dimensions - should be 4D (batch, num_key_value_heads, seq_len, head_dim)
-    input_val = input_tensor.meta.get("val", None)
-    if input_val is None or len(input_val.shape) != 4:
-        return None
-
-    # Extract batch size, num_kv_heads, seq_len, and head_dim from the input tensor shape
-    batch_size, num_kv_heads, seq_len, head_dim = input_val.shape
-
-    # Check reshape args
-    if len(reshape_node.args) < 2 or not isinstance(reshape_node.args[1], list):
-        return None
-
-    reshape_args = reshape_node.args[1]
-    if len(reshape_args) != 4:
-        return None
-
-    # Check expand args
-    if len(expand_node.args) < 2 or not isinstance(expand_node.args[1], list):
-        return None
-
-    expand_args = expand_node.args[1]
-    if len(expand_args) != 5:
-        return None
-
-    # Determine n_rep by comparing the output and input head dimensions
-    # In the expand args, we should have [batch, num_kv_heads, n_rep, seq_len, head_dim]
-    # In the reshape args, we should have [batch, num_heads, seq_len, head_dim]
-    # where num_heads = num_kv_heads * n_rep
-    _, _, n_rep, _, _ = expand_args
-    _, reshape_num_heads, _, _ = reshape_args
-
-    # Check that n_rep is an integer
-    if not isinstance(n_rep, int):
-        return None
-
-    # Check that num_heads = num_kv_heads * n_rep
-    # This may be a symbolic expression, so we need to compare with caution
-    reshape_out_val = reshape_node.meta.get("val", None)
-    if reshape_out_val is None or len(reshape_out_val.shape) != 4:
-        return None
-
-    # Ensure output shape is correct
-    out_batch, out_heads, out_seq, out_dim = reshape_out_val.shape
-
-    # Check that input batch and seq dimensions match output
-    if out_batch != batch_size or out_seq != seq_len or out_dim != head_dim:
-        return None
-
-    # Check if reshape is followed by a contiguous node
-    contiguous_node = None
-    users = list(reshape_node.users)
-
-    # Only consider contiguous if reshape has exactly one user
-    if len(users) == 1 and is_op(users[0], torch.ops.aten.contiguous):
-        contiguous_node = users[0]
-
-    result = {
-        "input_tensor": input_tensor,
-        "unsqueeze_node": unsqueeze_node,
-        "expand_node": expand_node,
-        "reshape_node": reshape_node,
-        "n_rep": n_rep,
-    }
-
-    if contiguous_node:
-        result["contiguous_node"] = contiguous_node
-
-    return result
 
 
 def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str, Node]]:
@@ -471,29 +393,6 @@ def _match_grouped_attention_pattern(sdpa_node: Node) -> Optional[Dict[str, Node
         "n_rep": key_n_rep,
         "sdpa_node": sdpa_node,
     }
-
-
-def _replace_with_repeat_kv(graph, match_info: Dict[str, Node]) -> None:
-    """
-    Replace the matched repeat_kv pattern with the custom op.
-    """
-    input_tensor = match_info["input_tensor"]
-    reshape_node = match_info["reshape_node"]
-    n_rep = match_info["n_rep"]
-
-    # Determine the node to replace (either reshape or contiguous if present)
-    node_to_replace = match_info.get("contiguous_node", reshape_node)
-
-    with graph.inserting_before(node_to_replace):
-        repeat_kv_node = graph.call_function(
-            torch.ops.attention.repeat_kv, args=(input_tensor, n_rep)
-        )
-
-    # Preserve metadata from the original node
-    repeat_kv_node.meta = node_to_replace.meta.copy()
-
-    # Replace all uses of the node with the repeat_kv node
-    node_to_replace.replace_all_uses_with(repeat_kv_node)
 
 
 def _replace_with_sdpa(graph, match_info: Dict[str, Node]) -> None:

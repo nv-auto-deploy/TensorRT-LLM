@@ -420,13 +420,14 @@ class GroupedAttentionModel(torch.nn.Module):
 @pytest.mark.parametrize(
     "model_cls", [RepeatKVModel, RepeatKVModel2, RepeatKVModel3, HFRepeatKVModel]
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 @torch.inference_mode()
-def test_match_repeat_kv(num_heads, num_kv_heads, model_cls):
+def test_match_repeat_kv(num_heads, num_kv_heads, model_cls, dtype):
     batch_size, seq_len = 4, 12
     hidden_size = 512
 
-    model = model_cls(hidden_size, num_heads, num_kv_heads).to("cuda", dtype=torch.float16)
-    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
+    model = model_cls(hidden_size, num_heads, num_kv_heads).to("cuda", dtype=dtype)
+    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
     dynamic_shapes = model.get_dynamic_shapes()
 
     # When num_heads == num_kv_heads, we don't expect any pattern match
