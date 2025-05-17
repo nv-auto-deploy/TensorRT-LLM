@@ -7,7 +7,7 @@ from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch.fx import GraphModule
 
 from ...utils.logger import ad_logger
-from ...utils.pattern_matcher_utils import register_pattern
+from ...utils.pattern_matcher import register_pattern
 from .._graph import canonicalize_graph
 
 
