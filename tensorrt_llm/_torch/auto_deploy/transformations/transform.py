@@ -25,14 +25,13 @@ from .library import (
     insert_cached_attention,
     match_attention_layout,
     match_causal_attn_mask,
-    match_complex_rope,
     match_eager_attention,
-    match_explicit_rope,
     match_grouped_attention,
     match_moe_pattern,
     match_repeat_kv,
     match_rms_norm_with_pm,
     match_rope_layout,
+    match_rope_pattern,
     optimize_rope,
     quantize,
     resize_kv_cache,
@@ -50,11 +49,15 @@ class InferenceOptimizer:
         self.factory = factory
         self.attn_backend = ad_config.attn_backend
         self.mla_backend = ad_config.mla_backend
-        # TODO (lliebenwein): let's split up the compile backend to separately handle cuda graph
-        # and torch compile so we can follow the PyTorchConfig here and enable it separately.
+
         self.ad_config = ad_config
-        if ad_config.use_cuda_graph or ad_config.torch_compile_enabled:
+        # Map Pytorch config to AutoDeploy compile backends.
+        if ad_config.use_cuda_graph and ad_config.torch_compile_enabled:
             compile_backend = "torch-opt"
+        elif ad_config.use_cuda_graph:
+            compile_backend = "torch-cudagraph"
+        elif ad_config.torch_compile_enabled:
+            compile_backend = "torch-compile"
         else:
             compile_backend = "torch-simple"
         self.compile_backend = compile_backend
@@ -121,8 +124,11 @@ class InferenceOptimizer:
         egm = match_attention_layout(egm, self.attention_op)
 
         # Match rope
-        egm = match_explicit_rope(egm)
-        egm = match_complex_rope(egm)
+        # TODO: remove `match_explicit_rope` and `match_explicit_rope` once Llama4 RoPE and DeepSeek RoPE are verified
+        # egm = match_explicit_rope(egm)
+        # egm = match_complex_rope(egm)
+        egm, _ = match_rope_pattern(egm)
+
         # Match RoPE layout expected by our backend
         egm = match_rope_layout(egm, self.attention_op.get_attention_layout())
 
@@ -207,7 +213,7 @@ class InferenceOptimizer:
 
         # Free memory ratio is hardcoded to 0.8 for now to ensure we have enough memory for graph
         # capture.
-        resize_kv_cache(egm, cm, free_mem_ratio=0.8)
+        resize_kv_cache(egm, cm, free_mem_ratio=self.ad_config.free_mem_ratio)
 
         ############################################################################################
         # COMPILE MODEL
