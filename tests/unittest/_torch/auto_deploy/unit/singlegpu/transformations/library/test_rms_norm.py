@@ -1,3 +1,5 @@
+from functools import partial
+
 import pytest
 import torch
 from _graph_test_helpers import run_test
@@ -39,19 +41,25 @@ class TestModel(torch.nn.Module):
 
 
 @pytest.mark.parametrize("eps", [1e-2, 1e-6])
-def test_rms_norm(eps):
+@pytest.mark.parametrize("variant", ["flashinfer", "triton"])
+def test_rms_norm(eps, variant):
     def checker(gm):
-        return any(is_op(n, torch.ops.rms_norm.flashinfer) for n in gm.graph.nodes)
+        if variant == "flashinfer":
+            op = torch.ops.auto_deploy.rms_norm_flashinfer
+        else:
+            op = torch.ops.auto_deploy.rms_norm_triton
+        return any(is_op(n, op) for n in gm.graph.nodes)
 
     model = TestModel(eps)
     gm_transformed = run_test(
         model,
         torch.randn(2, 1024, device="cuda", dtype=torch.float16),
-        match_rms_norm_with_pm,
-        lambda gm: True,
+        partial(match_rms_norm_with_pm, backend=variant),
+        checker,
         lambda num_p_og: num_p_og,
         dynamic_shapes={0: Dim("batch_size", max=8)},
     )
+    print(gm_transformed.graph)
     new_input = torch.randn(4, 1024, device="cuda", dtype=torch.float16)
     y_transformed = gm_transformed(new_input)
     y_model = model(new_input)
