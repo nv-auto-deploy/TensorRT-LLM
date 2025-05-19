@@ -2,10 +2,10 @@ import torch
 import torch.cuda.nvtx as nvtx
 import torch.nn.functional as F
 import transformers
-from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
+from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm, Qwen3MoeSparseMoeBlock
 
 from tensorrt_llm._torch.auto_deploy.shim import AutoDeployConfig
-from tensorrt_llm._torch.auto_deploy.transformations.library import fused_moe, sharding
+from tensorrt_llm._torch.auto_deploy.transformations.library import sharding
 from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.logger import logger
@@ -155,6 +155,10 @@ class LayerwiseNvtxMarker(object):
         return
 
 
+def _forward_rmsnorm(self: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor):
+    return torch.ops.trtllm.fused_rmsnorm(hidden_states, self.weight, self.bias, self.eps)
+
+
 # patch for MoE to reduce torch.export time
 def _forward_moe(self: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor):
     batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -185,6 +189,10 @@ def _forward_moe(self: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor):
 Qwen3MoeSparseMoeBlock._original_forward = Qwen3MoeSparseMoeBlock.forward
 Qwen3MoeSparseMoeBlock.forward = _forward_moe
 
+if False:
+    Qwen3MoeRMSNorm._original_forward = Qwen3MoeRMSNorm.forward
+    Qwen3MoeRMSNorm.forward = _forward_rmsnorm
+
 
 # fix sharder bug
 def _insert_sharded_matmul_patch(gm, n, dim, rank, world_size, add_dist=False):
@@ -195,13 +203,6 @@ _insert_sharded_matmul_original = sharding._insert_sharded_matmul
 sharding._insert_sharded_matmul = _insert_sharded_matmul_patch
 
 
-# skip broken trt-llm fused moe op
-def fuse_moe_patch(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
-    return gm
-
-
-fused_moe.fuse_moe = fuse_moe_patch
-
 layerwise_nvtx_marker = LayerwiseNvtxMarker()
 module_prefix = "Model"
 try:
@@ -211,7 +212,7 @@ except Exception as e:
 
 
 def main():
-    model_name = "Qwen/Qwen3-30B-A3B"
+    model_name = "Qwen/Qwen3-235B-A22B"  # Qwen/Qwen3-30B-A3B, Qwen/Qwen3-8B, Qwen/Qwen3-235B-A22B
 
     # load the tokenizer and the model
     model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -227,15 +228,17 @@ def main():
         use_cuda_graph=False,
         torch_compile_enabled=False,
         attn_backend="FlashInfer",
+        model_kwargs={"num_hidden_layers": 4},
     )
 
     # Create the LLM object
     llm = LLM(
-        model="Qwen/Qwen3-30B-A3B",  # Qwen/Qwen3-30B-A3B, Qwen/Qwen3-8B, Qwen/Qwen3-235B-A22B
+        model=model_name,
         backend="autodeploy",
         build_config=build_config,
         pytorch_backend_config=ad_config,
         tensor_parallel_size=4,
+        verbose=True,
     )
     torch.cuda.cudart().cudaProfilerStart()
     # Generate text

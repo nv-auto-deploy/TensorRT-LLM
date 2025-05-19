@@ -17,10 +17,14 @@
       "workspaceFolder": "/workspaces/tensorrt_llm",
       // "workspaceFolder": "/home/coder/${localWorkspaceFolderBasename}",
       // "workspaceMount": "source=${localWorkspaceFolder},target=/home/coder/${localWorkspaceFolderBasename},type=bind,consistency=consistent",
+
       "mounts": [
-        "source=${localEnv:HOME}/.cache/huggingface,target=/huggingface,type=bind", // HF cache
-        "source=/home/scratch.trt_llm_data/,target=/home/scratch.trt_llm_data/,type=bind,consistency=consistent"
+        "source=/home/scratch.kgoyal_gpu_1/hf_cache,target=/huggingface,type=bind", // HF cache
+        "source=/home/scratch.trt_llm_data/,target=/home/scratch.trt_llm_data/,type=bind,consistency=consistent",
+        "source=/home/scratch.crush_data/trtllm-checkpoints/fp8-128e-ckpt,target=/crush,type=bind",
+        "source=/home/scratch.weimingc_sw/models/modelopt_artifacts/saved_models_Qwen3-235B-A22B_nvfp4_hf/,target=/qwen3_235b_a22b_nvfp4_hf,type=bind"
       ],
+
       // Note: sourcing .profile is required since we use a local user and the python interpreter is
       // global (/usr/bin/python). In this case, pip will default to a local user path which is not
       // by default in the PATH. In interactive devcontainer shells, .profile is sourced by default.

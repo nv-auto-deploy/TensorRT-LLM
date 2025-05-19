@@ -4,7 +4,7 @@ from ....logger import Logger
 class ADLogger(Logger):
     ENV_VARIABLE = "AUTO_DEPLOY_LOG_LEVEL"
     PREFIX = "TRT-LLM AUTO-DEPLOY"
-    DEFAULT_LEVEL = "info"
+    DEFAULT_LEVEL = "debug"
 
 
 ad_logger = ADLogger()
