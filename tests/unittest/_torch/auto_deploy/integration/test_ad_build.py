@@ -129,7 +129,7 @@ from utils.llm_data import llm_models_root
                     "deepseek-ai/DeepSeek-V3",
                 ),
                 "compile_backend": "torch-simple",
-                "model_kwargs": {"num_hidden_layers": 6},
+                "model_kwargs": {"num_hidden_layers": 5},
                 "skip_loading_weights": "True",
             },
         ),
