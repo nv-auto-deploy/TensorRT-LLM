@@ -158,6 +158,7 @@ def deepseek_v3_rope(self, x, seq_len=None):
         self.sin_cached.to(dtype=x.dtype).to(device=x.device),
     )
 
+
 _from_config_original = AutoModelForCausalLM.from_config
 
 CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
