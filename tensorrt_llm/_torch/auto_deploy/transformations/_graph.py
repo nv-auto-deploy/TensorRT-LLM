@@ -112,6 +112,7 @@ def _move_single_gm_to_device(
             kwargs = node.kwargs.copy()
             kwargs["device"] = device
             node.kwargs = kwargs
+
         if is_op(node, torch.ops.aten.to.device):
             args = list(node.args)
             args[1] = device
