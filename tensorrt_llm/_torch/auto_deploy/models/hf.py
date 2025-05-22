@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
-from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+from accelerate import init_empty_weights, load_checkpoint_in_model
 from accelerate.utils import modeling
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
@@ -28,7 +28,15 @@ from .factory import ModelFactory, ModelFactoryRegistry
 
 @contextmanager
 def hf_load_state_dict_with_device(device: DeviceLikeType):
-    """Patch HF load_state_dict to use provided device."""
+    """Patch HF load_state_dict to use provided device.
+
+    NOTE (lucaslie): this function is called by ``load_checkpoint_in_model``. We provide the device
+    map here as a patch instead of going through ``load_checkpoint_in_model``. This is because
+    otherwise ``load_checkpoint_in_model`` will execute its own state_dict loading logic instead of
+    calling ``nn.Module.load_state_dict``. However, we rely on the state dict loading hooks in
+    ``nn.Module.load_state_dict`` to correctly load the weights. By providing the device map here,
+    we can ensure that ``load_checkpoint_in_model`` will call ``nn.Module.load_state_dict``.
+    """
     # save the original load_state_dict method
     original_load_state_dict = modeling.load_state_dict
 
@@ -288,7 +296,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         # reuse the load checkpoint utility from accelerate
         with hf_load_state_dict_with_device(device):
-            load_checkpoint_and_dispatch(model, checkpoint=ckpt_file)
+            load_checkpoint_in_model(model, checkpoint=ckpt_file)
 
     def _load_quantization_config(self):
         assert self.model
