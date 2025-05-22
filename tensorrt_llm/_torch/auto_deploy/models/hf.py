@@ -293,7 +293,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         # identify the most relevant checkpoint file
         ckpt_file = self._get_checkpoint_file(self.model)
-
         # reuse the load checkpoint utility from accelerate
         with hf_load_state_dict_with_device(device):
             load_checkpoint_in_model(model, checkpoint=ckpt_file)

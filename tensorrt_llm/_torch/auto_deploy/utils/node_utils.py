@@ -120,18 +120,15 @@ def is_match(node: Node, names_to_skip: List[str]):
     return False
 
 
-def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]]:
-    """Extracts the name of the parameter associated with the given matmul node.
-
-    Args:
-        mm_node: Matmul node in the graph.
-    """
-    # List of nodes allowed in between a get_attr node and the matmul node
-    allowed_ops = {torch.ops.aten.to.dtype}
+def extract_weight_node(mm_node: Node) -> int:
+    """Extracts the weight node from the given matmul node."""
 
     def find_get_attr_node(node: Node) -> Node:
         """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
         # If node is a get_attr node return node
+        # List of nodes allowed in between a get_attr node and the matmul node
+        allowed_ops = {torch.ops.aten.to.dtype}
+
         if node.op == "get_attr":
             return node
 
@@ -145,17 +142,30 @@ def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]
                 return result
         return None
 
-    assert is_linear_op(mm_node, include_quantization=True), (
-        f"Expecting linear node, Found: {mm_node}"
-    )
-    # second arg is the weight
     weight_node = mm_node.args[1]
     # for modelopt quantized graph, there will be a quantize_op
     _, weight_params, _ = get_quantization_params_from_linear_node(mm_node)
     weight_node = weight_params.input_node if weight_params else weight_node
 
-    # Find the get_attr node for the weight node so that it can be slice.
-    weight_node = find_get_attr_node(weight_node)
+    return find_get_attr_node(weight_node)
+
+
+def num_users_of_weight_node(mm_node: Node) -> int:
+    """Returns the number of users of the weight node of the given matmul node."""
+    weight_node = extract_weight_node(mm_node)
+    return len(weight_node.users)
+
+
+def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]]:
+    """Extracts the name of the parameter associated with the given matmul node.
+
+    Args:
+        mm_node: Matmul node in the graph.
+    """
+    assert is_linear_op(mm_node, include_quantization=True), (
+        f"Expecting linear node, Found: {mm_node}"
+    )
+    weight_node = extract_weight_node(mm_node)
 
     assert weight_node, "Cannot identify weight parameter of linear node."
 
