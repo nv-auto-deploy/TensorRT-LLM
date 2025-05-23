@@ -158,8 +158,8 @@ def match_causal_attn_mask(gm: GraphModule) -> GraphModule:
                     node.args[len(new_args)] if len(node.args) > len(new_args) else None
                 )
             new_args.append(True)  # Append is_causal=True
-            
-            #In the case dropout_p is set to default value, it is not captured in node.args. Set it to 0.0 in this case
+
+            # In the case dropout_p is set to default value, it is not captured in node.args. Set it to 0.0 in this case
             new_args[4] = 0.0 if new_args[4] is None else new_args[4]
 
         # Create new node with updated arguments
