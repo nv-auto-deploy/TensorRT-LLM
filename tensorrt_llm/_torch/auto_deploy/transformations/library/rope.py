@@ -203,9 +203,9 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         if is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
             q_node, k_node, freqs_node, unsq = extract_op_args(
                 node,
-                "q",  # argument name in schema
-                "k",
-                "freqs",
+                "xq",  # argument name in schema
+                "xk",
+                "freqs_cis",
                 "unsqueeze_dim",
             )
 
