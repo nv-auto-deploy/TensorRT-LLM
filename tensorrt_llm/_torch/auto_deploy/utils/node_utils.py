@@ -364,7 +364,12 @@ def extract_op_args(node: Node, *arg_names):
         raise ValueError(f"extract_op_args only supports call_function nodes, got {node.op}")
 
     op = node.target
-    schema = next(iter(op._schemas.values()))
+    if hasattr(op, "_schemas"):
+        schema = next(iter(op._schemas.values()))
+    elif hasattr(op, "_schema"):
+        schema = op._schema
+    else:
+        raise RuntimeError(f"No schema found on op {op}")
     args_meta = schema.arguments
 
     # name→index in signature, and name→default_value
@@ -384,4 +389,4 @@ def extract_op_args(node: Node, *arg_names):
             return defs[name]
         raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
 
-    return tuple(_get(n) for n in arg_names)
+    return [_get(n) for n in arg_names]
