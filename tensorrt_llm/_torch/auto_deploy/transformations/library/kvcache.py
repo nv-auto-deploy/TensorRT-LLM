@@ -15,16 +15,16 @@ from .._graph import add_graph_input, canonicalize_graph
 
 
 def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> GraphModule:
-    """Check for input and output nodes in the graph and return input nodes including new args.
+    """Modify the graph module by adding new input nodes and canonicalizing the graph.
 
-    The new args are related to the extra arguments needed for cached+flattened attention.
+    The new input nodes correspond to the extra arguments needed for cached and flattened attention.
 
     Args:
-        egm: The graph module to analyze
-        cm: Cached sequence interface containing extra argument information
+        egm: The graph module to analyze and modify.
+        cm: Cached sequence interface containing extra argument information.
 
     Returns:
-        List of input nodes including any extra argument nodes added
+        The updated GraphModule with new input nodes and a canonicalized graph.
     """
     # loop through nodes to get input, output, and get_attr nodes
     input_nodes, output_nodes = get_all_input_output_nodes(egm.graph)
