@@ -18,9 +18,9 @@ class SimpleConfig:
     # 1. Sharded checkpoint (multiple files) in the safetensors format
     # 2. Single, unsharded checkpoint in the safetensors format
     # 3. Single, unsharded checkpoint in the pytorch format (.pt/.pth) file ending.
-    # If no `model` argument is provided, the checkpoint directory is used to infer the model
-    # architecture.
-    model: Optional[str] = None
+    model: str
+    # same as model. None defaults to model. Only used if customize_tokenizer is True
+    tokenizer: Optional[str] = None
     model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = (
         "AutoModelForCausalLM"
     )
@@ -47,9 +47,6 @@ class SimpleConfig:
     # [here](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/tokenization_llama_fast.py#L127).
     # NOTE: This is only used if customize_tokenizer is True
     tokenizer_kwargs: Dict = field(default_factory=dict)
-    # Specify to load the tokenizer of another model via the model's name
-    # NOTE: This is only used if customize_tokenizer is True
-    tokenizer_name: str = None
 
     ### CONFIGURE BACKEND, RUNTIME, AND WORLD SIZE ##################################
     world_size: int = 1  # choose from number of GPUs for TP (0--> no TP, no spawned processes)
