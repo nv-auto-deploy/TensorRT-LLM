@@ -2,7 +2,7 @@
 
 import argparse
 import json
-from typing import Any, Dict, List, Optional, Union
+from typing import List, Optional, Union
 
 import torch
 from simple_config import SimpleConfig
@@ -83,7 +83,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
     return llm
 
 
-def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> Dict[str, Any]:
+def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> List[List[str]]:
     prompts_and_outputs: List[List[str]] = []
     if isinstance(outs, RequestOutput):
         outs = [outs]
