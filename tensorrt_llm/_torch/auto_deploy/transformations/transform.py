@@ -67,9 +67,6 @@ class InferenceOptimizer:
         self.attention_op = AttentionRegistry.get(self.attn_backend)
         self.mla_op = AttentionRegistry.get(self.mla_backend)
 
-        # whether to only do simple shard in TP sharding
-        self.simple_shard_only = ad_config.simple_shard_only
-
     def __call__(self, cm: CachedSequenceInterface) -> GraphModule:
         """Transform a model into an optimized inference model.
 
@@ -142,7 +139,7 @@ class InferenceOptimizer:
         egm = optimize_rope(egm)
 
         # run TP sharding across ranks
-        egm = column_row_shard(egm, local_rank, world_size, self.simple_shard_only)
+        egm = column_row_shard(egm, local_rank, world_size, self.ad_config.simple_shard_only)
 
         # run EP sharding across ranks
         egm = ep_shard(egm, local_rank, world_size)
