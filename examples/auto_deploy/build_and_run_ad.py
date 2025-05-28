@@ -60,6 +60,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
     factory = ModelFactoryRegistry.get(config.model_factory)(
         model=config.model,
         model_kwargs=config.model_kwargs,
+        tokenizer=config.tokenizer,
         tokenizer_kwargs=config.tokenizer_kwargs,
         skip_loading_weights=config.skip_loading_weights,
     )
@@ -76,7 +77,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
         build_config=build_config,
         pytorch_backend_config=ad_config,
         tensor_parallel_size=config.world_size,
-        tokenizer=factory.init_tokenizer(config.tokenizer) if config.customize_tokenizer else None,
+        tokenizer=factory.init_tokenizer() if config.customize_tokenizer else None,
     )
 
     return llm
