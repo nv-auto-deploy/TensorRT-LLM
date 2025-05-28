@@ -191,7 +191,7 @@ def _simple_shard(
 
 
 def column_row_shard(
-    gm: GraphModule, rank: int, world_size: int, simple_shard_only: bool
+    gm: GraphModule, rank: int, world_size: int, simple_shard_only: bool = False
 ) -> GraphModule:
     """A transformation to apply sharding to the model following tensor parallelism.
 
