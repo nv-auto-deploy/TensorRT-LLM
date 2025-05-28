@@ -450,7 +450,7 @@ class SequenceInfo:
         self.pages_per_seq[: len(pages_per_seq)].copy_(pages_per_seq, non_blocking=True)
 
 
-Constant = Union[int, float, str, None]
+Constant = Union[int, float, str, torch.Tensor,None]
 
 
 class MHACallable(Protocol):

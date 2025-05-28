@@ -1,7 +1,9 @@
 """Custom ops for MHA/XQA attention."""
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
+from types import NoneType
+
 
 import torch
 import triton
@@ -254,7 +256,7 @@ def flattened_mha_fake(
     seq_start: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    scale: Optional[float],
+    scale: Optional[torch.Tensor],
 ):
     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
 
