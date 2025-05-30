@@ -6,6 +6,7 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
+import math
 
 from ..utils.cuda_graph import cuda_graph_state
 from ..utils.logger import ad_logger
@@ -414,6 +415,10 @@ class FlashInferAttention(AttentionDescriptor):
             scale = source_attn_node.args[6]
         else:
             scale = source_attn_node.kwargs.get("scale", None)
+
+        if not isinstance(scale, float):
+            ad_logger.warning("Provided scale is not a float. Using default scale instead.")
+            scale = None
 
         return [
             scale,  # softmax scale
