@@ -1,9 +1,7 @@
 """Custom ops for MHA/XQA attention."""
 
 import math
-from typing import List, Optional, Tuple, Union
-from types import NoneType
-
+from typing import List, Optional, Tuple
 
 import torch
 import triton

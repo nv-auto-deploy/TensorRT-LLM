@@ -6,7 +6,6 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
-import math
 
 from ..utils.cuda_graph import cuda_graph_state
 from ..utils.logger import ad_logger
