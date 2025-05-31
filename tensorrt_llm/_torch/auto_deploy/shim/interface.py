@@ -108,7 +108,7 @@ class AutoDeployConfig(PyTorchConfig):
     simple_shard_only: bool = False  # if True, force simple sharding(all_gather) in TP;
     # otherwise auto-detect and use column+row (all_reduce) sharding
 
-    checkpoint_device: str = None # Device on which to load the model checkpoint
+    checkpoint_device: str = None  # Device on which to load the model checkpoint
     # (defaults to the same device as the rest of the pipeline)
 
     def __post_init__(self):
