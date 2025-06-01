@@ -1,5 +1,6 @@
 """Interface to initialize and load HF models."""
 
+import fnmatch
 import json
 import os
 import types
@@ -11,7 +12,7 @@ import torch.nn as nn
 from accelerate import init_empty_weights, load_checkpoint_in_model
 from accelerate.utils import modeling
 from huggingface_hub import HfApi, snapshot_download
-from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
+from huggingface_hub.utils import HFValidationError, validate_repo_id
 from torch._prims_common import DeviceLikeType
 from transformers import (
     AutoConfig,
@@ -182,7 +183,49 @@ class AutoModelForCausalLMFactory(ModelFactory):
         return self.autotokenizer_from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
 
     @staticmethod
-    def _get_ignore_patterns(repo_id: str, skip_prefetch_weights: bool) -> List[str]:
+    def _get_checkpoint_file(file_names: List[str]) -> Optional[str]:
+        """Get the most relevant checkpoint file from the list of file names.
+
+        Args:
+            file_names: The list of file names to check.
+
+        Returns:
+            The path to the most relevant checkpoint file.
+
+        Following order of precedence for the checkpoint file:
+
+            1. checkpoint dir contains SAFE_WEIGHTS_INDEX_NAME
+            2. checkpoint dir contains SAFE_WEIGHTS_NAME
+            3. checkpoint dir contains WEIGHTS_INDEX_NAME
+            4. checkpoint dir contains WEIGHTS_NAME
+
+        """
+        # Go through file list and sorty by priority
+        file_priority_list = [None for _ in range(4)]
+        for file_name in file_names:
+            if file_name.endswith(SAFE_WEIGHTS_INDEX_NAME):
+                file_priority_list[0] = file_name
+            elif file_name.endswith(SAFE_WEIGHTS_NAME):
+                file_priority_list[1] = file_name
+            elif file_name.endswith(WEIGHTS_INDEX_NAME):
+                file_priority_list[2] = file_name
+            elif file_name.endswith(WEIGHTS_NAME):
+                file_priority_list[3] = file_name
+
+        # Return the first non-None file name, i.e. the checkpoint file with highest priority
+        for file_name in file_priority_list:
+            if file_name is not None:
+                return file_name
+
+        raise ValueError(
+            f"Could not find any model weights in {file_names}. "
+            f"Expected one of the following files: "
+            f"{SAFE_WEIGHTS_INDEX_NAME}, {SAFE_WEIGHTS_NAME}, "
+            f"{WEIGHTS_INDEX_NAME}, or {WEIGHTS_NAME}."
+        )
+
+    @classmethod
+    def _get_ignore_patterns(cls, repo_id: str, skip_prefetch_weights: bool) -> List[str]:
         """Get the ignore patterns for the HF repo."""
         ignore_patterns = ["*.pt", "*.pth"]
         bin_pattern = "*.bin*"
@@ -198,12 +241,12 @@ class AutoModelForCausalLMFactory(ModelFactory):
             api = HfApi()
             repo_info = api.repo_info(repo_id)
 
-            # check files in the repo
-            files = [f.rfilename for f in repo_info.siblings]
-
-            # if we have safetensors we can ignore all bin files
-            if list(filter_repo_objects(items=files, allow_patterns=[safetensors_pattern])):
+            # check for the most relevant checkpoint file
+            checkpoint_file = cls._get_checkpoint_file([f.rfilename for f in repo_info.siblings])
+            if fnmatch.fnmatch(checkpoint_file, safetensors_pattern):
                 ignore_patterns.append(bin_pattern)
+            elif fnmatch.fnmatch(checkpoint_file, bin_pattern):
+                ignore_patterns.append(safetensors_pattern)
         except:  # noqa: E722
             pass
 
@@ -235,6 +278,17 @@ class AutoModelForCausalLMFactory(ModelFactory):
         if not os.path.isdir(checkpoint):
             raise ValueError(
                 f"Checkpoint path '{checkpoint}' is neither a file nor a directory, or does not exist."
+            )
+
+        # construct list of files in checkpoint directory
+        files = os.listdir(checkpoint)
+        checkpoint_file = self._get_checkpoint_file(files)
+        if checkpoint_file is None:
+            raise ValueError(
+                f"Could not find any model weights in {checkpoint}. "
+                f"Expected one of the following files: "
+                f"{SAFE_WEIGHTS_INDEX_NAME}, {SAFE_WEIGHTS_NAME}, "
+                f"{WEIGHTS_INDEX_NAME}, or {WEIGHTS_NAME}."
             )
 
         # now check which is the most relevant checkpoint file
@@ -297,6 +351,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         # identify the most relevant checkpoint file
         ckpt_file = self._get_checkpoint_file(self.model)
+
         # reuse the load checkpoint utility from accelerate
         with hf_load_state_dict_with_device(device):
             load_checkpoint_in_model(model, checkpoint=ckpt_file)
