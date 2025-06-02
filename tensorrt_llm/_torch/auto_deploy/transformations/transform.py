@@ -19,7 +19,6 @@ from .library import (
     eliminate_redundant_transposes,
     ep_shard,
     fuse_allreduce_residual_rmsnorm,
-    fuse_collectives,
     insert_cached_attention,
     match_attention_layout,
     match_causal_attn_mask,
@@ -178,7 +177,7 @@ class InferenceOptimizer:
         egm = fuse_allreduce_residual_rmsnorm(egm)
 
         # check if we can fuse collectives
-        egm = fuse_collectives(egm)
+        # egm = fuse_collectives(egm)
 
         # visualize the final graph
         if self.visualize:
