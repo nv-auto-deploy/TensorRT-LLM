@@ -24,13 +24,11 @@ class ModelFactory(ABC):
         model: str,
         tokenizer: Optional[str] = None,
         skip_loading_weights: bool = False,
-        checkpoint_device: str = None,
         **kwargs,
     ):
         self._model = model
         self._tokenizer = tokenizer
         self.skip_loading_weights = skip_loading_weights
-        self.checkpoint_device = checkpoint_device
         self._prefetched_model_path: Optional[str] = None
         self._prefetched_tokenizer_path: Optional[str] = None
 

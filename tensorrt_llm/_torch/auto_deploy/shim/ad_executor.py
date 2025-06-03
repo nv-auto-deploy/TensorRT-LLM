@@ -102,7 +102,6 @@ class ADEngine(ModelEngine):
             model=model,
             model_kwargs=model_kwargs,
             skip_loading_weights=ad_config.skip_loading_weights,
-            checkpoint_device=ad_config.checkpoint_device,
         )
 
         # construct inference optimizer

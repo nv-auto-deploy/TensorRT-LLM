@@ -64,7 +64,6 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
         tokenizer=config.tokenizer,
         tokenizer_kwargs=config.tokenizer_kwargs,
         skip_loading_weights=config.skip_loading_weights,
-        checkpoint_device=config.checkpoint_device,
     )
     ad_logger.info(f"Prefetched model : {factory.model}")
 
