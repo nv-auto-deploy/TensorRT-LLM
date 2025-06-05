@@ -115,9 +115,9 @@ def test_build_ad(config: Dict):
     print(f"Simple Config: {simple_config}")
     original_init = InferenceOptimizer.__init__
 
-    def check_and_original_init(self, factory, *, ad_config, **kwargs):
+    def check_and_original_init(self, factory, ad_config):
         _check_ad_config(simple_config, ad_config)
-        return original_init(self, factory, ad_config=ad_config, **kwargs)
+        return original_init(self, factory, ad_config=ad_config)
 
     # Temporarily replace the __init__ method
     InferenceOptimizer.__init__ = check_and_original_init

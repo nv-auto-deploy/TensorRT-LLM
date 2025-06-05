@@ -1739,14 +1739,15 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
 
-class _AutoDeployLlmArgs(TorchLlmArgs):
+class _AutoDeployLlmArgs(BaseLlmArgs):
     """LLM arguments specifically for AutoDeploy backend.
 
-    This class extends TorchLlmArgs with AutoDeploy-specific configuration options.
+    This class extends BaseLlmArgs with AutoDeploy-specific configuration options.
     AutoDeploy provides automatic deployment and optimization of language models
     with various attention backends and optimization strategies.
     """
 
+    ### MODEL AND TOKENIZER FACTORY ################################################################
     model_factory: Literal[
         "AutoModelForCausalLM", "AutoModelForImageTextToText"] = Field(
             default="AutoModelForCausalLM",
@@ -1763,11 +1764,6 @@ class _AutoDeployLlmArgs(TorchLlmArgs):
         "model config class, it will be ignored.",
     )
 
-    mla_backend: Literal["MultiHeadLatentAttention"] = Field(
-        default="MultiHeadLatentAttention",
-        description="The Multi-Head Latent Attention backend to use.",
-    )
-
     skip_loading_weights: bool = Field(
         default=False,
         description=
@@ -1775,10 +1771,66 @@ class _AutoDeployLlmArgs(TorchLlmArgs):
         "If True, only the model architecture is loaded.",
     )
 
+    customize_tokenizer: bool = Field(
+        default=False,
+        description="True: tokenizer from the model factory, False: from LLM api"
+    )
+
+    tokenizer: Optional[Union[str, Path, TokenizerBase,
+                              PreTrainedTokenizerBase]] = Field(
+                                  description="The tokenizer",
+                                  default=None,
+                                  repr=False,
+                              )
+
+    tokenizer_kwargs: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=
+        "Extra kwargs for the tokenizer class to customize the tokenizer. Same as "
+        "model_kwargs. For example, the default HF Llama tokenizer can be initialized with the "
+        "arguments specified here: "
+        "https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/tokenization_llama_fast.py#L127."
+        " NOTE: This is only used if customize_tokenizer is True",
+    )
+
+    ### RUNTIME FEATURES ###########################################################################
+    disable_overlap_scheduler: bool = Field(
+        default=True,
+        description=
+        "Disable the overlap scheduler. This is a temporary field until the overlap "
+        "scheduler is supported (https://github.com/NVIDIA/TensorRT-LLM/issues/4364).",
+        frozen=True,
+        repr=False,
+    )
+
+    world_size: int = Field(
+        default=1,
+        ge=0,
+        description=
+        "Choose from number of GPUs for Auto Sharding. A world size of 0 indicates that"
+        " no processes are spawned and the model is run on a single GPU (only for ``demollm``).",
+    )
+
+    runtime: Literal["demollm", "trtllm"] = Field(default="trtllm")
+
+    device: str = Field(default="cuda",
+                        description="The device to use for the model.",
+                        frozen=True)
+
+    # INFERENCE OPTIMIZER CONFIG ###################################################################
+    attn_backend: Literal["FlashInfer", "TritonWithFlattenedInputs"] = Field(
+        default="FlashInfer", description="Attention backend to use.")
+
+    mla_backend: Literal["MultiHeadLatentAttention"] = Field(
+        default="MultiHeadLatentAttention",
+        description="The Multi-Head Latent Attention backend to use.",
+    )
+
     free_mem_ratio: float = Field(
-        default=0.8,
-        description="The fraction of available memory to allocate for cache. "
-        "Must be between 0.0 and 1.0.",
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="The fraction of available memory to allocate for cache.",
     )
 
     simple_shard_only: bool = Field(
@@ -1788,58 +1840,123 @@ class _AutoDeployLlmArgs(TorchLlmArgs):
         "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
     )
 
-    # TODO: Remove this field once tokens_per_block is properly passed through
+    compile_backend: Literal[
+        "torch-simple", "torch-compile", "torch-cudagraph",
+        "torch-opt"] = (Field(
+            default="torch-compile",
+            description="The backend to use for compiling the model.",
+        ))
+
+    cuda_graph_batch_sizes: Optional[List[int]] = Field(
+        default=None,
+        description="List of batch sizes to create CUDA graphs for.")
+
+    visualize: bool = Field(default=False,
+                            description="Whether to visualize the model graph.")
+
+    ### SEQUENCE INTERFACE CONFIG ##################################################################
+    max_seq_len: int = Field(default=512,
+                             ge=1,
+                             description="The maximum sequence length.")
+    max_batch_size: int = Field(default=8,
+                                ge=1,
+                                description="The maximum batch size.")
     attn_page_size: int = Field(
         default=64,
+        ge=1,
         description=
         "Page size for attention (tokens_per_block). For TritonWithFlattenedInputs "
         "backend, this should equal max_seq_len. Temporary field until tokens_per_block gets "
         "properly passed through.",
     )
 
-    @field_validator("free_mem_ratio")
-    @classmethod
-    def validate_free_mem_ratio(cls, v):
-        """Validate that free_mem_ratio is between 0.0 and 1.0."""
-        if not 0.0 <= v <= 1.0:
-            raise ValueError(
-                f"free_mem_ratio must be between 0.0 and 1.0, got {v}")
-        return v
-
-    @print_traceback_on_error
-    def model_post_init(self, __context):
-        # Modify default values that differ from TorchLlmArgs
-        new_defaults = {
-            "max_batch_size": 8,
-            "max_seq_len": 512,
-            "attn_backend": "FlashInfer",
-            # TODO: Remove this when overlap scheduler is supported (https://github.com/NVIDIA/TensorRT-LLM/issues/4364)
-            "disable_overlap_scheduler": True,
-        }
-        for k, v_default in new_defaults.items():
-            if k not in self.__pydantic_fields_set__:
-                setattr(self, k, v_default)
-
-        # NOTE: Only call super() after setting the default values since default values should be
-        # set first.
-        super().model_post_init(__context)
-
-        # Handle attn_page_size for TritonWithFlattenedInputs backend
-        if self.attn_backend == "TritonWithFlattenedInputs":
-            self.attn_page_size = self.max_seq_len
-
-        # Add max_position_embeddings to model_kwargs
-        # TODO (lucaslie): this is more HF specific than a generic model_kwargs. Ideally, we can
-        # move this to the HF model factory but we don't have access to max_seq_len there right now.
-        self.model_kwargs["max_position_embeddings"] = min(
-            self.max_seq_len,
-            self.model_kwargs.get("max_position_embeddings", self.max_seq_len),
-        )
+    ### !!! DO NOT USE !!! #########################################################################
+    build_config: Optional[object] = Field(
+        default_factory=lambda: BuildConfig(),
+        description=
+        "!!! DO NOT USE !!! Internal only; needed for BaseLlmArgs compatibility.",
+        exclude_from_json=True,
+        frozen=True,
+        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"},
+        repr=False,
+    )
+    _tokenizer: Optional[str] = PrivateAttr(default=None)
+    backend: Literal["_autodeploy"] = Field(
+        default="_autodeploy",
+        description="The backend to use for this LLM instance.",
+        frozen=True,
+    )
+    gpus_per_node: int = Field(
+        default=torch.cuda.device_count(),
+        description="The number of GPUs per node.",
+        frozen=True,
+    )
 
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "_AutoDeployLlmArgs":
         """Return the _AutoDeployLlmArgs (self) object."""
-        return self
+        # NOTE (lucaslie): this is a bit hacky but we do NOT want to pass through the whole
+        # tokenizer object
+        self_dict = self.to_dict()
+        self_dict.pop("tokenizer")
+        self_dict["skip_tokenizer_init"] = True
+        return type(self)(**self_dict)
+
+    ### VALIDATION #################################################################################
+    @field_validator("build_config", mode="before")
+    @classmethod
+    def ensure_no_build_config(cls, value: Any) -> Any:
+        if value is not None:
+            raise ValueError("build_config is not used")
+        return value
+
+    # NOTE (lucaslie): ideally implemented as field validator but can't be done due to base class
+    # behavior. Have to do it here instead...
+    @print_traceback_on_error
+    def model_post_init(self, __context: Any):
+        # setup parallel config
+        self._parallel_config = _ParallelConfig(
+            auto_parallel=True, gpus_per_node=self.gpus_per_node)
+        self._parallel_config.world_size = self.world_size
+
+        # Force attn_page_size to equal max_seq_len for TritonWithFlattenedInputs backend
+        if self.attn_backend == "TritonWithFlattenedInputs":
+            self.attn_page_size = self.max_seq_len
+
+        # Retain the tokenizer info as string if provided as string.
+        if self._tokenizer is None and isinstance(self.tokenizer, str):
+            self._tokenizer = self.tokenizer
+
+        # NOTE (lucaslie): now this is less than ideal but the LLM api expects the tokenizer
+        # instance to be initialized in the Args object... so we gotta go with the flow...
+        if self.skip_tokenizer_init:
+            self.tokenizer = None
+        else:
+            from .._torch.auto_deploy.models import ModelFactory
+
+            factory: ModelFactory = self.create_factory()
+            self.tokenizer = tokenizer_factory(factory.init_tokenizer())
+
+    ### UTILITY METHODS ############################################################################
+    def create_factory(self) -> Any:
+        """Create a model factory from the arguments."""
+        from .._torch.auto_deploy.models import ModelFactoryRegistry
+
+        return ModelFactoryRegistry.get(self.model_factory)(
+            model=self.model,
+            model_kwargs=self.model_kwargs,
+            tokenizer=self._tokenizer,
+            tokenizer_kwargs=self.tokenizer_kwargs,
+            skip_loading_weights=self.skip_loading_weights,
+            max_seq_len=self.max_seq_len,
+        )
+
+    def to_dict(self) -> Dict:
+        """Convert model to a dictionary such that cls(**self.to_dict()) == self."""
+        self_dict = dict(self)
+        self_dict.pop("build_config")
+        self_dict.pop("mpi_session")
+        return self_dict
 
 
 def update_llm_args_with_extra_dict(

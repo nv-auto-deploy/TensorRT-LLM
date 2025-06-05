@@ -2,13 +2,11 @@
 
 import gc
 import types
-from pathlib import Path
 from queue import Empty
-from typing import Any, Callable, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.multiprocessing as mp
-from transformers import PreTrainedTokenizerBase
 
 from ....executor import GenerationExecutor
 from ....executor.request import GenerationRequest
@@ -16,9 +14,7 @@ from ....executor.result import CompletionOutput, GenerationResult
 from ....inputs.registry import create_input_processor
 from ....llmapi.llm import LLM, RequestOutput
 from ....llmapi.llm_args import _AutoDeployLlmArgs
-from ....llmapi.tokenizer import TokenizerBase
 from ....sampling_params import SamplingParams
-from ..custom_ops.attention_interface import SequenceInfo
 from ..distributed import common as dist_ad
 from ..utils.logger import ad_logger
 from .ad_executor import ADEngine
@@ -36,13 +32,8 @@ class DemoEngine(ADEngine):
     """
 
     @torch.inference_mode()
-    def __init__(
-        self,
-        get_inference_model,
-        seq_info,
-        device,
-    ) -> None:
-        super().__init__(get_inference_model, seq_info, device)
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self.queue = mp.Queue()
 
     @torch.inference_mode()
@@ -338,57 +329,19 @@ class DemoLLM(LLM):
     This is a very simple implementation of an LLM class that can be hacked and used for debugging.
     """
 
-    def __init__(
-        self,
-        model: str,
-        tokenizer: Optional[Union[str, Path, TokenizerBase, PreTrainedTokenizerBase]] = None,
-        tokenizer_mode: Literal["auto", "slow"] = "auto",
-        skip_tokenizer_init: bool = False,
-        trust_remote_code: bool = False,
-        tensor_parallel_size: int = 1,
-        dtype: str = "auto",
-        revision: Optional[str] = None,
-        tokenizer_revision: Optional[str] = None,
-        **kwargs,
-    ):
-        try:
-            self.args: _AutoDeployLlmArgs = _AutoDeployLlmArgs.from_kwargs(
-                model=model,
-                tokenizer=tokenizer,
-                tokenizer_mode=tokenizer_mode,
-                skip_tokenizer_init=skip_tokenizer_init,
-                trust_remote_code=trust_remote_code,
-                tensor_parallel_size=tensor_parallel_size,
-                dtype=dtype,
-                revision=revision,
-                tokenizer_revision=tokenizer_revision,
-                backend=kwargs.pop("backend", "_autodeploy"),
-                **kwargs,
-            )
+    def __init__(self, **kwargs):
+        self.args: _AutoDeployLlmArgs = _AutoDeployLlmArgs.from_kwargs(**kwargs)
 
-        except Exception as e:
-            ad_logger.error(f"Failed to parse the arguments for the LLM constructor: {e}")
-            raise e
         self.mpi_session = None
         self.runtime_context = None
         self._tokenizer = self._try_load_tokenizer()
         self.input_processor = create_input_processor(None, self.tokenizer)
 
-        # construct sequence info object
-        seq_info = SequenceInfo(
-            max_seq_len=self.args.max_seq_len,
-            max_batch_size=self.args.max_batch_size,
-            page_size=self.args.attn_page_size,
-        )
-
         # construct demo executor + engine
         self._executor = DemoGenerationExecutor(
-            world_size=tensor_parallel_size,
+            world_size=self.args.world_size,
             tokenizer=self.tokenizer,
-            model=model,
             ad_config=self.args.get_pytorch_backend_config(),
-            seq_info=seq_info,
-            device="cuda",
         )
 
     def __del__(self):

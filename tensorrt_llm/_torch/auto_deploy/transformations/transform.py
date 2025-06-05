@@ -39,27 +39,9 @@ from .library import (
 
 
 class InferenceOptimizer:
-    def __init__(
-        self,
-        factory: ModelFactory,
-        *,  # TODO: temporary until we have a better config system
-        ad_config: _AutoDeployLlmArgs,
-        visualize: bool = False,
-    ):
+    def __init__(self, factory: ModelFactory, ad_config: _AutoDeployLlmArgs):
         self.factory = factory
-
         self.ad_config = ad_config
-        # Map Pytorch config to AutoDeploy compile backends.
-        if ad_config.use_cuda_graph and ad_config.torch_compile_enabled:
-            compile_backend = "torch-opt"
-        elif ad_config.use_cuda_graph:
-            compile_backend = "torch-cudagraph"
-        elif ad_config.torch_compile_enabled:
-            compile_backend = "torch-compile"
-        else:
-            compile_backend = "torch-simple"
-        self.compile_backend = compile_backend
-        self.visualize = visualize
 
     def __call__(self, cm: CachedSequenceInterface) -> GraphModule:
         """Transform a model into an optimized inference model.
@@ -178,7 +160,7 @@ class InferenceOptimizer:
         egm = fuse_collectives(egm)
 
         # visualize the final graph
-        if self.visualize:
+        if self.ad_config.visualize:
             try:
                 from .library import visualize_namespace
 
@@ -218,7 +200,7 @@ class InferenceOptimizer:
         }
         egm_compiled = compile_and_capture(
             egm,
-            self.compile_backend,
+            self.ad_config.compile_backend,
             args=cm.args,
             dynamic_shapes=cm.dynamic_shapes,
             compiler_kwargs=compiler_kwargs,

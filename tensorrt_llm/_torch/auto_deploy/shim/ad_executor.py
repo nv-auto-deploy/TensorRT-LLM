@@ -1,5 +1,6 @@
 from itertools import chain
-from typing import Dict, List, Optional, Tuple
+from types import SimpleNamespace
+from typing import List, Optional, Tuple
 
 import torch
 from torch._prims_common import DeviceLikeType
@@ -12,7 +13,6 @@ from ....bindings.internal.batch_manager import CacheType
 from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ....mapping import Mapping
 from ...distributed import MPIDist
-from ...pyexecutor.config import PyTorchConfig
 from ...pyexecutor.model_engine import ModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager
@@ -25,7 +25,6 @@ from ...pyexecutor.scheduler import (
 )
 from ..custom_ops.attention_interface import SequenceInfo
 from ..distributed import common as dist
-from ..models import ModelFactoryRegistry
 from ..transformations.transform import InferenceOptimizer
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
@@ -82,37 +81,36 @@ class ADEngine(ModelEngine):
         return self.cache_seq_interface.device
 
     @classmethod
-    def build_from_config(
-        cls,
-        model: str,
-        ad_config: _AutoDeployLlmArgs,
-        seq_info: SequenceInfo,
-        device: DeviceLikeType,
-    ):
+    def build_from_config(cls, ad_config: _AutoDeployLlmArgs):
         """Build the ADEngine using the _AutoDeployLlmArgs that gets passed through from the LLM."""
 
+        max_batch_size = ad_config.max_batch_size
+        max_seq_len = ad_config.max_seq_len
+        attn_page_size = ad_config.attn_page_size
+        max_num_tokens = ad_config.max_num_tokens
+        ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}")
+
+        # initialize seq info object
+        seq_info = SequenceInfo(
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            page_size=attn_page_size,
+            max_num_tokens=max_num_tokens,
+        )
+
         # update device to contain the current default device if it's in cuda
-        device = torch.device(device)
+        device = torch.device(ad_config.device)
         if device.type == "cuda" and device.index is None:
             device = torch.device(f"cuda:{torch.cuda.current_device()}")
         device = str(device)
 
-        # construct model factory
-        model_kwargs = {"max_position_embeddings": seq_info.max_seq_len, **ad_config.model_kwargs}
-        factory = ModelFactoryRegistry.get(ad_config.model_factory)(
-            model=model,
-            model_kwargs=model_kwargs,
-            skip_loading_weights=ad_config.skip_loading_weights,
+        # construct inference optimizer
+        build_and_optimize = InferenceOptimizer(
+            factory=ad_config.create_factory(), ad_config=ad_config
         )
 
-        # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(factory=factory, ad_config=ad_config)
-
         # construct engine
-        engine = cls(build_and_optimize, seq_info, device)
-        engine.pytorch_backend_config = ad_config
-
-        return engine
+        return cls(build_and_optimize, seq_info, device)
 
     @torch.inference_mode()
     def __init__(
@@ -122,16 +120,15 @@ class ADEngine(ModelEngine):
         device: DeviceLikeType,
     ) -> None:
         """Initialize the engine with model and sequence information."""
-        # TODO: this seems to have been hastily added in !8301. Let's see if it gets reverted...
-        # PyTorchEngine requirement which is not set in the base class though...
-        self.iter_states: Dict[str, int] = {}
-        self.pytorch_backend_config: Optional[PyTorchConfig] = None
+        # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
+        # This is not correctly declared in the base ModelEngine class though...
+        self.pytorch_backend_config = SimpleNamespace()
+        self.pytorch_backend_config.print_iter_log = False
+        self.pytorch_backend_config.enable_iter_perf_stats = False
+        self.pytorch_backend_config.enable_iter_req_stats = False
 
-        # TODO: not a declared base member in the base class (see !8291 for diff)
+        # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
         self.enable_attention_dp = False
-
-        # TODO: fix baseclass from this diff in !8360
-        self.iter_counter = 0
 
         # construct cache sequence interface
         self.cache_seq_interface = CachedSequenceInterface(
@@ -198,12 +195,6 @@ class ADEngine(ModelEngine):
         si.update_pos(input_pos, reset=True)
         si.assign_cache_loc(page_assignments)
 
-        # update iter_stats for PyExecutor
-        num_ctx_requests = len(context_requests)
-        self.iter_states["num_ctx_requests"] = num_ctx_requests
-        self.iter_states["num_ctx_tokens"] = sum(len(ids) for ids in input_ids[:num_ctx_requests])
-        self.iter_states["num_generation_tokens"] = len(gen_requests)
-
         return last_logit_only
 
     def _compute_logits(self) -> List[torch.Tensor]:
@@ -263,45 +254,29 @@ def create_autodeploy_executor(
     assert isinstance(executor_config.pytorch_backend_config, _AutoDeployLlmArgs), msg
     ad_config: _AutoDeployLlmArgs = executor_config.pytorch_backend_config
 
-    max_batch_size = ad_config.max_batch_size
-    max_seq_len = ad_config.max_seq_len
-    attn_page_size = ad_config.attn_page_size
-    max_num_tokens = ad_config.max_num_tokens
-    ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}")
-
     # initialize model engine
-    engine = ADEngine.build_from_config(
-        model=checkpoint_dir,
-        ad_config=ad_config,
-        seq_info=SequenceInfo(
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch_size,
-            page_size=attn_page_size,
-            max_num_tokens=max_num_tokens,
-        ),
-        device="cuda",
-    )
+    engine = ADEngine.build_from_config(ad_config=ad_config)
 
     # resource managers
     kv_cache_manager = _CacheManagerWithFakePool(
         ad_config.kv_cache_config,
         num_blocks=engine.cache_seq_interface.info.num_pages,
-        tokens_per_block=attn_page_size,
-        max_seq_len=max_seq_len,
-        max_batch_size=max_batch_size,
+        tokens_per_block=ad_config.attn_page_size,
+        max_seq_len=ad_config.max_seq_len,
+        max_batch_size=ad_config.max_batch_size,
     )
     resource_manager = ResourceManager({"kv_cache_manager": kv_cache_manager})
     resource_manager.resource_managers.move_to_end("kv_cache_manager", last=True)
 
     # scheduling
-    capacitor_scheduler = BindCapacityScheduler(max_batch_size, kv_cache_manager.impl)
+    capacitor_scheduler = BindCapacityScheduler(ad_config.max_batch_size, kv_cache_manager.impl)
     mb_scheduler = BindMicroBatchScheduler(
-        max_batch_size, engine.cache_seq_interface.info.max_num_tokens
+        ad_config.max_batch_size, engine.cache_seq_interface.info.max_num_tokens
     )
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
     # search sampler with speculative decoding
-    sampler = TorchSampler(max_seq_len=max_seq_len)
+    sampler = TorchSampler(max_seq_len=ad_config.max_seq_len)
 
     # creating the executor object
     py_executor = PyExecutor(
