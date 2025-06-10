@@ -79,6 +79,12 @@ class InferenceOptimizer:
         ############################################################################################
         model = self.factory.build_model(device="meta")
         config = model.config
+        if "text_config" in config:
+            config = config.text_config
+        if "hidden_size" in config and "num_attention_heads" in config:
+            head_dim = config.hidden_size // config.num_attention_heads
+        else:
+            head_dim = 1
 
         ############################################################################################
         # EXPORT MODEL TO GRAPH MODULE
@@ -136,7 +142,11 @@ class InferenceOptimizer:
 
         # run TP sharding across ranks
         egm = column_row_shard(
-            egm, config, local_rank, world_size, self.ad_config.simple_shard_only
+            egm,
+            local_rank,
+            world_size,
+            self.ad_config.simple_shard_only,
+            min_local_shape=head_dim,
         )
 
         # run EP sharding across ranks

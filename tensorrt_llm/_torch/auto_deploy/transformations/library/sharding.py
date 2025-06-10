@@ -16,6 +16,7 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
+import math
 import operator
 from collections import defaultdict
 from functools import partial
@@ -94,7 +95,7 @@ def _insert_sharded_matmul(
         # The local tensor shape has to be divisible by min_local_shape
         max_split_size = t.shape[d] // min_local_shape
         if ws > max_split_size:
-            num_groups = ws // max_split_size
+            num_groups = math.ceil(ws / max_split_size)
             ad_logger.warning(
                 f"World size {ws} is greater than the max split size {max_split_size}. "
                 + f"Splitting tensor to {num_groups} chunks"
@@ -207,10 +208,10 @@ def _simple_shard(
 
 def column_row_shard(
     gm: GraphModule,
-    config,
     rank: int,
     world_size: int,
     simple_shard_only: bool = False,
+    min_local_shape: int = 1,
 ) -> GraphModule:
     """A transformation to apply sharding to the model following tensor parallelism.
 
@@ -224,16 +225,15 @@ def column_row_shard(
        **all** nodes in the subgraph. The subgraph here is defined as the region between the first
        linear node to the last linear node of an identified sharding region.
     # 5. Shard the GEMM nodes or skip accordingly.
+
+    min_local_shape is the minimum size of the local tensor shard, to prevent TP parallelism
+    splitting, e.g., the individual heads into smaller shards.
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
 
     if world_size < 2:
         ad_logger.info("Skipping sharding for single device")
         return gm
-
-    # head_dim is the minimum size of the local tensor shard, to prevent TP parallelism
-    # splitting the individual heads into smaller shards.
-    head_dim = config.hidden_size // config.num_attention_heads
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
 
@@ -353,7 +353,7 @@ def column_row_shard(
         for i, group in enumerate(nodes_linear.values()):
             for n in group:
                 _insert_sharded_matmul(
-                    gm, n, i, rank, world_size, add_dist=i > 0, min_local_shape=head_dim
+                    gm, n, i, rank, world_size, add_dist=i > 0, min_local_shape=min_local_shape
                 )
 
     # canonicalize and return
