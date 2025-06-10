@@ -71,7 +71,13 @@ def _load_hook_remove(
 
 
 def _insert_sharded_matmul(
-    gm: GraphModule, node: Node, dim: int, rank: int, world_size: int, add_dist: bool = False
+    gm: GraphModule,
+    node: Node,
+    dim: int,
+    rank: int,
+    world_size: int,
+    add_dist: bool = False,
+    min_local_shape: int = 1,
 ):
     """Replaces the matmul node with a new matmul node that accepts sharded weights.
 
@@ -85,6 +91,15 @@ def _insert_sharded_matmul(
     def split_tensor(
         t: torch.Tensor, d: int = dim, r: int = rank, ws: int = world_size
     ) -> torch.Tensor:
+        # The local tensor shape has to be divisible by min_local_shape
+        max_split_size = t.shape[d] // min_local_shape
+        if ws > max_split_size:
+            num_groups = ws // max_split_size
+            ad_logger.warning(
+                f"World size {ws} is greater than the max split size {max_split_size}. "
+                + f"Splitting tensor to {num_groups} chunks"
+            )
+            return torch.tensor_split(t, max_split_size, dim=d)[r // num_groups]
         return torch.tensor_split(t, ws, dim=d)[r]
 
     num_users = num_users_of_weight_node(node)
@@ -191,7 +206,11 @@ def _simple_shard(
 
 
 def column_row_shard(
-    gm: GraphModule, rank: int, world_size: int, simple_shard_only: bool = False
+    gm: GraphModule,
+    config,
+    rank: int,
+    world_size: int,
+    simple_shard_only: bool = False,
 ) -> GraphModule:
     """A transformation to apply sharding to the model following tensor parallelism.
 
@@ -211,6 +230,10 @@ def column_row_shard(
     if world_size < 2:
         ad_logger.info("Skipping sharding for single device")
         return gm
+
+    # head_dim is the minimum size of the local tensor shard, to prevent TP parallelism
+    # splitting the individual heads into smaller shards.
+    head_dim = config.hidden_size // config.num_attention_heads
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
 
@@ -329,7 +352,9 @@ def column_row_shard(
         # --> row_split (dim 0) + col_split (dim 1) + all_reduce
         for i, group in enumerate(nodes_linear.values()):
             for n in group:
-                _insert_sharded_matmul(gm, n, i, rank, world_size, add_dist=i > 0)
+                _insert_sharded_matmul(
+                    gm, n, i, rank, world_size, add_dist=i > 0, min_local_shape=head_dim
+                )
 
     # canonicalize and return
     if num_shards:
