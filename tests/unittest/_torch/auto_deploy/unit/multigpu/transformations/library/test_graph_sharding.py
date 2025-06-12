@@ -86,7 +86,7 @@ def _run_job(
 
     # GQA specific parameters
     num_heads = 4
-    num_key_value_heads = 2
+    num_key_value_heads = 1
 
     if model_cls == GQA_Block:
         model = model_cls(
@@ -100,20 +100,29 @@ def _run_job(
         )
     x = torch.randn(batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16)
 
+    if model_cls == GQA_Block:
+        head_dim = num_features // num_heads
+        min_local_size = head_dim
+    else:
+        min_local_size = 1
+
     def _get_expected_num_params(num_p_og: int) -> int:
         num_update = 0
         if bias and dist_op_expected == "all_reduce":
             num_p_og -= num_features
             num_update = num_features * (rank == world_size - 1)
 
-        num_params = num_p_og // world_size + num_update
+        if min_local_size > 1:
+            # it means we are in the GQA. W_kv are partially replicated, we need to count
+            # the number of parameters manually.
+            W_q_local_size = num_features * num_features // world_size
+            W_o_local_size = W_q_local_size
+            W_k_local_size = num_features * head_dim * max(num_key_value_heads // world_size, 1)
+            W_v_local_size = W_k_local_size
+            num_params = W_q_local_size + W_k_local_size + W_v_local_size + W_o_local_size
+        else:
+            num_params = num_p_og // world_size + num_update
         return num_params
-
-    if model_cls == GQA_Block:
-        head_dim = num_features // num_heads
-        min_local_size = head_dim
-    else:
-        min_local_size = 1
 
     def verify_local_weight_sizes(gm) -> bool:
         """Verify that all weight tensors have first dimension >= min_local_size after sharding."""
@@ -151,7 +160,7 @@ def _run_job(
 
 
 @pytest.mark.parametrize("device_count", get_device_counts())
-@pytest.mark.parametrize("bias", [False])  # , True])
+@pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize(
     "model_cls, dist_op_expected",
     (
