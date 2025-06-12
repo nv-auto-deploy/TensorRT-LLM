@@ -100,6 +100,90 @@ def test_gqa_op(device, dtype, n_heads, group_size, seq_len):
     )
 
 
+@pytest.mark.parametrize("logit_cap", [50.0])
+@pytest.mark.parametrize("group_size", [1, 4])
+@pytest.mark.parametrize("n_heads", [8])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_gqa_op_with_logit_cap(device, dtype, n_heads, group_size, logit_cap):
+    # This test is for generation phase, so seq_len is 1.
+    seq_len = 1
+    BATCH_SIZE = 2
+    D_HEAD = 16
+    CACHE_SEQ_LEN = 8
+
+    dtype = getattr(torch, dtype)
+    n_kv_heads = n_heads // group_size
+
+    offset = 4  # some offset
+    input_positions = torch.zeros(BATCH_SIZE, device=device, dtype=torch.int) + offset
+
+    q = torch.randn(BATCH_SIZE, seq_len, n_heads, D_HEAD, dtype=dtype, device=device)
+    k = torch.randn(BATCH_SIZE, seq_len, n_kv_heads, D_HEAD, dtype=dtype, device=device)
+    v = torch.randn(BATCH_SIZE, seq_len, n_kv_heads, D_HEAD, dtype=dtype, device=device)
+
+    # setup kv-cache
+    k_cache = torch.randn(BATCH_SIZE, CACHE_SEQ_LEN, n_kv_heads, D_HEAD, dtype=dtype, device=device)
+    v_cache = torch.randn(BATCH_SIZE, CACHE_SEQ_LEN, n_kv_heads, D_HEAD, dtype=dtype, device=device)
+
+    # Store k,v in cache for op
+    k_cache_op = k_cache.clone()
+    v_cache_op = v_cache.clone()
+
+    # run custom op
+    output = torch.ops.attention.fused_mha_with_cache(
+        q, k, v, input_positions, k_cache_op, v_cache_op, None, logit_cap
+    )
+
+    # for reference, we manually update the cache
+    k_cache[:, input_positions[0] : input_positions[0] + seq_len] = k
+    v_cache[:, input_positions[0] : input_positions[0] + seq_len] = v
+
+    k_cache_ref = torch.repeat_interleave(k_cache, group_size, dim=2)  # [b,s,n,d]
+    v_cache_ref = torch.repeat_interleave(v_cache, group_size, dim=2)  # [b,s,n,d]
+
+    # Reference implementation
+    q_ref = q.transpose(1, 2)
+    # up to `offset + 1`
+    k_ref = k_cache_ref[:, : offset + seq_len].transpose(1, 2)
+    v_ref = v_cache_ref[:, : offset + seq_len].transpose(1, 2)
+
+    scale = 1.0 / (D_HEAD**0.5)
+    attn = torch.matmul(q_ref, k_ref.transpose(-2, -1)) * scale
+
+    if logit_cap is not None:
+        attn = logit_cap * torch.tanh(attn / logit_cap)
+
+    # For seq_len=1, there is no causal mask. We attend to all keys in cache up to current position.
+
+    attn = torch.nn.functional.softmax(attn, dim=-1)
+    ref_out = torch.matmul(attn, v_ref)
+
+    ref = ref_out.transpose(1, 2).contiguous().view(BATCH_SIZE, seq_len, n_heads * D_HEAD)
+
+    # Check that op output and reference are close
+    assert torch.allclose(
+        ref.cpu().to(torch.float32),
+        output.cpu().to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+    # Check that cache is updated correctly by the op
+    assert torch.allclose(
+        k_cache_op.cpu(),
+        k_cache.cpu(),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.allclose(
+        v_cache_op.cpu(),
+        v_cache.cpu(),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
 @pytest.mark.parametrize("num_generate_ratio", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("max_seq_len", [0, 1, 16])
 @pytest.mark.parametrize("group_size", [1, 4])

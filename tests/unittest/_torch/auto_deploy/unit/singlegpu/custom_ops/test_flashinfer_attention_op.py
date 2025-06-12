@@ -109,6 +109,7 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         None,
         1.0,
         1.0,
+        None,  # logit_cap
     )
 
     ref = torch.nn.functional.scaled_dot_product_attention(
@@ -234,6 +235,7 @@ def test_flashinfer_attention_op_decode(
         None,
         1.0,
         1.0,
+        None,  # logit_cap
     )
 
     assert torch.allclose(
@@ -350,6 +352,7 @@ def test_flashinfer_attention_context_and_generate(
         None,
         1.0,
         1.0,
+        None,  # logit_cap
     )
 
     # Generate reference outputs
@@ -425,6 +428,7 @@ def test_flashinfer_attention_context_and_generate(
         None,
         1.0,
         1.0,
+        None,  # logit_cap
     )
 
     # Generate reference outputs
@@ -534,6 +538,7 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         None,
         1.0,
         1.0,
+        None,  # logit_cap
     )
 
     # Generate ref
@@ -681,6 +686,7 @@ def test_flashinfer_attention_with_fp8_cache(
         None,
         K_SCALE,
         V_SCALE,
+        None,  # logit_cap
     )
 
     y = flashinfer_output.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
@@ -778,6 +784,7 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         None,
         1.0,
         1.0,
+        None,  # logit_cap
     )
 
     # Compute reference
@@ -861,6 +868,7 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         None,
         1.0,
         1.0,
+        None,  # logit_cap
     )
 
     # Compute reference
@@ -882,6 +890,117 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
 
     assert torch.allclose(
         flashinfer_output_gen.squeeze().cpu().to(torch.float32),
+        ref.cpu().to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+@pytest.mark.parametrize("seq_length", [64])
+@pytest.mark.parametrize("n_heads", [8])
+@pytest.mark.parametrize("batch_size", [4])
+@pytest.mark.parametrize("logit_cap", [10.0, 30.0])
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_flashinfer_attention_op_context_with_logit_cap(
+    seq_length, n_heads, batch_size, logit_cap, dtype, device
+):
+    """
+    Tests the context phase of flashinfer attention with logit soft-capping.
+    """
+    D_HEAD = 64
+    MAX_SEQ_LEN = 2048
+    MAX_BATCH_SIZE = 32
+    DTYPE = dtype
+    BATCH_SIZE = batch_size
+    N_HEADS = n_heads
+    SEQ_LEN = seq_length
+
+    # metadata
+    seq_len_tensor = torch.tensor([SEQ_LEN] * BATCH_SIZE, dtype=torch.int32, device=device)
+    offsets = torch.zeros(BATCH_SIZE, device=device, dtype=torch.int)
+
+    qo_indptr = torch.cat(
+        (torch.zeros_like(seq_len_tensor[:1]), torch.cumsum(seq_len_tensor, 0))
+    ).to(torch.int32)
+    paged_kv_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device)
+    paged_kv_indices = torch.arange(BATCH_SIZE).int().to(device)
+    paged_kv_last_page_len = offsets + seq_len_tensor
+
+    # Q,K,V are computed using GEMM.
+    q = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
+    k = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
+    v = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=DTYPE).to(device)
+
+    # Setup KV Cache. KV cache is empty, context phase
+    k_cache = torch.zeros(
+        (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
+    )
+    v_cache = torch.zeros(
+        (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD), dtype=DTYPE, device=device
+    )
+
+    # make sure planner is initialized
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    _GlobalFlashInferPlanner.init_workspace(workspace)
+
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * SEQ_LEN,
+    )
+    flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
+        # Q, K, V
+        q,
+        k,
+        v,
+        # METADATA
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        batch_indices,
+        positions,
+        # CACHES
+        k_cache,
+        v_cache,
+        # BUFFERS
+        workspace,
+        # CONSTANTS
+        None,
+        1.0,
+        1.0,
+        logit_cap,
+    )
+
+    # Reference implementation
+    q_ref = q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD).transpose(1, 2)
+    k_ref = k.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD).transpose(1, 2)
+    v_ref = v.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD).transpose(1, 2)
+
+    scale = D_HEAD**-0.5
+    logits = torch.matmul(q_ref, k_ref.transpose(-2, -1)) * scale
+
+    # Apply logit softcapping
+    if logit_cap > 0.0:
+        logits = logit_cap * torch.tanh(logits / logit_cap)
+
+    # Apply causal mask
+    causal_mask = torch.triu(
+        torch.ones(SEQ_LEN, SEQ_LEN, device=device, dtype=torch.bool), diagonal=1
+    )
+    logits.masked_fill_(causal_mask, -float("inf"))
+
+    # Apply softmax
+    attn_weights = torch.softmax(logits, dim=-1).to(v_ref.dtype)
+
+    # Compute output
+    ref = (attn_weights @ v_ref).transpose(1, 2).reshape(BATCH_SIZE, SEQ_LEN, -1)
+
+    assert torch.allclose(
+        flashinfer_output.cpu().to(torch.float32),
         ref.cpu().to(torch.float32),
         atol=1e-2,
         rtol=1e-2,

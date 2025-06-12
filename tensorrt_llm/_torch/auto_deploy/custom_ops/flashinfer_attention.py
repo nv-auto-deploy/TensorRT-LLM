@@ -37,6 +37,7 @@ class PlanParams:
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
     sm_scale: Optional[float] = None
+    logit_cap: Optional[float] = None
 
     causal: bool = True
 
@@ -107,6 +108,7 @@ class _FlashInferPlanner:
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
                 sm_scale=plan_params.sm_scale,
+                logits_soft_cap=plan_params.logit_cap,
             )
 
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
@@ -143,6 +145,7 @@ class _FlashInferPlanner:
                     q_data_type=plan_params.q_dtype,
                     kv_data_type=plan_params.kv_dtype,
                     sm_scale=plan_params.sm_scale,
+                    logits_soft_cap=plan_params.logit_cap,
                 )
             self.plan_params = plan_params
 
@@ -250,6 +253,7 @@ def flashinfer_mha_with_cache(
     scale: Optional[float],
     k_scale: float,
     v_scale: float,
+    logit_cap: Optional[float],
 ) -> torch.Tensor:
     # reshape to standard [b*s, n_heads, head_dim] layout
     head_dim = k_cache.shape[-1]
@@ -273,6 +277,7 @@ def flashinfer_mha_with_cache(
         q_dtype=q.dtype,
         kv_dtype=k_cache.dtype,
         sm_scale=scale,
+        logit_cap=logit_cap,
     )
 
     # Assuming k_scale = v_scale = 1.0, we just have to cast k and v to fp8 before appending to kv cache
@@ -327,6 +332,7 @@ def flashinfer_mha_with_cache_fake(
     scale: Optional[float],
     k_scale: float,
     v_scale: float,
+    logit_cap: Optional[float],
 ) -> torch.Tensor:
     return torch.empty_like(q.contiguous())
 
@@ -419,8 +425,17 @@ class FlashInferAttention(AttentionDescriptor):
             ad_logger.warning("Provided scale is not a float. Using default scale instead.")
             scale = None
 
+        logit_cap = source_attn_node.kwargs.get("logit_cap", None)
+        if not (isinstance(logit_cap, float) or logit_cap is None):
+            ad_logger.debug("Provided logit_cap is not a float or None. Disabling soft-capping.")
+            logit_cap = None
+        elif isinstance(logit_cap, float) and logit_cap <= 0:
+            ad_logger.warning("Provided logit_cap is not positive. Disabling soft-capping.")
+            logit_cap = None
+
         return [
             scale,  # softmax scale
             1.0,  # k_scale
             1.0,  # v_scale
+            logit_cap,
         ]
