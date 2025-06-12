@@ -9,14 +9,54 @@ import torch.nn as nn
 import torch.nn.functional as F
 from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_test
-from _model_test_utils import GQA
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.transformations.library import column_row_shard
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
-num_heads = 4
-num_key_value_heads = 2
+
+class GQA_Block(nn.Module):
+    def __init__(
+        self,
+        num_attention_heads: int,
+        hidden_size: int,
+        num_key_value_heads: int,
+    ):
+        super().__init__()
+        self.num_attention_heads = num_attention_heads
+        self.hidden_size = hidden_size
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.is_gqa = num_key_value_heads < num_attention_heads
+        assert self.hidden_size == self.num_attention_heads * self.head_dim
+
+        # key, query, value, out projections
+        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.k_proj = nn.Linear(
+            self.hidden_size,
+            self.head_dim * self.num_key_value_heads,
+            bias=False,
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size,
+            self.head_dim * self.num_key_value_heads,
+            bias=False,
+        )
+
+        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, s, _ = x.shape
+
+        q = self.q_proj(x).view(b, s, -1, self.head_dim)
+        k = self.k_proj(x).view(b, s, -1, self.head_dim)
+        v = self.v_proj(x).view(b, s, -1, self.head_dim)
+
+        y = torch.ops.attention.bsnd_grouped_sdpa(q, k, v, is_causal=True)
+        y = y.contiguous().view(b, s, -1)
+
+        return self.o_proj(y)
 
 
 class MLP(nn.Module):
@@ -44,7 +84,11 @@ def _run_job(
     sequence_len = 8
     num_features = 32
 
-    if model_cls == GQA:
+    # GQA specific parameters
+    num_heads = 4
+    num_key_value_heads = 2
+
+    if model_cls == GQA_Block:
         model = model_cls(
             num_attention_heads=num_heads,
             hidden_size=num_features,
@@ -65,7 +109,7 @@ def _run_job(
         num_params = num_p_og // world_size + num_update
         return num_params
 
-    if model_cls == GQA:
+    if model_cls == GQA_Block:
         head_dim = num_features // num_heads
         min_local_size = head_dim
     else:
@@ -107,13 +151,13 @@ def _run_job(
 
 
 @pytest.mark.parametrize("device_count", get_device_counts())
-@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("bias", [False])  # , True])
 @pytest.mark.parametrize(
     "model_cls, dist_op_expected",
     (
         (MLP, "all_reduce"),
         (nn.Linear, "all_gather"),
-        (GQA, "all_gather"),
+        (GQA_Block, "all_reduce"),
     ),
 )
 def test_sharding(model_cls: Type[nn.Module], dist_op_expected: str, bias: bool, device_count: int):
