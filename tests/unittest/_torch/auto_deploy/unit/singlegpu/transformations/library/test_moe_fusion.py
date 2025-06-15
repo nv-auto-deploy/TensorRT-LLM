@@ -119,7 +119,9 @@ def test_moe_fusion():
         x,
         fuse_moe,
         lambda gm: any(
-            is_op(n, {torch.ops.auto_deploy.torch_moe_fused, torch.ops.auto_deploy.trtllm_moe_fused})
+            is_op(
+                n, {torch.ops.auto_deploy.torch_moe_fused, torch.ops.auto_deploy.trtllm_moe_fused}
+            )
             for n in gm.graph.nodes
         ),
         lambda num_p_og: num_p_og,

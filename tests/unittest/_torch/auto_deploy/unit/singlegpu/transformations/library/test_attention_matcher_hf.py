@@ -97,7 +97,9 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
         )
 
         # TODO: check that there is no repeat_kv pattern left...
-        nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.auto_deploy.torch_attention_repeat_kv)
+        nodes = gm.graph.find_nodes(
+            op="call_function", target=torch.ops.auto_deploy.torch_attention_repeat_kv
+        )
         assert len(nodes) == 0, "Found repeat_kv pattern in the graph"
 
         return True

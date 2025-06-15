@@ -434,7 +434,9 @@ def test_match_repeat_kv(num_heads, num_kv_heads, model_cls):
     expected_matches = 0 if num_heads == num_kv_heads else 2
 
     def verify_matcher(gm):
-        repeat_kv_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_repeat_kv)]
+        repeat_kv_nodes = [
+            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_repeat_kv)
+        ]
 
         # Check that we have the expected number of replacements
         if len(repeat_kv_nodes) != expected_matches:
@@ -656,7 +658,9 @@ def test_counter_example():
 
     def verify_no_matches(gm):
         # No nodes should be replaced with torch.ops.auto_deploy.torch_attention_repeat_kv
-        repeat_kv_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_repeat_kv)]
+        repeat_kv_nodes = [
+            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_repeat_kv)
+        ]
         return len(repeat_kv_nodes) == 0
 
     # Ensure the pattern matcher doesn't match our counter-examples
@@ -693,7 +697,9 @@ def test_match_grouped_attention(num_heads, num_kv_heads, has_mask):
 
     def verify_matcher(gm):
         grouped_sdpa_nodes = [
-            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
+            n
+            for n in gm.graph.nodes
+            if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
         ]
 
         # Check that we have the expected number of replacements
@@ -886,12 +892,14 @@ def test_match_causal_attention(mask_type, use_grouped_sdpa):
     def verify_matcher(gm):
         # Find attention operations
         if use_grouped_sdpa:
-            attn_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)]
-        else:
             attn_nodes = [
                 n
                 for n in gm.graph.nodes
-                if is_op(n, torch.ops.auto_deploy.torch_attention_sdpa)
+                if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
+            ]
+        else:
+            attn_nodes = [
+                n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_sdpa)
             ]
 
         if len(attn_nodes) != 1:
@@ -1077,12 +1085,14 @@ def test_match_llama3_causal_attention(use_grouped_sdpa):
     def verify_matcher(gm):
         # Find attention operations
         if use_grouped_sdpa:
-            attn_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)]
-        else:
             attn_nodes = [
                 n
                 for n in gm.graph.nodes
-                if is_op(n, torch.ops.auto_deploy.torch_attention_sdpa)
+                if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
+            ]
+        else:
+            attn_nodes = [
+                n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_sdpa)
             ]
 
         if len(attn_nodes) != 1:
@@ -1318,7 +1328,9 @@ def test_match_attention_layout(layout, model_config, has_mask):
         if model_config["type"] == "standard":
             if model_config["use_grouped_sdpa"]:
                 original_nodes = [
-                    n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
+                    n
+                    for n in gm.graph.nodes
+                    if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
                 ]
             else:
                 original_nodes = [
@@ -1330,7 +1342,9 @@ def test_match_attention_layout(layout, model_config, has_mask):
             original_nodes = []
 
         bsnd_nodes = [
-            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa)
+            n
+            for n in gm.graph.nodes
+            if is_op(n, torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa)
         ]
         transpose_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.aten.transpose.int)]
 

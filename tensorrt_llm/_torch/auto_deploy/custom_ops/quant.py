@@ -114,7 +114,9 @@ def fused_fp8_linear_all_reduce(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    out = torch.ops.auto_deploy.torch_quant_fp8_linear(input, weight_fp8, bias, input_scale, weight_scale)
+    out = torch.ops.auto_deploy.torch_quant_fp8_linear(
+        input, weight_fp8, bias, input_scale, weight_scale
+    )
     if trtllm_dist.is_trtllm_op_available():
         return trtllm_dist.trtllm_allreduce(out, op=dist.ReduceOp.SUM)
     dist.all_reduce(out, op=dist.ReduceOp.SUM)
@@ -129,7 +131,9 @@ def fused_fp8_linear_all_reduce_fake(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    return torch.ops.auto_deploy.torch_quant_fp8_linear(input, weight_fp8, bias, input_scale, weight_scale)
+    return torch.ops.auto_deploy.torch_quant_fp8_linear(
+        input, weight_fp8, bias, input_scale, weight_scale
+    )
 
 
 class FP8Linear(nn.Linear):
@@ -218,4 +222,7 @@ def fp4_linear_fake(
     return torch.ops.aten.linear(input, weight_fp4.repeat(1, 2).to(input.dtype), bias)
 
 
-QUANT_OPS = [torch.ops.auto_deploy.torch_quant_fp8_linear, torch.ops.auto_deploy.torch_quant_fp4_linear]
+QUANT_OPS = [
+    torch.ops.auto_deploy.torch_quant_fp8_linear,
+    torch.ops.auto_deploy.torch_quant_fp4_linear,
+]

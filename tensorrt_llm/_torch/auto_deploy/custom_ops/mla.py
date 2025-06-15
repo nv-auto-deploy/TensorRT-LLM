@@ -22,7 +22,9 @@ from .triton_attention import _flattened_context_mha, _generate_mha
 Constant = Union[int, float, str, None]
 
 
-@torch.library.custom_op("auto_deploy::triton_attention_fused_flattened_mla_with_cache", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::triton_attention_fused_flattened_mla_with_cache", mutates_args=()
+)
 def fused_flattened_mla_with_cache(
     # Q, K, V
     q_nope: torch.Tensor,
@@ -169,7 +171,9 @@ def fused_flattened_mla_with_cache_fake(
     return torch.empty_like(kv[..., -v_head_dim:])
 
 
-@torch.library.custom_op("auto_deploy::triton_attention_prepare_fused_mla_metadata", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::triton_attention_prepare_fused_mla_metadata", mutates_args=()
+)
 def prepare_fused_mla_metadata(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,

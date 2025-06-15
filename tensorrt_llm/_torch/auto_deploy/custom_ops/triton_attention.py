@@ -259,7 +259,9 @@ def flattened_mha_fake(
     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
 
 
-@torch.library.custom_op("auto_deploy::triton_attention_prepare_fused_mha_metadata", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::triton_attention_prepare_fused_mha_metadata", mutates_args=()
+)
 def prepare_fused_mha_metadata(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
