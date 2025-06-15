@@ -83,7 +83,9 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
     )
 
     def verify_matcher(gm: GraphModule):
-        """Ensure that there is exactly one torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa call in the graph."""
+        """Ensure that there is exactly one torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
+        call in the graph. Also check that there is no repeat_kv pattern left.
+        """
         nodes = gm.graph.find_nodes(
             op="call_function", target=torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
         )
