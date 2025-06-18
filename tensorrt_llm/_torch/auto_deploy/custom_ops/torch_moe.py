@@ -3,8 +3,6 @@ from typing import List
 import torch
 import torch.nn.functional as F
 
-from ...modules.fused_moe import MoE  # noqa: F401
-
 
 @torch.library.custom_op("auto_deploy::torch_moe", mutates_args=())
 def torch_moe(

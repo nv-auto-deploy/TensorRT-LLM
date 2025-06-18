@@ -1,7 +1,5 @@
 import torch
 
-from ...modules.fused_moe import MoE  # noqa: F401
-
 
 @torch.library.custom_op("auto_deploy::trtllm_moe_fused", mutates_args=())
 def trtllm_fused_moe(
