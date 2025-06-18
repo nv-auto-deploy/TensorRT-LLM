@@ -301,7 +301,7 @@ def create_autodeploy_executor(
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
     # search sampler with speculative decoding
-    sampler = TorchSampler(max_seq_len=max_seq_len)
+    sampler = TorchSampler(max_seq_len=max_seq_len, mixed_sampler=True)
 
     # creating the executor object
     py_executor = PyExecutor(
