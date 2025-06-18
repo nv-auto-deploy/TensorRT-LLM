@@ -182,11 +182,10 @@ class InferenceOptimizer:
                 from .library import visualize_namespace
 
                 visualize_namespace(egm, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
-                ad_logger.warning(
-                    "Please run `pip install -r examples/auto_deploy/requirements.txt` to visualize"
-                    " the graph."
-                )
             except ImportError:
+                ad_logger.warning(
+                    "Please run `pip install -r examples/auto_deploy/requirements.txt` to visualize the graph."
+                )
                 pass
 
         ############################################################################################

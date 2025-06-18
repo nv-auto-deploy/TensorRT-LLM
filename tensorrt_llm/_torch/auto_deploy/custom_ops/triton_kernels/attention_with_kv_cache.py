@@ -128,8 +128,10 @@ def gqa_attention_kv_stage1(
     1. Fetch the K-cache from 0 to input_pos
     2. Fetch the V-cache from 0 to input_pos
     3. A = Q*K^T [1,D_HEAD] * [1,seq_len,D_HEAD] -> [1, seq_len]
-    4. S = softmax(A)
-    5. O = S*V [1, seq_len] * [1, seq_len, D_HEAD] -> [1, D_HEAD]
+    4. A = A * scale
+    5. A = A * logit_cap if logit_cap is not None
+    6. S = softmax(A)
+    7. O = S*V [1, seq_len] * [1, seq_len, D_HEAD] -> [1, D_HEAD]
     """
     # Assume KV-cache layout: [Batch, Seq, Head, Dim]
     # A program is responsible for 1 batch, 1 head and a block of sequences.
@@ -577,6 +579,7 @@ def context_attention_kv_flattened(
     V_D_HEAD: tl.constexpr,  # Dimension of each value head.
     SEQ_BLOCK: tl.constexpr,
     MAX_SEQ_LENGTH: tl.constexpr,
+    LOGIT_CAP: tl.constexpr = None,
 ):
     """Kernel for context phase.
 
@@ -645,6 +648,8 @@ def context_attention_kv_flattened(
             (seq_offsets[:, None] + kv_position) >= kv_seq_offsets[None, :], qk, float("-inf")
         )
         qk *= SCALE
+        if LOGIT_CAP is not None:
+            qk = LOGIT_CAP * tanh(qk / LOGIT_CAP)
         # rowmax
         m_ij = tl.maximum(tl.max(qk, 1), lse_i)
         p = tl.exp(qk - m_ij[:, None])

@@ -40,6 +40,7 @@ def scaled_dot_product_attention(
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: Optional[float] = None,
+    logit_cap: Optional[float] = None,
 ) -> torch.Tensor:
     """A carbon copy of torch.nn.functional.scaled_dot_product_attention as custom op.
 
@@ -47,20 +48,50 @@ def scaled_dot_product_attention(
     of the vanilla sdpa in a graph.
     """
 
-    return F.scaled_dot_product_attention(
-        query.contiguous(),
-        key.contiguous(),
-        value.contiguous(),
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=is_causal,
-        scale=scale,
-    )
+    # Handle soft capping by applying it manually since F.scaled_dot_product_attention
+    # may not support soft_cap parameter
+    if logit_cap is not None:
+        # Apply manual soft capping to the attention scores
+        # First compute raw attention scores
+        d_k = query.size(-1)
+        if scale is None:
+            scale = 1.0 / (d_k**0.5)
+
+        # Compute attention scores
+        scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+
+        # Apply soft capping: tanh(scores / logit_cap) * logit_cap
+        scores = torch.tanh(scores / logit_cap) * logit_cap
+
+        if attn_mask is not None:
+            scores += attn_mask
+
+        # Apply softmax
+        attn_weights = F.softmax(scores, dim=-1)
+
+        # Apply dropout if specified
+        if dropout_p > 0.0:
+            attn_weights = F.dropout(attn_weights, p=dropout_p, training=torch.is_grad_enabled())
+
+        # Apply attention to values
+        output = torch.matmul(attn_weights, value)
+        return output.contiguous()
+    else:
+        # Use standard SDPA when no soft capping
+        return F.scaled_dot_product_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+        )
 
 
 @scaled_dot_product_attention.register_fake
 def scaled_dot_product_attention_fake(
-    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
+    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, logit_cap=None
 ):
     """Fake implementation of scaled_dot_product_attention."""
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
@@ -75,10 +106,12 @@ def grouped_sdpa(
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: Optional[float] = None,
+    logit_cap: Optional[float] = None,
 ) -> torch.Tensor:
     """SDPA attention that can handle GQA."""
 
-    return F.scaled_dot_product_attention(
+    # Use our custom scaled_dot_product_attention that supports soft capping
+    return scaled_dot_product_attention(
         query.contiguous(),
         key.contiguous(),
         value.contiguous(),
@@ -86,7 +119,7 @@ def grouped_sdpa(
         dropout_p=dropout_p,
         is_causal=is_causal,
         scale=scale,
-        enable_gqa=True,
+        logit_cap=logit_cap,
     )
 
 
@@ -99,6 +132,7 @@ def grouped_sdpa_fake(
     dropout_p=0.0,
     is_causal=False,
     scale=None,
+    logit_cap=None,
 ):
     """Fake implementation of grouped SDPA."""
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
@@ -113,6 +147,7 @@ def bsnd_grouped_sdpa(
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: Optional[float] = None,
+    logit_cap: Optional[float] = None,
 ) -> torch.Tensor:
     """Attention that assumes the input layout is bsnd.
 
@@ -124,7 +159,7 @@ def bsnd_grouped_sdpa(
     key = key.transpose(1, 2).contiguous()
     value = value.transpose(1, 2).contiguous()
 
-    out = grouped_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale)
+    out = grouped_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale, logit_cap)
 
     # let's transpose back to bnsd
     return out.transpose(1, 2).contiguous()
@@ -132,7 +167,7 @@ def bsnd_grouped_sdpa(
 
 @bsnd_grouped_sdpa.register_fake
 def bsnd_grouped_sdpa_fake(
-    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
+    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, logit_cap=None
 ):
     """Fake implementation of bnsd grouped SDPA."""
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
