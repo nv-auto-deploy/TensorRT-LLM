@@ -4,7 +4,6 @@ from ._triton_attention_internal import *
 from .dist import *
 from .flashinfer_attention import *
 from .flashinfer_rope import *
-from .fused_moe import *
 from .linear import *
 from .mla import *
 from .quant import *
@@ -13,3 +12,4 @@ from .torch_moe import *
 from .torch_rope import *
 from .triton_attention import *
 from .triton_rope import *
+from .trtllm_moe import *
