@@ -119,7 +119,7 @@ def grouped_sdpa(
         dropout_p=dropout_p,
         is_causal=is_causal,
         scale=scale,
-        logit_cap=logit_cap,
+        enable_gqa=True,
     )
 
 

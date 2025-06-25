@@ -56,6 +56,7 @@ def _generate_mha(
     stage1_output_logsumexp = torch.empty(
         b, n_heads, num_blocks, device=device, dtype=torch.float32
     ) - float("inf")
+
     update_kv_cache[(b, n_kv_heads, 1)](
         k,
         v,
@@ -74,7 +75,13 @@ def _generate_mha(
     )
 
     HEAD_BLOCK_SIZE = max(16, triton.next_power_of_2(n_heads // n_kv_heads))
-    gqa_attention_kv_stage1[(b, n_heads, num_blocks)](
+    gqa_attention_kv_stage1[
+        (
+            b,
+            n_kv_heads,
+            num_blocks,
+        )
+    ](
         q,
         k_cache,
         v_cache,
@@ -382,6 +389,7 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
             scale = source_attn_node.args[6]
         else:
             scale = source_attn_node.kwargs.get("scale", None)
+
         # do a sanity check on the scale if it is not None, we only support the default scale
         # of 1/sqrt(head_dim) and so we should do an approximate check for that one
         if not isinstance(scale, float):
