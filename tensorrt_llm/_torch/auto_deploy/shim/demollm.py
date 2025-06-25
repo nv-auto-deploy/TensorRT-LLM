@@ -201,11 +201,16 @@ class DemoEngine(ADEngine):
     def _sample(
         cls, logits: torch.Tensor, sampling_params: SamplingParams
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from tensorrt_llm._torch.pyexecutor.sampler import top_k_sampling_batch
-
         logits_shape = logits.shape
-        logits = logits.view(-1, logits_shape[-1])  # top_k_sampling_batch expects 2D logits
-        idx_next, probs = top_k_sampling_batch(logits, sampling_params.top_k)
+        logits = logits.view(-1, logits_shape[-1])  # sampling_batch expects 2D logits
+        if isinstance(sampling_params.top_k, int):
+            from tensorrt_llm._torch.pyexecutor.sampler import top_k_sampling_batch
+
+            idx_next, probs = top_k_sampling_batch(logits, sampling_params.top_k)
+        else:
+            from tensorrt_llm._torch.pyexecutor.sampler import greedy_search_sampling_batch
+
+            idx_next, probs = greedy_search_sampling_batch(logits)
         idx_next = idx_next.view(logits_shape[:-1])
         return idx_next, probs
 
