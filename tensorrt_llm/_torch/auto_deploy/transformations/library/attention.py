@@ -293,7 +293,8 @@ def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str
     Match the eager attention pattern starting from the final matmul node.
 
     The pattern is:
-    transpose -> matmul -> mul/div -> (optional) add -> (optional) to -> softmax -> (optional) to -> dropout -> matmul
+    transpose -> matmul -> mul/div -> (optional) div -> tanh -> mul (soft capping)
+    -> (optional) add -> (optional) to -> softmax -> (optional) to -> dropout -> matmul
 
     Returns a dictionary with information about the match or None if no match.
     """
@@ -352,21 +353,51 @@ def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str
         prev_node = prev_node.args[0]
 
     # Check for attention mask pattern (add node)
+    attn_mask = None
     if is_op(prev_node, torch.ops.aten.add):
         add_node = prev_node
         attn_mask = add_node.args[1]  # Second arg is the mask
 
-        # The add should have a mul or div node as its first argument
+        # The add should have input as its first argument
         if len(add_node.args) < 1:
             return None
 
-        scaling_node = add_node.args[0]
-        if not (is_op(scaling_node, torch.ops.aten.mul) or is_op(scaling_node, torch.ops.aten.div)):
-            return None
-    elif is_op(prev_node, torch.ops.aten.mul) or is_op(prev_node, torch.ops.aten.div):
-        # No mask case - the softmax input is directly the mul or div node
+        prev_node = add_node.args[0]
+
+    # Check for optional soft capping pattern: div -> tanh -> mul
+    logit_cap = None
+    if is_op(prev_node, torch.ops.aten.mul):
+        # Check if this mul is part of soft capping (mul after tanh)
+        if len(prev_node.args) >= 2:
+            mul_input = prev_node.args[0]
+            soft_cap_mul_factor = prev_node.args[1]
+
+            # Check if the input to mul is tanh
+            if is_op(mul_input, torch.ops.aten.tanh):
+                if len(mul_input.args) >= 1:
+                    tanh_input = mul_input.args[0]
+
+                    # Check if the input to tanh is div (completing the soft cap pattern)
+                    if is_op(tanh_input, torch.ops.aten.div):
+                        if len(tanh_input.args) >= 2:
+                            div_input = tanh_input.args[0]
+                            soft_cap_div_factor = tanh_input.args[1]
+
+                            # Verify that the div and mul factors are the same (soft cap scale)
+                            if isinstance(soft_cap_div_factor, (float, int)) and isinstance(
+                                soft_cap_mul_factor, (float, int)
+                            ):
+                                if abs(soft_cap_div_factor - soft_cap_mul_factor) < 1e-6:
+                                    logit_cap = soft_cap_div_factor
+                                    prev_node = div_input
+                            elif soft_cap_div_factor == soft_cap_mul_factor:
+                                # Same node/tensor used for both operations
+                                logit_cap = soft_cap_div_factor
+                                prev_node = div_input
+
+    # Now prev_node should be the scaling operation (mul or div)
+    if is_op(prev_node, torch.ops.aten.mul) or is_op(prev_node, torch.ops.aten.div):
         scaling_node = prev_node
-        attn_mask = None
     else:
         return None
 
@@ -421,6 +452,10 @@ def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str
     # Add the attention mask if it exists
     if attn_mask is not None:
         match_info["attn_mask"] = attn_mask
+
+    # Add soft cap scale if it exists
+    if logit_cap is not None:
+        match_info["logit_cap"] = logit_cap
 
     return match_info
 

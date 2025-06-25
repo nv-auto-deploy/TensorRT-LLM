@@ -554,6 +554,7 @@ def fused_mha_with_cache(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     freqs_cis: Optional[torch.Tensor],
+    logit_cap: Optional[float] = None,
 ) -> torch.Tensor:
     """Fused MHA with cache that takes raw input from q, k, v GEMMs."""
     # b, s info
@@ -593,6 +594,7 @@ def fused_mha_fake(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     freqs_cis: torch.Tensor,
+    logit_cap: Optional[float] = None,
 ):
     return torch.empty_like(q.contiguous())
 
