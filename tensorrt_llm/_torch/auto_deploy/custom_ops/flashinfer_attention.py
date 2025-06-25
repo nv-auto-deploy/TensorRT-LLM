@@ -425,7 +425,12 @@ class FlashInferAttention(AttentionDescriptor):
             ad_logger.warning("Provided scale is not a float. Using default scale instead.")
             scale = None
 
-        logit_cap = source_attn_node.kwargs.get("logit_cap", None)
+        # Get logit_cap from args or kwargs - it's typically the 8th argument (index 7)
+        if len(source_attn_node.args) > 7:
+            logit_cap = source_attn_node.args[7]
+        else:
+            logit_cap = source_attn_node.kwargs.get("logit_cap", None)
+
         if not (isinstance(logit_cap, float) or logit_cap is None):
             ad_logger.debug("Provided logit_cap is not a float or None. Disabling soft-capping.")
             logit_cap = None
