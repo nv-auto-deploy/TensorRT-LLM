@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 
 import tensorrt_llm
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
@@ -19,13 +20,11 @@ from tensorrt_llm.quantization import QuantAlgo
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
 from ..speculative import NGramConfig, get_spec_resource_manager
-from ._util import (create_kv_cache_manager, create_py_executor_instance,
-                    estimate_max_kv_cache_tokens, get_token_num_for_estimation,
+from ._util import (KvCacheCreator, create_py_executor_instance,
                     instantiate_sampler, is_mla)
 from .config import PyTorchConfig
 from .config_utils import is_mla
-from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
-                           PyTorchModelEngine)
+from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 
 
@@ -33,6 +32,7 @@ class _ExecutorCreationStage(enum.Enum):
     SAMPLER = "Sampler"
     INIT_KV_CACHE = "Initial KV cache (temporary for KV cache size estimation)"
     INIT_EXTRA_RESOURCES = "Additional executor resources (temporary for KV cache size estimation)"
+    MODEL_EXTRA = "Model resources created during usage"
     EXTRA_RESOURCES = "Additional executor resources"
     KV_CACHE = "KV cache"
     MODEL_ENGINE_MAIN = "Model"
@@ -88,6 +88,8 @@ class _ExecutorMemoryMonitor():
             "reduce max_num_tokens",
             _ExecutorCreationStage.EXTRA_RESOURCES:
             "reduce max_num_tokens",
+            _ExecutorCreationStage.MODEL_EXTRA:
+            "reduce max_num_tokens",
         }
 
         msg = "\n".join([
@@ -138,23 +140,13 @@ class _ExecutorMemoryMonitor():
                 ))
 
 
-def create_py_executor(executor_config: ExecutorConfig,
-                       checkpoint_dir: str = None,
-                       engine_dir: str = None,
-                       lora_config: Optional[LoraConfig] = None) -> PyExecutor:
+def _mangle_executor_config(executor_config: ExecutorConfig):
     if executor_config.pytorch_backend_config is None:
         executor_config.pytorch_backend_config = PyTorchConfig()
-
     pytorch_backend_config = executor_config.pytorch_backend_config
 
-    if executor_config.mapping is None:
-        mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
-                          tp_size=tensorrt_llm.mpi_world_size(),
-                          gpus_per_node=tensorrt_llm.default_gpus_per_node(),
-                          rank=tensorrt_llm.mpi_rank())
-    else:
-        mapping = copy.deepcopy(executor_config.mapping)
-        mapping.rank = tensorrt_llm.mpi_rank()
+    if executor_config.max_num_tokens is None:
+        executor_config.max_num_tokens = 8192
 
     if pytorch_backend_config.attn_backend in [
             "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
@@ -172,8 +164,30 @@ def create_py_executor(executor_config: ExecutorConfig,
         )
         executor_config.enable_chunked_context = False
 
-    if executor_config.max_num_tokens is None:
-        executor_config.max_num_tokens = 8192
+
+def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
+    if executor_config.mapping is None:
+        mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
+                          tp_size=tensorrt_llm.mpi_world_size(),
+                          gpus_per_node=tensorrt_llm.default_gpus_per_node(),
+                          rank=tensorrt_llm.mpi_rank())
+    else:
+        mapping = copy.deepcopy(executor_config.mapping)
+        mapping.rank = tensorrt_llm.mpi_rank()
+    return mapping
+
+
+def create_py_executor(
+        executor_config: ExecutorConfig,
+        checkpoint_dir: str = None,
+        engine_dir: str = None,
+        lora_config: Optional[LoraConfig] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
+    _mangle_executor_config(executor_config)
+    pytorch_backend_config = executor_config.pytorch_backend_config
+
+    mapping = _get_mapping(executor_config)
+
     dist = MPIDist(mapping=mapping)
 
     spec_config = executor_config.speculative_config
@@ -220,13 +234,16 @@ def create_py_executor(executor_config: ExecutorConfig,
                 pytorch_backend_config,
                 batch_size=executor_config.max_batch_size,
                 max_num_tokens=executor_config.max_num_tokens,
-                max_seq_len=model_engine.max_seq_len,
+                # Note: The draft model engine will infer its own max_seq_len.
+                # We'll stop drafting when we hit the max.
+                max_seq_len=executor_config.max_seq_len,
                 mapping=mapping,
                 attn_runtime_features=attn_runtime_features,
                 dist=dist,
                 spec_config=draft_spec_config,
+                is_draft_model=True,
             )
-            draft_model_engine.kv_cache_manager_key = DRAFT_KV_CACHE_MANAGER_KEY
+            draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
             draft_model_engine.load_weights_from_target_model(
                 model_engine.model)
     else:
@@ -234,7 +251,7 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     # PyTorchModelEngine modifies these fields, update them to executor_config
     max_seq_len = model_engine.max_seq_len
-    origin_seq_len = max_seq_len
+    net_max_seq_len = max_seq_len
     if not pytorch_backend_config.disable_overlap_scheduler:
         max_seq_len = model_engine.max_seq_len + 1
         if spec_config is not None:
@@ -247,9 +264,6 @@ def create_py_executor(executor_config: ExecutorConfig,
     executor_config.max_seq_len = max_seq_len
     executor_config.max_num_tokens = model_engine.max_num_tokens
     spec_config = model_engine.spec_config
-    if not model_engine.model.model_config.is_generation:
-        #NOTE: non-generation models do not have kv cache
-        executor_config.pytorch_backend_config.use_kv_cache = False
 
     if executor_config.enable_chunked_context:
         chunk_unit_size = executor_config.tokens_per_block
@@ -294,33 +308,29 @@ def create_py_executor(executor_config: ExecutorConfig,
         sampler = instantiate_sampler(model_engine, executor_config,
                                       pytorch_backend_config, mapping)
 
-    kv_cache_manager = None
-    draft_kv_cache_manager = None
     resources = {}
-    origin_executor_config = copy.deepcopy(executor_config)
     estimating_kv_cache = False
-    if executor_config.pytorch_backend_config.use_kv_cache:
-        if 'cp_type' not in mapping.cp_config:
-            estimating_kv_cache = True
-            executor_config.kv_cache_config.max_tokens = get_token_num_for_estimation(
-                executor_config, model_engine.model.model_config)
+    kv_cache_creator = None
+    if model_engine.model.model_config.is_generation:
+        #NOTE: non-generation models do not have kv cache
+        kv_cache_creator = KvCacheCreator(executor_config=executor_config,
+                                          model_engine=model_engine,
+                                          draft_model_engine=draft_model_engine,
+                                          mapping=mapping,
+                                          net_max_seq_len=net_max_seq_len)
+        estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.INIT_KV_CACHE
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
-            kv_cache_manager = create_kv_cache_manager(model_engine, mapping,
-                                                       executor_config)
-            draft_kv_cache_manager = create_kv_cache_manager(
-                draft_model_engine, mapping,
-                executor_config) if draft_model_engine is not None else None
-        resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
-        resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
+            kv_cache_creator.build_managers(resources)
 
     # resource managers for speculative decoding
     if spec_config is not None:
         spec_resource_manager = get_spec_resource_manager(
-            spec_config, model_engine.model.config, model_engine.batch_size * 2)
+            spec_config, model_engine, draft_model_engine)
         if spec_resource_manager is not None:
-            resources["spec_resource_manager"] = spec_resource_manager
+            resources[ResourceManagerType.
+                      SPEC_RESOURCE_MANAGER] = spec_resource_manager
 
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES
@@ -328,17 +338,15 @@ def create_py_executor(executor_config: ExecutorConfig,
         py_executor = create_py_executor_instance(
             dist, resources, mapping, pytorch_backend_config, executor_config,
             ctx_chunk_config, model_engine, draft_model_engine, False, sampler,
-            lora_config)
+            lora_config, garbage_collection_gen0_threshold)
 
-    if executor_config.pytorch_backend_config.use_kv_cache and 'cp_type' not in mapping.cp_config:
-        kv_cache_max_tokens = estimate_max_kv_cache_tokens(
-            py_executor, model_engine, origin_executor_config, mapping,
-            origin_seq_len, ctx_chunk_config, draft_model_engine)
+    if estimating_kv_cache:
+        assert kv_cache_creator is not None
+        with mem_monitor.observe_creation_stage(
+                _ExecutorCreationStage.MODEL_EXTRA):
+            kv_cache_creator.estimate_max_tokens(py_executor)
+        kv_cache_creator.teardown_managers(resources)
         del py_executor  # free before constructing new
-        del kv_cache_manager  # free before constructing new
-        del resources[KV_CACHE_MANAGER_KEY]
-
-        executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
 
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.KV_CACHE):
@@ -346,34 +354,23 @@ def create_py_executor(executor_config: ExecutorConfig,
             # create_kv_cache_manager above, which caps executor_config.max_seq_len. Restoring
             # the original value before creating the final KV cache.
             executor_config.max_seq_len = max_seq_len
-            kv_cache_manager = create_kv_cache_manager(model_engine, mapping,
-                                                       executor_config)
-            resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
+            kv_cache_creator.build_managers(resources)
 
-            if model_engine.attn_metadata is not None:
-                if pytorch_backend_config.use_cuda_graph:
-                    model_engine._release_cuda_graphs()
-                del model_engine.attn_metadata
-                model_engine.attn_metadata = None
-
-            if draft_model_engine is not None:
-                del draft_kv_cache_manager  # free before constructing new
-                del resources[DRAFT_KV_CACHE_MANAGER_KEY]
-                draft_kv_cache_manager = create_kv_cache_manager(
-                    draft_model_engine, mapping, executor_config)
-                resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
-                if draft_model_engine.attn_metadata is not None:
+            for eng in [model_engine, draft_model_engine]:
+                if eng is None:
+                    continue
+                if eng.attn_metadata is not None:
                     if pytorch_backend_config.use_cuda_graph:
-                        draft_model_engine._release_cuda_graphs()
-                    del draft_model_engine.attn_metadata
-                    draft_model_engine.attn_metadata = None
+                        eng._release_cuda_graphs()
+                    eng.attn_metadata = None
 
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.EXTRA_RESOURCES):
             py_executor = create_py_executor_instance(
                 dist, resources, mapping, pytorch_backend_config,
                 executor_config, ctx_chunk_config, model_engine,
-                draft_model_engine, False, sampler, lora_config)
+                draft_model_engine, False, sampler, lora_config,
+                garbage_collection_gen0_threshold)
 
     py_executor.start_worker()
     return py_executor

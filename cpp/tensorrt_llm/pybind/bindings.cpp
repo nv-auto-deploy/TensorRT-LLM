@@ -24,7 +24,7 @@
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
+#include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
 #include "tensorrt_llm/pybind/batch_manager/bindings.h"
@@ -40,7 +40,6 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
-#include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -298,12 +297,13 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("has_fp8_kv_cache", &tc::QuantMode::hasFp8KvCache)
         .def_property_readonly("has_fp8_qdq", &tc::QuantMode::hasFp8Qdq)
         .def_property_readonly("has_nvfp4", &tc::QuantMode::hasNvfp4)
+        .def_property_readonly("has_w4a8_mxfp4_fp8", &tc::QuantMode::hasW4a8Mxfp4Fp8)
         .def_property_readonly("has_kv_cache_quant", &tc::QuantMode::hasKvCacheQuant)
-        .def_static("from_description", &tc::QuantMode::fromDescription, py::arg("quantize_weights") = false,
-            py::arg("quantize_activations") = false, py::arg("per_token") = false, py::arg("per_channel") = false,
-            py::arg("per_group") = false, py::arg("use_int4_weights") = false, py::arg("use_int8_kv_cache") = false,
-            py::arg("use_fp8_kv_kache") = false, py::arg("use_fp8_qdq") = false, py::arg("use_fp8_rowwise") = false,
-            py::arg("use_w4a8_qserve") = false, py::arg("use_nvfp4") = false, py::arg("use_fp8_block_scales") = false)
+        .def_static("from_description", &tc::QuantMode::fromDescription, py::arg("quantize_weights"),
+            py::arg("quantize_activations"), py::arg("per_token"), py::arg("per_channel"), py::arg("per_group"),
+            py::arg("use_int4_weights"), py::arg("use_int8_kv_cache"), py::arg("use_fp8_kv_kache"),
+            py::arg("use_fp8_qdq"), py::arg("use_fp8_rowwise"), py::arg("use_w4a8_qserve"), py::arg("use_nvfp4"),
+            py::arg("use_fp8_block_scales"), py::arg("use_w4a8_mxfp4_fp8"))
         .def_static("use_smooth_quant", &tc::QuantMode::useSmoothQuant, py::arg("per_token") = false,
             py::arg("per_channel") = false)
         .def_static("use_weight_only", &tc::QuantMode::useWeightOnly, py::arg("use_int4_weights") = false,
@@ -509,43 +509,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("DISAGG_GENERATION_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS)
         .value("DISAGG_GENERATION_TRANS_COMPLETE", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE)
         .value("DISAGG_CONTEXT_INIT_AND_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
-
-    auto gptModelParamsGetState = [&kvCacheConfigGetState](tb::TrtGptModelOptionalParams const& params)
-    {
-        auto kvCacheState = kvCacheConfigGetState(params.kvCacheConfig);
-        return py::make_tuple(kvCacheState, params.enableTrtOverlap, params.deviceIds, params.normalizeLogProbs,
-            params.enableChunkedContext, params.decodingConfig.getDecodingMode());
-    };
-    auto gptModelParamsSetState = [&kvCacheConfigSetState](py::tuple t)
-    {
-        auto kvCacheConfig = kvCacheConfigSetState(t[0]);
-        return tb::TrtGptModelOptionalParams(kvCacheConfig, t[1].cast<bool>(),
-            t[2].cast<std::optional<std::vector<SizeType32>>>(), t[3].cast<bool>(), t[4].cast<bool>(),
-            tb::PeftCacheManagerConfig{},
-            tensorrt_llm::executor::DecodingConfig(t[5].cast<std::optional<tensorrt_llm::executor::DecodingMode>>()));
-    };
-
-    py::class_<tb::TrtGptModelOptionalParams>(m, "TrtGptModelOptionalParams")
-        .def(py::init<tbk::KvCacheConfig, bool, std::optional<std::vector<SizeType32>> const&, bool, bool,
-                 tb::PeftCacheManagerConfig const&>(),
-            py::arg_v("kv_cache_config", tbk::KvCacheConfig{}, "KvCacheConfig()"),
-            py::arg("enable_trt_overlap") = false, py::arg("device_ids") = std::nullopt,
-            py::arg("normalize_log_probs") = true, py::arg("enable_chunked_context") = false,
-            py::arg_v("peft_cache_manager_config", tb::PeftCacheManagerConfig{}, "PeftCacheManagerConfig()"))
-        .def(py::init<tensorrt_llm::executor::ExecutorConfig const&, bool>(), py::arg("executor_config"),
-            py::arg("is_leader_in_orch_mode") = false)
-        .def_readwrite("kv_cache_config", &tb::TrtGptModelOptionalParams::kvCacheConfig)
-        .def_readwrite("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap)
-        .def_readwrite("device_ids", &tb::TrtGptModelOptionalParams::deviceIds)
-        .def_readwrite("enable_chunked_context", &tb::TrtGptModelOptionalParams::enableChunkedContext)
-        .def_readwrite("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs)
-        .def_readwrite("decoding_config", &tb::TrtGptModelOptionalParams::decodingConfig)
-        .def_readwrite("use_gpu_direct_storage", &tb::TrtGptModelOptionalParams::useGpuDirectStorage)
-        .def_readwrite("gpu_weights_percent", &tb::TrtGptModelOptionalParams::gpuWeightsPercent)
-        .def_readwrite("max_beam_width", &tb::TrtGptModelOptionalParams::maxBeamWidth)
-        .def_readwrite("scheduler_config", &tb::TrtGptModelOptionalParams::schedulerConfig)
-        .def_readwrite("cache_transceiver_config", &tb::TrtGptModelOptionalParams::cacheTransceiverConfig)
-        .def(py::pickle(gptModelParamsGetState, gptModelParamsSetState));
 
     py::class_<tr::MemoryCounters>(m, "MemoryCounters")
         .def_static("instance", &tr::MemoryCounters::getInstance, py::return_value_policy::reference)
