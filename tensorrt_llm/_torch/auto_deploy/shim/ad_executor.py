@@ -315,10 +315,6 @@ def create_autodeploy_executor(
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
     # search sampler with speculative decoding
-    # TODO (lucaslie, fridah-nv): some models require mixed_sampler=True to have good outputs, see
-    # https://github.com/NVIDIA/TensorRT-LLM/issues/5254
-    # We should expose mixed_sample to our build_and_run_ad script so we can configure this
-    # correctly for models as needed.
     sampler_args = TorchSampler.Args(
         max_seq_len=max_seq_len,
         max_draft_tokens=max_draft_tokens,

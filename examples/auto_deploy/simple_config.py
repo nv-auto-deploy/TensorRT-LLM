@@ -78,6 +78,8 @@ class SimpleConfig:
         ]
     )
     max_tokens: int = 100
+    mixed_sampler: bool = False  # Whether to use mixed_sampler in trtllm runtime,
+    # need to set True to enable topk sampling, otherwise only do greedy search
     top_k: int = 200
     temperature: float = 1.0
     visualize: bool = False
