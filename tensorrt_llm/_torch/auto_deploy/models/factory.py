@@ -1,5 +1,6 @@
 """The model factory interface used by auto-deploy to build custom models."""
 
+import copy
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Type
 
@@ -22,13 +23,19 @@ class ModelFactory(ABC):
     def __init__(
         self,
         model: str,
+        model_kwargs: Optional[Dict[str, Any]] = None,
         tokenizer: Optional[str] = None,
+        tokenizer_kwargs: Optional[Dict[str, Any]] = None,
         skip_loading_weights: bool = False,
+        max_seq_len: int = 512,
         **kwargs,
     ):
         self._model = model
+        self.model_kwargs = copy.deepcopy(model_kwargs or {})
         self._tokenizer = tokenizer
+        self.tokenizer_kwargs = copy.deepcopy(tokenizer_kwargs or {})
         self.skip_loading_weights = skip_loading_weights
+        self.max_seq_len = max_seq_len
         self._prefetched_model_path: Optional[str] = None
         self._prefetched_tokenizer_path: Optional[str] = None
 
@@ -42,7 +49,6 @@ class ModelFactory(ABC):
         """The tokenizer path."""
         return self._prefetched_tokenizer_path or self._tokenizer or self.model
 
-    @abstractmethod
     def build_model(self, device: str) -> nn.Module:
         """Build the model on the desired device.
 
@@ -72,6 +78,19 @@ class ModelFactory(ABC):
             position_ids.shape == (batch_size, seq_len)
             logits.shape == (batch_size, seq_len, vocab_size)
         """
+        # make sure model architecture is pre-fetched (no weights needed at this point)
+        skip_loading_weights = self.skip_loading_weights
+        self.skip_loading_weights = True
+        self.prefetch_checkpoint()
+        self.skip_loading_weights = skip_loading_weights
+
+        # build the model
+        return self._build_model(device)
+
+    @abstractmethod
+    def _build_model(self, device: str) -> nn.Module:
+        """Factory-specific model building logic."""
+        raise NotImplementedError("Subclasses must implement this method.")
 
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or None if not quantized."""
@@ -152,6 +171,7 @@ class ModelFactory(ABC):
         ad_logger.info("Loading and initializing weights.")
         self._to_maybe_random(model, device)
         if not self.skip_loading_weights:
+            self.prefetch_checkpoint()
             self._load_checkpoint(model, device)
 
     @staticmethod
