@@ -73,6 +73,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
         tensor_parallel_size=config.world_size,
         tokenizer=factory.init_tokenizer() if config.customize_tokenizer else None,
         checkpoint_device=config.checkpoint_device,
+        mixed_sampler=config.mixed_sampler,
     )
 
     return llm
