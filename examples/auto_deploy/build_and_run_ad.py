@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, CliApp
+from pydantic_settings import BaseSettings, CliImplicitFlag
 
 from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM, LlmArgs
 from tensorrt_llm._torch.auto_deploy.llm_args import _try_decode_dict_with_str_values
@@ -76,7 +76,10 @@ class BenchmarkConfig(BaseModel):
 class ExperimentConfig(BaseSettings):
     """Experiment Configuration based on Pydantic BaseModel."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        cli_parse_args=True,
+    )
 
     ### CORE ARGS ##################################################################################
     # The main LLM arguments - contains model, tokenizer, backend configs, etc.
@@ -96,6 +99,9 @@ class ExperimentConfig(BaseSettings):
 
     ### BENCHMARKING CONFIG ########################################################################
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
+
+    ### CONFIG DEBUG FLAG ##########################################################################
+    dry_run: CliImplicitFlag[bool] = Field(default=False, description="Show final config and exit")
 
     ### VALIDATION #################################################################################
     @model_validator(mode="before")
@@ -137,9 +143,6 @@ class ExperimentConfig(BaseSettings):
             args.max_seq_len = max(args.max_seq_len, benchmark.isl + benchmark.osl)
         return benchmark
 
-    def cli_cmd(self):
-        return self
-
 
 def build_llm_from_config(config: ExperimentConfig) -> LLM:
     """Builds a LLM object from our config."""
@@ -166,8 +169,11 @@ def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> List[List[
 
 def main(config: Optional[ExperimentConfig] = None):
     if config is None:
-        config = CliApp.run(ExperimentConfig)
-    ad_logger.info(f"Config: {config}")
+        config = ExperimentConfig()
+    ad_logger.info(f"{config=}")
+
+    if config.dry_run:
+        return
 
     llm = build_llm_from_config(config)
 

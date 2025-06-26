@@ -187,6 +187,11 @@ class LlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def validate_and_init_tokenizer(self):
+        """Skip tokenizer initialization in config. We do this in the AutoDeploy LLM class."""
+        return self
+
+    @model_validator(mode="after")
     def update_attn_page_size(self):
         # NOTE force attn_page_size to equal max_seq_len for TritonWithFlattenedInputs backend
         if self.attn_backend == "TritonWithFlattenedInputs":
