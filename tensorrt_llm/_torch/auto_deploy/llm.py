@@ -36,6 +36,10 @@ class LLM(BaseLLM):
         model = args.model
         return cls(model)
 
+    def _prefetch_model(self):
+        """Prefetch the model for the LLM."""
+        self.args.create_factory().prefetch_checkpoint()
+
     def _build_model(self):
         """Build the model for the LLM.
 
@@ -43,8 +47,7 @@ class LLM(BaseLLM):
         factory.
         """
         # prefetch model with factory
-        factory = self.args.create_factory()
-        factory.prefetch_checkpoint()
+        self._prefetch_model()
 
         # NOTE (lucaslie): do regular build model, we bypass the regular LLM CachedModelLoader in
         # _autodeploy backend.
@@ -62,6 +65,9 @@ class DemoLLM(LLM):
 
         self.mpi_session = None
         self.runtime_context = None
+
+        # prefetch model and load tokenizer
+        self._prefetch_model()
         self._tokenizer = self._try_load_tokenizer()
         self.input_processor = create_input_processor(None, self.tokenizer)
 

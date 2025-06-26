@@ -113,13 +113,17 @@ class ModelFactory(ABC):
         """
         return None
 
-    def prefetch_checkpoint(self):
-        """Try or skip prefetching the checkpoint for the model and tokenizer."""
-        if not self._prefetched_model_path:
+    def prefetch_checkpoint(self, force: bool = False):
+        """Try or skip prefetching the checkpoint for the model and tokenizer.
+
+        Args:
+            force: Whether to force prefetching the checkpoint.
+        """
+        if not self._prefetched_model_path or force:
             self._prefetched_model_path = self._prefetch_checkpoint(
                 self._model, self.skip_loading_weights
             )
-        if self._tokenizer and not self._prefetched_tokenizer_path:
+        if self._tokenizer and (not self._prefetched_tokenizer_path or force):
             self._prefetched_tokenizer_path = self._prefetch_checkpoint(self._tokenizer, True)
 
     def _prefetch_checkpoint(self, model_name_or_path: str, skip_prefetch_weights: bool) -> str:
@@ -171,7 +175,7 @@ class ModelFactory(ABC):
         ad_logger.info("Loading and initializing weights.")
         self._to_maybe_random(model, device)
         if not self.skip_loading_weights:
-            self.prefetch_checkpoint()
+            self.prefetch_checkpoint(force=True)
             self._load_checkpoint(model, device)
 
     @staticmethod
