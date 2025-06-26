@@ -292,7 +292,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # at this point it should be a directory (either the original one or the download dir)
         assert os.path.isdir(fetched_dir), f"Checkpoint path {fetched_dir} is not a directory."
 
-        # also load the quantization config at this point
         self._load_quantization_config()
 
         return fetched_dir

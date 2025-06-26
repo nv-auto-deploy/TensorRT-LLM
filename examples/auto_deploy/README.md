@@ -122,21 +122,30 @@ ______________________________________________________________________
 
 ## Advanced Usage
 
-### Example Build Script ([`build_and_run_ad.py`](./build_and_run_ad.py))
+### Example Run Script ([`build_and_run_ad.py`](./build_and_run_ad.py))
 
-#### Experiment Configuration
+To build and run AutoDeploy example, use the [`build_and_run_ad.py`](./build_and_run_ad.py) script:
 
-To build and run AutoDeploy example, use the following command with the [`build_and_run_ad.py`](./build_and_run_ad.py) script:
+```bash
+cd examples/auto_deploy
+python build_and_run_ad.py --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+```
 
-The most config options are:
+You can arbitrarily configure your experiment. Use the `-h/--help` flag to see available options:
+
+```bash
+python build_and_run_ad.py --help
+```
+
+Below is a non-exhaustive list of common config options:
 
 | Configuration Key | Description |
 |-------------------|-------------|
 | `--model` | The HF model card or path to a HF checkpoint folder |
 | `--args.model_factory` | Choose model factory implementation (`"AutoModelForCausalLM"`, ...) |
 | `--args.skip_loading_weights` | Only load the architecture, not the weights |
-| `--args.model_kwargs` | Extra kwargs for the model config class to customize the model config |
-| `--args.tokenizer_kwargs` | Extra kwargs for the tokenizer class to customize the tokenizer |
+| `--args.model_kwargs` | Extra kwargs that are being passed to the model initializer in the model factory |
+| `--args.tokenizer_kwargs` | Extra kwargs that are being passed to the tokenizer initializer in the model factory |
 | `--args.world_size` | The number of GPUs for Tensor Parallel |
 | `--args.runtime` | Specifies which type of Engine to use during runtime (`"demollm"` or `"trtllm"`) |
 | `--args.compile_backend` | Specifies how to compile the graph at the end |
@@ -149,12 +158,6 @@ The most config options are:
 | `--benchmark.enabled` | Whether to run the built-in benchmark (true/false) |
 
 For default values and additional configuration options, refer to the `ExperimentConfig` class in [build_and_run_ad.py](./build_and_run_ad.py) file.
-
-You can also use the `-h/--help` flag to see available options:
-
-```bash
-python build_and_run_ad.py --help
-```
 
 Here is a more complete example of using the script:
 

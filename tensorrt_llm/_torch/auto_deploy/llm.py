@@ -11,7 +11,7 @@ from .shim.demollm import DemoGenerationExecutor
 
 
 class LLM(BaseLLM):
-    """LLM class is the main class for running a LLM model using AutoDeploy backend."""
+    """LLM class is the main class for running an LLM model using AutoDeploy backend."""
 
     args: LlmArgs
 
