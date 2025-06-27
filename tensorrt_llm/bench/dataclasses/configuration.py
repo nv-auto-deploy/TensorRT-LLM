@@ -113,7 +113,7 @@ class PerformanceOptions:
 
     def get_autodeploy_perf_config(self) -> _AutoDeployLlmArgs:
         ad_config = _AutoDeployLlmArgs(**self.pytorch_config)
-        ad_config.attn_backend = "FlashInfer"
+        ad_config.attn_backend = "flashinfer"
         ad_config.torch_compile_config = TorchCompileConfig()
         ad_config.skip_loading_weights = True
         return ad_config

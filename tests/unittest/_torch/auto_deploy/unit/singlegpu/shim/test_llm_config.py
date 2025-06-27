@@ -16,7 +16,7 @@ def test_custom_values():
         "free_mem_ratio": 0.9,
         "simple_shard_only": True,
         "attn_page_size": 128,
-        "attn_backend": "FlashInfer",
+        "attn_backend": "flashinfer",
         "max_seq_len": 2048,
     }
 
@@ -32,7 +32,7 @@ def test_custom_values():
     assert args.attn_page_size == 128
     assert args.max_seq_len == 2048
     # attn_backend should be overridden if it was 'TRTLLM'
-    assert args.attn_backend == "FlashInfer"
+    assert args.attn_backend == "flashinfer"
 
 
 def test_free_mem_ratio_validation():
@@ -70,7 +70,7 @@ def test_config_params():
         "simple_shard_only": True,
         "skip_loading_weights": True,
         "attn_page_size": 17,
-        "attn_backend": "FlashInfer",
+        "attn_backend": "flashinfer",
         "max_seq_len": 19,
         "max_batch_size": 5,
         "world_size": 3,
@@ -156,8 +156,8 @@ def test_invalid_model_factory():
 @pytest.mark.parametrize(
     "attn_backend,expected_attn_page_size",
     [
-        ("FlashInfer", 64),  # Default attn_page_size
-        ("TritonWithFlattenedInputs", 1024),  # Should equal max_seq_len
+        ("flashinfer", 64),  # Default attn_page_size
+        ("triton", 1024),  # Should equal max_seq_len
     ],
 )
 def test_attention_backend_page_size_logic(attn_backend, expected_attn_page_size):

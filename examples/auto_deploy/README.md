@@ -68,7 +68,7 @@ Additionally, we have officially verified support for the following models:
 
 | Model Series | HF Model Card | Model Factory | Precision | World Size | Runtime | Compile Backend ||| Attention Backend |||
 |--------------|----------------------|----------------|-----------|------------|---------|-----------------|--------------------|--------------------|--------------------|----------|----------|
-|              |               |            |           |            |         | torch-simple    | torch-compile    | torch-opt          | TritonWithFlattenedInputs | FlashInfer | MultiHeadLatentAttention |
+|              |               |            |           |            |         | torch-simple    | torch-compile    | torch-opt          | triton | flashinfer | MultiHeadLatentAttention |
 | LLaMA        | meta-llama/Llama-2-7b-chat-hf<br>meta-llama/Meta-Llama-3.1-8B-Instruct<br>meta-llama/Llama-3.1-70B-Instruct<br>codellama/CodeLlama-13b-Instruct-hf | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
 | LLaMA-4      | meta-llama/Llama-4-Scout-17B-16E-Instruct<br>meta-llama/Llama-4-Maverick-17B-128E-Instruct | AutoModelForImageTextToText | BF16 | 1,2,4,8 | demollm, trtllm | ✅ | ✅ | ❌ | ✅ | ✅ | n/a |
 | Nvidia Minitron | nvidia/Llama-3_1-Nemotron-51B-Instruct<br>nvidia/Llama-3.1-Minitron-4B-Width-Base<br>nvidia/Llama-3.1-Minitron-4B-Depth-Base | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
@@ -108,8 +108,8 @@ Optimize attention operations using different attention kernel implementations:
 
 | `"attn_backend"` | Description |
 |----------------------|-------------|
-| `TritonWithFlattenedInputs` | Custom fused multi-head attention (MHA) with KV Cache kernels for efficient attention processing. |
-| `FlashInfer`         | Uses off-the-shelf optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. |
+| `triton` | Custom fused multi-head attention (MHA) with KV Cache kernels for efficient attention processing. |
+| `flashinfer`         | Uses off-the-shelf optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. |
 
 ### Precision Support
 
@@ -168,7 +168,7 @@ python build_and_run_ad.py \
 --args.world_size 2 \
 --args.runtime "demollm" \
 --args.compile_backend "torch-compile" \
---args.attn_backend "FlashInfer" \
+--args.attn_backend "flashinfer" \
 --benchmark.enabled True
 ```
 
@@ -236,7 +236,7 @@ llm = LLM(
     world_size=<NUM_WORLD_RANK>,
     compile_backend="torch-compile",
     model_kwargs={"num_hidden_layers": 2}, # test with smaller model configuration
-    attn_backend="FlashInfer", # choose between "TritonWithFlattenedInputs" and "FlashInfer"
+    attn_backend="flashinfer", # choose between "triton" and "flashinfer"
     attn_page_size=64, # page size for attention (tokens_per_block, should be == max_seq_len for triton)
     skip_loading_weights=False,
     model_factory="AutoModelForCausalLM", # choose appropriate model factory

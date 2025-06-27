@@ -97,8 +97,8 @@ class LlmArgs(BaseLlmArgs):
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
     # INFERENCE OPTIMIZER CONFIG ###################################################################
-    attn_backend: Literal["FlashInfer", "TritonWithFlattenedInputs"] = Field(
-        default="FlashInfer", description="Attention backend to use."
+    attn_backend: Literal["flashinfer", "triton"] = Field(
+        default="flashinfer", description="Attention backend to use."
     )
 
     mla_backend: Literal["MultiHeadLatentAttention"] = Field(
@@ -138,7 +138,7 @@ class LlmArgs(BaseLlmArgs):
     attn_page_size: int = Field(
         default=64,
         ge=1,
-        description="Page size for attention (tokens_per_block). For TritonWithFlattenedInputs "
+        description="Page size for attention (tokens_per_block). For triton "
         "backend, this should equal max_seq_len. Temporary field until tokens_per_block gets "
         "properly passed through.",
     )
@@ -199,8 +199,8 @@ class LlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def update_attn_page_size(self):
-        # NOTE force attn_page_size to equal max_seq_len for TritonWithFlattenedInputs backend
-        if self.attn_backend == "TritonWithFlattenedInputs":
+        # NOTE force attn_page_size to equal max_seq_len for triton backend
+        if self.attn_backend == "triton":
             self.attn_page_size = self.max_seq_len
         return self
 

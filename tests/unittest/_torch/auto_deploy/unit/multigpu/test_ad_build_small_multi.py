@@ -13,7 +13,7 @@ from build_and_run_ad import ExperimentConfig, main
     [
         get_small_model_config(
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
-            attn_backend="FlashInfer",
+            attn_backend="flashinfer",
             compile_backend="torch-opt",
         ),
     ],

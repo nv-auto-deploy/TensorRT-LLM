@@ -12,7 +12,7 @@
                 "--args.runtime=demollm",
                 "--args.compile_backend=torch-simple",
                 "--args.attn_page_size=16",
-                "--args.attn_backend=FlashInfer",
+                "--args.attn_backend=flashinfer",
                 "--args.model_factory=AutoModelForCausalLM",
                 "--benchmark.enabled=false",
                 "--prompt.batch_size=2",
