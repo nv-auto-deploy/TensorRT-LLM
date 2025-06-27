@@ -179,6 +179,12 @@ class LlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_parallel_config(self):
+        """Setup parallel config according to world_size.
+
+        NOTE: AutoDeploy does *not* use parallel_config directly. It simply uses world_size and
+        rank to automatically shard the model. This is just to ensure that other objects in the
+        runtime that may read parallel_config can do so.
+        """
         # setup parallel config
         self._parallel_config = _ParallelConfig(
             auto_parallel=True, gpus_per_node=self.gpus_per_node

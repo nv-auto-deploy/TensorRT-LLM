@@ -214,7 +214,7 @@ Refer to [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Mo
 
 ```bash
 cd examples/auto_deploy
-python build_and_run_ad.py --model "{<MODELOPT_CKPT_PATH>}" --args.world_size 1
+python build_and_run_ad.py --model "<MODELOPT_CKPT_PATH>" --args.world_size 1
 ```
 
 ### Incorporating `auto_deploy` into your own workflow

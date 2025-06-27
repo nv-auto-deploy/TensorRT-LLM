@@ -79,6 +79,7 @@ class ExperimentConfig(BaseSettings):
     model_config = ConfigDict(
         extra="forbid",
         cli_parse_args=True,
+        cli_kebab_case=True,
     )
 
     ### CORE ARGS ##################################################################################
