@@ -120,8 +120,9 @@ def test_config_flow(
 
     # Create instance with appropriate mocking
     with patch.object(api_class, "_try_load_tokenizer", return_value=MagicMock()):
-        with patch.object(api_class, "_build_model", return_value=MagicMock()):
-            instance = api_class(**config_params)
+        with patch.object(api_class, "_prefetch_model", return_value=MagicMock()):
+            with patch.object(api_class, "_build_model", return_value=MagicMock()):
+                instance = api_class(**config_params)
 
     # Verify args were created correctly
     assert hasattr(instance, "args")
