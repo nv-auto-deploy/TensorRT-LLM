@@ -68,6 +68,7 @@ def insert_cached_attention(
 
     if not source_attn_nodes:
         # If there are no nodes for kv cache insertion found, return current graph
+        ad_logger.info("No source attention nodes found, skipping cache insertion.")
         return egm
 
     # Sanity check
