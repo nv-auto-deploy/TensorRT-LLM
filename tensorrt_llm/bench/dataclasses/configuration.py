@@ -15,7 +15,6 @@ from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DynamicBatchConfig,
                                  ExtendedRuntimePerfKnobConfig, KvCacheConfig,
                                  SchedulerConfig)
-from tensorrt_llm.llmapi.llm_args import TorchCompileConfig
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
@@ -112,10 +111,14 @@ class PerformanceOptions:
         return self.pytorch_config
 
     def get_autodeploy_perf_config(self) -> _AutoDeployLlmArgs:
-        ad_config = _AutoDeployLlmArgs(**self.pytorch_config)
-        ad_config.attn_backend = "flashinfer"
-        ad_config.torch_compile_config = TorchCompileConfig()
-        ad_config.skip_loading_weights = True
+        # ad_config = _AutoDeployLlmArgs(**self.pytorch_config)
+        # ad_config.attn_backend = "flashinfer"
+        # ad_config.torch_compile_config = TorchCompileConfig()
+        # ad_config.skip_loading_weights = True
+        ad_config = dict()  #self.pytorch_config
+        #ad_config["kv_cache_dtype"] = "auto"
+        ad_config["attn_backend"] = "flashinfer"
+        #d_config["torch_compile_enabled"] = True
         return ad_config
 
 
