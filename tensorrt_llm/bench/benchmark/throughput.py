@@ -372,10 +372,6 @@ def throughput_command(
                 )
             llm = PyTorchLLM(**kwargs)
         elif runtime_config.backend == "_autodeploy":
-            # if kwargs.pop("kv_cache_dtype", None):
-            #     logger.warning(
-            #         "Ignore kv_cache_dtype for _autodeploy backend."
-            #     )
             if kwargs.pop("extended_runtime_perf_knob_config", None):
                 logger.warning(
                     "Ignore extended_runtime_perf_knob_config for _autodeploy backend."
@@ -424,9 +420,6 @@ def throughput_command(
         if modality is not None:
             # For multimodal models, we need to update the metadata with the correct input lengths
             metadata = update_metadata_for_multimodal(metadata, statistics)
-
-        # if runtime_config.backend == "_autodeploy":
-        #     kwargs["kv_cache_dtype"] = "auto"
 
         report_utility = ReportUtility(statistics, metadata, runtime_config,
                                        logger, kwargs, streaming)

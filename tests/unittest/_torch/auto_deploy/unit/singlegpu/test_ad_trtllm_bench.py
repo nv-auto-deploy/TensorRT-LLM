@@ -56,8 +56,6 @@ def run_benchmark(model_name: str, dataset_path: str, temp_dir: str):
         "_autodeploy",
         "--dataset",
         dataset_path,
-        "--max_batch_size",
-        "128",
         "--extra_llm_api_options",
         f"{temp_dir}/model_kwargs.yaml",
     ]
@@ -74,25 +72,13 @@ def test_trtllm_bench(llm_root):  # noqa: F811
     with tempfile.TemporaryDirectory() as temp_dir:
         with open(f"{temp_dir}/model_kwargs.yaml", "w") as f:
             yaml.dump(
-                {"model_kwargs": {"num_hidden_layers": 2}, "cuda_graph_batch_sizes": [1, 2]}, f
+                {
+                    "model_kwargs": {"num_hidden_layers": 2},
+                    "cuda_graph_batch_sizes": [1, 2],
+                    "max_batch_size": 128,
+                },
+                f,
             )
 
         dataset_path = prepare_dataset(llm_root, temp_dir, model_name)
         run_benchmark(model_name, dataset_path, temp_dir)
-
-        # runner = CliRunner()
-        # result = runner.invoke(
-        #     trtllm_bench,
-        #     [
-        #         "--model",
-        #         model_name,
-        #         "throughput",
-        #         "--backend",
-        #         "_autodeploy",
-        #         "--dataset",
-        #         dataset_path,
-        #         "--extra_llm_api_options",
-        #         f"{temp_dir}/model_kwargs.yaml",
-        #     ],
-        # )
-        # assert result.exit_code == 0
