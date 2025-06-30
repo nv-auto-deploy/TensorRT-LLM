@@ -4,20 +4,19 @@ from pathlib import Path
 
 import yaml
 from _model_test_utils import _hf_model_dir_or_hub_id
+from click.testing import CliRunner
 from utils.cpp_paths import llm_root  # noqa: F401
 from utils.llm_data import llm_models_root
 
-# from benchmarks.cpp.prepare_dataset import cli as prepare_dataset_cli
+from tensorrt_llm.commands.bench import main
 
 
 def prepare_dataset(root_dir: str, temp_dir: str, model_name: str):
     _DATASET_NAME = "synthetic_128_128.txt"
-    dataset_path = f"{temp_dir}/{_DATASET_NAME}"
-
+    dataset_path = Path(temp_dir, _DATASET_NAME)
     dataset_tool = Path(root_dir, "benchmarks", "cpp", "prepare_dataset.py")
 
     # Generate a small dataset to run a test.
-    # self.work_dir.mkdir(parents=True)
     command = [
         "python3",
         f"{dataset_tool}",
@@ -47,8 +46,9 @@ def prepare_dataset(root_dir: str, temp_dir: str, model_name: str):
 
 
 def run_benchmark(model_name: str, dataset_path: str, temp_dir: str):
-    command = [
-        "trtllm-bench",
+    runner = CliRunner()
+
+    args = [
         "--model",
         model_name,
         "throughput",
@@ -59,9 +59,7 @@ def run_benchmark(model_name: str, dataset_path: str, temp_dir: str):
         "--extra_llm_api_options",
         f"{temp_dir}/model_kwargs.yaml",
     ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to run benchmark: {result.stderr}")
+    runner.invoke(main, args, catch_exceptions=False)
 
 
 def test_trtllm_bench(llm_root):  # noqa: F811
