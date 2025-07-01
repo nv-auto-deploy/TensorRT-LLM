@@ -97,7 +97,7 @@ class LlmArgs(BaseLlmArgs):
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
     # INFERENCE OPTIMIZER CONFIG ###################################################################
-    attn_backend: Literal["flashinfer", "triton"] = Field(
+    attn_backend: Literal["flashinfer", "triton", "torch"] = Field(
         default="flashinfer", description="Attention backend to use."
     )
 
@@ -138,8 +138,8 @@ class LlmArgs(BaseLlmArgs):
     attn_page_size: int = Field(
         default=64,
         ge=1,
-        description="Page size for attention (tokens_per_block). For triton "
-        "backend, this should equal max_seq_len. Temporary field until tokens_per_block gets "
+        description="Page size for attention (tokens_per_block). For triton and torch "
+        "backends, this should equal max_seq_len. Temporary field until tokens_per_block gets "
         "properly passed through.",
     )
 
@@ -200,8 +200,8 @@ class LlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def update_attn_page_size(self):
-        # NOTE force attn_page_size to equal max_seq_len for triton backend
-        if self.attn_backend == "triton":
+        # NOTE force attn_page_size to equal max_seq_len for triton and torch backends
+        if self.attn_backend in ["triton", "torch"]:
             self.attn_page_size = self.max_seq_len
         return self
 
