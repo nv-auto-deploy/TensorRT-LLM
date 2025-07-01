@@ -165,10 +165,10 @@ Here is a more complete example of using the script:
 cd examples/auto_deploy
 python build_and_run_ad.py \
 --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" \
---args.world_size 2 \
+--args.world-size 2 \
 --args.runtime "demollm" \
---args.compile_backend "torch-compile" \
---args.attn_backend "flashinfer" \
+--args.compile-backend "torch-compile" \
+--args.attn-backend "flashinfer" \
 --benchmark.enabled True
 ```
 
@@ -214,7 +214,7 @@ Refer to [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Mo
 
 ```bash
 cd examples/auto_deploy
-python build_and_run_ad.py --model "<MODELOPT_CKPT_PATH>" --args.world_size 1
+python build_and_run_ad.py --model "<MODELOPT_CKPT_PATH>" --args.world-size 1
 ```
 
 ### Incorporating `auto_deploy` into your own workflow
