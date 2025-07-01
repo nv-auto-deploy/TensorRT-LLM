@@ -7,11 +7,11 @@ from typing import Any, Callable, List, Optional, Tuple
 import torch
 import torch.multiprocessing as mp
 
-from ...._torch.pyexecutor.sampler import greedy_search_sampling_batch, top_k_sampling_batch
 from ....executor import GenerationExecutor
 from ....executor.request import GenerationRequest
 from ....executor.result import CompletionOutput, GenerationResult
 from ....sampling_params import SamplingParams
+from ...pyexecutor.sampler import greedy_search_sampling_batch, top_k_sampling_batch
 from ..distributed import common as dist_ad
 from ..utils.logger import ad_logger
 from .ad_executor import ADEngine
