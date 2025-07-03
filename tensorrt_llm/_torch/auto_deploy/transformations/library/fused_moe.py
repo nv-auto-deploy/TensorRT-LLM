@@ -71,7 +71,7 @@ def match_moe_pattern(gm: GraphModule) -> None:
 
             if weight_type == "fp8":
                 fused_moe_node = graph.call_function(
-                    torch.ops.auto_deploy.torch_fp8_moe,
+                    torch.ops.auto_deploy.torch_quant_fp8_moe,
                     args=(
                         hidden_states,
                         selected_experts,
@@ -89,7 +89,7 @@ def match_moe_pattern(gm: GraphModule) -> None:
                 )
             elif weight_type == "fp4":
                 fused_moe_node = graph.call_function(
-                    torch.ops.auto_deploy.torch_fp4_moe,
+                    torch.ops.auto_deploy.torch_quant_fp4_moe,
                     args=(
                         hidden_states,
                         selected_experts,
@@ -184,7 +184,7 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
 
         with graph.inserting_before(node):
             new_node = graph.call_function(
-                # TODO: torch.ops.auto_deploy.trtllm_fused_moe for unquantized models,
+                # TODO(Fridah-nv): torch.ops.auto_deploy.trtllm_moe_fused for quantized models
                 torch.ops.auto_deploy.trtllm_moe_fused,
                 args=(
                     hidden_states,
@@ -369,28 +369,21 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
         arg_a, arg_b = mul_node.args[:2]
         silu_node = (
             arg_a
-            if (isinstance(arg_a, Node) and is_op(arg_a, torch.ops.aten.silu))
+            if is_op(arg_a, torch.ops.aten.silu)
             else arg_b
-            if (isinstance(arg_b, Node) and is_op(arg_b, torch.ops.aten.silu))
+            if is_op(arg_b, torch.ops.aten.silu)
             else None
         )
         if silu_node is None:
             continue
 
-        if not (
-            silu_node.args
-            and isinstance(silu_node.args[0], Node)
-            and is_linear_op(silu_node.args[0], include_quantization=True)
-        ):
+        if not (silu_node.args and is_linear_op(silu_node.args[0], include_quantization=True)):
             continue
         linear_w1_node = silu_node.args[0]
 
         # The other branch should be a linear op (w3 branch).
         linear_w3_node = arg_b if arg_a is silu_node else arg_a
-        if not (
-            isinstance(linear_w3_node, Node)
-            and is_linear_op(linear_w3_node, include_quantization=True)
-        ):
+        if not is_linear_op(linear_w3_node, include_quantization=True):
             continue
         if not (linear_w1_node.args and linear_w3_node.args):
             continue
@@ -510,7 +503,7 @@ def _extract_index_branches_from_expert_outputs(
         if not mul or len(mul.args) < 2:
             continue
         idx_node = mul.args[1]
-        if not (isinstance(idx_node, Node) and is_op(idx_node, torch.ops.aten.index)):
+        if not is_op(idx_node, torch.ops.aten.index):
             continue
         routing_branches.append(idx_node.args[0])
         experts = idx_node.args[1]

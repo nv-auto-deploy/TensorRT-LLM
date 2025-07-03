@@ -22,7 +22,7 @@ from .node_utils import (
 )
 
 try:
-    from tensorrt_llm.quantization.utils.fp4_utils import float4_sf_dtype
+    from ....quantization.utils.fp4_utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
 

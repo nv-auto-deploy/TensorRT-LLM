@@ -171,15 +171,18 @@ class MoEPatternModel(nn.Module):
 
 
 @pytest.mark.parametrize(
-    "use_fp8,expected_op,skip",
+    "use_fp8,expected_op",
     [
-        pytest.param(False, torch.ops.auto_deploy.torch_moe, False, id="simple"),
-        pytest.param(True, torch.ops.auto_deploy.torch_fp8_moe, not fp8_compatible(), id="fp8"),
+        pytest.param(False, torch.ops.auto_deploy.torch_moe, id="simple"),
+        pytest.param(
+            True,
+            torch.ops.auto_deploy.torch_quant_fp8_moe,
+            marks=pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support"),
+            id="fp8",
+        ),
     ],
 )
-def test_moe_matching(use_fp8, expected_op, skip):
-    if skip:
-        pytest.skip("FP8 not supported on this hardware")
+def test_moe_matching(use_fp8, expected_op):
     device = "cuda"
 
     model = MoEPatternModel(use_fp8=use_fp8).to(device=device)
