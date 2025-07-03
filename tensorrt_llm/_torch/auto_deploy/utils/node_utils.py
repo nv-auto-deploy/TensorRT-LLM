@@ -106,19 +106,6 @@ def get_quantization_params_from_linear_node(linear_op: torch.fx.node.Node):
     return input_params, weight_params, output_params
 
 
-def is_match(node: Node, names_to_skip: List[str]):
-    if names_to_skip is None:
-        return False
-    for n in names_to_skip:
-        module_stack = node.meta.get("nn_module_stack", None)
-        if module_stack is None:
-            return False
-        module_stack = list(module_stack.keys())
-        if n in module_stack[-1]:
-            return True
-    return False
-
-
 def extract_weight_node(mm_node: Node) -> int:
     """Extracts the weight node from the given matmul node."""
 

@@ -1,3 +1,4 @@
+from fnmatch import fnmatch
 from typing import Dict, List, Tuple, Union
 
 import torch
@@ -12,6 +13,7 @@ from ..custom_ops.quant import (
 )
 from .logger import ad_logger
 from .node_utils import (
+    extract_param_names_from_lin_node,
     get_quantization_params_from_linear_node,
     is_linear_op,
     is_op,
@@ -330,14 +332,11 @@ class FP4QuantizationImpl(QuantizationImpl):
     def shard_load_hook(
         state_dict, prefix, *args, weight_name, weight_shape, dim, rank, world_size
     ):
-        try:
-            if weight_name + "_scale" in state_dict:
-                weight_scale = state_dict[weight_name + "_scale"]
-                state_dict[weight_name + "_scale"] = _shard_fp4_weight_scale(
-                    weight_scale, weight_shape, dim, rank, world_size
-                )
-        except Exception as e:
-            print(f"[shard_load_hook] Skipped due to exception: {e}", flush=True)
+        if weight_name + "_scale" in state_dict:
+            weight_scale = state_dict[weight_name + "_scale"]
+            state_dict[weight_name + "_scale"] = _shard_fp4_weight_scale(
+                weight_scale, weight_shape, dim, rank, world_size
+            )
 
     @staticmethod
     def fuse_linear_weights(
@@ -464,3 +463,10 @@ class FP8BMMQuantizationImpl(QuantizationImpl):
                             attr_name,
                             torch.nn.Parameter(param_cm, requires_grad=param.requires_grad),
                         )
+def should_skip_quantization(node: Node, excluded_patterns: List[str]) -> bool:
+    """Check if a node is a non-quantized linear op that matches any excluded pattern."""
+    if not is_linear_op(node, include_quantization=False):
+        return True
+    param_name, _ = extract_param_names_from_lin_node(node)
+    modname, _, _ = param_name.rpartition(".")
+    return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
