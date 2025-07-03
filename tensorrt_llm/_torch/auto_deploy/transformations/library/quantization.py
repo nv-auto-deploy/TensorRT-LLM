@@ -9,8 +9,6 @@ from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     extract_param_names_from_lin_node,
     get_quantization_params_from_linear_node,
-    is_linear_op,
-    is_match,
 )
 from ...utils.quantization_utils import (
     QuantizationImpl,
@@ -18,6 +16,7 @@ from ...utils.quantization_utils import (
     is_quantized_graph,
     is_quantized_op,
     remove_output_quantizers,
+    should_skip_quantization,
 )
 from .._graph import canonicalize_graph
 
@@ -86,7 +85,7 @@ def quantize(gm: GraphModule, quant_config: Dict[str, Any]):
     # extract info from quant_config
     is_quant_graph = is_quantized_graph(gm)
     quant_algo = quant_config.get("quant_algo")
-    skip = quant_config.get("exclude_modules", [])
+    excluded_patterns = quant_config.get("exclude_modules", [])
 
     # no quantization to do
     if not (is_quant_graph or quant_config):
@@ -96,8 +95,7 @@ def quantize(gm: GraphModule, quant_config: Dict[str, Any]):
     # tracking quantized linears in the graph
     quantized_nodes: Dict[str, int] = defaultdict(lambda: 0)
     for n in gm.graph.nodes:
-        # check if we should skip this node
-        if is_match(n, skip) or not is_linear_op(n, include_quantization=False):
+        if should_skip_quantization(n, excluded_patterns):
             continue
 
         # get per-layer quantization format from the node
