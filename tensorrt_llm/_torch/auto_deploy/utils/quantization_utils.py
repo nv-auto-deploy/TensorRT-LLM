@@ -1,5 +1,5 @@
 from fnmatch import fnmatch
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -470,3 +470,32 @@ def should_skip_quantization(node: Node, excluded_patterns: List[str]) -> bool:
     param_name, _ = extract_param_names_from_lin_node(node)
     modname, _, _ = param_name.rpartition(".")
     return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
+
+
+def extract_scales_from_node(node: Node, scale_names: list[str]) -> Dict[str, Optional[Node]]:
+    """
+    Extracts scale tensors from node.args/kwargs using a fixed list of expected scale names.
+    """
+    scales = {}
+    args = list(node.args)
+
+    # Try kwargs first
+    for i, name in enumerate(scale_names):
+        scales[name] = node.kwargs.get(name, None)
+
+    # Fallback to positional args (starting after input, weight, bias)
+    for i, name in enumerate(scale_names):
+        if scales[name] is None and len(args) > 3 + i:
+            scales[name] = args[3 + i]
+
+    return scales
+
+
+def get_scales_and_type_from_node(node: Node) -> Tuple[Dict[str, Node], str]:
+    """Returns a dict of scale args and quantization type string ('fp4', 'fp8', etc)."""
+    for qtype in [FP4QuantizationImpl, FP8QuantizationImpl]:
+        if is_op(node, qtype.target_op()):
+            return extract_scales_from_node(
+                node, qtype.scale_names()
+            ), qtype.__name__.lower().replace("quantizationimpl", "")
+    return None, "simple"

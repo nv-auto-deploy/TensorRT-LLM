@@ -7,6 +7,7 @@ from torch.fx import GraphModule, Node
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
 from ...utils.node_utils import bfs, identify_regions_between_residuals, is_linear_op, is_op
+from ...utils.quantization_utils import get_scales_and_type_from_node
 from .._graph import canonicalize_graph
 
 
@@ -280,42 +281,16 @@ def _extract_linear_parameters(linear_node: Node) -> tuple[Node, torch.Tensor, O
       - Returns (input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale, "alpha": alpha}, "fp4")
     """
     input_node = linear_node.args[0]
-    if is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp8_linear):
+    if is_op(linear_node, torch.ops.auto_deploy.torch_linear_simple):
         weight = linear_node.args[1]
-        input_scale = linear_node.kwargs.get("input_scale", None)
-        weight_scale = linear_node.kwargs.get("weight_scale", None)
-
-        # in case input_scale and weight_scale is not provided by kwargs
-        # args layout is (input, weight, bias, input_scale, weight_scale)
-        if input_scale is None and len(linear_node.args) >= 4:
-            input_scale = linear_node.args[3]
-        if weight_scale is None and len(linear_node.args) >= 5:
-            weight_scale = linear_node.args[4]
-        return input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale}, "fp8"
-    elif is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp4_linear):
+        return input_node, weight, None, ""
+    elif {
+        is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp4_linear),
+        is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp8_linear),
+    }:
         weight = linear_node.args[1]
-        input_scale = linear_node.kwargs.get("input_scale", None)
-        weight_scale = linear_node.kwargs.get("weight_scale", None)
-        alpha = linear_node.kwargs.get("alpha", None)
-        # fallback to positional args if absent
-        args = linear_node.args
-        if input_scale is None and len(args) >= 4:
-            input_scale = args[3]
-        if weight_scale is None and len(args) >= 5:
-            weight_scale = args[4]
-        if alpha is None and len(args) >= 6:
-            alpha = args[5]
-        return (
-            input_node,
-            weight,
-            {"input_scale": input_scale, "weight_scale": weight_scale, "alpha": alpha},
-            "fp4",
-        )
-    elif is_op(linear_node, torch.ops.auto_deploy.torch_linear_simple):
-        weight = linear_node.args[1]
-        return input_node, weight, None, "simple"
-    else:
-        return None, None, None, ""
+        scales, quant_type = get_scales_and_type_from_node(linear_node)
+        return input_node, weight, scales, quant_type
 
 
 def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):

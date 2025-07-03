@@ -25,6 +25,7 @@ from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
+from ...utils.quantization_utils import QuantizationImpl
 from .._graph import canonicalize_graph
 
 
@@ -66,8 +67,9 @@ def _insert_sharded_moe(
     sharded `selected_experts` and `final_scales(router_logics)`.
     Add an all_reduce node after the moe node.
     """
-    is_fp8 = is_op(node, torch.ops.auto_deploy.torch_quant_fp8_moe)
-    is_fp4 = is_op(node, torch.ops.auto_deploy.torch_quant_fp4_moe)
+    quant_impl = QuantizationImpl.create(node)
+    scale_names = quant_impl.scale_names() if quant_impl else []
+
     num_experts = len(node.args[3])
     args = list(node.args)
 
@@ -124,12 +126,9 @@ def _insert_sharded_moe(
     args[4] = w2_list_sharded
     args[5] = w3_list_sharded
 
-    if is_fp8:
-        for i in range(6):
-            args[6 + i] = get_partition(args[6 + i], world_size, rank)
-    elif is_fp4:
-        for i in range(9):
-            args[6 + i] = get_partition(args[6 + i], world_size, rank)
+    # Shard scales for quantized ops
+    for i in range(len(scale_names) * 3):  # 3 layers (w1, w2, w3) × #scale_names per layer
+        args[6 + i] = get_partition(args[6 + i], world_size, rank)
 
     ad_logger.debug(
         f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
