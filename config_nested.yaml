@@ -1,0 +1,6 @@
+args:
+  foo:
+    value: 20
+  bar:
+    name: "hello_nested"
+    option: "off"

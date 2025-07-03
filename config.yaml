@@ -1,0 +1,7 @@
+  foo:
+    value: 200
+    flag: true
+    name: "config"
+  bar:
+    name: "hello_config"
+    option: "off"

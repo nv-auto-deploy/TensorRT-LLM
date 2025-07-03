@@ -1,0 +1,4 @@
+foo:
+  name: "config2"
+bar:
+  option: "on"

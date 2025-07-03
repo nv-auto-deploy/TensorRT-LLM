@@ -1,0 +1,6 @@
+foo:
+  flag: false
+  name: "conf1"
+bar:
+  name: "hell_conf1"
+  option: "off"
