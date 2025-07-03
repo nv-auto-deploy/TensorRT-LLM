@@ -1,18 +1,12 @@
-import os
-import sys
-
 import pytest
 import torch
 import torch.nn.functional as F
+from _torch.helpers import reference_moe_torch
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.modules.fused_moe import MoE  # noqa: F401
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
-from helpers import reference_moe_torch
-
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
+from tensorrt_llm._torch.modules.fused_moe import MoE  # noqa: F401
 
 
 def setup_moe_test(dtype, num_experts):
@@ -163,7 +157,7 @@ def test_fp8_moe_op_run(dtype):
         fused_w2_weight[i] = (fused_w2_weight[i] / w2_weight_scale[i]).to(torch.float8_e4m3fn)
 
     with torch.inference_mode():
-        output_torch_fp8_moe = torch.ops.auto_deploy.torch_fp8_moe(
+        output_torch_fp8_moe = torch.ops.auto_deploy.torch_quant_fp8_moe(
             x,
             selected_experts,
             final_scales,
@@ -254,7 +248,7 @@ def test_fp4_moe_op_run(dtype):
 
     # run FP4 MoE op
     with torch.inference_mode():
-        output_torch_fp4_moe = torch.ops.auto_deploy.torch_fp4_moe(
+        output_torch_fp4_moe = torch.ops.auto_deploy.torch_quant_fp4_moe(
             x,
             selected_experts,
             final_scales,
