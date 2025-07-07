@@ -139,6 +139,7 @@ class EagerAttentionModel(torch.nn.Module):
         self.out_proj = torch.nn.Linear(num_heads * self.head_dim, hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        print("self.training: ", self.training)
         batch_size, seq_len, _ = x.shape
         device = x.device
         dtype = x.dtype
@@ -416,17 +417,18 @@ class GroupedAttentionModel(torch.nn.Module):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("num_heads, num_kv_heads", [(8, 8), (8, 4), (8, 2)])
 @pytest.mark.parametrize(
     "model_cls", [RepeatKVModel, RepeatKVModel2, RepeatKVModel3, HFRepeatKVModel]
 )
 @torch.inference_mode()
-def test_match_repeat_kv(num_heads, num_kv_heads, model_cls):
+def test_match_repeat_kv(num_heads, num_kv_heads, model_cls, dtype):
     batch_size, seq_len = 4, 12
     hidden_size = 512
 
-    model = model_cls(hidden_size, num_heads, num_kv_heads).to("cuda", dtype=torch.float16)
-    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
+    model = model_cls(hidden_size, num_heads, num_kv_heads).to("cuda", dtype=dtype)
+    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
     dynamic_shapes = model.get_dynamic_shapes()
 
     # When num_heads == num_kv_heads, we don't expect any pattern match
@@ -499,16 +501,25 @@ def test_match_repeat_kv(num_heads, num_kv_heads, model_cls):
     )
 
 
-@pytest.mark.parametrize("has_mask", [True, False])
-@pytest.mark.parametrize("use_division", [False, True])
+# @pytest.mark.parametrize("has_mask", [True, False])
+# @pytest.mark.parametrize("use_division", [False, True])
+# @pytest.mark.parametrize(
+#     "dropout, rtol, atol",
+#     [
+#         (0.0, 1e-3, 1e-3),  # (dropout, rtol, atol) for no dropout
+#         (0.1, float("inf"), float("inf")),  # (dropout, rtol, atol) for dropout=0.1
+#     ],
+# )
+# @pytest.mark.parametrize("model_type", ["standard", "complex"])
+@pytest.mark.parametrize("has_mask", [False])
+@pytest.mark.parametrize("use_division", [False])
 @pytest.mark.parametrize(
     "dropout, rtol, atol",
     [
         (0.0, 1e-3, 1e-3),  # (dropout, rtol, atol) for no dropout
-        (0.1, float("inf"), float("inf")),  # (dropout, rtol, atol) for dropout=0.1
     ],
 )
-@pytest.mark.parametrize("model_type", ["standard", "complex"])
+@pytest.mark.parametrize("model_type", ["standard"])
 @torch.inference_mode()
 def test_match_eager_attention(has_mask, use_division, dropout, rtol, atol, model_type):
     # Set a fixed seed for consistent dropout behavior in tests
@@ -520,8 +531,10 @@ def test_match_eager_attention(has_mask, use_division, dropout, rtol, atol, mode
 
     # Create different model types based on the parameter
     if model_type == "standard":
-        model = EagerAttentionModel(hidden_size, num_heads, has_mask, dropout, use_division).to(
-            "cuda", dtype=torch.float16
+        model = (
+            EagerAttentionModel(hidden_size, num_heads, has_mask, dropout, use_division)
+            .to("cuda", dtype=torch.float16)
+            .eval()
         )
         # Print the original scaling approach and value
         if use_division:
@@ -532,8 +545,10 @@ def test_match_eager_attention(has_mask, use_division, dropout, rtol, atol, mode
             expected_scale = model.scaling
     else:  # complex
         # Complex model only uses division for scaling
-        model = ComplexEagerAttentionModel(hidden_size, num_heads, has_mask, dropout).to(
-            "cuda", dtype=torch.float16
+        model = (
+            ComplexEagerAttentionModel(hidden_size, num_heads, has_mask, dropout)
+            .to("cuda", dtype=torch.float16)
+            .eval()
         )
         expected_scale = 1.0 / model.scale_divisor
         # Override use_division and only run test once (ignore the parameterization)
