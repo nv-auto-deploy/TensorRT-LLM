@@ -114,12 +114,16 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
 
     # Use torch backend as clean reference
     q_reshaped = q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
-    k_reshaped = k.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD) 
+    k_reshaped = k.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
     v_reshaped = v.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
-    
+
     ref = TorchAttentionReference.basic_mha_with_cache(
-        q_reshaped, k_reshaped, v_reshaped, k_cache, v_cache, 
-        torch.zeros(BATCH_SIZE, device=device, dtype=torch.int)
+        q_reshaped,
+        k_reshaped,
+        v_reshaped,
+        k_cache,
+        v_cache,
+        torch.zeros(BATCH_SIZE, device=device, dtype=torch.int),
     )
 
     assert torch.allclose(
@@ -265,8 +269,12 @@ def test_flashinfer_attention_op_decode(
 
     # Use torch backend as clean reference for decode with prefilled cache
     ref = TorchAttentionReference.decode_with_prefilled_cache(
-        q_ref, k_ref, v_ref, k_cache, v_cache,
-        torch.tensor([PREFILL_SEQ_LEN] * BATCH_SIZE, device=device, dtype=torch.int)
+        q_ref,
+        k_ref,
+        v_ref,
+        k_cache,
+        v_cache,
+        torch.tensor([PREFILL_SEQ_LEN] * BATCH_SIZE, device=device, dtype=torch.int),
     )
 
     assert torch.allclose(
@@ -360,11 +368,12 @@ def test_flashinfer_attention_context_and_generate(
 
     # Use torch backend as clean reference
     ref = TorchAttentionReference.basic_mha_with_cache(
-        q_ref.view(BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD), 
+        q_ref.view(BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD),
         k_ref.transpose(1, 2).transpose(2, 3),  # Convert [B,N,S,D] to [B,S,N,D]
         v_ref.transpose(1, 2).transpose(2, 3),  # Convert [B,N,S,D] to [B,S,N,D]
-        k_cache, v_cache,
-        torch.zeros(BATCH_SIZE, device=device, dtype=torch.int)
+        k_cache,
+        v_cache,
+        torch.zeros(BATCH_SIZE, device=device, dtype=torch.int),
     )
     flashinfer_output_1 = flashinfer_output_1.view(BATCH_SIZE, -1, N_HEADS, D_HEAD)
 
