@@ -38,7 +38,7 @@ class DynamicYamlWithDeepMergeSettingsSource(YamlConfigSettingsSource):
 
 
 class DynamicYamlMixInForSettings:
-    """Mix-in class class for settings providing dynamic yaml loading as lowest priority source.
+    """Mix-in class for settings providing dynamic yaml loading as lowest priority source.
 
     NOTE: This class must come FIRST in the MRO such that `yaml_configs` can be processed before
     since otherwise we cannot load default values from the `yaml_configs` first.
@@ -50,6 +50,9 @@ class DynamicYamlMixInForSettings:
     - file secret settings
     - yaml configs
     - default settings
+
+    You can learn more about the different settings sources in
+    https://docs.pydantic.dev/latest/concepts/pydantic_settings/#field-value-priority.
 
     Note in particular how yaml settings have precedence only over default settings. You can hence
     think of the yaml settings as a way to override default settings.
