@@ -8,9 +8,6 @@ code duplication and ensure consistency.
 import torch
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.custom_ops.torch_backend_attention import (
-    torch_backend_mha_with_cache,
-)
 
 
 class TorchAttentionReference:
@@ -48,8 +45,8 @@ class TorchAttentionReference:
         k_flat = k.view(1, batch_size * seq_len, -1)
         v_flat = v.view(1, batch_size * seq_len, -1)
 
-        # Call torch backend
-        output_flat = torch_backend_mha_with_cache(
+        # Call torch backend via custom op registry
+        output_flat = torch.ops.auto_deploy.torch_cached_attention_with_cache(
             q_flat,
             k_flat,
             v_flat,
@@ -77,9 +74,9 @@ class TorchAttentionReference:
     ):
         """Reference implementation following triton flattened MHA pattern.
 
-        This function directly calls the torch backend implementation to ensure consistency.
+        This function directly calls the torch backend implementation via custom op registry.
         """
-        return torch_backend_mha_with_cache(
+        return torch.ops.auto_deploy.torch_cached_attention_with_cache(
             q, k, v, seq_len, input_positions, cache_loc, seq_start, k_cache, v_cache, scale
         )
 
@@ -116,8 +113,8 @@ class TorchAttentionReference:
         k_flat = k_new.view(1, batch_size, -1)
         v_flat = v_new.view(1, batch_size, -1)
 
-        # Call torch backend
-        output_flat = torch_backend_mha_with_cache(
+        # Call torch backend via custom op registry
+        output_flat = torch.ops.auto_deploy.torch_cached_attention_with_cache(
             q_flat,
             k_flat,
             v_flat,
@@ -152,7 +149,7 @@ class TorchAttentionReference:
 
         This demonstrates how to use the torch backend with additional features.
         """
-        return torch_backend_mha_with_cache(
+        return torch.ops.auto_deploy.torch_cached_attention_with_cache(
             q,
             k,
             v,
@@ -163,8 +160,9 @@ class TorchAttentionReference:
             k_cache,
             v_cache,
             scale,
-            logit_cap,
+            None,  # sinks
             sliding_window_size,
+            logit_cap,
         )
 
     @staticmethod
