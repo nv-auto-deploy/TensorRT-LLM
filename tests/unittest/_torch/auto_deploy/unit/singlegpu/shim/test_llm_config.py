@@ -175,7 +175,7 @@ def test_parallel_config_validation(parallel_field, invalid_value):
     }
 
     with pytest.raises(
-        ValueError, match="AutoDeply only supports parallelization via the `world_size` argument."
+        ValueError, match="AutoDeploy only supports parallelization via the `world_size` argument."
     ):
         LlmArgs(**kwargs)
 

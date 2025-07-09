@@ -11,13 +11,16 @@ from tensorrt_llm._torch.auto_deploy.transformations.transform import InferenceO
 
 
 def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
-    # Verify that ad_config was captured
-    assert llm_args is not None, "ad_config should have been captured"
+    # Verify that llm_args was captured
+    assert llm_args is not None, "llm_args should have been captured"
 
-    # Check that ad_config is an instance of AutoDeployConfig
-    assert isinstance(llm_args, LlmArgs), f"Expected AutoDeploy LlmArgs, got {type(llm_args)}"
+    # Check that llm_args is an instance of LlmArgs and also an instance of AutoDeployConfig
+    assert isinstance(llm_args, LlmArgs), f"Expected LlmArgs, got {type(llm_args)}"
+    assert isinstance(llm_args, AutoDeployConfig), (
+        f"Expected AutoDeployConfig, got {type(llm_args)}"
+    )
 
-    # check that ad_config and experiment_config have the same args
+    # check that llm_args and experiment_config have the same args
     expected_ad_config: AutoDeployConfig = experiment_config.args
     expected_llm_args: LlmArgs = expected_ad_config.to_llm_args()
     assert expected_llm_args == llm_args, f"Expected llm args {expected_llm_args}, got {llm_args}"

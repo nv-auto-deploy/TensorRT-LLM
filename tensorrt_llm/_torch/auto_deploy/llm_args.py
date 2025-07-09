@@ -202,8 +202,8 @@ class AutoDeployConfig(BaseModel):
 class LlmArgs(AutoDeployConfig, BaseLlmArgs):
     """LlmArgs config class for providing full expert configurability of the AutoDeploy backend.
 
-    Specifically, this class extends AutoDeployArgs with all the fields from BaseLlmArgs for
-    providing configurability beyond what is provided by AutoDeployArgs.
+    Specifically, this class extends AutoDeployConfig with all the fields from BaseLlmArgs for
+    providing configurability beyond what is provided by AutoDeployConfig.
 
     Just like AutoDeployConfig, this class is compatible with AutoDeploy's LLM API
     (``tensorrt_llm._torch.auto_deploy.llm.LLM``) but provides greater configurability.
@@ -212,7 +212,7 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs):
     AutoDeployConfig should be used instead.
 
     NOTE: this class may expose redundant fields from BaseLlmArgs or fields that are ignored or
-    have overlapping functionality with AutoDeployArgs. Please be careful when using this class.
+    have overlapping functionality with AutoDeployConfig. Please be careful when using this class.
     """
 
     build_config: Optional[object] = Field(
@@ -258,7 +258,7 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs):
         assert field_name is not None, "field_name should be set for validated field."
         if value != cls.model_fields[field_name].get_default(call_default_factory=True):
             raise ValueError(
-                "AutoDeply only supports parallelization via the `world_size` argument."
+                "AutoDeploy only supports parallelization via the `world_size` argument."
             )
         return value
 
