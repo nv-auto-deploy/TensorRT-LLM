@@ -34,7 +34,6 @@ class DynamicYamlWithDeepMergeSettingsSource(YamlConfigSettingsSource):
             yaml_data,
             self._read_files(self.current_state.get("yaml_configs", [])),
         )
-        print(f"\n{final_data=}\n")
         return final_data
 
 

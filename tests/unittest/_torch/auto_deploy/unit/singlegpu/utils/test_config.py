@@ -3,7 +3,7 @@
 import os
 import tempfile
 from pathlib import Path
-from typing import Literal
+from typing import Dict, Literal
 from unittest.mock import patch
 
 import pytest
@@ -508,6 +508,286 @@ option:
     assert settings.simple.flag is False  # from yaml3
     assert settings.option.name == "yaml2_option"  # from yaml2
     assert settings.option.option == "off"  # from yaml3
+
+
+# New test case for nested dictionary deep merging
+class SomeConfigModel(BaseModel):
+    """Model representing a configuration entry."""
+
+    param1: str
+    param2: int = 42
+    param3: bool = False
+
+
+class SomeSettings(DynamicYamlMixInForSettings, BaseSettings):
+    """Settings with a dictionary of config models."""
+
+    configs: Dict[str, SomeConfigModel]
+
+
+class SomeNestedSettings(DynamicYamlMixInForSettings, BaseSettings):
+    """Nested settings containing SomeSettings."""
+
+    args: SomeSettings
+    extra_field: str = "default_extra"
+
+
+def create_some_nested_settings_with_default_yaml(default_yaml_path: Path):
+    """Create SomeNestedSettings with a default yaml file."""
+
+    class SomeNestedSettingsWithDefaultYaml(DynamicYamlMixInForSettings, BaseSettings):
+        """Nested settings with default yaml file."""
+
+        model_config = ConfigDict(yaml_file=str(default_yaml_path))
+
+        args: SomeSettings
+        extra_field: str = "default_extra"
+
+    return SomeNestedSettingsWithDefaultYaml
+
+
+@pytest.fixture
+def dict_config_yaml_files(temp_dir):
+    """Create yaml files for testing dictionary config deep merging."""
+    files = {}
+
+    # Inner settings config (for SomeSettings)
+    files["inner_config"] = temp_dir / "inner_config.yaml"
+    files["inner_config"].write_text("""
+configs:
+  k1:
+    param1: "inner_k1_value"
+    param2: 100
+    param3: true
+  k2:
+    param1: "inner_k2_value"
+    param2: 200
+    param3: false
+""")
+
+    # Outer settings config (for SomeNestedSettings)
+    files["outer_config"] = temp_dir / "outer_config.yaml"
+    files["outer_config"].write_text("""
+args:
+  configs:
+    k1:
+      param1: "outer_k1_value"
+      param2: 150
+      # param3 not specified, should remain from inner
+    k3:
+      param1: "outer_k3_value"
+      param2: 300
+      param3: true
+extra_field: "outer_extra_value"
+""")
+
+    # Default config for nested settings
+    files["nested_default"] = temp_dir / "nested_default.yaml"
+    files["nested_default"].write_text("""
+args:
+  configs:
+    k1:
+      param1: "default_k1_value"
+      param2: 50
+      param3: false
+    k4:
+      param1: "default_k4_value"
+      param2: 400
+      param3: true
+extra_field: "default_extra_value"
+""")
+
+    return files
+
+
+def test_nested_dict_deep_merge_basic(dict_config_yaml_files):
+    """Test basic deep merging of nested dictionaries."""
+    # Test with only inner config
+    settings = SomeNestedSettings(args={"yaml_configs": [dict_config_yaml_files["inner_config"]]})
+
+    # Should have k1 and k2 from inner config
+    assert len(settings.args.configs) == 2
+    assert "k1" in settings.args.configs
+    assert "k2" in settings.args.configs
+
+    # Check k1 values
+    k1_config = settings.args.configs["k1"]
+    assert k1_config.param1 == "inner_k1_value"
+    assert k1_config.param2 == 100
+    assert k1_config.param3 is True
+
+    # Check k2 values
+    k2_config = settings.args.configs["k2"]
+    assert k2_config.param1 == "inner_k2_value"
+    assert k2_config.param2 == 200
+    assert k2_config.param3 is False
+
+    # Check default extra field
+    assert settings.extra_field == "default_extra"
+
+
+def test_nested_dict_deep_merge_with_outer_yaml(dict_config_yaml_files):
+    """Test deep merging when outer YAML contains nested dictionary configs."""
+    # Create settings with both inner and outer configs
+    # Use args as dict to allow deep merging, not as explicitly initialized object
+    settings = SomeNestedSettings(
+        yaml_configs=[dict_config_yaml_files["outer_config"]],
+        args={"yaml_configs": [dict_config_yaml_files["inner_config"]]},
+    )
+
+    # Should have k1 (merged), k2 (from inner), and k3 (from outer)
+    assert len(settings.args.configs) == 3
+    assert "k1" in settings.args.configs
+    assert "k2" in settings.args.configs
+    assert "k3" in settings.args.configs
+
+    # Check k1 values - outer should override inner for specified fields
+    k1_config = settings.args.configs["k1"]
+    assert k1_config.param1 == "outer_k1_value"  # from outer
+    assert k1_config.param2 == 150  # from outer
+    assert k1_config.param3 is True  # from inner (not overridden by outer)
+
+    # Check k2 values - should remain from inner
+    k2_config = settings.args.configs["k2"]
+    assert k2_config.param1 == "inner_k2_value"
+    assert k2_config.param2 == 200
+    assert k2_config.param3 is False
+
+    # Check k3 values - should be from outer
+    k3_config = settings.args.configs["k3"]
+    assert k3_config.param1 == "outer_k3_value"
+    assert k3_config.param2 == 300
+    assert k3_config.param3 is True
+
+    # Check extra field from outer
+    assert settings.extra_field == "outer_extra_value"
+
+
+def test_nested_dict_deep_merge_with_default_yaml(dict_config_yaml_files):
+    """Test deep merging with default yaml file and additional configs."""
+    SomeNestedSettingsWithDefaultYaml = create_some_nested_settings_with_default_yaml(
+        dict_config_yaml_files["nested_default"]
+    )
+
+    # Create settings with default yaml and additional outer config
+    settings = SomeNestedSettingsWithDefaultYaml(
+        yaml_configs=[dict_config_yaml_files["outer_config"]],
+        args={"yaml_configs": [dict_config_yaml_files["inner_config"]]},
+    )
+
+    # Should have k1 (from outer, overriding both default and inner),
+    # k2 (from inner), k3 (from outer), and k4 (from default)
+    assert len(settings.args.configs) == 4
+    assert "k1" in settings.args.configs
+    assert "k2" in settings.args.configs
+    assert "k3" in settings.args.configs
+    assert "k4" in settings.args.configs
+
+    # Check k1 values - outer should have highest precedence
+    k1_config = settings.args.configs["k1"]
+    assert k1_config.param1 == "outer_k1_value"  # from outer
+    assert k1_config.param2 == 150  # from outer
+    assert (
+        k1_config.param3 is False
+    )  # from default (outer config takes precedence over inner for k1)
+
+    # Check k2 values - should be from inner
+    k2_config = settings.args.configs["k2"]
+    assert k2_config.param1 == "inner_k2_value"
+    assert k2_config.param2 == 200
+    assert k2_config.param3 is False
+
+    # Check k3 values - should be from outer
+    k3_config = settings.args.configs["k3"]
+    assert k3_config.param1 == "outer_k3_value"
+    assert k3_config.param2 == 300
+    assert k3_config.param3 is True
+
+    # Check k4 values - should be from default
+    k4_config = settings.args.configs["k4"]
+    assert k4_config.param1 == "default_k4_value"
+    assert k4_config.param2 == 400
+    assert k4_config.param3 is True
+
+    # Check extra field from outer
+    assert settings.extra_field == "outer_extra_value"
+
+
+def test_nested_dict_deep_merge_precedence_order(dict_config_yaml_files):
+    """Test the complete precedence order for nested dictionary deep merging."""
+    SomeNestedSettingsWithDefaultYaml = create_some_nested_settings_with_default_yaml(
+        dict_config_yaml_files["nested_default"]
+    )
+
+    # Create additional yaml file that partially overrides outer config
+    partial_override = dict_config_yaml_files["outer_config"].parent / "partial_override.yaml"
+    partial_override.write_text("""
+args:
+  configs:
+    k1:
+      param2: 999  # Override just param2
+    k2:
+      param1: "partial_k2_value"  # Add k2 config at outer level
+extra_field: "partial_extra_value"
+""")
+
+    # Test with multiple yaml configs: default -> outer -> partial_override
+    # and inner config for args
+    settings = SomeNestedSettingsWithDefaultYaml(
+        yaml_configs=[dict_config_yaml_files["outer_config"], partial_override],
+        args={"yaml_configs": [dict_config_yaml_files["inner_config"]]},
+    )
+
+    # Should have all keys
+    assert len(settings.args.configs) == 4
+
+    # Check k1 - should be combination of all sources with proper precedence
+    k1_config = settings.args.configs["k1"]
+    assert k1_config.param1 == "outer_k1_value"  # from outer (not overridden by partial)
+    assert k1_config.param2 == 999  # from partial_override (highest precedence)
+    assert (
+        k1_config.param3 is False
+    )  # from default (outer config takes precedence over inner for k1)
+
+    # Check k2 - should be from inner with partial outer override
+    k2_config = settings.args.configs["k2"]
+    assert k2_config.param1 == "partial_k2_value"  # from partial_override
+    assert k2_config.param2 == 200  # from inner
+    assert k2_config.param3 is False  # from inner
+
+    # Check extra field from partial (highest precedence)
+    assert settings.extra_field == "partial_extra_value"
+
+
+def test_nested_dict_explicit_init_vs_yaml_precedence(dict_config_yaml_files):
+    """Test that explicitly initialized objects take precedence over yaml configs."""
+    # When we pass an explicitly initialized SomeSettings object,
+    # it should take precedence over outer yaml configs
+    settings = SomeNestedSettings(
+        yaml_configs=[dict_config_yaml_files["outer_config"]],
+        args=SomeSettings(yaml_configs=[dict_config_yaml_files["inner_config"]]),
+    )
+
+    # Should only have k1 and k2 from inner config (explicit init takes precedence)
+    assert len(settings.args.configs) == 2
+    assert "k1" in settings.args.configs
+    assert "k2" in settings.args.configs
+    assert "k3" not in settings.args.configs  # k3 from outer is ignored
+
+    # Check k1 values - should be from inner only
+    k1_config = settings.args.configs["k1"]
+    assert k1_config.param1 == "inner_k1_value"  # from inner
+    assert k1_config.param2 == 100  # from inner
+    assert k1_config.param3 is True  # from inner
+
+    # Check k2 values - should be from inner
+    k2_config = settings.args.configs["k2"]
+    assert k2_config.param1 == "inner_k2_value"
+    assert k2_config.param2 == 200
+    assert k2_config.param3 is False
+
+    # Check extra field from outer (this still works at the top level)
+    assert settings.extra_field == "outer_extra_value"
 
 
 # Real world scenario tests
