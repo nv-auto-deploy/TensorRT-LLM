@@ -273,7 +273,7 @@ class TestTorchBackendAttention:
         self, data, scale=None, logit_cap=None, sliding_window_size=None, sinks=None
     ):
         """Run torch backend attention operation with optional sinks parameter."""
-        return torch.ops.auto_deploy.torch_backend_attention_mha_with_cache(
+        return torch.ops.auto_deploy.torch_cached_attention_with_cache(
             data["q"],
             data["k"],
             data["v"],
@@ -477,7 +477,7 @@ class TestTorchBackendAttention:
         pages_per_seq = torch.ones(batch_size, device=device, dtype=torch.int32)
 
         # Test metadata preparation
-        result = torch.ops.auto_deploy.torch_backend_attention_prepare_metadata(
+        result = torch.ops.auto_deploy.torch_cached_attention_prepare_metadata(
             input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, 128
         )
 
@@ -485,7 +485,3 @@ class TestTorchBackendAttention:
         assert len(result) == 4, "Metadata preparation should return 4 tensors"
         assert all(torch.is_tensor(t) for t in result), "All results should be tensors"
         assert result[0].shape[0] == batch_size, "First tensor should have batch_size elements"
-
-
-if __name__ == "__main__":
-    pytest.main([__file__])
