@@ -466,12 +466,19 @@ class FP8BMMQuantizationImpl(QuantizationImpl):
                         )
 
 
-def should_skip_quantization(node: Node, excluded_patterns: List[str]) -> bool:
-    """Check if a node is a non-quantized linear op that matches any excluded pattern."""
-    if not is_linear_op(node, include_quantization=False):
-        return True
-    param_name, _ = extract_param_names_from_lin_node(node)
-    modname, _, _ = param_name.rpartition(".")
+def should_skip_quantization(
+    node_or_name: Union[Node, str],
+    excluded_patterns: list[str],
+) -> bool:
+    """Check if a node or parameter name should be skipped based on excluded patterns."""
+    if isinstance(node_or_name, str):
+        modname, _, _ = node_or_name.rpartition(".")
+    else:
+        if not is_linear_op(node_or_name, include_quantization=False):
+            return True
+        param_name, _ = extract_param_names_from_lin_node(node_or_name)
+        modname, _, _ = param_name.rpartition(".")
+
     return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
 
 
