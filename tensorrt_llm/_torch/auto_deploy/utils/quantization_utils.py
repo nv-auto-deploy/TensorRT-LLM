@@ -85,6 +85,7 @@ class QuantizationImpl:
                 quantization_impl_map = {
                     "": None,
                     "FP8": FP8QuantizationImpl,
+                    "NVFP4": FP4QuantizationImpl,
                 }
             return quantization_impl_map[quant_type_or_node]
 
@@ -463,6 +464,8 @@ class FP8BMMQuantizationImpl(QuantizationImpl):
                             attr_name,
                             torch.nn.Parameter(param_cm, requires_grad=param.requires_grad),
                         )
+
+
 def should_skip_quantization(node: Node, excluded_patterns: List[str]) -> bool:
     """Check if a node is a non-quantized linear op that matches any excluded pattern."""
     if not is_linear_op(node, include_quantization=False):
