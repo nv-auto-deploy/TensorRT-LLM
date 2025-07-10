@@ -249,7 +249,7 @@ def _torch_context_mha(
         out.copy_(torch.cat(attn_outputs, dim=0))
 
 
-@torch.library.custom_op("auto_deploy::torch_backend_attention_mha_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_cached_attention_with_cache", mutates_args=())
 def torch_backend_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -356,7 +356,7 @@ def torch_backend_mha_with_cache_fake(
     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
 
 
-@torch.library.custom_op("auto_deploy::torch_backend_attention_prepare_metadata", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_cached_attention_prepare_metadata", mutates_args=())
 def torch_backend_prepare_metadata(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
@@ -414,11 +414,11 @@ class TorchBackendAttention(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.torch_backend_attention_mha_with_cache
+        return torch.ops.auto_deploy.torch_cached_attention_with_cache
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.auto_deploy.torch_backend_attention_prepare_metadata, 4
+        return torch.ops.auto_deploy.torch_cached_attention_prepare_metadata, 4
 
     @classmethod
     def get_cache_initializers(
@@ -482,11 +482,10 @@ class TorchBackendAttention(AttentionDescriptor):
             ad_logger.warning("Provided scale is not a float. Using default scale instead.")
             scale = None
 
-        # Get sinks and sliding_window from args or kwargs
+        # Get sinks, sliding_window, and logit_cap from args or kwargs
         sinks = extract_op_args(source_attn_node, "sinks")[0]
         sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
-
-        logit_cap = None
+        logit_cap = extract_op_args(source_attn_node, "logit_cap")[0]
 
         return [
             scale,  # softmax scale
