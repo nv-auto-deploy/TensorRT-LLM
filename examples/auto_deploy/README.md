@@ -6,7 +6,7 @@
 
 <div align="left">
 
-AutoDeploy is designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models like those from Hugging Face, to TensorRT-LLM. It automates graph transformations to integrate inference optimizations such as tensor parallelism, KV-caching and quantization. AutoDeploy supports optimized in-framework deployment, minimizing the amount of manual modification needed.
+AutoDeploy is an experimental feature in beta stage designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models like those from Hugging Face, to TensorRT-LLM. It automates graph transformations to integrate inference optimizations such as tensor parallelism, KV-caching and quantization. AutoDeploy supports optimized in-framework deployment, minimizing the amount of manual modification needed.
 
 ______________________________________________________________________
 
@@ -142,19 +142,19 @@ Below is a non-exhaustive list of common config options:
 | Configuration Key | Description |
 |-------------------|-------------|
 | `--model` | The HF model card or path to a HF checkpoint folder |
-| `--args.model_factory` | Choose model factory implementation (`"AutoModelForCausalLM"`, ...) |
-| `--args.skip_loading_weights` | Only load the architecture, not the weights |
-| `--args.model_kwargs` | Extra kwargs that are being passed to the model initializer in the model factory |
-| `--args.tokenizer_kwargs` | Extra kwargs that are being passed to the tokenizer initializer in the model factory |
-| `--args.world_size` | The number of GPUs for Tensor Parallel |
+| `--args.model-factory` | Choose model factory implementation (`"AutoModelForCausalLM"`, ...) |
+| `--args.skip-loading-weights` | Only load the architecture, not the weights |
+| `--args.model-kwargs` | Extra kwargs that are being passed to the model initializer in the model factory |
+| `--args.tokenizer-kwargs` | Extra kwargs that are being passed to the tokenizer initializer in the model factory |
+| `--args.world-size` | The number of GPUs used for auto-sharding the model |
 | `--args.runtime` | Specifies which type of Engine to use during runtime (`"demollm"` or `"trtllm"`) |
-| `--args.compile_backend` | Specifies how to compile the graph at the end |
-| `--args.attn_backend` | Specifies kernel implementation for attention |
-| `--args.mla_backend` | Specifies implementation for multi-head latent attention |
-| `--args.max_seq_len` | Maximum sequence length for inference/cache |
-| `--args.max_batch_size` | Maximum dimension for statically allocated KV cache |
-| `--args.attn_page_size` | Page size for attention |
-| `--prompt.batch_size` | Number of queries to generate |
+| `--args.compile-backend` | Specifies how to compile the graph at the end |
+| `--args.attn-backend` | Specifies kernel implementation for attention |
+| `--args.mla-backend` | Specifies implementation for multi-head latent attention |
+| `--args.max-seq-len` | Maximum sequence length for inference/cache |
+| `--args.max-batch-size` | Maximum dimension for statically allocated KV cache |
+| `--args.attn-page-size` | Page size for attention |
+| `--prompt.batch-size` | Number of queries to generate |
 | `--benchmark.enabled` | Whether to run the built-in benchmark (true/false) |
 
 For default values and additional configuration options, refer to the `ExperimentConfig` class in [build_and_run_ad.py](./build_and_run_ad.py) file.
@@ -165,10 +165,10 @@ Here is a more complete example of using the script:
 cd examples/auto_deploy
 python build_and_run_ad.py \
 --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" \
---args.world_size 2 \
+--args.world-size 2 \
 --args.runtime "demollm" \
---args.compile_backend "torch-compile" \
---args.attn_backend "flashinfer" \
+--args.compile-backend "torch-compile" \
+--args.attn-backend "flashinfer" \
 --benchmark.enabled True
 ```
 
@@ -214,7 +214,7 @@ Refer to [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Mo
 
 ```bash
 cd examples/auto_deploy
-python build_and_run_ad.py --model "<MODELOPT_CKPT_PATH>" --args.world_size 1
+python build_and_run_ad.py --model "<MODELOPT_CKPT_PATH>" --args.world-size 1
 ```
 
 ### Incorporating `auto_deploy` into your own workflow
@@ -223,9 +223,6 @@ AutoDeploy can be seamlessly integrated into your existing workflows using TRT-L
 
 Here is an example of how you can build an LLM object with AutoDeploy integration:
 
-<details>
-<summary>Click to expand the example</summary>
-
 ```
 from tensorrt_llm._torch.auto_deploy import LLM
 
@@ -233,7 +230,7 @@ from tensorrt_llm._torch.auto_deploy import LLM
 # Construct the LLM high-level interface object with autodeploy as backend
 llm = LLM(
     model=<HF_MODEL_CARD_OR_DIR>,
-    world_size=<NUM_WORLD_RANK>,
+    world_size=<DESIRED_WORLD_SIZE>,
     compile_backend="torch-compile",
     model_kwargs={"num_hidden_layers": 2}, # test with smaller model configuration
     attn_backend="flashinfer", # choose between "triton" and "flashinfer"
@@ -249,28 +246,38 @@ llm = LLM(
 
 ```
 
+Please consult the [AutoDeploy `LLM` API](../../tensorrt_llm/_torch/auto_deploy/llm.py#L13) and the
+[`AutoDeployConfig` class](../../tensorrt_llm/_torch/auto_deploy/llm_args.py#L26)
+for more detail on how AutoDeploy is configured via the `**kwargs` of the `LLM` API.
+
+### Expert Configuration of LLM API
+
+For expert TensorRT-LLM users, we also expose the full set of [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py#L201)
+*at your own risk* (the argument list diverges from TRT-LLM's argument list):
+
+<details>
+<summary>Click to expand for more details on using LlmArgs directly</summary>
+
+- All config fields that are used by the AutoDeploy core pipeline (i.e. the `InferenceOptimizer`) are
+  _exclusively_ exposed in the [`AutoDeployConfig` class](../../tensorrt_llm/_torch/auto_deploy/llm_args.py).
+  Please make sure to refer to those first.
+- For expert users we expose the full set of [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py#L201)
+  that can be used to configure the [AutoDeploy `LLM` API](../../tensorrt_llm/_torch/auto_deploy/llm.py#L13) including runtime options.
+- Note that some fields in the full [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py#L201)
+  object are overlapping, duplicated, and/or _ignored_ in AutoDeploy, particularly arguments
+  pertaining to configuring the model itself since AutoDeploy's model ingestion+optimize pipeline
+  significantly differs from the default manual workflow in TensorRT-LLM.
+- However, with the proper care the full [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py#L201)
+  objects can be used to configure advanced runtime options in TensorRT-LLM.
+- Note that any valid field can be simply provided as keyword argument ("`**kwargs`") to the
+  [AutoDeploy `LLM` API](../../tensorrt_llm/_torch/auto_deploy/llm.py#L13).
+
 </details>
-
-For more examples on TRT-LLM LLM API, visit [`this page`](https://nvidia.github.io/TensorRT-LLM/examples/llm_api_examples.html).
-
-______________________________________________________________________
 
 ## Roadmap
 
-1. **Model Coverage:**
-
-   - Expand support for additional LLM variants and features:
-     - LoRA
-     - Speculative Decoding
-     - Model specialization for disaggregated serving
-
-1. **Performance Optimization:**
-
-   - Enhance inference speed and efficiency with:
-     - MoE fusion and all-reduce fusion techniques
-     - Reuse of TRT-LLM PyTorch operators for greater efficiency
-
-______________________________________________________________________
+Check out our [Github Project Board](https://github.com/orgs/NVIDIA/projects/83) to learn more about
+the current progress in AutoDeploy and where you can help.
 
 ## Disclaimer
 

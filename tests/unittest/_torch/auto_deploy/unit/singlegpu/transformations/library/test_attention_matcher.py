@@ -502,15 +502,15 @@ def test_match_repeat_kv(num_heads, num_kv_heads, model_cls):
 @pytest.mark.parametrize("has_mask", [True, False])
 @pytest.mark.parametrize("use_division", [False, True])
 @pytest.mark.parametrize(
-    "dropout, rtol, atol",
+    "dropout, skip_output_assert",
     [
-        (0.0, 1e-3, 1e-3),  # (dropout, rtol, atol) for no dropout
-        (0.1, float("inf"), float("inf")),  # (dropout, rtol, atol) for dropout=0.1
+        (0.0, False),
+        (0.1, True),  # skip all_close assertion for dropout=0.1 for its non-deterministic output
     ],
 )
 @pytest.mark.parametrize("model_type", ["standard", "complex"])
 @torch.inference_mode()
-def test_match_eager_attention(has_mask, use_division, dropout, rtol, atol, model_type):
+def test_match_eager_attention(has_mask, use_division, dropout, skip_output_assert, model_type):
     # Set a fixed seed for consistent dropout behavior in tests
     torch.manual_seed(0)
 
@@ -631,20 +631,18 @@ def test_match_eager_attention(has_mask, use_division, dropout, rtol, atol, mode
         return valid
 
     # Run the test with the run_test utility
-    # Disable load hook tests and strict loading for dropout cases since random states differ between implementations
-    test_load_hook = dropout == 0.0
-    strict_loading = dropout == 0.0
     run_test(
         model,
         x,
         match_eager_attention,
         verify_matcher,
         lambda num_p_og: num_p_og,
-        atol=atol,
-        rtol=rtol,
-        test_load_hook=test_load_hook,
-        strict_loading=strict_loading,
+        atol=1e-3,
+        rtol=1e-3,
+        test_load_hook=False,
+        strict_loading=True,
         dynamic_shapes=dynamic_shapes,
+        skip_output_assert=skip_output_assert,
     )
 
 

@@ -685,7 +685,7 @@ def temp_extra_llm_api_options_file(request):
             pytorch_backend_config = {}
             if request.node.callspec.params['pytorch_backend_config']:
                 pytorch_backend_config = {
-                    "use_cuda_graph": True,
+                    "cuda_graph_config": {},
                     # trtllm-bench will set cuda_max_batch_size to
                     # max_batch_size, so the cuda_graph_batch_sizes is not
                     # needed.
@@ -1375,6 +1375,18 @@ def test_trtllm_serve_multimodal_example(llm_root, llm_venv):
     ])
 
 
+def test_trtllm_serve_lora_example(llm_root, llm_venv):
+    example_root = Path(os.path.join(llm_root, "examples", "serve"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_trtllm_serve_lora.py")])
+
+
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_misc_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
@@ -1415,6 +1427,11 @@ def test_openai_reasoning(llm_root, llm_venv, backend: str):
         "-m", "pytest",
         str(test_root / "_test_openai_reasoning.py"), "-k", backend
     ])
+
+
+def test_openai_lora(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_lora.py")])
 
 
 def test_openai_chat_multimodal_example(llm_root, llm_venv):
@@ -2026,7 +2043,6 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         *accuracy_inputs[modality]["prompt"],
         "--media",
         *accuracy_inputs[modality]["media"],
-        "--disable_kv_cache_reuse",
     ]
     # NOTE: Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens for video.
     if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"

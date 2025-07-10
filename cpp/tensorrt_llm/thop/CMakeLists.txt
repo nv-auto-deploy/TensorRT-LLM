@@ -34,6 +34,7 @@ set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
                                       ${CURAND_LIB})
 
+# TODO This does not compile with internal cutlass MOE gemm
 add_library(
   th_common SHARED
   mlaPreprocessOp.cpp
@@ -84,7 +85,8 @@ add_library(
   userbuffersTensor.cpp
   weightOnlyQuantOp.cpp
   mtpOp.cpp
-  loraOp.cpp)
+  loraOp.cpp
+  finegrained_mixed_dtype_gemm_thop.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
                                         ${Python3_LIBRARIES} ${SHARED_TARGET})

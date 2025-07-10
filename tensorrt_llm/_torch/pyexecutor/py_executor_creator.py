@@ -230,6 +230,7 @@ def create_py_executor(
             checkpoint_dir,
             pytorch_backend_config,
             batch_size=executor_config.max_batch_size,
+            max_beam_width=executor_config.max_beam_width,
             max_num_tokens=executor_config.max_num_tokens,
             max_seq_len=executor_config.max_seq_len,
             mapping=mapping,
@@ -252,6 +253,7 @@ def create_py_executor(
                 spec_config.draft_model_path,
                 pytorch_backend_config,
                 batch_size=executor_config.max_batch_size,
+                max_beam_width=executor_config.max_beam_width,
                 max_num_tokens=executor_config.max_num_tokens,
                 # Note: The draft model engine will infer its own max_seq_len.
                 # We'll stop drafting when we hit the max.
@@ -319,6 +321,13 @@ def create_py_executor(
 
     if executor_config.enable_chunked_context:
         chunk_unit_size = executor_config.tokens_per_block
+        max_attention_window = executor_config.kv_cache_config.max_attention_window
+        if max_attention_window and max_seq_len > min(max_attention_window):
+            # maxKvStepSizeInFmha = 256
+            chunk_unit_size = max(256, chunk_unit_size)
+            logger.info(
+                f"ChunkUnitSize is set to {chunk_unit_size} as sliding window attention is used."
+            )
         chunking_policy = (
             executor_config.scheduler_config.context_chunking_policy
             if executor_config.scheduler_config.context_chunking_policy
