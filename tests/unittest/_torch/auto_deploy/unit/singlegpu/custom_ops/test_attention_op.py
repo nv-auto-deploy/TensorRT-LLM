@@ -242,13 +242,6 @@ def test_flat_gqa_op_with_rope(
             freqs_cis,
         )
 
-    # For RoPE test, we unfortunately still need manual reference since torch backend
-    # doesn't support RoPE fusion yet. Keep the manual implementation for now.
-    # TODO (chenghao): Once torch backend supports RoPE, replace this with:
-    # ref_flat = TorchAttentionReference.flattened_mha_with_cache(
-    #     q_o.clone(), k_o.clone(), v, seq_len, input_positions, cache_loc, seq_start, k_cache, v_cache
-    # )
-
     # prep batched tensors for comparison
     q_b = torch.zeros(batch_size, n_heads, max_seq_len, D_HEAD, **dtype_kwargs)
     k_cache_b = k_cache[cache_loc].transpose(1, 2)
@@ -429,9 +422,7 @@ def test_paged_gqa_op(
         None,
     )
 
-    # For paged cache test, we need to keep manual reference since torch backend
-    # doesn't support paged cache operations yet. Keep the manual implementation for now.
-    # TODO (chenghao): Once torch backend supports paged cache, replace this with torch backend reference.
+    # TODO (chenghao): Replace this with torch backend reference.
 
     # prep batched tensors for comparison
     def compute_reference(q, k_cache, v_cache):
