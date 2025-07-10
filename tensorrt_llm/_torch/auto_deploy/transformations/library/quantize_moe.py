@@ -92,7 +92,7 @@ def _quantize_moe_node(
             quantized_op,
             args=tuple(args),
         )
-        print(f"updating {node.name} args, ", new_node.args)
+        ad_logger.debug(f"Updating {node.name} args to {new_node.args}")
         node.replace_all_uses_with(new_node)
         gm.graph.erase_node(node)
 
