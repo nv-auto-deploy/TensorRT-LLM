@@ -103,10 +103,13 @@ class DemoEngine(ADEngine):
         idxs_stop = [sampling_params.max_tokens - 1] * batch_size
         gen_logits = [] if sampling_params.return_generation_logits else None
         context_logits: Optional[List[torch.Tensor]] = None
+        if not self.use_cache:
+            accumulated_token_id = sequence_info.input_ids
 
         def _generate_single_step(idx: int):
             # assign pages
-            self._assign_pages()
+            if self.use_cache:
+                self._assign_pages()
 
             # get the logits and then last token logits in each sequence ([b, 1, vocab_size])
             logits = self._compute_logits()
@@ -116,7 +119,12 @@ class DemoEngine(ADEngine):
 
             # update sequence info accordingly for next step
             sequence_info.update_pos(sequence_info.sequence_lengths)
-            sequence_info.nest_sequences(token_ids)
+            if not self.use_cache:
+                nonlocal accumulated_token_id
+                accumulated_token_id = torch.cat([accumulated_token_id, token_ids], dim=-1)
+                sequence_info.nest_sequences(accumulated_token_id)
+            else:
+                sequence_info.nest_sequences(token_ids)
 
             # nest new tokens and run stop check
             for b, (new_tokens_b, new_id) in enumerate(zip(new_tokens, token_ids)):
