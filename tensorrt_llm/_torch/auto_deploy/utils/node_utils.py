@@ -148,8 +148,8 @@ def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]
     Args:
         mm_node: Matmul node in the graph.
     """
-    assert is_linear_op(mm_node, include_quantization=True), (
-        f"Expecting linear node, Found: {mm_node}"
+    assert is_linear_op(mm_node, include_quantization=True) or is_bmm_op(mm_node), (
+        f"Expecting linear or bmm node, Found: {mm_node}"
     )
     weight_node = extract_weight_node(mm_node)
 

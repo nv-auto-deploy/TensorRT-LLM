@@ -15,6 +15,7 @@ from .logger import ad_logger
 from .node_utils import (
     extract_param_names_from_lin_node,
     get_quantization_params_from_linear_node,
+    is_bmm_op,
     is_linear_op,
     is_op,
     modelopt_dynamic_block_quantize_op,
@@ -474,10 +475,15 @@ def should_skip_quantization(
     if isinstance(node_or_name, str):
         modname, _, _ = node_or_name.rpartition(".")
     else:
-        if not is_linear_op(node_or_name, include_quantization=False):
+        if not (is_linear_op(node_or_name, include_quantization=False) or is_bmm_op(node_or_name)):
             return True
-        param_name, _ = extract_param_names_from_lin_node(node_or_name)
-        modname, _, _ = param_name.rpartition(".")
+        try:
+            param_name, _ = extract_param_names_from_lin_node(node_or_name)
+            modname, _, _ = param_name.rpartition(".")
+        except Exception:
+            # Cannot trace parameter — likely a dynamic tensor.
+            # Assume it’s not explicitly excluded and allow quantization to proceed.
+            return False
 
     return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
 
