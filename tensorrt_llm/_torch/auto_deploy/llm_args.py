@@ -115,7 +115,7 @@ class AutoDeployConfig(BaseModel):
     )
 
     # INFERENCE OPTIMIZER CONFIG ###################################################################
-    attn_backend: Literal["flashinfer", "triton"] = Field(
+    attn_backend: Literal["flashinfer", "triton", "torch-no-cache"] = Field(
         default="flashinfer", description="Attention backend to use."
     )
 

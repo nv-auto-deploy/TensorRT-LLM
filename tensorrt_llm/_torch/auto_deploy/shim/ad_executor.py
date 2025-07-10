@@ -111,7 +111,7 @@ class ADEngine(ModelEngine):
         )
 
         # construct engine
-        return cls(build_and_optimize, seq_info, device)
+        return cls(build_and_optimize, seq_info, device, ad_config)
 
     @torch.inference_mode()
     def __init__(
@@ -119,6 +119,7 @@ class ADEngine(ModelEngine):
         get_inference_model: GetInferenceModel,
         seq_info: SequenceInfo,
         device: DeviceLikeType,
+        ad_config: AutoDeployConfig,
     ) -> None:
         """Initialize the engine with model and sequence information."""
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
@@ -132,6 +133,9 @@ class ADEngine(ModelEngine):
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
         self.enable_attention_dp = False
+
+        # Store the ad_config for later access
+        self.use_cache = ad_config.attn_backend != "torch-no-cache"
 
         # construct cache sequence interface
         self.cache_seq_interface = CachedSequenceInterface(

@@ -176,17 +176,19 @@ class InferenceOptimizer:
         ############################################################################################
 
         update_in_out_nodes(egm, cm)
+        if self.ad_config.attn_backend == "torch-no-cache":
+            pass
+        else:
+            # detect attention op and replace with cache-aware op
+            for a_backend in [self.ad_config.attn_backend, self.ad_config.mla_backend]:
+                attn_descriptor = AttentionRegistry.get(a_backend)
+                insert_cached_attention(egm, cm, attn_descriptor, self.factory.get_cache_config())
 
-        # detect attention op and replace with cache-aware op
-        for a_backend in [self.ad_config.attn_backend, self.ad_config.mla_backend]:
-            attn_descriptor = AttentionRegistry.get(a_backend)
-            insert_cached_attention(egm, cm, attn_descriptor, self.factory.get_cache_config())
+            # initialize cache on correct device
+            cm.initialize_caches()
 
-        # initialize cache on correct device
-        cm.initialize_caches()
-
-        # resize kv cache to occupy the available GPU memory up to free_mem_ratio
-        resize_kv_cache(egm, cm, free_mem_ratio=self.ad_config.free_mem_ratio)
+            # resize kv cache to occupy the available GPU memory up to free_mem_ratio
+            resize_kv_cache(egm, cm, free_mem_ratio=self.ad_config.free_mem_ratio)
 
         ############################################################################################
         # COMPILE MODEL

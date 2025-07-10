@@ -1,11 +1,25 @@
 """Torch reference implementations for attention."""
 
 import math
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch._ops import OpOverloadPacket
+from torch.fx import Node
+
+from .attention_interface import (
+    AttentionDescriptor,
+    AttentionLayout,
+    AttentionRegistry,
+    BufferInitializerDict,
+    CacheConfig,
+    CacheInitializerDict,
+    Constant,
+    MHACallable,
+    PrepareMetadataCallable,
+)
 
 
 @torch.library.custom_op("auto_deploy::torch_attention_repeat_kv", mutates_args=())
@@ -106,9 +120,9 @@ def grouped_sdpa_fake(
 
 @torch.library.custom_op("auto_deploy::torch_attention_bsnd_grouped_sdpa", mutates_args=())
 def bsnd_grouped_sdpa(
-    query: torch.Tensor,  # layout: [b, n, s_q, d]
-    key: torch.Tensor,  # layout: [b, n, s_k, d]
-    value: torch.Tensor,  # layout: [b, n, s_k, d]
+    query: torch.Tensor,  # layout: [b, s_q, n, d]
+    key: torch.Tensor,  # layout: [b, s_k, n, d]
+    value: torch.Tensor,  # layout: [b, s_k, n, d]
     attn_mask: Optional[torch.Tensor] = None,  # layout: [b, n, s_q, s_k]
     dropout_p: float = 0.0,
     is_causal: bool = False,
@@ -432,3 +446,74 @@ def mla(
 ) -> torch.Tensor:
     """MLA style attention that handles compressed kv."""
     return torch.empty_like(q_nope)
+
+
+@torch.library.custom_op("auto_deploy::torch_no_cache_prepare_metadata", mutates_args=())
+def torch_no_cache_prepare_metadata(
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_len: torch.Tensor,
+    input_pos: torch.Tensor,
+    cache_loc: torch.Tensor,
+    pages_per_seq: torch.Tensor,
+    page_size: int,
+) -> List[torch.Tensor]:
+    """Prepare metadata for torch no-cache attention."""
+    return [seq_len, input_pos]
+
+
+@torch_no_cache_prepare_metadata.register_fake
+def torch_no_cache_prepare_metadata_fake(
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_len: torch.Tensor,
+    input_pos: torch.Tensor,
+    cache_loc: torch.Tensor,
+    pages_per_seq: torch.Tensor,
+    page_size: int,
+) -> List[torch.Tensor]:
+    """Fake implementation for torch no-cache prepare metadata."""
+    return [seq_len.clone(), input_pos.clone()]
+
+
+@AttentionRegistry.register("torch-no-cache")
+class TorchNoCacheAttention(AttentionDescriptor):
+    """Torch attention backend without KV cache for growing sequences."""
+
+    @classmethod
+    def is_paged(cls) -> bool:
+        return False
+
+    @classmethod
+    def get_attention_layout(cls) -> AttentionLayout:
+        return "bsnd"
+
+    @classmethod
+    def get_num_qkv_args(cls) -> int:
+        return 3
+
+    @classmethod
+    def get_source_attention_op(cls) -> OpOverloadPacket:
+        return torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
+
+    @classmethod
+    def get_cached_attention_op(cls) -> MHACallable:
+        assert False, "TorchNoCacheAttention does not support KV cache"
+
+    @classmethod
+    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
+        return torch.ops.auto_deploy.torch_no_cache_prepare_metadata, 2
+
+    @classmethod
+    def get_cache_initializers(
+        cls, source_attn_node: Node, cache_config: CacheConfig
+    ) -> CacheInitializerDict:
+        assert False, "TorchNoCacheAttention does not support KV cache"
+
+    @classmethod
+    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
+        return {}
+
+    @classmethod
+    def get_constants(cls, source_attn_node: Node) -> List[Constant]:
+        return []
