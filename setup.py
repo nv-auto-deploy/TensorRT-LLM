@@ -112,6 +112,7 @@ package_data += [
     'tools/plugin_gen/templates/*',
     'bench/build/benchmark_config.yml',
     'evaluate/lm_eval_tasks/**/*',
+    "_torch/auto_deploy/config/*.yaml",
 ]
 
 
