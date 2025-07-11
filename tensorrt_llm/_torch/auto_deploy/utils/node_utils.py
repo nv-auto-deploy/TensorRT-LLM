@@ -116,8 +116,6 @@ def extract_weight_node(mm_node: Node) -> int:
         allowed_ops = {
             torch.ops.aten.to.dtype,
             torch.ops.aten.view.default,
-            # there could be torch_linear_simple.default between BMM node and the weight node
-            torch.ops.auto_deploy.torch_quant_fp8_linear,
         }
 
         if node.op == "get_attr":
