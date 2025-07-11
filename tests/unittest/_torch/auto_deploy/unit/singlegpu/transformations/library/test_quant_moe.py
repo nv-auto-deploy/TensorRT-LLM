@@ -54,6 +54,8 @@ def test_quantize_moe_transformation(quant_algo, expected_op):
 
         if quant_algo == "NVFP4":
             expert_params = num_experts * 3 * hidden_size * intermediate_size // 2
+            # 3 weights per expert, of shape [hidden_size, intermediate_size] or
+            # [intermediate_size, hidden_size], shape will be halved to store quantized uint8 weight
             return gate_params + expert_params
         else:
             return n
