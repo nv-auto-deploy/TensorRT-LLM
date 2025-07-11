@@ -171,9 +171,6 @@ class ADEngine(ModelEngine):
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
         previous_batch_indices: List[int] = []
-        # We keep track of the batch index for the requests.
-        # This is needed by the overlap scheduler.
-        batch_idx = 0
 
         # look at context requests first
         for request in context_requests:
@@ -181,12 +178,12 @@ class ADEngine(ModelEngine):
             input_ids.append(request.get_tokens(0))
             input_pos.append(request.context_current_position)
 
-            request.py_batch_idx = batch_idx
-            batch_idx += 1
+            request.py_batch_idx = request.seq_slot
             last_logit_only.append(True)
 
-        # look at extend+generate requests next
-        for request in chain(extend_requests, gen_requests):
+        # look at generate requests next
+        # TODO: we should also handle extend requests (for speculative decoding) here
+        for request in gen_requests:
             # new_tokens are provided when the overlap scheduler is enabled.
             if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
                 input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
@@ -194,12 +191,8 @@ class ADEngine(ModelEngine):
             else:
                 previous_batch_indices.append(request.py_batch_idx)
                 input_pos.append(request.max_beam_num_tokens)
-            # check for draft tokens
-            if request.draft_tokens:
-                input_ids[-1].extend([t for t in request.draft_tokens])
 
-            request.py_batch_idx = batch_idx
-            batch_idx += 1
+            request.py_batch_idx = request.seq_slot
 
             # return all logits
             last_logit_only.append(False)
@@ -220,7 +213,6 @@ class ADEngine(ModelEngine):
         si.nest_sequences(input_ids)
         si.update_pos(input_pos, reset=True)
         si.assign_cache_loc(page_assignments)
-
         return last_logit_only
 
     def _compute_logits(self) -> List[torch.Tensor]:
@@ -336,7 +328,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         sampler=sampler,
         dist=mpi_dist,
         max_num_sequences=max_num_sequences,
-        disable_overlap_scheduler=False,
+        disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         max_input_len=ad_config.max_input_len,
         max_batch_size=ad_config.max_batch_size,
         max_draft_tokens=max_draft_tokens,

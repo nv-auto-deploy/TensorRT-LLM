@@ -72,11 +72,9 @@ class LlmArgs(BaseLlmArgs):
 
     ### RUNTIME FEATURES ###########################################################################
     disable_overlap_scheduler: bool = Field(
-        default=True,
+        default=False,
         description="Disable the overlap scheduler. This is a temporary field until the overlap "
         "scheduler is supported (https://github.com/NVIDIA/TensorRT-LLM/issues/4364).",
-        frozen=True,
-        repr=False,
     )
 
     mixed_sampler: bool = Field(
@@ -139,7 +137,7 @@ class LlmArgs(BaseLlmArgs):
     visualize: bool = Field(default=False, description="Whether to visualize the model graph.")
 
     ### SEQUENCE INTERFACE CONFIG ##################################################################
-    max_seq_len: int = Field(default=512, ge=1, description="The maximum sequence length.")
+    max_seq_len: int = Field(default=128, ge=1, description="The maximum sequence length.")
     max_batch_size: int = Field(default=8, ge=1, description="The maximum batch size.")
     attn_page_size: int = Field(
         default=64,
