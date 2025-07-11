@@ -9,9 +9,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, _ParallelConfig
 from ...llmapi.utils import get_type_repr
 from .models import ModelFactory, ModelFactoryRegistry
+from .transform.interface import TransformConfig
 from .utils._config import DynamicYamlMixInForSettings
 
 PathLike = Union[str, Path]
+InferenceOptimizerConfig = Dict[str, TransformConfig]
 
 
 def _get_config_dict() -> SettingsConfigDict:
@@ -165,6 +167,13 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     )
 
     visualize: bool = Field(default=False, description="Whether to visualize the model graph.")
+
+    ### NEW INFERENCE OPTIMIZER CONFIG #############################################################
+    transforms: InferenceOptimizerConfig = Field(
+        default_factory=dict,
+        description="A dictionary of transform configurations. The key is the transform name and "
+        "the value is the transform configuration.",
+    )
 
     ### SEQUENCE INTERFACE CONFIG ##################################################################
     max_input_len: int = Field(default=1024, description="The maximum input length.")
