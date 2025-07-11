@@ -399,15 +399,16 @@ class SequenceInfo:
         seq_lens = [len(ids) for ids in input_ids]
         self.seq_len.zero_()
         self.seq_len[: len(seq_lens)].copy_(torch.tensor(seq_lens), non_blocking=True)
-
+        # We'll preserve the dtype of the input_ids tensor if it is a tensor, otherwise we'll use int
+        dtype = input_ids.dtype if isinstance(input_ids, torch.Tensor) else torch.int
         # set new input_ids as new tensor from flattened input_ids
         ids_list = [
             val
             for lst in input_ids
             for val in (lst.detach().tolist() if isinstance(lst, torch.Tensor) else lst)
         ]
-        self.input_ids = torch.tensor(ids_list, dtype=torch.int).to(self.device)
-
+        self.input_ids = torch.tensor(ids_list, dtype=dtype).to(self.device)
+        
         # set derivative properties
         self._sequence_lengths = seq_lens
 
