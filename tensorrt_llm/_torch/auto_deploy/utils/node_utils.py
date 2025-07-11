@@ -107,13 +107,18 @@ def get_quantization_params_from_linear_node(linear_op: torch.fx.node.Node):
 
 
 def extract_weight_node(mm_node: Node) -> int:
-    """Extracts the weight node from the given matmul node."""
+    """Extracts the weight node from the given linear or BMM node. We assume torch.bmm(activation, weight)"""
 
     def find_get_attr_node(node: Node) -> Node:
         """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
         # If node is a get_attr node return node
         # List of nodes allowed in between a get_attr node and the matmul node
-        allowed_ops = {torch.ops.aten.to.dtype}
+        allowed_ops = {
+            torch.ops.aten.to.dtype,
+            torch.ops.aten.view.default,
+            # there could be torch_linear_simple.default between BMM node and the weight node
+            torch.ops.auto_deploy.torch_quant_fp8_linear,
+        }
 
         if node.op == "get_attr":
             return node

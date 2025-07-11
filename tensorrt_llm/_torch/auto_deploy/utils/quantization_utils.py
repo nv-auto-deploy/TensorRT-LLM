@@ -477,13 +477,8 @@ def should_skip_quantization(
     else:
         if not (is_linear_op(node_or_name, include_quantization=False) or is_bmm_op(node_or_name)):
             return True
-        try:
-            param_name, _ = extract_param_names_from_lin_node(node_or_name)
-            modname, _, _ = param_name.rpartition(".")
-        except Exception:
-            # Cannot trace parameter — likely a dynamic tensor.
-            # Assume it’s not explicitly excluded and allow quantization to proceed.
-            return False
+        param_name, _ = extract_param_names_from_lin_node(node_or_name)
+        modname, _, _ = param_name.rpartition(".")
 
     return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
 
