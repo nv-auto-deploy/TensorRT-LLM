@@ -271,6 +271,7 @@ def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads
             V_D_HEAD,
             SEQ_BLOCK_SIZE,
             HEAD_BLOCK_SIZE,
+            -1,  # SLIDING_WINDOW: -1 means no sliding window
         )
 
     run(q, k_cache, v_cache, output_tensor, output_logsumexp)
@@ -331,6 +332,8 @@ def test_attention_with_kv_stage2():
             N_HEADS,
             D_HEAD,
             SEQ_BLOCK_SIZE,
+            False,  # HAS_SINKS: no sink tokens used
+            None,  # sinks_ptr: no sink tokens used
         )
 
     run()
@@ -535,6 +538,9 @@ def test_context_attention_kv_flattened(q_d_head, v_d_head, n_heads, n_kv_heads,
         V_D_HEAD,
         SEQ_BLOCK,
         MAX_SEQ_LEN,
+        -1,  # SLIDING_WINDOW: -1 means no sliding window
+        False,  # HAS_SINKS: no sink tokens used
+        None,  # sinks_ptr: no sink tokens used
         num_stages=2,
     )
     assert torch.allclose(ref, output_tensor, atol=1e-2, rtol=1e-2)
