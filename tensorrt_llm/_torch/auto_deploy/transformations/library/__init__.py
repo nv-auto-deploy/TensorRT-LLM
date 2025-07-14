@@ -11,6 +11,7 @@ from .quantization import *
 from .quantize_moe import *
 from .rope import *
 from .sharding import *
+from .rms_norm import *
 
 try:
     from .visualization import visualize_namespace

@@ -14,3 +14,4 @@ from .torch_rope import *
 from .triton_attention import *
 from .triton_rope import *
 from .trtllm_moe import *
+from .rms_norm import *

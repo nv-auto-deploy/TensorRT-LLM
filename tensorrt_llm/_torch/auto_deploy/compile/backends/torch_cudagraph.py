@@ -35,7 +35,7 @@ class CapturedGraph(nn.Module):
         self._out_buffer_flat: List[torch.Tensor] = None
         self._args_hash: Optional[Tuple[int, ...]] = None
         self.cuda_graph_batch_sizes = (
-            cuda_graph_batch_sizes
+            sorted(cuda_graph_batch_sizes, reverse=True)
             if cuda_graph_batch_sizes is not None
             else self._get_graph_batch_sizes(self.max_batch_size)
         )
@@ -88,7 +88,7 @@ class CapturedGraph(nn.Module):
         batch_sizes.update(range(multiplier, max_bs + 1, multiplier))
 
         # return as sorted list
-        return sorted(batch_sizes)
+        return sorted(batch_sizes, reverse=True)
 
     def capture_graph(self, *args, **kwargs):
         """Capture and pre-fetch the graph for variable batch size."""
