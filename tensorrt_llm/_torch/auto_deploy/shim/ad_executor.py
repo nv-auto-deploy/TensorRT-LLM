@@ -89,8 +89,7 @@ class ADEngine(ModelEngine):
         max_seq_len = ad_config.max_seq_len
         attn_page_size = ad_config.attn_page_size
         max_num_tokens = ad_config.max_num_tokens
-        max_beam_width = ad_config.max_beam_width
-        ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}, {max_beam_width=}")
+        ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}")
 
         # initialize seq info object
         seq_info = SequenceInfo(
@@ -112,7 +111,7 @@ class ADEngine(ModelEngine):
         )
 
         # construct engine
-        return cls(build_and_optimize, seq_info, device, max_beam_width)
+        return cls(build_and_optimize, seq_info, device)
 
     @torch.inference_mode()
     def __init__(
@@ -120,7 +119,6 @@ class ADEngine(ModelEngine):
         get_inference_model: GetInferenceModel,
         seq_info: SequenceInfo,
         device: DeviceLikeType,
-        max_beam_width: Optional[int] = 1,
     ) -> None:
         """Initialize the engine with model and sequence information."""
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
@@ -133,7 +131,6 @@ class ADEngine(ModelEngine):
         self.iter_counter = 0
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
-        self.max_beam_width = max_beam_width
         self.enable_attention_dp = False
 
         # construct cache sequence interface
@@ -315,7 +312,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         max_seq_len=ad_config.max_seq_len,
         max_draft_tokens=max_draft_tokens,
         max_num_sequences=max_num_sequences,
-        max_beam_width=executor_config.max_beam_width,
+        max_beam_width=ad_config.max_beam_width,
         mixed_sampler=ad_config.mixed_sampler,
     )
     sampler = TorchSampler(sampler_args)

@@ -231,6 +231,11 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs):
         frozen=True,
     )
     garbage_collection_gen0_threshold: int = Field(default=20000, description="See TorchLlmArgs.")
+    max_beam_width: int = Field(
+        default=1,
+        description="The maximum beam width. >1 is not supported by AutoDeploy.",
+        frozen=True,
+    )
 
     ### VALIDATION #################################################################################
     @field_validator("build_config", mode="before")
