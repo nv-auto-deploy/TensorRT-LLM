@@ -427,7 +427,6 @@ _SMALL_MODEL_CONFIGS = {
             "num_experts_per_token": 2,
             "q_lora_rank": 128,
         },
-        
     },
     "Qwen/Qwen2.5-3B-Instruct": {
         "model": _hf_model_dir_or_hub_id(
