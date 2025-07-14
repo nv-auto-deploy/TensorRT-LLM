@@ -160,9 +160,8 @@ class ADEngine(ModelEngine):
             ResourceManagerType.KV_CACHE_MANAGER
         )
 
-        # requests in order of context, extend (generate with draft), generate
+        # requests in order of context, generate
         context_requests = scheduled_requests.context_requests
-        extend_requests = [r for r in scheduled_requests.generation_requests if r.draft_tokens]
         gen_requests = [r for r in scheduled_requests.generation_requests if not r.draft_tokens]
 
         # info to be extracted
@@ -203,7 +202,7 @@ class ADEngine(ModelEngine):
         for prev_batch_idx in previous_batch_indices:
             input_ids.append([new_tokens_list[prev_batch_idx]])
         # extract cache information for all requests
-        for request in chain(context_requests, extend_requests, gen_requests):
+        for request in chain(context_requests, gen_requests):
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
             page_assignments.append(cache_indices)

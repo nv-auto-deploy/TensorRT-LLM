@@ -85,8 +85,7 @@ class AutoDeployConfig(BaseModel):
     ### RUNTIME FEATURES ###########################################################################
     disable_overlap_scheduler: bool = Field(
         default=False,
-        description="Disable the overlap scheduler. This is a temporary field until the overlap "
-        "scheduler is supported (https://github.com/NVIDIA/TensorRT-LLM/issues/4364).",
+        description="Disable the overlap scheduler in trtllm runtime",
     )
 
     mixed_sampler: bool = Field(
