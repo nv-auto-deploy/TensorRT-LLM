@@ -408,7 +408,7 @@ class SequenceInfo:
             for val in (lst.detach().tolist() if isinstance(lst, torch.Tensor) else lst)
         ]
         self.input_ids = torch.tensor(ids_list, dtype=dtype).to(self.device)
-        
+
         # set derivative properties
         self._sequence_lengths = seq_lens
 

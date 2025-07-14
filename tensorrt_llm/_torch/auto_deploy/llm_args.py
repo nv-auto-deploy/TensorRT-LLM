@@ -111,6 +111,12 @@ class AutoDeployConfig(BaseModel):
         "supported in AutoDeploy.",
     )
 
+    max_beam_width: int = Field(
+        default=1,
+        description="The maximum beam width. >1 is not supported by AutoDeploy.",
+        frozen=True,
+    )
+
     # INFERENCE OPTIMIZER CONFIG ###################################################################
     attn_backend: Literal["flashinfer", "triton", "torch"] = Field(
         default="flashinfer", description="Attention backend to use."

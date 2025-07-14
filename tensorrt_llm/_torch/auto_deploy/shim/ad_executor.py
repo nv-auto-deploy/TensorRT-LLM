@@ -90,7 +90,9 @@ class ADEngine(ModelEngine):
         attn_page_size = ad_config.attn_page_size
         max_num_tokens = ad_config.max_num_tokens
         max_beam_width = ad_config.max_beam_width
-        ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}, {max_beam_width=}")
+        ad_logger.info(
+            f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}, {max_beam_width=}"
+        )
 
         # initialize seq info object
         seq_info = SequenceInfo(
@@ -120,7 +122,7 @@ class ADEngine(ModelEngine):
         get_inference_model: GetInferenceModel,
         seq_info: SequenceInfo,
         device: DeviceLikeType,
-        max_beam_width: Optional[int] = 1,
+        max_beam_width: int = 1,
     ) -> None:
         """Initialize the engine with model and sequence information."""
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
@@ -154,7 +156,7 @@ class ADEngine(ModelEngine):
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
         new_tokens: Optional[torch.Tensor] = None,
-    ) -> bool:
+    ) -> List[bool]:
         """Prepare inputs for AD Model from scheduled requests."""
         # cache manager
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -165,12 +167,15 @@ class ADEngine(ModelEngine):
         context_requests = scheduled_requests.context_requests
         gen_requests = [r for r in scheduled_requests.generation_requests if not r.draft_tokens]
 
+        # new_tokens is a tensor on the device, we need to convert it to a list of lists.
+        # can we avoid this additional gpu->cpu transfer?
+        new_tokens_list = new_tokens.flatten().cpu().tolist() if new_tokens is not None else None
+
         # info to be extracted
         input_ids: List[List[int]] = []
         input_pos: List[int] = []
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
-        previous_batch_indices: List[int] = []
 
         # look at context requests first
         for request in context_requests:
@@ -185,11 +190,11 @@ class ADEngine(ModelEngine):
         # TODO: we should also handle extend requests (for speculative decoding) here
         for request in gen_requests:
             # new_tokens are provided when the overlap scheduler is enabled.
-            if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
+            if new_tokens_list is None or request.is_dummy or request.py_batch_idx is None:
                 input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
                 input_pos.append(request.max_beam_num_tokens - 1)
             else:
-                previous_batch_indices.append(request.py_batch_idx)
+                input_ids.append([new_tokens_list[request.py_batch_idx]])
                 input_pos.append(request.max_beam_num_tokens)
 
             request.py_batch_idx = request.seq_slot
@@ -197,11 +202,6 @@ class ADEngine(ModelEngine):
             # return all logits
             last_logit_only.append(False)
 
-        # new_tokens is a tensor on the device, we need to convert it to a list of lists.
-        # can we avoid this additional gpu->cpu transfer?
-        new_tokens_list = new_tokens.flatten().cpu().tolist() if new_tokens is not None else None
-        for prev_batch_idx in previous_batch_indices:
-            input_ids.append([new_tokens_list[prev_batch_idx]])
         # extract cache information for all requests
         for request in chain(context_requests, gen_requests):
             # get cache indices
@@ -315,7 +315,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         max_seq_len=ad_config.max_seq_len,
         max_draft_tokens=max_draft_tokens,
         max_num_sequences=max_num_sequences,
-        max_beam_width=executor_config.max_beam_width,
+        max_beam_width=ad_config.max_beam_width,
         mixed_sampler=ad_config.mixed_sampler,
     )
     sampler = TorchSampler(sampler_args)
