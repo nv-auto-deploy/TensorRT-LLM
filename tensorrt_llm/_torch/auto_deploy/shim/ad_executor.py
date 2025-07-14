@@ -112,7 +112,7 @@ class ADEngine(ModelEngine):
         )
 
         # construct engine
-        return cls(build_and_optimize, seq_info, device)
+        return cls(build_and_optimize, seq_info, device, max_beam_width)
 
     @torch.inference_mode()
     def __init__(
@@ -120,6 +120,7 @@ class ADEngine(ModelEngine):
         get_inference_model: GetInferenceModel,
         seq_info: SequenceInfo,
         device: DeviceLikeType,
+        max_beam_width: int,
     ) -> None:
         """Initialize the engine with model and sequence information."""
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
@@ -132,7 +133,7 @@ class ADEngine(ModelEngine):
         self.iter_counter = 0
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
-        self.max_beam_width = 1
+        self.max_beam_width = max_beam_width
         self.enable_attention_dp = False
 
         # construct cache sequence interface
