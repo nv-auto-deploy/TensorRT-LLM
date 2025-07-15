@@ -13,7 +13,7 @@ from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from .._graph import canonicalize_graph
 
 
-def _repeat_kv_pattern1(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+def _repeat_kv_pattern1(hidden_states, n_rep) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
@@ -23,12 +23,12 @@ def _repeat_kv_pattern1(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def _repeat_kv_pattern2(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+def _repeat_kv_pattern2(hidden_states, n_rep) -> torch.Tensor:
     # using the aten op directly will force the contiguous call to be inserted
     return torch.ops.aten.contiguous.default(_repeat_kv_pattern1(hidden_states, n_rep))
 
 
-def _repeat_kv_repl(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+def _repeat_kv_repl(hidden_states, n_rep) -> torch.Tensor:
     return torch.ops.auto_deploy.torch_attention_repeat_kv(hidden_states, n_rep)
 
 
@@ -66,7 +66,7 @@ def match_repeat_kv(gm: GraphModule) -> None:
         )
 
     _register(_repeat_kv_pattern1)
-    _register(_repeat_kv_pattern2)
+    # _register(_repeat_kv_pattern2)
 
     num_matches = patterns.apply(graph)
     gm = canonicalize_graph(gm)
@@ -74,30 +74,28 @@ def match_repeat_kv(gm: GraphModule) -> None:
 
 
 
-def _sfdp_pattern_1(query, key, value, scaling, dropout):
+def _sfdp_pattern_1(query, key, value, attention_mask, scaling, dropout):
     attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
-    # causal_mask = attention_mask[:, :, :, : key.shape[-2]]
-    # attn_weights = attn_weights + causal_mask
+    attn_weights = attn_weights + attention_mask
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = F.dropout(attn_weights, p=dropout, training=False)
     attn_output = torch.matmul(attn_weights, value)
-    # attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output
 
 
-def _sfdp_replacement_1(query, key, value, scaling, dropout):
+def _sfdp_replacement_1(query, key, value, attention_mask, scaling, dropout):
     return torch.ops.auto_deploy.torch_attention_sdpa.default(
         query,
         key,
         value,
-        attn_mask=None,
+        attn_mask=attention_mask,
         dropout_p=dropout,
         is_causal=False,
         scale=scaling,
     )
 
 
-def _get_sfdp_patterns2() -> List[Dict[str, Any]]:
+def _get_sfdp_patterns1() -> List[Dict[str, Any]]:
     bs = 8
     seq_len = 16
     n_heads = 8
@@ -111,15 +109,66 @@ def _get_sfdp_patterns2() -> List[Dict[str, Any]]:
                 torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
                 torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
                 torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, 1, 1, seq_len, device="cuda", dtype=torch.bfloat16),
                 0.1234743,
                 0.85849734,
             ],
             "scalar_workaround": {"dropout": 0.85849734, "scaling": 0.1234743},
             "op_ignore_types": {
                 torch.ops.aten.to.dtype: (torch.dtype,),
+                torch.ops.aten.slice.Tensor: (int,),
             },
         }
     ]
+
+
+# This passes one unit test
+# def _sfdp_pattern_2(query, key, value, scaling, dropout):
+#     attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+#     # causal_mask = attention_mask[:, :, :, : key.shape[-2]]
+#     # attn_weights = attn_weights + causal_mask
+#     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+#     attn_weights = F.dropout(attn_weights, p=dropout, training=False)
+#     attn_output = torch.matmul(attn_weights, value)
+#     # attn_output = attn_output.transpose(1, 2).contiguous()
+#     return attn_output
+
+
+# def _sfdp_replacement_2(query, key, value, scaling, dropout):
+#     return torch.ops.auto_deploy.torch_attention_sdpa.default(
+#         query,
+#         key,
+#         value,
+#         attn_mask=None,
+#         dropout_p=dropout,
+#         is_causal=False,
+#         scale=scaling,
+#     )
+
+
+# def _get_sfdp_patterns2() -> List[Dict[str, Any]]:
+#     bs = 8
+#     seq_len = 16
+#     n_heads = 8
+#     hidden_size = 512
+#     head_dim = hidden_size // n_heads
+#     return [
+#         {
+#             "search_fn": _sfdp_pattern_2,
+#             "replace_fn": _sfdp_replacement_2,
+#             "dummy_args": [
+#                 torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+#                 torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+#                 torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+#                 0.1234743,
+#                 0.85849734,
+#             ],
+#             "scalar_workaround": {"dropout": 0.85849734, "scaling": 0.1234743},
+#             "op_ignore_types": {
+#                 torch.ops.aten.to.dtype: (torch.dtype,),
+#             },
+#         }
+#     ]
 
 
 def match_eager_attention(gm: GraphModule) -> None:
@@ -130,12 +179,65 @@ def match_eager_attention(gm: GraphModule) -> None:
     graph = gm.graph
     patterns = ADPatternMatcherPass()
 
-    for pattern_config in _get_sfdp_patterns2():
+    for pattern_config in _get_sfdp_patterns1():
         register_ad_pattern(**pattern_config, patterns=patterns)
 
     # Apply patterns and clean-up
-    patterns.apply(graph)
+    num_matches = patterns.apply(graph)
     gm = canonicalize_graph(gm)
+    ad_logger.info(f"Found and matched {num_matches} Eager Attention patterns")
+
+
+def _grouped_attn_pattern(q, k, v, n_rep, attn_mask, dropout_p, scale):
+    k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
+    v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
+    return torch.ops.auto_deploy.torch_attention_sdpa.default(
+        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
+    )
+
+
+def _grouped_attn_replacement(q, k, v, n_rep, attn_mask, dropout_p, scale):
+    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
+        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
+    )
+
+
+def match_grouped_attention(gm: GraphModule) -> None:
+    """Match and replace the grouped attention pattern using pattern matcher util."""
+    graph = gm.graph
+    patterns = ADPatternMatcherPass()
+
+    # Dummy inputs: meta tensors for FX tracing
+    bs, seqlen, n_heads, hidden_size = 8, 16, 8, 512
+    head_dim = hidden_size // n_heads
+
+    dummy_args = [
+        torch.randn(bs, n_heads, seqlen, head_dim, device="meta", dtype=torch.float16),  # q
+        torch.randn(bs, 1, seqlen, head_dim, device="meta", dtype=torch.float16),  # k
+        torch.randn(bs, 1, seqlen, head_dim, device="meta", dtype=torch.float16),  # v
+        7,  # n_rep
+        torch.randn(bs, 1, 1, seqlen, device="meta", dtype=torch.float16),  # attn_mask
+        0.12345,  # dropout
+        0.56789,  # scale
+    ]
+
+    scalar_workaround = {"scale": 0.56789, "dropout_p": 0.12345, "n_rep": 7}
+
+    register_ad_pattern(
+        search_fn=_grouped_attn_pattern,
+        replace_fn=_grouped_attn_replacement,
+        patterns=patterns,
+        dummy_args=dummy_args,
+        # trace_fn=fwd_only,
+        op_ignore_types={
+            # torch.ops.aten.to.dtype: (torch.dtype,),
+        },
+        scalar_workaround=scalar_workaround,
+    )
+
+    num_matches = patterns.apply(graph)
+    gm = canonicalize_graph(gm)
+    ad_logger.info(f"Found and matched {num_matches} Grouped Attention patterns")
 
 
 
@@ -308,7 +410,7 @@ def match_eager_attention2(gm: GraphModule) -> GraphModule:
     ad_logger.info(f"Found {num_eager_patterns} eager attention patterns")
 
 
-def match_grouped_attention(gm: GraphModule) -> None:
+def match_grouped_attention2(gm: GraphModule) -> GraphModule:
     """
     Match and replace the grouped attention pattern in fx graphs.
 
