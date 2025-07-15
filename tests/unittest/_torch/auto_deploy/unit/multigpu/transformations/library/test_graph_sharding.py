@@ -16,7 +16,9 @@ from tensorrt_llm._torch.auto_deploy.transformations.library import (
     ShardingConfig,
     TPShardingInfo,
     detect_column_row_shard,
-    sharding_executor,
+)
+from tensorrt_llm._torch.auto_deploy.transformations.library.base_transformations import (
+    transformation_executor,
 )
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 
@@ -148,7 +150,7 @@ def _run_job(
     def transform_func(gm):
         sharding_config = ShardingConfig()
         detect_column_row_shard(gm, rank, world_size, sharding_config)
-        sharding_executor(sharding_config)
+        transformation_executor(sharding_config)
 
     def combined_graph_check(gm) -> bool:
         # Check for expected distributed operations
@@ -166,31 +168,6 @@ def _run_job(
         check_transformed_graph=combined_graph_check,
         _get_expected_num_params=_get_expected_num_params,
     )
-
-    # Test pattern detection - create expected transformations for validation
-    gm = torch_export_to_gm(model, args=(x,), clone=True)
-    expected_transformations = []
-    for node in gm.graph.nodes:
-        if is_op(node, {torch.ops.aten.addmm, torch.ops.aten.linear}):
-            expected_transformations.append(
-                TPShardingInfo(
-                    anchor_gm=gm,
-                    anchor_node=node,
-                    dim=0,  # Simple shard uses dim=0
-                    rank=rank,
-                    world_size=world_size,
-                    add_dist=True,
-                    min_local_shape=1 if model_cls != GQA_Block else num_features // num_heads,
-                )
-            )
-
-    # get detected transformations
-    sharding_config = ShardingConfig()
-    detect_column_row_shard(gm, rank, world_size, sharding_config)
-    detected_transformations = sharding_config.tp_sharing_transformations
-
-    # Run pattern detection test
-    run_pattern_detection_test(detected_transformations, expected_transformations)
 
 
 def _run_pattern_detection_job(
@@ -291,7 +268,7 @@ def _run_pattern_detection_job(
     # get detected transformations
     sharding_config = ShardingConfig()
     detect_column_row_shard(gm, rank, world_size, sharding_config)
-    detected_transformations = sharding_config.tp_sharing_transformations
+    detected_transformations = sharding_config.transformation_list
 
     # Run pattern detection test
     run_pattern_detection_test(detected_transformations, expected_transformations)
@@ -327,8 +304,9 @@ def test_sharding(model_cls: Type[nn.Module], dist_op_expected: str, bias: bool,
 def test_sharding_pattern_detection(
     model_cls: Type[nn.Module], dist_op_expected: str, bias: bool, world_size: int
 ):
-    """
+    """Test pattern detection logic without distributed execution.
+
+    This test verifies only the pattern detection logic with provided world_size.
     No need to run distributed job, can be run on single process.
-    This test is to verify only the pattern detection logic, with p6rovided world_size.
     """
     _run_pattern_detection_job(model_cls, bias, 0, world_size)

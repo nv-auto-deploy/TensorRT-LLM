@@ -1,7 +1,7 @@
 """A library of transformation passes."""
 
 from .attention import *
-from .base import *
+from .base_transformations import *
 from .collectives import *
 from .eliminate_redundant_transposes import *
 from .ep_sharding import *

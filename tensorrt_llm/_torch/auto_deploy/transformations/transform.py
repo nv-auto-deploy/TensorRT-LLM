@@ -1,11 +1,9 @@
 """High-level entrypoint to transform a model into an efficient inference model."""
 
 import gc
-from abc import ABC
 
 import torch
 import torch.nn as nn
-from pydantic import BaseModel, ConfigDict
 
 from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
@@ -36,42 +34,9 @@ from .library import (
     optimize_rope,
     quantize,
     resize_kv_cache,
-    sharding_executor,
     update_in_out_nodes,
 )
-
-
-class TransformationInfo(BaseModel, ABC):
-    """Abstract base class for transformation configurations."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    anchor_gm: torch.fx.GraphModule
-    anchor_node: torch.fx.Node
-
-    def __eq__(self, other):
-        """Custom equality comparison ignoring GraphModule and Node objects."""
-        if not isinstance(other, self.__class__):
-            return False
-
-        # Compare all fields except anchor_gm and anchor_node
-        self_dict = self.model_dump(exclude={"anchor_gm", "anchor_node"})
-        other_dict = other.model_dump(exclude={"anchor_gm", "anchor_node"})
-
-        # Compare node names instead of objects
-        self_dict["anchor_node_name"] = getattr(self.anchor_node, "name", str(self.anchor_node))
-        other_dict["anchor_node_name"] = getattr(other.anchor_node, "name", str(other.anchor_node))
-
-        return self_dict == other_dict
-
-    def __hash__(self):
-        """Custom hash function for set operations."""
-        # Create a hashable representation excluding anchor_gm and anchor_node
-        hashable_dict = self.model_dump(exclude={"anchor_gm", "anchor_node"})
-        hashable_dict["anchor_node_name"] = getattr(self.anchor_node, "name", str(self.anchor_node))
-
-        # Convert dict to tuple of sorted items for hashing
-        return hash(tuple(sorted(hashable_dict.items())))
+from .library.base_transformations import transformation_executor
 
 
 class InferenceOptimizer:
@@ -152,8 +117,7 @@ class InferenceOptimizer:
         # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
         optimize_rope(egm)
 
-        # TODO (gkwasniewski): if present, infer sharding parameters (tp_size, row/column sharding)
-        # from the model config.
+        # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
         sharding_config = ShardingConfig()
 
         # run TP sharding across ranks
@@ -167,7 +131,7 @@ class InferenceOptimizer:
         # run BMM sharding across ranks
         dp_bmm_shard(egm, local_rank, world_size)
 
-        sharding_executor(sharding_config)
+        transformation_executor(sharding_config)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
         # subsequent optimization passes. Lift state_dict to meta as shape propagation involves device check

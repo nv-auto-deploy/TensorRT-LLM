@@ -1,9 +1,13 @@
 """Base classes for transformations."""
 
-from abc import ABC
+from abc import ABC, abstractmethod
+from typing import List
 
 import torch
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+
+from ...utils.logger import ad_logger
+from .._graph import canonicalize_graph
 
 
 class TransformationInfo(BaseModel, ABC):
@@ -37,3 +41,36 @@ class TransformationInfo(BaseModel, ABC):
 
         # Convert dict to tuple of sorted items for hashing
         return hash(tuple(sorted(hashable_dict.items())))
+
+    @abstractmethod
+    def apply(self) -> None:
+        """Apply the transformation to the graph module.
+
+        This method must be implemented by each transformation class.
+        """
+        pass
+
+
+class TransformationConfig(BaseModel):
+    """Configuration for transformations."""
+
+    transformation_list: List[TransformationInfo] = Field(default_factory=list)
+
+
+def transformation_executor(config: TransformationConfig) -> None:
+    """Apply transformations to the graph module.
+
+    Args:
+        config: Transformation configuration containing list of transformations to apply
+    """
+    gms = set()
+    for transformation in config.transformation_list:
+        if transformation.anchor_gm is None or transformation.anchor_node is None:
+            continue
+        gms.add(transformation.anchor_gm)
+        transformation.apply()
+
+    # canonicalize and return
+    for gm in gms:
+        gm = canonicalize_graph(gm)
+        ad_logger.debug("After applying graph transformations: " + str(gm))

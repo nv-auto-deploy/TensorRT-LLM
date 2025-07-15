@@ -24,7 +24,7 @@ from typing import Callable, DefaultDict, Dict, List, Set
 
 import torch
 import torch.nn as nn
-from pydantic import BaseModel, Field
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
@@ -37,7 +37,7 @@ from ...utils.node_utils import (
 )
 from ...utils.quantization_utils import QuantizationImpl
 from .._graph import canonicalize_graph
-from .base import TransformationInfo
+from .base_transformations import TransformationConfig, TransformationInfo
 
 
 class TPShardingInfo(TransformationInfo):
@@ -49,12 +49,30 @@ class TPShardingInfo(TransformationInfo):
     add_dist: bool = True
     min_local_shape: int = 1
 
+    def apply(self) -> None:
+        """Apply TP sharding transformation to the graph module."""
+        _insert_sharded_matmul(
+            gm=self.anchor_gm,
+            node=self.anchor_node,
+            dim=self.dim,
+            rank=self.rank,
+            world_size=self.world_size,
+            add_dist=self.add_dist,
+            min_local_shape=self.min_local_shape,
+        )
+
 
 class BMMShardingInfo(TransformationInfo):
     """Configuration for BMM sharing transformations."""
 
     rank: int
     world_size: int
+
+    def apply(self) -> None:
+        """Apply BMM sharding transformation to the graph module."""
+        # TODO: Implement BMM sharding logic
+        # This would involve slicing the batch dimension and adding all_gather
+        pass
 
 
 class EPShardingInfo(TransformationInfo):
@@ -63,14 +81,20 @@ class EPShardingInfo(TransformationInfo):
     rank: int
     world_size: int
 
+    def apply(self) -> None:
+        """Apply EP sharding transformation to the graph module."""
+        # TODO: Implement EP sharding logic
+        # This would involve expert parallelism transformations
+        pass
 
-class ShardingConfig(BaseModel):
+
+class ShardingConfig(TransformationConfig):
     """Configuration for sharding the model."""
 
     tp_size: int = 1
     dp_size: int = 1
     ep_size: int = 1
-    tp_sharing_transformations: List[TPShardingInfo] = Field(default_factory=list)
+    transformation_list: List[TPShardingInfo] = Field(default_factory=list)
 
 
 def _load_hook(
@@ -114,8 +138,8 @@ def _insert_sharded_matmul(
     world_size: int,
     add_dist: bool = False,
     min_local_shape: int = 1,
-):
-    """Replaces the matmul node with a new matmul node that accepts sharded weights.
+) -> None:
+    """Replace the matmul node with a new matmul node that accepts sharded weights.
 
     The state_dict is also updated to contain the sharded weights.
     """
@@ -432,7 +456,7 @@ def detect_column_row_shard(
                 )
 
     ad_logger.info(f"Found {num_shards} TP shards")
-    sharding_config.tp_sharing_transformations.extend(tp_shards)
+    sharding_config.transformation_list.extend(tp_shards)
 
 
 def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> None:
@@ -560,32 +584,3 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> None:
         gm = canonicalize_graph(gm)
     ad_logger.debug("After sharding BMM: " + str(gm))
     ad_logger.info(f"Found {num_bmm_shards} BMM shards")
-
-
-def sharding_executor(config: ShardingConfig) -> None:
-    """
-    Apply sharding transformations to the model.
-    Args:
-        config: Sharding configuration
-    Returns:
-        None. Transformations are applied in place.
-    """
-    gms = set()
-    for transformation in config.tp_sharing_transformations:
-        if transformation.anchor_gm is None or transformation.anchor_node is None:
-            continue
-        gms.add(transformation.anchor_gm)
-        _insert_sharded_matmul(
-            gm=transformation.anchor_gm,
-            node=transformation.anchor_node,
-            dim=transformation.dim,
-            rank=transformation.rank,
-            world_size=transformation.world_size,
-            add_dist=transformation.add_dist,
-            min_local_shape=transformation.min_local_shape,
-        )
-
-    # canonicalize and return
-    for gm in gms:
-        gm = canonicalize_graph(gm)
-        ad_logger.debug("After sharding: " + str(gm))
