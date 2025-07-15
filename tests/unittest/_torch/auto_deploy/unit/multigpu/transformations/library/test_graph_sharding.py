@@ -8,17 +8,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from _dist_test_utils import get_device_counts
-from _graph_test_helpers import run_pattern_detection_test, run_test
+from _graph_test_helpers import run_sharding_pattern_detection_test, run_test
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations.library import (
     ShardingConfig,
+    SplitDimension,
     TPShardingInfo,
     detect_column_row_shard,
-)
-from tensorrt_llm._torch.auto_deploy.transformations.library.base_transformations import (
-    transformation_executor,
+    sharding_transform_executor,
 )
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 
@@ -147,10 +146,10 @@ def _run_job(
     # now run the test
     op_expected = getattr(torch.ops.auto_deploy, dist_op_expected)
 
-    def transform_func(gm):
+    def transform_func(gm) -> None:
         sharding_config = ShardingConfig()
         detect_column_row_shard(gm, rank, world_size, sharding_config)
-        transformation_executor(sharding_config)
+        sharding_transform_executor(gm, sharding_config)
 
     def combined_graph_check(gm) -> bool:
         # Check for expected distributed operations
@@ -211,19 +210,18 @@ def _run_pattern_detection_job(
                     # for O layer, we expect:
                     # dim = 1, add_dist = True
                     if "o_proj" in node.args[1].name:
-                        dim = 1
-                        add_dist = True
+                        dim = SplitDimension.COLUMN
+                        dist_op = "all_reduce"
                     else:
-                        dim = 0
-                        add_dist = False
+                        dim = SplitDimension.ROW
+                        dist_op = None
                     expected_transformations.append(
                         TPShardingInfo(
-                            anchor_gm=gm,
-                            anchor_node=node,
-                            dim=dim,
+                            target_node=node.name,
+                            split_dim=dim,
                             rank=rank,
                             world_size=world_size,
-                            add_dist=add_dist,
+                            dist_op=dist_op,
                             min_local_shape=min_local_shape,
                         )
                     )
@@ -233,19 +231,18 @@ def _run_pattern_detection_job(
                     # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
                     # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
                     if "linear1" in node.args[1].name:
-                        dim = 0
-                        add_dist = False
+                        dim = SplitDimension.ROW
+                        dist_op = None
                     else:
-                        dim = 1
-                        add_dist = True
+                        dim = SplitDimension.COLUMN
+                        dist_op = "all_reduce"
                     expected_transformations.append(
                         TPShardingInfo(
-                            anchor_gm=gm,
-                            anchor_node=node,
-                            dim=dim,
+                            target_node=node.name,
+                            split_dim=dim,
                             rank=rank,
                             world_size=world_size,
-                            add_dist=add_dist,
+                            dist_op=dist_op,
                             min_local_shape=1,
                         )
                     )
@@ -255,12 +252,11 @@ def _run_pattern_detection_job(
                 if is_linear_op(node, include_quantization=True):
                     expected_transformations.append(
                         TPShardingInfo(
-                            anchor_gm=gm,
-                            anchor_node=node,
-                            dim=0,  # Simple shard uses dim=0
+                            target_node=node.name,
+                            split_dim=SplitDimension.ROW,  # Simple shard uses dim=0
                             rank=rank,
                             world_size=world_size,
-                            add_dist=True,
+                            dist_op="all_gather",
                             min_local_shape=1,
                         )
                     )
@@ -271,7 +267,7 @@ def _run_pattern_detection_job(
     detected_transformations = sharding_config.transformation_list
 
     # Run pattern detection test
-    run_pattern_detection_test(detected_transformations, expected_transformations)
+    run_sharding_pattern_detection_test(detected_transformations, expected_transformations)
 
 
 @pytest.mark.parametrize("device_count", get_device_counts())

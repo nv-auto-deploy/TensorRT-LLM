@@ -34,9 +34,9 @@ from .library import (
     optimize_rope,
     quantize,
     resize_kv_cache,
+    sharding_transform_executor,
     update_in_out_nodes,
 )
-from .library.base_transformations import transformation_executor
 
 
 class InferenceOptimizer:
@@ -72,7 +72,6 @@ class InferenceOptimizer:
         del model
         ad_logger.debug("original graph: " + str(egm))
         local_rank, world_size = dist_ad.get_rank_world_size()
-        world_size = 2
 
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
@@ -131,7 +130,7 @@ class InferenceOptimizer:
         # run BMM sharding across ranks
         dp_bmm_shard(egm, local_rank, world_size)
 
-        transformation_executor(sharding_config)
+        sharding_transform_executor(egm, sharding_config)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
         # subsequent optimization passes. Lift state_dict to meta as shape propagation involves device check

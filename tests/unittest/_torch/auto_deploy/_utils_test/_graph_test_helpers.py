@@ -8,9 +8,7 @@ from _torch_test_utils import all_close, reset_parameters
 from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations.library.base_transformations import (
-    TransformationInfo,
-)
+from tensorrt_llm._torch.auto_deploy.transformations.library.sharding import ShardingTransformInfo
 
 
 def count_parameters(model: torch.nn.Module):
@@ -110,9 +108,9 @@ def run_test(
     return gm
 
 
-def run_pattern_detection_test(
-    detected_transformations: List[TransformationInfo],
-    expected_transformations: List[TransformationInfo],
+def run_sharding_pattern_detection_test(
+    detected_transformations: List[ShardingTransformInfo],
+    expected_transformations: List[ShardingTransformInfo],
 ) -> None:
     """Compare two lists of transformations ignoring order.
 
@@ -124,4 +122,4 @@ def run_pattern_detection_test(
     detected_set = set(detected_transformations)
     expected_set = set(expected_transformations)
 
-    assert detected_set == expected_set
+    assert detected_set == expected_set, "Expected sharding pattern does not match detected pattern"
