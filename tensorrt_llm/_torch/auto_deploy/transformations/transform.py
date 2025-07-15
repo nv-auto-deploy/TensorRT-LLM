@@ -1,9 +1,11 @@
 """High-level entrypoint to transform a model into an efficient inference model."""
 
 import gc
+from abc import ABC
 
 import torch
 import torch.nn as nn
+from pydantic import BaseModel, ConfigDict
 
 from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
@@ -16,7 +18,6 @@ from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .export import torch_export_to_gm
 from .library import (
     ShardingConfig,
-    TransformationConfig,
     detect_column_row_shard,
     dp_bmm_shard,
     eliminate_redundant_transposes,
@@ -35,9 +36,42 @@ from .library import (
     optimize_rope,
     quantize,
     resize_kv_cache,
-    transformation_executor,
+    sharding_executor,
     update_in_out_nodes,
 )
+
+
+class TransformationInfo(BaseModel, ABC):
+    """Abstract base class for transformation configurations."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    anchor_gm: torch.fx.GraphModule
+    anchor_node: torch.fx.Node
+
+    def __eq__(self, other):
+        """Custom equality comparison ignoring GraphModule and Node objects."""
+        if not isinstance(other, self.__class__):
+            return False
+
+        # Compare all fields except anchor_gm and anchor_node
+        self_dict = self.model_dump(exclude={"anchor_gm", "anchor_node"})
+        other_dict = other.model_dump(exclude={"anchor_gm", "anchor_node"})
+
+        # Compare node names instead of objects
+        self_dict["anchor_node_name"] = getattr(self.anchor_node, "name", str(self.anchor_node))
+        other_dict["anchor_node_name"] = getattr(other.anchor_node, "name", str(other.anchor_node))
+
+        return self_dict == other_dict
+
+    def __hash__(self):
+        """Custom hash function for set operations."""
+        # Create a hashable representation excluding anchor_gm and anchor_node
+        hashable_dict = self.model_dump(exclude={"anchor_gm", "anchor_node"})
+        hashable_dict["anchor_node_name"] = getattr(self.anchor_node, "name", str(self.anchor_node))
+
+        # Convert dict to tuple of sorted items for hashing
+        return hash(tuple(sorted(hashable_dict.items())))
 
 
 class InferenceOptimizer:
@@ -78,8 +112,6 @@ class InferenceOptimizer:
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
         ############################################################################################
-        transformation_config = TransformationConfig()
-
         # quantization
         quantize(egm, self.factory.get_quant_config())
 
@@ -124,11 +156,9 @@ class InferenceOptimizer:
         # from the model config.
         sharding_config = ShardingConfig()
 
-        transformation_config.sharding_config = sharding_config
-
         # run TP sharding across ranks
-        sharding_config.tp_sharing_transformations = detect_column_row_shard(
-            egm, local_rank, world_size, self.ad_config.simple_shard_only
+        detect_column_row_shard(
+            egm, local_rank, world_size, sharding_config, self.ad_config.simple_shard_only
         )
 
         # run EP sharding across ranks
@@ -137,7 +167,7 @@ class InferenceOptimizer:
         # run BMM sharding across ranks
         dp_bmm_shard(egm, local_rank, world_size)
 
-        transformation_executor(transformation_config)
+        sharding_executor(sharding_config)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
         # subsequent optimization passes. Lift state_dict to meta as shape propagation involves device check

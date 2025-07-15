@@ -8,6 +8,7 @@ from _torch_test_utils import all_close, reset_parameters
 from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transformations.library.sharding import TransformationInfo
 
 
 def count_parameters(model: torch.nn.Module):
@@ -105,3 +106,23 @@ def run_test(
 
     # return graph module for further testing
     return gm
+
+
+def run_pattern_detection_test(
+    detected_transformations: List[TransformationInfo],
+    expected_transformations: List[TransformationInfo],
+) -> None:
+    """Compare two lists of transformations ignoring order.
+
+    Args:
+        detected_transformations: List of detected transformation configurations
+        expected_transformations: List of expected transformation configurations
+
+    Returns:
+        True if the lists contain the same transformations (ignoring order), False otherwise
+    """
+    # Convert to sets for unordered comparison
+    detected_set = set(detected_transformations)
+    expected_set = set(expected_transformations)
+
+    assert detected_set == expected_set
