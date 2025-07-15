@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# TODO (chenghao): Remove related kernels once we have a backend-specific implementation for attention.
+
 
 @torch.library.custom_op("auto_deploy::torch_attention_repeat_kv", mutates_args=())
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -115,6 +117,7 @@ def bsnd_grouped_sdpa(
     scale: Optional[float] = None,
     sinks: Optional[torch.Tensor] = None,
     sliding_window: Optional[int] = None,
+    logit_cap: Optional[float] = None,
 ) -> torch.Tensor:
     """Attention that assumes the input layout is bsnd.
 
@@ -143,6 +146,7 @@ def bsnd_grouped_sdpa_fake(
     scale=None,
     sinks=None,
     sliding_window=None,
+    logit_cap=None,
 ):
     """Fake implementation of bnsd grouped SDPA."""
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
