@@ -13,9 +13,7 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 class RMSNorm(torch.nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
-        self.weight = torch.nn.Parameter(
-            torch.ones(hidden_size, device="cuda")
-        )
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size, device="cuda"))
         self.eps = eps
 
     def forward(self, hidden_states):

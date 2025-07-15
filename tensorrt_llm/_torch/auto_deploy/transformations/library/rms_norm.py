@@ -3,11 +3,12 @@
 from functools import partial
 
 import torch
-from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch.fx import GraphModule
 
 from ...utils.logger import ad_logger
-from ...utils.pattern_matcher import register_ad_pattern
+
+# It is important to import ADPatternMatcherPass from pattern_matcher.py, not from torch._inductor.pattern_matcher
+from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from .._graph import canonicalize_graph
 
 
@@ -73,7 +74,7 @@ def match_rms_norm(gm: GraphModule, backend: str = "triton") -> GraphModule:
     ad_logger.info(f"Starting RMSNorm pattern matching with backend: {backend}")
 
     graph = gm.graph
-    patterns = PatternMatcherPass()
+    patterns = ADPatternMatcherPass()
 
     # Create dummy tensors for pattern matching
     bs = 2
