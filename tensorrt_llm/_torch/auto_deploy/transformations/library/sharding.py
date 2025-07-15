@@ -69,9 +69,6 @@ class ShardingTransformInfo(BaseModel, ABC):
 class ShardingConfig(BaseModel):
     """Configuration for sharding the model."""
 
-    tp_size: int = 1
-    dp_size: int = 1
-    ep_size: int = 1
     transformation_list: List[ShardingTransformInfo] = Field(default_factory=list)
 
 
