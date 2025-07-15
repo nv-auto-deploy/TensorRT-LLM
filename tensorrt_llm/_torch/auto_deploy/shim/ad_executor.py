@@ -176,7 +176,6 @@ class ADEngine(ModelEngine):
         input_pos: List[int] = []
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
-        previous_batch_indices: List[int] = []
 
         # look at context requests first
         for request in context_requests:
@@ -203,11 +202,6 @@ class ADEngine(ModelEngine):
             # return all logits
             last_logit_only.append(False)
 
-        # new_tokens is a tensor on the device, we need to convert it to a list of lists.
-        # can we avoid this additional gpu->cpu transfer?
-        new_tokens_list = new_tokens.flatten().cpu().tolist() if new_tokens is not None else None
-        for prev_batch_idx in previous_batch_indices:
-            input_ids.append([new_tokens_list[prev_batch_idx]])
         # extract cache information for all requests
         for request in chain(context_requests, gen_requests):
             # get cache indices
