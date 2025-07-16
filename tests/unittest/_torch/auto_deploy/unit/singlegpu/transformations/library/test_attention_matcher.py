@@ -167,14 +167,13 @@ class EagerAttentionModel(torch.nn.Module):
 
         # Add attention mask if enabled
         if self.has_mask:
-            # Create a simple causal mask for testing - make sure all tensors are on the same device
-            mask = torch.triu(
-                torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
-                diagonal=1,
+            # [1, 1, seq_len, seq_len] causal mask with -inf in the upper triangle
+            attn_mask = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=device), diagonal=1
             )
-            mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
-            attn_mask = torch.zeros_like(attn_weights, device=device)
-            attn_mask = attn_mask.masked_fill(mask, float("-inf"))
+            attn_mask = (
+                attn_mask.unsqueeze(0).unsqueeze(0).to(x.dtype)
+            )  # shape: [1, 1, seq_len, seq_len]
             attn_weights = attn_weights + attn_mask
 
         # Apply softmax, dtype conversion, and dropout
@@ -250,13 +249,13 @@ class ComplexEagerAttentionModel(torch.nn.Module):
 
         # Add attention mask if enabled
         if self.has_mask:
-            mask = torch.triu(
-                torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
-                diagonal=1,
+            # [1, 1, seq_len, seq_len] causal mask with -inf in the upper triangle
+            attn_mask = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=device), diagonal=1
             )
-            mask = mask.unsqueeze(0).unsqueeze(0)
-            attn_mask = torch.zeros_like(attn_weights, device=device)
-            attn_mask = attn_mask.masked_fill(mask, float("-inf"))
+            attn_mask = (
+                attn_mask.unsqueeze(0).unsqueeze(0).to(x.dtype)
+            )  # shape: [1, 1, seq_len, seq_len]
             attn_weights = attn_weights + attn_mask
 
         # Add a to_dtype node before softmax to match pattern in the graph
@@ -518,18 +517,8 @@ def test_match_repeat_kv(num_heads, num_kv_heads, model_cls, dtype):
     )
 
 
-# @pytest.mark.parametrize("has_mask", [True, False])
-# @pytest.mark.parametrize("use_division", [False, True])
-# @pytest.mark.parametrize(
-#     "dropout, rtol, atol",
-#     [
-#         (0.0, 1e-3, 1e-3),  # (dropout, rtol, atol) for no dropout
-#         (0.1, float("inf"), float("inf")),  # (dropout, rtol, atol) for dropout=0.1
-#     ],
-# )
-# @pytest.mark.parametrize("model_type", ["standard", "complex"])
-@pytest.mark.parametrize("has_mask", [False])
-@pytest.mark.parametrize("use_division", [False])
+@pytest.mark.parametrize("has_mask", [True, False])
+@pytest.mark.parametrize("use_division", [False, True])
 @pytest.mark.parametrize(
     "dropout, skip_output_assert",
     [
@@ -537,7 +526,7 @@ def test_match_repeat_kv(num_heads, num_kv_heads, model_cls, dtype):
         (0.1, True),  # skip all_close assertion for dropout=0.1 for its non-deterministic output
     ],
 )
-@pytest.mark.parametrize("model_type", ["standard"])
+@pytest.mark.parametrize("model_type", ["standard", "complex"])
 @torch.inference_mode()
 def test_match_eager_attention(has_mask, use_division, dropout, skip_output_assert, model_type):
     # Set a fixed seed for consistent dropout behavior in tests

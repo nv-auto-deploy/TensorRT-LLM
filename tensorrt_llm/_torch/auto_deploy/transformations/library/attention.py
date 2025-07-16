@@ -1,6 +1,6 @@
 """Pattern matching for detecting repeat_kv pattern from Huggingface models."""
 
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Type
 
 import torch
 import torch.nn.functional as F
@@ -10,7 +10,7 @@ from ...custom_ops.attention_interface import AttentionDescriptor
 from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
-from .._graph import canonicalize_graph
+from .._graph import canonicalize_graph, lift_to_meta
 
 
 def _repeat_kv_pattern1(hidden_states, n_rep) -> torch.Tensor:
@@ -69,11 +69,12 @@ def match_repeat_kv(gm: GraphModule) -> None:
     # _register(_repeat_kv_pattern2)
 
     num_matches = patterns.apply(graph)
-    gm = canonicalize_graph(gm)
+    with lift_to_meta(gm):
+        gm = canonicalize_graph(gm, shape_prop=True)
     ad_logger.info(f"Found and matched {num_matches} Repeat KV patterns")
 
 
-
+# with causal_mask, no division
 def _sfdp_pattern_1(query, key, value, attention_mask, scaling, dropout):
     attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
     attn_weights = attn_weights + attention_mask
@@ -95,7 +96,120 @@ def _sfdp_replacement_1(query, key, value, attention_mask, scaling, dropout):
     )
 
 
-def _get_sfdp_patterns1() -> List[Dict[str, Any]]:
+# no causal_mask, no division
+def _sfdp_pattern_2(query, key, value, scaling, dropout):
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=False)
+    attn_output = torch.matmul(attn_weights, value)
+    return attn_output
+
+
+def _sfdp_replacement_2(query, key, value, scaling, dropout):
+    return torch.ops.auto_deploy.torch_attention_sdpa.default(
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=dropout,
+        is_causal=False,
+        scale=scaling,
+    )
+
+
+# with causal_mask, with division
+def _sfdp_pattern_3(query, key, value, attention_mask, scaling, dropout):
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) / scaling
+    attn_weights = attn_weights + attention_mask
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=False)
+    attn_output = torch.matmul(attn_weights, value)
+    return attn_output
+
+
+def _sfdp_replacement_3(query, key, value, attention_mask, scaling, dropout):
+    scaling = 1.0 / scaling
+    return torch.ops.auto_deploy.torch_attention_sdpa.default(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        dropout_p=dropout,
+        is_causal=False,
+        scale=scaling,
+    )
+
+
+# no causal_mask, with division
+def _sfdp_pattern_4(query, key, value, scaling, dropout):
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) / scaling
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=False)
+    attn_output = torch.matmul(attn_weights, value)
+    return attn_output
+
+
+def _sfdp_replacement_4(query, key, value, scaling, dropout):
+    scaling = 1.0 / scaling
+    return torch.ops.auto_deploy.torch_attention_sdpa.default(
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=dropout,
+        is_causal=False,
+        scale=scaling,
+    )
+
+
+# no causal_mask, with division, 'complex' model
+def _sfdp_pattern_5(query, key, value, scaling, dropout):
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) / scaling
+    attn_weights = attn_weights.to(torch.float32)
+    attn_weights = F.softmax(attn_weights, dim=-1).to(query.dtype)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=False)
+    attn_output = torch.matmul(attn_weights, value)
+    return attn_output
+
+
+def _sfdp_replacement_5(query, key, value, scaling, dropout):
+    scaling = 1.0 / scaling
+    return torch.ops.auto_deploy.torch_attention_sdpa.default(
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=dropout,
+        is_causal=False,
+        scale=scaling,
+    )
+
+
+# with causal_mask, with division, 'complex' model
+def _sfdp_pattern_6(query, key, value, attention_mask, scaling, dropout):
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) / scaling
+    attn_weights = attn_weights + attention_mask
+    attn_weights = attn_weights.to(torch.float32)
+    attn_weights = F.softmax(attn_weights, dim=-1).to(query.dtype)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=False)
+    attn_output = torch.matmul(attn_weights, value)
+    return attn_output
+
+
+def _sfdp_replacement_6(query, key, value, attention_mask, scaling, dropout):
+    scaling = 1.0 / scaling
+    return torch.ops.auto_deploy.torch_attention_sdpa.default(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        dropout_p=dropout,
+        is_causal=False,
+        scale=scaling,
+    )
+
+
+def _get_sfdp_patterns() -> List[Dict[str, Any]]:
     bs = 8
     seq_len = 16
     n_heads = 8
@@ -110,65 +224,104 @@ def _get_sfdp_patterns1() -> List[Dict[str, Any]]:
                 torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
                 torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
                 torch.randn(bs, 1, 1, seq_len, device="cuda", dtype=torch.bfloat16),
-                0.1234743,
-                0.85849734,
+                0.1234743,  # scaling
+                0.85849734,  # dropout
             ],
             "scalar_workaround": {"dropout": 0.85849734, "scaling": 0.1234743},
             "op_ignore_types": {
                 torch.ops.aten.to.dtype: (torch.dtype,),
-                torch.ops.aten.slice.Tensor: (int,),
             },
-        }
+        },
+        {
+            "search_fn": _sfdp_pattern_2,
+            "replace_fn": _sfdp_replacement_2,
+            "dummy_args": [
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                0.234743,  # scaling
+                0.5849734,  # dropout
+            ],
+            "scalar_workaround": {"dropout": 0.5849734, "scaling": 0.234743},
+            "op_ignore_types": {
+                torch.ops.aten.to.dtype: (torch.dtype,),
+            },
+        },
+        {
+            "search_fn": _sfdp_pattern_3,
+            "replace_fn": _sfdp_replacement_3,
+            "dummy_args": [
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, 1, 1, seq_len, device="cuda", dtype=torch.bfloat16),
+                0.34743,  # scaling
+                0.849734,  # dropout
+            ],
+            "scalar_workaround": {
+                "scaling": 0.34743,
+                "dropout": 0.849734,
+            },
+            "op_ignore_types": {
+                torch.ops.aten.to.dtype: (torch.dtype,),
+            },
+        },
+        {
+            "search_fn": _sfdp_pattern_4,
+            "replace_fn": _sfdp_replacement_4,
+            "dummy_args": [
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                0.74321,  # scaling
+                0.9734,  # dropout
+            ],
+            "scalar_workaround": {
+                "scaling": 0.74321,
+                "dropout": 0.9734,
+            },
+            "op_ignore_types": {
+                torch.ops.aten.to.dtype: (torch.dtype,),
+            },
+        },
+        {
+            "search_fn": _sfdp_pattern_5,
+            "replace_fn": _sfdp_replacement_5,
+            "dummy_args": [
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                0.874321,  # scaling
+                0.89734,  # dropout
+            ],
+            "scalar_workaround": {
+                "scaling": 0.874321,
+                "dropout": 0.89734,
+            },
+            "op_ignore_types": {
+                torch.ops.aten.to.dtype: (torch.dtype,),
+            },
+        },
+        {
+            "search_fn": _sfdp_pattern_6,
+            "replace_fn": _sfdp_replacement_6,
+            "dummy_args": [
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+                torch.randn(bs, 1, 1, seq_len, device="cuda", dtype=torch.bfloat16),
+                0.634743,  # scaling
+                0.6849734,  # dropout
+            ],
+            "scalar_workaround": {
+                "scaling": 0.634743,
+                "dropout": 0.6849734,
+            },
+            "op_ignore_types": {
+                torch.ops.aten.to.dtype: (torch.dtype,),
+            },
+        },
     ]
-
-
-# This passes one unit test
-# def _sfdp_pattern_2(query, key, value, scaling, dropout):
-#     attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
-#     # causal_mask = attention_mask[:, :, :, : key.shape[-2]]
-#     # attn_weights = attn_weights + causal_mask
-#     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-#     attn_weights = F.dropout(attn_weights, p=dropout, training=False)
-#     attn_output = torch.matmul(attn_weights, value)
-#     # attn_output = attn_output.transpose(1, 2).contiguous()
-#     return attn_output
-
-
-# def _sfdp_replacement_2(query, key, value, scaling, dropout):
-#     return torch.ops.auto_deploy.torch_attention_sdpa.default(
-#         query,
-#         key,
-#         value,
-#         attn_mask=None,
-#         dropout_p=dropout,
-#         is_causal=False,
-#         scale=scaling,
-#     )
-
-
-# def _get_sfdp_patterns2() -> List[Dict[str, Any]]:
-#     bs = 8
-#     seq_len = 16
-#     n_heads = 8
-#     hidden_size = 512
-#     head_dim = hidden_size // n_heads
-#     return [
-#         {
-#             "search_fn": _sfdp_pattern_2,
-#             "replace_fn": _sfdp_replacement_2,
-#             "dummy_args": [
-#                 torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
-#                 torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
-#                 torch.randn(bs, n_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
-#                 0.1234743,
-#                 0.85849734,
-#             ],
-#             "scalar_workaround": {"dropout": 0.85849734, "scaling": 0.1234743},
-#             "op_ignore_types": {
-#                 torch.ops.aten.to.dtype: (torch.dtype,),
-#             },
-#         }
-#     ]
 
 
 def match_eager_attention(gm: GraphModule) -> None:
@@ -179,7 +332,7 @@ def match_eager_attention(gm: GraphModule) -> None:
     graph = gm.graph
     patterns = ADPatternMatcherPass()
 
-    for pattern_config in _get_sfdp_patterns1():
+    for pattern_config in _get_sfdp_patterns():
         register_ad_pattern(**pattern_config, patterns=patterns)
 
     # Apply patterns and clean-up
@@ -228,218 +381,13 @@ def match_grouped_attention(gm: GraphModule) -> None:
         replace_fn=_grouped_attn_replacement,
         patterns=patterns,
         dummy_args=dummy_args,
-        # trace_fn=fwd_only,
-        op_ignore_types={
-            # torch.ops.aten.to.dtype: (torch.dtype,),
-        },
+        op_ignore_types={},
         scalar_workaround=scalar_workaround,
     )
 
     num_matches = patterns.apply(graph)
     gm = canonicalize_graph(gm)
     ad_logger.info(f"Found and matched {num_matches} Grouped Attention patterns")
-
-
-
-def match_repeat_kv2(gm: GraphModule) -> None:
-    """
-    Match and replace the repeat_kv pattern in fx graphs.
-
-    The pattern is:
-    unsqueeze -> expand -> reshape -> [optional] contiguous
-
-    This is replaced with torch.ops.auto_deploy.torch_attention_repeat_kv.
-    """
-    graph = gm.graph
-
-    num_kv_patterns = 0
-
-    # Iterate through nodes in the graph
-    for node in list(graph.nodes):
-        # Look for reshape nodes that could be the end of our pattern
-        if is_op(node, torch.ops.aten.reshape):
-            match_info = _match_repeat_kv_pattern(node)
-            if match_info:
-                ad_logger.debug(f"Found repeat_kv pattern at {node}")
-                _replace_with_repeat_kv(graph, match_info)
-                num_kv_patterns += 1
-
-    # Clean up the graph if we made any replacements
-    if num_kv_patterns:
-        canonicalize_graph(gm)
-    ad_logger.info(f"Found {num_kv_patterns} repeat_kv patterns")
-
-
-
-def _match_repeat_kv_pattern(reshape_node: Node) -> Optional[Dict[str, Node]]:
-    """
-    Match the repeat_kv pattern starting from a reshape node.
-
-    The pattern is:
-    unsqueeze -> expand -> reshape -> [optional] contiguous
-
-    Returns a dictionary with information about the match or None if no match.
-    """
-    # Check that reshape_node is a reshape operation
-    if not is_op(reshape_node, torch.ops.aten.reshape):
-        return None
-
-    # The reshape should have expand as its first argument
-    if len(reshape_node.args) < 1:
-        return None
-
-    expand_node = reshape_node.args[0]
-    if not is_op(expand_node, torch.ops.aten.expand):
-        return None
-
-    # The expand should have unsqueeze as its first argument
-    if len(expand_node.args) < 1:
-        return None
-
-    unsqueeze_node = expand_node.args[0]
-    if not is_op(unsqueeze_node, torch.ops.aten.unsqueeze):
-        return None
-
-    # The unsqueeze should be inserting a dimension at position 2
-    if len(unsqueeze_node.args) < 2 or unsqueeze_node.args[1] != 2:
-        return None
-
-    # Get the input tensor to unsqueeze
-    if len(unsqueeze_node.args) < 1:
-        return None
-
-    input_tensor = unsqueeze_node.args[0]
-
-    # Check input dimensions - should be 4D (batch, num_key_value_heads, seq_len, head_dim)
-    input_val = input_tensor.meta.get("val", None)
-    if input_val is None or len(input_val.shape) != 4:
-        return None
-
-    # Extract batch size, num_kv_heads, seq_len, and head_dim from the input tensor shape
-    batch_size, num_kv_heads, seq_len, head_dim = input_val.shape
-
-    # Check reshape args
-    if len(reshape_node.args) < 2 or not isinstance(reshape_node.args[1], list):
-        return None
-
-    reshape_args = reshape_node.args[1]
-    if len(reshape_args) != 4:
-        return None
-
-    # Check expand args
-    if len(expand_node.args) < 2 or not isinstance(expand_node.args[1], list):
-        return None
-
-    expand_args = expand_node.args[1]
-    if len(expand_args) != 5:
-        return None
-
-    # Determine n_rep by comparing the output and input head dimensions
-    # In the expand args, we should have [batch, num_kv_heads, n_rep, seq_len, head_dim]
-    # In the reshape args, we should have [batch, num_heads, seq_len, head_dim]
-    # where num_heads = num_kv_heads * n_rep
-    _, _, n_rep, _, _ = expand_args
-    _, reshape_num_heads, _, _ = reshape_args
-
-    # Check that n_rep is an integer
-    if not isinstance(n_rep, int):
-        return None
-
-    # Check that num_heads = num_kv_heads * n_rep
-    # This may be a symbolic expression, so we need to compare with caution
-    reshape_out_val = reshape_node.meta.get("val", None)
-    if reshape_out_val is None or len(reshape_out_val.shape) != 4:
-        return None
-
-    # Ensure output shape is correct
-    out_batch, out_heads, out_seq, out_dim = reshape_out_val.shape
-
-    # Check that input batch and seq dimensions match output
-    if out_batch != batch_size or out_seq != seq_len or out_dim != head_dim:
-        return None
-
-    # Check if reshape is followed by a contiguous node
-    contiguous_node = None
-    users = list(reshape_node.users)
-
-    # Only consider contiguous if reshape has exactly one user
-    if len(users) == 1 and is_op(users[0], torch.ops.aten.contiguous):
-        contiguous_node = users[0]
-
-    result = {
-        "input_tensor": input_tensor,
-        "unsqueeze_node": unsqueeze_node,
-        "expand_node": expand_node,
-        "reshape_node": reshape_node,
-        "n_rep": n_rep,
-    }
-
-    if contiguous_node:
-        result["contiguous_node"] = contiguous_node
-
-    return result
-
-
-def match_eager_attention2(gm: GraphModule) -> GraphModule:
-    """
-    Match and replace the eager attention pattern in fx graphs.
-
-    The pattern is:
-    transpose -> matmul -> mul -> (optional) add -> softmax -> to -> dropout -> matmul
-
-    This is replaced with torch.ops.auto_deploy.torch_attention_sdpa.
-    """
-    graph = gm.graph
-
-    # Track replacements to avoid processing nodes multiple times
-    num_eager_patterns = 0
-
-    # Iterate through nodes in the graph
-    for node in list(graph.nodes):
-        # Look for the final matmul nodes that could be part of our pattern
-        if is_op(node, torch.ops.aten.matmul):
-            match_info = _match_eager_attention_pattern(node)
-            if match_info:
-                ad_logger.debug(f"Found eager attention pattern at {node}")
-                _replace_with_sdpa(graph, match_info)
-                num_eager_patterns += 1
-
-    # Clean up the graph if we made any replacements
-    if num_eager_patterns:
-        canonicalize_graph(gm)
-    ad_logger.info(f"Found {num_eager_patterns} eager attention patterns")
-
-
-def match_grouped_attention2(gm: GraphModule) -> GraphModule:
-    """
-    Match and replace the grouped attention pattern in fx graphs.
-
-    The pattern is:
-    repeat_kv(k, n_rep) ->
-    repeat_kv(v, n_rep) ->
-    sdpa(q, repeated_k, repeated_v)
-
-    This is replaced with torch.ops.auto_deploy.torch_attention_grouped_sdpa.
-    """
-    graph = gm.graph
-
-    # Track replacements to avoid processing nodes multiple times
-    num_grouped_patterns = 0
-
-    # Iterate through nodes in the graph
-    for node in list(graph.nodes):
-        # Look for SDPA nodes that could be part of our pattern
-        if is_op(node, torch.ops.auto_deploy.torch_attention_sdpa):
-            match_info = _match_grouped_attention_pattern(node)
-            if match_info:
-                ad_logger.debug(f"Found grouped attention pattern at {node}")
-                _replace_with_grouped_sdpa(graph, match_info)
-                num_grouped_patterns += 1
-
-    # Clean up the graph if we made any replacements
-    if num_grouped_patterns:
-        canonicalize_graph(gm)
-    ad_logger.info(f"Found {num_grouped_patterns} grouped attention patterns")
 
 
 def match_causal_attn_mask(gm: GraphModule) -> None:
@@ -512,271 +460,6 @@ def match_causal_attn_mask(gm: GraphModule) -> None:
     if num_causal_patterns:
         canonicalize_graph(gm)
     ad_logger.info(f"Found {num_causal_patterns} causal mask attention patterns")
-
-
-def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str, Node]]:
-    """
-    Match the eager attention pattern starting from the final matmul node.
-
-    The pattern is:
-    transpose -> matmul -> mul/div -> (optional) add -> (optional) to -> softmax -> (optional) to -> dropout -> matmul
-
-    Returns a dictionary with information about the match or None if no match.
-    """
-    # Check that final_matmul_node is a matmul operation
-    if not is_op(final_matmul_node, torch.ops.aten.matmul):
-        return None
-
-    # Check we have two arguments
-    if len(final_matmul_node.args) < 2:
-        return None
-
-    # The first arg of final matmul should be dropout
-    dropout_node = final_matmul_node.args[0]
-    if not is_op(dropout_node, torch.ops.aten.dropout):
-        return None
-
-    # The second arg of final matmul is the value tensor (possibly repeated/transformed)
-    value = final_matmul_node.args[1]
-
-    # The dropout should have a to_dtype node (or directly softmax) as input
-    if len(dropout_node.args) < 1:
-        return None
-
-    # Allow optional to_dtype node after softmax
-    to_dtype_after_softmax = dropout_node.args[0]
-    if is_op(to_dtype_after_softmax, torch.ops.aten.to):
-        if len(to_dtype_after_softmax.args) < 1:
-            return None
-        softmax_node = to_dtype_after_softmax.args[0]
-    else:
-        softmax_node = to_dtype_after_softmax
-
-    # Now we should have a softmax node
-    if not is_op(softmax_node, torch.ops.aten.softmax):
-        return None
-
-    # The softmax should have dim=-1 (may be specified in different ways)
-    if len(softmax_node.args) < 2 or (
-        isinstance(softmax_node.args[1], int) and softmax_node.args[1] != -1
-    ):
-        # Check kwargs if not in args
-        if softmax_node.kwargs.get("dim", -1) != -1:
-            return None
-
-    # The softmax node's input can be:
-    # - direct from add/mul/div
-    # - or through a to_dtype node (like to_35 in the example)
-    if len(softmax_node.args) < 1:
-        return None
-
-    # Handle optional to_dtype node before softmax
-    prev_node = softmax_node.args[0]
-    if is_op(prev_node, torch.ops.aten.to):
-        if len(prev_node.args) < 1:
-            return None
-        prev_node = prev_node.args[0]
-
-    # Check for attention mask pattern (add node)
-    if is_op(prev_node, torch.ops.aten.add):
-        add_node = prev_node
-        attn_mask = add_node.args[1]  # Second arg is the mask
-
-        # The add should have a mul or div node as its first argument
-        if len(add_node.args) < 1:
-            return None
-
-        scaling_node = add_node.args[0]
-        if not (is_op(scaling_node, torch.ops.aten.mul) or is_op(scaling_node, torch.ops.aten.div)):
-            return None
-    elif is_op(prev_node, torch.ops.aten.mul) or is_op(prev_node, torch.ops.aten.div):
-        # No mask case - the softmax input is directly the mul or div node
-        scaling_node = prev_node
-        attn_mask = None
-    else:
-        return None
-
-    # Check the scaling operation and extract the scaling factor
-    is_division = is_op(scaling_node, torch.ops.aten.div)
-
-    # The mul/div node should have a matmul node as input
-    if len(scaling_node.args) < 2:
-        return None
-
-    # Extract the scaling factor, adjusting for division vs multiplication
-    scale = scaling_node.args[1]
-    # Allow for constant or tensor scale
-    if not isinstance(scale, (float, int, Node)):
-        return None
-
-    # For division, we need to invert the scaling factor if it's a constant
-    if is_division and isinstance(scale, (float, int)):
-        scale = 1.0 / scale
-
-    first_matmul_node = scaling_node.args[0]
-    if not is_op(first_matmul_node, torch.ops.aten.matmul):
-        return None
-
-    # The first matmul should have the query and key transpose as inputs
-    if len(first_matmul_node.args) < 2:
-        return None
-
-    query = first_matmul_node.args[0]
-    transpose_key = first_matmul_node.args[1]
-
-    # Check for transpose, could be any dimensions
-    if not is_op(transpose_key, torch.ops.aten.transpose):
-        return None
-
-    # The transpose should have the key as input
-    if len(transpose_key.args) < 1:
-        return None
-
-    key = transpose_key.args[0]
-
-    # Create the match info dictionary
-    match_info = {
-        "query": query,
-        "key": key,
-        "value": value,
-        "scale": scale,
-        "dropout_p": dropout_node.args[1] if len(dropout_node.args) > 1 else 0.0,
-        "final_matmul": final_matmul_node,
-    }
-
-    # Add the attention mask if it exists
-    if attn_mask is not None:
-        match_info["attn_mask"] = attn_mask
-
-    return match_info
-
-
-def _match_grouped_attention_pattern(sdpa_node: Node) -> Optional[Dict[str, Node]]:
-    """
-    Match the grouped attention pattern starting from an SDPA node.
-
-    The pattern is:
-    repeat_kv(k, n_rep) ->
-    repeat_kv(v, n_rep) ->
-    sdpa(q, repeated_k, repeated_v)
-
-    Returns a dictionary with information about the match or None if no match.
-    """
-    # Check that sdpa_node is an SDPA operation
-    if not is_op(sdpa_node, torch.ops.auto_deploy.torch_attention_sdpa):
-        return None
-
-    # SDPA should have query, key, value as its first three arguments
-    if len(sdpa_node.args) < 3:
-        return None
-
-    query, key_repeated, value_repeated = sdpa_node.args[0:3]
-
-    # Key and value should come from repeat_kv operations
-    if not is_op(key_repeated, torch.ops.auto_deploy.torch_attention_repeat_kv) or not is_op(
-        value_repeated, torch.ops.auto_deploy.torch_attention_repeat_kv
-    ):
-        return None
-
-    # Extract the original key, value, and n_rep
-    orig_key = key_repeated.args[0]
-    orig_value = value_repeated.args[0]
-    key_n_rep = key_repeated.args[1]
-    value_n_rep = value_repeated.args[1]
-
-    # Both repeat_kv operations should have the same n_rep
-    if key_n_rep != value_n_rep:
-        return None
-
-    # Return the match information
-    return {
-        "query": query,
-        "key": orig_key,
-        "value": orig_value,
-        "key_repeated": key_repeated,
-        "value_repeated": value_repeated,
-        "n_rep": key_n_rep,
-        "sdpa_node": sdpa_node,
-    }
-
-
-def _replace_with_repeat_kv(graph, match_info: Dict[str, Node]) -> None:
-    """
-    Replace the matched repeat_kv pattern with the custom op.
-    """
-    input_tensor = match_info["input_tensor"]
-    reshape_node = match_info["reshape_node"]
-    n_rep = match_info["n_rep"]
-
-    # Determine the node to replace (either reshape or contiguous if present)
-    node_to_replace = match_info.get("contiguous_node", reshape_node)
-
-    with graph.inserting_before(node_to_replace):
-        repeat_kv_node = graph.call_function(
-            torch.ops.auto_deploy.torch_attention_repeat_kv, args=(input_tensor, n_rep)
-        )
-
-    # Preserve metadata from the original node
-    repeat_kv_node.meta = node_to_replace.meta.copy()
-
-    # Replace all uses of the node with the repeat_kv node
-    node_to_replace.replace_all_uses_with(repeat_kv_node)
-
-
-def _replace_with_sdpa(graph, match_info: Dict[str, Node]) -> None:
-    """
-    Replace the matched eager attention pattern with scaled_dot_product_attention.
-    """
-    # retrieve the default op for scaled_dot_product_attention
-    sdpa_op = torch.ops.auto_deploy.torch_attention_sdpa.default
-
-    # construct the args for the ops based on the match_info and the op's schema
-    args = []
-    for arg in sdpa_op._schema.arguments:
-        if arg.name in match_info:
-            args.append(match_info[arg.name])
-        elif arg.has_default_value:
-            args.append(arg.default_value)
-        else:
-            raise ValueError(f"Missing required argument: {arg.name}")
-    args = tuple(args)
-
-    # retrieve the final matmul node to know where to insert the sdpa node
-    final_matmul = match_info["final_matmul"]
-
-    with graph.inserting_before(final_matmul):
-        sdpa_node = graph.call_function(sdpa_op, args=args)
-
-    # Preserve metadata from the original node
-    sdpa_node.meta = final_matmul.meta.copy()
-
-    # Replace all uses of the final matmul node with the sdpa node
-    final_matmul.replace_all_uses_with(sdpa_node)
-
-
-def _replace_with_grouped_sdpa(graph, match_info: Dict[str, Node]) -> None:
-    """
-    Replace the matched grouped attention pattern with torch.ops.auto_deploy.torch_attention_grouped_sdpa.
-    """
-    sdpa_node = match_info["sdpa_node"]
-    query = match_info["query"]
-    key = match_info["key"]
-    value = match_info["value"]
-
-    # Construct the new args and kwargs
-    args = (query, key, value) + sdpa_node.args[3:]
-    kwargs = sdpa_node.kwargs.copy()
-
-    with graph.inserting_before(sdpa_node):
-        grouped_sdpa_node = graph.call_function(
-            torch.ops.auto_deploy.torch_attention_grouped_sdpa.default, args=args, kwargs=kwargs
-        )
-
-    # Preserve metadata from the original node
-    grouped_sdpa_node.meta = sdpa_node.meta.copy()
-
-    # Replace all uses of the SDPA node with the grouped_sdpa node
-    sdpa_node.replace_all_uses_with(grouped_sdpa_node)
 
 
 def _is_causal_mask(mask_node: Node) -> bool:
