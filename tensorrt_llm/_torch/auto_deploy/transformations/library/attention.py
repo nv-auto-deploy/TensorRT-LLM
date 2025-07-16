@@ -69,8 +69,9 @@ def match_repeat_kv(gm: GraphModule) -> None:
     # _register(_repeat_kv_pattern2)
 
     num_matches = patterns.apply(graph)
+    # We do shape propagation here since dynamic shape information is lost during pattern matching
     with lift_to_meta(gm):
-        gm = canonicalize_graph(gm, shape_prop=True)
+        canonicalize_graph(gm, shape_prop=True)
     ad_logger.info(f"Found and matched {num_matches} Repeat KV patterns")
 
 
@@ -337,7 +338,7 @@ def match_eager_attention(gm: GraphModule) -> None:
 
     # Apply patterns and clean-up
     num_matches = patterns.apply(graph)
-    gm = canonicalize_graph(gm)
+    canonicalize_graph(gm)
     ad_logger.info(f"Found and matched {num_matches} Eager Attention patterns")
 
 
@@ -386,7 +387,7 @@ def match_grouped_attention(gm: GraphModule) -> None:
     )
 
     num_matches = patterns.apply(graph)
-    gm = canonicalize_graph(gm)
+    canonicalize_graph(gm)
     ad_logger.info(f"Found and matched {num_matches} Grouped Attention patterns")
 
 
