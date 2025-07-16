@@ -39,6 +39,7 @@ class CapturedGraph(nn.Module):
             if cuda_graph_batch_sizes is not None
             else self._get_graph_batch_sizes(self.max_batch_size)
         )
+        self._cuda_graph_mem_pool = None
 
     def _get_hash(self, flat_args: List[Any]) -> Tuple[int, ...]:
         return tuple(hash(a) for a in flat_args)
@@ -64,7 +65,7 @@ class CapturedGraph(nn.Module):
         # capture graph now
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
             # compute output
             out = self.model(*args, **kwargs)
             # write out into output buffer up to out batch size
@@ -73,7 +74,7 @@ class CapturedGraph(nn.Module):
             for o_buffer, o in zip(self._out_buffer_flat, out_flat):
                 o_buffer[: o.shape[0]] = o
         torch.cuda.synchronize()
-
+        self._cuda_graph_mem_pool = self._cuda_graph_mem_pool or graph.pool()
         return graph
 
     @staticmethod
@@ -112,13 +113,14 @@ class CapturedGraph(nn.Module):
         self._input_buffers = [
             input[:1].repeat_interleave(self.max_batch_size, dim=0) for input in args_batched
         ]
-
         # create new args, kwargs with the input buffers and static args
         args, kwargs = self._in_spec.unflatten(self._input_buffers + args_static)
 
         # capture output once with max batch size to capture output buffers
         with CudaGraphWarmUpPhase():
+            ad_logger.info(f"Warm up with max batch size {self.max_batch_size} before graph capture")
             out = self.model(*args, **kwargs)
+        
         self._out_buffer_flat, out_spec = tree_flatten(out)
         assert out_spec == self._out_spec, "Output spec mismatch."
 
@@ -190,7 +192,6 @@ class TorchCudagraphCompiler(BackendCompiler):
     @torch.inference_mode()
     def compile(self) -> CapturedGraph:
         captured_model = self._init_captured_graph(self.gm, self.gm._in_spec, self.gm._out_spec)
-
         # try capturing cudagraph
         if self.args is not None or self.kwargs is not None:
             captured_model.capture_graph(*self.args, **self.kwargs)

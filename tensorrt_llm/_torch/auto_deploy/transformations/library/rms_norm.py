@@ -54,7 +54,7 @@ def _rms_norm_replacement(
     return BACKEND_OPS[backend.lower()](data, weight, eps)
 
 
-def match_rms_norm(gm: GraphModule, backend: str = "triton") -> GraphModule:
+def fuse_rmsnorm(gm: GraphModule, backend: str = "triton") -> GraphModule:
     """Matches and replaces RMSNorm patterns in the graph with FlashInfer or Triton implementation.
 
     This function sets up pattern matching to identify RMSNorm operations in the graph

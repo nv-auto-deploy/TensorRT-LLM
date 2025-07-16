@@ -21,6 +21,7 @@ from .library import (
     ep_shard,
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
+    fuse_rmsnorm,
     insert_cached_attention,
     match_attention_layout,
     match_causal_attn_mask,
@@ -28,7 +29,6 @@ from .library import (
     match_grouped_attention,
     match_moe_pattern,
     match_repeat_kv,
-    match_rms_norm,
     match_rope_layout,
     match_rope_pattern,
     optimize_rope,
@@ -161,6 +161,10 @@ class InferenceOptimizer:
         # check if we can fuse collectives
         fuse_collectives(egm)
 
+        # TODO (lucaslie): add backend selection as part of configurable inference optimizers
+        # check if we can fuse rmsnorm
+        fuse_rmsnorm(egm, "flashinfer")
+
         # visualize the final graph
         if self.ad_config.visualize:
             try:
@@ -190,10 +194,6 @@ class InferenceOptimizer:
 
         # resize kv cache to occupy the available GPU memory up to free_mem_ratio
         resize_kv_cache(egm, cm, free_mem_ratio=self.ad_config.free_mem_ratio)
-
-        # match rmsnorm
-        # TODO (lucaslie): add backend selection as part of configurable inference optimizers
-        match_rms_norm(egm)
 
         ############################################################################################
         # COMPILE MODEL
