@@ -7,8 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# TODO (chenghao): Remove related kernels once we have a backend-specific implementation for attention.
-
 
 def _apply_logit_softcapping(attn_scores: torch.Tensor, logit_cap: Optional[float]) -> torch.Tensor:
     """Apply logit softcapping using the formula: logit_cap * tanh(logits / logit_cap)"""
