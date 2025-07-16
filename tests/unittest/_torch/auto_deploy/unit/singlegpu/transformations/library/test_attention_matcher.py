@@ -141,7 +141,6 @@ class EagerAttentionModel(torch.nn.Module):
         self.out_proj = torch.nn.Linear(num_heads * self.head_dim, hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        print("self.training: ", self.training)
         batch_size, seq_len, _ = x.shape
         device = x.device
         dtype = x.dtype
