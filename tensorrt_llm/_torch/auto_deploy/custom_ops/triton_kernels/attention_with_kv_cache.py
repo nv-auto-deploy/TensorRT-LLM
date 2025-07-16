@@ -123,7 +123,7 @@ def gqa_attention_kv_stage1(
     Supports non-power-of-2 D_HEAD
 
     Uses flash decoding.
-    KV-cache layout is assumed to be [Batch,Seq, Head, Dim]
+    KV-cache layout is assumed to be [Batch, Seq, Head, Dim]
     1. Fetch the K-cache from 0 to input_pos
     2. Fetch the V-cache from 0 to input_pos
     3. A = Q*K^T [1,D_HEAD] * [1,seq_len,D_HEAD] -> [1, seq_len]
@@ -151,7 +151,7 @@ def gqa_attention_kv_stage1(
     if SLIDING_WINDOW > 0:
         # For sliding window, limit the sequence range
         sliding_start = tl.maximum(0, kv_position - SLIDING_WINDOW + 1)
-        if seq_start_pos < sliding_start:
+        if seq_start_pos + SEQ_BLOCK_SIZE <= sliding_start or seq_start_pos > kv_position:
             return
         seq_offsets = seq_start_pos + tl.arange(0, SEQ_BLOCK_SIZE)
         seq_mask = (seq_offsets <= kv_position) & (seq_offsets >= sliding_start)
@@ -650,9 +650,6 @@ def context_attention_kv_flattened(
         # Calculate sliding window range for each token in the current block
         min_kv_position = tl.maximum(0, kv_position + seq_offsets - SLIDING_WINDOW + 1)
         max_kv_position = kv_position + seq_offsets
-    else:
-        min_kv_position = tl.zeros_like(seq_offsets)
-        max_kv_position = kv_position + seq_offsets
 
     for s in range(0, num_blocks + 1, 1):
         kv_seq_offsets = s * SEQ_BLOCK + tl.arange(0, SEQ_BLOCK)
@@ -682,9 +679,18 @@ def context_attention_kv_flattened(
         qk = tl.where(combined_mask, qk, float("-inf"))
 
         qk *= SCALE
+
+        # Check if any valid attention weights exist for each query token
+        has_valid_attn = tl.sum(combined_mask.to(tl.int32), axis=1) > 0
+
         # rowmax
         m_ij = tl.maximum(tl.max(qk, 1), lse_i)
+        # For rows with no valid attention, set m_ij to 0 to avoid NaN
+        m_ij = tl.where(has_valid_attn, m_ij, 0.0)
+
         p = tl.exp(qk - m_ij[:, None])
+        # Set exp values to 0 for rows with no valid attention
+        p = tl.where(has_valid_attn[:, None], p, 0.0)
         v = tl.load(
             v_cache_ptr
             + cache_batch_offset * V_D_HEAD

@@ -18,10 +18,16 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.triton_kernels.attention_with_kv
 )
 
 
-def torch_reference_stage2(values, logsumexp):
+def torch_reference_stage2(values, logsumexp, sinks=None):
     max_logsumexp = torch.max(logsumexp, axis=-1, keepdim=True)[0]  # [b, n_heads, 1]
     sumexp = torch.exp(logsumexp - max_logsumexp)  # [b, n_heads, num_blocks]
     aggregate_sumexp = torch.sum(sumexp, axis=-1)  # [b, n_heads]
+
+    # Add sinks contribution to the softmax denominator
+    if sinks is not None:
+        sinks_exp = torch.exp(sinks - max_logsumexp.squeeze(-1))  # [b, n_heads]
+        aggregate_sumexp += sinks_exp
+
     output = values * sumexp[:, :, :, None]  # [b, n_heads, num_blocks, d_head]
     output = output / aggregate_sumexp[:, :, None, None]
     output = torch.sum(output, axis=2)
@@ -198,7 +204,7 @@ def test_attention_kv_flash_decoding(d_head):
 @pytest.mark.parametrize("q_d_head", [16, 96])
 @pytest.mark.parametrize("v_d_head", [16, 96])
 @pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 8), (8, 1)])
-@pytest.mark.parametrize("sliding_window", [None, 32])
+@pytest.mark.parametrize("sliding_window", [-1, 16])
 def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads, sliding_window):
     DEVICE = "cuda"
     DTYPE = torch.float16
@@ -210,7 +216,6 @@ def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads
     MAX_SEQ_LEN = 64
     CACHE_LOCS = list(range(0, BATCH_SIZE))
     INPUT_POS = [0] * BATCH_SIZE
-
     # Q,K,V are computed using GEMM.
     q = torch.randn(BATCH_SIZE, 1, N_HEADS, Q_D_HEAD, dtype=DTYPE, device=DEVICE)
     k = torch.randn(BATCH_SIZE, 1, N_KV_HEADS, Q_D_HEAD, dtype=DTYPE, device=DEVICE)
@@ -273,13 +278,12 @@ def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads
             V_D_HEAD,
             SEQ_BLOCK_SIZE,
             HEAD_BLOCK_SIZE,
-            sliding_window
-            if sliding_window is not None
-            else -1,  # SLIDING_WINDOW: -1 means no sliding window
+            sliding_window,  # SLIDING_WINDOW: parameterized
         )
 
     run(q, k_cache, v_cache, output_tensor, output_logsumexp)
     # This needs to be another kernel if torch-trt doesn't support broadcast + div.
+    print(output_tensor, output_tensor.shape)
     output = torch_reference_stage2(output_tensor, output_logsumexp)
 
     ref = []
@@ -306,8 +310,8 @@ def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads
     )
 
 
-@pytest.mark.parametrize("use_sinks", [False, True])
-def test_attention_with_kv_stage2(use_sinks):
+@pytest.mark.parametrize("has_sinks", [False, True])
+def test_attention_with_kv_stage2(has_sinks):
     DEVICE = "cuda"
     BATCH_SIZE = 4
     N_HEADS = 32
@@ -315,19 +319,17 @@ def test_attention_with_kv_stage2(use_sinks):
     SEQ_BLOCK_SIZE = 8
     input_positions = torch.zeros(BATCH_SIZE, device=DEVICE, dtype=torch.int32) + 10
     num_blocks = 3
-
-    # Create sinks tensor if needed
-    sinks = None
-    if use_sinks:
-        sinks = torch.randint(
-            0, 2, (BATCH_SIZE, 4), device=DEVICE, dtype=torch.int32
-        )  # 4 sink tokens per sequence
     # Produced by stage1
     values = torch.randn(
         BATCH_SIZE, N_HEADS, num_blocks, D_HEAD, device=DEVICE, dtype=torch.float32
     )
     logsumexp = torch.randn(BATCH_SIZE, N_HEADS, num_blocks, device=DEVICE, dtype=torch.float32)
     output = torch.zeros(BATCH_SIZE, N_HEADS, D_HEAD, device=DEVICE, dtype=torch.float32)
+
+    # Create sink tokens if needed - kernel expects [BATCH_SIZE, N_HEADS] shape
+    sinks = (
+        torch.randn(BATCH_SIZE, N_HEADS, device=DEVICE, dtype=torch.float32) if has_sinks else None
+    )
 
     def run():
         attention_kv_stage2[
@@ -344,17 +346,20 @@ def test_attention_with_kv_stage2(use_sinks):
             N_HEADS,
             D_HEAD,
             SEQ_BLOCK_SIZE,
-            use_sinks,  # HAS_SINKS: whether sink tokens are used
-            sinks,  # sinks_ptr: sink tokens tensor
+            has_sinks,  # HAS_SINKS: parameterized
+            sinks,  # sinks_ptr: sink tokens tensor or None
         )
 
     run()
     ref = []
     for i in range(BATCH_SIZE):
         block_id = input_positions[i].item() // SEQ_BLOCK_SIZE + 1
+        batch_sinks = sinks[i : i + 1, :] if has_sinks else None  # [1, N_HEADS]
         ref.append(
             torch_reference_stage2(
-                values[i, :, :block_id, :].unsqueeze(0), logsumexp[i, :, :block_id].unsqueeze(0)
+                values[i, :, :block_id, :].unsqueeze(0),
+                logsumexp[i, :, :block_id].unsqueeze(0),
+                batch_sinks,
             )
         )
     ref = torch.cat(ref, dim=0)
@@ -421,7 +426,6 @@ def test_context_attention_kv(batch_size, q_d_head, v_d_head, n_heads, n_kv_head
         V_D_HEAD,
         SEQ_BLOCK,
         MAX_SEQ_LEN,
-        num_stages=2,
     )
 
     if N_HEADS != N_KV_HEADS:
@@ -440,10 +444,9 @@ def test_context_attention_kv(batch_size, q_d_head, v_d_head, n_heads, n_kv_head
 @pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 8), (8, 1)])
 @pytest.mark.parametrize("q_d_head", [32, 96])
 @pytest.mark.parametrize("v_d_head", [32, 96])
-@pytest.mark.parametrize("sliding_window", [None, 24])
-@pytest.mark.parametrize("use_sinks", [False, True])
+@pytest.mark.parametrize("sliding_window", [-1, 16])
 def test_context_attention_kv_flattened(
-    q_d_head, v_d_head, n_heads, n_kv_heads, dtype, sliding_window, use_sinks
+    q_d_head, v_d_head, n_heads, n_kv_heads, dtype, sliding_window
 ):
     DEVICE = "cuda"
     DTYPE = getattr(torch, dtype)
@@ -456,13 +459,6 @@ def test_context_attention_kv_flattened(
     CACHE_LOCS = list(range(0, len(SEQ_LENS)))
     random.shuffle(CACHE_LOCS)
     INPUT_POS = [2, 4, 8, 0, 1]  # The starting position for in the cache for each of the sequences.
-
-    # Create sinks tensor if needed
-    sinks = None
-    if use_sinks:
-        sinks = torch.randint(
-            0, 2, (len(SEQ_LENS), 4), device=DEVICE, dtype=torch.int32
-        )  # 4 sink tokens per sequence
     q = []
     k = []
     v = []
@@ -494,10 +490,34 @@ def test_context_attention_kv_flattened(
                 kk = repeat_kv(q[i], kk)
                 vv = repeat_kv(q[i], vv)
 
+            # Create causal mask
             mask = torch.tril(
                 torch.ones(q[i].shape[1], kk.shape[1], dtype=torch.bool),
                 diagonal=kk.shape[1] - q[i].shape[1],
             )
+
+            # Apply sliding window constraints if enabled
+            if sliding_window > 0:
+                seq_len_q = q[i].shape[1]  # Current sequence length
+                seq_len_k = kk.shape[1]  # Total KV sequence length
+
+                # Create sliding window mask
+                sliding_mask = torch.zeros_like(mask)
+                for q_pos in range(seq_len_q):
+                    # For each query position, determine its absolute position in the cache
+                    abs_q_pos = INPUT_POS[i] + q_pos
+                    # Calculate sliding window range
+                    sliding_start = max(0, abs_q_pos - sliding_window + 1)
+                    sliding_end = abs_q_pos + 1
+                    # Apply to KV cache positions
+                    k_start = max(0, sliding_start)
+                    k_end = min(seq_len_k, sliding_end)
+                    if k_start < k_end:
+                        sliding_mask[q_pos, k_start:k_end] = True
+
+                # Combine causal and sliding window masks
+                mask = mask & sliding_mask
+
             ref.append(
                 torch.nn.functional.scaled_dot_product_attention(
                     q[i].transpose(1, 2),
@@ -561,130 +581,12 @@ def test_context_attention_kv_flattened(
         V_D_HEAD,
         SEQ_BLOCK,
         MAX_SEQ_LEN,
-        sliding_window
-        if sliding_window is not None
-        else -1,  # SLIDING_WINDOW: -1 means no sliding window
-        use_sinks,  # HAS_SINKS: whether sink tokens are used
-        sinks,  # sinks_ptr: sink tokens tensor
-        num_stages=2,
+        sliding_window,  # SLIDING_WINDOW: parameterized
+        False,  # HAS_SINKS: no sink tokens used
+        None,  # sinks_ptr: no sink tokens used
     )
+
     assert torch.allclose(ref, output_tensor, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize("q_d_head", [32, 96])
-@pytest.mark.parametrize("v_d_head", [32, 96])
-@pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 8), (8, 1)])
-@pytest.mark.parametrize("sliding_window", [None, 32])
-@pytest.mark.parametrize("use_sinks", [False, True])
-def test_gqa_attention_full_pipeline_with_stage2(
-    q_d_head, v_d_head, n_heads, n_kv_heads, sliding_window, use_sinks
-):
-    """Test full pipeline including both stage1 and stage2 with sliding window and sinks support."""
-    DEVICE = "cuda"
-    DTYPE = torch.float16
-    BATCH_SIZE = 8
-    N_HEADS = n_heads
-    N_KV_HEADS = n_kv_heads
-    Q_D_HEAD = q_d_head
-    V_D_HEAD = v_d_head
-    MAX_SEQ_LEN = 64
-    CACHE_LOCS = list(range(0, BATCH_SIZE))
-    INPUT_POS = [16] * BATCH_SIZE  # All tokens at position 16
-
-    # Create sinks tensor if needed
-    sinks = None
-    if use_sinks:
-        sinks = torch.randint(
-            0, 2, (BATCH_SIZE, 4), device=DEVICE, dtype=torch.int32
-        )  # 4 sink tokens per sequence
-
-    # Q,K,V are computed using GEMM.
-    q = torch.randn(BATCH_SIZE, 1, N_HEADS, Q_D_HEAD, dtype=DTYPE, device=DEVICE)
-    k = torch.randn(BATCH_SIZE, 1, N_KV_HEADS, Q_D_HEAD, dtype=DTYPE, device=DEVICE)
-    v = torch.randn(BATCH_SIZE, 1, N_KV_HEADS, V_D_HEAD, dtype=DTYPE, device=DEVICE)
-    k_cache = torch.randn(BATCH_SIZE, MAX_SEQ_LEN, N_KV_HEADS, Q_D_HEAD, dtype=DTYPE, device=DEVICE)
-    v_cache = torch.randn(BATCH_SIZE, MAX_SEQ_LEN, N_KV_HEADS, V_D_HEAD, dtype=DTYPE, device=DEVICE)
-
-    cache_loc = torch.tensor(CACHE_LOCS, device=DEVICE, dtype=torch.int32)
-    input_pos = torch.tensor(INPUT_POS, device=DEVICE, dtype=torch.int32)
-
-    # Update cache first
-    grid = (BATCH_SIZE, N_KV_HEADS, 1)
-    update_kv_cache[grid](
-        k,
-        v,
-        torch.tensor([1] * BATCH_SIZE, device=DEVICE, dtype=torch.int32),
-        torch.arange(0, BATCH_SIZE, 1, device=DEVICE, dtype=torch.int32),
-        k_cache,
-        v_cache,
-        input_pos,
-        cache_loc,
-        MAX_SEQ_LEN,
-        N_KV_HEADS,
-        Q_D_HEAD,
-        V_D_HEAD,
-        SEQ_BLOCK=1,
-        GENERATE_ONLY=True,
-    )
-
-    # Stage 1: Compute attention scores and values
-    SEQ_BLOCK_SIZE = 16
-    num_blocks = MAX_SEQ_LEN // SEQ_BLOCK_SIZE
-    stage1_output_values = torch.zeros(
-        BATCH_SIZE, N_HEADS, num_blocks, V_D_HEAD, device=DEVICE, dtype=torch.float32
-    )
-    stage1_output_logsumexp = torch.zeros(
-        BATCH_SIZE, N_HEADS, num_blocks, device=DEVICE, dtype=torch.float32
-    ) - float("inf")
-
-    HEAD_BLOCK_SIZE = max(16, triton.next_power_of_2(N_HEADS // N_KV_HEADS))
-
-    gqa_attention_kv_stage1[
-        (
-            BATCH_SIZE,
-            N_KV_HEADS,
-            num_blocks,
-        )
-    ](
-        q,
-        k_cache,
-        v_cache,
-        cache_loc,
-        input_pos,
-        stage1_output_values,
-        stage1_output_logsumexp,
-        num_blocks,
-        1.0 / math.sqrt(Q_D_HEAD),
-        MAX_SEQ_LEN,
-        N_HEADS,
-        N_KV_HEADS,
-        Q_D_HEAD,
-        V_D_HEAD,
-        SEQ_BLOCK_SIZE,
-        HEAD_BLOCK_SIZE,
-        sliding_window if sliding_window is not None else -1,
-    )
-
-    # Stage 2: Combine results from all blocks
-    final_output = torch.zeros(BATCH_SIZE, N_HEADS, V_D_HEAD, device=DEVICE, dtype=torch.float32)
-
-    attention_kv_stage2[(BATCH_SIZE, N_HEADS, 1)](
-        stage1_output_values,
-        stage1_output_logsumexp,
-        final_output,
-        input_pos,
-        num_blocks,
-        N_HEADS,
-        V_D_HEAD,
-        SEQ_BLOCK_SIZE,
-        use_sinks,  # HAS_SINKS: whether sink tokens are used
-        sinks,  # sinks_ptr: sink tokens tensor
-    )
-
-    # Basic sanity check - output should have reasonable values
-    assert not torch.isnan(final_output).any()
-    assert not torch.isinf(final_output).any()
-    assert final_output.shape == (BATCH_SIZE, N_HEADS, V_D_HEAD)
 
 
 @pytest.mark.parametrize(
