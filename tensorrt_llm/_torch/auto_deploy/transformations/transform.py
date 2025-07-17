@@ -11,11 +11,12 @@ from ..distributed import common as dist_ad
 from ..llm_args import AutoDeployConfig
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
+from ..transform.optimizer import InferenceOptimizer as ModularInferenceOptimizer
 from ..utils.logger import ad_logger
 from ._graph import canonicalize_graph, lift_to_meta, move_to_device
-from .export import torch_export_to_gm
 from .library import (
-    column_row_shard,
+    ShardingConfig,
+    detect_column_row_shard,
     dp_bmm_shard,
     eliminate_redundant_transposes,
     ep_shard,
@@ -35,6 +36,7 @@ from .library import (
     quantize,
     quantize_moe,
     resize_kv_cache,
+    sharding_transform_executor,
     update_in_out_nodes,
 )
 
@@ -59,24 +61,16 @@ class InferenceOptimizer:
             A nn.Module representing the optimized inference model.
         """
         ############################################################################################
-        # INITIALIZE MODEL
+        # RUN MODULAR INFERENCE OPTIMIZER FOR ALREADY-MIGRATED TRANSFORMS
         ############################################################################################
-        model = self.factory.build_model(device="meta")
+        new_optimizer = ModularInferenceOptimizer(self.factory, self.ad_config.transforms)
+        egm = new_optimizer(cm)
 
-        ############################################################################################
-        # EXPORT MODEL TO GRAPH MODULE
-        ############################################################################################
-
-        cm.info.set_example_sequence()
-        egm = torch_export_to_gm(model, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
-        del model
-        ad_logger.debug("original graph: " + str(egm))
-        local_rank, world_size = dist_ad.get_rank_world_size()
+        # TODO (lucaslie): continue moving legacy transforms to the new optimizer
 
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
         ############################################################################################
-
         # quantization
         quantize(egm, self.factory.get_quant_config())
         quantize_moe(egm, self.factory.get_quant_config())
@@ -111,6 +105,8 @@ class InferenceOptimizer:
         # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
         ############################################################################################
 
+        local_rank, world_size = dist_ad.get_rank_world_size()
+
         # eliminate redundant transpose operations
         eliminate_redundant_transposes(egm)
 
@@ -118,14 +114,21 @@ class InferenceOptimizer:
         # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
         optimize_rope(egm)
 
+        # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
+        sharding_config = ShardingConfig()
+
         # run TP sharding across ranks
-        column_row_shard(egm, local_rank, world_size, self.ad_config.simple_shard_only)
+        detect_column_row_shard(
+            egm, local_rank, world_size, sharding_config, self.ad_config.simple_shard_only
+        )
 
         # run EP sharding across ranks
         ep_shard(egm, local_rank, world_size)
 
         # run BMM sharding across ranks
         dp_bmm_shard(egm, local_rank, world_size)
+
+        sharding_transform_executor(egm, sharding_config)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
         # subsequent optimization passes. Lift state_dict to meta as shape propagation involves device check

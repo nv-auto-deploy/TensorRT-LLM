@@ -118,9 +118,11 @@ class CapturedGraph(nn.Module):
 
         # capture output once with max batch size to capture output buffers
         with CudaGraphWarmUpPhase():
-            ad_logger.info(f"Warm up with max batch size {self.max_batch_size} before graph capture")
+            ad_logger.info(
+                f"Warm up with max batch size {self.max_batch_size} before graph capture"
+            )
             out = self.model(*args, **kwargs)
-        
+
         self._out_buffer_flat, out_spec = tree_flatten(out)
         assert out_spec == self._out_spec, "Output spec mismatch."
 
