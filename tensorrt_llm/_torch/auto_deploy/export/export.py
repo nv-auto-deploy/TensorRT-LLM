@@ -25,7 +25,7 @@ except ImportError:
     torch_export_context = nullcontext
 
 
-def _clean_up_device_info(gm: fx.GraphModule):
+def _clean_up_device_info(gm: fx.GraphModule) -> None:
     """Correct device information in the graph."""
     devices = {t.device for _, t in gm.named_parameters()}
     if len(devices) == 0:
@@ -59,7 +59,7 @@ def _load_hook_for_deduplication(
         state_dict[k_remaining] = state_dict.pop(k_removed)
 
 
-def _deduplicate_params_and_buffers(gm: fx.GraphModule):
+def _deduplicate_params_and_buffers(gm: fx.GraphModule) -> None:
     """This will de-duplicate params and buffers that share the same tensor."""
     # get all get_attr nodes
     get_attr_nodes = [n for n in gm.graph.nodes if n.op == "get_attr"]
@@ -95,7 +95,7 @@ def _deduplicate_params_and_buffers(gm: fx.GraphModule):
     canonicalize_graph(gm)
 
 
-def _add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> fx.GraphModule:
+def _add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> None:
     """Adds back the state dict load hooks stripped away during export."""
     hooks = {
         k: mod._load_state_dict_pre_hooks
@@ -110,10 +110,8 @@ def _add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> fx.GraphMod
     assert not (bool(hooks)), f"""Mismatch in names of exported and source modules with hooks.
         The following module names were not found in exported module {list(hooks.keys())}"""
 
-    return gm
 
-
-def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module):
+def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> None:
     """
     Add a load hook to handle aliased parameters in the model.
 
@@ -178,9 +176,6 @@ def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module):
     gm._register_load_state_dict_pre_hook(aliasing_load_pre_hook)
 
 
-# Inline ModuleList getitem patch moved to registered patch system
-
-
 def torch_export_to_gm(
     model: nn.Module,
     args: Tuple[Any, ...],
@@ -225,8 +220,6 @@ def torch_export_to_gm(
     elif patch_configs is None:
         # Default patch configurations - apply all registered patches with default settings
         patch_configs = {patch_name: {} for patch_name in ExportPatchRegistry.list_patches()}
-
-    # ModuleList getitem patch is now handled through the registered patch system
 
     # run export with patches and lifted to meta
     with apply_export_patches(patch_configs), lift_to_meta(model) as state_dict:

@@ -5,7 +5,7 @@ This module defines the base classes and interfaces for all export patches.
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Type, Union, final
+from typing import Any, Callable, Dict, List, Type, Union, final
 
 from pydantic import BaseModel, Field
 
@@ -206,7 +206,7 @@ class ExportPatchRegistry:
         return patch_cls(config)
 
     @classmethod
-    def list_patches(cls) -> list[str]:
+    def list_patches(cls) -> List[str]:
         """List all registered patch names."""
         return list(cls._registry.keys())
 
