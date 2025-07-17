@@ -1,18 +1,23 @@
-import importlib.metadata
+"""Main export functionality with utilities for torch.export."""
+
 from collections import defaultdict
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.export as te
 import torch.nn as nn
-import torch.nn.functional as F
-from packaging import version
 from torch import fx
 
+from ..transformations._graph import (
+    canonicalize_graph,
+    lift_to_meta,
+    load_buffers_and_params,
+    tree_to,
+)
 from ..utils.logger import ad_logger
-from ._graph import canonicalize_graph, lift_to_meta, load_buffers_and_params, tree_to
+from .interface import ExportPatchRegistry, apply_export_patches
 
 try:
     from modelopt.torch.quantization.utils import export_torch_mode as torch_export_context
@@ -80,8 +85,8 @@ def _deduplicate_params_and_buffers(gm: fx.GraphModule):
             gm._register_load_state_dict_pre_hook(
                 partial(
                     _load_hook_for_deduplication,
-                    param_key_remaining=node_kept.target,
-                    param_key_removed=n.target,
+                    param_key_remaining=str(node_kept.target),
+                    param_key_removed=str(n.target),
                 )
             )
 
@@ -90,94 +95,7 @@ def _deduplicate_params_and_buffers(gm: fx.GraphModule):
     canonicalize_graph(gm)
 
 
-# TODO: remove once https://github.com/pytorch/pytorch/issues/140710 is resolved
-def _torch_where_patch(condition: torch.Tensor, *args, **kwargs):
-    if len(args) == 0 and len(kwargs) == 0:
-        return torch.nonzero(condition, as_tuple=True)
-    return _torch_where_patch.where_original(condition, *args, **kwargs)
-
-
-_torch_where_patch.where_original = torch.where
-
-
-def _torch_linear_patch(
-    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    return torch.ops.auto_deploy.torch_linear_simple(input, weight, bias)
-
-
-# TODO: remove once https://github.com/pytorch/pytorch/issues/142439 is resolved
-def _torch_modulelist_getitem_patch(self: nn.ModuleList, idx):
-    if isinstance(idx, slice):
-        # return a simple list.
-        # NOTE: this obviously only works for any use case where we access the sliced module list
-        # like a regular list like a for-loop. For most other things, this hack will not work.
-        return list(self._modules.values())[idx]
-    else:
-        return _torch_modulelist_getitem_patch.getitem_original(self, idx)
-
-
-_torch_modulelist_getitem_patch.getitem_original = nn.ModuleList.__getitem__
-
-
-def _torch_tensor_patch(data, **kwargs):
-    """Patch torch.tensor to handle 0.0 on meta device.
-
-    ``torch.tensor(0.0, device="meta")`` does not work and hence we are patching it to use
-    ``torch.zeros((), device="meta")`` instead, which is equivalent.
-    """
-    device = kwargs.get("device", None)
-    if data == 0.0 and device is not None and torch.device(device) == torch.device("meta"):
-        return torch.zeros((), **kwargs)
-    return _torch_tensor_patch.tensor_original(data, **kwargs)
-
-
-_torch_tensor_patch.tensor_original = torch.tensor
-
-
-def _transformers_version() -> str:
-    """Get the version of transformers."""
-    return version.parse(importlib.metadata.version("transformers")).base_version
-
-
-# TODO (@lucaslie): https://github.com/NVIDIA/TensorRT-LLM/issues/5728
-# not great that this patch is here but it's the least invasisve change until we make headway on the
-# above issue.
-@contextmanager
-def _transformers_sdpa_mask_patch():
-    """Patch transformers.masking_utils.sdpa_mask to be export-compatible."""
-    # this patch is only needed+compatible for transformers >= 4.53.0
-    if version.parse(_transformers_version()) < version.parse("4.53.0"):
-        yield  # Just yield without doing anything (like nullcontext)
-        return
-
-    # imports only after version check
-    from transformers import masking_utils
-    from transformers.integrations.executorch import sdpa_mask_without_vmap
-
-    # recall original implementation
-    sdpa_mask_original = masking_utils.sdpa_mask
-
-    # patch function and mask attention interface
-    masking_utils.sdpa_mask = sdpa_mask_without_vmap
-    if "sdpa" in masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._local_mapping:
-        sdpa_local_original = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._local_mapping["sdpa"]
-    else:
-        sdpa_local_original = None
-    masking_utils.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"] = sdpa_mask_without_vmap
-
-    try:
-        yield
-    finally:
-        # revert patches
-        masking_utils.sdpa_mask = sdpa_mask_original
-        if sdpa_local_original is None:
-            del masking_utils.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"]
-        else:
-            masking_utils.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"] = sdpa_local_original
-
-
-def add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> fx.GraphModule:
+def _add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> fx.GraphModule:
     """Adds back the state dict load hooks stripped away during export."""
     hooks = {
         k: mod._load_state_dict_pre_hooks
@@ -192,8 +110,10 @@ def add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> fx.GraphModu
     assert not (bool(hooks)), f"""Mismatch in names of exported and source modules with hooks.
         The following module names were not found in exported module {list(hooks.keys())}"""
 
+    return gm
 
-def add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module):
+
+def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module):
     """
     Add a load hook to handle aliased parameters in the model.
 
@@ -258,14 +178,7 @@ def add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module):
     gm._register_load_state_dict_pre_hook(aliasing_load_pre_hook)
 
 
-@torch.inference_mode()
-def torch_export(model: nn.Module, *args, **kwargs) -> te.ExportedProgram:
-    """Just like torch.export except we decorate it to be in inference_mode."""
-    with torch_export_context():
-        ep = te.export(model, *args, **kwargs)
-
-    # return the result
-    return ep
+# Inline ModuleList getitem patch moved to registered patch system
 
 
 def torch_export_to_gm(
@@ -276,95 +189,73 @@ def torch_export_to_gm(
     *,
     dynamic_shapes: Optional[Union[dict[str, Any], tuple[Any], list[Any]]] = None,
     strict: bool = False,
+    patch_configs: Optional[Dict[str, Union[dict, Any]]] = None,
+    patch_list: Optional[List[str]] = None,
 ) -> fx.GraphModule:
-    """torch_export with wrapping into GraphModule + useful additions to the resulting module.
+    """torch's export with wrapping into GraphModule + useful additions to the resulting module.
 
     This utility improves over stock torch.export.export in the following aspects:
 
         1. Provide patches for certain corner cases that torch.export does not support.
         2. Standardize the export process to strictly run on the meta device.
         3. Automatically extract the GraphModule from the exported program.
-        4. Retain load hooks for state_dict loading from the oroginal module.
+        4. Retain load hooks for state_dict loading from the original module.
         5. Manage parameter aliasing in the model.
+
+    Args:
+        model: The model to export
+        args: Arguments for the model
+        kwargs: Keyword arguments for the model
+        clone: Whether to clone the model state_dict
+        dynamic_shapes: Dynamic shapes for the export
+        strict: Whether to use strict mode for export
+        patch_configs: Optional patch configurations. If None, all registered patches
+                      will be applied with default settings.
+        patch_list: Optional list of patch names to apply with default settings.
+                   Cannot be used together with patch_configs.
     """
-    # we need to better control how F.scaled_dot_product_attention is represented in the graph
-    # there is no guarantee how it is represented and we need to make sure it is easily identifiable
-    # in the graph.
-    sdpa_original = F.scaled_dot_product_attention
-    F.scaled_dot_product_attention = torch.ops.auto_deploy.torch_attention_sdpa
+    # Validate that both patch_configs and patch_list are not provided simultaneously
+    if patch_configs is not None and patch_list is not None:
+        raise ValueError("Cannot specify both patch_configs and patch_list. Use only one.")
 
-    # We overwrite the linear functional as well. This basically avoids exporting the view ops
-    # that are used to flatten/unflatten multiple batch dimensions of the input tensor.
-    linear_original = F.linear
-    # patch linear → always supply bias
-    F.linear = _torch_linear_patch
+    # Handle patch configuration
+    if patch_list is not None:
+        # Convert patch_list to patch_configs format
+        patch_configs = {patch_name: {} for patch_name in patch_list}
+    elif patch_configs is None:
+        # Default patch configurations - apply all registered patches with default settings
+        patch_configs = {patch_name: {} for patch_name in ExportPatchRegistry.list_patches()}
 
-    # patch torch.where(condition) to torch.nonzero(condition, as_tuple=True)
-    torch.where = _torch_where_patch
+    # ModuleList getitem patch is now handled through the registered patch system
 
-    # patch nn.ModuleList.__getitem__ to handle slicing
-    nn.ModuleList.__getitem__ = _torch_modulelist_getitem_patch
+    # run export with patches and lifted to meta
+    with apply_export_patches(patch_configs), lift_to_meta(model) as state_dict:
+        # clean up args, kwargs and move to correct device
+        args, kwargs = tree_to((args, kwargs or {}), device="meta")
 
-    # overwrite autocast/sdpa contextmanagers to be no-ops
-    autocast_original = torch.autocast
-    sdpa_kernel_original = torch.nn.attention.sdpa_kernel
-    torch.autocast = lambda *args, **kwargs: nullcontext()
-    torch.nn.attention.sdpa_kernel = lambda *args, **kwargs: nullcontext()
+        # NOTE (lucaslie): export is VERY sensitive to the location of the inference_mode
+        # context manager. Do NOT move it unless absolutely necessary.
+        with torch.inference_mode():
+            ep = te.export(model, args, kwargs, dynamic_shapes=dynamic_shapes, strict=strict)
+        egm = ep.module()
+        assert isinstance(egm, fx.GraphModule)
 
-    # patch torch.tensor to handle 0.0 on meta device
-    torch.tensor = _torch_tensor_patch
-
-    # run export with sdpa masking patch and lifted to meta
-    with _transformers_sdpa_mask_patch():
-        with lift_to_meta(model) as state_dict:
-            # clean up args, kwargs and move to correct device
-            args, kwargs = tree_to((args, kwargs or {}), device="meta")
-
-            # NOTE: we always export in non-strict mode for now as it relaxes some
-            # assumptions around tracing. Strict mode uses torchdynamo (symbolic bytecode analysis),
-            # which can be brittle since it relies on the exact bytecode representation of the model
-            # see here as well: https://pytorch.org/docs/stable/export.html#non-strict-export
-
-            # run export and extract graph module
-            egm: fx.GraphModule = torch_export(
-                model, args, kwargs, dynamic_shapes=dynamic_shapes, strict=strict
-            ).module()
-
-            # load state_dict into egm
-            # NOTE: export might have removed unused params/buffers (hence we allow unexpected keys)
-            load_buffers_and_params(
-                egm, state_dict, strict_missing=True, strict_unexpected=False, clone=clone
-            )
-
-    # revert sdpa back to original
-    F.scaled_dot_product_attention = sdpa_original
-
-    # revert linear back to original
-    F.linear = linear_original
-
-    # revert torch.where patch
-    torch.where = _torch_where_patch.where_original
-
-    # revert nn.ModuleList.__getitem__ patch
-    nn.ModuleList.__getitem__ = _torch_modulelist_getitem_patch.getitem_original
-
-    # revert autocast/sdpa back to original
-    torch.autocast = autocast_original
-    torch.nn.attention.sdpa_kernel = sdpa_kernel_original
-
-    # revert torch.tensor patch
-    torch.tensor = _torch_tensor_patch.tensor_original
+        # load state_dict into egm
+        # NOTE: export might have removed unused params/buffers (hence we allow unexpected keys)
+        load_buffers_and_params(
+            egm, state_dict, strict_missing=True, strict_unexpected=False, clone=clone
+        )
 
     # Export strips away all methods not traced during forward. The model could have
     # load hooks that contain logic for correct state_dict loading. We need to add those
     # hooks back to the exported graph module.
-    add_missing_load_hooks(egm, model)
+    _add_missing_load_hooks(egm, model)
 
     # Add load hook to correctly load parameters that are aliased in the source model.
     # deduplicate params and buffers
     # TODO (lucaslie, suyoggupta): seems there is some overlap here. I believe we should just have
     # the deduplicate function and extend it to handle reading from state dict for any name.
-    add_load_hook_for_aliased_params(egm, model)
+    _add_load_hook_for_aliased_params(egm, model)
     _deduplicate_params_and_buffers(egm)
 
     # clean up devices in the graph
