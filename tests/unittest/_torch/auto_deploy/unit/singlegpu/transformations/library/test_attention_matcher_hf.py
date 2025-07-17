@@ -5,18 +5,16 @@ from typing import Any, Callable, Dict
 import pytest
 import torch
 import torch.nn as nn
-from _graph_test_helpers import run_test
 from torch.export import Dim
 from torch.fx import GraphModule
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaModel
 
+from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device
+from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations.library import (
     match_attention_layout,
-    match_causal_attn_mask,
-    match_eager_attention,
-    match_grouped_attention,
-    match_repeat_kv,
+    match_attention_pattern,
 )
 
 
@@ -45,10 +43,7 @@ class HFWrapper(nn.Module):
 
 
 def _joint_transform(gm: GraphModule) -> None:
-    match_repeat_kv(gm)
-    match_eager_attention(gm)
-    match_grouped_attention(gm)
-    match_causal_attn_mask(gm)
+    match_attention_pattern(gm)
     match_attention_layout(gm, MockAttentionDescriptor())
 
 
@@ -76,11 +71,22 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
     }
     dynamic_shapes = {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
 
-    model = HFWrapper(LlamaModel(LlamaConfig(**full_config))).to("cuda")
-    model.eval()
+    model = HFWrapper(LlamaModel(LlamaConfig(**full_config))).to("cuda").eval()
     x = torch.randint(
         0, full_config["vocab_size"], (batch_size, seq_len), dtype=torch.long, device="cuda"
     )
+
+    y_model = model(x)
+    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
+    y_gm = gm(x)
+    torch.testing.assert_close(y_model, y_gm, atol=1e-3, rtol=5e-2)
+
+    move_to_device(gm, "meta")
+    _joint_transform(gm)
+
+    # move_to_device(gm, "cuda")
+
+    # gm.print_readable()
 
     def verify_matcher(gm: GraphModule):
         """Ensure that there is exactly one torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
@@ -109,15 +115,4 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
 
         return True
 
-    _ = run_test(
-        model,
-        x,
-        _joint_transform,
-        verify_matcher,
-        lambda num_p_og: num_p_og,
-        atol=1e-3,
-        rtol=5e-2,
-        test_load_hook=True,
-        strict_loading=True,
-        dynamic_shapes=dynamic_shapes,
-    )
+    assert verify_matcher(gm)

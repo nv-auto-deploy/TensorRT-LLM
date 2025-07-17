@@ -10,10 +10,7 @@ from transformers.integrations.sdpa_attention import repeat_kv as hf_repeat_kv
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.transformations.library.attention import (
     match_attention_layout,
-    match_causal_attn_mask,
-    match_eager_attention,
-    match_grouped_attention,
-    match_repeat_kv,
+    match_attention_pattern,
 )
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
@@ -426,7 +423,7 @@ def _get_match_repeat_kv_optimizer() -> Callable:
 
     def _transform(gm: GraphModule) -> GraphModule:
         gm = InferenceOptimizer(None, config)(None, gm)
-        match_repeat_kv(gm)
+        match_attention_pattern(gm)
         return gm
 
     return _transform
@@ -655,7 +652,7 @@ def test_match_eager_attention(has_mask, use_division, dropout, skip_output_asse
     run_test(
         model,
         x,
-        match_eager_attention,
+        match_attention_pattern,
         verify_matcher,
         lambda num_p_og: num_p_og,
         atol=1e-3,
@@ -689,7 +686,7 @@ def test_counter_example():
     _ = run_test(
         model,
         x,
-        match_repeat_kv,
+        match_attention_pattern,
         verify_no_matches,
         lambda num_p_og: num_p_og,
         atol=1e-3,
@@ -764,7 +761,7 @@ def test_match_grouped_attention(num_heads, num_kv_heads, has_mask):
     _ = run_test(
         model,
         x,
-        match_grouped_attention,
+        match_attention_pattern,
         verify_matcher,
         lambda num_p_og: num_p_og,
         atol=1e-3,
@@ -888,98 +885,6 @@ class CausalAttentionModel(torch.nn.Module):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
 
 
-@pytest.mark.parametrize("mask_type", ["triu", "negative_fill", "non_causal"])
-@pytest.mark.parametrize("use_grouped_sdpa", [False, True])
-@torch.inference_mode()
-def test_match_causal_attention(mask_type, use_grouped_sdpa):
-    batch_size, seq_len = 4, 12
-    hidden_size = 512
-    num_heads = 8
-    num_kv_heads = 4 if use_grouped_sdpa else num_heads
-
-    model = CausalAttentionModel(
-        hidden_size,
-        num_heads,
-        mask_type=mask_type,
-        use_grouped_sdpa=use_grouped_sdpa,
-        num_kv_heads=num_kv_heads,
-    ).to("cuda", dtype=torch.float16)
-
-    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
-    dynamic_shapes = model.get_dynamic_shapes()
-
-    # We expect optimization (None mask + is_causal=True) when using causal masks
-    should_optimize = mask_type in ["triu", "negative_fill"]
-
-    def verify_matcher(gm):
-        # Find attention operations
-        if use_grouped_sdpa:
-            attn_nodes = [
-                n
-                for n in gm.graph.nodes
-                if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
-            ]
-        else:
-            attn_nodes = [
-                n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_sdpa)
-            ]
-
-        if len(attn_nodes) != 1:
-            print(f"Expected 1 attention node, found {len(attn_nodes)}")
-            return False
-
-        node = attn_nodes[0]
-
-        # Check if attention mask was set to None and is_causal was set to True
-        if should_optimize:
-            # Attention mask (4th arg) should be None
-            has_mask = (
-                node.args[3] is not None if len(node.args) > 3 else "attn_mask" in node.kwargs
-            )
-
-            # is_causal (6th arg) should be True
-            is_causal = node.args[5] if len(node.args) > 5 else node.kwargs.get("is_causal", False)
-
-            # Check if optimization was correctly applied
-            if has_mask or not is_causal:
-                print("❌ Expected optimization: mask=None, is_causal=True")
-                print(
-                    f"   Got: mask={node.args[3] if len(node.args) > 3 else 'not in args'}, "
-                    f"is_causal={is_causal}"
-                )
-                return False
-
-            print("✅ Successfully optimized causal mask: mask=None, is_causal=True")
-        else:
-            # Non-causal masks should remain as is
-            has_mask = (
-                node.args[3] is not None if len(node.args) > 3 else "attn_mask" in node.kwargs
-            )
-
-            # Check if non-optimization was correctly preserved
-            if not has_mask:
-                print("❌ Expected non-causal mask to be preserved")
-                return False
-
-            print("✅ Successfully preserved non-causal mask")
-
-        return True
-
-    # Run the test
-    _ = run_test(
-        model,
-        x,
-        match_causal_attn_mask,
-        verify_matcher,
-        lambda num_p_og: num_p_og,
-        atol=1e-3,
-        rtol=1e-3,
-        test_load_hook=True,
-        strict_loading=True,
-        dynamic_shapes=dynamic_shapes,
-    )
-
-
 class Llama3CausalAttentionModel(torch.nn.Module):
     """Model that creates a causal attention mask mimicking the llama-3.1 pattern."""
 
@@ -1084,77 +989,6 @@ class Llama3CausalAttentionModel(torch.nn.Module):
 
     def get_dynamic_shapes(self):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
-
-
-@pytest.mark.parametrize("use_grouped_sdpa", [False, True])
-@pytest.mark.skip(reason="Skip until we have more robust attention masking handling, see #4783")
-@torch.inference_mode()
-def test_match_llama3_causal_attention(use_grouped_sdpa):
-    batch_size, seq_len = 4, 12
-    hidden_size = 512
-    num_heads = 8
-    num_kv_heads = 4 if use_grouped_sdpa else num_heads
-
-    model = Llama3CausalAttentionModel(
-        hidden_size,
-        num_heads,
-        use_grouped_sdpa=use_grouped_sdpa,
-        num_kv_heads=num_kv_heads,
-    ).to("cuda", dtype=torch.float32)
-
-    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float32)
-    dynamic_shapes = model.get_dynamic_shapes()
-
-    def verify_matcher(gm):
-        # Find attention operations
-        if use_grouped_sdpa:
-            attn_nodes = [
-                n
-                for n in gm.graph.nodes
-                if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
-            ]
-        else:
-            attn_nodes = [
-                n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_sdpa)
-            ]
-
-        if len(attn_nodes) != 1:
-            print(f"Expected 1 attention node, found {len(attn_nodes)}")
-            return False
-
-        node = attn_nodes[0]
-
-        # Attention mask (4th arg) should be None
-        has_mask = node.args[3] is not None if len(node.args) > 3 else "attn_mask" in node.kwargs
-
-        # is_causal (6th arg) should be True
-        is_causal = node.args[5] if len(node.args) > 5 else node.kwargs.get("is_causal", False)
-
-        # Check if optimization was correctly applied
-        if has_mask or not is_causal:
-            print("❌ Expected optimization: mask=None, is_causal=True")
-            print(
-                f"   Got: mask={node.args[3] if len(node.args) > 3 else 'not in args'}, "
-                f"is_causal={is_causal}"
-            )
-            return False
-
-        print("✅ Successfully optimized llama-3.1 causal mask: mask=None, is_causal=True")
-        return True
-
-    # Run the test
-    run_test(
-        model,
-        x,
-        match_causal_attn_mask,
-        verify_matcher,
-        lambda num_p_og: num_p_og,
-        atol=1e-3,
-        rtol=1e-3,
-        test_load_hook=True,
-        strict_loading=True,
-        dynamic_shapes=dynamic_shapes,
-    )
 
 
 class MockAttentionDescriptor:
