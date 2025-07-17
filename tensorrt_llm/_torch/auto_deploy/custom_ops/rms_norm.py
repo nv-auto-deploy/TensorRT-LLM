@@ -58,3 +58,25 @@ def triton_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> tor
 def _(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Fake implementation for the custom operator during tracing."""
     return torch.empty_like(input)
+
+
+@torch.library.custom_op("auto_deploy::torch_rmsnorm", mutates_args=())
+def torch_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Custom operator for Torch RMSNorm implementation.
+
+    Args:
+        input: Input tensor to normalize.
+        weight: Scaling weights for the normalized output.
+        eps: Small constant for numerical stability.
+    """
+    input_dtype = input.dtype
+    input = input.to(torch.float32)
+    variance = input.pow(2).mean(-1, keepdim=True)
+    input = input * torch.rsqrt(variance + eps)
+    return weight * input.to(input_dtype)
+
+
+@torch_rmsnorm.register_fake
+def _(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Fake implementation for the custom operator during tracing."""
+    return torch.empty_like(input)

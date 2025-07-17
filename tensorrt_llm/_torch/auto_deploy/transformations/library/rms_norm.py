@@ -11,6 +11,12 @@ from ...utils.logger import ad_logger
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from .._graph import canonicalize_graph
 
+_BACKEND_OPS = {
+    "flashinfer": torch.ops.auto_deploy.flashinfer_rms_norm,
+    "triton": torch.ops.auto_deploy.triton_rms_norm,
+    "torch": torch.ops.auto_deploy.torch_rmsnorm,
+}
+
 
 def _rms_norm_pattern(data: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Implements the RMSNorm pattern for pattern matching.
@@ -44,17 +50,14 @@ def _rms_norm_replacement(
     Returns:
         Normalized and scaled tensor using the specified backend implementation.
     """
-    BACKEND_OPS = {
-        "flashinfer": torch.ops.auto_deploy.flashinfer_rms_norm,
-        "triton": torch.ops.auto_deploy.triton_rms_norm,
-    }
-    assert backend.lower() in list(BACKEND_OPS.keys()), (
-        f"Invalid backend: {backend}, must be one of {list(BACKEND_OPS.keys())}"
+
+    assert backend.lower() in _BACKEND_OPS, (
+        f"Invalid {backend=}; must be one of {list(_BACKEND_OPS)}"
     )
-    return BACKEND_OPS[backend.lower()](data, weight, eps)
+    return _BACKEND_OPS[backend.lower()](data, weight, eps)
 
 
-def fuse_rmsnorm(gm: GraphModule, backend: str = "triton") -> GraphModule:
+def fuse_rmsnorm(gm: GraphModule, backend: str = "triton") -> None:
     """Matches and replaces RMSNorm patterns in the graph with FlashInfer or Triton implementation.
 
     This function sets up pattern matching to identify RMSNorm operations in the graph
@@ -68,9 +71,8 @@ def fuse_rmsnorm(gm: GraphModule, backend: str = "triton") -> GraphModule:
     Returns:
         Transformed graph module with optimized RMSNorm operations.
     """
-    VALID_BACKENDS = {"flashinfer", "triton"}
-    if backend.lower() not in VALID_BACKENDS:
-        raise ValueError(f"Invalid backend, must be one of {VALID_BACKENDS}, got {backend}")
+    if backend.lower() not in _BACKEND_OPS:
+        raise ValueError(f"Invalid backend, must be one of {list(_BACKEND_OPS)}, got {backend}")
     ad_logger.info(f"Starting RMSNorm pattern matching with backend: {backend}")
 
     graph = gm.graph
@@ -107,6 +109,5 @@ def fuse_rmsnorm(gm: GraphModule, backend: str = "triton") -> GraphModule:
 
     cnt = patterns.apply(graph)
     ad_logger.info(f"RMSNorm pattern count: {cnt}")
-    gm = canonicalize_graph(gm)
+    canonicalize_graph(gm)
     ad_logger.debug("RMSNorm pattern matching completed.")
-    return gm

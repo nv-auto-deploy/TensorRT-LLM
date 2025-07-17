@@ -113,16 +113,14 @@ class CapturedGraph(nn.Module):
         self._input_buffers = [
             input[:1].repeat_interleave(self.max_batch_size, dim=0) for input in args_batched
         ]
+
         # create new args, kwargs with the input buffers and static args
         args, kwargs = self._in_spec.unflatten(self._input_buffers + args_static)
 
         # capture output once with max batch size to capture output buffers
         with CudaGraphWarmUpPhase():
-            ad_logger.info(
-                f"Warm up with max batch size {self.max_batch_size} before graph capture"
-            )
+            ad_logger.info(f"Warm up with {self.max_batch_size=} before graph capture")
             out = self.model(*args, **kwargs)
-
         self._out_buffer_flat, out_spec = tree_flatten(out)
         assert out_spec == self._out_spec, "Output spec mismatch."
 
@@ -194,6 +192,7 @@ class TorchCudagraphCompiler(BackendCompiler):
     @torch.inference_mode()
     def compile(self) -> CapturedGraph:
         captured_model = self._init_captured_graph(self.gm, self.gm._in_spec, self.gm._out_spec)
+
         # try capturing cudagraph
         if self.args is not None or self.kwargs is not None:
             captured_model.capture_graph(*self.args, **self.kwargs)

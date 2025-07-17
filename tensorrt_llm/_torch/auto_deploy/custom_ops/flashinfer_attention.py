@@ -188,6 +188,7 @@ def prepare_flashinfer_metadata(
     # NOTE: it is okay to clone cache_loc here without truncation. paged_kv_indptr is already
     # truncated and will point to the correct sub range of cache_loc.
     paged_kv_indices = cache_loc.clone()
+
     paged_kv_last_page_len = ((offsets + seq_len - 1) % page_size) + 1
 
     # Compute batch_indices and positions so that they can be reused for kv cache appends
@@ -279,6 +280,7 @@ def flashinfer_mha_with_cache(
     if k_cache.dtype == torch.float8_e4m3fn:
         k = (k / k_scale).to(torch.float8_e4m3fn)
         v = (v / v_scale).to(torch.float8_e4m3fn)
+
     flashinfer.page.append_paged_kv_cache(
         k,
         v,
