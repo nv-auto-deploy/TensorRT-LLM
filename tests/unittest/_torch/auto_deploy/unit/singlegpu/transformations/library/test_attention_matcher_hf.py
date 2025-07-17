@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict
 import pytest
 import torch
 import torch.nn as nn
+from accelerate import init_empty_weights
 from torch.export import Dim
 from torch.fx import GraphModule
 from transformers.models.llama.configuration_llama import LlamaConfig
@@ -60,34 +61,6 @@ def _joint_transform(gm: GraphModule) -> None:
     ["eager", "sdpa"],
 )
 def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str):
-    batch_size, seq_len = 4, 12
-    full_config = {
-        "num_hidden_layers": 1,
-        "vocab_size": 256,
-        "hidden_size": 128,
-        "intermediate_size": 128,
-        "attn_implementation": attn_implementation,
-        **config,
-    }
-    dynamic_shapes = {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
-
-    model = HFWrapper(LlamaModel(LlamaConfig(**full_config))).to("cuda").eval()
-    x = torch.randint(
-        0, full_config["vocab_size"], (batch_size, seq_len), dtype=torch.long, device="cuda"
-    )
-
-    y_model = model(x)
-    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
-    y_gm = gm(x)
-    torch.testing.assert_close(y_model, y_gm, atol=1e-3, rtol=5e-2)
-
-    move_to_device(gm, "meta")
-    _joint_transform(gm)
-
-    # move_to_device(gm, "cuda")
-
-    # gm.print_readable()
-
     def verify_matcher(gm: GraphModule):
         """Ensure that there is exactly one torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
         call in the graph. Also check that there is no repeat_kv pattern left.
@@ -115,4 +88,47 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
 
         return True
 
+    batch_size, seq_len = 4, 12
+    full_config = {
+        "num_hidden_layers": 1,
+        "vocab_size": 256,
+        "hidden_size": 128,
+        "intermediate_size": 128,
+        "attn_implementation": attn_implementation,
+        **config,
+    }
+    dynamic_shapes = {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
+
+    # Build and export model on meta device
+    with init_empty_weights():
+        model = HFWrapper(LlamaModel(LlamaConfig(**full_config))).eval()
+    x = torch.randint(
+        0, full_config["vocab_size"], (batch_size, seq_len), dtype=torch.long, device="cuda"
+    )
+    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
+
+    # Move model to cuda
+    device = "cuda"
+    model._apply(
+        lambda t: torch.normal(0.0, 1.0, size=t.shape, device=device).to(t.dtype)
+        if t.device == torch.device("meta")
+        else t.to(device)
+    )
+    y_model = model(x)
+
+    # Apply transformation
+    _joint_transform(gm)
     assert verify_matcher(gm)
+
+    # Move gm to cuda
+    gm._apply(
+        lambda t: torch.normal(0.0, 1.0, size=t.shape, device=device).to(t.dtype)
+        if t.device == torch.device("meta")
+        else t.to(device)
+    )
+    gm.load_state_dict(model.state_dict())
+    move_to_device(gm, "cuda")
+
+    # Verify output
+    y_gm = gm(x)
+    torch.testing.assert_close(y_model, y_gm, atol=1e-3, rtol=5e-2)
