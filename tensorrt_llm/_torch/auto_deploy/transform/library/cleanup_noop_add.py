@@ -17,8 +17,8 @@ class CleanupNoopAdd(BaseTransform):
 
     NOTE: this function has one failure mode when the op ``out = tensor + zero_tensor`` is used
     in such a way that``out`` will be broadcast to the shape of zero_tensor. After removing this op
-    then, out won't have the right shape anymore. This should e a rare case and we can handle it
-    when it comes up.
+    then, out won't have the right shape anymore. This should be a rare case and we can handle it
+    when it comes up or disable this transform.
     """
 
     def _apply(
