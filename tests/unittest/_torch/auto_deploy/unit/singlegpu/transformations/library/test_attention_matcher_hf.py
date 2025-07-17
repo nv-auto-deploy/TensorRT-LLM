@@ -11,8 +11,8 @@ from torch.fx import GraphModule
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaModel
 
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device
-from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations.library import (
     match_attention_layout,
     match_attention_pattern,
@@ -85,6 +85,10 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
             op="call_function", target=torch.ops.auto_deploy.torch_attention_repeat_kv
         )
         assert len(nodes) == 0, "Found repeat_kv pattern in the graph"
+        attn_nodes = gm.graph.find_nodes(
+            op="call_function", target=torch.ops.auto_deploy.torch_attention_sdpa
+        )
+        assert len(attn_nodes) == 0, "Found torch_attention_sdpa node in the graph"
 
         return True
 

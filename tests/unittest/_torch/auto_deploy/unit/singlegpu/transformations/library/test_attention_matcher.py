@@ -414,7 +414,7 @@ class GroupedAttentionModel(torch.nn.Module):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
 
 
-def _get_match_repeat_kv_optimizer() -> Callable:
+def _get_match_attention_optimizer() -> Callable:
     config = {
         "cleanup_noop_slice": {
             "stage": "post_export",
@@ -427,90 +427,6 @@ def _get_match_repeat_kv_optimizer() -> Callable:
         return gm
 
     return _transform
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-@pytest.mark.parametrize("num_heads, num_kv_heads", [(8, 8), (8, 4), (8, 2)])
-@pytest.mark.parametrize(
-    "model_cls", [RepeatKVModel, RepeatKVModel2, RepeatKVModel3, HFRepeatKVModel]
-)
-@torch.inference_mode()
-def test_match_repeat_kv(num_heads, num_kv_heads, model_cls, dtype):
-    batch_size, seq_len = 4, 12
-    hidden_size = 512
-
-    model = model_cls(hidden_size, num_heads, num_kv_heads).to("cuda", dtype=dtype)
-    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
-    dynamic_shapes = model.get_dynamic_shapes()
-
-    # When num_heads == num_kv_heads, we don't expect any pattern match
-    # Otherwise, we should find 2 instances (one for k and one for v)
-    expected_matches = 0 if num_heads == num_kv_heads else 2
-
-    def verify_matcher(gm):
-        repeat_kv_nodes = [
-            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_repeat_kv)
-        ]
-
-        # Check that we have the expected number of replacements
-        if len(repeat_kv_nodes) != expected_matches:
-            return False
-
-        # If we don't expect any matches, we're done
-        if expected_matches == 0:
-            return True
-
-        # Otherwise, check the shape metadata of all repeat_kv nodes
-        for node in repeat_kv_nodes:
-            # Check input tensor metadata
-            input_tensor = node.args[0]
-            n_rep = node.args[1]
-
-            if "val" not in input_tensor.meta:
-                return False
-
-            input_shape = input_tensor.meta["val"].shape
-            output_shape = node.meta.get("val", None).shape if "val" in node.meta else None
-
-            # Input should be [batch, num_kv_heads, seq_len, head_dim]
-            if len(input_shape) != 4:
-                return False
-
-            batch, input_heads, input_seq, input_dim = input_shape
-
-            # Output should be [batch, num_heads, seq_len, head_dim]
-            # where num_heads = num_kv_heads * n_rep
-            if output_shape is None or len(output_shape) != 4:
-                return False
-
-            output_batch, output_heads, output_seq, output_dim = output_shape
-
-            # Check shapes are consistent
-            if (
-                output_batch != batch
-                or output_heads != input_heads * n_rep
-                or output_seq != input_seq
-                or output_dim != input_dim
-            ):
-                print(
-                    f"Expected shape {(batch, input_heads * n_rep, input_seq, input_dim)}, got {output_shape}"
-                )
-                return False
-
-        return True
-
-    _ = run_test(
-        model,
-        x,
-        _get_match_repeat_kv_optimizer(),
-        verify_matcher,
-        lambda num_p_og: num_p_og,
-        atol=1e-3,
-        rtol=1e-3,
-        test_load_hook=True,
-        strict_loading=True,
-        dynamic_shapes=dynamic_shapes,
-    )
 
 
 @pytest.mark.parametrize("has_mask", [True, False])
@@ -568,8 +484,11 @@ def test_match_eager_attention(has_mask, use_division, dropout, skip_output_asse
     expected_matches = 1
 
     def verify_matcher(gm):
+        # torch_attention_sdpa is replaced with torch_attention_grouped_sdpa after the transformation
         sdpa_nodes = [
-            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_sdpa)
+            n
+            for n in gm.graph.nodes
+            if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
         ]
 
         # Check that we have the expected number of replacements
@@ -652,7 +571,7 @@ def test_match_eager_attention(has_mask, use_division, dropout, skip_output_asse
     run_test(
         model,
         x,
-        match_attention_pattern,
+        _get_match_attention_optimizer(),
         verify_matcher,
         lambda num_p_og: num_p_og,
         atol=1e-3,
@@ -686,7 +605,7 @@ def test_counter_example():
     _ = run_test(
         model,
         x,
-        match_attention_pattern,
+        _get_match_attention_optimizer(),
         verify_no_matches,
         lambda num_p_og: num_p_og,
         atol=1e-3,
@@ -710,9 +629,8 @@ def test_match_grouped_attention(num_heads, num_kv_heads, has_mask):
     x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
     dynamic_shapes = model.get_dynamic_shapes()
 
-    # We should find 1 instance of the pattern if num_heads != num_kv_heads
-    # Otherwise, no pattern should be matched (no grouped attention)
-    expected_matches = 1 if num_heads != num_kv_heads else 0
+    # We should find 1 instance of torch_attention_grouped_sdpa
+    expected_matches = 1
 
     def verify_matcher(gm):
         grouped_sdpa_nodes = [
@@ -727,10 +645,6 @@ def test_match_grouped_attention(num_heads, num_kv_heads, has_mask):
                 f"Expected {expected_matches} grouped SDPA nodes, found {len(grouped_sdpa_nodes)}"
             )
             return False
-
-        # If we don't expect any matches, we're done
-        if expected_matches == 0:
-            return True
 
         # Otherwise, check the node properties
         for node in grouped_sdpa_nodes:
@@ -761,7 +675,7 @@ def test_match_grouped_attention(num_heads, num_kv_heads, has_mask):
     _ = run_test(
         model,
         x,
-        match_attention_pattern,
+        _get_match_attention_optimizer(),
         verify_matcher,
         lambda num_p_og: num_p_og,
         atol=1e-3,

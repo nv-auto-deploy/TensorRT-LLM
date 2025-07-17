@@ -33,68 +33,46 @@ def _apply_pattern(
 
 def match_attention_pattern(gm: GraphModule) -> None:
     """Match and replace the attention pattern in the graph. Applying these transformations in sequence:
-
-    Match repeat_kv pattern and replace with torch.ops.auto_deploy.torch_attention_repeat_kv.
     Match eager attention pattern and replace with torch.ops.auto_deploy.torch_attention_sdpa.
     Match grouped attention pattern and replace with torch.ops.auto_deploy.torch_attention_grouped_sdpa
     """
-
-    def register_repeat_kv(patterns: ADPatternMatcherPass):
-        dummy_args = [
-            torch.randn(8, 8, 16, 64, device="cuda", dtype=torch.float16),
-            7,
-        ]
-        register_ad_pattern(
-            search_fn=_repeat_kv_pattern,
-            replace_fn=_repeat_kv_repl,
-            patterns=patterns,
-            dummy_args=dummy_args,
-            op_ignore_types={
-                torch.ops.aten.reshape.default: (int,),
-                torch.ops.aten.expand.default: (int,),
-            },
-            scalar_workaround={"n_rep": dummy_args[1]},
-        )
 
     def register_eager_attention(patterns: ADPatternMatcherPass):
         for pattern_config in _get_sfdp_patterns():
             register_ad_pattern(**pattern_config, patterns=patterns)
 
     def register_grouped_attention(patterns: ADPatternMatcherPass):
-        dummy_args = [
-            torch.randn(8, 8, 16, 64, device="cuda", dtype=torch.float16),  # q
-            torch.randn(8, 1, 16, 64, device="cuda", dtype=torch.float16),  # k
-            torch.randn(8, 1, 16, 64, device="cuda", dtype=torch.float16),  # v
-            7,  # n_rep
-            torch.randn(8, 1, 1, 16, device="cuda", dtype=torch.float16),  # attn_mask
-            0.12345,  # dropout
-            0.56789,  # scale
-        ]
+        q = torch.randn(8, 8, 16, 64, device="cuda", dtype=torch.float16)
+        k1 = torch.randn(8, 1, 16, 64, device="cuda", dtype=torch.float16)
+        v1 = torch.randn(8, 1, 16, 64, device="cuda", dtype=torch.float16)
+        attn_mask = torch.randn(8, 1, 1, 16, device="cuda", dtype=torch.float16)
+        dropout = 0.12345
+        scale = 0.56789
+        n_rep = 7
+
+        dummy_args_1 = [q, k1, v1, n_rep, attn_mask, dropout, scale]
+        dummy_args_2 = [q, k1, v1, attn_mask, dropout, scale]
+
         register_ad_pattern(
             search_fn=_grouped_attn_pattern,
             replace_fn=_grouped_attn_replacement,
             patterns=patterns,
-            dummy_args=dummy_args,
-            scalar_workaround={"scale": 0.56789, "dropout_p": 0.12345, "n_rep": 7},
+            dummy_args=dummy_args_1,
+            scalar_workaround={"scale": scale, "dropout_p": dropout, "n_rep": n_rep},
+        )
+        register_ad_pattern(
+            search_fn=_grouped_attn_pattern_2,
+            replace_fn=_grouped_attn_replacement_2,
+            patterns=patterns,
+            dummy_args=dummy_args_2,
+            scalar_workaround={
+                "scale": scale,
+                "dropout_p": dropout,
+            },
         )
 
-    _apply_pattern(gm, "Repeat KV", register_repeat_kv, shape_prop=True)
     _apply_pattern(gm, "Eager Attention", register_eager_attention)
     _apply_pattern(gm, "Grouped Attention", register_grouped_attention)
-
-
-def _repeat_kv_pattern(hidden_states, n_rep) -> torch.Tensor:
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def _repeat_kv_repl(hidden_states, n_rep) -> torch.Tensor:
-    return torch.ops.auto_deploy.torch_attention_repeat_kv(hidden_states, n_rep)
 
 
 # with causal_mask, no division
@@ -272,14 +250,38 @@ def _get_sfdp_patterns() -> List[Dict[str, Any]]:
 
 
 def _grouped_attn_pattern(q, k, v, n_rep, attn_mask, dropout_p, scale):
-    k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
-    v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
+    # Repeat k and v
+    k_rep = (
+        torch.unsqueeze(k, 2)
+        .expand(k.shape[0], k.shape[1], n_rep, k.shape[2], k.shape[3])
+        .reshape(k.shape[0], k.shape[1] * n_rep, k.shape[2], k.shape[3])
+    )
+
+    v_rep = (
+        torch.unsqueeze(v, 2)
+        .expand(v.shape[0], v.shape[1], n_rep, v.shape[2], v.shape[3])
+        .reshape(v.shape[0], v.shape[1] * n_rep, v.shape[2], v.shape[3])
+    )
+
+    return torch.ops.auto_deploy.torch_attention_sdpa.default(
+        q, k_rep, v_rep, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
+    )
+
+
+def _grouped_attn_replacement(q, k, v, n_rep, attn_mask, dropout_p, scale):
+    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
+        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
+    )
+
+
+# Only expose torch_attention_grouped_sdpa after the transformation
+def _grouped_attn_pattern_2(q, k, v, attn_mask, dropout_p, scale):
     return torch.ops.auto_deploy.torch_attention_sdpa.default(
         q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
     )
 
 
-def _grouped_attn_replacement(q, k, v, n_rep, attn_mask, dropout_p, scale):
+def _grouped_attn_replacement_2(q, k, v, attn_mask, dropout_p, scale):
     return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
         q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
     )
