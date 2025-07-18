@@ -9,7 +9,11 @@ from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_sharding_pattern_detection_test, run_test
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
+<<<<<<< HEAD
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+=======
+from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
+>>>>>>> 9377e3737 (Updated tests)
 from tensorrt_llm._torch.auto_deploy.transformations.library.sharding import (
     BMMShardingInfo,
     ShardingConfig,
@@ -79,7 +83,11 @@ def _run_job(
     run_test(
         model,
         x,
+<<<<<<< HEAD
         transform=transform_func,
+=======
+        transform=partial(transform_func, rank=rank, world_size=world_size),
+>>>>>>> 9377e3737 (Updated tests)
         check_transformed_graph=lambda gm: any(is_op(n, op_expected) for n in gm.graph.nodes)
         == (world_size > 1),
         _get_expected_num_params=_get_expected_num_params,
