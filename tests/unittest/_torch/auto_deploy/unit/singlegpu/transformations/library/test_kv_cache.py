@@ -13,8 +13,6 @@ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.interface import InferenceOptimizerConfig
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.transformations.library import update_in_out_nodes
-from tensorrt_llm._torch.auto_deploy.transformations.library.kvcache import insert_cached_attention
 
 
 # Class that uses SDPA directly instead of the regular attention mechanism
@@ -68,7 +66,7 @@ class GQAWithSdpa(GQA):
         return self.o_proj(attn_output)
 
 
-def _get_optimizer_config() -> InferenceOptimizerConfig:
+def _get_optimizer_config(attn_descriptor, cache_config) -> InferenceOptimizerConfig:
     return {
         "build_model": {
             "stage": "factory",
@@ -85,6 +83,14 @@ def _get_optimizer_config() -> InferenceOptimizerConfig:
         },
         "cleanup_input_constraints": {
             "stage": "post_export",
+        },
+        "update_in_out_nodes": {
+            "stage": "post_export",
+        },
+        "insert_cached_attention": {
+            "stage": "cache_init",
+            "attn_descriptor": attn_descriptor,
+            "cache_config": cache_config,
         },
     }
 
@@ -166,21 +172,13 @@ def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
     # Get the model's regular output
     y_model = model(x, position_ids)  # b, s, d
 
-    # run modular inference optimizer up to post_export
-    optimizer = InferenceOptimizer(factory, _get_optimizer_config())  # type: ignore
-    gm = optimizer(cm)
-
-    y_gm = gm(x, position_ids)
-    assert all_close(y_model, y_gm, atol=atol, rtol=rtol)
-
     # Set up cache configuration
     cache_config = CacheConfig()
 
-    # Get input node(s)
-    update_in_out_nodes(gm, cm)
-
     # Apply the transformation
-    insert_cached_attention(gm, cm, attn_descriptor=attn_descriptor, cache_config=cache_config)
+    optimizer = InferenceOptimizer(factory, _get_optimizer_config(attn_descriptor, cache_config))  # type: ignore
+    gm = optimizer(cm)
+
     gm.to("cuda")
     cm.initialize_caches()
 
