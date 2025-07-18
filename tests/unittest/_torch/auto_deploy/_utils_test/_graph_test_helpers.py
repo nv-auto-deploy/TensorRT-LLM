@@ -48,7 +48,7 @@ def count_buffers(model: torch.nn.Module):
     return sum(np.prod(b.shape) for b in model.buffers())
 
 
-def run_test_optimizer(
+def run_test_transformed_gm(
     model: nn.Module,
     x: torch.Tensor,
     gm_transformed: GraphModule,

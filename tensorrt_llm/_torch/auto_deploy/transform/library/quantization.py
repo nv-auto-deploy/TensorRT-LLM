@@ -249,7 +249,7 @@ class Quantization(BaseTransform):
                 num_matches += count
         ad_logger.debug("After quantization: " + str(gm))
 
-        # TODO: confirm this
+        # TODO:(hg) confirm this
         info = TransformInfo(
             skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=True
         )

@@ -51,7 +51,7 @@ class UpdateInOutNodes(BaseTransform):
 
         canonicalize_graph(gm)
 
-        # TODO: confirm this
+        # TODO:(hg) confirm this
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
 
         return gm, info
@@ -181,7 +181,7 @@ class InsertCachedAttention(BaseTransform):
         return gm, info
 
 
-# TODO: figure out where to move this?
+# TODO: (hg) figure out where to move this?
 # def resize_kv_cache(
 #     egm: GraphModule,
 #     cm: CachedSequenceInterface,

@@ -4,7 +4,7 @@ Tests for basic graph sharding.
 
 import pytest
 import torch
-from _graph_test_helpers import run_test_optimizer
+from _graph_test_helpers import run_test_transformed_gm
 from _model_test_utils import MLP, BMMDynamicModel, BMMModel
 from _torch_test_utils import fp4_compatible, fp8_compatible
 
@@ -66,7 +66,7 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
     gm_transformed = InferenceOptimizer(None, _get_optimizer_config(quant_config))(None, gm)
     gm_transformed.to("cuda")
 
-    run_test_optimizer(
+    run_test_transformed_gm(
         model,
         x,
         gm_transformed,
@@ -141,7 +141,7 @@ def test_bmm_quantization(quant_config, atol, rtol, num_p_og, model_class):
     gm_transformed = InferenceOptimizer(None, _get_optimizer_config(quant_config))(None, gm)
     gm_transformed.to("cuda")
 
-    run_test_optimizer(
+    run_test_transformed_gm(
         model,
         x,
         gm_transformed,
