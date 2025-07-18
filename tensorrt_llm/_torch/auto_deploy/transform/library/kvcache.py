@@ -17,7 +17,14 @@ from ..interface import BaseTransform, TransformConfig, TransformInfo, Transform
 
 @TransformRegistry.register("update_in_out_nodes")
 class UpdateInOutNodes(BaseTransform):
-    """A transform to update the in and out nodes of the graph module to support cached attention."""
+    """Modify the graph module by adding new input nodes and canonicalizing the graph.
+
+    The new input nodes correspond to the extra arguments needed for cached and flattened attention.
+
+    Args:
+        egm: The graph module to analyze and modify.
+        cm: Cached sequence interface containing extra argument information.
+    """
 
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
@@ -34,24 +41,26 @@ class UpdateInOutNodes(BaseTransform):
         assert len(output_nodes[0].all_input_nodes) == 1, (
             "Expected to only return final tensor output!"
         )
+        ad_logger.info(f"Found {len(input_nodes)} input nodes and {len(output_nodes)} output nodes")
 
         # Activate and add extra argument nodes
         new_args = cm.info.switch_to_cached_attn_inputs()
         for name in new_args:
             input_nodes.append(add_graph_input(gm, name))
+        ad_logger.info(f"Added {len(new_args)} new input nodes for cached attention metadata")
 
         canonicalize_graph(gm)
 
-        # this is a clean graph by definition since it was just exported
+        # TODO: confirm this
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
 
         return gm, info
 
 
-class KVCachedAttentionConfig(TransformConfig):
+class InsertCachedAttentionConfig(TransformConfig):
     """Configuration for the insert cached attention transform."""
 
-    # NOTE:type CacheConfig contains a torch.dtype, which is not a pydantic type. We set this to avoid the error.
+    # NOTE:type CacheConfig contains a torch.dtype not supported by pydantic. We set this to avoid error.
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     attn_descriptor: Type[AttentionDescriptor] = Field(
@@ -64,11 +73,11 @@ class KVCachedAttentionConfig(TransformConfig):
 class InsertCachedAttention(BaseTransform):
     """A transform to insert cached attention into the graph module."""
 
-    config: KVCachedAttentionConfig
+    config: InsertCachedAttentionConfig
 
     @classmethod
     def get_config_class(cls) -> Type[TransformConfig]:
-        return KVCachedAttentionConfig
+        return InsertCachedAttentionConfig
 
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
@@ -162,12 +171,14 @@ class InsertCachedAttention(BaseTransform):
         )
         ad_logger.debug(f"After inserting {attn_descriptor=} with cache: {gm}")
 
-        return gm, TransformInfo(
+        info = TransformInfo(
             skipped=False,
             num_matches=num_cached_attn_replacements,
-            is_clean=True,
-            has_valid_shapes=True,
+            is_clean=False,
+            has_valid_shapes=False,
         )
+
+        return gm, info
 
 
 # TODO: figure out where to move this?

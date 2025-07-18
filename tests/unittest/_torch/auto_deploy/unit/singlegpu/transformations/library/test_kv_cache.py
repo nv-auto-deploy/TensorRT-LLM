@@ -2,11 +2,11 @@ from typing import Optional
 
 import pytest
 import torch
-from _graph_test_helpers import FakeFactory
+from _graph_test_helpers import FakeFactory, SequenceEmbeddingInfo
 from _model_test_utils import GQA
 from _torch_test_utils import all_close
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import CacheConfig, SequenceInfo
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import CacheConfig
 from tensorrt_llm._torch.auto_deploy.custom_ops.flashinfer_attention import FlashInferAttention
 from tensorrt_llm._torch.auto_deploy.custom_ops.triton_attention import TritonAttention
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -85,7 +85,7 @@ def _get_optimizer_config(attn_descriptor, cache_config) -> InferenceOptimizerCo
             "stage": "post_export",
         },
         "update_in_out_nodes": {
-            "stage": "post_export",
+            "stage": "cache_init",
         },
         "insert_cached_attention": {
             "stage": "cache_init",
@@ -93,21 +93,6 @@ def _get_optimizer_config(attn_descriptor, cache_config) -> InferenceOptimizerCo
             "cache_config": cache_config,
         },
     }
-
-
-class SequenceEmbeddingInfo(SequenceInfo):
-    hidden_size: int
-    dtype: torch.dtype
-
-    def set_example_sequence(self) -> None:
-        super().set_example_sequence()
-        # set input ids to a 3D tensor (actually input embeddings)
-        self.input_ids = torch.rand(
-            *self.input_ids.shape,
-            self.hidden_size,
-            device=self.input_ids.device,
-            dtype=self.dtype,
-        )
 
 
 # TODO (lucaslie): consider rewriting this test with a custom InferenceOptimizer config
