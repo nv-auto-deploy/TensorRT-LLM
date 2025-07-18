@@ -1,4 +1,4 @@
-"""Pattern matching for detecting repeat_kv pattern from Huggingface models."""
+"""Pattern matching for detecting eager and grouped attention pattern from Huggingface models."""
 
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Type
