@@ -75,7 +75,7 @@ def _run_job(
         sharding_transform_executor(gm, sharding_config)
 
     # now run the test
-    op_expected = getattr(torch.ops.auto_deploy, "torch_dist_all_gather")
+    op_expected = getattr(torch.ops.auto_deploy, "torch_all_gather")
     run_test(
         model,
         x,

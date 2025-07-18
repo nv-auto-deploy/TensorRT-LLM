@@ -262,15 +262,6 @@ def is_bmm_op(node: Node, include_quantization: bool = False) -> bool:
     return is_op(node, dist_ops)
 
 
-def is_dist_op(node: Node) -> bool:
-    """Check if the node is a distributed op."""
-    dist_ops = {
-        torch.ops.auto_deploy.torch_dist_all_gather,
-        torch.ops.auto_deploy.torch_dist_all_reduce,
-    }
-    return is_op(node, dist_ops)
-
-
 def get_all_input_output_nodes(graph: Graph) -> Tuple[List[Node], List[Node]]:
     input_nodes: List[Node] = graph.find_nodes(op="placeholder")
     output_nodes: List[Node] = graph.find_nodes(op="output")

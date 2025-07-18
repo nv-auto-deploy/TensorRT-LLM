@@ -18,8 +18,8 @@ The table below lists the operators ordered by their backend.
 | `torch.ops.auto_deploy.torch_attention_grouped_sdpa` | Grouped SDPA implementation |
 | `torch.ops.auto_deploy.torch_attention_repeat_kv` | KV repetition for attention |
 | `torch.ops.auto_deploy.torch_attention_sdpa` | Standard SDPA implementation |
-| `torch.ops.auto_deploy.torch_dist_all_gather` | Distributed all-gather operation |
-| `torch.ops.auto_deploy.torch_dist_all_reduce` | Distributed all-reduce operation |
+| `torch.ops.auto_deploy.torch_all_gather` | Distributed all-gather operation |
+| `torch.ops.auto_deploy.torch_all_reduce` | Distributed all-reduce operation |
 | `torch.ops.auto_deploy.torch_linear_simple` | Simple linear layer implementation |
 | `torch.ops.auto_deploy.torch_moe` | Mixture of Experts implementation |
 | `torch.ops.auto_deploy.torch_moe_fused` | Fused Mixture of Experts implementation |
@@ -39,4 +39,4 @@ The table below lists the operators ordered by their backend.
 | `torch.ops.auto_deploy.triton_rope_on_flattened_inputs` | Triton RoPE on flattened inputs |
 | `torch.ops.auto_deploy.triton_rope_with_input_pos` | Triton RoPE with input positions |
 | `torch.ops.auto_deploy.trtllm_moe_fused` | TensorRT-LLM fused MoE implementation |
-| `torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce` | TensorRT-LLM fused linear layer followed by all-reduce operation |
+| `torch.ops.auto_deploy.torch_fused_linear_all_reduce` | fused linear layer followed by all-reduce operation |

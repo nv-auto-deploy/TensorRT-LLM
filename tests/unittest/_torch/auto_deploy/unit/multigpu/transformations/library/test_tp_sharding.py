@@ -115,7 +115,7 @@ def _run_job(
 
     def _get_expected_num_params(num_p_og: int) -> int:
         num_update = 0
-        if bias and dist_op_expected == "torch_dist_all_reduce":
+        if bias and dist_op_expected == "torch_all_reduce":
             num_p_og -= num_features
             num_update = num_features * (rank == world_size - 1)
 
@@ -275,9 +275,9 @@ def _run_pattern_detection_job(
 @pytest.mark.parametrize(
     "model_cls, dist_op_expected",
     (
-        (MLP, "torch_dist_all_reduce"),
-        (nn.Linear, "torch_dist_all_gather"),
-        (GQA_Block, "torch_dist_all_reduce"),
+        (MLP, "torch_all_reduce"),
+        (nn.Linear, "torch_all_gather"),
+        (GQA_Block, "torch_all_reduce"),
     ),
 )
 def test_sharding(model_cls: Type[nn.Module], dist_op_expected: str, bias: bool, device_count: int):
@@ -292,9 +292,9 @@ def test_sharding(model_cls: Type[nn.Module], dist_op_expected: str, bias: bool,
 @pytest.mark.parametrize(
     "model_cls, dist_op_expected",
     (
-        (MLP, "torch_dist_all_reduce"),
-        (nn.Linear, "torch_dist_all_gather"),
-        (GQA_Block, "torch_dist_all_reduce"),
+        (MLP, "torch_all_reduce"),
+        (nn.Linear, "torch_all_gather"),
+        (GQA_Block, "torch_all_reduce"),
     ),
 )
 def test_sharding_pattern_detection(
