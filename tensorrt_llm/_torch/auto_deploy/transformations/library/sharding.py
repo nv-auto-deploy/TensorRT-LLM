@@ -380,6 +380,7 @@ def _insert_sharded_matmul(
     The state_dict is also updated to contain the sharded weights.
     """
     assert dim in [0, 1], "Only dim 0 and 1 are supported for sharding"
+    assert dist_op or dim == 0, "For dim=1 sharding, dist_op is required."
 
     quantization_impl = QuantizationImpl.create(node)
 

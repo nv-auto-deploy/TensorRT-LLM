@@ -46,7 +46,6 @@ def _test_allreduce_fusion(port: int):
     if not dist.is_trtllm_dist_available():
         pytest.skip("Require trtllm ops to run test_allreduce_fusion.")
 
-    print("ran initialize_or_skip")
     _, _ = dist.initialize_or_skip(port=port)
 
     # Testing tensors
@@ -88,8 +87,6 @@ def _test_allreduce_fusion(port: int):
     # check if we can still export the model as expected
     export(gm, args=args)
     torch_export_to_gm(gm, args=args)
-
-    print("ran test_allreduce_fusion")
 
 
 @pytest.mark.parametrize("device_count", get_device_counts())
