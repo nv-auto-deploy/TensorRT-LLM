@@ -164,11 +164,27 @@ class AutoModelForCausalLMFactory(ModelFactory):
         if hasattr(model, "post_init"):
             model.post_init()
 
+        # if present, initialize sharding config
+        if hasattr(model_config, "base_model_tp_plan"):
+            self._sharding_config = model_config.base_model_tp_plan
+        # if it is a multi-modal factory, overwrite the sharding config with the
+        # dedicated sub-configs
+        if hasattr(model_config, "sub_configs"):
+            if isinstance(self, AutoModelForImageTextToTextFactory):
+                # for image-text-to-text models, we only support sharding for the text sub-config
+                self._sharding_config = model_config.sub_configs["text_config"].base_model_tp_plan
+            else:
+                # TODO: support sharding for other multi-modal models
+                pass
+
         # patch forward method
         model.forward = types.MethodType(self._simple_forward, model)
 
         model.eval()
         return model
+
+    def get_sharding_config(self):
+        return self._sharding_config or {}
 
     def get_quant_config(self) -> Dict:
         return self._quant_config or {}

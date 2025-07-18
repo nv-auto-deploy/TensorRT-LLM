@@ -103,7 +103,7 @@ class InferenceOptimizer:
         optimize_rope(egm)
 
         # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
-        sharding_config = ShardingConfig()
+        sharding_config = ShardingConfig(self.factory.get_sharding_config())
 
         # run TP sharding across ranks
         detect_column_row_shard(
