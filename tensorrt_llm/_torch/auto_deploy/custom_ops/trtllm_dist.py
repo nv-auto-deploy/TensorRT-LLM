@@ -30,11 +30,11 @@ def all_gather_fake(tensor, dim=0, sizes=None):
 
 
 @torch.library.custom_op("auto_deploy::trtllm_all_reduce", mutates_args=(), device_types="cuda")
-def all_reduce(tensor: torch.Tensor) -> torch.Tensor:
+def all_reduce(tensor: torch.Tensor, strategy: int = int(AllReduceStrategy.AUTO)) -> torch.Tensor:
     """TRT-LLM all_reduce across the ranks."""
     rank, world_size = get_rank_world_size()
     p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
-    torch_op = AllReduce(mapping=p_config, strategy=AllReduceStrategy.AUTO)
+    torch_op = AllReduce(mapping=p_config, strategy=AllReduceStrategy(strategy))
     result = torch_op(tensor)
     assert isinstance(result, torch.Tensor), "Expected tensor result from allreduce"
     return result
@@ -49,7 +49,11 @@ def all_reduce_fake(tensor):
     "auto_deploy::trtllm_fused_allreduce_residual_rmsnorm", mutates_args=(), device_types="cuda"
 )
 def trtllm_fused_allreduce_residual_rmsnorm(
-    tensor: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    strategy: int = int(AllReduceStrategy.AUTO),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fusing allreduce, residual (add), and hf_rms_norm together."""
     rank, world_size = get_rank_world_size()
@@ -64,7 +68,7 @@ def trtllm_fused_allreduce_residual_rmsnorm(
         eps=eps,
     )
 
-    torch_op = AllReduce(mapping=p_config, strategy=AllReduceStrategy.AUTO)
+    torch_op = AllReduce(mapping=p_config, strategy=AllReduceStrategy(strategy))
     output = torch_op(tensor, all_reduce_params=all_reduce_params)
     assert len(output) == 2, "Expected 2 outputs from trtllm_fused_allreduce_residual_rmsnorm"
     return output[0], output[1]
@@ -72,6 +76,10 @@ def trtllm_fused_allreduce_residual_rmsnorm(
 
 @trtllm_fused_allreduce_residual_rmsnorm.register_fake
 def trtllm_fused_allreduce_residual_rmsnorm_fake(
-    tensor: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    strategy: int = int(AllReduceStrategy.AUTO),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(tensor), torch.empty_like(tensor)

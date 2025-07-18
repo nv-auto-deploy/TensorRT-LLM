@@ -15,7 +15,7 @@ from .._graph import canonicalize_graph
 #    similar pointwise ops. None of this can be done with the stock torch collectives.
 # 3. Hence I wonder if there is any value in transform only given us a small perf boost but not
 #    really taking us to peak perf anyway...
-def fuse_torch_collectives(gm: GraphModule) -> None:
+def fuse_torch_allreduce(gm: GraphModule) -> None:
     """Replace linear followed by torch's allreduce with a fused op.
 
     Torch's collectives are in-place operations, which we cannot express as single custom op. Hence,
@@ -68,11 +68,11 @@ def fuse_allreduce_residual_rmsnorm(gm: GraphModule) -> None:
     """Essentially, this function fuses the following operators into one allreduce trtllm implementation.
 
     * target pattern:
-        x = all_reduce(x)
+        x = all_reduce(x, strategy)
         y = x + residual
         return rmsnorm(y), y
     * replacement:
-        trtllm_fused_allreduce_residual_rmsnorm(x, residual, rmsnorm_weight, rmsnorm_eps)
+        trtllm_fused_allreduce_residual_rmsnorm(x, residual, rmsnorm_weight, rmsnorm_eps, strategy)
 
     """
     num_ar_r_rms_fusions = 0
@@ -127,16 +127,15 @@ def fuse_allreduce_residual_rmsnorm(gm: GraphModule) -> None:
             )
             eps = add_eps_node.args[1]
 
+            all_args = (tensor, residual, norm_weight, eps)
+            if len(allreduce_node.args) > 1:
+                all_args += (allreduce_node.args[1],)  # strategy is the second arg
+
             # Insert nodes
             with graph.inserting_before(allreduce_node):
                 fused_node = graph.call_function(
                     torch.ops.auto_deploy.trtllm_fused_allreduce_residual_rmsnorm,
-                    args=(
-                        tensor,
-                        residual,
-                        norm_weight,
-                        eps,
-                    ),
+                    args=all_args,
                 )
                 # Extract outputs from the tuple returned by `fused_node`
                 final_output_node = gm.graph.create_node(

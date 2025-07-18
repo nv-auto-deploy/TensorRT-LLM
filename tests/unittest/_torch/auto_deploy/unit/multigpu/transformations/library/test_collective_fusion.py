@@ -13,7 +13,7 @@ from _torch_test_utils import fp8_compatible
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.custom_ops.quant import FP8Linear
-from tensorrt_llm._torch.auto_deploy.transformations.library import fuse_torch_collectives
+from tensorrt_llm._torch.auto_deploy.transformations.library import fuse_torch_allreduce
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
@@ -65,7 +65,7 @@ def _run_job(
     run_test(
         model,
         x,
-        transform=fuse_torch_collectives,
+        transform=fuse_torch_allreduce,
         check_transformed_graph=check_transformed_graph,
         _get_expected_num_params=_get_expected_num_params,
         test_load_hook=False,

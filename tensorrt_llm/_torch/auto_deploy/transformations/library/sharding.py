@@ -20,15 +20,18 @@ import math
 import operator
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from functools import partial
-from typing import Callable, DefaultDict, Dict, List, Literal, Optional, Set
+from typing import Callable, DefaultDict, Dict, List, Literal, Optional, Set, Tuple, overload
 
 import torch
 import torch.nn as nn
 from pydantic import BaseModel, ConfigDict, Field
+from torch._ops import OpOverloadPacket
 from torch.fx import GraphModule, Node
 
+from .....functional import AllReduceStrategy
+from ... import distributed as dist
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     extract_param_names_from_lin_node,
@@ -48,6 +51,14 @@ class SplitDimension(IntEnum):
     COLUMN = 1  # Split along columns (second dimension)
 
 
+class DistBackend(StrEnum):
+    """Enum for distributed backends."""
+
+    AUTO = "auto"  # pick trtllm if available, otherwise torch
+    TORCH = "torch"
+    TRTLLM = "trtllm"
+
+
 class ShardingTransformInfo(BaseModel, ABC):
     """Abstract base class for transformation configurations."""
 
@@ -56,6 +67,8 @@ class ShardingTransformInfo(BaseModel, ABC):
     target_node: str
     rank: int
     world_size: int
+    dist_backend: DistBackend = DistBackend.AUTO
+    trtllm_allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """
@@ -78,6 +91,34 @@ class ShardingTransformInfo(BaseModel, ABC):
             ad_logger.warning(f"Skipping invalid transformation {self}.")
             return
         self.apply(gm, node)
+
+    @overload
+    def _get_dist_op(self, dist_op: None) -> Tuple[None, Tuple]: ...
+
+    @overload
+    def _get_dist_op(self, dist_op: str) -> Tuple[OpOverloadPacket, Tuple]: ...
+
+    def _get_dist_op(self, dist_op: Optional[str]) -> Tuple[Optional[OpOverloadPacket], Tuple]:
+        """Get the dist op and extra final args for the dist op."""
+        if dist_op is None:
+            return None, ()
+        # construct dist op lookup
+        strategy = int(self.trtllm_allreduce_strategy)
+        dist_lookup = {
+            DistBackend.TORCH: {
+                "all_reduce": (torch.ops.auto_deploy.torch_all_reduce, ()),
+                "all_gather": (torch.ops.auto_deploy.torch_all_gather, ()),
+            },
+            DistBackend.TRTLLM: {
+                "all_reduce": (torch.ops.auto_deploy.trtllm_all_reduce, (strategy,)),
+                "all_gather": (torch.ops.auto_deploy.trtllm_all_gather, ()),
+            },
+        }
+        auto_backend = DistBackend.TRTLLM if dist.is_trtllm_dist_available() else DistBackend.TORCH
+        dist_lookup[DistBackend.AUTO] = dist_lookup[auto_backend]
+
+        dist_op, final_args = dist_lookup[self.dist_backend][dist_op]
+        return dist_op, final_args  # type: ignore
 
 
 class TPShardingInfo(ShardingTransformInfo):
@@ -107,13 +148,18 @@ class TPShardingInfo(ShardingTransformInfo):
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply TP sharding transformation to the graph module."""
 
+        dist_op, dist_final_args = self._get_dist_op(self.dist_op)
+        if self.dist_op == "all_gather":
+            dist_final_args = (-1,) + dist_final_args
+
         _insert_sharded_matmul(
             gm=gm,
             node=node,
             dim=self.split_dim.value,
             rank=self.rank,
             world_size=self.world_size,
-            add_dist=self.dist_op is not None,
+            dist_op=dist_op,
+            dist_extra_args=dist_final_args,
             min_local_shape=self.min_local_shape,
         )
 
@@ -211,10 +257,11 @@ class BMMShardingInfo(ShardingTransformInfo):
         handle_tensor(node, rhs_tensor, 1, self.start_idx, self.end_idx)
 
         # Add all_gather node after BMM to collect results
+        dist_op, dist_final_args = self._get_dist_op("all_gather")
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
-                torch.ops.auto_deploy.torch_all_gather,
-                args=(node, 0),  # Gather along batch dimension (0)
+                dist_op,
+                args=(node, 0, *dist_final_args),  # Gather along batch dimension (0)
             )
             node.replace_all_uses_with(gather_node)
             gather_node.replace_input_with(gather_node, node)
@@ -242,7 +289,8 @@ class EPShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply EP sharding transformation to the graph module."""
-        _insert_sharded_moe(gm, node, self.rank, self.world_size)
+        dist_op, dist_final_args = self._get_dist_op("all_reduce")
+        _insert_sharded_moe(gm, node, dist_op, dist_final_args, self.rank, self.world_size)
 
 
 class ShardingConfig(BaseModel):
@@ -323,7 +371,8 @@ def _insert_sharded_matmul(
     dim: int,
     rank: int,
     world_size: int,
-    add_dist: bool = False,
+    dist_op: Optional[Callable] = None,
+    dist_extra_args: Optional[Tuple] = None,
     min_local_shape: int = 1,
 ) -> None:
     """Replace the matmul node with a new matmul node that accepts sharded weights.
@@ -331,7 +380,6 @@ def _insert_sharded_matmul(
     The state_dict is also updated to contain the sharded weights.
     """
     assert dim in [0, 1], "Only dim 0 and 1 are supported for sharding"
-    assert add_dist or dim == 0, "For dim=1 sharding, dist_op is required."
 
     quantization_impl = QuantizationImpl.create(node)
 
@@ -428,20 +476,13 @@ def _insert_sharded_matmul(
             )
         )
 
-    # no comm node needed for single device
-    if not add_dist:
+    # no dist op provided
+    if dist_op is None:
         return
 
-    # figure out the right dist op
-    dist_lookup = {
-        0: (torch.ops.auto_deploy.torch_all_gather, -1),
-        1: (torch.ops.auto_deploy.torch_all_reduce,),
-    }
-    fn_dist, *dist_args = dist_lookup[dim]
-
-    # add reduction node
+    # add dist op node
     with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(fn_dist, args=(node, *dist_args))
+        dist_node = gm.graph.call_function(dist_op, args=(node, *(dist_extra_args or ())))
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
 
@@ -764,6 +805,8 @@ def detect_ep_shard(
 def _insert_sharded_moe(
     gm: GraphModule,
     node: Node,
+    dist_op: OpOverloadPacket,
+    dist_final_args: Tuple,
     rank: int,
     world_size: int,
 ):
@@ -841,6 +884,6 @@ def _insert_sharded_moe(
 
     # -- add an all_reduce node --
     with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(torch.ops.auto_deploy.torch_all_reduce, args=(node,))
+        dist_node = gm.graph.call_function(dist_op, args=(node, *dist_final_args))
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
