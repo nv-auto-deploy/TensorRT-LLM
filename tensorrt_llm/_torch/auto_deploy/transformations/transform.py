@@ -21,8 +21,8 @@ from .library import (
     detect_ep_shard,
     eliminate_redundant_transposes,
     fuse_allreduce_residual_rmsnorm,
-    fuse_collectives,
     fuse_rmsnorm,
+    fuse_torch_collectives,
     insert_cached_attention,
     match_attention_layout,
     match_attention_pattern,
@@ -150,7 +150,7 @@ class InferenceOptimizer:
         fuse_allreduce_residual_rmsnorm(egm)
 
         # check if we can fuse collectives
-        fuse_collectives(egm)
+        fuse_torch_collectives(egm)
 
         # TODO (lucaslie): add backend selection as part of configurable inference optimizers
         # check if we can fuse rmsnorm

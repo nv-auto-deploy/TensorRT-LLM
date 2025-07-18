@@ -44,7 +44,7 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
         detect_ep_shard(gm, rank, world_size, sharding_config)
         sharding_transform_executor(gm, sharding_config)
 
-    op_expected = torch.ops.auto_deploy.torch_dist_all_reduce
+    op_expected = torch.ops.auto_deploy.torch_all_reduce
 
     run_test(
         model,

@@ -146,7 +146,7 @@ class BMMShardingInfo(ShardingTransformInfo):
         # Check if the distribution is balanced
         remainder = bmm_batch_size % self.world_size
 
-        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather doesn't support uneven splits at the moment.
+        # NOTE: our torch.ops.auto_deploy.torch_all_gather doesn't support uneven splits at the moment.
         if remainder:
             ad_logger.warning(
                 f"BMM batch size {bmm_batch_size} is not divisible by world size {self.world_size}. "
@@ -213,7 +213,7 @@ class BMMShardingInfo(ShardingTransformInfo):
         # Add all_gather node after BMM to collect results
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
-                torch.ops.auto_deploy.torch_dist_all_gather,
+                torch.ops.auto_deploy.torch_all_gather,
                 args=(node, 0),  # Gather along batch dimension (0)
             )
             node.replace_all_uses_with(gather_node)
@@ -434,8 +434,8 @@ def _insert_sharded_matmul(
 
     # figure out the right dist op
     dist_lookup = {
-        0: (torch.ops.auto_deploy.torch_dist_all_gather, -1),
-        1: (torch.ops.auto_deploy.torch_dist_all_reduce,),
+        0: (torch.ops.auto_deploy.torch_all_gather, -1),
+        1: (torch.ops.auto_deploy.torch_all_reduce,),
     }
     fn_dist, *dist_args = dist_lookup[dim]
 
@@ -690,7 +690,7 @@ def detect_dp_bmm_shard(
         base_size = bmm_batch_size // world_size
         remainder = bmm_batch_size % world_size
 
-        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather doesn't support uneven splits at the moment.
+        # NOTE: our torch.ops.auto_deploy.torch_all_gather doesn't support uneven splits at the moment.
         if remainder:
             ad_logger.warning(
                 f"BMM batch size {bmm_batch_size} is not divisible by world size {world_size}. "
@@ -841,8 +841,6 @@ def _insert_sharded_moe(
 
     # -- add an all_reduce node --
     with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(
-            torch.ops.auto_deploy.torch_dist_all_reduce, args=(node,)
-        )
+        dist_node = gm.graph.call_function(torch.ops.auto_deploy.torch_all_reduce, args=(node,))
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)

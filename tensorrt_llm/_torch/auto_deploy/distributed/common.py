@@ -1,4 +1,15 @@
-"""Common utilities for distributed inference."""
+"""Common utilities for distributed inference.
+
+These utilities serve two purposes:
+
+1. Drop-in replacement for torch.distributed to ensure that any function in torch.distributed works
+   out of the box.
+2. Provide a simple interface to spawn multiple processes and communicate with them. We support
+   three supports:
+   a. MPI initialized via TRT-LLM runtime or mpirun.
+   b. TorchElastic initialized via torchrun.
+   c. Simple python multiprocessing started explicitly.
+"""
 
 import atexit
 import os
@@ -11,8 +22,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from ..utils.logger import ad_logger
-
-# TODO: check to what extend we can reuse _torch/distributed.py
 
 
 class _DistGroup:
@@ -93,17 +102,22 @@ def initialize_or_skip(*args, **kwargs) -> Tuple[int, int]:
     return get_rank(), get_world_size()
 
 
-def is_ompi():
+def is_ompi() -> bool:
     """Check whether multi-processing was initialized with explicitly calling mpirun."""
     return "OMPI_COMM_WORLD_SIZE" in os.environ
 
 
-def is_torchelastic():
+def is_trtllm_dist_available() -> bool:
+    """Check if TRT-LLM distributed operations are available (they only work with MPI!)."""
+    return is_ompi()
+
+
+def is_torchelastic() -> bool:
     """Check whether multi-processing was initialized with torchelastic."""
     return "TORCHELASTIC_RUN_ID" in os.environ
 
 
-def cleanup():
+def cleanup() -> None:
     """Destroy process group when the program exits."""
     if dist.is_initialized():
         ad_logger.info("Destroying process group")

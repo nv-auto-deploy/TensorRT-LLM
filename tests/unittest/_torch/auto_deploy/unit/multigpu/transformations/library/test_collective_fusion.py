@@ -13,7 +13,7 @@ from _torch_test_utils import fp8_compatible
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.custom_ops.quant import FP8Linear
-from tensorrt_llm._torch.auto_deploy.transformations.library import fuse_collectives
+from tensorrt_llm._torch.auto_deploy.transformations.library import fuse_torch_collectives
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
@@ -26,8 +26,8 @@ class MLPAllReduce(nn.Module):
         self.linear2 = cls(4 * in_features, out_features, bias=bias)
 
     def forward(self, x):
-        y = F.relu(torch.ops.auto_deploy.torch_dist_all_reduce(self.linear1(x)))
-        return torch.ops.auto_deploy.torch_dist_all_reduce(self.linear2(y))
+        y = F.relu(torch.ops.auto_deploy.torch_all_reduce(self.linear1(x)))
+        return torch.ops.auto_deploy.torch_all_reduce(self.linear2(y))
 
 
 def _run_job(
@@ -58,14 +58,14 @@ def _run_job(
 
     def check_transformed_graph(gm):
         return any(is_op(n, op_expected) for n in gm.graph.nodes) and not any(
-            is_op(n, torch.ops.auto_deploy.torch_dist_all_reduce) for n in gm.graph.nodes
+            is_op(n, torch.ops.auto_deploy.torch_all_reduce) for n in gm.graph.nodes
         )
 
     # now run the test
     run_test(
         model,
         x,
-        transform=fuse_collectives,
+        transform=fuse_torch_collectives,
         check_transformed_graph=check_transformed_graph,
         _get_expected_num_params=_get_expected_num_params,
         test_load_hook=False,
@@ -76,7 +76,7 @@ def _run_job(
 @pytest.mark.parametrize(
     "linear_cls, dist_op_expected",
     (
-        (nn.Linear, "auto_deploy.trtllm_dist_fused_linear_all_reduce"),
+        (nn.Linear, "auto_deploy.torch_fused_linear_all_reduce"),
         pytest.param(
             FP8Linear,
             "auto_deploy.torch_quant_fused_fp8_linear_all_reduce",

@@ -5,8 +5,7 @@ import torch
 from _dist_test_utils import get_device_counts
 from torch.export import export
 
-from tensorrt_llm._torch.auto_deploy.distributed import common as dist
-from tensorrt_llm._torch.auto_deploy.distributed.trtllm import is_trtllm_op_available
+from tensorrt_llm._torch.auto_deploy import distributed as dist
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations.library.collectives import (
     fuse_allreduce_residual_rmsnorm,
@@ -37,16 +36,17 @@ class AllreduceResidualNorm(torch.nn.Module):
         self.norm = RMSNorm(hidden_size, 1e-5, dtype)
 
     def forward(self, x, residual):
-        x = torch.ops.auto_deploy.torch_dist_all_reduce(x)
+        x = torch.ops.auto_deploy.trtllm_all_reduce(x)
         y = x + residual
         normed = self.norm(y)
         return normed, y
 
 
 def _test_allreduce_fusion(port: int):
-    if not is_trtllm_op_available():
+    if not dist.is_trtllm_dist_available():
         pytest.skip("Require trtllm ops to run test_allreduce_fusion.")
 
+    print("ran initialize_or_skip")
     _, _ = dist.initialize_or_skip(port=port)
 
     # Testing tensors
@@ -73,7 +73,7 @@ def _test_allreduce_fusion(port: int):
     # Check if fused node in the graph
     has_fused_node = False
     for node in gm.graph.nodes:
-        if is_op(node, torch.ops.dist.fused_allreduce_residual_rmsnorm):
+        if is_op(node, torch.ops.auto_deploy.trtllm_fused_allreduce_residual_rmsnorm):
             has_fused_node = True
     assert has_fused_node, "Fused node not found."
 
@@ -89,6 +89,8 @@ def _test_allreduce_fusion(port: int):
     export(gm, args=args)
     torch_export_to_gm(gm, args=args)
 
+    print("ran test_allreduce_fusion")
+
 
 @pytest.mark.parametrize("device_count", get_device_counts())
 def test_allreduce_fusion(device_count):
@@ -98,4 +100,7 @@ def test_allreduce_fusion(device_count):
 
     n_workers = device_count
     mpi_pool = MpiPoolSession(n_workers=n_workers)
-    mpi_pool.submit_sync(_test_allreduce_fusion, port=port)
+    try:
+        mpi_pool.submit_sync(_test_allreduce_fusion, port=port)
+    finally:
+        mpi_pool.shutdown()

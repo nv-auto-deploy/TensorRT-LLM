@@ -3,33 +3,38 @@ import operator
 import torch
 from torch.fx import GraphModule
 
-from ...distributed.trtllm import is_trtllm_op_available
 from ...utils.logger import ad_logger
 from ...utils.node_utils import get_op_overload_packet, get_user_if_pattern_match, is_op
 from .._graph import canonicalize_graph
 
 
-# TODO: This is an overly simplified model that works well for vanilla Llama models.
-# However, we eventually want to consider more sophisticated patterns such as
-# * all_reduce(lin1(x) + lin2(x))
-# * version above with fused GEMMs (i.e. with a split node)
-# * all_reduce(pointwise_op(linear(x)))
-# * ...
-def fuse_collectives(gm: GraphModule) -> None:
+# TODO (lucaslie): reconsider the value-add of this transform. Here are some thoughts:
+# 1. This is only useful for using torch's built-in, in-place allreduce op. TRT-LLM's allreduce op
+#    is not in-place anyway (hence can be expressed as a custom op) and supposedly more performant.
+# 2. Peak performance can only be achieved with fusing the collective with other ops like RMS or
+#    similar pointwise ops. None of this can be done with the stock torch collectives.
+# 3. Hence I wonder if there is any value in transform only given us a small perf boost but not
+#    really taking us to peak perf anyway...
+def fuse_torch_collectives(gm: GraphModule) -> None:
+    """Replace linear followed by torch's allreduce with a fused op.
+
+    Torch's collectives are in-place operations, which we cannot express as single custom op. Hence,
+    to take advantage of the memory savings we fuse them with the preceding linear op.
+    """
     num_gemm_collective_fusions = 0
     ad_logger.debug("Before GEMM+Collective fusion: " + str(gm))
 
     # lookup for fused ops
     # TODO: avoid this hardcoded lookup, e.g., by generating fused ops on the fly.
     lookup = {
-        torch.ops.auto_deploy.torch_linear_simple: torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce,
-        torch.ops.aten.linear: torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce,
+        torch.ops.auto_deploy.torch_linear_simple: torch.ops.auto_deploy.torch_fused_linear_all_reduce,
+        torch.ops.aten.linear: torch.ops.auto_deploy.torch_fused_linear_all_reduce,
         torch.ops.auto_deploy.torch_quant_fp8_linear: torch.ops.auto_deploy.torch_quant_fused_fp8_linear_all_reduce,
     }
 
     # go through all nodes and find all_reduce nodes
     for node in gm.graph.nodes:
-        if not is_op(node, torch.ops.auto_deploy.torch_dist_all_reduce):
+        if not is_op(node, torch.ops.auto_deploy.torch_all_reduce):
             continue
 
         # check if args are as expected
@@ -67,12 +72,9 @@ def fuse_allreduce_residual_rmsnorm(gm: GraphModule) -> None:
         y = x + residual
         return rmsnorm(y), y
     * replacement:
-        fused_allreduce_residual_rmsnorm(x, residual, rmsnorm_weight, rmsnorm_eps)
+        trtllm_fused_allreduce_residual_rmsnorm(x, residual, rmsnorm_weight, rmsnorm_eps)
 
     """
-    if not is_trtllm_op_available():
-        return
-
     num_ar_r_rms_fusions = 0
     ad_logger.debug("Before allreduce+residual+rmsnorm fusion: " + str(gm))
 
@@ -128,7 +130,7 @@ def fuse_allreduce_residual_rmsnorm(gm: GraphModule) -> None:
             # Insert nodes
             with graph.inserting_before(allreduce_node):
                 fused_node = graph.call_function(
-                    torch.ops.dist.fused_allreduce_residual_rmsnorm,
+                    torch.ops.auto_deploy.trtllm_fused_allreduce_residual_rmsnorm,
                     args=(
                         tensor,
                         residual,
@@ -159,7 +161,7 @@ def fuse_allreduce_residual_rmsnorm(gm: GraphModule) -> None:
 
     # Traverse all nodes
     for node in gm.graph.nodes:
-        if is_op(node, torch.ops.auto_deploy.torch_dist_all_reduce):
+        if is_op(node, torch.ops.auto_deploy.trtllm_all_reduce):
             trace_and_fuse(allreduce_node=node, graph=gm.graph)
 
     canonicalize_graph(gm)
