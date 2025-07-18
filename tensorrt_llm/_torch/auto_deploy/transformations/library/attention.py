@@ -32,9 +32,11 @@ def _apply_pattern(
 
 
 def match_attention_pattern(gm: GraphModule) -> None:
-    """Match and replace the attention pattern in the graph. Applying these transformations in sequence:
-    Match eager attention pattern and replace with torch.ops.auto_deploy.torch_attention_sdpa.
-    Match grouped attention pattern and replace with torch.ops.auto_deploy.torch_attention_grouped_sdpa
+    """
+    Match and replace attention patterns in the graph.
+
+    This transformation detects both eager (ungrouped) and grouped attention patterns,
+    and replaces them with `torch.ops.auto_deploy.torch_attention_grouped_sdpa`.
     """
 
     def register_eager_attention(patterns: ADPatternMatcherPass):
