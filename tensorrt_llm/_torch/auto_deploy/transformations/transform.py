@@ -17,18 +17,16 @@ from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .library import (
     ShardingConfig,
     detect_column_row_shard,
-    dp_bmm_shard,
+    detect_dp_bmm_shard,
+    detect_ep_shard,
     eliminate_redundant_transposes,
-    ep_shard,
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
+    fuse_rmsnorm,
     insert_cached_attention,
     match_attention_layout,
-    match_causal_attn_mask,
-    match_eager_attention,
-    match_grouped_attention,
+    match_attention_pattern,
     match_moe_pattern,
-    match_repeat_kv,
     match_rope_layout,
     match_rope_pattern,
     optimize_rope,
@@ -77,17 +75,8 @@ class InferenceOptimizer:
         # Match MoE pattern
         match_moe_pattern(egm)
 
-        # Match repeat_kv pattern
-        match_repeat_kv(egm)
-
-        # Match eager attention pattern
-        match_eager_attention(egm)
-
-        # Match grouped attention pattern
-        match_grouped_attention(egm)
-
-        # Match and optimize causal attention masks
-        match_causal_attn_mask(egm)
+        # Match attention pattern
+        match_attention_pattern(egm)
 
         # Match attention layout expected by our backend
         match_attention_layout(egm, AttentionRegistry.get(self.ad_config.attn_backend))
@@ -122,10 +111,10 @@ class InferenceOptimizer:
         )
 
         # run EP sharding across ranks
-        ep_shard(egm, local_rank, world_size)
+        detect_ep_shard(egm, local_rank, world_size, sharding_config)
 
         # run BMM sharding across ranks
-        dp_bmm_shard(egm, local_rank, world_size)
+        detect_dp_bmm_shard(egm, local_rank, world_size, sharding_config)
 
         sharding_transform_executor(egm, sharding_config)
 
@@ -162,6 +151,10 @@ class InferenceOptimizer:
 
         # check if we can fuse collectives
         fuse_collectives(egm)
+
+        # TODO (lucaslie): add backend selection as part of configurable inference optimizers
+        # check if we can fuse rmsnorm
+        fuse_rmsnorm(egm, "flashinfer")
 
         # visualize the final graph
         if self.ad_config.visualize:
