@@ -164,15 +164,26 @@ class AutoModelForCausalLMFactory(ModelFactory):
         if hasattr(model, "post_init"):
             model.post_init()
 
-        # if present, initialize sharding config
+        # if present, initialize sharding config. We need head_dim for colwise sharding.
+        self._sharding_config = {}
+        self._sharding_config["head_dim"] = 1
         if hasattr(model_config, "base_model_tp_plan"):
-            self._sharding_config = model_config.base_model_tp_plan
+            self._sharding_config["tp_plan"] = model_config.base_model_tp_plan
+        if hasattr(model_config, "head_dim"):
+            self._sharding_config["head_dim"] = model_config.head_dim
         # if it is a multi-modal factory, overwrite the sharding config with the
         # dedicated sub-configs
         if hasattr(model_config, "sub_configs"):
+            # for image-text-to-text models, we only support sharding for the text sub-config
             if isinstance(self, AutoModelForImageTextToTextFactory):
-                # for image-text-to-text models, we only support sharding for the text sub-config
-                self._sharding_config = model_config.sub_configs["text_config"].base_model_tp_plan
+                text_config = model_config.sub_configs["text_config"]
+                # if text_config is a class, instantiate it
+                if isinstance(text_config, type):
+                    text_config = text_config()
+                if hasattr(text_config, "base_model_tp_plan"):
+                    self._sharding_config["tp_plan"] = text_config.base_model_tp_plan
+                if hasattr(text_config, "head_dim"):
+                    self._sharding_config["head_dim"] = text_config.head_dim
             else:
                 # TODO: support sharding for other multi-modal models
                 pass

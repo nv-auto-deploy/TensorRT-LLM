@@ -102,19 +102,24 @@ class InferenceOptimizer:
         # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
         optimize_rope(egm)
 
-        # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
-        sharding_config = ShardingConfig(self.factory.get_sharding_config())
+        sharding_config = ShardingConfig(local_rank, world_size, self.factory.get_sharding_config())
 
-        # run TP sharding across ranks
-        detect_column_row_shard(
-            egm, local_rank, world_size, sharding_config, self.ad_config.simple_shard_only
-        )
+        if (
+            self.ad_config.use_sharding_from_config
+            and sharding_config.predefined_config is not None
+        ):
+            sharding_config.create_sharding_from_config(egm)
+        else:
+            # run TP sharding across ranks
+            detect_column_row_shard(
+                egm, local_rank, world_size, sharding_config, self.ad_config.simple_shard_only
+            )
 
-        # run EP sharding across ranks
-        detect_ep_shard(egm, local_rank, world_size, sharding_config)
+            # run EP sharding across ranks
+            detect_ep_shard(egm, local_rank, world_size, sharding_config)
 
-        # run BMM sharding across ranks
-        detect_dp_bmm_shard(egm, local_rank, world_size, sharding_config)
+            # run BMM sharding across ranks
+            detect_dp_bmm_shard(egm, local_rank, world_size, sharding_config)
 
         sharding_transform_executor(egm, sharding_config)
 
