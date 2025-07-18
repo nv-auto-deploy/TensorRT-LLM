@@ -135,4 +135,4 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
 
     # Verify output
     y_gm = gm(x)
-    torch.testing.assert_close(y_model, y_gm, atol=1e-3, rtol=5e-2)
+    torch.testing.assert_close(y_model, y_gm, atol=5e-3, rtol=5e-3)
