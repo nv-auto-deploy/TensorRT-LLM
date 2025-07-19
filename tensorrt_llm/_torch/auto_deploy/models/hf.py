@@ -156,9 +156,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
     def _build_model(self, device: DeviceLikeType) -> nn.Module:
         """Build the model on the desired device."""
-        # We only support fp16 to fp4 conversion.
-        if self._quant_config and self._quant_config.get("quant_algo", None) == "NVFP4":
-            self.model_kwargs["torch_dtype"] = torch.half
 
         # NOTE (lucaslie): HF doesn't recursively update nested PreTrainedConfig objects. Instead,
         # the entire subconfig will be overwritten.
@@ -184,17 +181,14 @@ class AutoModelForCausalLMFactory(ModelFactory):
         return self._quant_config or {}
 
     def get_cache_config(self):
-        """Setup cache information based on quantization information."""
-        if self._quant_config is not None and "kv_cache_quant_algo" in self._quant_config.keys():
-            kv_cache_format = self._quant_config.get("kv_cache_quant_algo", None)
-            if kv_cache_format is not None:
-                assert kv_cache_format == "FP8", (
-                    f"KV cache quantization format {kv_cache_format} is not supported."
-                )
-            kv_cache_dtype = torch.float8_e4m3fn if kv_cache_format is not None else None
-        else:
-            kv_cache_dtype = None
-        return CacheConfig(dtype=kv_cache_dtype)
+        """Return kv cache dtype configuration."""
+        if not self._quant_config:
+            return CacheConfig(dtype=None)
+
+        kv_cache_dtype = self._quant_config.get("kv_cache_dtype")
+        torch_dtype = {"float8_e4m3fn": torch.float8_e4m3fn}.get(kv_cache_dtype, None)
+
+        return CacheConfig(dtype=torch_dtype)
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer—either a custom name or the model's default."""
@@ -341,6 +335,18 @@ class AutoModelForCausalLMFactory(ModelFactory):
                 # We do not quantize lm_head.
                 if "exclude_modules" not in self._quant_config:
                     self._quant_config["exclude_modules"] = ["lm_head"]
+        # We only support fp16 to fp4 conversion.
+        if self._quant_config and self._quant_config.get("quant_algo", None) == "NVFP4":
+            self.model_kwargs["torch_dtype"] = torch.half
+
+        # Setup cache information based on quantization information.
+        if self._quant_config is not None and "kv_cache_quant_algo" in self._quant_config.keys():
+            kv_cache_format = self._quant_config.get("kv_cache_quant_algo", None)
+            if kv_cache_format is not None:
+                assert kv_cache_format == "FP8", (
+                    f"KV cache quantization format {kv_cache_format} is not supported."
+                )
+                self._quant_config["kv_cache_dtype"] = "float8_e4m3fn"
 
 
 @ModelFactoryRegistry.register("AutoModelForImageTextToText")
