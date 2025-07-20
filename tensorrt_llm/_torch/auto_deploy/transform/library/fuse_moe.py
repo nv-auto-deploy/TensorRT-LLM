@@ -375,8 +375,6 @@ def _remove_dead_inplace_nodes_in_region(
 
 @TransformRegistry.register("match_moe_pattern")
 class MatchMoePattern(BaseTransform):
-    config: TransformConfig
-
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
     ) -> Tuple[GraphModule, TransformInfo]:
