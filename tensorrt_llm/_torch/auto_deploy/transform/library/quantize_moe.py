@@ -144,7 +144,7 @@ class QuantizationConfig(TransformConfig):
 
 
 @TransformRegistry.register("quantize_moe")
-class Quantization(BaseTransform):
+class QuantizeMOE(BaseTransform):
     """
     Traverse gm, find every torch.ops.auto_deploy.torch_moe, and replace it with the
     quantized version using the quant_algo from quant_config.
