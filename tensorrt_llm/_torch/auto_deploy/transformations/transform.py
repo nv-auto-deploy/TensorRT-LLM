@@ -94,6 +94,7 @@ class InferenceOptimizer:
         ############################################################################################
 
         local_rank, world_size = dist_ad.get_rank_world_size()
+        world_size = 2
 
         # eliminate redundant transpose operations
         eliminate_redundant_transposes(egm)
@@ -103,11 +104,12 @@ class InferenceOptimizer:
         optimize_rope(egm)
 
         sharding_config = ShardingConfig(local_rank, world_size, self.factory.get_sharding_config())
-
+        self.ad_config.use_sharding_from_config = True
         if (
             self.ad_config.use_sharding_from_config
             and sharding_config.predefined_config is not None
         ):
+            sharding_config.simple_shard_attention_layers()
             sharding_config.create_sharding_from_config(egm)
         else:
             # run TP sharding across ranks
@@ -120,6 +122,10 @@ class InferenceOptimizer:
 
             # run BMM sharding across ranks
             detect_dp_bmm_shard(egm, local_rank, world_size, sharding_config)
+
+        if local_rank == 0:
+            for n in sharding_config.tp_transforms:
+                print(f"{n.target_node}, {n.split_dim}, {n.dist_op}")
 
         sharding_transform_executor(egm, sharding_config)
 

@@ -391,7 +391,58 @@ class ShardingConfig(BaseModel):
                     # after successful match, break the loop
                     break
 
-        self.transformation_list = [ShardingTransformInfo(**config) for config in sharding_config]
+    def simple_shard_first_n_layers(self, n_layers: int) -> None:
+        """
+        Simple shard the first n layers.
+        1. Take the existing config self.predefined_config,
+        2. Search for lines with wildcard "*",
+        3. Prepend to the top of the config list the same lines with "0, 1, ..., n_layers-1"
+        # instead of "*".
+        """
+        new_tp_plan = {}
+        for layer_pattern, config in self.predefined_config["tp_plan"].items():
+            if "*" in layer_pattern:
+                # Create new dict with first n_layers entries first
+
+                for i in range(n_layers):
+                    new_tp_plan[layer_pattern.replace("*", str(i))] = "gather"
+
+            # Add the default config after
+            new_tp_plan[layer_pattern] = config
+
+        self.predefined_config["tp_plan"] = new_tp_plan
+
+    def simple_shard_last_n_layers(self, n_layers: int) -> None:
+        """
+        Simple shard the last n layers.
+        1. Take the existing config self.predefined_config,
+        2. Search for lines with wildcard "*",
+        3. Prepend to the top of the config list the same lines with "0, 1, ..., n_layers-1"
+        # instead of "*".
+        """
+        new_tp_plan = {}
+        num_layers = self.predefined_config["num_hidden_layers"]
+        for layer_pattern, config in self.predefined_config["tp_plan"].items():
+            if "*" in layer_pattern:
+                # Create new dict with first n_layers entries first
+
+                for i in range(num_layers - n_layers, num_layers):
+                    new_tp_plan[layer_pattern.replace("*", str(i))] = "gather"
+
+            # Add the default config after
+            new_tp_plan[layer_pattern] = config
+        self.predefined_config["tp_plan"] = new_tp_plan
+
+    def simple_shard_attention_layers(self) -> None:
+        """
+        If any key in tp_plan contains "attention", replace it with "gather"
+        """
+        for layer_pattern, config in self.predefined_config["tp_plan"].items():
+            if any(
+                attn_name in layer_pattern
+                for attn_name in ["attention", "Attention", "attn", "Attn"]
+            ):
+                self.predefined_config["tp_plan"][layer_pattern] = "gather"
 
 
 def sharding_transform_executor(gm: GraphModule, sharding_config: ShardingConfig) -> None:
@@ -987,3 +1038,17 @@ def _insert_sharded_moe(
         )
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
+
+
+# from torch.fx.passes.graph_drawer import FxGraphDrawer
+
+
+# def visualize_model(model: nn.Module, filename: str = "model.svg"):
+#     gm = torch.fx.symbolic_trace(model)
+#     visualize_graph(gm, model.dag, filename)
+
+
+# def visualize_graph(gm: GraphModule, filename: str = "graph.svg"):
+#     drawer = FxGraphDrawer(gm, "my_module")
+#     dot_graph = drawer.get_dot_graph()
+#     dot_graph.write_svg(filename)
