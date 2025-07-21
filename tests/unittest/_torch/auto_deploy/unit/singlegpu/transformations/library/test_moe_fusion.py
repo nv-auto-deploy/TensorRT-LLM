@@ -7,7 +7,6 @@ from _model_test_utils import MoEOpModel
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transform.interface import InferenceOptimizerConfig
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.transformations.library.fused_moe import fuse_moe
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
@@ -260,14 +259,6 @@ class MoEPatternModel(nn.Module):
     def get_input(self, device):
         torch.manual_seed(2345)
         return torch.randint(0, 1000, (2, 2), device=device)
-
-
-def _get_optimizer_config() -> InferenceOptimizerConfig:
-    return {
-        "match_moe_pattern": {
-            "stage": "pattern_matcher",
-        },
-    }
 
 
 @pytest.mark.parametrize(

@@ -5,18 +5,8 @@ from _model_test_utils import MoEOpModel
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transform.interface import InferenceOptimizerConfig
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
-
-
-def _get_optimizer_config(quant_config) -> InferenceOptimizerConfig:
-    return {
-        "quantize_moe": {
-            "stage": "pattern_matcher",
-            "quant_config": quant_config,
-        },
-    }
 
 
 @pytest.mark.parametrize(
@@ -74,7 +64,15 @@ def test_quantize_moe_transformation(quant_algo, expected_op):
     quant_config = {"quant_algo": quant_algo}
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
-    gm_transformed = InferenceOptimizer(None, _get_optimizer_config(quant_config))(None, gm)
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "quantize_moe": {
+                "stage": "pattern_matcher",
+                "quant_config": quant_config,
+            },
+        },
+    )(None, gm)
 
     run_test_transformed_gm(
         model=model,
