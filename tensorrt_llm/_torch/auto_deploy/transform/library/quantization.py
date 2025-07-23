@@ -9,7 +9,6 @@ from torch.fx import GraphModule, Node
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...transformations._graph import canonicalize_graph
-from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     extract_param_names_from_lin_node,
     get_quantization_params_from_linear_node,
@@ -142,12 +141,8 @@ def _insert_quantized_bmm(
         scale_target_module = gm  # Register in root module
         scale_name_prefix = ""
 
-        ad_logger.info(f"Quantized BMM with dynamic weight tensor for node {node}")
     else:
         # If we can't determine the shape, skip quantization
-        ad_logger.warning(
-            f"BMM weight is dynamic tensor without shape metadata, skipping quantization for node {node}"
-        )
         return
 
     # Common logic for both parameter and dynamic tensor cases
@@ -201,7 +196,6 @@ class Quantization(BaseTransform):
 
         # no quantization to do
         if not (is_quant_graph or quant_algo):
-            ad_logger.info("No quantization to do.")
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -245,9 +239,7 @@ class Quantization(BaseTransform):
         num_matches = 0
         for quant_algo in quantized_nodes:
             for op_type, count in quantized_nodes[quant_algo].items():
-                ad_logger.info(f"Found {count} {quant_algo} quantized {op_type} nodes.")
                 num_matches += count
-        ad_logger.debug("After quantization: " + str(gm))
 
         # TODO:(hg) confirm this
         info = TransformInfo(

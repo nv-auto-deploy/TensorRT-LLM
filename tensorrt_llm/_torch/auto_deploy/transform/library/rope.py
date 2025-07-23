@@ -56,7 +56,6 @@ from torch.fx import GraphModule, Node
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...transformations._graph import canonicalize_graph
-from ...utils.logger import ad_logger
 from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, Match, register_ad_pattern
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
@@ -191,7 +190,6 @@ class MatchRopePattern(BaseTransform):
 
         num_matches = patterns.apply(graph)
         canonicalize_graph(gm)
-        ad_logger.info(f"Found and matched {num_matches} RoPE patterns")
 
         # TODO:(hg) confirm this
         info = TransformInfo(
@@ -228,13 +226,7 @@ class MatchRopeLayout(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         supported = {"bsnd", "bnsd"}
         if self.config.expected_layout.lower() not in supported:
-            ad_logger.warning(
-                f"""Unsupported RoPE layout '{self.config.expected_layout}';
-                    expected '{supported}'. Skipping RoPE layout matching."""
-            )
             return
-
-        ad_logger.info(f"Match RoPE layout to {self.config.expected_layout}")
 
         graph = gm.graph
         rope_ops = {
@@ -267,10 +259,6 @@ class MatchRopeLayout(BaseTransform):
             elif unsq == 1:
                 current_layout = "bnsd"
             else:
-                ad_logger.warning(
-                    "Unsqueeze_dim is not one of [1, 2]. "
-                    "Unable to infer layout of q node. Skip layout matching"
-                )
                 continue
 
             need_transpose = self.config.expected_layout.lower() != current_layout
@@ -282,15 +270,8 @@ class MatchRopeLayout(BaseTransform):
             # retrieve q and k output node from node
             q_rope_old, k_rope_old = extract_output_tuple(node, 2)
             if q_rope_old is None or k_rope_old is None:
-                ad_logger.warning(
-                    f"Failed to extract all two outputs from the explicit op, \
-                        get {q_rope_old}, {k_rope_old}, fail to match rope layout with {node} with"
-                )
                 continue
 
-            ad_logger.debug(
-                f"Inferred RoPE input layout: '{current_layout}']Mapping layout to '{self.config.expected_layout}']"
-            )
             with graph.inserting_before(node):
                 q_for_op = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
                 k_for_op = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
@@ -335,7 +316,6 @@ class MatchRopeLayout(BaseTransform):
 
         if num_rope_layout_matches:
             canonicalize_graph(gm)
-        ad_logger.info(f"Found {num_rope_layout_matches} RoPE layout matches")
 
         # TODO:(hg) confirm this
         info = TransformInfo(
@@ -375,7 +355,6 @@ class OptimizeRope(BaseTransform):
             num_rope_optimizations += 1
         if num_rope_optimizations:
             canonicalize_graph(gm)
-        ad_logger.info(f"Found {num_rope_optimizations} RoPE optimizations")
         # TODO:(hg) confirm this
         info = TransformInfo(
             skipped=False, num_matches=num_rope_optimizations, is_clean=False, has_valid_shapes=True
@@ -392,10 +371,6 @@ def _optimize_explicit(
     # retrieve q and k output node from node
     q_rope_old, k_rope_old = extract_output_tuple(node, 2)
     if q_rope_old is None or k_rope_old is None:
-        ad_logger.warning(
-            f"Failed to extract all two outputs from the explicit op, \
-                get {q_rope_old}, {k_rope_old}, fail to replace {node} with flashinfer rope"
-        )
         return
 
     # Sanity check on head_dim
@@ -406,15 +381,8 @@ def _optimize_explicit(
     q_fake = q_node.meta.get("val", None)
     if q_fake is not None and len(q_fake.shape) > 2:
         if not (isinstance(q_fake.shape[1], torch.SymInt) and isinstance(q_fake.shape[2], int)):
-            ad_logger.warning(
-                f"""Sanity check failed: q_fake should have shape [b, s, n, d],
-                s should be symbolic and n should be int, instead got shape {q_fake.shape}"""
-            )
             return
     elif q_fake is not None:
-        ad_logger.warning(
-            f"Sanity check failed: q_fake should be 3D or 4D, but got shape {q_fake.shape}"
-        )
         return
 
     head_dim = cos_node.meta["val"].shape[-1]
@@ -497,15 +465,8 @@ def _optimize_complex(
     q_fake = q_node.meta.get("val", None)
     if q_fake is not None and len(q_fake.shape) > 2:
         if not (isinstance(q_fake.shape[1], torch.SymInt) and isinstance(q_fake.shape[2], int)):
-            ad_logger.warning(
-                f"""Sanity check failed: q_fake should have shape [b, s, n, d],
-                s should be symbolic and n should be int, instead got shape {q_fake.shape}"""
-            )
             return
     elif q_fake is not None:
-        ad_logger.warning(
-            f"Sanity check failed: q_fake should be 3D or 4D, but got shape {q_fake.shape}"
-        )
         return
 
     # Retrieve or register the lookup table for inv_freq_node -> cos_sin_flash
@@ -629,36 +590,21 @@ def _validate_rope_inputs(q_node: Node, k_node: Node) -> bool:
     for name, node in [("q", q_node), ("k", k_node)]:
         fake_val = node.meta.get("val", None)
         if fake_val is None:
-            ad_logger.warning(
-                f"Meta['val'] for {name} not available; skipping RoPE transformation."
-            )
             return False
 
         # Check dtype
         if fake_val.dtype not in (torch.float16, torch.bfloat16):
-            ad_logger.warning(
-                f"""{name} tensor is {fake_val.dtype},
-                expected half precision (float16 or bfloat16). Skipping RoPE transformation."""
-            )
             return False
 
         # Check head_dim
         if len(fake_val.shape) < 1:
-            ad_logger.warning(f"{name} tensor has invalid shape {fake_val.shape}.")
             return False
         head_dim = fake_val.shape[-1]
         if isinstance(head_dim, int) and head_dim % 64 != 0:
-            ad_logger.warning(
-                f"{name} head_dim = {head_dim} is not a multiple of 64. Skipping RoPE transformation."
-            )
             return False
 
         # Check shape
         if not isinstance(fake_val.shape[1], torch.SymInt):
-            ad_logger.warning(
-                f"{name} has shape {fake_val.shape} that is not supported. Only support [B, S, N, D] layout.\
-                Skipping RoPE transformation."
-            )
             return False
 
     return True

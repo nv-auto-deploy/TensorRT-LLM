@@ -9,7 +9,6 @@ from torch.fx import GraphModule, Node
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...transformations._graph import canonicalize_graph
-from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
 from ...utils.quantization_utils import QuantizationImpl, should_skip_quantization
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
@@ -96,7 +95,6 @@ def _quantize_moe_node(
             quantized_op,
             args=tuple(args),
         )
-        ad_logger.debug(f"Updating {node.name} args to {new_node.args}")
         node.replace_all_uses_with(new_node)
         gm.graph.erase_node(node)
 
@@ -161,7 +159,6 @@ class QuantizeMOE(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         quant_algo = self.config.quant_config.get("quant_algo")
         if not quant_algo:
-            ad_logger.info("No quantization to do.")
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -190,8 +187,6 @@ class QuantizeMOE(BaseTransform):
             )
 
         canonicalize_graph(gm)
-
-        ad_logger.info(f"Found {count} {quant_algo} quantized {quantized_op} nodes.")
 
         # TODO:(hg) confirm this
         info = TransformInfo(

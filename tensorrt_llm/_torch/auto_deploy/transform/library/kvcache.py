@@ -10,7 +10,6 @@ from ...custom_ops.attention_interface import AttentionDescriptor, CacheConfig
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...transformations._graph import add_graph_input, canonicalize_graph
-from ...utils.logger import ad_logger
 from ...utils.node_utils import get_all_input_output_nodes, is_op
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
 
@@ -41,13 +40,11 @@ class UpdateInOutNodes(BaseTransform):
         assert len(output_nodes[0].all_input_nodes) == 1, (
             "Expected to only return final tensor output!"
         )
-        ad_logger.info(f"Found {len(input_nodes)} input nodes and {len(output_nodes)} output nodes")
 
         # Activate and add extra argument nodes
         new_args = cm.info.switch_to_cached_attn_inputs()
         for name in new_args:
             input_nodes.append(add_graph_input(gm, name))
-        ad_logger.info(f"Added {len(new_args)} new input nodes for cached attention metadata")
 
         canonicalize_graph(gm)
 
@@ -104,8 +101,6 @@ class InsertCachedAttention(BaseTransform):
         # Sanity check
         if cm.info.is_paged:
             assert attn_descriptor.is_paged(), "Paged sequence info requires paged attention op."
-
-        ad_logger.debug(f"Before inserting {attn_descriptor=} with cache: {gm}")
 
         # retrieve input nodes
         input_nodes, _ = get_all_input_output_nodes(gm.graph)
@@ -165,11 +160,6 @@ class InsertCachedAttention(BaseTransform):
             num_cached_attn_replacements += 1
 
         canonicalize_graph(gm)
-        ad_logger.info(
-            f"Replaced {num_cached_attn_replacements} {source_op} ops "
-            f"with {attn_descriptor.get_cached_attention_op()}"
-        )
-        ad_logger.debug(f"After inserting {attn_descriptor=} with cache: {gm}")
 
         info = TransformInfo(
             skipped=False,

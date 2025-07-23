@@ -10,7 +10,6 @@ from torch.fx import GraphModule
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...transformations._graph import canonicalize_graph
-from ...utils.logger import ad_logger
 
 # It is important to import ADPatternMatcherPass from pattern_matcher.py, not from torch._inductor.pattern_matcher
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
@@ -100,7 +99,6 @@ class FuseRMSNorm(BaseTransform):
             raise ValueError(
                 f"Invalid backend, must be one of {list(_BACKEND_OPS)}, got {self.config.backend}"
             )
-        ad_logger.info(f"Starting RMSNorm pattern matching with backend: {self.config.backend}")
 
         graph = gm.graph
         patterns = ADPatternMatcherPass()
@@ -135,9 +133,7 @@ class FuseRMSNorm(BaseTransform):
             )
 
         cnt = patterns.apply(graph)
-        ad_logger.info(f"RMSNorm pattern count: {cnt}")
         canonicalize_graph(gm)
-        ad_logger.debug("RMSNorm pattern matching completed.")
 
         # TODO:(hg) confirm this
         info = TransformInfo(skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True)

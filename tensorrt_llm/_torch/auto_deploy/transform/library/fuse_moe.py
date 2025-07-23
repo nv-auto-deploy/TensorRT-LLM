@@ -8,7 +8,6 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...transformations._graph import canonicalize_graph
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
-from ...utils.logger import ad_logger
 from ...utils.node_utils import bfs, identify_regions_between_residuals, is_linear_op, is_op
 from ...utils.quantization_utils import get_scales_and_type_from_node
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
@@ -22,7 +21,6 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
         if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
 
-        ad_logger.debug(f"Found MoE op to fuse: {node} with args: {node.args}")
         hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = node.args
 
         fused_w3_w1_experts = torch.stack(
@@ -366,7 +364,6 @@ def _remove_dead_inplace_nodes_in_region(
 
     try:
         node_to_remove = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
-        ad_logger.debug(f"Removing In-place Dead Node: {node_to_remove}")
         graph.erase_node(node_to_remove)
         return True
     except RuntimeError:
@@ -380,7 +377,6 @@ class MatchMoePattern(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
 
-        ad_logger.debug("Before MoE Pattern Matching: " + str(gm))
         # Preprocessing: Identify boundary nodes (e.g. residual connections) in the graph.
         boundary_nodes = identify_regions_between_residuals(gm)
 
@@ -430,13 +426,6 @@ class MatchMoePattern(BaseTransform):
                 continue
 
             # Step 5: Insert the MoE op into the graph.
-            ad_logger.debug(
-                f"Found MoE Pattern: between boundary {start_boundary} and {end_boundary}.\n"
-                f"Input hidden states node: {hidden_states}, "
-                f"selected_experts node: {selected_experts}, "
-                f"routing_weights node: {normalized_routing_weights}, "
-                f"expert weights: {expert_weights}, weight type: {weight_type}"
-            )
             with graph.inserting_before(final_hidden_state_node):
                 w1_list = expert_weights["w1"]
                 w2_list = expert_weights["w2"]
@@ -504,9 +493,6 @@ class MatchMoePattern(BaseTransform):
 
         canonicalize_graph(gm)
 
-        ad_logger.info(f"Found {num_moe_patterns} MoE Patterns")
-        ad_logger.debug("After MoE Pattern Matching: " + str(gm))
-
         # TODO:(hg) confirm this
         info = TransformInfo(
             skipped=False, num_matches=num_moe_patterns, is_clean=False, has_valid_shapes=True
@@ -526,15 +512,10 @@ class FuseMoe(BaseTransform):
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
     ) -> Tuple[GraphModule, TransformInfo]:
-        ad_logger.debug("Before MoE fusion: " + str(gm))
-
         with cuda_memory_tracker():
             fused_key_counter = _insert_fused_moe_ops(gm)
             if fused_key_counter:
                 canonicalize_graph(gm)
-
-        ad_logger.info(f"Found {fused_key_counter} MoE fusions")
-        ad_logger.debug("After MoE fusion: " + str(gm))
 
         # TODO:(hg) confirm this
         info = TransformInfo(
