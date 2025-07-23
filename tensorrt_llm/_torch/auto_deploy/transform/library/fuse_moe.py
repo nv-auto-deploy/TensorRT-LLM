@@ -10,7 +10,7 @@ from ...transformations._graph import canonicalize_graph
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.node_utils import bfs, identify_regions_between_residuals, is_linear_op, is_op
 from ...utils.quantization_utils import get_scales_and_type_from_node
-from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
+from ..interface import BaseTransform, TransformInfo, TransformRegistry
 
 
 def _insert_fused_moe_ops(gm: GraphModule) -> int:
@@ -506,8 +506,6 @@ class FuseMoe(BaseTransform):
     Scan the FX graph and replace all calls to torch.ops.auto_deploy.torch_moe with
     torch.ops.auto_deploy.trtllm_moe_fused.
     """
-
-    config: TransformConfig
 
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
