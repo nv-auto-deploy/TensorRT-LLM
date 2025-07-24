@@ -14,25 +14,6 @@ def parse_kv_cache_metrics(log_output: str, free_mem_ratio: float = 0.8):
     """Parse KV cache metrics from the benchmark log output."""
     metrics = {}
 
-    # Add debug logging to see what's in the log output
-    print("🔍 DEBUG: Searching for KV cache metrics in log output...")
-
-    # Look for any memory-related messages to understand what's happening
-    memory_lines = [
-        line.strip()
-        for line in log_output.split("\n")
-        if any(keyword in line.lower() for keyword in ["memory", "cache", "resize", "free", "mb"])
-    ]
-
-    if memory_lines:
-        print("📋 Found memory-related log lines:")
-        for i, line in enumerate(memory_lines[:1000]):  # Show first 10 lines
-            print(f"  {i + 1}: {line}")
-        if len(memory_lines) > 100:
-            print(f"  ... and {len(memory_lines) - 100} more lines")
-    else:
-        print("⚠️ No memory-related log lines found in output")
-
     # Simple patterns based on actual log format
     patterns = {
         "current_cache_size": r"Current cache size:\s*(\d+)",
@@ -62,9 +43,6 @@ def parse_kv_cache_metrics(log_output: str, free_mem_ratio: float = 0.8):
         )
     else:
         print("  ❌ Cannot calculate new_cache_size - missing required metrics")
-        print(
-            "     This usually happens when memory pressure is too low to trigger KV cache resizing"
-        )
 
     return metrics
 
@@ -482,20 +460,14 @@ def test_trtllm_bench_backend_comparison(llm_root):  # noqa: F811
             ]
 
             if not missing_metrics:
-                print("=== VALIDATING AUTODEPLOY KV CACHE METRICS ===")
                 expected_metrics = calculate_expected_kv_cache_metrics(0.9)
                 assert expected_metrics, "Could not determine expected metrics for this GPU"
                 validate_kv_cache_metrics_dynamic(kv_cache_metrics, expected_metrics)
                 print("✅ KV Cache Metrics validation passed")
             else:
                 print(f"ℹ️ KV cache validation skipped - missing metrics: {missing_metrics}")
-                print("   This can happen with small models that don't trigger memory management")
-                print(
-                    "   Tip: Try increasing num_hidden_layers or max_batch_size to trigger KV cache resizing"
-                )
         else:
             print("ℹ️ No KV cache metrics found in autodeploy report")
-            print("   This can happen with small models that don't trigger memory management")
 
         print("=== BACKEND COMPARISON TEST PASSED ===")
         print(f"Autodeploy: {autodeploy_tokens_per_sec:.2f} tokens/sec/user")
@@ -516,7 +488,6 @@ def test_trtllm_bench_perf_golden_comparison(llm_root):  # noqa: F811
             yaml.dump(
                 {
                     "model_kwargs": {"num_hidden_layers": 10},
-                    # "cuda_graph_batch_sizes": [1, 2],
                     "compile_backend": "torch-opt",
                     "free_mem_ratio": 0.9,
                     "runtime": "trtllm",
@@ -593,7 +564,6 @@ def test_trtllm_bench_perf_golden_comparison(llm_root):  # noqa: F811
         # KV cache metrics validation using dynamic expected values
         print(f"Validating {len(kv_cache_metrics)} KV cache metrics against GPU-specific ranges...")
         validate_kv_cache_metrics_dynamic(kv_cache_metrics, expected_metrics)
-
         print("=== ALL TESTS PASSED ===")
         print(f"Performance: ✅ {actual_tokens_per_sec:.2f} tokens/sec/user within bounds")
         print("KV Cache Metrics: ✅ All metrics within GPU-specific expected ranges")
