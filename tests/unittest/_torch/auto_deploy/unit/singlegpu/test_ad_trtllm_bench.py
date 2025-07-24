@@ -14,6 +14,25 @@ def parse_kv_cache_metrics(log_output: str, free_mem_ratio: float = 0.8):
     """Parse KV cache metrics from the benchmark log output."""
     metrics = {}
 
+    # Add debug logging to see what's in the log output
+    print("🔍 DEBUG: Searching for KV cache metrics in log output...")
+
+    # Look for any memory-related messages to understand what's happening
+    memory_lines = [
+        line.strip()
+        for line in log_output.split("\n")
+        if any(keyword in line.lower() for keyword in ["memory", "cache", "resize", "free", "mb"])
+    ]
+
+    if memory_lines:
+        print("📋 Found memory-related log lines:")
+        for i, line in enumerate(memory_lines[:1000]):  # Show first 10 lines
+            print(f"  {i + 1}: {line}")
+        if len(memory_lines) > 100:
+            print(f"  ... and {len(memory_lines) - 100} more lines")
+    else:
+        print("⚠️ No memory-related log lines found in output")
+
     # Simple patterns based on actual log format
     patterns = {
         "current_cache_size": r"Current cache size:\s*(\d+)",
@@ -43,11 +62,20 @@ def parse_kv_cache_metrics(log_output: str, free_mem_ratio: float = 0.8):
         )
     else:
         print("  ❌ Cannot calculate new_cache_size - missing required metrics")
+        print(
+            "     This usually happens when memory pressure is too low to trigger KV cache resizing"
+        )
 
     return metrics
 
 
-def run_benchmark(model_name: str, dataset_path: str, temp_dir: str, report_json_path: str = None):
+def run_benchmark(
+    model_name: str,
+    dataset_path: str,
+    temp_dir: str,
+    backend: str = "_autodeploy",
+    report_json_path: str = None,
+):
     """Run benchmark and capture KV cache metrics from log output."""
 
     # Read the test config to get free_mem_ratio
@@ -65,18 +93,22 @@ def run_benchmark(model_name: str, dataset_path: str, temp_dir: str, report_json
         model_name,
         "throughput",
         "--backend",
-        "_autodeploy",
+        backend,
         "--dataset",
         str(dataset_path),
-        "--extra_llm_api_options",
-        config_path,
+        "--max_batch_size",
+        "32",
     ]
+
+    # Add extra_llm_api_options only for autodeploy backend
+    if backend == "_autodeploy":
+        cmd.extend(["--extra_llm_api_options", config_path])
 
     # Add report_json argument if path is provided
     if report_json_path:
         cmd.extend(["--report_json", report_json_path])
 
-    print(f"🚀 Running benchmark command: {' '.join(cmd)}")
+    print(f"🚀 Running benchmark command ({backend} backend): {' '.join(cmd)}")
     print(f"📋 Using free_mem_ratio from config: {free_mem_ratio}")
 
     # Run benchmark as subprocess to capture ALL output
@@ -91,27 +123,82 @@ def run_benchmark(model_name: str, dataset_path: str, temp_dir: str, report_json
     # Combine stdout and stderr for parsing
     full_log_output = f"{result.stdout}\n{result.stderr}"
 
-    # Parse KV cache metrics from the combined log output
-    kv_cache_metrics = parse_kv_cache_metrics(full_log_output, free_mem_ratio)
-    print("📊 KV Cache Metrics parsed from logs:")
-    if kv_cache_metrics:
-        for key, value in kv_cache_metrics.items():
-            if "mb" in key.lower():
-                print(f"  {key}: {value}MB")
-            else:
-                print(f"  {key}: {value} bytes")
+    # Parse KV cache metrics from the combined log output (only for autodeploy backend)
+    kv_cache_metrics = {}
+    if backend == "_autodeploy":
+        kv_cache_metrics = parse_kv_cache_metrics(full_log_output, free_mem_ratio)
+        print("📊 KV Cache Metrics parsed from logs:")
+        if kv_cache_metrics:
+            for key, value in kv_cache_metrics.items():
+                if "mb" in key.lower():
+                    print(f"  {key}: {value}MB")
+                else:
+                    print(f"  {key}: {value} bytes")
+        else:
+            print("  ⚠️ No KV cache metrics were parsed successfully")
     else:
-        print("  ⚠️ No KV cache metrics were parsed successfully")
+        print(f"📊 KV Cache Metrics: Skipped for {backend} backend")
 
     # Return parsed JSON report with KV cache metrics if requested
     if report_json_path and Path(report_json_path).exists():
         with open(report_json_path, "r") as f:
             report_data = json.load(f)
 
-        # Add KV cache metrics to the report
-        report_data["kv_cache_metrics"] = kv_cache_metrics
+        # Add KV cache metrics to the report (only for autodeploy backend)
+        if backend == "_autodeploy":
+            report_data["kv_cache_metrics"] = kv_cache_metrics
+        report_data["backend"] = backend
         return report_data
     return None
+
+
+def compare_backends_performance(
+    autodeploy_tokens_per_sec: float,
+    pytorch_tokens_per_sec: float,
+    relative_tolerance: float = 0.20,
+    absolute_tolerance: float = 10.0,
+):
+    """
+    Compare performance between autodeploy and pytorch backends.
+    Fails if autodeploy is significantly worse than pytorch.
+
+    Args:
+        autodeploy_tokens_per_sec: Performance of autodeploy backend
+        pytorch_tokens_per_sec: Performance of pytorch backend
+        relative_tolerance: Relative tolerance (20% by default for backend comparison)
+        absolute_tolerance: Absolute tolerance (10 tokens/sec by default)
+    """
+    # Calculate performance difference
+    performance_diff = pytorch_tokens_per_sec - autodeploy_tokens_per_sec
+    relative_diff = performance_diff / pytorch_tokens_per_sec if pytorch_tokens_per_sec > 0 else 0
+
+    print("=== BACKEND PERFORMANCE COMPARISON ===")
+    print(f"PyTorch backend: {pytorch_tokens_per_sec:.2f} tokens/sec/user")
+    print(f"Autodeploy backend: {autodeploy_tokens_per_sec:.2f} tokens/sec/user")
+    print(f"Performance difference: {performance_diff:.2f} tokens/sec ({relative_diff:.2%})")
+
+    # If autodeploy is better than or equal to pytorch, always pass
+    if autodeploy_tokens_per_sec >= pytorch_tokens_per_sec:
+        print("✅ Autodeploy backend matches or exceeds PyTorch backend performance")
+        return
+
+    # Autodeploy is slower - check if it's within acceptable tolerance
+    within_relative_tolerance = relative_diff <= relative_tolerance
+    within_absolute_tolerance = performance_diff <= absolute_tolerance
+
+    if within_relative_tolerance or within_absolute_tolerance:
+        print("✅ Autodeploy backend performance within acceptable tolerance")
+        print(
+            f"   Tolerance: {relative_tolerance:.2%} relative OR {absolute_tolerance:.2f} tokens/sec absolute"
+        )
+    else:
+        assert False, (
+            f"Autodeploy backend significantly underperforms compared to PyTorch! "
+            f"Autodeploy: {autodeploy_tokens_per_sec:.2f} tokens/sec/user, "
+            f"PyTorch: {pytorch_tokens_per_sec:.2f} tokens/sec/user, "
+            f"Performance gap: {performance_diff:.2f} tokens/sec ({relative_diff:.2%}), "
+            f"Tolerance: {relative_tolerance:.2%} relative OR {absolute_tolerance:.2f} tokens/sec absolute"
+        )
 
 
 def assert_performance_within_tolerance(
@@ -163,7 +250,7 @@ def prepare_dataset(root_dir: str, temp_dir: str, model_name: str):
     dataset_tool = Path(root_dir, "benchmarks", "cpp", "prepare_dataset.py")
     script_dir = Path(root_dir, "benchmarks", "cpp")
 
-    # Generate a small dataset to run a test.
+    # Generate a small dataset to run a test - matching workload configuration
     command = [
         "python3",
         f"{dataset_tool}",
@@ -306,7 +393,6 @@ def test_trtllm_bench(llm_root):  # noqa: F811
                 {
                     "model_kwargs": {"num_hidden_layers": 2},
                     "cuda_graph_batch_sizes": [1, 2],
-                    "max_batch_size": 128,
                 },
                 f,
             )
@@ -315,8 +401,109 @@ def test_trtllm_bench(llm_root):  # noqa: F811
         run_benchmark(model_name, dataset_path, temp_dir)
 
 
+def test_trtllm_bench_backend_comparison(llm_root):  # noqa: F811
+    """Test that compares autodeploy backend performance against pytorch backend."""
+    model_name = _hf_model_dir_or_hub_id(
+        f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with open(f"{temp_dir}/model_kwargs.yaml", "w") as f:
+            yaml.dump(
+                {
+                    "model_kwargs": {"num_hidden_layers": 10},
+                    # "cuda_graph_batch_sizes": [1, 2],
+                    "compile_backend": "torch-opt",
+                    "free_mem_ratio": 0.9,
+                    "runtime": "trtllm",
+                    "skip_loading_weights": True,
+                },
+                f,
+            )
+
+        dataset_path = prepare_dataset(llm_root, temp_dir, model_name)
+
+        # Run benchmarks for both backends
+        autodeploy_report_path = f"{temp_dir}/autodeploy_report.json"
+        pytorch_report_path = f"{temp_dir}/pytorch_report.json"
+
+        print("=== RUNNING AUTODEPLOY BACKEND ===")
+        autodeploy_report = run_benchmark(
+            model_name, dataset_path, temp_dir, "_autodeploy", autodeploy_report_path
+        )
+
+        print("=== RUNNING PYTORCH BACKEND ===")
+        pytorch_report = run_benchmark(
+            model_name, dataset_path, temp_dir, "pytorch", pytorch_report_path
+        )
+
+        # Extract performance metrics from both backends
+        assert autodeploy_report is not None, "Failed to capture autodeploy benchmark report"
+        assert pytorch_report is not None, "Failed to capture pytorch benchmark report"
+
+        assert "performance" in autodeploy_report, (
+            "Performance metrics not found in autodeploy report"
+        )
+        assert "performance" in pytorch_report, "Performance metrics not found in pytorch report"
+
+        autodeploy_tokens_per_sec = autodeploy_report["performance"].get(
+            "output_throughput_per_user_tok_s"
+        )
+        pytorch_tokens_per_sec = pytorch_report["performance"].get(
+            "output_throughput_per_user_tok_s"
+        )
+
+        assert autodeploy_tokens_per_sec is not None, (
+            "output_throughput_per_user_tok_s not found in autodeploy performance metrics"
+        )
+        assert pytorch_tokens_per_sec is not None, (
+            "output_throughput_per_user_tok_s not found in pytorch performance metrics"
+        )
+
+        # Compare backend performance
+        compare_backends_performance(
+            autodeploy_tokens_per_sec,
+            pytorch_tokens_per_sec,
+            relative_tolerance=0.30,  # 30% tolerance for backend comparison
+            absolute_tolerance=15.0,  # 15 tokens/sec absolute tolerance
+        )
+
+        # KV cache validation only for autodeploy backend (optional)
+        if "kv_cache_metrics" in autodeploy_report:
+            kv_cache_metrics = autodeploy_report["kv_cache_metrics"]
+            required_metrics = [
+                "current_cache_size",
+                "free_mem_pre_mb",
+                "free_mem_post_mb",
+                "new_cache_size",
+            ]
+            missing_metrics = [
+                metric for metric in required_metrics if metric not in kv_cache_metrics
+            ]
+
+            if not missing_metrics:
+                print("=== VALIDATING AUTODEPLOY KV CACHE METRICS ===")
+                expected_metrics = calculate_expected_kv_cache_metrics(0.9)
+                assert expected_metrics, "Could not determine expected metrics for this GPU"
+                validate_kv_cache_metrics_dynamic(kv_cache_metrics, expected_metrics)
+                print("✅ KV Cache Metrics validation passed")
+            else:
+                print(f"ℹ️ KV cache validation skipped - missing metrics: {missing_metrics}")
+                print("   This can happen with small models that don't trigger memory management")
+                print(
+                    "   Tip: Try increasing num_hidden_layers or max_batch_size to trigger KV cache resizing"
+                )
+        else:
+            print("ℹ️ No KV cache metrics found in autodeploy report")
+            print("   This can happen with small models that don't trigger memory management")
+
+        print("=== BACKEND COMPARISON TEST PASSED ===")
+        print(f"Autodeploy: {autodeploy_tokens_per_sec:.2f} tokens/sec/user")
+        print(f"PyTorch: {pytorch_tokens_per_sec:.2f} tokens/sec/user")
+
+
 def test_trtllm_bench_perf_golden_comparison(llm_root):  # noqa: F811
-    """Test that runs autodeploy backend and compares performance and KV cache metrics to expected ranges."""
+    """Test that runs the autodeploy backend and compares performance + memory to golden values."""
     model_name = _hf_model_dir_or_hub_id(
         f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     )
@@ -329,9 +516,11 @@ def test_trtllm_bench_perf_golden_comparison(llm_root):  # noqa: F811
             yaml.dump(
                 {
                     "model_kwargs": {"num_hidden_layers": 10},
-                    "cuda_graph_batch_sizes": [1, 2],
-                    "max_batch_size": 128,
+                    # "cuda_graph_batch_sizes": [1, 2],
+                    "compile_backend": "torch-opt",
                     "free_mem_ratio": 0.9,
+                    "runtime": "trtllm",
+                    "skip_loading_weights": True,
                 },
                 f,
             )
@@ -344,7 +533,9 @@ def test_trtllm_bench_perf_golden_comparison(llm_root):  # noqa: F811
         assert expected_metrics, "Could not determine expected metrics for this GPU"
 
         # Run benchmark and capture performance + KV cache results
-        report_data = run_benchmark(model_name, dataset_path, temp_dir, report_json_path)
+        report_data = run_benchmark(
+            model_name, dataset_path, temp_dir, "_autodeploy", report_json_path
+        )
 
         # Extract performance metrics
         assert report_data is not None, "Failed to capture benchmark report"
