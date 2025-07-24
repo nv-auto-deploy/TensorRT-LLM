@@ -21,6 +21,35 @@ from tensorrt_llm._torch.auto_deploy.transformations.library import (
 )
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 
+base_model_tp_plan = {
+    "q_proj": "colwise",
+    "k_proj": "colwise",
+    "v_proj": "colwise",
+    "o_proj": "rowwise",
+    "gate_proj": "colwise",
+    "up_proj": "colwise",
+    "down_proj": "rowwise",
+    "linear1": "colwise",
+    "linear2": "rowwise",
+    "linear": "gather",
+    "input_layernorm.weight": "sequence_parallel",
+    "post_attention_layernorm.weight": "sequence_parallel",
+    "norm.weight": "sequence_parallel",
+    "shared_expert.gate_proj": "local_colwise",
+    "shared_expert.up_proj": "local_colwise",
+    "shared_expert.down_proj": "local_rowwise",
+    "experts.gate_up_proj": "local_packed_rowwise",
+    "experts.down_proj": "local_colwise",
+    "experts": "local",
+    "feed_forward": "gather",
+    "self": "gather",
+}
+
+predefined_config = {
+    "head_dim": 8,
+    "tp_plan": base_model_tp_plan,
+}
+
 
 class GQA_Block(nn.Module):
     def __init__(
@@ -83,6 +112,7 @@ def _run_job(
     model_cls: nn.Module,
     dist_op_expected: str,
     bias: bool,
+    from_config: bool,
     rank: int,
     world_size: int,
 ) -> None:
@@ -129,6 +159,7 @@ def _run_job(
             num_params = W_q_local_size + W_k_local_size + W_v_local_size + W_o_local_size
         else:
             num_params = num_p_og // world_size + num_update
+        print(f"\n\nnum_p_og: {num_p_og}, num_params: {num_params}")
         return num_params
 
     def verify_local_weight_sizes(gm) -> bool:
@@ -147,8 +178,12 @@ def _run_job(
     op_expected = getattr(torch.ops.auto_deploy, dist_op_expected)
 
     def transform_func(gm) -> None:
-        sharding_config = ShardingConfig()
-        detect_column_row_shard(gm, rank, world_size, sharding_config)
+        sharding_config = ShardingConfig(rank=rank, world_size=world_size)
+        if from_config:
+            if world_size > 1:
+                sharding_config.create_sharding_from_config(gm, predefined_config)
+        else:
+            detect_column_row_shard(gm, rank, world_size, sharding_config)
         sharding_transform_executor(gm, sharding_config)
 
     def combined_graph_check(gm) -> bool:
@@ -174,6 +209,7 @@ def _run_pattern_detection_job(
     bias: bool,
     rank: int,
     world_size: int,
+    from_config: bool,
 ) -> None:
     # init model and input
     batch_size = 4
@@ -200,7 +236,7 @@ def _run_pattern_detection_job(
     gm = torch_export_to_gm(model, args=(x,), clone=True)
     expected_transformations = []
     # if world_size == 1, no sharding transformations should be detected
-    if world_size > 1:
+    if world_size > 1 or from_config:
         if model_cls == GQA_Block:
             min_local_shape = num_features // num_heads
             for node in gm.graph.nodes:
@@ -262,8 +298,11 @@ def _run_pattern_detection_job(
                     )
 
     # get detected transformations
-    sharding_config = ShardingConfig()
-    detect_column_row_shard(gm, rank, world_size, sharding_config)
+    sharding_config = ShardingConfig(rank=rank, world_size=world_size)
+    if from_config:
+        sharding_config.create_sharding_from_config(gm, predefined_config)
+    else:
+        detect_column_row_shard(gm, rank, world_size, sharding_config)
     detected_transformations = sharding_config.tp_transforms
 
     # Run pattern detection test
@@ -272,6 +311,7 @@ def _run_pattern_detection_job(
 
 @pytest.mark.parametrize("device_count", get_device_counts())
 @pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("from_config", [False, True])
 @pytest.mark.parametrize(
     "model_cls, dist_op_expected",
     (
@@ -280,15 +320,22 @@ def _run_pattern_detection_job(
         (GQA_Block, "torch_dist_all_reduce"),
     ),
 )
-def test_sharding(model_cls: Type[nn.Module], dist_op_expected: str, bias: bool, device_count: int):
+def test_sharding(
+    model_cls: Type[nn.Module],
+    dist_op_expected: str,
+    bias: bool,
+    device_count: int,
+    from_config: bool,
+):
     dist_common.spawn_multiprocess_job(
-        job=partial(_run_job, model_cls, dist_op_expected, bias),
+        job=partial(_run_job, model_cls, dist_op_expected, bias, from_config),
         size=device_count,
     )
 
 
 @pytest.mark.parametrize("world_size", [1, 8])
 @pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("from_config", [False, True])
 @pytest.mark.parametrize(
     "model_cls, dist_op_expected",
     (
@@ -298,11 +345,15 @@ def test_sharding(model_cls: Type[nn.Module], dist_op_expected: str, bias: bool,
     ),
 )
 def test_sharding_pattern_detection(
-    model_cls: Type[nn.Module], dist_op_expected: str, bias: bool, world_size: int
+    model_cls: Type[nn.Module],
+    dist_op_expected: str,
+    bias: bool,
+    world_size: int,
+    from_config: bool,
 ):
     """Test pattern detection logic without distributed execution.
 
     This test verifies only the pattern detection logic with provided world_size.
     No need to run distributed job, can be run on single process.
     """
-    _run_pattern_detection_job(model_cls, bias, 0, world_size)
+    _run_pattern_detection_job(model_cls, bias, 0, world_size, from_config)

@@ -322,6 +322,25 @@ class ShardingConfig(BaseModel):
 
         for lin_node in filtered_nodes(gm.graph.nodes, is_linear_op):
             module_name = list(lin_node.meta["nn_module_stack"].keys())[-1]
+
+            # If the node is inside the attention module, we need to set min_local_shape to the
+            # head_dim - otherwise, we would risk splitting the heads into smaller shards.
+            # TODO: is there a better way to check if we are in attention module?
+            attn_names = [
+                "attention",
+                "Attention",
+                "attn",
+                "Attn",
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+            ]
+            if any(attn_name in module_name for attn_name in attn_names):
+                min_local_shape = head_dim
+            else:
+                min_local_shape = 1
+
             # use regex to find if module_name matches any of the keys in sharding_config
             for key in tp_plan.keys():
                 pattern_string = "*" + key + "*"
@@ -338,15 +357,6 @@ class ShardingConfig(BaseModel):
                     # all-gather after column, and all-reduce after row.
                     # But since we assume Y = W @ X^T, we have a swapped column and row split.
                     if config == "colwise":
-                        # if we are doing colwise split, we need to check if we are in
-                        # attention module. If so, we need to set min_local_shape to the
-                        # head_dim - otherwise, we would risk splitting the heads into smaller shards.
-                        # TODO: is there a better way to check if we are in attention module?
-                        attn_names = ["attention", "Attention", "attn", "Attn"]
-                        if any(attn_name in module_name for attn_name in attn_names):
-                            min_local_shape = head_dim
-                        else:
-                            min_local_shape = 1
                         self.tp_transforms.append(
                             TPShardingInfo(
                                 target_node=lin_node.name,
@@ -365,7 +375,7 @@ class ShardingConfig(BaseModel):
                                 rank=self.rank,
                                 world_size=self.world_size,
                                 dist_op="all_reduce",
-                                min_local_shape=1,
+                                min_local_shape=min_local_shape,
                             )
                         )
                     elif "sequence" in config:
