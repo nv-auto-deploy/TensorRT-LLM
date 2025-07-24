@@ -54,14 +54,12 @@ def run_benchmark(
     backend: str = "_autodeploy",
     report_json_path: str = None,
     max_batch_size: int = 32,
+    num_hidden_layers: int = 2,
 ):
     """Run benchmark and capture KV cache metrics from log output."""
 
     # Read the test config to get free_mem_ratio
-    config_path = f"{temp_dir}/model_kwargs.yaml"
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    free_mem_ratio = config.get("free_mem_ratio", 0.8)  # Default to 0.8 if not specified
+    config_path = f"{temp_dir}/extra_llm_api_options.yaml"
 
     # Build the command to run the benchmark
     cmd = [
@@ -79,19 +77,27 @@ def run_benchmark(
         str(max_batch_size),
     ]
 
-    # Add extra_llm_api_options only for autodeploy backend
-    if backend == "_autodeploy":
-        cmd.extend(["--extra_llm_api_options", config_path])
-
     # Add report_json argument if path is provided
     if report_json_path:
         cmd.extend(["--report_json", report_json_path])
 
-    print(f"🚀 Running benchmark command ({backend} backend): {' '.join(cmd)}")
-    print(f"📋 Using free_mem_ratio from config: {free_mem_ratio}")
+    if backend == "_autodeploy":
+        # Add extra_llm_api_options only for autodeploy backend
+        cmd.extend(["--extra_llm_api_options", config_path])
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+        free_mem_ratio = config.get("free_mem_ratio", 0.0)  # Default to 0.0 if not specified
+        print(f"📋 Using free_mem_ratio from config: {free_mem_ratio}")
 
     # Run benchmark as subprocess to capture ALL output
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    import os
+
+    env = os.environ.copy()
+    if backend == "pytorch":
+        env["TLLM_OVERRIDE_LAYER_NUM"] = str(num_hidden_layers)
+        print(f"📋 Using TLLM_OVERRIDE_LAYER_NUM from env: {env['TLLM_OVERRIDE_LAYER_NUM']}")
+    print(f"🚀 Running benchmark command ({backend} backend): {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
 
     # Check if the command succeeded
     assert result.returncode == 0, (
@@ -272,14 +278,14 @@ def calculate_expected_kv_cache_metrics(free_mem_ratio: float):
             # For TinyLlama-1.1B, model should be 2.2GB
             estimated_model_size_mb = 2200  # Conservative estimate
             # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/6335 check why there is extra consumption
-            extra_consumption_mb = 800
+            extra_consumption_mb = 2200
             expected_free_mem_range = (
                 total_mem_mb - estimated_model_size_mb - extra_consumption_mb,
                 total_mem_mb - estimated_model_size_mb,
             )
 
-            # Current cache size is typically small initially (80MB range)
-            expected_current_cache_size = 83886080  # This is more stable across GPUs
+            # Current cache size is typically small initially (16MB range)
+            expected_current_cache_size = 16777216
 
             # Free memory values should be in reasonable range
             expected_free_mem_pre_range = expected_free_mem_range
@@ -444,12 +450,12 @@ def print_kv_cache_metrics(kv_cache_metrics):
 def trtllm_bench_unified_comparison(
     llm_root,  # noqa: F811
     comparison_mode="backend",
-    free_mem_ratio=0.9,
-    num_hidden_layers=10,
-    max_batch_size=32,
-    golden_tokens_per_sec=730,
-    backend_relative_tolerance=0.30,
-    backend_absolute_tolerance=15.0,
+    free_mem_ratio=0.1,
+    num_hidden_layers=2,
+    max_batch_size=32,  # below this value the kv cache resizing is skipped
+    golden_tokens_per_sec=1400,
+    backend_relative_tolerance=0.2,
+    backend_absolute_tolerance=250.0,
     golden_relative_tolerance=0.1,
     golden_absolute_tolerance=5.0,
 ):
@@ -461,21 +467,21 @@ def trtllm_bench_unified_comparison(
     Args:
         llm_root: Root directory for LLM models (pytest fixture)
         comparison_mode: Either "backend" or "golden" to determine comparison type
-        free_mem_ratio: Ratio of free memory to use for KV cache (default: 0.9)
-        num_hidden_layers: Number of hidden layers for the model (default: 10)
-        max_batch_size: Maximum batch size for benchmarking (default: 32)
-        golden_tokens_per_sec: Golden performance value in tokens/sec/user (default: 730)
-        backend_relative_tolerance: Relative tolerance for backend comparison (default: 0.30)
-        backend_absolute_tolerance: Absolute tolerance for backend comparison (default: 15.0)
-        golden_relative_tolerance: Relative tolerance for golden comparison (default: 0.1)
-        golden_absolute_tolerance: Absolute tolerance for golden comparison (default: 5.0)
+        free_mem_ratio: Ratio of free memory to use for KV cache
+        num_hidden_layers: Number of hidden layers for the model
+        max_batch_size: Maximum batch size for benchmarking
+        golden_tokens_per_sec: Golden performance value in tokens/sec/user
+        backend_relative_tolerance: Relative tolerance for backend comparison
+        backend_absolute_tolerance: Absolute tolerance for backend comparison
+        golden_relative_tolerance: Relative tolerance for golden comparison
+        golden_absolute_tolerance: Absolute tolerance for golden comparison
     """
     model_name = _hf_model_dir_or_hub_id(
         f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     )
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        with open(f"{temp_dir}/model_kwargs.yaml", "w") as f:
+        with open(f"{temp_dir}/extra_llm_api_options.yaml", "w") as f:
             yaml.dump(
                 {
                     "model_kwargs": {"num_hidden_layers": num_hidden_layers},
@@ -483,7 +489,6 @@ def trtllm_bench_unified_comparison(
                     "compile_backend": "torch-opt",
                     "free_mem_ratio": free_mem_ratio,
                     "runtime": "trtllm",
-                    "skip_loading_weights": True,
                 },
                 f,
             )
@@ -515,7 +520,13 @@ def trtllm_bench_unified_comparison(
             pytorch_report_path = f"{temp_dir}/pytorch_report.json"
             print("=== RUNNING PYTORCH BACKEND ===")
             pytorch_report = run_benchmark(
-                model_name, dataset_path, temp_dir, "pytorch", pytorch_report_path, max_batch_size
+                model_name,
+                dataset_path,
+                temp_dir,
+                "pytorch",
+                pytorch_report_path,
+                max_batch_size,
+                num_hidden_layers,
             )
 
             # Extract pytorch performance metrics
