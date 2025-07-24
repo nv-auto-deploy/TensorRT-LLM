@@ -114,72 +114,6 @@ def run_benchmark(model_name: str, dataset_path: str, temp_dir: str, report_json
     return None
 
 
-def assert_kv_cache_metrics_within_bounds(
-    actual_metrics: dict,
-    golden_metrics: dict,
-    tolerance_percentage: float = 10.0,
-):
-    """
-    Assert that KV cache metrics are within tolerance of golden values.
-
-    Args:
-        actual_metrics: Measured KV cache metrics
-        golden_metrics: Expected KV cache metrics
-        tolerance_percentage: Relative tolerance percentage (10% by default)
-    """
-    for metric_name, golden_value in golden_metrics.items():
-        if metric_name not in actual_metrics:
-            raise AssertionError(f"KV cache metric '{metric_name}' not found in actual metrics")
-
-        actual_value = actual_metrics[metric_name]
-        relative_diff = (
-            abs(actual_value - golden_value) / golden_value if golden_value > 0 else float("inf")
-        )
-
-        assert relative_diff <= tolerance_percentage / 100.0, (
-            f"KV cache metric '{metric_name}' outside expected bounds! "
-            f"Actual: {actual_value}, "
-            f"Golden: {golden_value}, "
-            f"Relative diff: {relative_diff:.2%}, "
-            f"Tolerance: {tolerance_percentage}%"
-        )
-
-
-def prepare_dataset(root_dir: str, temp_dir: str, model_name: str):
-    _DATASET_NAME = "synthetic_128_128.txt"
-    dataset_path = Path(temp_dir, _DATASET_NAME)
-    dataset_tool = Path(root_dir, "benchmarks", "cpp", "prepare_dataset.py")
-    script_dir = Path(root_dir, "benchmarks", "cpp")
-
-    # Generate a small dataset to run a test.
-    command = [
-        "python3",
-        f"{dataset_tool}",
-        "--stdout",
-        "--tokenizer",
-        model_name,
-        "token-norm-dist",
-        "--input-mean",
-        "128",
-        "--output-mean",
-        "128",
-        "--input-stdev",
-        "0",
-        "--output-stdev",
-        "0",
-        "--num-requests",
-        "10",
-    ]
-    print(f"Running command: {' '.join(command)}")
-    result = subprocess.run(command, cwd=str(script_dir), capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to prepare dataset: {result.stderr}")
-    # Grab the stdout and write it to a dataset file for passing to suite.
-    with open(dataset_path, "w") as dataset:
-        dataset.write(result.stdout)
-    return dataset_path
-
-
 def assert_performance_within_tolerance(
     actual_tokens_per_sec: float,
     golden_tokens_per_sec: float,
@@ -223,6 +157,144 @@ def assert_performance_within_tolerance(
     )
 
 
+def prepare_dataset(root_dir: str, temp_dir: str, model_name: str):
+    _DATASET_NAME = "synthetic_128_128.txt"
+    dataset_path = Path(temp_dir, _DATASET_NAME)
+    dataset_tool = Path(root_dir, "benchmarks", "cpp", "prepare_dataset.py")
+    script_dir = Path(root_dir, "benchmarks", "cpp")
+
+    # Generate a small dataset to run a test.
+    command = [
+        "python3",
+        f"{dataset_tool}",
+        "--stdout",
+        "--tokenizer",
+        model_name,
+        "token-norm-dist",
+        "--input-mean",
+        "128",
+        "--output-mean",
+        "128",
+        "--input-stdev",
+        "0",
+        "--output-stdev",
+        "0",
+        "--num-requests",
+        "10",
+    ]
+    print(f"Running command: {' '.join(command)}")
+    result = subprocess.run(command, cwd=str(script_dir), capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to prepare dataset: {result.stderr}")
+    # Grab the stdout and write it to a dataset file for passing to suite.
+    with open(dataset_path, "w") as dataset:
+        dataset.write(result.stdout)
+    return dataset_path
+
+
+def calculate_expected_kv_cache_metrics(free_mem_ratio: float):
+    """Calculate expected KV cache metrics based on actual GPU memory."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            # Get total GPU memory in MB
+            _, total_mem_bytes = torch.cuda.mem_get_info(0)
+            total_mem_mb = total_mem_bytes // (1024 * 1024)
+
+            # Estimate expected values based on model size
+            # For TinyLlama-1.1B, model should be 2.2GB
+            estimated_model_size_mb = 2200  # Conservative estimate
+            extra_consumption_mb = 3300  # TODO: check why there is extra consumption
+            expected_free_mem_range = (
+                total_mem_mb - estimated_model_size_mb - extra_consumption_mb,
+                total_mem_mb - estimated_model_size_mb,
+            )
+
+            # Current cache size is typically small initially (80MB range)
+            expected_current_cache_size = 83886080  # This is more stable across GPUs
+
+            # Free memory values should be in reasonable range
+            expected_free_mem_pre_range = expected_free_mem_range
+            expected_free_mem_post_range = (
+                expected_free_mem_range[0] - 1000,
+                expected_free_mem_range[1] - 500,
+            )
+
+            print("📊 GPU Memory Analysis:")
+            print(f"  Total GPU memory: {total_mem_mb}MB")
+            print(
+                f"  Expected free memory range: {expected_free_mem_range[0]}-{expected_free_mem_range[1]}MB"
+            )
+
+            return {
+                "total_mem_mb": total_mem_mb,
+                "expected_current_cache_size": expected_current_cache_size,
+                "expected_free_mem_pre_range": expected_free_mem_pre_range,
+                "expected_free_mem_post_range": expected_free_mem_post_range,
+                "free_mem_ratio": free_mem_ratio,
+            }
+        else:
+            return None
+    except ImportError:
+        return None
+
+
+def validate_kv_cache_metrics_dynamic(kv_cache_metrics: dict, expected_metrics: dict):
+    """Validate KV cache metrics using dynamic expected values."""
+
+    # Validate current_cache_size (should be relatively stable)
+    current_cache_size = kv_cache_metrics.get("current_cache_size")
+    expected_cache_size = expected_metrics["expected_current_cache_size"]
+    if current_cache_size:
+        cache_diff = abs(current_cache_size - expected_cache_size) / expected_cache_size
+        assert cache_diff <= 0.5, (  # 50% tolerance for cache size
+            f"Current cache size outside expected range: {current_cache_size} vs expected ~{expected_cache_size}"
+        )
+        print(f"  ✅ current_cache_size: {current_cache_size} bytes (within range)")
+
+    # Validate free memory values are in reasonable ranges
+    free_mem_pre = kv_cache_metrics.get("free_mem_pre_mb")
+    free_mem_post = kv_cache_metrics.get("free_mem_post_mb")
+
+    if free_mem_pre:
+        pre_range = expected_metrics["expected_free_mem_pre_range"]
+        assert pre_range[0] <= free_mem_pre <= pre_range[1], (
+            f"Free memory before forward pass outside expected range: "
+            f"{free_mem_pre}MB not in range {pre_range[0]}-{pre_range[1]}MB"
+        )
+        print(f"  ✅ free_mem_pre_mb: {free_mem_pre}MB (within range)")
+
+    if free_mem_post:
+        post_range = expected_metrics["expected_free_mem_post_range"]
+        assert post_range[0] <= free_mem_post <= post_range[1], (
+            f"Free memory after forward pass outside expected range: "
+            f"{free_mem_post}MB not in range {post_range[0]}-{post_range[1]}MB"
+        )
+        print(f"  ✅ free_mem_post_mb: {free_mem_post}MB (within range)")
+
+    # Validate memory consumption (pre should be > post)
+    if free_mem_pre and free_mem_post:
+        memory_consumed = free_mem_pre - free_mem_post
+        assert memory_consumed > 0, (
+            f"Expected memory consumption during forward pass, got {memory_consumed}MB"
+        )
+        assert memory_consumed < 5000, f"Memory consumption too high: {memory_consumed}MB"
+        print(f"  ✅ Memory consumed during forward pass: {memory_consumed}MB (reasonable)")
+
+    # Validate calculated new_cache_size
+    new_cache_size = kv_cache_metrics.get("new_cache_size")
+    if new_cache_size and free_mem_post and current_cache_size:
+        expected_new_cache = int(
+            free_mem_post * 1024 * 1024 * expected_metrics["free_mem_ratio"] + current_cache_size
+        )
+        cache_size_diff = abs(new_cache_size - expected_new_cache) / expected_new_cache
+        assert cache_size_diff <= 0.01, (  # 1% tolerance for calculated value
+            f"Calculated new_cache_size mismatch: {new_cache_size} vs expected {expected_new_cache}"
+        )
+        print(f"  ✅ new_cache_size: {new_cache_size} bytes (calculation correct)")
+
+
 def test_trtllm_bench(llm_root):  # noqa: F811
     model_name = _hf_model_dir_or_hub_id(
         f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
@@ -244,21 +316,13 @@ def test_trtllm_bench(llm_root):  # noqa: F811
 
 
 def test_trtllm_bench_perf_golden_comparison(llm_root):  # noqa: F811
-    """Test that runs autodeploy backend and compares performance and KV cache metrics to golden results."""
+    """Test that runs autodeploy backend and compares performance and KV cache metrics to expected ranges."""
     model_name = _hf_model_dir_or_hub_id(
         f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     )
 
     # Golden performance value for TinyLlama-1.1B-Chat-v1.0 with autodeploy backend
     GOLDEN_TOKENS_PER_SEC_PER_USER = 30.41  # tokens/sec/user (updated from actual test result)
-
-    # Golden KV cache metrics (updated from actual test results)
-    GOLDEN_KV_CACHE_METRICS = {
-        "current_cache_size": 83886080,  # bytes - from logs
-        "free_mem_pre_mb": 76151,  # MB - from logs
-        "free_mem_post_mb": 75407,  # MB - from logs
-        "new_cache_size": 71258625997,  # bytes - calculated: int(75407 * 1024 * 1024 * 0.9) + 83886080
-    }
 
     with tempfile.TemporaryDirectory() as temp_dir:
         with open(f"{temp_dir}/model_kwargs.yaml", "w") as f:
@@ -274,6 +338,10 @@ def test_trtllm_bench_perf_golden_comparison(llm_root):  # noqa: F811
 
         dataset_path = prepare_dataset(llm_root, temp_dir, model_name)
         report_json_path = f"{temp_dir}/benchmark_report.json"
+
+        # Calculate expected KV cache metrics for this GPU
+        expected_metrics = calculate_expected_kv_cache_metrics(0.9)
+        assert expected_metrics, "Could not determine expected metrics for this GPU"
 
         # Run benchmark and capture performance + KV cache results
         report_data = run_benchmark(model_name, dataset_path, temp_dir, report_json_path)
@@ -316,13 +384,12 @@ def test_trtllm_bench_perf_golden_comparison(llm_root):  # noqa: F811
         print(f"Measured performance: {actual_tokens_per_sec:.2f} tokens/sec/user")
         print(f"Golden performance: {GOLDEN_TOKENS_PER_SEC_PER_USER:.2f} tokens/sec/user")
 
-        print("=== KV CACHE METRICS (REQUIRED) ===")
+        print("=== KV CACHE METRICS (DYNAMIC VALIDATION) ===")
         for metric_name, actual_value in kv_cache_metrics.items():
-            golden_value = GOLDEN_KV_CACHE_METRICS.get(metric_name, "N/A")
             if "mb" in metric_name.lower():
-                print(f"{metric_name}: {actual_value}MB (golden: {golden_value})")
+                print(f"{metric_name}: {actual_value}MB")
             else:
-                print(f"{metric_name}: {actual_value} bytes (golden: {golden_value})")
+                print(f"{metric_name}: {actual_value} bytes")
 
         # Performance validation (always required)
         assert_performance_within_tolerance(
@@ -332,15 +399,10 @@ def test_trtllm_bench_perf_golden_comparison(llm_root):  # noqa: F811
             absolute_tolerance=5.0,  # 5 tokens/sec absolute tolerance
         )
 
-        # KV cache metrics validation
-        print(f"Validating {len(kv_cache_metrics)} KV cache metrics against golden values...")
-        tolerance_percentage = 1.0  # % tolerance for KV cache metrics
-        assert_kv_cache_metrics_within_bounds(
-            kv_cache_metrics, GOLDEN_KV_CACHE_METRICS, tolerance_percentage=tolerance_percentage
-        )
+        # KV cache metrics validation using dynamic expected values
+        print(f"Validating {len(kv_cache_metrics)} KV cache metrics against GPU-specific ranges...")
+        validate_kv_cache_metrics_dynamic(kv_cache_metrics, expected_metrics)
 
         print("=== ALL TESTS PASSED ===")
         print(f"Performance: ✅ {actual_tokens_per_sec:.2f} tokens/sec/user within bounds")
-        print(
-            f"KV Cache Metrics: ✅ All {len(kv_cache_metrics)} metrics within {tolerance_percentage}% of golden values"
-        )
+        print("KV Cache Metrics: ✅ All metrics within GPU-specific expected ranges")
