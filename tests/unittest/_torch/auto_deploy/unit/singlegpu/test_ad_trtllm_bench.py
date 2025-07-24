@@ -53,6 +53,7 @@ def run_benchmark(
     temp_dir: str,
     backend: str = "_autodeploy",
     report_json_path: str = None,
+    max_batch_size: int = 32,
 ):
     """Run benchmark and capture KV cache metrics from log output."""
 
@@ -75,7 +76,7 @@ def run_benchmark(
         "--dataset",
         str(dataset_path),
         "--max_batch_size",
-        "32",
+        str(max_batch_size),
     ]
 
     # Add extra_llm_api_options only for autodeploy backend
@@ -270,7 +271,8 @@ def calculate_expected_kv_cache_metrics(free_mem_ratio: float):
             # Estimate expected values based on model size
             # For TinyLlama-1.1B, model should be 2.2GB
             estimated_model_size_mb = 2200  # Conservative estimate
-            extra_consumption_mb = 3300  # TODO: check why there is extra consumption
+            # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/6335 check why there is extra consumption
+            extra_consumption_mb = 800
             expected_free_mem_range = (
                 total_mem_mb - estimated_model_size_mb - extra_consumption_mb,
                 total_mem_mb - estimated_model_size_mb,
@@ -360,210 +362,217 @@ def validate_kv_cache_metrics_dynamic(kv_cache_metrics: dict, expected_metrics: 
         print(f"  ✅ new_cache_size: {new_cache_size} bytes (calculation correct)")
 
 
-def test_trtllm_bench(llm_root):  # noqa: F811
-    model_name = _hf_model_dir_or_hub_id(
-        f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+def extract_performance_metric(report_data, report_name="benchmark"):
+    """Extract performance metric from a benchmark report with validation."""
+    assert report_data is not None, f"Failed to capture {report_name} report"
+    assert "performance" in report_data, f"Performance metrics not found in {report_name} report"
+
+    tokens_per_sec = report_data["performance"].get("output_throughput_per_user_tok_s")
+    assert tokens_per_sec is not None, (
+        f"output_throughput_per_user_tok_s not found in {report_name} performance metrics"
     )
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        with open(f"{temp_dir}/model_kwargs.yaml", "w") as f:
-            yaml.dump(
-                {
-                    "model_kwargs": {"num_hidden_layers": 2},
-                    "cuda_graph_batch_sizes": [1, 2],
-                },
-                f,
-            )
-
-        dataset_path = prepare_dataset(llm_root, temp_dir, model_name)
-        run_benchmark(model_name, dataset_path, temp_dir)
+    return tokens_per_sec
 
 
-def test_trtllm_bench_backend_comparison(llm_root):  # noqa: F811
-    """Test that compares autodeploy backend performance against pytorch backend."""
-    model_name = _hf_model_dir_or_hub_id(
-        f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    )
+def validate_and_extract_kv_cache_metrics(report_data, free_mem_ratio, require_metrics=True):
+    """
+    Validate and extract KV cache metrics from report.
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        with open(f"{temp_dir}/model_kwargs.yaml", "w") as f:
-            yaml.dump(
-                {
-                    "model_kwargs": {"num_hidden_layers": 10},
-                    # "cuda_graph_batch_sizes": [1, 2],
-                    "compile_backend": "torch-opt",
-                    "free_mem_ratio": 0.9,
-                    "runtime": "trtllm",
-                    "skip_loading_weights": True,
-                },
-                f,
-            )
+    Args:
+        report_data: The benchmark report data
+        free_mem_ratio: Free memory ratio for calculating expected metrics
+        require_metrics: If True, fail when metrics are missing. If False, just warn.
 
-        dataset_path = prepare_dataset(llm_root, temp_dir, model_name)
+    Returns:
+        Tuple of (kv_cache_metrics, expected_metrics) or (None, None) if validation fails
+    """
+    required_metrics = [
+        "current_cache_size",
+        "free_mem_pre_mb",
+        "free_mem_post_mb",
+        "new_cache_size",
+    ]
 
-        # Run benchmarks for both backends
-        autodeploy_report_path = f"{temp_dir}/autodeploy_report.json"
-        pytorch_report_path = f"{temp_dir}/pytorch_report.json"
+    # Extract KV cache metrics
+    kv_cache_metrics = report_data.get("kv_cache_metrics", {})
 
-        print("=== RUNNING AUTODEPLOY BACKEND ===")
-        autodeploy_report = run_benchmark(
-            model_name, dataset_path, temp_dir, "_autodeploy", autodeploy_report_path
-        )
-
-        print("=== RUNNING PYTORCH BACKEND ===")
-        pytorch_report = run_benchmark(
-            model_name, dataset_path, temp_dir, "pytorch", pytorch_report_path
-        )
-
-        # Extract performance metrics from both backends
-        assert autodeploy_report is not None, "Failed to capture autodeploy benchmark report"
-        assert pytorch_report is not None, "Failed to capture pytorch benchmark report"
-
-        assert "performance" in autodeploy_report, (
-            "Performance metrics not found in autodeploy report"
-        )
-        assert "performance" in pytorch_report, "Performance metrics not found in pytorch report"
-
-        autodeploy_tokens_per_sec = autodeploy_report["performance"].get(
-            "output_throughput_per_user_tok_s"
-        )
-        pytorch_tokens_per_sec = pytorch_report["performance"].get(
-            "output_throughput_per_user_tok_s"
-        )
-
-        assert autodeploy_tokens_per_sec is not None, (
-            "output_throughput_per_user_tok_s not found in autodeploy performance metrics"
-        )
-        assert pytorch_tokens_per_sec is not None, (
-            "output_throughput_per_user_tok_s not found in pytorch performance metrics"
-        )
-
-        # Compare backend performance
-        compare_backends_performance(
-            autodeploy_tokens_per_sec,
-            pytorch_tokens_per_sec,
-            relative_tolerance=0.30,  # 30% tolerance for backend comparison
-            absolute_tolerance=15.0,  # 15 tokens/sec absolute tolerance
-        )
-
-        # KV cache validation only for autodeploy backend (optional)
-        if "kv_cache_metrics" in autodeploy_report:
-            kv_cache_metrics = autodeploy_report["kv_cache_metrics"]
-            required_metrics = [
-                "current_cache_size",
-                "free_mem_pre_mb",
-                "free_mem_post_mb",
-                "new_cache_size",
-            ]
-            missing_metrics = [
-                metric for metric in required_metrics if metric not in kv_cache_metrics
-            ]
-
-            if not missing_metrics:
-                expected_metrics = calculate_expected_kv_cache_metrics(0.9)
-                assert expected_metrics, "Could not determine expected metrics for this GPU"
-                validate_kv_cache_metrics_dynamic(kv_cache_metrics, expected_metrics)
-                print("✅ KV Cache Metrics validation passed")
-            else:
-                print(f"ℹ️ KV cache validation skipped - missing metrics: {missing_metrics}")
-        else:
-            print("ℹ️ No KV cache metrics found in autodeploy report")
-
-        print("=== BACKEND COMPARISON TEST PASSED ===")
-        print(f"Autodeploy: {autodeploy_tokens_per_sec:.2f} tokens/sec/user")
-        print(f"PyTorch: {pytorch_tokens_per_sec:.2f} tokens/sec/user")
-
-
-def test_trtllm_bench_perf_golden_comparison(llm_root):  # noqa: F811
-    """Test that runs the autodeploy backend and compares performance + memory to golden values."""
-    model_name = _hf_model_dir_or_hub_id(
-        f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    )
-
-    # Golden performance value for TinyLlama-1.1B-Chat-v1.0 with autodeploy backend
-    GOLDEN_TOKENS_PER_SEC_PER_USER = 30.41  # tokens/sec/user (updated from actual test result)
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        with open(f"{temp_dir}/model_kwargs.yaml", "w") as f:
-            yaml.dump(
-                {
-                    "model_kwargs": {"num_hidden_layers": 10},
-                    "compile_backend": "torch-opt",
-                    "free_mem_ratio": 0.9,
-                    "runtime": "trtllm",
-                    "skip_loading_weights": True,
-                },
-                f,
-            )
-
-        dataset_path = prepare_dataset(llm_root, temp_dir, model_name)
-        report_json_path = f"{temp_dir}/benchmark_report.json"
-
-        # Calculate expected KV cache metrics for this GPU
-        expected_metrics = calculate_expected_kv_cache_metrics(0.9)
-        assert expected_metrics, "Could not determine expected metrics for this GPU"
-
-        # Run benchmark and capture performance + KV cache results
-        report_data = run_benchmark(
-            model_name, dataset_path, temp_dir, "_autodeploy", report_json_path
-        )
-
-        # Extract performance metrics
-        assert report_data is not None, "Failed to capture benchmark report"
-        assert "performance" in report_data, "Performance metrics not found in benchmark report"
-
-        actual_tokens_per_sec = report_data["performance"].get("output_throughput_per_user_tok_s")
-        assert actual_tokens_per_sec is not None, (
-            "output_throughput_per_user_tok_s not found in performance metrics"
-        )
-
-        # Extract KV cache metrics (REQUIRED - test fails if not found)
-        kv_cache_metrics = report_data.get("kv_cache_metrics", {})
-
-        # Fail if no KV cache metrics were captured
-        assert kv_cache_metrics, (
-            "REQUIRED KV cache metrics not found! "
+    if not kv_cache_metrics:
+        message = (
+            "KV cache metrics not found! "
             "The autodeploy backend must log memory statistics for this test to pass. "
-            "Expected metrics: current_cache_size, free_mem_pre_mb, free_mem_post_mb, new_cache_size"
+            f"Expected metrics: {', '.join(required_metrics)}"
         )
+        if require_metrics:
+            assert False, f"REQUIRED {message}"
+        else:
+            print(f"ℹ️ {message}")
+            assert False, "KV cache metrics are missing"
 
-        # Ensure we have the minimum required metrics
-        required_metrics = [
-            "current_cache_size",
-            "free_mem_pre_mb",
-            "free_mem_post_mb",
-            "new_cache_size",
-        ]
-        missing_metrics = [metric for metric in required_metrics if metric not in kv_cache_metrics]
-        assert not missing_metrics, (
+    # Check for missing metrics
+    missing_metrics = [metric for metric in required_metrics if metric not in kv_cache_metrics]
+
+    if missing_metrics:
+        message = (
             f"Missing required KV cache metrics: {missing_metrics}. "
             f"Found metrics: {list(kv_cache_metrics.keys())}. "
             f"All of {required_metrics} are required for the test to pass."
         )
+        if require_metrics:
+            assert False, message
+        else:
+            print(f"ℹ️ KV cache validation skipped - {message}")
+            assert False, "KV cache metrics are missing"
 
-        # Print all metrics for visibility
-        print("=== PERFORMANCE METRICS ===")
-        print(f"Measured performance: {actual_tokens_per_sec:.2f} tokens/sec/user")
-        print(f"Golden performance: {GOLDEN_TOKENS_PER_SEC_PER_USER:.2f} tokens/sec/user")
+    # Calculate expected metrics
+    expected_metrics = calculate_expected_kv_cache_metrics(free_mem_ratio)
+    assert expected_metrics, "Could not determine expected metrics for this GPU"
 
-        print("=== KV CACHE METRICS (DYNAMIC VALIDATION) ===")
-        for metric_name, actual_value in kv_cache_metrics.items():
-            if "mb" in metric_name.lower():
-                print(f"{metric_name}: {actual_value}MB")
-            else:
-                print(f"{metric_name}: {actual_value} bytes")
+    return kv_cache_metrics, expected_metrics
 
-        # Performance validation (always required)
-        assert_performance_within_tolerance(
-            actual_tokens_per_sec,
-            GOLDEN_TOKENS_PER_SEC_PER_USER,
-            relative_tolerance=0.1,  # 10% relative tolerance
-            absolute_tolerance=5.0,  # 5 tokens/sec absolute tolerance
+
+def print_kv_cache_metrics(kv_cache_metrics):
+    """Print KV cache metrics in a formatted way."""
+    print("=== KV CACHE METRICS (DYNAMIC VALIDATION) ===")
+    for metric_name, actual_value in kv_cache_metrics.items():
+        if "mb" in metric_name.lower():
+            print(f"{metric_name}: {actual_value}MB")
+        else:
+            print(f"{metric_name}: {actual_value} bytes")
+
+
+def trtllm_bench_unified_comparison(
+    comparison_mode="backend",
+    free_mem_ratio=0.9,
+    num_hidden_layers=10,
+    max_batch_size=32,
+    golden_tokens_per_sec=730,
+    backend_relative_tolerance=0.30,
+    backend_absolute_tolerance=15.0,
+    golden_relative_tolerance=0.1,
+    golden_absolute_tolerance=5.0,
+):  # noqa: F811
+    """
+    Unified test that compares autodeploy backend performance in two modes:
+    - "backend": compares against pytorch backend performance
+    - "golden": compares against predefined golden performance values
+
+    Args:
+        comparison_mode: Either "backend" or "golden" to determine comparison type
+        free_mem_ratio: Ratio of free memory to use for KV cache (default: 0.9)
+        num_hidden_layers: Number of hidden layers for the model (default: 10)
+        max_batch_size: Maximum batch size for benchmarking (default: 32)
+        golden_tokens_per_sec: Golden performance value in tokens/sec/user (default: 730)
+        backend_relative_tolerance: Relative tolerance for backend comparison (default: 0.30)
+        backend_absolute_tolerance: Absolute tolerance for backend comparison (default: 15.0)
+        golden_relative_tolerance: Relative tolerance for golden comparison (default: 0.1)
+        golden_absolute_tolerance: Absolute tolerance for golden comparison (default: 5.0)
+    """
+    model_name = _hf_model_dir_or_hub_id(
+        f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with open(f"{temp_dir}/model_kwargs.yaml", "w") as f:
+            yaml.dump(
+                {
+                    "model_kwargs": {"num_hidden_layers": num_hidden_layers},
+                    # "cuda_graph_batch_sizes": [1, 2],
+                    "compile_backend": "torch-opt",
+                    "free_mem_ratio": free_mem_ratio,
+                    "runtime": "trtllm",
+                    "skip_loading_weights": True,
+                },
+                f,
+            )
+
+        dataset_path = prepare_dataset(llm_root, temp_dir, model_name)
+
+        # Always run autodeploy backend
+        autodeploy_report_path = f"{temp_dir}/autodeploy_report.json"
+        print("=== RUNNING AUTODEPLOY BACKEND ===")
+        autodeploy_report = run_benchmark(
+            model_name,
+            dataset_path,
+            temp_dir,
+            "_autodeploy",
+            autodeploy_report_path,
+            max_batch_size,
         )
 
-        # KV cache metrics validation using dynamic expected values
-        print(f"Validating {len(kv_cache_metrics)} KV cache metrics against GPU-specific ranges...")
-        validate_kv_cache_metrics_dynamic(kv_cache_metrics, expected_metrics)
-        print("=== ALL TESTS PASSED ===")
-        print(f"Performance: ✅ {actual_tokens_per_sec:.2f} tokens/sec/user within bounds")
-        print("KV Cache Metrics: ✅ All metrics within GPU-specific expected ranges")
+        # Extract autodeploy performance metrics
+        autodeploy_tokens_per_sec = extract_performance_metric(autodeploy_report, "autodeploy")
+
+        # Validate and extract KV cache metrics (now required for both modes after user's changes)
+        kv_cache_metrics, expected_metrics = validate_and_extract_kv_cache_metrics(
+            autodeploy_report, free_mem_ratio, require_metrics=True
+        )
+
+        if comparison_mode == "backend":
+            # Backend comparison mode: also run pytorch backend
+            pytorch_report_path = f"{temp_dir}/pytorch_report.json"
+            print("=== RUNNING PYTORCH BACKEND ===")
+            pytorch_report = run_benchmark(
+                model_name, dataset_path, temp_dir, "pytorch", pytorch_report_path, max_batch_size
+            )
+
+            # Extract pytorch performance metrics
+            pytorch_tokens_per_sec = extract_performance_metric(pytorch_report, "pytorch")
+
+            # Compare backend performance
+            compare_backends_performance(
+                autodeploy_tokens_per_sec,
+                pytorch_tokens_per_sec,
+                relative_tolerance=backend_relative_tolerance,
+                absolute_tolerance=backend_absolute_tolerance,
+            )
+
+            # Validate KV cache metrics
+            validate_kv_cache_metrics_dynamic(kv_cache_metrics, expected_metrics)
+            print("✅ KV Cache Metrics validation passed")
+
+            print("=== BACKEND COMPARISON TEST PASSED ===")
+            print(f"Autodeploy: {autodeploy_tokens_per_sec:.2f} tokens/sec/user")
+            print(f"PyTorch: {pytorch_tokens_per_sec:.2f} tokens/sec/user")
+
+        elif comparison_mode == "golden":
+            # Golden comparison mode: compare against golden values
+            print("=== PERFORMANCE METRICS ===")
+            print(f"Measured performance: {autodeploy_tokens_per_sec:.2f} tokens/sec/user")
+            print(f"Golden performance: {golden_tokens_per_sec:.2f} tokens/sec/user")
+
+            # Print KV cache metrics
+            print_kv_cache_metrics(kv_cache_metrics)
+
+            # Performance validation
+            assert_performance_within_tolerance(
+                autodeploy_tokens_per_sec,
+                golden_tokens_per_sec,
+                relative_tolerance=golden_relative_tolerance,
+                absolute_tolerance=golden_absolute_tolerance,
+            )
+
+            # KV cache metrics validation
+            print(
+                f"Validating {len(kv_cache_metrics)} KV cache metrics against GPU-specific ranges..."
+            )
+            validate_kv_cache_metrics_dynamic(kv_cache_metrics, expected_metrics)
+
+            print("=== ALL TESTS PASSED ===")
+            print(f"Performance: ✅ {autodeploy_tokens_per_sec:.2f} tokens/sec/user within bounds")
+            print("KV Cache Metrics: ✅ All metrics within GPU-specific expected ranges")
+
+        else:
+            raise ValueError(
+                f"Invalid comparison_mode: {comparison_mode}. Must be 'backend' or 'golden'"
+            )
+
+
+def test_trtllm_bench_backend_comparison(llm_root):  # noqa: F811
+    """Test that compares autodeploy backend performance against pytorch backend."""
+    trtllm_bench_unified_comparison(llm_root, comparison_mode="backend")
+
+
+def test_trtllm_bench_perf_golden_comparison(llm_root):  # noqa: F811
+    """Test that runs the autodeploy backend and compares performance + memory to golden values."""
+    trtllm_bench_unified_comparison(llm_root, comparison_mode="golden")
