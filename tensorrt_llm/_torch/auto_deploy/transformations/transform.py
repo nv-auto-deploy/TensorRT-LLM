@@ -96,7 +96,7 @@ class InferenceOptimizer:
         optimize_rope(egm)
 
         sharding_config = ShardingConfig(local_rank, world_size, self.factory.get_sharding_config())
-        self.ad_config.use_sharding_from_config = False
+        # self.ad_config.use_sharding_from_config = False
         if (
             self.ad_config.use_sharding_from_config
             and sharding_config.predefined_config is not None
