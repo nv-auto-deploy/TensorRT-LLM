@@ -1,9 +1,8 @@
 from collections import defaultdict
 from functools import partial
-from typing import Any, Dict, Tuple, Type
+from typing import Dict, Tuple
 
 import torch.nn as nn
-from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
@@ -22,7 +21,7 @@ from ...utils.quantization_utils import (
     remove_output_quantizers,
     should_skip_quantization,
 )
-from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
+from ..interface import BaseTransform, TransformInfo, TransformRegistry
 
 
 def _insert_quantized_linear(
@@ -167,31 +166,27 @@ def _insert_quantized_bmm(
     node.args = (*node.args, *scale_values)
 
 
-class QuantizationConfig(TransformConfig):
-    """Configuration for the quantization transform."""
-
-    quant_config: Dict[str, Any] = Field(
-        description="Quantization configuration with quant_algo and optioanlly exclude_modules"
-    )
-
-
 @TransformRegistry.register("quantize")
 class Quantization(BaseTransform):
     """Quantize the GraphModule and replace linear/BMM with quantized linear/BMM."""
-
-    config: QuantizationConfig
-
-    @classmethod
-    def get_config_class(cls) -> Type[TransformConfig]:
-        return QuantizationConfig
 
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
     ) -> Tuple[GraphModule, TransformInfo]:
         # extract info from quant_config
+        quant_config = factory.get_quant_config()
+        if not quant_config:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
         is_quant_graph = is_quantized_graph(gm)
-        quant_algo = self.config.quant_config.get("quant_algo")
-        excluded_patterns = self.config.quant_config.get("exclude_modules", [])
+        quant_algo = quant_config.get("quant_algo")
+        excluded_patterns = quant_config.get("exclude_modules", [])
+        if not quant_algo:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
 
         # no quantization to do
         if not (is_quant_graph or quant_algo):

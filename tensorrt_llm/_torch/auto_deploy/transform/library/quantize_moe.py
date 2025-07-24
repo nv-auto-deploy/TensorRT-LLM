@@ -1,16 +1,15 @@
 from functools import partial
-from typing import Any, Callable, Dict, List, Tuple, Type
+from typing import Callable, List, Tuple
 
 import torch
 import torch.nn as nn
-from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
 from ...utils.quantization_utils import QuantizationImpl, should_skip_quantization
-from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
+from ..interface import BaseTransform, TransformInfo, TransformRegistry
 
 quantized_moe_op_map = {
     "FP8": torch.ops.auto_deploy.torch_quant_fp8_moe,
@@ -132,14 +131,6 @@ def _extract_moe_weight_param_lists(moe_node: Node) -> Tuple[List[str], List[str
     return w1_names, w2_names, w3_names
 
 
-class QuantizationConfig(TransformConfig):
-    """Configuration for the quantization transform."""
-
-    quant_config: Dict[str, Any] = Field(
-        description="Quantization configuration with quant_algo and optioanlly exclude_modules"
-    )
-
-
 @TransformRegistry.register("quantize_moe")
 class QuantizeMOE(BaseTransform):
     """
@@ -147,21 +138,17 @@ class QuantizeMOE(BaseTransform):
     quantized version using the quant_algo from quant_config.
     """
 
-    config: QuantizationConfig
-
-    @classmethod
-    def get_config_class(cls) -> Type[TransformConfig]:
-        return QuantizationConfig
-
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
     ) -> Tuple[GraphModule, TransformInfo]:
-        quant_algo = self.config.quant_config.get("quant_algo")
-        if not quant_algo:
+        quant_config = factory.get_quant_config()
+        quant_algo = quant_config.get("quant_algo") if quant_config else None
+
+        if not quant_config or not quant_algo:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
-        excluded_patterns = self.config.quant_config.get("exclude_modules", [])
+        excluded_patterns = quant_config.get("exclude_modules", [])
 
         quant_impl = QuantizationImpl.create(quant_algo)
         quantized_op = quantized_moe_op_map[quant_algo]

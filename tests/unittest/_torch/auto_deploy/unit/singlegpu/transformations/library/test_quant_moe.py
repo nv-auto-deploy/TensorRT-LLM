@@ -5,8 +5,25 @@ from _model_test_utils import MoEOpModel
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+
+
+class DummyFactory(ModelFactory):
+    """Dummy factory to pass quant_config for testing."""
+
+    def __init__(self, quant_config):
+        self.quant_config = quant_config
+
+    def _build_model(self, device: str):
+        return
+
+    def _load_checkpoint(self, model, device):
+        return
+
+    def get_quant_config(self):
+        return self.quant_config
 
 
 @pytest.mark.parametrize(
@@ -65,11 +82,10 @@ def test_quantize_moe_transformation(quant_algo, expected_op):
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
     gm_transformed = InferenceOptimizer(
-        None,
+        DummyFactory(quant_config),
         {
             "quantize_moe": {
                 "stage": "pattern_matcher",
-                "quant_config": quant_config,
             },
         },
     )(None, gm)

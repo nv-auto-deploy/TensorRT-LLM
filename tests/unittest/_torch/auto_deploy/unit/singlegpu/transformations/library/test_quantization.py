@@ -10,7 +10,7 @@ from _torch_test_utils import fp4_compatible, fp8_compatible
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.quant import QUANT_OPS
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transform.interface import InferenceOptimizerConfig
+from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp8_scale
@@ -20,13 +20,20 @@ def check_quantized(gm):
     return any(is_op(n, QUANT_OPS) for n in gm.graph.nodes)
 
 
-def _get_optimizer_config(quant_config) -> InferenceOptimizerConfig:
-    return {
-        "quantize": {
-            "stage": "pattern_matcher",
-            "quant_config": quant_config,
-        },
-    }
+class DummyFactory(ModelFactory):
+    """Dummy factory to pass quant_config for testing."""
+
+    def __init__(self, quant_config):
+        self.quant_config = quant_config
+
+    def _build_model(self, device: str):
+        return
+
+    def _load_checkpoint(self, model, device):
+        return
+
+    def get_quant_config(self):
+        return self.quant_config
 
 
 @pytest.mark.parametrize(
@@ -63,7 +70,14 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
         )
     # set up sequence+cache objects
     gm = torch_export_to_gm(model, args=(x,), clone=True)
-    gm_transformed = InferenceOptimizer(None, _get_optimizer_config(quant_config))(None, gm)
+    gm_transformed = InferenceOptimizer(
+        DummyFactory(quant_config),
+        {
+            "quantize": {
+                "stage": "pattern_matcher",
+            },
+        },
+    )(None, gm)
     gm_transformed.to("cuda")
 
     run_test_transformed_gm(
@@ -138,7 +152,14 @@ def test_bmm_quantization(quant_config, atol, rtol, num_p_og, model_class):
 
     # set up sequence+cache objects
     gm = torch_export_to_gm(model, args=(x,), clone=True)
-    gm_transformed = InferenceOptimizer(None, _get_optimizer_config(quant_config))(None, gm)
+    gm_transformed = InferenceOptimizer(
+        DummyFactory(quant_config),
+        {
+            "quantize": {
+                "stage": "pattern_matcher",
+            },
+        },
+    )(None, gm)
     gm_transformed.to("cuda")
 
     run_test_transformed_gm(
