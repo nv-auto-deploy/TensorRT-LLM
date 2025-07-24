@@ -4,10 +4,10 @@ import operator
 from typing import Dict, Tuple, Type
 
 import torch
-from pydantic import ConfigDict, Field
+from pydantic import Field
 from torch.fx import Graph, GraphModule, Node
 
-from ...custom_ops.attention_interface import AttentionDescriptor, CacheConfig
+from ...custom_ops.attention_interface import AttentionDescriptor
 from ...distributed.common import all_gather_object, get_world_size
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
@@ -58,13 +58,9 @@ class UpdateInOutNodes(BaseTransform):
 class InsertCachedAttentionConfig(TransformConfig):
     """Configuration for the insert cached attention transform."""
 
-    # NOTE:type CacheConfig contains a torch.dtype not supported by pydantic. We set this to avoid error.
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
     attn_descriptor: Type[AttentionDescriptor] = Field(
         description="The attention descriptor to use."
     )
-    cache_config: CacheConfig = Field(description="The cache config to use.")
 
 
 @TransformRegistry.register("insert_cached_attention")
@@ -82,7 +78,7 @@ class InsertCachedAttention(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         """Replace uncached source attention node with corresponding cached attn node."""
         attn_descriptor = self.config.attn_descriptor
-        cache_config = self.config.cache_config
+        cache_config = factory.get_cache_config()
 
         # Get all attention nodes and their info objects
         source_op = attn_descriptor.get_source_attention_op()
