@@ -442,6 +442,7 @@ def print_kv_cache_metrics(kv_cache_metrics):
 
 
 def trtllm_bench_unified_comparison(
+    llm_root,  # noqa: F811
     comparison_mode="backend",
     free_mem_ratio=0.9,
     num_hidden_layers=10,
@@ -451,13 +452,14 @@ def trtllm_bench_unified_comparison(
     backend_absolute_tolerance=15.0,
     golden_relative_tolerance=0.1,
     golden_absolute_tolerance=5.0,
-):  # noqa: F811
+):
     """
     Unified test that compares autodeploy backend performance in two modes:
     - "backend": compares against pytorch backend performance
     - "golden": compares against predefined golden performance values
 
     Args:
+        llm_root: Root directory for LLM models (pytest fixture)
         comparison_mode: Either "backend" or "golden" to determine comparison type
         free_mem_ratio: Ratio of free memory to use for KV cache (default: 0.9)
         num_hidden_layers: Number of hidden layers for the model (default: 10)
