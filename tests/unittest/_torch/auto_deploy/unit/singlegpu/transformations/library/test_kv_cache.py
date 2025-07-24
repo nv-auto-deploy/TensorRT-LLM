@@ -2,19 +2,17 @@ from typing import Optional
 
 import pytest
 import torch
-from _graph_test_helpers import FakeFactory
+from _graph_test_helpers import FakeFactory, SequenceEmbeddingInfo
 from _model_test_utils import GQA
 from _torch_test_utils import all_close
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import CacheConfig, SequenceInfo
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import CacheConfig
 from tensorrt_llm._torch.auto_deploy.custom_ops.flashinfer_attention import FlashInferAttention
 from tensorrt_llm._torch.auto_deploy.custom_ops.triton_attention import TritonAttention
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.interface import InferenceOptimizerConfig
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.transformations.library import update_in_out_nodes
-from tensorrt_llm._torch.auto_deploy.transformations.library.kvcache import insert_cached_attention
 
 
 # Class that uses SDPA directly instead of the regular attention mechanism
@@ -68,7 +66,7 @@ class GQAWithSdpa(GQA):
         return self.o_proj(attn_output)
 
 
-def _get_optimizer_config() -> InferenceOptimizerConfig:
+def _get_optimizer_config(attn_descriptor, cache_config) -> InferenceOptimizerConfig:
     return {
         "build_model": {
             "stage": "factory",
@@ -86,22 +84,15 @@ def _get_optimizer_config() -> InferenceOptimizerConfig:
         "cleanup_input_constraints": {
             "stage": "post_export",
         },
+        "update_in_out_nodes": {
+            "stage": "cache_init",
+        },
+        "insert_cached_attention": {
+            "stage": "cache_init",
+            "attn_descriptor": attn_descriptor,
+            "cache_config": cache_config,
+        },
     }
-
-
-class SequenceEmbeddingInfo(SequenceInfo):
-    hidden_size: int
-    dtype: torch.dtype
-
-    def set_example_sequence(self) -> None:
-        super().set_example_sequence()
-        # set input ids to a 3D tensor (actually input embeddings)
-        self.input_ids = torch.rand(
-            *self.input_ids.shape,
-            self.hidden_size,
-            device=self.input_ids.device,
-            dtype=self.dtype,
-        )
 
 
 # TODO (lucaslie): consider rewriting this test with a custom InferenceOptimizer config
@@ -166,21 +157,13 @@ def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
     # Get the model's regular output
     y_model = model(x, position_ids)  # b, s, d
 
-    # run modular inference optimizer up to post_export
-    optimizer = InferenceOptimizer(factory, _get_optimizer_config())  # type: ignore
-    gm = optimizer(cm)
-
-    y_gm = gm(x, position_ids)
-    assert all_close(y_model, y_gm, atol=atol, rtol=rtol)
-
     # Set up cache configuration
     cache_config = CacheConfig()
 
-    # Get input node(s)
-    update_in_out_nodes(gm, cm)
-
     # Apply the transformation
-    insert_cached_attention(gm, cm, attn_descriptor=attn_descriptor, cache_config=cache_config)
+    optimizer = InferenceOptimizer(factory, _get_optimizer_config(attn_descriptor, cache_config))  # type: ignore
+    gm = optimizer(cm)
+
     gm.to("cuda")
     cm.initialize_caches()
 
