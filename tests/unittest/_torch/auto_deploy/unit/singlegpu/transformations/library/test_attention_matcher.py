@@ -161,7 +161,7 @@ class EagerAttentionModel(torch.nn.Module):
             # Multiplication pattern
             attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
 
-        # Add attention mask if enabled
+        # Add causal attention mask if enabled
         if self.has_mask:
             # [1, 1, seq_len, seq_len] causal mask with -inf in the upper triangle
             attn_mask = torch.triu(
@@ -362,8 +362,6 @@ class GroupedAttentionModel(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
-        device = x.device
-        dtype = x.dtype
 
         # Generate q, k, v
         q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -381,28 +379,26 @@ class GroupedAttentionModel(torch.nn.Module):
             v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, self.n_rep)
 
         # Create attention mask if needed
-        attn_mask = None
         if self.has_mask:
-            # Simple causal mask
-            mask = torch.triu(
-                torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
-                diagonal=1,
+            attn_output = torch.ops.auto_deploy.torch_attention_sdpa(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=self.dropout,
+                is_causal=True,
+                scale=1.0 / (self.head_dim**0.5),
             )
-            mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
-            attn_mask = torch.zeros(
-                (batch_size, 1, seq_len, seq_len), device=device, dtype=dtype
-            ).masked_fill(mask, float("-inf"))
-
-        # Apply scaled dot product attention
-        attn_output = torch.ops.auto_deploy.torch_attention_sdpa(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout,
-            is_causal=False,
-            scale=1.0 / (self.head_dim**0.5),
-        )
+        else:
+            attn_output = torch.ops.auto_deploy.torch_attention_sdpa(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=self.dropout,
+                is_causal=False,
+                scale=1.0 / (self.head_dim**0.5),
+            )
 
         # Reshape output for the linear projection
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -429,8 +425,91 @@ def _get_match_attention_optimizer() -> Callable:
     return _transform
 
 
-@pytest.mark.parametrize("has_mask", [True, False])
-@pytest.mark.parametrize("use_division", [False, True])
+@pytest.mark.parametrize("num_heads, num_kv_heads", [(8, 8), (8, 4), (8, 2)])
+@pytest.mark.parametrize(
+    "model_cls", [RepeatKVModel, RepeatKVModel2, RepeatKVModel3, HFRepeatKVModel]
+)
+@torch.inference_mode()
+def test_match_repeat_kv(num_heads, num_kv_heads, model_cls):
+    batch_size, seq_len = 4, 12
+    hidden_size = 512
+
+    model = model_cls(hidden_size, num_heads, num_kv_heads).to("cuda", dtype=torch.float16)
+    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
+    dynamic_shapes = model.get_dynamic_shapes()
+
+    # When num_heads == num_kv_heads, we don't expect any pattern match
+    # Otherwise, we should find 2 instances (one for k and one for v)
+    expected_matches = 0 if num_heads == num_kv_heads else 2
+
+    def verify_matcher(gm):
+        repeat_kv_nodes = [
+            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_repeat_kv)
+        ]
+
+        # Check that we have the expected number of replacements
+        if len(repeat_kv_nodes) != expected_matches:
+            return False
+
+        # If we don't expect any matches, we're done
+        if expected_matches == 0:
+            return True
+
+        # Otherwise, check the shape metadata of all repeat_kv nodes
+        for node in repeat_kv_nodes:
+            # Check input tensor metadata
+            input_tensor = node.args[0]
+            n_rep = node.args[1]
+
+            if "val" not in input_tensor.meta:
+                return False
+
+            input_shape = input_tensor.meta["val"].shape
+            output_shape = node.meta.get("val", None).shape if "val" in node.meta else None
+
+            # Input should be [batch, num_kv_heads, seq_len, head_dim]
+            if len(input_shape) != 4:
+                return False
+
+            batch, input_heads, input_seq, input_dim = input_shape
+
+            # Output should be [batch, num_heads, seq_len, head_dim]
+            # where num_heads = num_kv_heads * n_rep
+            if output_shape is None or len(output_shape) != 4:
+                return False
+
+            output_batch, output_heads, output_seq, output_dim = output_shape
+
+            # Check shapes are consistent
+            if (
+                output_batch != batch
+                or output_heads != input_heads * n_rep
+                or output_seq != input_seq
+                or output_dim != input_dim
+            ):
+                print(
+                    f"Expected shape {(batch, input_heads * n_rep, input_seq, input_dim)}, got {output_shape}"
+                )
+                return False
+
+        return True
+
+    _ = run_test(
+        model,
+        x,
+        _get_match_attention_optimizer(),
+        verify_matcher,
+        lambda num_p_og: num_p_og,
+        atol=1e-3,
+        rtol=1e-3,
+        test_load_hook=True,
+        strict_loading=True,
+        dynamic_shapes=dynamic_shapes,
+    )
+
+
+@pytest.mark.parametrize("has_mask", [False, True])
+@pytest.mark.parametrize("use_division", [True, False])
 @pytest.mark.parametrize(
     "dropout, skip_output_assert",
     [
@@ -556,13 +635,15 @@ def test_match_eager_attention(has_mask, use_division, dropout, skip_output_asse
 
             # Check mask handling for masked attention
             if has_mask:
-                has_mask_arg = "attn_mask" in kwargs
-                if not has_mask_arg and len(node.args) >= 4:
-                    has_mask_arg = node.args[3] is not None
+                is_causal = kwargs.get("is_causal", None)
+                if is_causal is None and len(node.args) >= 6:
+                    is_causal = node.args[5]
 
-                if not has_mask_arg:
-                    print("❌ Missing mask information in SDPA node")
+                if is_causal is not True:
+                    print(f"❌ Expected is_causal=True for masked attention, got {is_causal}")
                     valid = False
+                else:
+                    print("✅ is_causal correctly set to True")
 
         print("Graph verification successful" if valid else "Graph verification failed")
         return valid
@@ -658,16 +739,14 @@ def test_match_grouped_attention(num_heads, num_kv_heads, has_mask):
 
             # Mask handling should be preserved
             if has_mask:
-                # Check if attn_mask is in kwargs or provided via args
-                has_mask_arg = "attn_mask" in kwargs
-                if (
-                    not has_mask_arg and len(node.args) >= 4
-                ):  # Assuming attn_mask is the 4th positional arg
-                    has_mask_arg = node.args[3] is not None
+                is_causal = kwargs.get("is_causal", None)
+                if is_causal is None and len(node.args) >= 6:
+                    is_causal = node.args[5]
 
-                if not has_mask_arg:
-                    print("❌ Expected attn_mask in args or kwargs but not found")
-                    return False
+                if is_causal is not True:
+                    print(f"❌ Expected is_causal=True for masked attention, got {is_causal}")
+                else:
+                    print("✅ is_causal correctly set to True")
 
         return True
 
