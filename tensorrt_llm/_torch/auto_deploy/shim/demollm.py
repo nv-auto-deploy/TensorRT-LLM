@@ -45,7 +45,7 @@ class DemoEngine(ADEngine):
         self.queue.close()
         self.queue.join_thread()
 
-    def _assign_pages(self) -> List[List[int]]:
+    def _assign_pages(self, total_lens: List[int]) -> List[List[int]]:
         """A simple heuristic to assign pages based on current sequence info.
 
         In a nutshell, we will look at the following information to update the page assignments:
@@ -67,7 +67,6 @@ class DemoEngine(ADEngine):
         unassigned page if needed.
         """
         si = self.cache_seq_interface.info
-        total_lens = [s_l + i_p for s_l, i_p in zip(si.sequence_lengths, si.input_positions)]
         page_assignments = si.page_assignments
 
         free_pages = set(range(si.num_pages)) - {i for pages in page_assignments for i in pages}
@@ -76,7 +75,7 @@ class DemoEngine(ADEngine):
             extra_tokens = t_l - len(pages) * si.page_size
             num_extra_pages = (extra_tokens // si.page_size) + (extra_tokens > 0)
             updated_assignments.append(pages + [free_pages.pop() for _ in range(num_extra_pages)])
-        si.assign_cache_loc(updated_assignments)
+        return updated_assignments
 
     def generate_tokens_batched(
         self, requests: List[GenerationRequest]
@@ -94,7 +93,11 @@ class DemoEngine(ADEngine):
         # set up sequence info object
         sequence_info = self.cache_seq_interface.info
         sequence_info.reset()
-        sequence_info.nest_sequences([r.prompt_token_ids for r in requests])
+        total_lens = [len(r.prompt_token_ids) for r in requests]
+        sequence_info.nest_sequences(
+            input_ids=[r.prompt_token_ids for r in requests],
+            page_assignments=self._assign_pages(total_lens),
+        )
 
         # setup objects we want to track for the output
         batch_size = sequence_info.num_sequences
@@ -105,18 +108,21 @@ class DemoEngine(ADEngine):
         context_logits: Optional[List[torch.Tensor]] = None
 
         def _generate_single_step(idx: int):
-            # assign pages
-            self._assign_pages()
-
-            # get the logits and then last token logits in each sequence ([b, 1, vocab_size])
             logits = self._compute_logits()
             logits_last = torch.stack([l_one_seq[-1] for l_one_seq in logits]).float().unsqueeze(1)
 
             token_ids, _ = self._decode_tokens(logits_last, sampling_params)  # [b,1]
 
             # update sequence info accordingly for next step
-            sequence_info.update_pos(sequence_info.sequence_lengths)
-            sequence_info.nest_sequences(token_ids)
+            input_pos_next = sequence_info.input_positions
+            seq_lens_current = sequence_info.sequence_lengths
+            input_pos_next = [ip + sl for ip, sl in zip(input_pos_next, seq_lens_current)]
+            total_lens_next = [ip + len(t_ids) for ip, t_ids in zip(input_pos_next, token_ids)]
+            sequence_info.nest_sequences(
+                token_ids,
+                input_pos=input_pos_next,
+                page_assignments=self._assign_pages(total_lens_next),
+            )
 
             # nest new tokens and run stop check
             for b, (new_tokens_b, new_id) in enumerate(zip(new_tokens, token_ids)):
