@@ -31,15 +31,9 @@ def _apply_pattern(
     ad_logger.info(f"Found and matched {num_matches} {pattern_name} pattern(s)")
 
 
-def match_attention_pattern(gm: GraphModule) -> None:
+def match_repeat_kv(gm: GraphModule) -> None:
     """
-    Match and replace attention patterns in the graph.
-
-    This transformation detects both eager (ungrouped) and grouped attention patterns,
-    and replaces them with `torch.ops.auto_deploy.torch_attention_grouped_sdpa`.
-
-    Only causal attention masks are supported: `is_causal` is set to True and
-    `attn_mask` to None if an attention mask is detected.
+    Match and replace the repeat_kv pattern with torch.ops.auto_deploy.torch_attention_repeat_kv.
     """
 
     def register_repeat_kv(patterns: ADPatternMatcherPass):
@@ -59,9 +53,26 @@ def match_attention_pattern(gm: GraphModule) -> None:
             scalar_workaround={"n_rep": dummy_args[1]},
         )
 
+    _apply_pattern(gm, "Repeat KV", register_repeat_kv, shape_prop=True)
+
+
+def match_eager_attention(gm: GraphModule) -> None:
+    """
+    Match and replace the eager attention pattern with torch.ops.auto_deploy.torch_attention_sdpa.
+    """
+
     def register_eager_attention(patterns: ADPatternMatcherPass):
         for pattern_config in _get_sfdp_patterns():
             register_ad_pattern(**pattern_config, patterns=patterns)
+
+    _apply_pattern(gm, "Eager Attention", register_eager_attention)
+
+
+def match_grouped_attention(gm: GraphModule) -> None:
+    """
+    Match and replace the grouped attention pattern with
+    torch.ops.auto_deploy.torch_attention_grouped_sdpa.
+    """
 
     def register_grouped_attention(patterns: ADPatternMatcherPass):
         q = torch.randn(8, 8, 16, 64, device="cuda", dtype=torch.float16)
@@ -110,8 +121,6 @@ def match_attention_pattern(gm: GraphModule) -> None:
             },
         )
 
-    _apply_pattern(gm, "Repeat KV", register_repeat_kv, shape_prop=True)
-    _apply_pattern(gm, "Eager Attention", register_eager_attention)
     _apply_pattern(gm, "Grouped Attention", register_grouped_attention)
 
 

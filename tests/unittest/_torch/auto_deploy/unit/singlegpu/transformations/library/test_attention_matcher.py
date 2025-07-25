@@ -10,7 +10,9 @@ from transformers.integrations.sdpa_attention import repeat_kv as hf_repeat_kv
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.transformations.library.attention import (
     match_attention_layout,
-    match_attention_pattern,
+    match_eager_attention,
+    match_grouped_attention,
+    match_repeat_kv,
 )
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
@@ -410,7 +412,7 @@ class GroupedAttentionModel(torch.nn.Module):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
 
 
-def _get_match_attention_optimizer() -> Callable:
+def _get_match_repeat_kv_optimizer() -> Callable:
     config = {
         "cleanup_noop_slice": {
             "stage": "post_export",
@@ -419,7 +421,37 @@ def _get_match_attention_optimizer() -> Callable:
 
     def _transform(gm: GraphModule) -> GraphModule:
         gm = InferenceOptimizer(None, config)(None, gm)
-        match_attention_pattern(gm)
+        match_repeat_kv(gm)
+        return gm
+
+    return _transform
+
+
+def _get_match_eager_attention_optimizer() -> Callable:
+    config = {
+        "cleanup_noop_slice": {
+            "stage": "post_export",
+        },
+    }
+
+    def _transform(gm: GraphModule) -> GraphModule:
+        gm = InferenceOptimizer(None, config)(None, gm)
+        match_eager_attention(gm)
+        return gm
+
+    return _transform
+
+
+def _get_match_grouped_attention_optimizer() -> Callable:
+    config = {
+        "cleanup_noop_slice": {
+            "stage": "post_export",
+        },
+    }
+
+    def _transform(gm: GraphModule) -> GraphModule:
+        gm = InferenceOptimizer(None, config)(None, gm)
+        match_grouped_attention(gm)
         return gm
 
     return _transform
@@ -497,7 +529,7 @@ def test_match_repeat_kv(num_heads, num_kv_heads, model_cls):
     _ = run_test(
         model,
         x,
-        _get_match_attention_optimizer(),
+        _get_match_repeat_kv_optimizer(),
         verify_matcher,
         lambda num_p_og: num_p_og,
         atol=1e-3,
@@ -563,11 +595,9 @@ def test_match_eager_attention(has_mask, use_division, dropout, skip_output_asse
     expected_matches = 1
 
     def verify_matcher(gm):
-        # torch_attention_sdpa is replaced with torch_attention_grouped_sdpa after the transformation
+        # torch_attention_sdpa is replaced with torch_attention_sdpa after the transformation
         sdpa_nodes = [
-            n
-            for n in gm.graph.nodes
-            if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
+            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_sdpa)
         ]
 
         # Check that we have the expected number of replacements
@@ -652,7 +682,7 @@ def test_match_eager_attention(has_mask, use_division, dropout, skip_output_asse
     run_test(
         model,
         x,
-        _get_match_attention_optimizer(),
+        _get_match_eager_attention_optimizer(),
         verify_matcher,
         lambda num_p_og: num_p_og,
         atol=1e-3,
@@ -686,7 +716,7 @@ def test_counter_example():
     _ = run_test(
         model,
         x,
-        _get_match_attention_optimizer(),
+        _get_match_eager_attention_optimizer(),
         verify_no_matches,
         lambda num_p_og: num_p_og,
         atol=1e-3,
@@ -754,7 +784,7 @@ def test_match_grouped_attention(num_heads, num_kv_heads, has_mask):
     _ = run_test(
         model,
         x,
-        _get_match_attention_optimizer(),
+        _get_match_grouped_attention_optimizer(),
         verify_matcher,
         lambda num_p_og: num_p_og,
         atol=1e-3,
