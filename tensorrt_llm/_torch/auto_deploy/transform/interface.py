@@ -242,8 +242,11 @@ class BaseTransform(ABC):
                 gm, info = self._apply(gm, cm, factory)
 
             # we cannot say it's clean if the previous wasn't clean even if this one is
-            info.is_clean = info.is_clean and is_clean_pre
-            info.has_valid_shapes = info.has_valid_shapes and has_valid_shapes_pre
+            # create new info object with updated cleanup status
+            info_dict = info.model_dump()
+            info_dict["is_clean"] &= is_clean_pre
+            info_dict["has_valid_shapes"] &= has_valid_shapes_pre
+            info = TransformInfo(**info_dict)
 
             # run graph post-cleanup
             info = self._run_post_cleanup(gm, info)
