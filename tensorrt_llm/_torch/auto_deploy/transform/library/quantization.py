@@ -188,7 +188,6 @@ class Quantization(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-
         # tracking quantized operations in the graph
         quantized_nodes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         for n in gm.graph.nodes:
