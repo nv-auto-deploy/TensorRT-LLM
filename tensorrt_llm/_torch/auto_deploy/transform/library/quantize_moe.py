@@ -173,7 +173,7 @@ class QuantizeMOE(BaseTransform):
             )
 
         info = TransformInfo(
-            skipped=False, num_matches=count, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=count, is_clean=False, has_valid_shapes=False
         )
 
         return gm, info
