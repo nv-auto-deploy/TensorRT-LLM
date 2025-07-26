@@ -144,6 +144,6 @@ class FuseGemms(BaseTransform):
         torch.cuda.empty_cache()
 
         info = TransformInfo(
-            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
         )
         return gm, info

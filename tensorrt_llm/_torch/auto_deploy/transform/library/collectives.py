@@ -66,7 +66,6 @@ class FuseCollectives(BaseTransform):
             gm.graph.erase_node(parent_node)
             num_gemm_collective_fusions += 1
 
-        # TODO:(hg) confirm this
         info = TransformInfo(
             skipped=False,
             num_matches=num_gemm_collective_fusions,
@@ -190,7 +189,6 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             if is_op(node, torch.ops.auto_deploy.torch_dist_all_reduce):
                 trace_and_fuse(allreduce_node=node, graph=gm.graph)
 
-        # TODO:(hg) confirm this
         info = TransformInfo(
             skipped=False, num_matches=num_ar_r_rms_fusions, is_clean=False, has_valid_shapes=False
         )
