@@ -1,4 +1,3 @@
-# TODO: move to utils folder?
 """
 Quantization Config Reader Registry.
 
@@ -10,7 +9,7 @@ quantization producers by delegating parsing logic to dedicated subclasses.
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Optional, Type
+from typing import Any, Callable, Dict, Optional, Tuple, Type
 
 import torch
 
@@ -51,15 +50,6 @@ class QuantConfigReader(ABC):
 
         Returns:
             An initialized QuantConfigReader instance, or None if the file doesn't exist.
-        """
-        pass
-
-    def postprocess(cls, factory):
-        """
-        Optional postprocessing hook after loading quant config.
-
-        Args:
-            factory: The model factory instance that owns the config.
         """
         pass
 
@@ -107,24 +97,26 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
         return self._quant_config
 
     @classmethod
-    def from_file(cls, file_path: str) -> Optional["ModelOPTQuantConfigReader"]:
+    def from_file(
+        cls, ckpt_dir: str
+    ) -> Optional[Tuple["ModelOPTQuantConfigReader", Optional[torch.dtype]]]:
         """
-        Load and parse a modelopt-style quantization config JSON file.
+        Load and parse a modelopt-style quantization config from a checkpoint directory.
 
         Args:
-            file_path: Path to the quant config file.
+            ckpt_dir: Path to the root directory containing the checkpoint.
 
         Returns:
             An initialized ModelOPTQuantConfigReader instance, or None if the file doesn't exist.
         """
-        if not os.path.exists(file_path):
+        quant_file = os.path.join(ckpt_dir, "hf_quant_config.json")
+        if not os.path.exists(quant_file):
             return None
 
-        with open(file_path, "r") as f:
+        with open(quant_file, "r") as f:
             raw = json.load(f)
 
         producer = raw.get("producer", {}).get("name")
-
         # sanity check
         if producer != "modelopt":
             raise ValueError(f"Expected producer 'modelopt', got '{producer}'")
@@ -132,11 +124,7 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
         quant_config = raw.get("quantization", {})
         reader = cls()
         reader.read_config(quant_config)
-        return reader
-
-    def postprocess(self, factory):
-        """
-        Modify the factory based on the loaded quant config.
-        """
-        if self._quant_config and "torch_dtype" in self._quant_config:
-            factory.model_kwargs["torch_dtype"] = getattr(torch, self._quant_config["torch_dtype"])
+        extra_model_kwargs: Dict[str, Any] = {}
+        if quant_config and quant_config.get("quant_algo", None) == "NVFP4":
+            extra_model_kwargs["torch_dtype"] = "float16"
+        return reader, extra_model_kwargs

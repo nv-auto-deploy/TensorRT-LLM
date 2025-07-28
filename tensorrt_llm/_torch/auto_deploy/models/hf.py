@@ -173,6 +173,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         model.forward = types.MethodType(self._simple_forward, model)
 
         model.eval()
+
         return model
 
     def get_quant_config(self) -> Dict:
@@ -322,13 +323,16 @@ class AutoModelForCausalLMFactory(ModelFactory):
         """Load the quantization config from the model directory if not done already."""
         if self._quant_config_reader is not None:
             return
-        quant_file = os.path.join(fetched_dir, "hf_quant_config.json")
         # TODO: specified by user or auto-detect
         reader_cls = QuantConfigReaderRegistry.get("modelopt")
-        reader = reader_cls().from_file(quant_file)
+        result = reader_cls.from_file(fetched_dir)
+        if result is None:
+            return
+        reader, extra_model_kwargs = result
+
         if reader is not None:
             self._quant_config_reader = reader
-            reader.postprocess(self)
+            self.model_kwargs = deep_merge_dicts(self.model_kwargs, extra_model_kwargs)
 
 
 @ModelFactoryRegistry.register("AutoModelForImageTextToText")
