@@ -1,4 +1,3 @@
-from itertools import chain
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
@@ -166,45 +165,45 @@ class ADEngine(ModelEngine):
         # requests in order of context, generate
         context_requests = scheduled_requests.context_requests
         gen_requests = [r for r in scheduled_requests.generation_requests if not r.draft_tokens]
-
+        num_all_requests = len(context_requests) + len(gen_requests)
         # info to be extracted
-        input_ids: List[List[int]] = []
-        input_pos: List[int] = []
-        last_logit_only: List[bool] = []
-        page_assignments: List[List[int]] = []
+        input_ids: List[List[int]] = [
+            [-1]
+        ] * num_all_requests  # init for the common case of valid generation requests
+        input_pos: List[int] = [None] * num_all_requests
+        last_logit_only: List[bool] = [True] * len(context_requests) + [False] * len(gen_requests)
+        page_assignments: List[List[int]] = [None] * num_all_requests
         previous_batch_indices: List[int] = []
-        # look at context requests first
-        for request in context_requests:
-            # store input ids and pos of first token in sequence
-            input_ids.append(request.get_tokens(0))
-            input_pos.append(request.context_current_position)
 
-            request.py_batch_idx = request.seq_slot
-            last_logit_only.append(True)
+        idx = 0  # running index for all requests
+        with nvtx_range("ad_prepare_context"):
+            # look at context requests first
+            for request in context_requests:
+                # store input ids and pos of first token in sequence
+                input_ids[idx] = request.get_tokens(0)
+                input_pos[idx] = request.context_current_position
 
-        # look at generate requests next
-        # TODO: we should also handle extend requests (for speculative decoding) here
-        for request in gen_requests:
-            # new_tokens are provided when the overlap scheduler is enabled.
-            if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
-                input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
-                input_pos.append(request.max_beam_num_tokens - 1)
-            else:
-                # insert a dummy token to indicate the new tokens
-                input_ids.append([-1])
-                previous_batch_indices.append(request.py_batch_idx)
-                input_pos.append(request.max_beam_num_tokens)
+                request.py_batch_idx = request.seq_slot
+                cache_indices = kv_cache_manager.get_cache_indices(request)
+                page_assignments[idx] = cache_indices
+                idx += 1
 
-            request.py_batch_idx = request.seq_slot
+        with nvtx_range("ad_prepare_gen"):
+            # look at generate requests next
+            # TODO: we should also handle extend requests (for speculative decoding) here
+            for request in gen_requests:
+                # new_tokens are provided when the overlap scheduler is enabled.
+                if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
+                    input_ids[idx] = [request.get_token(0, request.get_num_tokens(0) - 1)]
+                    input_pos[idx] = request.max_beam_num_tokens - 1
+                else:
+                    previous_batch_indices.append(request.py_batch_idx)
+                    input_pos[idx] = request.max_beam_num_tokens
+                request.py_batch_idx = request.seq_slot
+                cache_indices = kv_cache_manager.get_cache_indices(request)
+                page_assignments[idx] = cache_indices
+                idx += 1
 
-            # return all logits
-            last_logit_only.append(False)
-
-        # extract cache information for all requests
-        for request in chain(context_requests, gen_requests):
-            # get cache indices
-            cache_indices = kv_cache_manager.get_cache_indices(request)
-            page_assignments.append(cache_indices)
         # update the sequence info object now
         si = self.cache_seq_interface.info
         si.nest_sequences(input_ids, previous_batch_indices, new_tokens)

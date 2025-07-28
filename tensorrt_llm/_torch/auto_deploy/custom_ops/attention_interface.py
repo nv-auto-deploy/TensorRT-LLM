@@ -17,7 +17,9 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.export import Dim
 from torch.fx import Node
+
 from tensorrt_llm._utils import nvtx_range
+
 
 @dataclass
 class CacheConfig:
@@ -389,7 +391,9 @@ class SequenceInfo:
             for in_pos, seq_len in zip(self.input_positions, self.sequence_lengths)
             for num in range(in_pos, in_pos + seq_len)
         ]
-        self.position_ids = torch.tensor(position_ids_list, dtype=torch.long, pin_memory=True).to(self.device)
+        self.position_ids = torch.tensor(position_ids_list, dtype=torch.long, pin_memory=True).to(
+            self.device
+        )
 
         # use [b,1] shape to indicate generate-only batch, otherwise use [1,total_len]
         if self.is_generate:
@@ -398,7 +402,12 @@ class SequenceInfo:
             self.position_ids = self.position_ids.view(1, -1)
 
     @nvtx_range("ad_nest_sequences")
-    def nest_sequences(self, input_ids: Sequence[Sequence[int]], previous_batch_indices: List[int] = [], new_tokens: Optional[torch.Tensor] = None) -> None:
+    def nest_sequences(
+        self,
+        input_ids: Sequence[Sequence[int]],
+        previous_batch_indices: List[int] = [],
+        new_tokens: Optional[torch.Tensor] = None,
+    ) -> None:
         """Create and store a flattened list of input_ids from the provided list of sequences.
 
         This i/f will also update any relevant sequence information.
@@ -417,8 +426,8 @@ class SequenceInfo:
         ]
         self.input_ids = torch.tensor(ids_list, dtype=dtype, pin_memory=True).to(self.device)
         if new_tokens is not None:
-            self.input_ids[self.input_ids == -1] = new_tokens[0,previous_batch_indices,0]
-        
+            self.input_ids[self.input_ids == -1] = new_tokens[0, previous_batch_indices, 0]
+
         # set derivative properties
         self._sequence_lengths = seq_lens
 
@@ -457,7 +466,9 @@ class SequenceInfo:
     def assign_cache_loc(self, page_assignments: Sequence[Sequence[int]]) -> None:
         """Set the cache location and pages_per_seq tensors from page assignments."""
         cache_loc_flat = torch.tensor(
-            [p_idx for pages in page_assignments for p_idx in pages], dtype=torch.int, pin_memory=True
+            [p_idx for pages in page_assignments for p_idx in pages],
+            dtype=torch.int,
+            pin_memory=True,
         )
         self.cache_loc[: len(cache_loc_flat)].copy_(cache_loc_flat, non_blocking=True)
 
