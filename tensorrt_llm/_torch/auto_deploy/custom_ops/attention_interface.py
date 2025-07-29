@@ -128,8 +128,12 @@ class SequenceInfo:
         )
         # Ensure that the device is set before initializing the tensors.
         # Need to allocated input_ids and position_ids on the GPUs to avoid overheads of tensor creation in every forward pass.s\
-        self.input_ids = torch.ones(self.max_num_tokens, dtype=torch.int, device=self.device)
-        self.position_ids = torch.zeros(self.max_num_tokens, dtype=torch.long, device=self.device)
+        self.input_ids = torch.ones(self.max_batch_size, dtype=torch.int, device=self.device)
+        self.input_ids_cuda = torch.ones(self.max_num_tokens, dtype=torch.int, device=self.device)
+
+        self.position_ids = torch.zeros(self.max_batch_size, dtype=torch.long, device=self.device)
+        self.position_ids_cuda = torch.zeros(self.max_num_tokens, dtype=torch.long, device=self.device)
+
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int, device=self.device)
         self.input_pos = torch.empty_like(self.seq_len, device=self.device)
         self.cache_loc = torch.empty(self.num_pages, dtype=torch.int, device=self.device)
@@ -163,13 +167,7 @@ class SequenceInfo:
                 val = getattr(self, f.name)
                 if not isinstance(val, torch.Tensor):
                     continue
-                # if it's input_ids or position_ids and has a singleton dim,
-                # do an async reshape-slice-reshape
-                if f.name in ("input_ids", "position_ids") and any(s == 1 for s in val.shape):
-                    truncated = val.flatten()[: self.num_tokens]     
-                    args.append(self.maybe_reshape_for_generate(truncated))
-                else:
-                    args.append(val)
+                args.append(val)
                 if len(args) >= self._num_uncached_attn_args and not self._is_cached_attn:
                     break
                 
@@ -474,7 +472,7 @@ class SequenceInfo:
                      previous_batch_indices: List[int] = [],
                      num_tokens: int = 0) -> None:
         # 1) flatten once
-        flat = self.input_ids.flatten()
+        flat = self.input_ids_cuda.flatten()
 
         # 2) copy across your prefix tokens asynchronously
         flat[:num_tokens].copy_(input_ids_host, non_blocking=True)
@@ -496,7 +494,8 @@ class SequenceInfo:
             flat.masked_scatter_(flat == -1, src)
 
         # 4) reshape back
-        self.input_ids = self.maybe_reshape_for_generate(flat)
+        self.input_ids = flat[:num_tokens]
+        self.input_ids = self.maybe_reshape_for_generate(self.input_ids)
 
 
         
