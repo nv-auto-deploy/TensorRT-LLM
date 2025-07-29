@@ -212,6 +212,7 @@ class ADEngine(ModelEngine):
         # update the sequence info object now
         si = self.cache_seq_interface.info
         seq_lens = [len(ids) for ids in input_ids]
+        num_tokens = sum(seq_lens)
         si.update_sequence_lengths(seq_lens)
         si.assign_cache_loc(page_assignments)   
 
@@ -225,8 +226,9 @@ class ADEngine(ModelEngine):
         @nvtx_range("ad_update_position_ids")
         def update_position_ids(position_ids_list):
             position_ids_host = torch.tensor(position_ids_list, dtype=torch.long, pin_memory=True)
-            si.position_ids = si.position_ids.flatten()
-            si.position_ids[:len(position_ids_list)].copy_(position_ids_host, non_blocking=True)
+            si.position_ids_cuda = si.position_ids_cuda.flatten()
+            si.position_ids_cuda[:len(position_ids_list)].copy_(position_ids_host, non_blocking=True)
+            si.position_ids = si.position_ids_cuda[:num_tokens]
             si.position_ids = si.maybe_reshape_for_generate(si.position_ids)
         
         update_position_ids(position_ids_list)
@@ -235,7 +237,6 @@ class ADEngine(ModelEngine):
         
         @nvtx_range("ad_update_input_ids")
         def update_input_ids(input_ids_host, new_tokens, previous_batch_indices):
-            num_tokens = sum(seq_lens)
             si.update_input_ids(input_ids_host, new_tokens, previous_batch_indices, num_tokens)
             
         update_input_ids(input_ids_host, new_tokens, previous_batch_indices)
