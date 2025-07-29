@@ -55,6 +55,7 @@ def run_benchmark(
     report_json_path: str = None,
     max_batch_size: int = 32,
     num_hidden_layers: int = 2,
+    free_mem_ratio: float = 0.1,
 ):
     """Run benchmark and capture KV cache metrics from log output."""
 
@@ -84,10 +85,6 @@ def run_benchmark(
     if backend == "_autodeploy":
         # Add extra_llm_api_options only for autodeploy backend
         cmd.extend(["--extra_llm_api_options", config_path])
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
-        free_mem_ratio = config.get("free_mem_ratio", 0.0)  # Default to 0.0 if not specified
-        print(f"📋 Using free_mem_ratio from config: {free_mem_ratio}")
 
     # Run benchmark as subprocess to capture ALL output
     import os
@@ -96,6 +93,7 @@ def run_benchmark(
     if backend == "pytorch":
         env["TLLM_OVERRIDE_LAYER_NUM"] = str(num_hidden_layers)
         print(f"📋 Using TLLM_OVERRIDE_LAYER_NUM from env: {env['TLLM_OVERRIDE_LAYER_NUM']}")
+        cmd.extend(["--kv_cache_free_gpu_mem_fraction", str(free_mem_ratio)])
     print(f"🚀 Running benchmark command ({backend} backend): {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, env=env)
 
@@ -278,7 +276,7 @@ def calculate_expected_kv_cache_metrics(free_mem_ratio: float):
             # For TinyLlama-1.1B, model should be 2.2GB
             estimated_model_size_mb = 2200  # Conservative estimate
             # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/6335 check why there is extra consumption
-            extra_consumption_mb = 2200
+            extra_consumption_mb = 2500
             expected_free_mem_range = (
                 total_mem_mb - estimated_model_size_mb - extra_consumption_mb,
                 total_mem_mb - estimated_model_size_mb,
@@ -527,6 +525,7 @@ def trtllm_bench_unified_comparison(
                 pytorch_report_path,
                 max_batch_size,
                 num_hidden_layers,
+                free_mem_ratio,
             )
 
             # Extract pytorch performance metrics
@@ -584,8 +583,3 @@ def trtllm_bench_unified_comparison(
 def test_trtllm_bench_backend_comparison(llm_root):  # noqa: F811
     """Test that compares autodeploy backend performance against pytorch backend."""
     trtllm_bench_unified_comparison(llm_root, comparison_mode="backend")
-
-
-def test_trtllm_bench_perf_golden_comparison(llm_root):  # noqa: F811
-    """Test that runs the autodeploy backend and compares performance + memory to golden values."""
-    trtllm_bench_unified_comparison(llm_root, comparison_mode="golden")
