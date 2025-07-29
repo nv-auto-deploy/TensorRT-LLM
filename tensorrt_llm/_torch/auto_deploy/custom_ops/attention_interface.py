@@ -130,11 +130,14 @@ class SequenceInfo:
         # Need to allocated input_ids and position_ids on the GPUs to avoid overheads of tensor creation in every forward pass.s\
         self.input_ids = torch.ones(self.max_num_tokens, dtype=torch.int, device=self.device)
         self.position_ids = torch.zeros(self.max_num_tokens, dtype=torch.long, device=self.device)
-        self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
-        self.input_pos = torch.empty_like(self.seq_len)
+        self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int, device=self.device)
+        self.input_pos = torch.empty_like(self.seq_len, device=self.device)
         self.cache_loc = torch.empty(self.num_pages, dtype=torch.int, device=self.device)
         self.pages_per_seq = torch.empty_like(self.seq_len, device=self.device)
         self.num_tokens = torch.empty(1, dtype=torch.int, device=self.device)
+        self.previous_batch_indices_cuda = torch.empty(self.max_num_tokens,
+                                                       dtype=torch.long,
+                                                       device=self.device)
         assert self.num_pages >= self.max_batch_size, (
             "num_pages must be greater than max_batch_size"
         )
@@ -158,12 +161,14 @@ class SequenceInfo:
             args = []
             for f in fields(self):
                 val = getattr(self, f.name)
-                if isinstance(val, torch.Tensor):
-                    if f.name == "input_ids" or f.name == "position_ids":
-                        shape = val.shape
-                        if any(s == 1 for s in shape):
-                            val = val.flatten()[:self.num_tokens]
-                            val = self.maybe_reshape_for_generate(val)
+                if not isinstance(val, torch.Tensor):
+                    continue
+                # if it's input_ids or position_ids and has a singleton dim,
+                # do an async reshape-slice-reshape
+                if f.name in ("input_ids", "position_ids") and any(s == 1 for s in val.shape):
+                    truncated = val.flatten()[: self.num_tokens]     
+                    args.append(self.maybe_reshape_for_generate(truncated))
+                else:
                     args.append(val)
                 if len(args) >= self._num_uncached_attn_args and not self._is_cached_attn:
                     break
@@ -449,12 +454,51 @@ class SequenceInfo:
         self.num_tokens.copy_(torch.tensor(sum(self._sequence_lengths), dtype=torch.int), non_blocking=True)
         self.seq_len[: len(self._sequence_lengths)].copy_(torch.tensor(self._sequence_lengths), non_blocking=True)
 
-    def update_input_ids(self, input_ids_host: torch.Tensor, new_tokens: Optional[torch.Tensor] = None, previous_batch_indices: List[int] = [], num_tokens: int = 0) -> None:
-        self.input_ids = self.input_ids.flatten()
-        self.input_ids[:num_tokens].copy_(input_ids_host, non_blocking=True)
-        if new_tokens is not None:
-            self.input_ids[self.input_ids == -1] = new_tokens[0,previous_batch_indices,0]
-        self.input_ids = self.maybe_reshape_for_generate(self.input_ids)
+    # def update_input_ids(self,
+    #                      input_ids_host: torch.Tensor,
+    #                      new_tokens: Optional[torch.Tensor] = None, 
+    #                      previous_batch_indices: List[int] = [], 
+    #                      num_tokens: int = 0) -> None:
+    #     previous_batch_indices_host = torch.tensor(previous_batch_indices, dtype=torch.int, pin_memory=True)
+    #     idx = self.previous_batch_indices_cuda[:len(previous_batch_indices)]
+    #     idx.copy_(previous_batch_indices_host, non_blocking=True)
+    #     self.input_ids = self.input_ids.flatten()
+    #     self.input_ids[:num_tokens].copy_(input_ids_host, non_blocking=True)
+    #     if new_tokens is not None:
+    #         self.input_ids[self.input_ids == -1] = new_tokens[0,idx,0]
+    #     self.input_ids = self.maybe_reshape_for_generate(self.input_ids)
+    
+    def update_input_ids(self,
+                     input_ids_host: torch.Tensor,
+                     new_tokens: Optional[torch.Tensor] = None,
+                     previous_batch_indices: List[int] = [],
+                     num_tokens: int = 0) -> None:
+        # 1) flatten once
+        flat = self.input_ids.flatten()
+
+        # 2) copy across your prefix tokens asynchronously
+        flat[:num_tokens].copy_(input_ids_host, non_blocking=True)
+
+        # 3) if you have new_tokens to inject:
+        if new_tokens is not None and previous_batch_indices:
+            # copy your indices to the GPU
+            host_idx = torch.tensor(previous_batch_indices, dtype=torch.int, pin_memory=True)
+            idx = self.previous_batch_indices_cuda[:len(previous_batch_indices)]
+            idx.copy_(host_idx, non_blocking=True)
+
+            # sort them so that masked_scatter_ lines up correctly
+            idx, _ = idx.sort()
+
+            # gather the exact values you want to write
+            src = new_tokens[0, idx, 0]
+
+            # in‐place fill every slot where flat == -1 with src, in order
+            flat.masked_scatter_(flat == -1, src)
+
+        # 4) reshape back
+        self.input_ids = self.maybe_reshape_for_generate(flat)
+
+
         
     @nvtx_range("ad_nest_sequences")
     def nest_sequences(self, 
