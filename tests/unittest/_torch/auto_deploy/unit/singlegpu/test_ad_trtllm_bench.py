@@ -580,6 +580,25 @@ def trtllm_bench_unified_comparison(
             )
 
 
+def test_trtllm_bench(llm_root):  # noqa: F811
+    model_name = _hf_model_dir_or_hub_id(
+        f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with open(f"{temp_dir}/extra_llm_api_options.yaml", "w") as f:
+            yaml.dump(
+                {
+                    "model_kwargs": {"num_hidden_layers": 2},
+                    "cuda_graph_batch_sizes": [1, 2],
+                },
+                f,
+            )
+
+        dataset_path = prepare_dataset(llm_root, temp_dir, model_name)
+        run_benchmark(model_name, dataset_path, temp_dir)
+
+
 def test_trtllm_bench_backend_comparison(llm_root):  # noqa: F811
     """Test that compares autodeploy backend performance against pytorch backend."""
     trtllm_bench_unified_comparison(llm_root, comparison_mode="backend")
