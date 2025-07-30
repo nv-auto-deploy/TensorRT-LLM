@@ -12,6 +12,7 @@ from accelerate import init_empty_weights, load_checkpoint_in_model
 from accelerate.utils import modeling
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
+from PIL import Image
 from torch._prims_common import DeviceLikeType
 from transformers import (
     AutoConfig,
@@ -393,6 +394,51 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
 
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:
         """Return a dictionary of example inputs for the model."""
+
+        def _prep_seq(text, img1, img2):
+            return [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img1},
+                        {"type": "image", "image": img2},
+                        {
+                            "type": "text",
+                            "text": text,
+                        },
+                    ],
+                },
+            ]
+
+        # Create a batch of conversations (batch_size = 2)
+        batch_messages = [
+            _prep_seq(
+                "Describe what you see in the two images and their differences.",
+                Image.new("RGB", (16, 16), color=(128, 128, 128)),
+                Image.new("RGB", (16, 16), color=(64, 64, 64)),
+            ),
+            _prep_seq(
+                "What are the main differences between these two images?",
+                Image.new("RGB", (16, 16), color=(255, 0, 0)),
+                Image.new("RGB", (16, 16), color=(0, 255, 0)),
+            ),
+        ]
+
+        processor = AutoProcessor.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+        inputs = processor.apply_chat_template(
+            batch_messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            padding=True,
+        )
+
+        return {
+            "input_ids": inputs["input_ids"],
+            "pixel_values": inputs["pixel_values"],
+        }
+
         # fmt: off
         input_ids = [[
             200000, 200005,   1556, 200006,    368, 200080, 200090, 200092, 200092,
