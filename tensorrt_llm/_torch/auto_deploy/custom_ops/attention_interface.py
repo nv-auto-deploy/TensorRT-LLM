@@ -50,7 +50,6 @@ class SequenceInfo:
     ### EXTRA ARGUMENTS PROVIDED TO THE INTERFACE ##################################################
     Those are extra arguments that can be provided to the interface and they are stored as follows:
     - _extra_args: dictionary of extra arguments with currently active values.
-    - _extra_example_inputs: dictionary of example inputs to the extra arguments.
     - _extra_none_inputs: dictionary of none inputs to the extra arguments.
       NOTE: we assume that extra arguments are *optional* arguments to the model. However, we
             cannot represent them via `None` since fx graphs require a fixed input type. Instead,
@@ -143,7 +142,6 @@ class SequenceInfo:
 
         # EXTRA TENSOR FIELDS
         self._extra_args: Dict[str, torch.Tensor] = {}
-        self._extra_example_inputs: Dict[str, torch.Tensor] = {}
         self._extra_none_inputs: Dict[str, torch.Tensor] = {}
         self._extra_dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
         self._extra_dynamic_shapes_callbacks: Dict[str, DynamicShapeCallback] = {}
@@ -359,7 +357,6 @@ class SequenceInfo:
                 d[k] = v.to(*args, **kwargs)
 
         _move_dict(self._extra_args)
-        _move_dict(self._extra_example_inputs)
         _move_dict(self._extra_none_inputs)
 
     def reset(self) -> None:
@@ -378,63 +375,26 @@ class SequenceInfo:
         self.cache_loc[:] = torch.arange(self.num_pages, dtype=torch.int, device=self.device)
         self.pages_per_seq.fill_(1)
 
-    def set_example_sequence(self) -> None:
+    def set_example_sequence(self, input_ids: Optional[torch.Tensor] = None, **kwargs) -> None:
         """Set an example sequence useful for testing and export purposes."""
         self.reset()
-        bs, seq_len = min(2, self.max_batch_size), min(4, self.max_seq_len)
-        input_ids = torch.ones(  # noqa
-            bs,
-            seq_len,
-            dtype=torch.int,
-            device=self.device,
+
+        # use a best guess default for input_ids if not provided
+        if input_ids is None:
+            bs, seq_len = min(2, self.max_batch_size), min(4, self.max_seq_len)
+            input_ids = torch.ones(
+                bs,
+                seq_len,
+                dtype=torch.int,
+                device=self.device,
+            )
+
+        # make sure that all extra arguments are provided
+        assert self._extra_args.keys() <= kwargs.keys(), (
+            f"Missing extra args: {self._extra_args.keys() - kwargs.keys()}"
         )
 
-        # TODO (lucaslie): seems we have hit a road block using generic example inputs for export
-        # with VLMs. We need to probably switch to having the factory provide an example input that
-        # is then being tokenized inside the factory.
-        # WHY: for VLMs we need to hit these special tokens representing images. No way we can do
-        # that with a generic example input.
-        # fmt: off
-        input_ids2 = [[
-            200000, 200005,   1556, 200006,    368, 200080, 200090, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200081, 200080,
-            200090, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200081,  74777,    290,   5326,     43, 200008, 200005, 140680,
-            200006,    368
-        ] for _ in range(2)]
-        # fmt: on
-
-        self.nest_sequences(input_ids2, **self._extra_example_inputs)
+        self.nest_sequences(input_ids, **kwargs)
 
     def set_max_num_tokens_sample(self) -> None:
         """Set an example sequence with max_num_tokens."""
@@ -626,7 +586,6 @@ class SequenceInfo:
     def add_extra_arg(
         self,
         name: str,
-        example_input: torch.Tensor,
         none_input: torch.Tensor,
         dynamic_shape_callback: Optional[DynamicShapeCallback] = None,
     ) -> None:
@@ -634,7 +593,6 @@ class SequenceInfo:
 
         Args:
             name: The name of the extra argument.
-            example_input: Example input value of the extra argument.
             none_input: None input value of the extra argument.
             dynamic_shape_callback: The callback to get the dynamic shape of the extra argument.
 
@@ -642,8 +600,7 @@ class SequenceInfo:
         """
         assert name not in self._named_args().keys(), f"Extra argument {name} already exists"
 
-        self._extra_args[name] = example_input.to(self.device)
-        self._extra_example_inputs[name] = example_input.to(self.device)
+        self._extra_args[name] = none_input.to(self.device)
         self._extra_none_inputs[name] = none_input.to(self.device)
 
         if dynamic_shape_callback is None:
