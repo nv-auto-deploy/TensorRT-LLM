@@ -118,7 +118,7 @@ endef
 DOCKER_RUN_OPTS ?= --rm -it --ipc=host --ulimit stack=67108864 $(if $(filter 0,$(IS_ROOTLESS)),--ulimit memlock=-1)
 DOCKER_RUN_ARGS   ?=
 # Check if NVIDIA_VISIBLE_DEVICES is set and not empty
-NVIDIA_VISIBLE_DEVICES_VAL = $(shell echo $$NVIDIA_VISIBLE_DEVICES)
+NVIDIA_VISIBLE_DEVICES_VAL = $(shell echo $$NV_GPU)
 ifeq ($(NVIDIA_VISIBLE_DEVICES_VAL),)
   # If empty or not set, use all GPUs
   GPU_OPTS ?= --gpus=all
@@ -147,17 +147,23 @@ ifeq ($(LOCAL_USER),1)
 	$(call add_local_user,$(IMAGE_WITH_TAG))
 endif
 	docker run $(DOCKER_RUN_OPTS) $(DOCKER_RUN_ARGS) \
+    		--network=host \
     		$(GPU_OPTS) \
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
     		$(if $(and $(filter 1,$(LOCAL_USER)),$(shell [ -w "$(USER_CACHE_DIR)" ] && echo 1)),--volume $(USER_CACHE_DIR):/home/$(USER_NAME)/.cache:rw) \
     		--env "CCACHE_DIR=$(CCACHE_DIR)" \
     		--env "CCACHE_BASEDIR=$(CODE_DIR)" \
     		--env "CONAN_HOME=$(CONAN_DIR)" \
+    		--env "HF_HOME=/home/scratch.williamz_gpu/code/trtc/builder/hf_cache" \
+    		--volume /home/scratch.trt_llm_data:/home/scratch.trt_llm_data \
+    		--volume /home/scratch.williamz_gpu:/home/scratch.williamz_gpu \
     		--workdir $(WORK_DIR) \
     		--hostname $(shell hostname)-$* \
     		--name $(CONTAINER_NAME)-$*-$(USER_NAME) \
     		--tmpfs /tmp:exec \
     		$(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX) $(RUN_CMD)
+    # 		$(if $(filter 1,$(LOCAL_USER)),--volume ${HOME_DIR}/.cache:/home/${USER_NAME}/.cache:rw) \
+    # 		--env TLLM_LLMAPI_BUILD_CACHE_ROOT=/home/scratch.williamz_gpu/trtllm_llmapi_cache \
 
 devel_%: STAGE = devel
 tritondevel_%: STAGE = tritondevel
