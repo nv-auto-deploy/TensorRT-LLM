@@ -96,6 +96,10 @@ class ModelFactory(ABC):
         """Returns the quantization config for this model or None if not quantized."""
         return {}
 
+    def get_sharding_config(self):
+        """Returns the sharding config for this model or None if not sharded."""
+        return {}
+
     def get_cache_config(self) -> CacheConfig:
         """Return the cache configuration for the model.
 

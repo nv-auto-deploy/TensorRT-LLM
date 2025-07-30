@@ -70,8 +70,8 @@ def _run_job(
         return num_params
 
     def transform_func(gm) -> None:
-        sharding_config = ShardingConfig()
-        detect_dp_bmm_shard(gm, rank, world_size, sharding_config)
+        sharding_config = ShardingConfig(rank, world_size)
+        detect_dp_bmm_shard(gm, sharding_config)
         sharding_transform_executor(gm, sharding_config)
 
     # now run the test
@@ -118,8 +118,8 @@ def _run_pattern_detection_job(
                 )
 
     # get detected transformations
-    sharding_config = ShardingConfig()
-    detect_dp_bmm_shard(gm, rank, world_size, sharding_config)
+    sharding_config = ShardingConfig(rank, world_size)
+    detect_dp_bmm_shard(gm, sharding_config)
     detected_transformations = sharding_config.bmm_transforms
 
     # Run pattern detection test

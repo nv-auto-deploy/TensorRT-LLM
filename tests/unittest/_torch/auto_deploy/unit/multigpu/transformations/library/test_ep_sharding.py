@@ -40,8 +40,8 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
         return n_gate + expected_expert
 
     def transform_func(gm) -> None:
-        sharding_config = ShardingConfig()
-        detect_ep_shard(gm, rank, world_size, sharding_config)
+        sharding_config = ShardingConfig(rank, world_size)
+        detect_ep_shard(gm, sharding_config)
         sharding_transform_executor(gm, sharding_config)
 
     op_expected = torch.ops.auto_deploy.torch_dist_all_reduce
@@ -89,8 +89,8 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                 )
 
     # get detected transformations
-    sharding_config = ShardingConfig()
-    detect_ep_shard(gm, rank, world_size, sharding_config)
+    sharding_config = ShardingConfig(rank, world_size)
+    detect_ep_shard(gm, sharding_config)
     detected_transformations = sharding_config.ep_transforms
 
     # Run pattern detection test

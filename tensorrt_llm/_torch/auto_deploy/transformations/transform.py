@@ -95,27 +95,22 @@ class InferenceOptimizer:
         # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
         optimize_rope(egm)
 
-        sharding_config = ShardingConfig(local_rank, world_size, self.factory.get_sharding_config())
-        # self.ad_config.use_sharding_from_config = False
-        if (
-            self.ad_config.use_sharding_from_config
-            and sharding_config.predefined_config is not None
-        ):
-            ad_logger.info("\n\nUsing TP sharding from config\n")
-            # sharding_config.simple_shard_attention_layers()
-            sharding_config.create_sharding_from_config(egm)
-        else:
-            ad_logger.info("\n\nRunning TP sharding detection\n")
-            # run TP sharding across ranks
-            detect_column_row_shard(
-                egm, local_rank, world_size, sharding_config, self.ad_config.simple_shard_only
-            )
+        sharding_config = ShardingConfig(
+            local_rank,
+            world_size,
+            self.factory.get_sharding_config(),
+            self.ad_config.simple_shard_only,
+            self.ad_config.use_sharding_from_factory,
+        )
 
-            # run EP sharding across ranks
-            detect_ep_shard(egm, local_rank, world_size, sharding_config)
+        # run TP sharding across ranks
+        detect_column_row_shard(egm, sharding_config)
 
-            # run BMM sharding across ranks
-            detect_dp_bmm_shard(egm, local_rank, world_size, sharding_config)
+        # run EP sharding across ranks
+        detect_ep_shard(egm, sharding_config)
+
+        # run BMM sharding across ranks
+        detect_dp_bmm_shard(egm, sharding_config)
 
         # print detected transformations
         ad_logger.info("\n\nTP sharding:")
