@@ -53,7 +53,7 @@ class ExportToGM(BaseTransform):
         model = gm.get_submodule("factory_model")
 
         # set the example sequence
-        cm.info.set_example_sequence()
+        cm.info.set_example_sequence(**factory.get_example_inputs())
 
         # export the model to a graph module
 
