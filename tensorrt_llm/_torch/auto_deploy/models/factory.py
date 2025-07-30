@@ -206,14 +206,16 @@ class ModelFactory(ABC):
             device: The device to load the model on.
         """
 
-    def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, DynamicShapeCallback]]:
+    def get_extra_inputs(
+        self,
+    ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor, DynamicShapeCallback]]:
         """Return a dictionary of extra inputs for the model.
 
         Returns:
             A dictionary of extra inputs for the model where the key corresponds to the argument
-            name and the value corresponds to a tuple of (example_input, dynamic_shape_callback).
-            The dynamic shape callback is a function that returns the dynamic shape of the extra
-            input.
+            name and the value corresponds to a tuple of (example_input, none_input,
+            dynamic_shape_callback). The dynamic shape callback is a function that returns the
+            dynamic shape of the extra input.
         """
         return {}
 

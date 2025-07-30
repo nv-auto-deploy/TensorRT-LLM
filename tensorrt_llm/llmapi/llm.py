@@ -407,6 +407,14 @@ class BaseLLM:
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
 
+        import torch
+        pixel_values = torch.zeros(2, 3, 336, 336).to(torch.bfloat16)
+        pixel_values[0] += 0.0078
+        pixel_values[1] -= 0.4961
+        multimodal_params = MultimodalParams(multimodal_data={
+            "pixel_values": pixel_values,
+        })
+
         self._check_arguments(
             len(prompt_token_ids),
             len(query_token_ids) if query_token_ids is not None else 0,
