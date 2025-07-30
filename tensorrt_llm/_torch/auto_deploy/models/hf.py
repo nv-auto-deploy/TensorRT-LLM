@@ -4,7 +4,7 @@ import json
 import os
 import types
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -17,6 +17,7 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
+    AutoProcessor,
     AutoTokenizer,
     PretrainedConfig,
 )
@@ -27,7 +28,7 @@ from transformers.utils import (
     WEIGHTS_NAME,
 )
 
-from ..custom_ops.attention_interface import CacheConfig
+from ..custom_ops.attention_interface import CacheConfig, Dim, DynamicShapeCallback
 from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
 from .factory import ModelFactory, ModelFactoryRegistry
@@ -366,3 +367,61 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     @property
     def automodel_from_config(self):
         return AutoModelForImageTextToText.from_config
+
+    @property
+    def autotokenizer_from_pretrained(self):
+        return AutoTokenizer.from_pretrained
+        return AutoProcessor.from_pretrained
+
+    @staticmethod
+    def _simple_forward(
+        model: nn.Module,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        pixel_values: torch.Tensor,
+    ):
+        """A simple forward pass for the model to functionalize the args.
+
+        This follows the standard function signature as expected by factory.py.
+        """
+        return type(model).forward(
+            model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            pixel_values=pixel_values,
+        )
+
+    def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, DynamicShapeCallback]]:
+        """Return a dictionary of extra inputs for the model.
+
+        Returns:
+            A dictionary of extra inputs for the model where the key corresponds to the argument
+            name and the value corresponds to a tuple of (example_input, dynamic_shape_callback).
+            The dynamic shape callback is a function that returns the dynamic shape of the extra
+            input.
+        """
+
+        def _get_dynamic_shape():
+            # return {}
+            return {
+                # TODO (lucaslie): how to set default values for dynamic shapes?
+                0: Dim("img_batch_size", max=10),
+                2: Dim("img_height", min=32, max=512),
+                3: Dim("img_width", min=32, max=512),
+            }
+
+        # TODO (lucaslie): try with both zero tensor and random tensor to activate/deactivate the
+        # vision branch
+        pixel_values = torch.ones(4, 3, 336, 336).to(torch.bfloat16)
+        pixel_values[1] = torch.zeros(3, 336, 336).to(torch.bfloat16)
+        pixel_values[3] = torch.zeros(3, 336, 336).to(torch.bfloat16)
+        none_pixel_values = torch.zeros(0, 3, 336, 336).to(torch.bfloat16)
+        return {
+            "pixel_values": (
+                # TODO: figure out how to automatically setdtype?? --> maybe just comes from the
+                # InputProcessor as well??
+                pixel_values,
+                none_pixel_values,
+                _get_dynamic_shape,
+            ),
+        }

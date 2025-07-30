@@ -37,7 +37,7 @@ class SequenceInfo:
     between arguments that are originally part of the model/graph and arguments that are needed for
     the attention operator when we switch to cached+flattened attention.
 
-    # ORIGINAL MODEL ARGUMENTS #####################################################################
+    ### ORIGINAL MODEL ARGUMENTS ###################################################################
     - input_ids: [id_0, ..., id_{s_total-1}]
       flattened sequence of [b, 1] or [1, s_total]. We use [b, 1] to denote generate-only batches.
     - position_ids: [pos_0, ..., pos_{s_total-1}]
@@ -47,7 +47,18 @@ class SequenceInfo:
     NOTE: ``input_ids`` and ``position_ids`` are initially expected to be of shape [b, seq_len]
     before we switch to cached+flattened attention.
 
-    # EXTRA ARGUMENTS NEEDED FOR ATTENTION OPERATORS FOR FLATTENED SEQUENCES + CACHES ##############
+    ### EXTRA ARGUMENTS PROVIDED TO THE INTERFACE ##################################################
+    Those are extra arguments that can be provided to the interface and they are stored as follows:
+    - _extra_args: dictionary of extra arguments with currently active values.
+    - _extra_example_inputs: dictionary of example inputs to the extra arguments.
+    - _extra_none_inputs: dictionary of none inputs to the extra arguments.
+      NOTE: we assume that extra arguments are *optional* arguments to the model. However, we
+            cannot represent them via `None` since fx graphs require a fixed input type. Instead,
+            we require a special placeholder tensor to represent the `None` input.
+    - _extra_dynamic_shapes_callbacks: dictionary of callbacks to initialize the dynamic shapes of
+      the extra arguments.
+
+    ### CACHE ARGUMENTS NEEDED FOR ATTENTION OPERATORS FOR FLATTENED SEQUENCES + CACHES ############
     - seq_len: [s_0, s_1, ..., s_{b-1}] such that s_total = sum(s_i)
       Describes how long each sequence is. For example,
       input_ids[:s_0] will correspond to sequence 0 in the batch and input_ids[s_0:s_1] will
@@ -128,6 +139,14 @@ class SequenceInfo:
         self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
         self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.long)
         self._uncached_arg_names = ["input_ids", "position_ids"]
+        self._uncached_dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
+
+        # EXTRA TENSOR FIELDS
+        self._extra_args: Dict[str, torch.Tensor] = {}
+        self._extra_example_inputs: Dict[str, torch.Tensor] = {}
+        self._extra_none_inputs: Dict[str, torch.Tensor] = {}
+        self._extra_dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
+        self._extra_dynamic_shapes_callbacks: Dict[str, DynamicShapeCallback] = {}
 
         # CACHED TENSOR FIELDS (for cached attention backends)
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
@@ -135,17 +154,7 @@ class SequenceInfo:
         self.cache_loc = torch.empty(self.num_pages, dtype=torch.int)
         self.pages_per_seq = torch.empty_like(self.seq_len)
         self._cached_arg_names = ["seq_len", "input_pos", "cache_loc", "pages_per_seq"]
-
-        # DYNAMIC SHAPES
-        # --> initialized lazily since Dim is not picklable for multi-processing
-        self._uncached_dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
         self._cached_dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
-        ############################################################################################
-
-        ### EXTRA ARGS #############################################################################
-        self._extra_args: Dict[str, torch.Tensor] = {}
-        self._extra_dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
-        self._extra_dynamic_shapes_callbacks: Dict[str, DynamicShapeCallback] = {}
         ############################################################################################
 
         # call reset once to initialize the tensors
@@ -345,9 +354,13 @@ class SequenceInfo:
         for k in self._uncached_arg_names + self._cached_arg_names:
             setattr(self, k, getattr(self, k).to(*args, **kwargs))
 
-        for k, v in self._extra_args.items():
-            if isinstance(v, torch.Tensor):
-                self._extra_args[k] = v.to(*args, **kwargs)
+        def _move_dict(d: Dict[str, torch.Tensor]) -> None:
+            for k, v in d.items():
+                d[k] = v.to(*args, **kwargs)
+
+        _move_dict(self._extra_args)
+        _move_dict(self._extra_example_inputs)
+        _move_dict(self._extra_none_inputs)
 
     def reset(self) -> None:
         """Reset the sequence information.
@@ -369,16 +382,63 @@ class SequenceInfo:
         """Set an example sequence useful for testing and export purposes."""
         self.reset()
         bs, seq_len = min(2, self.max_batch_size), min(4, self.max_seq_len)
-        input_ids = torch.ones(
+        input_ids = torch.ones(  # noqa
             bs,
             seq_len,
             dtype=torch.int,
             device=self.device,
         )
-        self.nest_sequences(input_ids)
+
+        # TODO (lucaslie): seems we have hit a road block using generic example inputs for export
+        # with VLMs. We need to probably switch to having the factory provide an example input that
+        # is then being tokenized inside the factory.
+        # WHY: for VLMs we need to hit these special tokens representing images. No way we can do
+        # that with a generic example input.
+        # fmt: off
+        input_ids2 = [[
+            200000, 200005,   1556, 200006,    368, 200080, 200090, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200081, 200080,
+            200090, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
+            200092, 200081,  74777,    290,   5326,     43, 200008, 200005, 140680,
+            200006,    368
+        ] for _ in range(2)]
+        # fmt: on
+
+        self.nest_sequences(input_ids2, **self._extra_example_inputs)
 
     def set_max_num_tokens_sample(self) -> None:
         """Set an example sequence with max_num_tokens."""
+        # TODO: understand what this implies for extra arguments
         self.reset()
         seq_len = self.max_num_tokens // self.max_batch_size
         input_ids = torch.ones(
@@ -480,6 +540,7 @@ class SequenceInfo:
         position_ids: Optional[Sequence[Sequence[int]]] = None,
         input_pos: Optional[Union[torch.Tensor, Sequence[int], int]] = None,
         page_assignments: Optional[Sequence[Sequence[int]]] = None,
+        **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
     ) -> None:
         """Create and store a flattened list of input_ids from the provided list of sequences.
 
@@ -488,6 +549,7 @@ class SequenceInfo:
             position_ids: List of sequences of position_ids for each token.
             input_pos: Absolute starting position in the cache for each sequence.
             page_assignments: List of sequences of page assignments for each sequence.
+            extra_args: Extra arguments to be stored in the interface.
 
         This i/f will ensure that all sequence info args are updated accordingly.
         """
@@ -542,6 +604,21 @@ class SequenceInfo:
         if page_assignments is not None:
             self._assign_pages_per_seq(page_assignments)
 
+        # go through all extra arguments and update them
+        for name, none_input in self._extra_none_inputs.items():
+            if name in extra_args:
+                arg = extra_args.pop(name)
+                if not isinstance(arg, torch.Tensor):
+                    if len(arg) > 1:
+                        arg = torch.cat(arg)
+                    else:
+                        arg = arg[0]
+                self._extra_args[name] = arg.to(self.device)
+            else:
+                self._extra_args[name] = none_input
+
+        assert not extra_args, f"Extra arguments {extra_args.keys()} not found"
+
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
         t_squeezed = t_nested.squeeze(1) if self.is_generate else t_nested.squeeze(0)
         return list(torch.split(t_squeezed, self.sequence_lengths))
@@ -549,28 +626,30 @@ class SequenceInfo:
     def add_extra_arg(
         self,
         name: str,
-        value: torch.Tensor,
+        example_input: torch.Tensor,
+        none_input: torch.Tensor,
         dynamic_shape_callback: Optional[DynamicShapeCallback] = None,
     ) -> None:
         """Add an extra argument to the sequence info object.
 
         Args:
             name: The name of the extra argument.
-            value: Example input value of the extra argument.
+            example_input: Example input value of the extra argument.
+            none_input: None input value of the extra argument.
             dynamic_shape_callback: The callback to get the dynamic shape of the extra argument.
 
         Note that the extra argument is expected to be a tensor.
         """
-        self._extra_args[name] = value.to(self.device)
+        assert name not in self._named_args().keys(), f"Extra argument {name} already exists"
+
+        self._extra_args[name] = example_input.to(self.device)
+        self._extra_example_inputs[name] = example_input.to(self.device)
+        self._extra_none_inputs[name] = none_input.to(self.device)
+
         if dynamic_shape_callback is None:
             self._extra_dynamic_shapes_callbacks[name] = lambda: {}
         else:
             self._extra_dynamic_shapes_callbacks[name] = dynamic_shape_callback
-
-    def set_extra_arg(self, name: str, value: torch.Tensor) -> None:
-        """Set an extra argument to the sequence info."""
-        # TODO (lucaslie): assume fixed shape for now
-        self._extra_args[name].copy_(value.to(self.device), non_blocking=True)
 
 
 Constant = Union[int, float, str, None]
