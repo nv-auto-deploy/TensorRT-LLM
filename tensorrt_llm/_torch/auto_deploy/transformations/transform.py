@@ -112,13 +112,6 @@ class InferenceOptimizer:
         # run BMM sharding across ranks
         detect_dp_bmm_shard(egm, sharding_config)
 
-        # print detected transformations
-        ad_logger.info("\n\nTP sharding:")
-        for tp_transform in sharding_config.tp_transforms:
-            ad_logger.info(
-                f"{tp_transform.target_node} {tp_transform.split_dim} {tp_transform.dist_op}"
-            )
-
         sharding_transform_executor(egm, sharding_config)
 
         # let's run a shape propagation pass to update the graph with correct meta values for

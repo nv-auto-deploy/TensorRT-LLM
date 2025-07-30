@@ -718,7 +718,6 @@ def detect_column_row_shard(
 
     if sharding_config.use_sharding_from_factory and sharding_config.predefined_config is not None:
         ad_logger.info("Using TP sharding from config")
-        # sharding_config.simple_shard_attention_layers()
         detect_tp_sharding_from_factory_config(gm, sharding_config)
         return
 
