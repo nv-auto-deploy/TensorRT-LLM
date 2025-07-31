@@ -1,8 +1,9 @@
 """A demo LLM api to for debugging and testing purposes of e2e workflows."""
 
 import gc
+from collections import defaultdict
 from queue import Empty
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.multiprocessing as mp
@@ -93,10 +94,22 @@ class DemoEngine(ADEngine):
         # set up sequence info object for decode phase
         sequence_info = self.cache_seq_interface.info
         sequence_info.reset()
-        total_lens = [len(r.prompt_token_ids) for r in requests]
+
+        input_ids = []
+        total_lens = []
+        extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
+
+        for request in requests:
+            total_lens.append(len(request.prompt_token_ids))
+            input_ids.append(request.prompt_token_ids)
+            if request.multimodal_params is not None:
+                for k, v in request.multimodal_params.multimodal_data.items():
+                    extra_args[k].append(v)
+
         sequence_info.nest_sequences(
-            input_ids=[r.prompt_token_ids for r in requests],
+            input_ids=input_ids,
             page_assignments=self._assign_pages(total_lens),
+            **extra_args,
         )
 
         # setup objects we want to track for the output
