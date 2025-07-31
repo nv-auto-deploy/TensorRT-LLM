@@ -10,6 +10,7 @@ and operates on a purely functional paradigm that is compatible with the torch c
 """
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from typing import Dict, List, Literal, Optional, Protocol, Sequence, Tuple, Type, Union
 
@@ -17,7 +18,7 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.export import Dim
 from torch.fx import Node
-
+from tensorrt_llm._utils import nvtx_range
 
 @dataclass
 class CacheConfig:
@@ -87,11 +88,13 @@ class SequenceInfo:
     # Similarly, if a batch is composed of generate-only requests,
     # then the maximum number of sequences possible in the batch is min (max_batch_size, max_num_tokens).
     max_num_tokens: Optional[int] = None
+    # device is the device on which the sequence info is stored.
+    device: str = "cuda"
 
     ## [UPDATE WITH CARE] TENSOR FIELDS THAT WILL BE PASSED TO PREPARE_METADATA OP #################
     # input_ids MUST ALWAYS BE THE FIRST FIELD
-    input_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.int))
-    position_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.long))
+    input_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.int))
+    position_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.long))
 
     seq_len: torch.Tensor = field(default_factory=lambda: torch.ones(1, dtype=torch.int))
     input_pos: torch.Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.int))
@@ -104,30 +107,39 @@ class SequenceInfo:
     _num_pages: int = 1
 
     def __post_init__(self):
+        print("in __post_init__ device: ", self.device)
         if self.page_size < 1:
             self.page_size = self.max_seq_len
 
         # NOTE (lucaslie): WAR to address issue when using flashinfer attention with
         # (max_batch_size, max_seq_len) input in trtllm runtime.
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
-        max_seq_len_adjusted = self.max_seq_len + 1
+        self.max_seq_len_adjusted = self.max_seq_len + 1
 
         if self.max_num_tokens is None or self.max_num_tokens < 1:
-            self.max_num_tokens = self.max_batch_size * max_seq_len_adjusted
+            self.max_num_tokens = self.max_batch_size * self.max_seq_len_adjusted
         # if the provided max_num_tokens is less than the max_batch_size * max_seq_len,
         # we use the provided max_num_tokens to calculate the number of pages
-        total_tokens = min(self.max_num_tokens, self.max_batch_size * max_seq_len_adjusted)
+        total_tokens = min(self.max_num_tokens, self.max_batch_size * self.max_seq_len_adjusted)
         # Num pages can not be less than max_batch_size.
         self._num_pages = max(
             self.max_batch_size,
             (total_tokens) // self.page_size + (total_tokens % self.page_size > 0),
         )
-        self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
-        self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.long)
+        # Ensure that the device is set before initializing the tensors.
+        # Need to allocated input_ids and position_ids on the GPUs to avoid overheads of tensor creation in every forward pass.s\
+        self.input_ids = torch.ones(self.max_num_tokens, dtype=torch.int, device=self.device)
+        self.position_ids = torch.zeros(self.max_num_tokens, dtype=torch.long, device=self.device)
+        self.input_ids_view = torch.ones(self.max_batch_size, dtype=torch.int, device=self.device)
+        self.position_ids_view = torch.zeros(self.max_batch_size, dtype=torch.long, device=self.device)
+
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
         self.input_pos = torch.empty_like(self.seq_len)
-        self.cache_loc = torch.empty(self.num_pages, dtype=torch.int)
-        self.pages_per_seq = torch.empty_like(self.seq_len)
+        self.cache_loc = torch.empty(self.num_pages, dtype=torch.int, device=self.device)
+        self.pages_per_seq = torch.empty_like(self.seq_len, device=self.device)
+        # self.num_tokens = torch.empty(1, dtype=torch.int, device=self.device)
+        self.num_tokens_scalar = 0 # keep a scalar copy, because slicing with a GPU tensor is slow
+
         assert self.num_pages >= self.max_batch_size, (
             "num_pages must be greater than max_batch_size"
         )
@@ -143,24 +155,34 @@ class SequenceInfo:
         # call reset once to initialize the tensors
         self.reset()
 
-    @property
-    def device(self) -> torch.device:
-        return self.input_pos.device
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
-        args = []
-        for f in fields(self):
-            val = getattr(self, f.name)
-            if isinstance(val, torch.Tensor):
-                args.append(val)
-            if len(args) >= self._num_uncached_attn_args and not self._is_cached_attn:
-                break
-        return tuple(args)
+        @nvtx_range("attention_interface_args")
+        def get_args():
+            args = []
+            for f in fields(self):
+                val = getattr(self, f.name)
+                val_view = val
+                if isinstance(val, torch.Tensor):
+                    if f.name == "input_ids" or f.name == "position_ids":
+                        shape = val.shape
+                        if any(s == 1 for s in shape):
+                            truncated_val = val.flatten()[:self.num_tokens_scalar]
+                            val_view = getattr(self, f.name + "_view")
+                            val_view = self.maybe_reshape_for_generate(truncated_val) #assign to view, no resize needed
+                    args.append(val_view)
+                if len(args) >= self._num_uncached_attn_args and not self._is_cached_attn:
+                    break
+                
+            return tuple(args)
+        return get_args()
 
     @property
     def _num_uncached_attn_args(self) -> int:
-        """Return the number of original graph arguments expected by the model."""
+        """Return the number of original graph arguments expected by the model.
+        This is 2 because we have input_ids and position_ids as the original graph arguments.
+        """
         return 2
 
     @property
@@ -185,7 +207,7 @@ class SequenceInfo:
             dynamic_shapes = ({}, {})
             if self.max_batch_size > 1:
                 dynamic_shapes[0][0] = Dim("batch_size", max=self.max_batch_size)
-            dynamic_shapes[0][1] = Dim("seq_len", max=self.max_seq_len)
+            dynamic_shapes[0][1] = Dim("seq_len", max=self.max_seq_len_adjusted)
             # set up shape for position_ids (same as input_ids)
             dynamic_shapes[1].update(dynamic_shapes[0])
             # set up shape for extra args
@@ -336,28 +358,50 @@ class SequenceInfo:
         self.input_pos.zero_()
 
         # set a dummy sequence corresponding to a generate-only batch (will also reset position_ids)
-        self.nest_sequences(torch.zeros(self.max_batch_size, 1, dtype=torch.int))
+        self.nest_sequences([[1]] * self.max_batch_size)
 
         # reset cache information
         self.cache_loc[:] = torch.arange(self.num_pages, dtype=torch.int, device=self.device)
         self.pages_per_seq.fill_(1)
 
-    def set_example_sequence(self) -> None:
-        """Set an example sequence useful for testing and export purposes."""
-        self.reset()
-        bs, seq_len = min(2, self.max_batch_size), min(4, self.max_seq_len)
-        input_ids = torch.ones(
-            bs,
-            seq_len,
-            dtype=torch.int,
-            device=self.device,
-        )
-        self.nest_sequences(input_ids)
-
-        # unflatten if we are not yet using cached+flattened attention
-        if not self._is_cached_attn:
-            self.input_ids = self.input_ids.view(bs, seq_len)
-            self.position_ids = self.position_ids.view(bs, seq_len)
+    @contextmanager
+    def example_sequence_context(self):
+        """Context manager that temporarily sets an example sequence useful for testing and export purposes.
+        
+        Saves the current state of input_ids and position_ids, applies example sequence logic,
+        and restores the original state upon exit.
+        """
+        # Save current state
+        original_input_ids = self.input_ids.clone()
+        original_position_ids = self.position_ids.clone()
+        original_sequence_lengths = self._sequence_lengths.copy()
+        original_seq_len = self.seq_len.clone()
+        original_input_pos = self.input_pos.clone()
+        original_cache_loc = self.cache_loc.clone()
+        original_pages_per_seq = self.pages_per_seq.clone()
+        
+        try:
+            # Apply example sequence logic
+            self.reset()
+            bs, seq_len = min(2, self.max_batch_size), min(4, self.max_seq_len)
+            input_ids = [[1] * seq_len] * bs
+            self.nest_sequences(input_ids, allow_realloc=True)
+            # unflatten if we are not yet using cached+flattened attention
+            if not self._is_cached_attn:
+                self.input_ids = self.input_ids.view(bs, seq_len)
+                self.position_ids = self.position_ids.view(bs, seq_len)
+            
+            yield self
+            
+        finally:
+            # Restore original state
+            self.input_ids = original_input_ids
+            self.position_ids = original_position_ids
+            self._sequence_lengths = original_sequence_lengths
+            self.seq_len = original_seq_len
+            self.input_pos = original_input_pos
+            self.cache_loc = original_cache_loc
+            self.pages_per_seq = original_pages_per_seq
 
     def _set_max_num_tokens_sample(self) -> None:
         """Set an example sequence with max_num_tokens."""
@@ -381,30 +425,64 @@ class SequenceInfo:
         self.reset()
         self.nest_sequences([[1]] * self.max_batch_size)
 
-    def _update_position_ids(self) -> None:
+    def maybe_reshape_for_generate(self, tensor: torch.Tensor) -> torch.Tensor:
+        # use [b,1] shape to indicate generate-only batch, otherwise use [1,total_len]
+        if self.is_generate:
+            return tensor.view(-1, 1, *tensor.shape[1:])
+        else:
+            return tensor.view(1, -1, *tensor.shape[1:])
+
+    @nvtx_range("ad_update_position_ids")
+    def _update_position_ids(self, allow_realloc: bool = False) -> None:
         # set new position_ids as new tensor from input_pos and seq_len via torch.arange
         position_ids_list = [
             num
             for in_pos, seq_len in zip(self.input_positions, self.sequence_lengths)
             for num in range(in_pos, in_pos + seq_len)
         ]
-        self.position_ids = torch.tensor(position_ids_list, dtype=torch.long).to(self.device)
-
-        # use [b,1] shape to indicate generate-only batch, otherwise use [1,total_len]
-        if self.is_generate:
-            self.position_ids = self.position_ids.view(-1, 1)
+        position_ids_host = torch.tensor(position_ids_list, dtype=torch.long, pin_memory=True)
+        if allow_realloc:
+            self.position_ids = position_ids_host.to(self.device).clone()
         else:
-            self.position_ids = self.position_ids.view(1, -1)
+            self.position_ids = self.position_ids.flatten()
+            self.position_ids[:len(position_ids_list)].copy_(position_ids_host, non_blocking=True)
+        
+        self.position_ids = self.maybe_reshape_for_generate(self.position_ids)
 
-    def nest_sequences(self, input_ids: Sequence[Sequence[int]]) -> None:
+    @nvtx_range("ad_update_sequence_lengths")
+    def update_sequence_lengths(self, sequence_lengths: List[int]) -> None:
+        self._sequence_lengths = sequence_lengths
+        self.seq_len.zero_()
+        # self.num_tokens.copy_(torch.tensor(sum(self._sequence_lengths), dtype=torch.int), non_blocking=True)
+        self.num_tokens_scalar = sum(self._sequence_lengths)
+        self.seq_len[: len(self._sequence_lengths)].copy_(torch.tensor(self._sequence_lengths), non_blocking=True)
+
+    def update_input_ids(self, input_ids: torch.Tensor, new_tokens: Optional[torch.Tensor] = None, previous_batch_indices: Optional[torch.Tensor] = None, num_tokens: int = 0) -> None:
+        with nvtx_range("flatten_input_ids"):
+            self.input_ids = self.input_ids.flatten()
+        with nvtx_range("assign_input_ids"):
+            self.input_ids[:num_tokens] = input_ids # gpu-gpu copy
+        with nvtx_range("reshape_input_ids"):
+            self.input_ids = self.maybe_reshape_for_generate(self.input_ids)
+        
+    @nvtx_range("ad_nest_sequences")
+    def nest_sequences(self, 
+                       input_ids: Sequence[Sequence[int]], 
+                       previous_batch_indices: List[int] = [], 
+                       new_tokens: Optional[torch.Tensor] = None, 
+                       allow_realloc: bool = False,
+                       ) -> None:
         """Create and store a flattened list of input_ids from the provided list of sequences.
 
         This i/f will also update any relevant sequence information.
         """
         # set new sequence lengths
-        seq_lens = [len(ids) for ids in input_ids]
+        self._sequence_lengths = [len(ids) for ids in input_ids]
+        num_tokens = sum(self._sequence_lengths)  
+        # self.num_tokens.copy_(torch.tensor(num_tokens, dtype=torch.int), non_blocking=True)
+        self.num_tokens_scalar = num_tokens
         self.seq_len.zero_()
-        self.seq_len[: len(seq_lens)].copy_(torch.tensor(seq_lens), non_blocking=True)
+        self.seq_len[: len(self._sequence_lengths)].copy_(torch.tensor(self._sequence_lengths), non_blocking=True)
         # We'll preserve the dtype of the input_ids tensor if it is a tensor, otherwise we'll use int
         dtype = input_ids.dtype if isinstance(input_ids, torch.Tensor) else torch.int
         # set new input_ids as new tensor from flattened input_ids
@@ -413,49 +491,53 @@ class SequenceInfo:
             for lst in input_ids
             for val in (lst.detach().tolist() if isinstance(lst, torch.Tensor) else lst)
         ]
-        self.input_ids = torch.tensor(ids_list, dtype=dtype).to(self.device)
-
-        # set derivative properties
-        self._sequence_lengths = seq_lens
-
-        # use [b,1] shape to indicate generate-only batch, otherwise use [1,total_len]
-        if self.is_generate:
-            self.input_ids = self.input_ids.view(-1, 1, *self.input_ids.shape[1:])
+        input_ids_host = torch.tensor(ids_list, dtype=dtype, pin_memory=True)
+        self.input_ids = self.input_ids.flatten()
+        if allow_realloc:
+            self.input_ids = input_ids_host.to(self.device).clone()
         else:
-            self.input_ids = self.input_ids.view(1, -1, *self.input_ids.shape[1:])
+            self.input_ids[:num_tokens].copy_(input_ids_host, non_blocking=True)
+
+        if new_tokens is not None:
+            self.input_ids[self.input_ids == -1] = new_tokens[0,previous_batch_indices,0]
+
+        self.input_ids = self.maybe_reshape_for_generate(self.input_ids)
 
         # update position_ids
-        self._update_position_ids()
+        self._update_position_ids(allow_realloc=allow_realloc)
 
+    @nvtx_range("ad_unnest_sequences")
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
         t_squeezed = t_nested.squeeze(1) if self.is_generate else t_nested.squeeze(0)
         return list(torch.split(t_squeezed, self.sequence_lengths))
 
+    @nvtx_range("ad_update_pos")
     def update_pos(self, seq_len: Union[torch.Tensor, List[int], int], reset: bool = False) -> None:
         """Update the starting position for each sequence in the cache.
 
         If ``reset=True`, ``input_pos`` will be reset to zero before updating.
         """
         if not isinstance(seq_len, torch.Tensor):
-            seq_len = torch.tensor(seq_len, dtype=torch.int)
+            seq_len = torch.tensor(seq_len, dtype=torch.int, pin_memory=True)
         bs = len(seq_len) if seq_len.dim() > 0 else self.max_batch_size
 
         if reset:
-            self.input_pos[:bs] = seq_len.to(self.device)
+            self.input_pos[:bs].copy_(seq_len, non_blocking=True)
         else:
             self.input_pos[:bs] += seq_len.to(self.device)
 
         # update position_ids
         self._update_position_ids()
 
+    @nvtx_range("ad_assign_cache_loc")
     def assign_cache_loc(self, page_assignments: Sequence[Sequence[int]]) -> None:
         """Set the cache location and pages_per_seq tensors from page assignments."""
         cache_loc_flat = torch.tensor(
-            [p_idx for pages in page_assignments for p_idx in pages], dtype=torch.int
+            [p_idx for pages in page_assignments for p_idx in pages], dtype=torch.int, pin_memory=True
         )
         self.cache_loc[: len(cache_loc_flat)].copy_(cache_loc_flat, non_blocking=True)
 
-        pages_per_seq = torch.tensor([len(p) for p in page_assignments], dtype=torch.int)
+        pages_per_seq = torch.tensor([len(p) for p in page_assignments], dtype=torch.int, pin_memory=True)
         self.pages_per_seq[: len(pages_per_seq)].copy_(pages_per_seq, non_blocking=True)
 
 
