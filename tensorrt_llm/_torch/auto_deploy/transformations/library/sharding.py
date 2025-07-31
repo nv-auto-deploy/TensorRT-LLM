@@ -30,6 +30,7 @@ import torch.nn as nn
 from pydantic import BaseModel, ConfigDict, Field
 from torch.fx import GraphModule, Node
 
+from ...models.factory import FactorySource
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     extract_param_names_from_lin_node,
@@ -254,9 +255,10 @@ class EPShardingInfo(ShardingTransformInfo):
 class ShardingConfig(BaseModel):
     """Configuration for sharding the model."""
 
-    rank: int = 0
-    world_size: int = 1
-    predefined_config: Dict[str, Any] = None
+    factory_source: FactorySource
+    rank: int
+    world_size: int
+    _predefined_config: Optional[Dict[str, Any]] = None
     simple_shard_only: bool = False
     use_sharding_from_factory: bool = False
     tp_transforms: List[TPShardingInfo] = Field(default_factory=list)
@@ -265,21 +267,81 @@ class ShardingConfig(BaseModel):
 
     def __init__(
         self,
+        factory_source: FactorySource,
         rank: int,
         world_size: int,
         sharding_config: Dict[str, Any] = None,
         simple_shard_only: bool = False,
         use_sharding_from_factory: bool = False,
     ):
-        super().__init__()
-        self.rank = rank
-        self.world_size = world_size
-        self.predefined_config = sharding_config
-        self.simple_shard_only = simple_shard_only
-        self.use_sharding_from_factory = use_sharding_from_factory
+        super().__init__(
+            factory_source=factory_source,
+            rank=rank,
+            world_size=world_size,
+            _predefined_config=sharding_config,
+            simple_shard_only=simple_shard_only,
+            use_sharding_from_factory=use_sharding_from_factory,
+        )
+
+        # Pydantic does not support setting private fields directly.
+        self._predefined_config = sharding_config
+        # Validate the config after initialization
+        if self._predefined_config is not None:
+            self.validate_config()
+
+    def validate_config(self) -> bool:
+        if self.factory_source != FactorySource.HUGGINGFACE:
+            ad_logger.warning(
+                "Sharding config is is currently only " + "supported for HuggingFace. Skipping."
+            )
+            # invalidate the config
+            self._predefined_config = None
+            return False
+
+        if not isinstance(self._predefined_config, dict):
+            ad_logger.warning("Sharding config is not a dictionary. Skipping.")
+            # invalidate the config
+            self._predefined_config = None
+            return False
+
+        if "head_dim" not in self._predefined_config:
+            ad_logger.warning("Sharding config does not contain head_dim. Skipping.")
+            # invalidate the config
+            self._predefined_config = None
+            return False
+
+        if "tp_plan" not in self._predefined_config:
+            ad_logger.warning("Sharding config does not contain tp_plan. Skipping.")
+            # invalidate the config
+            self._predefined_config = None
+            return False
+        tp_plan = self._predefined_config["tp_plan"]
+
+        values = set(tp_plan.values())
+        allowed_values = {
+            "colwise",  # row split and no collective
+            "rowwise",  # column split and all-reduce
+            "gather",  # simple shard (row + all_gather)
+            # TODO: remaining values are not supported yet.
+            # They require hybrid EP+TP and/or SP support.
+            # "sequence_parallel", # sequence parallelism
+            # "local_colwise",
+            # "local_rowwise",
+            # "local_packed_rowwise",
+            # "local",
+        }
+        if not values.issubset(allowed_values):
+            ad_logger.warning("Sharding config contains invalid values. Skipping.")
+            # invalidate the config
+            self._predefined_config = None
+            return False
+        return True
+
+    def get_predefined_config(self) -> Dict[str, Any]:
+        return self._predefined_config
 
 
-def detect_tp_sharding_from_factory_config(
+def detect_sharding_from_factory_config(
     gm: GraphModule,
     sharding_config: ShardingConfig,
 ) -> None:
@@ -305,54 +367,30 @@ def detect_tp_sharding_from_factory_config(
     # The following constraints are based on
     # https://github.com/huggingface/transformers/blob/d8e05951b8efd4880acca9a3f291e8b65841a86d/src/transformers/models/llama4/configuration_llama4.py#L249
 
-    if not isinstance(sharding_config.predefined_config, dict):
-        ad_logger.warning("Sharding config is not a dictionary. Skipping.")
-        return
-
-    if "head_dim" not in sharding_config.predefined_config:
-        ad_logger.warning("Sharding config does not contain head_dim. Skipping.")
-        return
-    head_dim = sharding_config.predefined_config["head_dim"]
-
-    if "tp_plan" not in sharding_config.predefined_config:
-        ad_logger.warning("Sharding config does not contain tp_plan. Skipping.")
-        return
-    tp_plan = sharding_config.predefined_config["tp_plan"]
-
-    values = set(tp_plan.values())
-    allowed_values = {
-        "colwise",
-        "rowwise",
-        "sequence_parallel",
-        "local_colwise",
-        "local_rowwise",
-        "local_packed_rowwise",
-        "local",
-        "gather",
-    }
-    if not values.issubset(allowed_values):
-        ad_logger.warning("Sharding config contains invalid values. Skipping.")
-        return
+    factory_config = sharding_config.get_predefined_config()
+    head_dim = factory_config["head_dim"]
+    tp_plan = factory_config["tp_plan"]
 
     rank, world_size = sharding_config.rank, sharding_config.world_size
+
+    # If the node is inside the attention module, we need to set min_local_shape to the
+    # head_dim - otherwise, we would risk splitting the heads into smaller shards.
+    # TODO: is there a better way to check if we are in attention module?
+    attn_names = [
+        "attention",
+        "Attention",
+        "attn",
+        "Attn",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+    ]
 
     for lin_node in filtered_nodes(gm.graph.nodes, is_linear_op):
         # use node's weight name to get the module name
         module_name = lin_node.args[1].target
 
-        # If the node is inside the attention module, we need to set min_local_shape to the
-        # head_dim - otherwise, we would risk splitting the heads into smaller shards.
-        # TODO: is there a better way to check if we are in attention module?
-        attn_names = [
-            "attention",
-            "Attention",
-            "attn",
-            "Attn",
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-        ]
         if any(attn_name in module_name for attn_name in attn_names):
             min_local_shape = head_dim
         else:
@@ -424,7 +462,8 @@ def simple_shard_first_n_layers(sharding_config: ShardingConfig, n_layers: int) 
     # instead of "*".
     """
     new_tp_plan = {}
-    for layer_pattern, config in sharding_config.predefined_config["tp_plan"].items():
+    factory_config = sharding_config.get_predefined_config()
+    for layer_pattern, config in factory_config["tp_plan"].items():
         if "*" in layer_pattern:
             # Create new dict with first n_layers entries first
 
@@ -434,7 +473,7 @@ def simple_shard_first_n_layers(sharding_config: ShardingConfig, n_layers: int) 
         # Add the default config after
         new_tp_plan[layer_pattern] = config
 
-    sharding_config.predefined_config["tp_plan"] = new_tp_plan
+    sharding_config._predefined_config["tp_plan"] = new_tp_plan
 
 
 def simple_shard_last_n_layers(sharding_config: ShardingConfig, n_layers: int) -> None:
@@ -446,8 +485,9 @@ def simple_shard_last_n_layers(sharding_config: ShardingConfig, n_layers: int) -
     # instead of "*".
     """
     new_tp_plan = {}
-    num_layers = sharding_config.predefined_config["num_hidden_layers"]
-    for layer_pattern, config in sharding_config.predefined_config["tp_plan"].items():
+    factory_config = sharding_config.get_predefined_config()
+    num_layers = factory_config["num_hidden_layers"]
+    for layer_pattern, config in factory_config["tp_plan"].items():
         if "*" in layer_pattern:
             # Create new dict with first n_layers entries first
 
@@ -456,18 +496,18 @@ def simple_shard_last_n_layers(sharding_config: ShardingConfig, n_layers: int) -
 
         # Add the default config after
         new_tp_plan[layer_pattern] = config
-    sharding_config.predefined_config["tp_plan"] = new_tp_plan
+    sharding_config._predefined_config["tp_plan"] = new_tp_plan
 
 
 def simple_shard_attention_layers(sharding_config: ShardingConfig) -> None:
     """
     If any key in tp_plan contains "attention", replace it with "gather"
     """
-    for layer_pattern, config in sharding_config.predefined_config["tp_plan"].items():
+    for layer_pattern, config in sharding_config._predefined_config["tp_plan"].items():
         if any(
             attn_name in layer_pattern for attn_name in ["attention", "Attention", "attn", "Attn"]
         ):
-            sharding_config.predefined_config["tp_plan"][layer_pattern] = "gather"
+            sharding_config._predefined_config["tp_plan"][layer_pattern] = "gather"
 
 
 def sharding_transform_executor(gm: GraphModule, sharding_config: ShardingConfig) -> None:
@@ -687,6 +727,26 @@ def _append_simple_shard(
     sharding_config.tp_transforms.extend(tp_shards)
 
 
+def detect_sharding(gm: GraphModule, sharding_config: ShardingConfig) -> None:
+    if (
+        sharding_config.use_sharding_from_factory
+        and sharding_config.get_predefined_config() is not None
+    ):
+        ad_logger.info("Applying sharding from config")
+        detect_sharding_from_factory_config(gm, sharding_config)
+        return
+
+    ad_logger.info("Running autodeploy sharding heuristics")
+    # run TP sharding across ranks
+    detect_column_row_shard(gm, sharding_config)
+
+    # run EP sharding across ranks
+    detect_ep_shard(gm, sharding_config)
+
+    # run BMM sharding across ranks
+    detect_dp_bmm_shard(gm, sharding_config)
+
+
 def detect_column_row_shard(
     gm: GraphModule,
     sharding_config: ShardingConfig,
@@ -715,11 +775,6 @@ def detect_column_row_shard(
         return
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
-
-    if sharding_config.use_sharding_from_factory and sharding_config.predefined_config is not None:
-        ad_logger.info("Using TP sharding from config")
-        detect_tp_sharding_from_factory_config(gm, sharding_config)
-        return
 
     ad_logger.info("Running TP sharding detection")
 

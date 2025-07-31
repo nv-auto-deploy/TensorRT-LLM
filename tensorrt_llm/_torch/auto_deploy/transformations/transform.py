@@ -16,9 +16,7 @@ from ..utils.logger import ad_logger
 from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .library import (
     ShardingConfig,
-    detect_column_row_shard,
-    detect_dp_bmm_shard,
-    detect_ep_shard,
+    detect_sharding,
     eliminate_redundant_transposes,
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
@@ -96,6 +94,7 @@ class InferenceOptimizer:
         optimize_rope(egm)
 
         sharding_config = ShardingConfig(
+            self.factory.get_model_source(),
             local_rank,
             world_size,
             self.factory.get_sharding_config(),
@@ -103,14 +102,7 @@ class InferenceOptimizer:
             self.ad_config.use_sharding_from_factory,
         )
 
-        # run TP sharding across ranks
-        detect_column_row_shard(egm, sharding_config)
-
-        # run EP sharding across ranks
-        detect_ep_shard(egm, sharding_config)
-
-        # run BMM sharding across ranks
-        detect_dp_bmm_shard(egm, sharding_config)
+        detect_sharding(egm, sharding_config)
 
         sharding_transform_executor(egm, sharding_config)
 

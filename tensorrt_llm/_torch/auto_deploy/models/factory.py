@@ -2,6 +2,7 @@
 
 import copy
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Any, Callable, Dict, Optional, Type
 
 import torch
@@ -10,6 +11,15 @@ from torch._prims_common import DeviceLikeType
 
 from ..custom_ops.attention_interface import CacheConfig
 from ..utils.logger import ad_logger
+
+5
+
+
+class FactorySource(Enum):
+    """Enum for factory source."""
+
+    HUGGINGFACE = "huggingface"
+    UNKNOWN = "unknown"
 
 
 class ModelFactory(ABC):
@@ -107,6 +117,14 @@ class ModelFactory(ABC):
             The cache configuration for the model.
         """
         return CacheConfig()
+
+    def get_model_source(self) -> FactorySource:
+        """Return the source of the model factory.
+
+        Returns:
+            The source identifier for this model factory.
+        """
+        return FactorySource.UNKNOWN
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer for the model.

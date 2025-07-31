@@ -30,7 +30,7 @@ from transformers.utils import (
 from ..custom_ops.attention_interface import CacheConfig
 from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
-from .factory import ModelFactory, ModelFactoryRegistry
+from .factory import FactorySource, ModelFactory, ModelFactoryRegistry
 
 
 @contextmanager
@@ -212,6 +212,14 @@ class AutoModelForCausalLMFactory(ModelFactory):
         else:
             kv_cache_dtype = None
         return CacheConfig(dtype=kv_cache_dtype)
+
+    def get_model_source(self) -> FactorySource:
+        """Return the source of the model factory.
+
+        Returns:
+            The source identifier for this model factory.
+        """
+        return FactorySource.HUGGINGFACE
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer—either a custom name or the model's default."""
