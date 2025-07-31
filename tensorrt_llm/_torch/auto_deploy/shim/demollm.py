@@ -11,6 +11,7 @@ import torch.multiprocessing as mp
 from ....executor import GenerationExecutor
 from ....executor.request import GenerationRequest
 from ....executor.result import CompletionOutput, GenerationResult
+from ....inputs.multimodal import MultimodalParams
 from ....sampling_params import SamplingParams
 from ...pyexecutor.sampler import greedy_search_sampling_batch, top_k_sampling_batch
 from ..distributed import common as dist_ad
@@ -35,8 +36,11 @@ class DemoEngine(ADEngine):
         self.queue = mp.Queue()
 
     @torch.inference_mode()
-    def __call__(self, requests: GenerationRequest) -> mp.Queue:
+    def __call__(
+        self, requests: GenerationRequest, multimodal_params: Optional[MultimodalParams]
+    ) -> mp.Queue:
         """Generate tokens and put the results in a queue and return the queue."""
+        requests.multimodal_params = multimodal_params
         output = self.generate_tokens_batched([requests])[0]
         self.queue.put(output)
         return self.queue
@@ -274,6 +278,7 @@ class DemoGenerationExecutor(GenerationExecutor):
         def _unpack(inputs) -> GenerationRequest:
             args, kwargs = inputs  # unpack the inputs
             request: GenerationRequest = args[0]
+            request.multimodal_params: Optional[MultimodalParams] = args[1]
             return request
 
         engine = DemoEngine.build_from_config(**engine_kwargs)
@@ -328,8 +333,11 @@ class DemoGenerationExecutor(GenerationExecutor):
             request.set_id(client_id)
 
         # submit request to our demo engine and store results
+        # NOTE: when returning from this function, the reference request.multimodal_params will
+        # be cleared immediately. So we pass it in explicitly to maintain a reference even when
+        # requests get submitted asynchronously.
         result = GenerationResult(request)
-        result.queue = self.engine_executor(request)
+        result.queue = self.engine_executor(request, request.multimodal_params)
 
         return result
 
