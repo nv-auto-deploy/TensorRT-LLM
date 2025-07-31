@@ -1,6 +1,5 @@
 """Pattern matching for detecting repeat_kv, eager, grouped attention patterns from Huggingface models."""
 
-from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Tuple, Type
 
 import torch
@@ -11,7 +10,6 @@ from torch.fx import GraphModule
 from ...custom_ops.attention_interface import AttentionDescriptor
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...transformations._graph import canonicalize_graph, lift_to_meta
 from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
@@ -22,16 +20,11 @@ def _apply_pattern(
     gm: GraphModule,
     pattern_name: str,
     register_fn: Callable[[ADPatternMatcherPass], None],
-    shape_prop: bool = False,
 ) -> int:
     """Utility to register and apply a pattern."""
     patterns = ADPatternMatcherPass()
     register_fn(patterns)
     num_matches = patterns.apply(gm.graph)
-
-    if num_matches > 0:
-        with lift_to_meta(gm) if shape_prop else nullcontext():
-            canonicalize_graph(gm, shape_prop=shape_prop)
     return num_matches
 
 
