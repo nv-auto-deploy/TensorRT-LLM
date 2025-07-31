@@ -356,8 +356,8 @@ class MatchRepeatKV(BaseTransform):
         info = TransformInfo(
             skipped=False,
             num_matches=num_kv_patterns,
-            is_clean=True,
-            has_valid_shapes=True,
+            is_clean=False,
+            has_valid_shapes=False,
         )
 
         return gm, info
