@@ -351,7 +351,10 @@ class MatchRepeatKV(BaseTransform):
                 scalar_workaround={"n_rep": dummy_args[1]},
             )
 
-        num_kv_patterns = _apply_pattern(gm, "Repeat KV", register_repeat_kv, shape_prop=True)
+        num_kv_patterns = _apply_pattern(gm, "Repeat KV", register_repeat_kv)
+
+        if num_kv_patterns > 0:
+            self.config.run_shape_prop = True
 
         info = TransformInfo(
             skipped=False,
