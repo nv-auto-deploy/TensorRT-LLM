@@ -450,7 +450,7 @@ class MatchGroupedAttention(BaseTransform):
         info = TransformInfo(
             skipped=False,
             num_matches=num_grouped_patterns,
-            is_clean=True,
+            is_clean=False,
             has_valid_shapes=False,
         )
 
