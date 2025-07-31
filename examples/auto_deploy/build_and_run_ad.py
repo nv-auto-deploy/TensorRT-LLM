@@ -26,6 +26,9 @@ from tensorrt_llm.sampling_params import SamplingParams
 # Global torch config, set the torch compile cache to fix up to llama 405B
 torch._dynamo.config.cache_size_limit = 20
 
+# simple string, TRT-LLM style text-only prompt or full-scale HF message template
+PromptInput = Union[str, Dict, List[Dict]]
+
 
 class PromptConfig(BaseModel):
     """Prompt configuration.
@@ -35,17 +38,27 @@ class PromptConfig(BaseModel):
     """
 
     batch_size: int = Field(default=2, description="Number of queries")
-    queries: Union[str, List[str]] = Field(
+    queries: Union[PromptInput, List[PromptInput]] = Field(
         default_factory=lambda: [
+            # OPTION 1: simple text prompt
             "How big is the universe? ",
-            "In simple words and in a single sentence, explain the concept of gravity: ",
-            "How to fix slicing in golf? ",
-            "Where is the capital of Iceland? ",
-            "How big is the universe? ",
-            "In simple words and in a single sentence, explain the concept of gravity: ",
-            "How to fix slicing in golf? ",
-            "Where is the capital of Iceland? ",
-        ]
+            # OPTION 2: wrapped text prompt for TRT-LLM
+            {"prompt": "In simple words and a single sentence, explain the concept of gravity: "},
+            # OPTION 3: a full-scale HF message template (this one works for text-only models!)
+            # Learn more about chat templates: https://huggingface.co/docs/transformers/en/chat_templating
+            # and multi-modal templates: https://huggingface.co/docs/transformers/en/chat_templating_multimodal
+            [
+                {
+                    "role": "user",
+                    "content": "How to fix slicing in golf?",
+                }
+            ],
+            # More prompts...
+            {"prompt": "Where is the capital of Iceland? "},
+        ],
+        description="Example queries to prompt the model with. We support both TRT-LLM text-only "
+        "queries via the 'prompt' key and full-scale HF message template called via "
+        "apply_chat_template.",
     )
     sp_kwargs: Dict[str, Any] = Field(
         default_factory=lambda: {"max_tokens": 100, "top_k": 200, "temperature": 1.0},
@@ -59,10 +72,28 @@ class PromptConfig(BaseModel):
         NOTE (lucaslie): has to be done with model_post_init to ensure it's always run. field
         validators are only run if a value is provided.
         """
-        queries = [self.queries] if isinstance(self.queries, str) else self.queries
+        queries = self.queries if isinstance(self.queries, list) else [self.queries]
         batch_size = self.batch_size
         queries = queries * (batch_size // len(queries) + 1)
-        self.queries = queries[:batch_size]
+        queries = queries[:batch_size]
+
+        # now let's standardize the queries for the LLM api to understand them
+        queries_processed = []
+        for query in queries:
+            if isinstance(query, str):
+                queries_processed.append({"prompt": query})
+            elif isinstance(query, dict):
+                queries_processed.append(query)
+            elif isinstance(query, list):
+                queries_processed.append(
+                    {
+                        "prompt": "Fake prompt. Check out messages field for the HF chat template.",
+                        "messages": query,  # contains the actual HF chat template
+                    }
+                )
+            else:
+                raise ValueError(f"Invalid query type: {type(query)}")
+        self.queries = queries_processed
 
     @field_validator("sp_kwargs", mode="after")
     @classmethod
@@ -237,56 +268,13 @@ def main(config: Optional[ExperimentConfig] = None):
 
     llm = build_llm_from_config(config)
 
-    # just run config.prompt.queries with our special token sequence including special image tokens
-    # fmt: off
-    input_ids = [[
-        200000, 200005,   1556, 200006,    368, 200080, 200090, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200081, 200080,
-        200090, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-        200092, 200081,  51212,   1780,    650,   2556,    310,    290,   1472,
-        8392,    341,   1357,  13492,     26, 200008, 200005, 140680, 200006,
-        368
-    ] for _ in range(2)]
-    # fmt: on
-
     # prompt the model and print its output
     ad_logger.info("Running example prompts...")
 
     # now let's try piping through multimodal data
 
     outs = llm.generate(
-        input_ids,
-        # config.prompt.queries,
+        config.prompt.queries,
         sampling_params=SamplingParams(**config.prompt.sp_kwargs),
     )
     results = {"prompts_and_outputs": print_outputs(outs)}

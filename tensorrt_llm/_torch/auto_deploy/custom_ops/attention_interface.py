@@ -577,6 +577,7 @@ class SequenceInfo:
             else:
                 self._extra_args[name] = none_input
 
+        # TODO (lucaslie): how strict do we wanna be here? Should we just warn/ignore instead?
         assert not extra_args, f"Extra arguments {extra_args.keys()} not found"
 
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
