@@ -90,7 +90,7 @@ class DemoEngine(ADEngine):
         )
         assert sampling_params.best_of == 1, "Best-of is not supported."
 
-        # set up sequence info object
+        # set up sequence info object for decode phase
         sequence_info = self.cache_seq_interface.info
         sequence_info.reset()
         total_lens = [len(r.prompt_token_ids) for r in requests]
@@ -113,7 +113,7 @@ class DemoEngine(ADEngine):
 
             token_ids, _ = self._decode_tokens(logits_last, sampling_params)  # [b,1]
 
-            # update sequence info accordingly for next step
+            # update sequence info accordingly for next step (generate phase)
             input_pos_next = sequence_info.input_positions
             seq_lens_current = sequence_info.sequence_lengths
             input_pos_next = [ip + sl for ip, sl in zip(input_pos_next, seq_lens_current)]

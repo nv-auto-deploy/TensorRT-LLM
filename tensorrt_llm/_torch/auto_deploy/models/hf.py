@@ -110,10 +110,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
     def autoconfig_from_pretrained(self):
         return AutoConfig.from_pretrained
 
-    @property
-    def autotokenizer_from_pretrained(self):
-        return AutoTokenizer.from_pretrained
-
     # TODO (@lucaslie): Do we ever want to switch to from_pretrained?
     @property
     def automodel_from_config(self):
@@ -202,7 +198,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         """Initialize the tokenizer—either a custom name or the model's default."""
         if self.tokenizer is None:
             return None
-        return self.autotokenizer_from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+        return AutoTokenizer.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
 
     @staticmethod
     def _get_ignore_patterns(repo_id: str, skip_prefetch_weights: bool) -> List[str]:
@@ -369,10 +365,18 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     def automodel_from_config(self):
         return AutoModelForImageTextToText.from_config
 
-    @property
-    def autotokenizer_from_pretrained(self):
-        return AutoTokenizer.from_pretrained
-        return AutoProcessor.from_pretrained
+    def init_tokenizer(self) -> Optional[Any]:
+        """Initialize the tokenizer—either a custom name or the model's default."""
+        processor = self.init_processor()
+        if processor is None:
+            return None
+        return processor.tokenizer
+
+    def init_processor(self) -> Optional[Any]:
+        """Initialize the processor for the model."""
+        if self.tokenizer is None:
+            return None
+        return AutoProcessor.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
 
     @staticmethod
     def _simple_forward(
@@ -402,12 +406,9 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
                     "content": [
                         {"type": "image", "image": img1},
                         {"type": "image", "image": img2},
-                        {
-                            "type": "text",
-                            "text": text,
-                        },
+                        {"type": "text", "text": text},
                     ],
-                },
+                }
             ]
 
         # Create a batch of conversations (batch_size = 2)
@@ -432,58 +433,12 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             return_dict=True,
             return_tensors="pt",
             padding=True,
+            return_attention_mask=False,
         )
 
         return {
             "input_ids": inputs["input_ids"],
             "pixel_values": inputs["pixel_values"],
-        }
-
-        # fmt: off
-        input_ids = [[
-            200000, 200005,   1556, 200006,    368, 200080, 200090, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200081, 200080,
-            200090, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092, 200092,
-            200092, 200081,  74777,    290,   5326,     43, 200008, 200005, 140680,
-            200006,    368
-        ] for _ in range(2)]
-        # fmt: on
-        pixel_values = torch.ones(4, 3, 336, 336)
-        pixel_values[1] = torch.zeros(3, 336, 336)
-        pixel_values[3] = torch.zeros(3, 336, 336)
-        return {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values.to(torch.bfloat16),
         }
 
     def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, DynamicShapeCallback]]:
@@ -497,7 +452,6 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         """
 
         def _get_dynamic_shape():
-            # return {}
             return {
                 # TODO (lucaslie): how to set default values for dynamic shapes?
                 0: Dim("img_batch_size", max=10),
@@ -505,18 +459,5 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
                 3: Dim("img_width", min=32, max=2048),
             }
 
-        # TODO (lucaslie): try with both zero tensor and random tensor to activate/deactivate the
-        # vision branch
-        # pixel_values = torch.ones(4, 3, 336, 336).to(torch.bfloat16)
-        # pixel_values[1] = torch.zeros(3, 336, 336).to(torch.bfloat16)
-        # pixel_values[3] = torch.zeros(3, 336, 336).to(torch.bfloat16)
         none_pixel_values = torch.zeros(0, 3, 336, 336)
-        return {
-            "pixel_values": (
-                # TODO: figure out how to automatically setdtype?? --> maybe just comes from the
-                # InputProcessor as well??
-                # pixel_values,
-                none_pixel_values,
-                _get_dynamic_shape,
-            ),
-        }
+        return {"pixel_values": (none_pixel_values, _get_dynamic_shape)}
