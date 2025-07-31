@@ -7,8 +7,8 @@ from torch.export import Dim
 from torch.fx import GraphModule
 from transformers.integrations.sdpa_attention import repeat_kv as hf_repeat_kv
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionDescriptor
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.transformations.library.attention import AttentionDescriptor
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 torch.manual_seed(0)

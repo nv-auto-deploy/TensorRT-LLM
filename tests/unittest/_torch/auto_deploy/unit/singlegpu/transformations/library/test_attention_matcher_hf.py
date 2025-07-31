@@ -12,10 +12,10 @@ from torch.fx import GraphModule
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaModel
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionDescriptor
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device
-from tensorrt_llm._torch.auto_deploy.transformations.library.attention import AttentionDescriptor
 
 torch.manual_seed(0)
 
