@@ -108,7 +108,6 @@ class ADEngine(ModelEngine):
             max_num_tokens=max_num_tokens,
             device=device,
         )
-        print(" in seq_info for device: ", torch.cuda.current_device())
 
         # construct inference optimizer
         build_and_optimize = InferenceOptimizer(
