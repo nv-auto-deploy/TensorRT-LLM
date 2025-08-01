@@ -99,7 +99,7 @@ class ADEngine(ModelEngine):
         if device.type == "cuda" and device.index is None:
             device = torch.device(f"cuda:{torch.cuda.current_device()}")
         device = str(device)
-        
+
         # initialize seq info object
         seq_info = SequenceInfo(
             max_seq_len=max_seq_len,
@@ -109,7 +109,6 @@ class ADEngine(ModelEngine):
             device=device,
         )
         print(" in seq_info for device: ", torch.cuda.current_device())
-
 
         # construct inference optimizer
         build_and_optimize = InferenceOptimizer(
@@ -208,7 +207,7 @@ class ADEngine(ModelEngine):
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
             page_assignments.append(cache_indices)
-            
+
         # update the sequence info object now
         si = self.cache_seq_interface.info
         si.update_pos(input_pos, reset=True)

@@ -46,7 +46,7 @@ class PyTorchConfig:
     moe_max_num_tokens: Optional[int] = None
     moe_load_balancer: Optional[Union[MoeLoadBalancerConfig, dict, str]] = None
 
-    attn_backend: str = 'FLASHINFER'
+    attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
 
     enable_mixed_sampler: bool = False
