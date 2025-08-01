@@ -172,20 +172,16 @@ class SequenceInfo:
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
-        @nvtx_range("attention_interface_args")
-        def get_args():
-            args = []
-            for f in fields(self):
-                val = getattr(self, f.name)
-                if not isinstance(val, torch.Tensor):
-                    continue
-                args.append(val)
-                if len(args) >= self._num_uncached_attn_args and not self._is_cached_attn:
-                    break
+        args = []
+        for f in fields(self):
+            val = getattr(self, f.name)
+            if not isinstance(val, torch.Tensor):
+                continue
+            args.append(val)
+            if len(args) >= self._num_uncached_attn_args and not self._is_cached_attn:
+                break
 
-            return tuple(args)
-
-        return get_args()
+        return tuple(args)
 
     @property
     def _num_uncached_attn_args(self) -> int:
