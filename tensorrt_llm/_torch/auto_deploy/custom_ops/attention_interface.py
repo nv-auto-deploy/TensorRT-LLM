@@ -138,6 +138,11 @@ class SequenceInfo:
         
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int, device=self.device)
         self.input_pos = torch.empty_like(self.seq_len, device=self.device)
+        
+        # Allocated host tensors for sequence lengths and input positions so that position_ids calculation can be done on host.
+        self.seq_len_host = torch.empty(self.max_batch_size, dtype=torch.int)
+        self.input_pos_host = torch.empty_like(self.seq_len_host)
+        
         self.cache_loc = torch.empty(self.num_pages, dtype=torch.int, device=self.device)
         self.pages_per_seq = torch.empty_like(self.seq_len, device=self.device)
         
@@ -224,10 +229,6 @@ class SequenceInfo:
     @property
     def sequence_lengths(self) -> List[int]:
         return self._sequence_lengths
-
-    @property
-    def input_positions(self) -> List[int]:
-        return self.input_pos[: self.num_sequences].tolist()
 
     @property
     def is_generate(self) -> bool:
@@ -418,9 +419,10 @@ class SequenceInfo:
     @nvtx_range("ad_update_position_ids")
     def _update_position_ids(self, allow_realloc: bool = False) -> None:
         # set new position_ids from input_pos and seq_len
+        # Make sure this is done on host to avoid host-device copies.
         position_ids_list = [
             num
-            for in_pos, seq_len in zip(self.input_positions, self.sequence_lengths)
+            for in_pos, seq_len in zip(self.input_pos_host, self.seq_len_host)
             for num in range(in_pos, in_pos + seq_len)
         ]
         position_ids_host = torch.tensor(position_ids_list, dtype=torch.long, pin_memory=True)
@@ -438,7 +440,8 @@ class SequenceInfo:
         self._sequence_lengths = sequence_lengths
         self.num_tokens = sum(self._sequence_lengths)
         self.seq_len.zero_()
-        self.seq_len[: len(self._sequence_lengths)].copy_(torch.tensor(self._sequence_lengths), non_blocking=True)
+        self.seq_len_host = torch.tensor(self._sequence_lengths, pin_memory=True)
+        self.seq_len[: len(self._sequence_lengths)].copy_(self.seq_len_host, non_blocking=True)
     
     def update_input_ids_with_new_tokens(self,
                                          new_tokens: torch.Tensor,
@@ -514,12 +517,13 @@ class SequenceInfo:
         bs = len(seq_len) if seq_len.dim() > 0 else self.max_batch_size
 
         if reset:
-            self.input_pos[:bs].copy_(seq_len, non_blocking=True)
+            self.input_pos_host[:bs].copy_(seq_len, non_blocking=True)
         else:
-            self.input_pos[:bs] += seq_len.to(self.device)
+            self.input_pos_host[:bs] += seq_len.to(self.device)
 
         # update position_ids
         self._update_position_ids()
+        self.input_pos[:bs].copy_(self.input_pos_host[:bs], non_blocking=True)
 
     @nvtx_range("ad_assign_cache_loc")
     def assign_cache_loc(self, page_assignments: Sequence[Sequence[int]]) -> None:

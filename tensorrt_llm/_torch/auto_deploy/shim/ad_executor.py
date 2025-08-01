@@ -211,9 +211,10 @@ class ADEngine(ModelEngine):
             
         # update the sequence info object now
         si = self.cache_seq_interface.info
-        si.nest_sequences(input_ids)
         si.update_pos(input_pos, reset=True)
         si.assign_cache_loc(page_assignments)
+        si.nest_sequences(input_ids)
+
         if new_tokens is not None:
             si.update_input_ids_with_new_tokens(new_tokens, previous_batch_indices)
         return last_logit_only
