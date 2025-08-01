@@ -175,9 +175,8 @@ class SequenceInfo:
         args = []
         for f in fields(self):
             val = getattr(self, f.name)
-            if not isinstance(val, torch.Tensor):
-                continue
-            args.append(val)
+            if isinstance(val, torch.Tensor):
+                args.append(val)
             if len(args) >= self._num_uncached_attn_args and not self._is_cached_attn:
                 break
 
