@@ -52,7 +52,7 @@ class ExportToGM(BaseTransform):
         # retrieve the actual model from the dummy graph module
         model = gm.get_submodule("factory_model")
 
-        # set the example sequence
+        # set an example sequence context
         cm.info.set_example_sequence()
 
         # export the model to a graph module
