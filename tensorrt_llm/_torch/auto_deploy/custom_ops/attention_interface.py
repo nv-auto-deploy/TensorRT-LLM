@@ -127,18 +127,20 @@ class SequenceInfo:
             (total_tokens) // self.page_size + (total_tokens % self.page_size > 0),
         )
         # Ensure that the device is set before initializing the tensors.
-        # Need to allocated input_ids and position_ids on the GPUs to avoid overheads of tensor creation in every forward pass.s\
-        self.input_ids = torch.ones(self.max_batch_size, dtype=torch.int, device=self.device)
-        self.input_ids_cuda = torch.ones(self.max_num_tokens, dtype=torch.int, device=self.device)
+        # Need to allocated input_ids and position_ids on the GPUs to avoid overheads of tensor creation in every forward pass.
+        self.input_ids = torch.ones(self.max_num_tokens, dtype=torch.int, device=self.device)
+        self.position_ids = torch.zeros(self.max_num_tokens, dtype=torch.long, device=self.device)
 
-        self.position_ids = torch.zeros(self.max_batch_size, dtype=torch.long, device=self.device)
-        self.position_ids_cuda = torch.zeros(self.max_num_tokens, dtype=torch.long, device=self.device)
-
+        # Consumers of the sequence info args require input_ids and position_ids to be truncated. 
+        # We maintain a full version of the input_ids and position_ids to avoid overheads of tensor creation in every forward pass.
+        self.input_ids_full = torch.ones(self.max_num_tokens, dtype=torch.int, device=self.device)
+        self.position_ids_full = torch.zeros(self.max_num_tokens, dtype=torch.long, device=self.device)
+        
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int, device=self.device)
         self.input_pos = torch.empty_like(self.seq_len, device=self.device)
         self.cache_loc = torch.empty(self.num_pages, dtype=torch.int, device=self.device)
         self.pages_per_seq = torch.empty_like(self.seq_len, device=self.device)
-        self.num_tokens = torch.empty(1, dtype=torch.int, device=self.device)
+        
         self.previous_batch_indices_cuda = torch.empty(self.max_num_tokens,
                                                        dtype=torch.long,
                                                        device=self.device)
@@ -154,6 +156,9 @@ class SequenceInfo:
         # indicator if extra args are activated that are needed for cached attention backends
         self._is_cached_attn = False
 
+        # total number of tokens in the current batch
+        self.num_tokens : int = 0
+        
         # call reset once to initialize the tensors
         self.reset()
 
@@ -354,50 +359,32 @@ class SequenceInfo:
         self.input_pos.zero_()
 
         # set a dummy sequence corresponding to a generate-only batch (will also reset position_ids)
-        self.nest_sequences([[1]] * self.max_batch_size)
+        self.nest_sequences([[1]] * self.max_batch_size, allow_realloc=True)
 
         # reset cache information
         self.cache_loc[:] = torch.arange(self.num_pages, dtype=torch.int, device=self.device)
         self.pages_per_seq.fill_(1)
+        
+        # let's also reset the input_ids and position_ids tensors to their max shapes (max_num_tokens)
+        self.input_ids = torch.ones(self.max_num_tokens, dtype=torch.int, device=self.device)
+        self.position_ids = torch.zeros(self.max_num_tokens, dtype=torch.long, device=self.device)
 
-    @contextmanager
-    def example_sequence_context(self):
-        """Context manager that temporarily sets an example sequence useful for testing and export purposes.
-        
-        Saves the current state of input_ids and position_ids, applies example sequence logic,
-        and restores the original state upon exit.
-        """
-        # Save current state
-        original_input_ids = self.input_ids.clone()
-        original_position_ids = self.position_ids.clone()
-        original_sequence_lengths = self._sequence_lengths.copy()
-        original_seq_len = self.seq_len.clone()
-        original_input_pos = self.input_pos.clone()
-        original_cache_loc = self.cache_loc.clone()
-        original_pages_per_seq = self.pages_per_seq.clone()
-        
-        try:
-            # Apply example sequence logic
-            self.reset()
-            bs, seq_len = min(2, self.max_batch_size), min(4, self.max_seq_len)
-            input_ids = [[1] * seq_len] * bs
-            self.nest_sequences(input_ids, allow_realloc=True)
-            # unflatten if we are not yet using cached+flattened attention
-            if not self._is_cached_attn:
-                self.input_ids = self.input_ids.view(bs, seq_len)
-                self.position_ids = self.position_ids.view(bs, seq_len)
-            
-            yield self
-            
-        finally:
-            # Restore original state
-            self.input_ids = original_input_ids
-            self.position_ids = original_position_ids
-            self._sequence_lengths = original_sequence_lengths
-            self.seq_len = original_seq_len
-            self.input_pos = original_input_pos
-            self.cache_loc = original_cache_loc
-            self.pages_per_seq = original_pages_per_seq
+    def set_example_sequence(self) -> None:
+        """Set an example sequence useful for testing and export purposes."""
+        self.reset()
+        bs, seq_len = min(2, self.max_batch_size), min(4, self.max_seq_len)
+        input_ids = torch.ones(
+            bs,
+            seq_len,
+            dtype=torch.int,
+            device=self.device,
+        )
+        self.nest_sequences(input_ids, allow_realloc=True)
+
+        # unflatten if we are not yet using cached+flattened attention
+        if not self._is_cached_attn:
+            self.input_ids = self.input_ids.view(bs, seq_len)
+            self.position_ids = self.position_ids.view(bs, seq_len)
 
     def _set_max_num_tokens_sample(self) -> None:
         """Set an example sequence with max_num_tokens."""
@@ -410,7 +397,7 @@ class SequenceInfo:
             device=self.device,
         )
         self.pages_per_seq.fill_(seq_len // self.page_size)
-        self.nest_sequences(input_ids)
+        self.nest_sequences(input_ids, allow_realloc=True)
 
     def set_generate_only_batch(self) -> None:
         """Set an example sequence for generate-only batch.
@@ -419,7 +406,7 @@ class SequenceInfo:
         mode. So we don't need to do anything mode-specific here.
         """
         self.reset()
-        self.nest_sequences([[1]] * self.max_batch_size)
+        self.nest_sequences([[1]] * self.max_batch_size, allow_realloc=True)
 
     def maybe_reshape_for_generate(self, tensor: torch.Tensor) -> torch.Tensor:
         # use [b,1] shape to indicate generate-only batch, otherwise use [1,total_len]
@@ -430,7 +417,7 @@ class SequenceInfo:
 
     @nvtx_range("ad_update_position_ids")
     def _update_position_ids(self, allow_realloc: bool = False) -> None:
-        # set new position_ids as new tensor from input_pos and seq_len via torch.arange
+        # set new position_ids from input_pos and seq_len
         position_ids_list = [
             num
             for in_pos, seq_len in zip(self.input_positions, self.sequence_lengths)
@@ -438,84 +425,59 @@ class SequenceInfo:
         ]
         position_ids_host = torch.tensor(position_ids_list, dtype=torch.long, pin_memory=True)
         if allow_realloc:
+            # Create a new position_ids tensor on the device
             self.position_ids = position_ids_host.to(self.device).clone()
         else:
-            self.position_ids = self.position_ids.flatten()
-            self.position_ids[:len(position_ids_list)].copy_(position_ids_host, non_blocking=True)
+            self.position_ids_full = self.position_ids_full.flatten()
+            self.position_ids_full[:len(position_ids_list)].copy_(position_ids_host, non_blocking=True)
         
-        self.position_ids = self.maybe_reshape_for_generate(self.position_ids)
+        self.position_ids = self.maybe_reshape_for_generate(self.position_ids if allow_realloc else self.position_ids_full[:self.num_tokens])
 
     @nvtx_range("ad_update_sequence_lengths")
-    def update_sequence_lengths(self, sequence_lengths: List[int]) -> None:
+    def _update_sequence_lengths(self, sequence_lengths: List[int]) -> None:
         self._sequence_lengths = sequence_lengths
+        self.num_tokens = sum(self._sequence_lengths)
         self.seq_len.zero_()
-        self.num_tokens.copy_(torch.tensor(sum(self._sequence_lengths), dtype=torch.int), non_blocking=True)
         self.seq_len[: len(self._sequence_lengths)].copy_(torch.tensor(self._sequence_lengths), non_blocking=True)
-
-    # def update_input_ids(self,
-    #                      input_ids_host: torch.Tensor,
-    #                      new_tokens: Optional[torch.Tensor] = None, 
-    #                      previous_batch_indices: List[int] = [], 
-    #                      num_tokens: int = 0) -> None:
-    #     previous_batch_indices_host = torch.tensor(previous_batch_indices, dtype=torch.int, pin_memory=True)
-    #     idx = self.previous_batch_indices_cuda[:len(previous_batch_indices)]
-    #     idx.copy_(previous_batch_indices_host, non_blocking=True)
-    #     self.input_ids = self.input_ids.flatten()
-    #     self.input_ids[:num_tokens].copy_(input_ids_host, non_blocking=True)
-    #     if new_tokens is not None:
-    #         self.input_ids[self.input_ids == -1] = new_tokens[0,idx,0]
-    #     self.input_ids = self.maybe_reshape_for_generate(self.input_ids)
     
-    def update_input_ids(self,
-                     input_ids_host: torch.Tensor,
-                     new_tokens: Optional[torch.Tensor] = None,
-                     previous_batch_indices: List[int] = [],
-                     num_tokens: int = 0) -> None:
+    def update_input_ids_with_new_tokens(self,
+                                         new_tokens: torch.Tensor,
+                                         previous_batch_indices: List[int]) -> None:
+        """Update the input_ids with new tokens.
+
+        This function will update the input_ids with new tokens and previous batch indices.
+        """
         # 1) flatten once
-        flat = self.input_ids_cuda.flatten()
+        original_shape = self.input_ids.shape
+        flat = self.input_ids.flatten()
 
-        # 2) copy across your prefix tokens asynchronously
-        flat[:num_tokens].copy_(input_ids_host, non_blocking=True)
+        # copy indices to the GPU
+        host_idx = torch.tensor(previous_batch_indices, dtype=torch.int, pin_memory=True)
+        idx = self.previous_batch_indices_cuda[:len(previous_batch_indices)]
+        idx.copy_(host_idx, non_blocking=True)
 
-        # 3) if you have new_tokens to inject:
-        if new_tokens is not None and previous_batch_indices:
-            # copy your indices to the GPU
-            host_idx = torch.tensor(previous_batch_indices, dtype=torch.int, pin_memory=True)
-            idx = self.previous_batch_indices_cuda[:len(previous_batch_indices)]
-            idx.copy_(host_idx, non_blocking=True)
+        # sort them so that masked_scatter_ lines up correctly
+        idx, _ = idx.sort()
 
-            # sort them so that masked_scatter_ lines up correctly
-            idx, _ = idx.sort()
+        # gather the exact values you want to write
+        src = new_tokens[0, idx, 0]
 
-            # gather the exact values you want to write
-            src = new_tokens[0, idx, 0]
-
-            # in‐place fill every slot where flat == -1 with src, in order
-            flat.masked_scatter_(flat == -1, src)
+        # in‐place fill every slot where flat == -1 with src, in order
+        flat.masked_scatter_(flat == -1, src)
 
         # 4) reshape back
-        self.input_ids = flat[:num_tokens]
-        self.input_ids = self.maybe_reshape_for_generate(self.input_ids)
-
-
+        self.input_ids = flat.view(original_shape)
         
     @nvtx_range("ad_nest_sequences")
-    def nest_sequences(self, 
-                       input_ids: Sequence[Sequence[int]], 
-                       previous_batch_indices: List[int] = [], 
-                       new_tokens: Optional[torch.Tensor] = None, 
-                       allow_realloc: bool = False,
-                       ) -> None:
+    def nest_sequences(self, input_ids: Sequence[Sequence[int]], allow_realloc: bool = False) -> None:
         """Create and store a flattened list of input_ids from the provided list of sequences.
-
+        
+        When allow_realloc is True, the input_ids will be reallocated on the device.
         This i/f will also update any relevant sequence information.
         """
         # set new sequence lengths
-        self._sequence_lengths = [len(ids) for ids in input_ids]
-        num_tokens = sum(self._sequence_lengths)  
-        self.num_tokens.copy_(torch.tensor(num_tokens, dtype=torch.int), non_blocking=True)
-        self.seq_len.zero_()
-        self.seq_len[: len(self._sequence_lengths)].copy_(torch.tensor(self._sequence_lengths), non_blocking=True)
+        self._update_sequence_lengths([len(ids) for ids in input_ids])
+       
         # We'll preserve the dtype of the input_ids tensor if it is a tensor, otherwise we'll use int
         dtype = input_ids.dtype if isinstance(input_ids, torch.Tensor) else torch.int
         # set new input_ids as new tensor from flattened input_ids
@@ -525,17 +487,14 @@ class SequenceInfo:
             for val in (lst.detach().tolist() if isinstance(lst, torch.Tensor) else lst)
         ]
         input_ids_host = torch.tensor(ids_list, dtype=dtype, pin_memory=True)
-        self.input_ids = self.input_ids.flatten()
+
         if allow_realloc:
             self.input_ids = input_ids_host.to(self.device).clone()
         else:
-            self.input_ids[:num_tokens].copy_(input_ids_host, non_blocking=True)
-
-        if new_tokens is not None:
-            self.input_ids[self.input_ids == -1] = new_tokens[0,previous_batch_indices,0]
+            self.input_ids_full = self.input_ids_full.flatten()
+            self.input_ids_full[:self.num_tokens].copy_(input_ids_host, non_blocking=True)
     
-        self.input_ids = self.maybe_reshape_for_generate(self.input_ids)
-
+        self.input_ids = self.maybe_reshape_for_generate(self.input_ids if allow_realloc else self.input_ids_full[:self.num_tokens])
         # update position_ids
         self._update_position_ids(allow_realloc=allow_realloc)
 
