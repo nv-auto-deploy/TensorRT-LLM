@@ -108,7 +108,6 @@ class SequenceInfo:
     _num_pages: int = 1
 
     def __post_init__(self):
-        print("in __post_init__ device: ", self.device)
         if self.page_size < 1:
             self.page_size = self.max_seq_len
 
