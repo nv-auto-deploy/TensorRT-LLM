@@ -514,7 +514,12 @@ class SequenceInfo:
         return list(torch.split(t_squeezed, self.sequence_lengths))
 
     @nvtx_range("ad_update_pos")
-    def update_pos(self, seq_len: Union[torch.Tensor, List[int], int], reset: bool = False) -> None:
+    def update_pos(
+        self,
+        seq_len: Union[torch.Tensor, List[int], int],
+        reset: bool = False,
+        update_position_ids: bool = True,
+    ) -> None:
         """Update the starting position for each sequence in the cache.
 
         If ``reset=True`, ``input_pos`` will be reset to zero before updating.
@@ -528,8 +533,9 @@ class SequenceInfo:
         else:
             self.input_pos_host[:bs] += seq_len.to(self.device)
 
-        # update position_ids
-        self._update_position_ids()
+        # In ad_executor context, this is done later in nest_sequences, so no need to do it here
+        if update_position_ids:
+            self._update_position_ids()
         self.input_pos[:bs].copy_(self.input_pos_host[:bs], non_blocking=True)
 
     @nvtx_range("ad_assign_cache_loc")

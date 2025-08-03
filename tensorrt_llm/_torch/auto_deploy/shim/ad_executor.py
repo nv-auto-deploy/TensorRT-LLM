@@ -209,7 +209,8 @@ class ADEngine(ModelEngine):
 
         # update the sequence info object now
         si = self.cache_seq_interface.info
-        si.update_pos(input_pos, reset=True)
+        # skip calling _update_position_ids() here, as it will be called in nest_sequences
+        si.update_pos(input_pos, reset=True, update_position_ids=False)
         si.assign_cache_loc(page_assignments)
         si.nest_sequences(input_ids)
 
