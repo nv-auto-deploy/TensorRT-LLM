@@ -422,7 +422,9 @@ class SequenceInfo:
             # Optimize for the common case where all seq_len values are 1 (generation mode)
             if torch.all(self.seq_len_host == 1):
                 # Fast path: when all seq_len are 1, position_ids is just input_pos_host
-                position_ids_host = self.input_pos_host.to(dtype=torch.long).pin_memory()
+                position_ids_host = (
+                    self.input_pos_host[: self.num_tokens].to(dtype=torch.long).pin_memory()
+                )
             else:
                 # General case - can probably be optimized too, but overall impact will be minor.
                 position_ids_list = []
@@ -437,7 +439,7 @@ class SequenceInfo:
                 self.position_ids = position_ids_host.to(self.device).clone()
             else:
                 self.position_ids_full = self.position_ids_full.flatten()
-                self.position_ids_full[: position_ids_host.numel()].copy_(
+                self.position_ids_full[: self.num_tokens].copy_(
                     position_ids_host, non_blocking=True
                 )
         with nvtx_range("maybe_reshape"):
