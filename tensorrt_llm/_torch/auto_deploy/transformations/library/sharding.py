@@ -30,7 +30,7 @@ import torch.nn as nn
 from pydantic import BaseModel, ConfigDict, Field
 from torch.fx import GraphModule, Node
 
-from ...models.factory import FactorySource
+from ...models.factory import ModelFactory, ShardingConfigSource
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     extract_param_names_from_lin_node,
@@ -255,7 +255,7 @@ class EPShardingInfo(ShardingTransformInfo):
 class ShardingConfig(BaseModel):
     """Configuration for sharding the model."""
 
-    factory_source: FactorySource
+    factory_source: ShardingConfigSource
     rank: int
     world_size: int
     _predefined_config: Optional[Dict[str, Any]] = None
@@ -267,7 +267,7 @@ class ShardingConfig(BaseModel):
 
     def __init__(
         self,
-        factory_source: FactorySource,
+        factory_source: ShardingConfigSource,
         rank: int,
         world_size: int,
         sharding_config: Dict[str, Any] = None,
@@ -290,30 +290,30 @@ class ShardingConfig(BaseModel):
             self.validate_config()
 
     def validate_config(self) -> bool:
-        if self.factory_source != FactorySource.HUGGINGFACE:
+        if self.factory_source != ShardingConfigSource.HUGGINGFACE:
             ad_logger.warning(
                 "Sharding config is is currently only " + "supported for HuggingFace. Skipping."
             )
             # invalidate the config
-            self._predefined_config = None
+            self._predefined_config = {}
             return False
 
         if not isinstance(self._predefined_config, dict):
             ad_logger.warning("Sharding config is not a dictionary. Skipping.")
             # invalidate the config
-            self._predefined_config = None
+            self._predefined_config = {}
             return False
 
         if "head_dim" not in self._predefined_config:
             ad_logger.warning("Sharding config does not contain head_dim. Skipping.")
             # invalidate the config
-            self._predefined_config = None
+            self._predefined_config = {}
             return False
 
         if "tp_plan" not in self._predefined_config:
             ad_logger.warning("Sharding config does not contain tp_plan. Skipping.")
             # invalidate the config
-            self._predefined_config = None
+            self._predefined_config = {}
             return False
         tp_plan = self._predefined_config["tp_plan"]
 
@@ -333,7 +333,7 @@ class ShardingConfig(BaseModel):
         if not values.issubset(allowed_values):
             ad_logger.warning("Sharding config contains invalid values. Skipping.")
             # invalidate the config
-            self._predefined_config = None
+            self._predefined_config = {}
             return False
         return True
 
@@ -727,10 +727,26 @@ def _append_simple_shard(
     sharding_config.tp_transforms.extend(tp_shards)
 
 
-def detect_sharding(gm: GraphModule, sharding_config: ShardingConfig) -> None:
+def detect_sharding(
+    gm: GraphModule,
+    factory: ModelFactory,
+    local_rank: int,
+    world_size: int,
+    simple_shard_only: bool,
+    use_sharding_from_factory: bool,
+) -> ShardingConfig:
+    sharding_config = ShardingConfig(
+        factory.get_sharding_config_source(),
+        local_rank,
+        world_size,
+        factory.get_sharding_config(),
+        simple_shard_only,
+        use_sharding_from_factory,
+    )
+
     if (
         sharding_config.use_sharding_from_factory
-        and sharding_config.get_predefined_config() is not None
+        and len(sharding_config.get_predefined_config()) > 0
     ):
         ad_logger.info("Applying sharding from config")
         detect_sharding_from_factory_config(gm, sharding_config)
@@ -745,6 +761,8 @@ def detect_sharding(gm: GraphModule, sharding_config: ShardingConfig) -> None:
 
     # run BMM sharding across ranks
     detect_dp_bmm_shard(gm, sharding_config)
+
+    return sharding_config
 
 
 def detect_column_row_shard(
@@ -771,7 +789,7 @@ def detect_column_row_shard(
 
     rank, world_size = sharding_config.rank, sharding_config.world_size
     if world_size < 2:
-        ad_logger.info("Skipping sharding for single device")
+        ad_logger.info("Skipping TP sharding for single device")
         return
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
@@ -937,7 +955,7 @@ def detect_dp_bmm_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Non
     ad_logger.debug("Before sharding graph: " + str(gm))
     rank, world_size = sharding_config.rank, sharding_config.world_size
     if world_size < 2:
-        ad_logger.info("Skipping sharding for single device")
+        ad_logger.info("Skipping DP BMM sharding for single device")
         return
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
@@ -1008,7 +1026,7 @@ def detect_ep_shard(gm: GraphModule, sharding_config: ShardingConfig) -> None:
 
     rank, world_size = sharding_config.rank, sharding_config.world_size
     if world_size < 2:
-        ad_logger.info("Skipping sharding for single device")
+        ad_logger.info("Skipping EP sharding for single device")
         return
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"

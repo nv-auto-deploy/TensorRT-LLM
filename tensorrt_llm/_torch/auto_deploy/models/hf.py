@@ -30,7 +30,7 @@ from transformers.utils import (
 from ..custom_ops.attention_interface import CacheConfig
 from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
-from .factory import FactorySource, ModelFactory, ModelFactoryRegistry
+from .factory import ModelFactory, ModelFactoryRegistry, ShardingConfigSource
 
 
 @contextmanager
@@ -175,7 +175,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
             model.post_init()
 
         # if present, initialize sharding config. We need head_dim for colwise sharding.
-        self._set_sharding_config(model_config)
+        self._set_sharding_config(model.config)
 
         # patch forward method
         model.forward = types.MethodType(self._simple_forward, model)
@@ -185,7 +185,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
     def _set_sharding_config(self, model_config: PretrainedConfig):
         """Set the sharding config for the model."""
-        self._sharding_config = {}
         self._sharding_config["head_dim"] = 1
         if hasattr(model_config, "base_model_tp_plan"):
             self._sharding_config["tp_plan"] = model_config.base_model_tp_plan
@@ -193,9 +192,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
             self._sharding_config["head_dim"] = model_config.head_dim
         if hasattr(model_config, "num_hidden_layers"):
             self._sharding_config["num_hidden_layers"] = model_config.num_hidden_layers
-
-    def get_sharding_config(self):
-        return self._sharding_config or {}
 
     def get_quant_config(self) -> Dict:
         return self._quant_config or {}
@@ -213,13 +209,13 @@ class AutoModelForCausalLMFactory(ModelFactory):
             kv_cache_dtype = None
         return CacheConfig(dtype=kv_cache_dtype)
 
-    def get_model_source(self) -> FactorySource:
+    def get_sharding_config_source(self) -> ShardingConfigSource:
         """Return the source of the model factory.
 
         Returns:
             The source identifier for this model factory.
         """
-        return FactorySource.HUGGINGFACE
+        return ShardingConfigSource.HUGGINGFACE
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer—either a custom name or the model's default."""
@@ -389,18 +385,17 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         }
 
     def _set_sharding_config(self, model_config: PretrainedConfig):
-        """Set the sharding config for the model."""
-        self._sharding_config = {}
-        text_config = model_config.sub_configs["text_config"]
-        # if text_config is a class, instantiate it
-        if isinstance(text_config, type):
-            text_config = text_config()
-        if hasattr(text_config, "base_model_tp_plan"):
-            self._sharding_config["tp_plan"] = text_config.base_model_tp_plan
-        if hasattr(text_config, "head_dim"):
-            self._sharding_config["head_dim"] = text_config.head_dim
-        if hasattr(text_config, "num_hidden_layers"):
-            self._sharding_config["num_hidden_layers"] = text_config.num_hidden_layers
+        """Override the sharding config for the model with text_config."""
+        super()._set_sharding_config(model_config)
+
+        if hasattr(model_config, "text_config"):
+            text_config = model_config.text_config
+            if hasattr(text_config, "base_model_tp_plan"):
+                self._sharding_config["tp_plan"] = text_config.base_model_tp_plan
+            if hasattr(text_config, "head_dim"):
+                self._sharding_config["head_dim"] = text_config.head_dim
+            if hasattr(text_config, "num_hidden_layers"):
+                self._sharding_config["num_hidden_layers"] = text_config.num_hidden_layers
 
     @property
     def automodel_from_config(self):
