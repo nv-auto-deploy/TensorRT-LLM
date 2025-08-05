@@ -14,9 +14,11 @@ import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations.library import (
     ShardingConfig,
+    ShardingConfigSource,
     SplitDimension,
     TPShardingInfo,
     detect_column_row_shard,
+    detect_sharding_from_factory_config,
     sharding_transform_executor,
 )
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
@@ -32,17 +34,18 @@ base_model_tp_plan = {
     "linear1": "colwise",
     "linear2": "rowwise",
     "linear": "gather",
-    "input_layernorm.weight": "sequence_parallel",
-    "post_attention_layernorm.weight": "sequence_parallel",
-    "norm.weight": "sequence_parallel",
-    "shared_expert.gate_proj": "local_colwise",
-    "shared_expert.up_proj": "local_colwise",
-    "shared_expert.down_proj": "local_rowwise",
-    "experts.gate_up_proj": "local_packed_rowwise",
-    "experts.down_proj": "local_colwise",
-    "experts": "local",
+    # "input_layernorm.weight": "sequence_parallel",
+    # "post_attention_layernorm.weight": "sequence_parallel",
+    # "norm.weight": "sequence_parallel",
+    # "shared_expert.gate_proj": "local_colwise",
+    # "shared_expert.up_proj": "local_colwise",
+    # "shared_expert.down_proj": "local_rowwise",
+    # "experts.gate_up_proj": "local_packed_rowwise",
+    # "experts.down_proj": "local_colwise",
+    # "experts": "local",
     "feed_forward": "gather",
     "self": "gather",
+    "weight": "gather",
 }
 
 predefined_config = {
@@ -178,12 +181,19 @@ def _run_job(
     op_expected = getattr(torch.ops.auto_deploy, dist_op_expected)
 
     def transform_func(gm) -> None:
-        sharding_config = ShardingConfig(rank=rank, world_size=world_size)
+        sharding_config = ShardingConfig(
+            rank=rank,
+            world_size=world_size,
+            factory_source=ShardingConfigSource.HUGGINGFACE,
+            sharding_config=predefined_config,
+            simple_shard_only=False,
+            use_sharding_from_factory=from_config,
+        )
         if from_config:
             if world_size > 1:
-                sharding_config.create_sharding_from_config(gm, predefined_config)
+                detect_sharding_from_factory_config(gm, sharding_config)
         else:
-            detect_column_row_shard(gm, rank, world_size, sharding_config)
+            detect_column_row_shard(gm, sharding_config)
         sharding_transform_executor(gm, sharding_config)
 
     def combined_graph_check(gm) -> bool:
@@ -246,10 +256,10 @@ def _run_pattern_detection_job(
                     # for O layer, we expect:
                     # dim = 1, add_dist = True
                     if "o_proj" in node.args[1].name:
-                        dim = SplitDimension.COLUMN
+                        dim = SplitDimension.ROW
                         dist_op = "all_reduce"
                     else:
-                        dim = SplitDimension.ROW
+                        dim = SplitDimension.COLUMN
                         dist_op = None
                     expected_transformations.append(
                         TPShardingInfo(
@@ -267,10 +277,10 @@ def _run_pattern_detection_job(
                     # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
                     # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
                     if "linear1" in node.args[1].name:
-                        dim = SplitDimension.ROW
+                        dim = SplitDimension.COLUMN
                         dist_op = None
                     else:
-                        dim = SplitDimension.COLUMN
+                        dim = SplitDimension.ROW
                         dist_op = "all_reduce"
                     expected_transformations.append(
                         TPShardingInfo(
@@ -289,7 +299,7 @@ def _run_pattern_detection_job(
                     expected_transformations.append(
                         TPShardingInfo(
                             target_node=node.name,
-                            split_dim=SplitDimension.ROW,  # Simple shard uses dim=0
+                            split_dim=SplitDimension.COLUMN,  # Simple shard uses dim=0
                             rank=rank,
                             world_size=world_size,
                             dist_op="all_gather",
@@ -298,11 +308,18 @@ def _run_pattern_detection_job(
                     )
 
     # get detected transformations
-    sharding_config = ShardingConfig(rank=rank, world_size=world_size)
+    sharding_config = ShardingConfig(
+        rank=rank,
+        world_size=world_size,
+        factory_source=ShardingConfigSource.HUGGINGFACE,
+        sharding_config=predefined_config,
+        simple_shard_only=False,
+        use_sharding_from_factory=from_config,
+    )
     if from_config:
-        sharding_config.create_sharding_from_config(gm, predefined_config)
+        detect_sharding_from_factory_config(gm, sharding_config)
     else:
-        detect_column_row_shard(gm, rank, world_size, sharding_config)
+        detect_column_row_shard(gm, sharding_config)
     detected_transformations = sharding_config.tp_transforms
 
     # Run pattern detection test

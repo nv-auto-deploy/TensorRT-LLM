@@ -97,16 +97,16 @@ class TPShardingInfo(ShardingTransformInfo):
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
         if self.dist_op is not None:
-            if self.split_dim == SplitDimension.ROW:
+            if self.split_dim == SplitDimension.COLUMN:
                 if self.dist_op == "all_reduce":
                     ad_logger.warning(
-                        f"Row split is only supported for all_gather. Skipping {self}."
+                        f"Column split is only supported for all_gather. Skipping {self}."
                     )
                     return False
-            if self.split_dim == SplitDimension.COLUMN:
+            if self.split_dim == SplitDimension.ROW:
                 if self.dist_op == "all_gather":
                     ad_logger.warning(
-                        f"Column split is only supported for all_reduce. Skipping {self}."
+                        f"Row split is only supported for all_reduce. Skipping {self}."
                     )
                     return False
         return True
@@ -267,9 +267,9 @@ class ShardingConfig(BaseModel):
 
     def __init__(
         self,
-        factory_source: ShardingConfigSource,
         rank: int,
         world_size: int,
+        factory_source: ShardingConfigSource = ShardingConfigSource.UNKNOWN,
         sharding_config: Dict[str, Any] = None,
         simple_shard_only: bool = False,
         use_sharding_from_factory: bool = False,
@@ -717,7 +717,7 @@ def _append_simple_shard(
             tp_shards.append(
                 TPShardingInfo(
                     target_node=n.name,
-                    split_dim=SplitDimension.ROW,
+                    split_dim=SplitDimension.COLUMN,
                     rank=rank,
                     world_size=world_size,
                     dist_op="all_gather",
@@ -736,9 +736,9 @@ def detect_sharding(
     use_sharding_from_factory: bool,
 ) -> ShardingConfig:
     sharding_config = ShardingConfig(
-        factory.get_sharding_config_source(),
         local_rank,
         world_size,
+        factory.get_sharding_config_source(),
         factory.get_sharding_config(),
         simple_shard_only,
         use_sharding_from_factory,
@@ -750,7 +750,7 @@ def detect_sharding(
     ):
         ad_logger.info("Applying sharding from config")
         detect_sharding_from_factory_config(gm, sharding_config)
-        return
+        return sharding_config
 
     ad_logger.info("Running autodeploy sharding heuristics")
     # run TP sharding across ranks

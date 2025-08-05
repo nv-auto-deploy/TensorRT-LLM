@@ -70,7 +70,10 @@ def _run_job(
         return num_params
 
     def transform_func(gm) -> None:
-        sharding_config = ShardingConfig(rank, world_size)
+        sharding_config = ShardingConfig(
+            rank,
+            world_size,
+        )
         detect_dp_bmm_shard(gm, sharding_config)
         sharding_transform_executor(gm, sharding_config)
 
