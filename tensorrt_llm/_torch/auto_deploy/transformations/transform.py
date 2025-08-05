@@ -15,10 +15,7 @@ from ..transform.optimizer import InferenceOptimizer as ModularInferenceOptimize
 from ..utils.logger import ad_logger
 from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .library import (
-    ShardingConfig,
-    detect_column_row_shard,
-    detect_dp_bmm_shard,
-    detect_ep_shard,
+    detect_sharding,
     eliminate_redundant_transposes,
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
@@ -95,19 +92,14 @@ class InferenceOptimizer:
         # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
         optimize_rope(egm)
 
-        # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
-        sharding_config = ShardingConfig()
-
-        # run TP sharding across ranks
-        detect_column_row_shard(
-            egm, local_rank, world_size, sharding_config, self.ad_config.simple_shard_only
+        sharding_config = detect_sharding(
+            egm,
+            self.factory,
+            local_rank,
+            world_size,
+            self.ad_config.simple_shard_only,
+            self.ad_config.use_sharding_from_factory,
         )
-
-        # run EP sharding across ranks
-        detect_ep_shard(egm, local_rank, world_size, sharding_config)
-
-        # run BMM sharding across ranks
-        detect_dp_bmm_shard(egm, local_rank, world_size, sharding_config)
 
         sharding_transform_executor(egm, sharding_config)
 
