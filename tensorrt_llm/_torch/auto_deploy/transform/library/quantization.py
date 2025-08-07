@@ -175,7 +175,7 @@ class QuantizationFromConfig(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         quant_config = factory.get_quant_config()
         if not quant_config:

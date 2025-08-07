@@ -29,7 +29,6 @@ import torch.nn as nn
 from pydantic import BaseModel, ConfigDict, Field
 from torch.fx import GraphModule, Node
 
-from ...distributed import common as dist_ad
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -41,7 +40,7 @@ from ...utils.node_utils import (
     num_users_of_weight_node,
 )
 from ...utils.quantization_utils import QuantizationImpl
-from ..interface import BaseTransform, Stages, TransformConfig, TransformInfo, TransformRegistry
+from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
 
 
 class SplitDimension(IntEnum):
@@ -248,15 +247,12 @@ class EPShardingInfo(ShardingTransformInfo):
         _insert_sharded_moe(gm, node, self.rank, self.world_size)
 
 
-class ShardingConfig(TransformConfig):
+class ShardingConfig(BaseModel):
     """Configuration for sharding the model."""
 
-    stage: Stages = Stages.SHARDING
-    run_shape_prop: bool = True
     tp_transforms: List[TPShardingInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
-    simple_shard_only: bool = Field(default=False)
 
 
 @TransformRegistry.register("sharding_transform_executor")
@@ -268,14 +264,8 @@ class ShardingTransformExecutor(BaseTransform):
         sharding_config: Transformation configuration containing list of transformations to apply
     """
 
-    config: ShardingConfig
-
-    @classmethod
-    def get_config_class(cls) -> Type[TransformConfig]:
-        return ShardingConfig
-
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         # create a node dict for faster lookup
         node_dict = {n.name: n for n in gm.graph.nodes}
@@ -290,13 +280,13 @@ class ShardingTransformExecutor(BaseTransform):
             transform.check_and_apply(gm, node_dict[transform.target_node])
 
         num_matches = 0
-        for tp_transform in self.config.tp_transforms:
+        for tp_transform in shared_config.sharding_config.tp_transforms:
             check_and_apply(tp_transform)
             num_matches += 1
-        for bmm_transform in self.config.bmm_transforms:
+        for bmm_transform in shared_config.sharding_config.bmm_transforms:
             check_and_apply(bmm_transform)
             num_matches += 1
-        for ep_transform in self.config.ep_transforms:
+        for ep_transform in shared_config.sharding_config.ep_transforms:
             check_and_apply(ep_transform)
             num_matches += 1
 
@@ -492,6 +482,12 @@ def _append_simple_shard(
     sharding_config.tp_transforms.extend(tp_shards)
 
 
+class ColumnRowShardConfig(TransformConfig):
+    """Configuration for column-row sharding."""
+
+    simple_shard_only: bool = Field(default=False)
+
+
 @TransformRegistry.register("detect_column_row_shard")
 class ColumnRowShard(BaseTransform):
     """A transformation to apply sharding to the model following tensor parallelism.
@@ -511,16 +507,17 @@ class ColumnRowShard(BaseTransform):
     splitting, e.g., the individual heads into smaller shards.
     """
 
-    config: ShardingConfig
+    config: ColumnRowShardConfig
 
     @classmethod
     def get_config_class(cls) -> Type[TransformConfig]:
-        return ShardingConfig
+        return ColumnRowShardConfig
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
-        local_rank, world_size = dist_ad.get_rank_world_size()
+        local_rank, world_size = shared_config.local_rank, shared_config.world_size
+
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
             return gm, TransformInfo(
@@ -601,13 +598,17 @@ class ColumnRowShard(BaseTransform):
 
             if self.config.simple_shard_only:
                 ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
-                _append_simple_shard(nodes_linear, local_rank, world_size, self.config)
+                _append_simple_shard(
+                    nodes_linear, local_rank, world_size, shared_config.sharding_config
+                )
                 continue
 
             # simple shard when we have != 2 groups of linear nodes
             if len(nodes_linear) != 2:
                 ad_logger.debug(f"Linear groups: {nodes_linear}")
-                _append_simple_shard(nodes_linear, local_rank, world_size, self.config)
+                _append_simple_shard(
+                    nodes_linear, local_rank, world_size, shared_config.sharding_config
+                )
                 continue
 
             # let's look at the unnacounted nodes. They are okay as long as they fall before the
@@ -637,7 +638,9 @@ class ColumnRowShard(BaseTransform):
             # check if any unaccounted nodes are left. If so, do a simply shard
             if unaccounted_nodes or attention_related_nodes:
                 ad_logger.debug(f"Unaccounted nodes: {unaccounted_nodes}")
-                _append_simple_shard(nodes_linear, local_rank, world_size, self.config)
+                _append_simple_shard(
+                    nodes_linear, local_rank, world_size, shared_config.sharding_config
+                )
                 continue
 
             # If we can account for all sharded nodes, we can do a two-way shard
@@ -649,7 +652,9 @@ class ColumnRowShard(BaseTransform):
                     # Column-row shard boundary region detection is probably wrong - there should be
                     # only one attention operation. Fall back to simple shard.
                     ad_logger.debug(f"More than one attention node: {unaccounted_nodes}")
-                    _append_simple_shard(nodes_linear, local_rank, world_size, self.config)
+                    _append_simple_shard(
+                        nodes_linear, local_rank, world_size, shared_config.sharding_config
+                    )
                     continue
                 # Extract head dimension. We cannot shard below the head_dim size.
                 # Assume that head_dim is the last (innermost) dimension of the tensor
@@ -662,7 +667,7 @@ class ColumnRowShard(BaseTransform):
                         dist_op = "all_reduce"
                     else:
                         dist_op = None
-                    self.config.tp_transforms.append(
+                    shared_config.sharding_config.tp_transforms.append(
                         TPShardingInfo(
                             target_node=n.name,
                             split_dim=i,
@@ -690,16 +695,10 @@ class DpBmmShard(BaseTransform):
     We'll also assume that the inputs to BMM are broadcasted across the devices already.
     """
 
-    config: ShardingConfig
-
-    @classmethod
-    def get_config_class(cls) -> Type[TransformConfig]:
-        return ShardingConfig
-
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
-        local_rank, world_size = dist_ad.get_rank_world_size()
+        local_rank, world_size = shared_config.local_rank, shared_config.world_size
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
             return gm, TransformInfo(
@@ -745,7 +744,7 @@ class DpBmmShard(BaseTransform):
                 start_idx = remainder + local_rank * base_size
                 end_idx = start_idx + base_size
 
-            self.config.bmm_transforms.append(
+            shared_config.sharding_config.bmm_transforms.append(
                 BMMShardingInfo(
                     target_node=node.name,
                     rank=local_rank,
@@ -770,16 +769,10 @@ class DpBmmShard(BaseTransform):
 
 @TransformRegistry.register("detect_ep_shard")
 class DetectEpShard(BaseTransform):
-    config: ShardingConfig
-
-    @classmethod
-    def get_config_class(cls) -> Type[TransformConfig]:
-        return ShardingConfig
-
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
-        local_rank, world_size = dist_ad.get_rank_world_size()
+        local_rank, world_size = shared_config.local_rank, shared_config.world_size
 
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
@@ -799,7 +792,7 @@ class DetectEpShard(BaseTransform):
                 ),
             ):
                 continue
-            self.config.ep_transforms.append(
+            shared_config.sharding_config.ep_transforms.append(
                 EPShardingInfo(
                     target_node=node.name,
                     rank=local_rank,

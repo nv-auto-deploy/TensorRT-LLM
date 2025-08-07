@@ -2,9 +2,12 @@
 
 from typing import Optional
 
+import torch.distributed as dist
 import torch.nn as nn
+from pydantic import BaseModel, Field
 from torch.fx import Graph, GraphModule
 
+from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from .interface import (
@@ -14,12 +17,26 @@ from .interface import (
     TransformConfig,
     TransformRegistry,
 )
+from .library.sharding import ShardingConfig
+
+
+class SharedConfig(BaseModel):
+    """Global config that shared between multiple transforms in the inference optimizer."""
+
+    sharding_config: ShardingConfig = Field(default_factory=ShardingConfig)
+    local_rank: int = Field(default=0)
+    world_size: int = Field(default=1)
 
 
 class InferenceOptimizer:
     def __init__(self, factory: ModelFactory, config: InferenceOptimizerConfig):
         self.factory = factory
         self.config = self._clean_config(config)
+        if not dist.is_initialized():
+            local_rank, world_size = 0, 1
+        else:
+            local_rank, world_size = dist_ad.get_rank_world_size()
+        self.shared_config = SharedConfig(local_rank=local_rank, world_size=world_size)
 
     def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:
         """Get a typed checked ("strict") config with sorted keys according to stages."""
@@ -68,7 +85,7 @@ class InferenceOptimizer:
             # instantiate transform
             transform = TransformRegistry.get(t_name)(t_config)
             # run transform
-            gm = transform(gm, cm, self.factory)
+            gm = transform(gm, cm, self.factory, self.shared_config)
 
         ############################################################################################
         # RETURN OPTIMIZED GRAPH

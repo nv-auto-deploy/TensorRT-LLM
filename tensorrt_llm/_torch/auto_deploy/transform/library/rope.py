@@ -124,7 +124,7 @@ def _explicit_not_interleaved(match: Match) -> bool:
 @TransformRegistry.register("match_rope_pattern")
 class MatchRopePattern(BaseTransform):
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
         patterns = ADPatternMatcherPass()
@@ -238,7 +238,7 @@ class MatchRopeLayout(BaseTransform):
         return MatchRopeLayoutConfig
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         supported = {"bsnd", "bnsd"}
         if self.config.expected_layout.lower() not in supported:
@@ -350,7 +350,7 @@ class OptimizeRope(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
         rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)

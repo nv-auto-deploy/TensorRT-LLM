@@ -372,7 +372,7 @@ def _remove_dead_inplace_nodes_in_region(
 @TransformRegistry.register("match_moe_pattern")
 class MatchMoePattern(BaseTransform):
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
 
@@ -504,7 +504,7 @@ class FuseMoe(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         with cuda_memory_tracker():
             fused_key_counter = _insert_fused_moe_ops(gm)

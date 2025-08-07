@@ -22,7 +22,7 @@ class CleanupInputConstraints(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         graph: Graph = gm.graph
         input_node = graph.find_nodes(op="placeholder")[0]

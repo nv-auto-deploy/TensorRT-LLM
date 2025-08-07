@@ -44,7 +44,7 @@ class ExportToGM(BaseTransform):
         return ExportToGMConfig
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         # at this point we assume the gm is just a dummy graph module
         assert len(gm.graph.nodes) == 0, "Expected empty graph module."

@@ -10,7 +10,6 @@ from ..custom_ops.attention_interface import AttentionRegistry
 from ..llm_args import AutoDeployConfig
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
-from ..transform.library.sharding import ShardingConfig
 from ..transform.optimizer import InferenceOptimizer as ModularInferenceOptimizer
 from ..utils.logger import ad_logger
 from .library import (
@@ -60,15 +59,15 @@ class InferenceOptimizer:
 
         # TODO (hg): similar to above.
         # These are configs that are shared across multiple transforms.
-        sharding_config = ShardingConfig()
-        if "sharding_transform_executor" in new_optimizer.config:
-            new_optimizer.config["sharding_transform_executor"] = sharding_config
-        if "detect_column_row_shard" in new_optimizer.config:
-            new_optimizer.config["detect_column_row_shard"] = sharding_config
-        if "detect_ep_shard" in new_optimizer.config:
-            new_optimizer.config["detect_ep_shard"] = sharding_config
-        if "detect_dp_bmm_shard" in new_optimizer.config:
-            new_optimizer.config["detect_dp_bmm_shard"] = sharding_config
+        # sharding_config = ShardingConfig()
+        # if "sharding_transform_executor" in new_optimizer.config:
+        #     new_optimizer.config["sharding_transform_executor"] = sharding_config
+        # if "detect_column_row_shard" in new_optimizer.config:
+        #     new_optimizer.config["detect_column_row_shard"] = sharding_config
+        # if "detect_ep_shard" in new_optimizer.config:
+        #     new_optimizer.config["detect_ep_shard"] = sharding_config
+        # if "detect_dp_bmm_shard" in new_optimizer.config:
+        #     new_optimizer.config["detect_dp_bmm_shard"] = sharding_config
 
         # TODO (hg): similar to above.
         if "load_weights" in new_optimizer.config:

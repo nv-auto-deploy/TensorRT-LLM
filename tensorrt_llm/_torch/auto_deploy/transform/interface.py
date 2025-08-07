@@ -190,7 +190,7 @@ class BaseTransform(ABC):
 
     @final
     def __call__(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> GraphModule:
         """Apply the transform to the graph.
 
@@ -232,14 +232,14 @@ class BaseTransform(ABC):
             # run the transform in a error-handling wrapper if desired
             if self.config.skip_on_error:
                 try:
-                    gm, info = self._apply(gm, cm, factory)
+                    gm, info = self._apply(gm, cm, factory, shared_config)
                 except Exception as e:
                     error_msg = f"Transform {t_name} failed"
                     ad_logger.warning(f"{error_msg}: {e}")
                     info = TransformInfo(skipped=True, num_matches=0)
             else:
                 # handle this here normally to improve debugging and error message
-                gm, info = self._apply(gm, cm, factory)
+                gm, info = self._apply(gm, cm, factory, shared_config)
 
             # we cannot say it's clean if the previous wasn't clean even if this one is
             # create new info object with updated cleanup status
@@ -346,7 +346,7 @@ class BaseTransform(ABC):
 
     @abstractmethod
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         """Apply the transform to the graph.
 

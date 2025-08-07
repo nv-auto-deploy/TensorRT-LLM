@@ -15,7 +15,7 @@ class LoadWeightsConfig(TransformConfig):
     """Configuration for the load weights transform."""
 
     device: str = Field(default="meta", description="The device to load the weights on.")
-    checkpoint_device: Optional[str] = Field(
+    adconfig_checkpoint_device: Optional[str] = Field(
         default=None, description="Optional checkpoint device argument from adconfig."
     )
 
@@ -31,9 +31,11 @@ class LoadWeights(BaseTransform):
         return LoadWeightsConfig
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
-        factory.load_or_random_init(gm, device=self.config.checkpoint_device or self.config.device)
+        factory.load_or_random_init(
+            gm, device=self.config.adconfig_checkpoint_device or self.config.device
+        )
         move_to_device(gm, self.config.device)
         cm.to(self.config.device)
 

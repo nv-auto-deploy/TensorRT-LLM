@@ -325,7 +325,7 @@ class MatchRepeatKV(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         def register_repeat_kv(patterns: ADPatternMatcherPass):
             dummy_args = [
@@ -366,7 +366,7 @@ class MatchEagerAttention(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         def register_eager_attention(patterns: ADPatternMatcherPass):
             for pattern_config in _get_sfdp_patterns():
@@ -392,7 +392,7 @@ class MatchGroupedAttention(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         def register_grouped_attention(patterns: ADPatternMatcherPass):
             q = torch.randn(8, 8, 16, 64, device="cuda", dtype=torch.float16)
@@ -478,7 +478,7 @@ class MatchAttentionLayout(BaseTransform):
         return MatchAttentionLayoutConfig
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         # Get attention layout from attention_op
         attention_layout = self.config.attention_op.get_attention_layout()

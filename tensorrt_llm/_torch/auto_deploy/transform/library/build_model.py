@@ -27,7 +27,7 @@ class BuildModel(BaseTransform):
         return BuildModelConfig
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
     ) -> Tuple[GraphModule, TransformInfo]:
         # build the model
         model = factory.build_model(self.config.device)
