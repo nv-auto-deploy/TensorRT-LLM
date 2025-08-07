@@ -58,18 +58,6 @@ class InferenceOptimizer:
         new_optimizer = ModularInferenceOptimizer(self.factory, self.ad_config.transforms)
 
         # TODO (hg): similar to above.
-        # These are configs that are shared across multiple transforms.
-        # sharding_config = ShardingConfig()
-        # if "sharding_transform_executor" in new_optimizer.config:
-        #     new_optimizer.config["sharding_transform_executor"] = sharding_config
-        # if "detect_column_row_shard" in new_optimizer.config:
-        #     new_optimizer.config["detect_column_row_shard"] = sharding_config
-        # if "detect_ep_shard" in new_optimizer.config:
-        #     new_optimizer.config["detect_ep_shard"] = sharding_config
-        # if "detect_dp_bmm_shard" in new_optimizer.config:
-        #     new_optimizer.config["detect_dp_bmm_shard"] = sharding_config
-
-        # TODO (hg): similar to above.
         if "load_weights" in new_optimizer.config:
             new_optimizer.config[
                 "load_weights"
@@ -79,18 +67,6 @@ class InferenceOptimizer:
         egm = new_optimizer(cm)
 
         # TODO (lucaslie): continue moving legacy transforms to the new optimizer
-
-        ############################################################################################
-        # MOVE MODEL AND LOAD WEIGHTS
-        ############################################################################################
-
-        # load weights
-        # self.factory.load_or_random_init(egm, device=self.ad_config.checkpoint_device or cm.device)
-
-        # move remaining parts to device
-        # move_to_device(egm, cm.device)
-        # cm.to(cm.device)
-
         ############################################################################################
         # RUN POST-LOAD FUSION AND OPTIMIZATIONS
         ############################################################################################

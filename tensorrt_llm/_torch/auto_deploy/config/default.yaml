@@ -53,7 +53,7 @@ transforms:
     stage: sharding
   detect_dp_bmm_shard:
     stage: sharding
-  # TODO: (hf) need to ensure run_shape_prop after sharding.
+  # TODO: (hg) need to ensure run_shape_prop after sharding.
   sharding_transform_executor:
     stage: sharding
     run_shape_prop: true
