@@ -327,6 +327,8 @@ class MatchRepeatKV(BaseTransform):
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
     ) -> Tuple[GraphModule, TransformInfo]:
+        gm.print_readable()
+
         def register_repeat_kv(patterns: ADPatternMatcherPass):
             dummy_args = [
                 torch.randn(8, 8, 16, 64, device="cuda", dtype=torch.float16),
@@ -346,8 +348,8 @@ class MatchRepeatKV(BaseTransform):
 
         num_kv_patterns = _apply_pattern(gm, "Repeat KV", register_repeat_kv)
 
-        if num_kv_patterns > 0:
-            self.config.run_shape_prop = True
+        # if num_kv_patterns > 0:
+        #     self.config.run_shape_prop = True
 
         info = TransformInfo(
             skipped=False,
@@ -356,6 +358,10 @@ class MatchRepeatKV(BaseTransform):
             has_valid_shapes=False,
         )
 
+        from ...transformations._graph import canonicalize_graph
+
+        canonicalize_graph(gm)
+        gm.print_readable()
         return gm, info
 
 
