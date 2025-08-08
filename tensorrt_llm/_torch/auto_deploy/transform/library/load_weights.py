@@ -11,7 +11,7 @@ from ...transformations._graph import move_to_device
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
 
 
-class LoadWeightsConfig(TransformConfig):
+class LoadWeightsToDeviceConfig(TransformConfig):
     """Configuration for the load weights transform."""
 
     device: str = Field(default="meta", description="The device to load the weights on.")
@@ -21,14 +21,14 @@ class LoadWeightsConfig(TransformConfig):
 
 
 @TransformRegistry.register("load_weights")
-class LoadWeights(BaseTransform):
+class LoadWeightsToDevice(BaseTransform):
     """A simple wrapper transform to load weights into a model."""
 
-    config: LoadWeightsConfig
+    config: LoadWeightsToDeviceConfig
 
     @classmethod
     def get_config_class(cls) -> Type[TransformConfig]:
-        return LoadWeightsConfig
+        return LoadWeightsToDeviceConfig
 
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
