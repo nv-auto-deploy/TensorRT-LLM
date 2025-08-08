@@ -32,6 +32,8 @@ from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 
+Match = torch._inductor.pattern_matcher.Match
+
 
 @contextlib.contextmanager
 def _patch_unsupported_input_tensor():
@@ -83,6 +85,7 @@ def _trace_to_gm(fn: Callable, args: Sequence[torch.Tensor]) -> GraphModule:
     Exports a function or Module into a GraphModule via torch_export_to_gm.
     """
     module = fn if isinstance(fn, torch.nn.Module) else _WrapperModule(fn)
+
     return torch_export_to_gm(module, tuple(args))
 
 

@@ -384,6 +384,8 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         pixel_values: torch.Tensor,
+        # How to get this programmatically?
+        image_sizes: torch.Tensor,
     ):
         """A simple forward pass for the model to functionalize the args.
 
@@ -394,6 +396,7 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             input_ids=input_ids,
             position_ids=position_ids,
             pixel_values=pixel_values,
+            image_sizes=image_sizes,
         )
 
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:
@@ -415,13 +418,13 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         batch_messages = [
             _prep_seq(
                 "Describe what you see in the two images and their differences.",
-                Image.new("RGB", (16, 16), color=(128, 128, 128)),
-                Image.new("RGB", (16, 16), color=(64, 64, 64)),
+                Image.new("RGB", (64, 64), color=(128, 128, 128)),
+                Image.new("RGB", (64, 64), color=(64, 64, 64)),
             ),
             _prep_seq(
                 "What are the main differences between these two images?",
-                Image.new("RGB", (16, 16), color=(255, 0, 0)),
-                Image.new("RGB", (16, 16), color=(0, 255, 0)),
+                Image.new("RGB", (64, 64), color=(255, 0, 0)),
+                Image.new("RGB", (64, 64), color=(0, 255, 0)),
             ),
         ]
 
@@ -437,8 +440,9 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         )
 
         return {
-            "input_ids": inputs["input_ids"],
-            "pixel_values": inputs["pixel_values"],
+            # "input_ids": inputs["input_ids"],
+            # "pixel_values": inputs["pixel_values"],
+            **inputs
         }
 
     def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, DynamicShapeCallback]]:
@@ -460,4 +464,9 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             }
 
         none_pixel_values = torch.zeros(0, 3, 336, 336)
-        return {"pixel_values": (none_pixel_values, _get_dynamic_shape)}
+        return {
+            "pixel_values": (none_pixel_values, _get_dynamic_shape),
+            # How to get this from the input processor? It seems there's no good way without
+            # running a dummy input through the processor.
+            "image_sizes": (torch.zeros(0, 2), None),
+        }
