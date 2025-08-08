@@ -71,7 +71,6 @@ class ExportToGM(BaseTransform):
                 strict=self.config.strict,
                 patch_list=self.config.patch_list,
             )
-
         # this is a clean graph by definition since it was just exported
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
 

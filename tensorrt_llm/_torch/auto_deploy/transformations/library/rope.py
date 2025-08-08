@@ -47,7 +47,7 @@ TODO: Support other variants:
 
 import operator
 from collections import defaultdict
-from typing import Any, DefaultDict, Dict, Optional, Sequence
+from typing import Any, Callable, DefaultDict, Dict, Optional, Sequence
 
 import torch
 from torch.fx import GraphModule, Node
@@ -119,7 +119,7 @@ def _explicit_not_interleaved(match: Match) -> bool:
     return not any(isinstance(n, Node) and _match_input_interleave_pattern(n) for n in (q, k))
 
 
-def match_rope_pattern(gm: GraphModule) -> int:
+def match_rope_pattern(gm: GraphModule, accept_match_fn: Callable[[Match], bool]) -> int:
     graph = gm.graph
     patterns = ADPatternMatcherPass()
 
@@ -154,7 +154,7 @@ def match_rope_pattern(gm: GraphModule) -> int:
         dummy_args=dummy_explicit,
         op_ignore_types={torch.ops.aten.slice.Tensor: (int,)},
         scalar_workaround={"unsqueeze_dim": 1},
-        extra_check=_explicit_not_interleaved,
+        extra_check=lambda match: _explicit_not_interleaved(match) and accept_match_fn(match),
     )
     register_ad_pattern(
         search_fn=_interleaved_rope_pattern,
@@ -167,6 +167,7 @@ def match_rope_pattern(gm: GraphModule) -> int:
             torch.ops.aten.view.default: (int,),
         },
         scalar_workaround={"unsqueeze_dim": 1},
+        extra_check=accept_match_fn,
     )
     register_ad_pattern(
         search_fn=_complex_rope_pattern,
@@ -177,6 +178,7 @@ def match_rope_pattern(gm: GraphModule) -> int:
             torch.ops.aten.reshape.default: (int,),
         },
         scalar_workaround={"unsqueeze_dim": 1},
+        extra_check=accept_match_fn,
     )
     register_ad_pattern(
         search_fn=_complex_rope_pattern,
@@ -187,6 +189,7 @@ def match_rope_pattern(gm: GraphModule) -> int:
             torch.ops.aten.reshape.default: (int,),
         },
         scalar_workaround={"unsqueeze_dim": 1},
+        extra_check=accept_match_fn,
     )
 
     num_matches = patterns.apply(graph)
