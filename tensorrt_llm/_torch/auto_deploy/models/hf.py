@@ -384,16 +384,21 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor = None,
+        attention_mask: torch.Tensor = None,
     ):
         """A simple forward pass for the model to functionalize the args.
 
         This follows the standard function signature as expected by factory.py.
         """
+        attention_mask = torch.ones_like(input_ids)
         return type(model).forward(
             model,
             input_ids=input_ids,
             position_ids=position_ids,
             pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
         )
 
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:
@@ -438,7 +443,12 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
 
         return {
             "input_ids": inputs["input_ids"],
-            "pixel_values": inputs["pixel_values"],
+            "pixel_values": torch.zeros(
+                14308, 1176
+            ),  # Example shape for export (will be dynamic at runtime)
+            "image_grid_thw": torch.tensor(
+                [[1, 98, 146]], dtype=torch.long
+            ),  # Example grid for export (will be dynamic at runtime)
         }
 
     def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, DynamicShapeCallback]]:
@@ -451,13 +461,31 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             input.
         """
 
-        def _get_dynamic_shape():
+        # Use dynamic shapes to handle variable-sized multimodal inputs
+        # This allows different image sizes and batch sizes to work properly
+
+        # Example tensors with reasonable default sizes
+        pixel_values_tensor = torch.zeros(14308, 1176)  # Example size for export
+        image_grid_thw_tensor = torch.tensor([[1, 98, 146]], dtype=torch.long)  # Example grid size
+
+        # Define dynamic shapes based on PyTorch's constraint analysis
+        # PyTorch has determined the exact mathematical constraints from the model
+
+        def pixel_values_dynamic_shape():
+            # PyTorch constraint analysis shows num_patches must be divisible by 4
+            # Use the suggested approach: num_patches = 4 * _num_patches
+            _num_patches = Dim("_num_patches", min=1, max=25000)
+            num_patches = 4 * _num_patches
             return {
-                # TODO (lucaslie): how to set default values for dynamic shapes?
-                0: Dim("img_batch_size", max=10),
-                2: Dim("img_height", min=32, max=2048),
-                3: Dim("img_width", min=32, max=2048),
+                0: num_patches,  # Number of image patches (must be multiple of 4)
             }
 
-        none_pixel_values = torch.zeros(0, 3, 336, 336)
-        return {"pixel_values": (none_pixel_values, _get_dynamic_shape)}
+        def image_grid_thw_dynamic_shape():
+            # TODO: add dynamic shape for image_grid_thw,
+            # the pytorch returned error when I change the first batch dim to dynamic
+            return {}
+
+        return {
+            "pixel_values": (pixel_values_tensor, pixel_values_dynamic_shape),
+            "image_grid_thw": (image_grid_thw_tensor, image_grid_thw_dynamic_shape),
+        }

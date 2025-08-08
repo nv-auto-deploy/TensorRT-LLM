@@ -68,6 +68,8 @@ class InferenceOptimizer:
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
         ############################################################################################
+        # Create both forward and backward visualizations of the initial graph
+        # visualize_model(egm, filename="initial_graph.svg", max_nodes=1000)
 
         # Match MoE pattern
         match_moe_pattern(egm)
@@ -205,6 +207,8 @@ class InferenceOptimizer:
             dynamic_shapes=cm.dynamic_shapes,
             compiler_kwargs=compiler_kwargs,
         )
+        # visualize_model(egm_compiled, max_nodes=1000)
+
         cm.info.reset()
 
         torch.cuda.empty_cache()
