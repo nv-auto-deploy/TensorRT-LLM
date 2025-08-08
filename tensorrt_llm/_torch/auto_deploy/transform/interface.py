@@ -15,6 +15,7 @@ from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..transformations._graph import canonicalize_graph, lift_to_meta
 from ..utils.logger import ad_logger
+from ..utils.sharding_utils import ShardingConfig
 
 
 class TransformError(Exception):
@@ -45,6 +46,14 @@ class Stages(Enum):
         if self.__class__ is other.__class__:
             return list(self.__class__).index(self) < list(other.__class__).index(other)
         return NotImplemented
+
+
+class SharedConfig(BaseModel):
+    """Global config shared between multiple transforms in the inference optimizer."""
+
+    sharding_config: ShardingConfig = Field(default_factory=ShardingConfig)
+    local_rank: int = Field(default=0)
+    world_size: int = Field(default=1)
 
 
 class TransformConfig(BaseModel):
@@ -190,7 +199,11 @@ class BaseTransform(ABC):
 
     @final
     def __call__(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> GraphModule:
         """Apply the transform to the graph.
 
@@ -198,6 +211,7 @@ class BaseTransform(ABC):
             gm: The graph module to apply the transform to.
             cm: The cached sequence interface defining the sequence interface.
             factory: The model factory used to build the model.
+            shared_config: Global info shared between multiple transforms.
 
         Returns:
             GraphModule: The transformed graph module.
@@ -346,7 +360,11 @@ class BaseTransform(ABC):
 
     @abstractmethod
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         """Apply the transform to the graph.
 

@@ -4,7 +4,6 @@ from typing import Optional
 
 import torch.distributed as dist
 import torch.nn as nn
-from pydantic import BaseModel, Field
 from torch.fx import Graph, GraphModule
 
 from ..distributed import common as dist_ad
@@ -12,20 +11,12 @@ from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from .interface import (
     InferenceOptimizerConfig,
+    SharedConfig,
     Stages,
     StrictInferenceOptimizerConfig,
     TransformConfig,
     TransformRegistry,
 )
-from .library.sharding import ShardingConfig
-
-
-class SharedConfig(BaseModel):
-    """Global config that shared between multiple transforms in the inference optimizer."""
-
-    sharding_config: ShardingConfig = Field(default_factory=ShardingConfig)
-    local_rank: int = Field(default=0)
-    world_size: int = Field(default=1)
 
 
 class InferenceOptimizer:
