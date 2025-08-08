@@ -105,9 +105,6 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
     optimizer.shared_config.world_size = world_size
     _ = optimizer(None, gm)
     detected_transformations = optimizer.shared_config.sharding_config.ep_transforms
-    # sharding_config = ShardingConfig()
-    # detect_ep_shard(gm, rank, world_size, sharding_config)
-    # detected_transformations = sharding_config.ep_transforms
 
     # Run pattern detection test
     run_sharding_pattern_detection_test(detected_transformations, expected_transformations)
