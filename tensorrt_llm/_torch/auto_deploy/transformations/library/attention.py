@@ -10,7 +10,7 @@ from torch.fx import GraphModule
 from ...custom_ops.attention_interface import AttentionDescriptor
 from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
-from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
+from ...utils.pattern_matcher import ADPatternMatcherPass, Match, register_ad_pattern
 from .._graph import canonicalize_graph, lift_to_meta
 
 
@@ -24,14 +24,13 @@ def _apply_pattern(
     patterns = ADPatternMatcherPass()
     register_fn(patterns)
     num_matches = patterns.apply(gm.graph)
-
     if num_matches > 0:
         with lift_to_meta(gm) if shape_prop else nullcontext():
             canonicalize_graph(gm, shape_prop=shape_prop)
     ad_logger.info(f"Found and matched {num_matches} {pattern_name} pattern(s)")
 
 
-def match_repeat_kv(gm: GraphModule) -> None:
+def match_repeat_kv(gm: GraphModule, accept_match_fn: Callable[[Match], bool]) -> None:
     """
     Match and replace the repeat_kv pattern with torch.ops.auto_deploy.torch_attention_repeat_kv.
     """
@@ -51,24 +50,25 @@ def match_repeat_kv(gm: GraphModule) -> None:
                 torch.ops.aten.expand.default: (int,),
             },
             scalar_workaround={"n_rep": dummy_args[1]},
+            extra_check=accept_match_fn,
         )
 
     _apply_pattern(gm, "Repeat KV", register_repeat_kv, shape_prop=True)
 
 
-def match_eager_attention(gm: GraphModule) -> None:
+def match_eager_attention(gm: GraphModule, accept_match_fn: Callable[[Match], bool]) -> None:
     """
     Match and replace the eager attention pattern with torch.ops.auto_deploy.torch_attention_sdpa.
     """
 
     def register_eager_attention(patterns: ADPatternMatcherPass):
         for pattern_config in _get_sfdp_patterns():
-            register_ad_pattern(**pattern_config, patterns=patterns)
+            register_ad_pattern(**pattern_config, patterns=patterns, extra_check=accept_match_fn)
 
     _apply_pattern(gm, "Eager Attention", register_eager_attention)
 
 
-def match_grouped_attention(gm: GraphModule) -> None:
+def match_grouped_attention(gm: GraphModule, accept_match_fn: Callable[[Match], bool]) -> None:
     """
     Match and replace the grouped attention pattern with
     torch.ops.auto_deploy.torch_attention_grouped_sdpa.
@@ -92,6 +92,7 @@ def match_grouped_attention(gm: GraphModule) -> None:
             patterns=patterns,
             dummy_args=dummy_args_1,
             scalar_workaround={"scale": scale, "dropout_p": dropout, "n_rep": n_rep},
+            extra_check=accept_match_fn,
         )
         register_ad_pattern(
             search_fn=_grouped_attn_pattern_2,
@@ -102,6 +103,7 @@ def match_grouped_attention(gm: GraphModule) -> None:
                 "scale": scale,
                 "dropout_p": dropout,
             },
+            extra_check=accept_match_fn,
         )
         register_ad_pattern(
             search_fn=_grouped_attn_pattern_3,
@@ -109,6 +111,7 @@ def match_grouped_attention(gm: GraphModule) -> None:
             patterns=patterns,
             dummy_args=dummy_args_1,
             scalar_workaround={"scale": scale, "dropout_p": dropout, "n_rep": n_rep},
+            extra_check=accept_match_fn,
         )
         register_ad_pattern(
             search_fn=_grouped_attn_pattern_4,
@@ -119,6 +122,7 @@ def match_grouped_attention(gm: GraphModule) -> None:
                 "scale": scale,
                 "dropout_p": dropout,
             },
+            extra_check=accept_match_fn,
         )
 
     _apply_pattern(gm, "Grouped Attention", register_grouped_attention)

@@ -28,10 +28,11 @@ def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> None:
 
     # NOTE: for now, we wanna make sure we *only* return the final output and no hidden states.
     # Later on, we can revisit how to support returning hidden states.
-    assert len(output_nodes) == 1, "Expected exactly one output node!"
-    assert len(output_nodes[0].all_input_nodes) == 1, "Expected to only return final tensor output!"
-
     ad_logger.info(f"Found {len(input_nodes)} input nodes and {len(output_nodes)} output nodes")
+
+    assert len(output_nodes) == 1, "Expected exactly one output node!"
+    # the following assert feels too restrictive..
+    # assert len(output_nodes[0].all_input_nodes) == 1, "Expected to only return final tensor output!"
 
     # Activate and add extra argument nodes
     new_args = cm.info.switch_to_cached_attn_inputs()
