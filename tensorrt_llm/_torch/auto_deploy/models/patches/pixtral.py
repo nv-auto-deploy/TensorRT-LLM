@@ -1,12 +1,10 @@
 """A patch for the PixtralVisionModel to make it compatible with torch.export."""
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from transformers.models.mistral3.modeling_mistral3 import Mistral3PatchMerger
 from transformers.models.pixtral.modeling_pixtral import (
-    generate_block_attention_mask,
     PixtralVisionModel,
+    generate_block_attention_mask,
     position_ids_in_meshgrid,
 )
 
@@ -18,6 +16,7 @@ from ...export.interface import BaseExportPatch, ExportPatchRegistry
 #       is a no-go.
 #    As such, pretty much only free-standing functions with tensor inputs are supported - instance
 #    methods cannot be decorated.
+
 
 @torch.library.custom_op("auto_deploy::process_pixtral_patch_embeds", mutates_args={})
 def _process_patch_embeds(
