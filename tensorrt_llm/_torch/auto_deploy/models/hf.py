@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from accelerate import init_empty_weights, load_checkpoint_in_model
+from accelerate import init_empty_weights
 from accelerate.utils import modeling
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
@@ -310,16 +310,58 @@ class AutoModelForCausalLMFactory(ModelFactory):
     def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
         """Load the checkpoint into the model."""
         # identify the most relevant checkpoint file
-        ckpt_file = self._get_checkpoint_file(self.model)
+        index_json_path = self._get_checkpoint_file(self.model)
+        checkpoint_dir = os.path.dirname(index_json_path)
+
+        # 2. Manually load and process the index file to map shards.
+        with open(index_json_path, "r") as f:
+            index_data = json.load(f)
+
+        weight_map = index_data["weight_map"]
+        from collections import defaultdict
+
+        from safetensors import safe_open
+
+        # Invert the map to group tensor names by the file they are in.
+        shards = defaultdict(list)
+        for tensor_name, shard_file in weight_map.items():
+            shards[shard_file].append(tensor_name)
+
+        # 3. Load all tensors from their respective shards into one dictionary.
+        state_dict = {}
+        for shard_file, tensor_names in shards.items():
+            shard_path = os.path.join(checkpoint_dir, shard_file)
+            # Use safe_open to efficiently load only the needed tensors from each shard.
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for tensor_name in tensor_names:
+                    state_dict[tensor_name] = f.get_tensor(tensor_name)
+
+        # 4. Perform the key remapping on the now fully assembled state_dict.
+        conversion_mapping = {
+            "^visual": "model.visual",
+            r"^model(?!\.(language_model|visual))": "model.language_model",
+        }
+        import re
+
+        keys_to_process = list(state_dict.keys())
+        for key in keys_to_process:
+            new_key = key
+            for pattern, replacement in conversion_mapping.items():
+                new_key = re.sub(pattern, replacement, new_key)
+
+            if new_key != key:
+                state_dict[new_key] = state_dict.pop(key)
+
         # reuse the load checkpoint utility from accelerate
-        with hf_load_state_dict_with_device(device):
-            # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
-            # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
-            # which collects local model params, syncs weights from checkpoint, and applies them via
-            # model.load_state_dict.
-            # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
-            # model-transformed weights,leading to unexpected key mismatches or format issues.
-            load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
+        # with hf_load_state_dict_with_device(device):
+        #     # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
+        #     # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
+        #     # which collects local model params, syncs weights from checkpoint, and applies them via
+        #     # model.load_state_dict.
+        #     # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
+        #     # model-transformed weights,leading to unexpected key mismatches or format issues.
+        #     load_checkpoint_in_model(model, checkpoint=state_dict, full_state_dict=False)
+        model.load_state_dict(state_dict)
 
     def _load_quantization_config(self, fetched_dir: str):
         """Load the quantization config from the model directory if not done already."""
