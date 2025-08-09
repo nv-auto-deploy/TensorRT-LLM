@@ -1,11 +1,9 @@
 """A patch for the PixtralVisionModel to make it compatible with torch.export."""
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from transformers.models.mistral3.modeling_mistral3 import Mistral3PatchMerger
 from transformers.models.pixtral.modeling_pixtral import (
-    generate_block_attention_mask,
+    PixtralRMSNorm,
     PixtralVisionModel,
     position_ids_in_meshgrid,
 )
@@ -18,6 +16,7 @@ from ...export.interface import BaseExportPatch, ExportPatchRegistry
 #       is a no-go.
 #    As such, pretty much only free-standing functions with tensor inputs are supported - instance
 #    methods cannot be decorated.
+
 
 @torch.library.custom_op("auto_deploy::process_pixtral_patch_embeds", mutates_args={})
 def _process_patch_embeds(
@@ -113,7 +112,6 @@ def generate_block_attention_mask(num_ids_per_image, tensor):
     dtype = tensor.dtype
     device = tensor.device
     seq_len = tensor.shape[1]
-    d_min = torch.finfo(dtype).min
 
     idx = torch.arange(seq_len, device=device)
     block_end_idx = num_ids_per_image.cumsum(-1)
@@ -189,6 +187,16 @@ def _patch_merger_forward(
     return image_features
 
 
+# Somehow there are dtype mismatches at runtime between bfloat16 and float32 without this.
+def _pixtral_rms_norm_forward(self, hidden_states):
+    # input_dtype = hidden_states.dtype
+    input_dtype = torch.bfloat16
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+    return self.weight * hidden_states.to(input_dtype)
+
+
 @ExportPatchRegistry.register("hf_pixtral_vit")
 class PixtralVisionModelPatch(BaseExportPatch):
     """Patch for `PixtralVisionModel`."""
@@ -198,6 +206,7 @@ class PixtralVisionModelPatch(BaseExportPatch):
         # Store original forward method
         self.original_values["PixtralVisionModel.forward"] = PixtralVisionModel.forward
         self.original_values["Mistral3PatchMerger.forward"] = Mistral3PatchMerger.forward
+        self.original_values["PixtralRMSNorm.forward"] = PixtralRMSNorm.forward
 
         # Apply patch by replacing the forward method
         PixtralVisionModel._original_forward = PixtralVisionModel.forward  # type: ignore
@@ -206,11 +215,15 @@ class PixtralVisionModelPatch(BaseExportPatch):
         Mistral3PatchMerger._original_forward = Mistral3PatchMerger.forward
         Mistral3PatchMerger.forward = _patch_merger_forward
 
+        PixtralRMSNorm._original_forward = PixtralRMSNorm.forward
+        PixtralRMSNorm.forward = _pixtral_rms_norm_forward
+
     def _revert_patch(self):
         """Revert the PixtralVisionModel patch."""
         # Restore original forward method.
         PixtralVisionModel.forward = self.original_values["PixtralVisionModel.forward"]  # type: ignore
         Mistral3PatchMerger.forward = self.original_values["Mistral3PatchMerger.forward"]
+        PixtralRMSNorm.forward = self.original_values["PixtralRMSNorm.forward"]
 
         # Clean up the temporary attribute.
         if hasattr(PixtralVisionModel, "_original_forward"):
@@ -218,3 +231,6 @@ class PixtralVisionModelPatch(BaseExportPatch):
 
         if hasattr(Mistral3PatchMerger, "_original_forward"):
             delattr(Mistral3PatchMerger, "_original_forward")
+
+        if hasattr(PixtralRMSNorm, "_original_forward"):
+            delattr(PixtralRMSNorm, "_original_forward")

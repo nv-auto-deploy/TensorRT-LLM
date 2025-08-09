@@ -163,6 +163,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # we want to recursively update model_config from model_kwargs here.
         model_config = self.autoconfig_from_pretrained(self.model, trust_remote_code=True)
         model_config = self._recursive_update_config(model_config, self.model_kwargs)
+        _propagate_dtype_to_subconfigs(model_config, ["vision_config", "text_config"])
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             model = self.automodel_from_config(model_config, trust_remote_code=True)
@@ -455,7 +456,7 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             input.
         """
 
-        def _get_dynamic_shape():
+        def _get_img_dynamic_shape():
             return {
                 # TODO (lucaslie): how to set default values for dynamic shapes?
                 0: Dim("img_batch_size", max=10),
@@ -463,10 +464,27 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
                 3: Dim("img_width", min=32, max=2048),
             }
 
+        # !! Somehow, during export, when `make_fake_inputs` is called, the `FakeTensor`
+        # corresponding to `image_sizes` is deduced to have a fixed shape (4, 2) - 4 coming from
+        # the `get_example_inputs` having 4 images across 2 requests, whereas the other tensors
+        # all are symbolically traced to have shapes where the dynamic shapes are reflected with
+        # `torch.SymInt`.
+        def _get_img_sizes_dynamic_shape():
+            return {
+                0: Dim("img_sizes_batch_size", max=10),
+            }
+
         none_pixel_values = torch.zeros(0, 3, 336, 336)
         return {
-            "pixel_values": (none_pixel_values, _get_dynamic_shape),
+            "pixel_values": (none_pixel_values, _get_img_dynamic_shape),
             # How to get this from the input processor? It seems there's no good way without
             # running a dummy input through the processor.
-            "image_sizes": (torch.zeros(0, 2), None),
+            "image_sizes": (torch.zeros(0, 2), _get_img_sizes_dynamic_shape),
         }
+
+
+def _propagate_dtype_to_subconfigs(model_config, subconfig_names: list[str]):
+    for name in subconfig_names:
+        config = getattr(model_config, name, None)
+        if config is not None:
+            config.torch_dtype = model_config.torch_dtype
