@@ -36,7 +36,13 @@ from ...utils.sharding_utils import (
     SplitDimension,
     TPShardingInfo,
 )
-from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 
 @TransformRegistry.register("sharding_transform_executor")
@@ -49,7 +55,11 @@ class ShardingTransformExecutor(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         # create a node dict for faster lookup
         node_dict = {n.name: n for n in gm.graph.nodes}
@@ -136,7 +146,11 @@ class ColumnRowShard(BaseTransform):
         return ColumnRowShardConfig
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
 
@@ -318,7 +332,11 @@ class DpBmmShard(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
         if world_size < 2:
@@ -392,7 +410,11 @@ class DpBmmShard(BaseTransform):
 @TransformRegistry.register("detect_ep_shard")
 class DetectEpShard(BaseTransform):
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
 

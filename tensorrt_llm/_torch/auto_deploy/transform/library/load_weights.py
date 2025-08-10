@@ -8,7 +8,13 @@ from torch.fx import GraphModule
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...transformations._graph import move_to_device
-from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 
 class LoadWeightsToDeviceConfig(TransformConfig):
@@ -31,7 +37,11 @@ class LoadWeightsToDevice(BaseTransform):
         return LoadWeightsToDeviceConfig
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory, shared_config
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         factory.load_or_random_init(
             gm, device=self.config.adconfig_checkpoint_device or self.config.device
