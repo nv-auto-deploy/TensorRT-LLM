@@ -12,7 +12,7 @@ from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..transform.optimizer import InferenceOptimizer as ModularInferenceOptimizer
 from ..utils.logger import ad_logger
-from .library import fuse_rmsnorm, insert_cached_attention, resize_kv_cache, update_in_out_nodes
+from .library import insert_cached_attention, resize_kv_cache, update_in_out_nodes
 
 
 class InferenceOptimizer:
@@ -63,10 +63,6 @@ class InferenceOptimizer:
         ############################################################################################
         # RUN POST-LOAD FUSION AND OPTIMIZATIONS
         ############################################################################################
-
-        # TODO (lucaslie): add backend selection as part of configurable inference optimizers
-        # check if we can fuse rmsnorm
-        fuse_rmsnorm(egm, "flashinfer")
 
         # visualize the final graph
         if self.ad_config.visualize:
