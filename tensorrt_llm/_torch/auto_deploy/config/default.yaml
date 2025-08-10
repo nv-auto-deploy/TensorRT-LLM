@@ -84,3 +84,14 @@ transforms:
   # check if we can fuse rmsnorm
   fuse_rmsnorm:
     stage: post_load_fusion
+  ############################################################################################
+  # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
+  ############################################################################################
+  update_in_out_nodes:
+    stage: cache_init
+  insert_cached_attention:
+    stage: cache_init
+  initialize_cache:
+    stage: cache_init
+  resize_kv_cache:
+    stage: cache_init

@@ -54,6 +54,7 @@ class SharedConfig(BaseModel):
     sharding_config: ShardingConfig = Field(default_factory=ShardingConfig)
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
+    attn_backend: str = Field(default="flashinfer", description="The attention backend to use.")
 
 
 class TransformConfig(BaseModel):
