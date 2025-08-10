@@ -277,13 +277,10 @@ class MoEPatternModel(nn.Module):
             torch.ops.auto_deploy.torch_quant_fp4_moe,
             0.05,
             0.01,
-            marks=[
-                pytest.mark.skipif(
-                    not fp4_compatible() or not trtllm_ops_available(),
-                    reason="Requires FP4 + TRTLLM support",
-                ),
-                pytest.mark.skip("https://nvbugs/5410946"),
-            ],
+            marks=pytest.mark.skipif(
+                not fp4_compatible() or not trtllm_ops_available(),
+                reason="Requires FP4 + TRTLLM support",
+            ),
             id="fp4",
         ),
     ],
