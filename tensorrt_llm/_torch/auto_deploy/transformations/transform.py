@@ -5,13 +5,11 @@ import gc
 import torch
 import torch.nn as nn
 
-from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
 from ..llm_args import AutoDeployConfig
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..transform.optimizer import InferenceOptimizer as ModularInferenceOptimizer
-from ..utils.logger import ad_logger
 
 
 class InferenceOptimizer:
@@ -64,43 +62,34 @@ class InferenceOptimizer:
         #     attn_descriptor = AttentionRegistry.get(a_backend)
         #     insert_cached_attention(egm, cm, attn_descriptor, self.factory.get_cache_config())
 
+        if "compile_model" in self.ad_config.transforms:
+            self.ad_config.transforms[
+                "compile_model"
+            ].cuda_graph_batch_sizes = self.ad_config.cuda_graph_batch_sizes
+            self.ad_config.transforms[
+                "compile_model"
+            ].compile_backend = self.ad_config.compile_backend
+
         new_optimizer = ModularInferenceOptimizer(self.factory, self.ad_config.transforms)
         # TODO: (hg) move this
         new_optimizer.shared_config.attn_backend = self.ad_config.attn_backend
 
         egm = new_optimizer(cm)
 
-        # visualize the final graph
-        if self.ad_config.visualize:
-            try:
-                from .library import visualize_namespace
+        # NOTE: (hg)Disabled visualization since compiled gm is a CapturedGraph instead of GraphModule.
+        # We can add a new stage in the optimizer to visualize the intermediate gm.
+        # if self.ad_config.visualize:
+        #     try:
+        #         from .library import visualize_namespace
 
-                visualize_namespace(egm, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
-                ad_logger.warning(
-                    "Please run `pip install -r examples/auto_deploy/requirements.txt` to visualize"
-                    " the graph."
-                )
-            except ImportError:
-                pass
-
-        ############################################################################################
-        # COMPILE MODEL
-        ############################################################################################
-
-        cm.info.set_generate_only_batch()
-        compiler_kwargs = {
-            "cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes,
-            "num_batched_inputs": 2,  # TODO (lucaslie): improve once we have a config system...
-        }
-        egm_compiled = compile_and_capture(
-            egm,
-            self.ad_config.compile_backend,
-            args=cm.args,
-            dynamic_shapes=cm.dynamic_shapes,
-            compiler_kwargs=compiler_kwargs,
-        )
-        cm.info.reset()
+        #         visualize_namespace(egm, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
+        #         ad_logger.warning(
+        #             "Please run `pip install -r examples/auto_deploy/requirements.txt` to visualize"
+        #             " the graph."
+        #         )
+        #     except ImportError:
+        #         pass
 
         torch.cuda.empty_cache()
         gc.collect()
-        return egm_compiled
+        return egm

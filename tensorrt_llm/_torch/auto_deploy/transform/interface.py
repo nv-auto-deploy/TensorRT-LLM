@@ -286,7 +286,10 @@ class BaseTransform(ABC):
         # update + store new meta data
         history[t_name] = info
         autodeploy_meta[self._history_key] = history
-        self._set_autodeploy_meta(gm, autodeploy_meta)
+
+        if isinstance(gm, GraphModule):
+            # After compilation, gm becomes type CapturedGraph with no meta data.
+            self._set_autodeploy_meta(gm, autodeploy_meta)
 
         # return the graph module
         return gm
