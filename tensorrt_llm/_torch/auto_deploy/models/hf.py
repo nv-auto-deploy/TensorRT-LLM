@@ -403,13 +403,12 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:
         """Return a dictionary of example inputs for the model."""
 
-        def _prep_seq(text, img1, img2):
+        def _prep_seq(text, *images):
             return [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": img1},
-                        {"type": "image", "image": img2},
+                        *({"type": "image", "image": img} for img in images),
                         {"type": "text", "text": text},
                     ],
                 }
@@ -419,13 +418,13 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         batch_messages = [
             _prep_seq(
                 "Describe what you see in the two images and their differences.",
-                Image.new("RGB", (64, 64), color=(128, 128, 128)),
-                Image.new("RGB", (64, 64), color=(64, 64, 64)),
+                Image.new("RGB", (512, 512), color=(128, 128, 128)),
+                # Image.new("RGB", (64, 64), color=(64, 64, 64)),
             ),
             _prep_seq(
                 "What are the main differences between these two images?",
-                Image.new("RGB", (64, 64), color=(255, 0, 0)),
-                Image.new("RGB", (64, 64), color=(0, 255, 0)),
+                Image.new("RGB", (512, 512), color=(255, 0, 0)),
+                # Image.new("RGB", (64, 64), color=(0, 255, 0)),
             ),
         ]
 
@@ -459,7 +458,7 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         def _get_img_dynamic_shape():
             return {
                 # TODO (lucaslie): how to set default values for dynamic shapes?
-                0: Dim("img_batch_size", max=10),
+                # 0: Dim("img_batch_size", max=10),
                 2: Dim("img_height", min=32, max=2048),
                 3: Dim("img_width", min=32, max=2048),
             }
@@ -471,15 +470,17 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         # `torch.SymInt`.
         def _get_img_sizes_dynamic_shape():
             return {
-                0: Dim("img_sizes_batch_size", max=10),
+                0: Dim("img_batch_size", max=10),
             }
 
-        none_pixel_values = torch.zeros(0, 3, 336, 336)
+        # none_pixel_values = torch.zeros(0, 3, 336, 336)
+        none_pixel_values = torch.zeros(0, 3, 532, 532)
         return {
             "pixel_values": (none_pixel_values, _get_img_dynamic_shape),
             # How to get this from the input processor? It seems there's no good way without
             # running a dummy input through the processor.
-            "image_sizes": (torch.zeros(0, 2), _get_img_sizes_dynamic_shape),
+            # "image_sizes": (torch.zeros(0, 2), _get_img_sizes_dynamic_shape),
+            "image_sizes": (torch.zeros(0, 2), None),
         }
 
 
