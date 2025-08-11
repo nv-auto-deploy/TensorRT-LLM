@@ -489,7 +489,7 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
                 14308, 1176
             ),  # Example shape for export (will be dynamic at runtime)
             "image_grid_thw": torch.tensor(
-                [[1, 98, 146]], dtype=torch.long
+                [[1, 98, 146], [1, 98, 146]], dtype=torch.long
             ),  # Example grid for export (will be dynamic at runtime)
         }
 
@@ -523,9 +523,9 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             }
 
         def image_grid_thw_dynamic_shape():
-            # TODO: add dynamic shape for image_grid_thw,
-            # the pytorch returned error when I change the first batch dim to dynamic
-            return {}
+            return {
+                0: Dim("_num_images", min=1, max=10),
+            }
 
         return {
             "pixel_values": (pixel_values_tensor, pixel_values_dynamic_shape),
