@@ -18,20 +18,23 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
 
 import math
 import operator
+import re
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from enum import IntEnum
 from functools import partial
-from typing import Callable, DefaultDict, Dict, List, Literal, Optional, Set
+from typing import Any, Callable, DefaultDict, Dict, List, Literal, Optional, Set
 
 import torch
 import torch.nn as nn
 from pydantic import BaseModel, ConfigDict, Field
 from torch.fx import GraphModule, Node
 
+from ...models.factory import ModelFactory, ShardingConfigSource
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     extract_param_names_from_lin_node,
+    filtered_nodes,
     identify_regions_between_residuals,
     is_linear_op,
     is_op,
@@ -44,8 +47,12 @@ from .._graph import canonicalize_graph
 class SplitDimension(IntEnum):
     """Enum for tensor split dimensions in sharding."""
 
-    ROW = 0  # Split along rows (first dimension)
-    COLUMN = 1  # Split along columns (second dimension)
+    # NOTE: The names COLUMN/ROW reflect the hugging face
+    # base_tp_plan sharding notation, but since we assume Y = W @ X^T,
+    # when splitting weight matrix W^T across columns, the actual split
+    # is over dimension 0
+    COLUMN = 0  # Split along columns (second dimension)
+    ROW = 1  # Split along rows (first dimension)
 
 
 class ShardingTransformInfo(BaseModel, ABC):
@@ -90,16 +97,16 @@ class TPShardingInfo(ShardingTransformInfo):
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
         if self.dist_op is not None:
-            if self.split_dim == SplitDimension.ROW:
+            if self.split_dim == SplitDimension.COLUMN:
                 if self.dist_op == "all_reduce":
                     ad_logger.warning(
-                        f"Row split is only supported for all_gather. Skipping {self}."
+                        f"Column split is only supported for all_gather. Skipping {self}."
                     )
                     return False
-            if self.split_dim == SplitDimension.COLUMN:
+            if self.split_dim == SplitDimension.ROW:
                 if self.dist_op == "all_gather":
                     ad_logger.warning(
-                        f"Column split is only supported for all_reduce. Skipping {self}."
+                        f"Row split is only supported for all_reduce. Skipping {self}."
                     )
                     return False
         return True
@@ -248,9 +255,259 @@ class EPShardingInfo(ShardingTransformInfo):
 class ShardingConfig(BaseModel):
     """Configuration for sharding the model."""
 
+    factory_source: ShardingConfigSource
+    rank: int
+    world_size: int
+    _predefined_config: Optional[Dict[str, Any]] = None
+    simple_shard_only: bool = False
+    use_sharding_from_factory: bool = False
     tp_transforms: List[TPShardingInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
+
+    def __init__(
+        self,
+        rank: int,
+        world_size: int,
+        factory_source: ShardingConfigSource = ShardingConfigSource.UNKNOWN,
+        sharding_config: Dict[str, Any] = None,
+        simple_shard_only: bool = False,
+        use_sharding_from_factory: bool = False,
+    ):
+        super().__init__(
+            factory_source=factory_source,
+            rank=rank,
+            world_size=world_size,
+            _predefined_config=sharding_config,
+            simple_shard_only=simple_shard_only,
+            use_sharding_from_factory=use_sharding_from_factory,
+        )
+
+        # Pydantic does not support setting private fields directly.
+        self._predefined_config = sharding_config
+        # Validate the config after initialization
+        if self._predefined_config is not None:
+            self.validate_config()
+
+    def validate_config(self) -> bool:
+        if self.factory_source != ShardingConfigSource.HUGGINGFACE:
+            ad_logger.warning(
+                "Sharding config is is currently only " + "supported for HuggingFace. Skipping."
+            )
+            # invalidate the config
+            self._predefined_config = {}
+            return False
+
+        if not isinstance(self._predefined_config, dict):
+            ad_logger.warning("Sharding config is not a dictionary. Skipping.")
+            # invalidate the config
+            self._predefined_config = {}
+            return False
+
+        if "head_dim" not in self._predefined_config:
+            ad_logger.warning("Sharding config does not contain head_dim. Skipping.")
+            # invalidate the config
+            self._predefined_config = {}
+            return False
+
+        if "tp_plan" not in self._predefined_config:
+            ad_logger.warning("Sharding config does not contain tp_plan. Skipping.")
+            # invalidate the config
+            self._predefined_config = {}
+            return False
+        tp_plan = self._predefined_config["tp_plan"]
+
+        values = set(tp_plan.values())
+        allowed_values = {
+            "colwise",  # row split and no collective
+            "rowwise",  # column split and all-reduce
+            "gather",  # simple shard (row + all_gather)
+            # TODO: remaining values are not supported yet.
+            # They require hybrid EP+TP and/or SP support.
+            # "sequence_parallel", # sequence parallelism
+            # "local_colwise",
+            # "local_rowwise",
+            # "local_packed_rowwise",
+            # "local",
+        }
+        if not values.issubset(allowed_values):
+            ad_logger.warning("Sharding config contains invalid values. Skipping.")
+            # invalidate the config
+            self._predefined_config = {}
+            return False
+        return True
+
+    def get_predefined_config(self) -> Dict[str, Any]:
+        return self._predefined_config
+
+
+def detect_sharding_from_factory_config(
+    gm: GraphModule,
+    sharding_config: ShardingConfig,
+) -> None:
+    """
+    Create sharding transformations from the predefined config.
+    TODO: currently, it applies only to TP sharding.
+    Args:
+        gm: Graph module to apply transformations to
+        sharding_config: Predefined sharding configuration
+    """
+    # check if config is valid.
+    # 1. it is a Dict[str, str]
+    # 2. the keys are of format "module.submodule.subsubmodule..."
+    # 3. the wildcard "*" is allowed in the keys
+    # 4. the allowed values are:
+    #   - "colwise"
+    #   - "rowwise"
+    #   - "sequence_parallel"
+    #   - "local_colwise"
+    #   - "local_rowwise"
+    #   - "local"
+    #   - "gather"
+    # The following constraints are based on
+    # https://github.com/huggingface/transformers/blob/d8e05951b8efd4880acca9a3f291e8b65841a86d/src/transformers/models/llama4/configuration_llama4.py#L249
+
+    factory_config = sharding_config.get_predefined_config()
+    head_dim = factory_config["head_dim"]
+    tp_plan = factory_config["tp_plan"]
+
+    rank, world_size = sharding_config.rank, sharding_config.world_size
+
+    # If the node is inside the attention module, we need to set min_local_shape to the
+    # head_dim - otherwise, we would risk splitting the heads into smaller shards.
+    # TODO: is there a better way to check if we are in attention module?
+    attn_names = [
+        "attention",
+        "Attention",
+        "attn",
+        "Attn",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+    ]
+
+    for lin_node in filtered_nodes(gm.graph.nodes, is_linear_op):
+        # use node's weight name to get the module name
+        module_name = lin_node.args[1].target
+
+        if any(attn_name in module_name for attn_name in attn_names):
+            min_local_shape = head_dim
+        else:
+            min_local_shape = 1
+
+        # use regex to find if module_name matches any of the keys in sharding_config
+        for key in tp_plan.keys():
+            pattern_string = "*" + key + "*"
+            # convert it to regex. Escape dots, replace * with .*
+            # First, we substitute * with an unlikely character, e.g. @
+            # Then we escape dots, and finally we replace @ with .*
+            pattern_string = pattern_string.replace("*", "@")
+            pattern_regex = re.escape(pattern_string).replace("@", ".*")
+            if re.match(pattern_regex, module_name):
+                # we have a match. Get the config for this layer
+                config = tp_plan[key]
+                if config == "colwise":
+                    sharding_config.tp_transforms.append(
+                        TPShardingInfo(
+                            target_node=lin_node.name,
+                            split_dim=SplitDimension.COLUMN,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op=None,
+                            min_local_shape=min_local_shape,
+                        )
+                    )
+                elif config == "rowwise":
+                    sharding_config.tp_transforms.append(
+                        TPShardingInfo(
+                            target_node=lin_node.name,
+                            split_dim=SplitDimension.ROW,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op="all_reduce",
+                            min_local_shape=min_local_shape,
+                        )
+                    )
+                elif "sequence" in config:
+                    # TODO: Sequence parallelism is not supported yet.
+                    ad_logger.warning("Sequence parallelism is not supported yet. Skipping.")
+                elif "local" in config:
+                    # TODO: local refers to hybrid EP+TP parallelism. Not supported yet.
+                    ad_logger.warning("Local EP+TP sharding is not supported yet. Skipping.")
+                elif "gather" in config:
+                    # Simple shard (row + all_gather)
+                    sharding_config.tp_transforms.append(
+                        TPShardingInfo(
+                            target_node=lin_node.name,
+                            split_dim=SplitDimension.COLUMN,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op="all_gather",
+                            min_local_shape=1,
+                        )
+                    )
+                else:
+                    ad_logger.warning("Invalid sharding config. Skipping.")
+                # after successful match, break the loop
+                break
+
+
+def simple_shard_first_n_layers(sharding_config: ShardingConfig, n_layers: int) -> None:
+    """
+    Simple shard the first n layers.
+    1. Take the existing config sharding_config.predefined_config,
+    2. Search for lines with wildcard "*",
+    3. Prepend to the top of the config list the same lines with "0, 1, ..., n_layers-1"
+    # instead of "*".
+    """
+    new_tp_plan = {}
+    factory_config = sharding_config.get_predefined_config()
+    for layer_pattern, config in factory_config["tp_plan"].items():
+        if "*" in layer_pattern:
+            # Create new dict with first n_layers entries first
+
+            for i in range(n_layers):
+                new_tp_plan[layer_pattern.replace("*", str(i))] = "gather"
+
+        # Add the default config after
+        new_tp_plan[layer_pattern] = config
+
+    sharding_config._predefined_config["tp_plan"] = new_tp_plan
+
+
+def simple_shard_last_n_layers(sharding_config: ShardingConfig, n_layers: int) -> None:
+    """
+    Simple shard the last n layers.
+    1. Take the existing config sharding_config.predefined_config,
+    2. Search for lines with wildcard "*",
+    3. Prepend to the top of the config list the same lines with "0, 1, ..., n_layers-1"
+    # instead of "*".
+    """
+    new_tp_plan = {}
+    factory_config = sharding_config.get_predefined_config()
+    num_layers = factory_config["num_hidden_layers"]
+    for layer_pattern, config in factory_config["tp_plan"].items():
+        if "*" in layer_pattern:
+            # Create new dict with first n_layers entries first
+
+            for i in range(num_layers - n_layers, num_layers):
+                new_tp_plan[layer_pattern.replace("*", str(i))] = "gather"
+
+        # Add the default config after
+        new_tp_plan[layer_pattern] = config
+    sharding_config._predefined_config["tp_plan"] = new_tp_plan
+
+
+def simple_shard_attention_layers(sharding_config: ShardingConfig) -> None:
+    """
+    If any key in tp_plan contains "attention", replace it with "gather"
+    """
+    for layer_pattern, config in sharding_config._predefined_config["tp_plan"].items():
+        if any(
+            attn_name in layer_pattern for attn_name in ["attention", "Attention", "attn", "Attn"]
+        ):
+            sharding_config._predefined_config["tp_plan"][layer_pattern] = "gather"
 
 
 def sharding_transform_executor(gm: GraphModule, sharding_config: ShardingConfig) -> None:
@@ -460,7 +717,7 @@ def _append_simple_shard(
             tp_shards.append(
                 TPShardingInfo(
                     target_node=n.name,
-                    split_dim=SplitDimension.ROW,
+                    split_dim=SplitDimension.COLUMN,
                     rank=rank,
                     world_size=world_size,
                     dist_op="all_gather",
@@ -470,12 +727,49 @@ def _append_simple_shard(
     sharding_config.tp_transforms.extend(tp_shards)
 
 
+def detect_sharding(
+    gm: GraphModule,
+    factory: ModelFactory,
+    local_rank: int,
+    world_size: int,
+    simple_shard_only: bool,
+    use_sharding_from_factory: bool,
+) -> ShardingConfig:
+    sharding_config = ShardingConfig(
+        local_rank,
+        world_size,
+        factory.get_sharding_config_source(),
+        factory.get_sharding_config(),
+        simple_shard_only,
+        use_sharding_from_factory,
+    )
+    if world_size < 2:
+        ad_logger.info("Skipping sharding for single device")
+        return sharding_config
+    if (
+        sharding_config.use_sharding_from_factory
+        and len(sharding_config.get_predefined_config()) > 0
+    ):
+        ad_logger.info("Applying sharding from config")
+        detect_sharding_from_factory_config(gm, sharding_config)
+        return sharding_config
+
+    ad_logger.info("Running autodeploy sharding heuristics")
+    # run TP sharding across ranks
+    detect_column_row_shard(gm, sharding_config)
+
+    # run EP sharding across ranks
+    detect_ep_shard(gm, sharding_config)
+
+    # run BMM sharding across ranks
+    detect_dp_bmm_shard(gm, sharding_config)
+
+    return sharding_config
+
+
 def detect_column_row_shard(
     gm: GraphModule,
-    rank: int,
-    world_size: int,
     sharding_config: ShardingConfig,
-    simple_shard_only: bool = False,
 ) -> None:
     """A transformation to apply sharding to the model following tensor parallelism.
 
@@ -495,11 +789,14 @@ def detect_column_row_shard(
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
 
+    rank, world_size = sharding_config.rank, sharding_config.world_size
     if world_size < 2:
-        ad_logger.info("Skipping sharding for single device")
+        ad_logger.info("Skipping TP sharding for single device")
         return
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
+
+    ad_logger.info("Running TP sharding detection")
 
     # find boundary nodes of regions we want to shard
     boundary_nodes = identify_regions_between_residuals(gm)
@@ -571,7 +868,7 @@ def detect_column_row_shard(
 
         num_shards += 1
 
-        if simple_shard_only:
+        if sharding_config.simple_shard_only:
             ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
             _append_simple_shard(nodes_linear, rank, world_size, sharding_config)
             continue
@@ -648,9 +945,7 @@ def detect_column_row_shard(
     ad_logger.info(f"Found {num_shards} TP shards")
 
 
-def detect_dp_bmm_shard(
-    gm: GraphModule, rank: int, world_size: int, sharding_config: ShardingConfig
-) -> None:
+def detect_dp_bmm_shard(gm: GraphModule, sharding_config: ShardingConfig) -> None:
     """A transformation to apply sharding to batched matrix multiplications in the graph.
 
     We'll shard the BMM nodes by slicing the batch dimension of input tensors into world_size number of slices.
@@ -660,9 +955,9 @@ def detect_dp_bmm_shard(
     We'll also assume that the inputs to BMM are broadcasted across the devices already.
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
-
+    rank, world_size = sharding_config.rank, sharding_config.world_size
     if world_size < 2:
-        ad_logger.info("Skipping sharding for single device")
+        ad_logger.info("Skipping DP BMM sharding for single device")
         return
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
@@ -728,13 +1023,12 @@ def detect_dp_bmm_shard(
     ad_logger.info(f"Found {num_bmm_shards} BMM shards")
 
 
-def detect_ep_shard(
-    gm: GraphModule, rank: int, world_size: int, sharding_config: ShardingConfig
-) -> None:
+def detect_ep_shard(gm: GraphModule, sharding_config: ShardingConfig) -> None:
     ad_logger.debug("Before sharding graph: " + str(gm))
 
+    rank, world_size = sharding_config.rank, sharding_config.world_size
     if world_size < 2:
-        ad_logger.info("Skipping sharding for single device")
+        ad_logger.info("Skipping EP sharding for single device")
         return
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"

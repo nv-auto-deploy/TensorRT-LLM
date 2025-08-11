@@ -1005,8 +1005,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             enable_partial_reuse=self.enable_partial_reuse,
             copy_on_partial_reuse=self.copy_on_partial_reuse,
             use_uvm=self.use_uvm,
-            attention_dp_events_gather_period_ms=self.
-            attention_dp_events_gather_period_ms,
+            # attention_dp_events_gather_period_ms=self.
+            # attention_dp_events_gather_period_ms,
         )
 
 

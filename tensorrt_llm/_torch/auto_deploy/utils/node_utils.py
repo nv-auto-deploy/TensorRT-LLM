@@ -2,7 +2,7 @@
 
 import operator
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Tuple, Union
+from typing import Callable, Iterable, List, Optional, Tuple, Union, overload
 
 import torch
 from torch._ops import OpOverload, OpOverloadPacket
@@ -206,35 +206,61 @@ def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
     return is_match
 
 
+@overload
+def filtered_nodes(nodes: Iterable[Node], target: Callable[[Node], bool]) -> Iterable[Node]:
+    """Overload for filtering with a callable target function."""
+    ...
+
+
+@overload
 def filtered_nodes(
     nodes: Iterable[Node], ops: Union[OperatorLike, Iterable[OperatorLike]]
 ) -> Iterable[Node]:
-    """Iterate over nodes that are filtered by the given operations.
+    """Overload for filtering with operation(s)."""
+    ...
+
+
+def filtered_nodes(
+    nodes: Iterable[Node],
+    target: Union[Callable[[Node], bool], Union[OperatorLike, Iterable[OperatorLike]]] = None,
+    ops: Union[OperatorLike, Iterable[OperatorLike]] = None,
+) -> Iterable[Node]:
+    """Iterate over nodes that are filtered by the given operations or target function.
 
     This utility function simplifies the common pattern of iterating through nodes
-    and filtering by operation type.
+    and filtering by operation type or custom function.
 
     Args:
         nodes: Iterable of nodes to filter (e.g., gm.graph.nodes)
         ops: Operation(s) to match against
 
     Yields:
-        Node: Nodes that match the given operations
+        Node: Nodes that match the given operations or target function
 
     Example:
-        # Instead of:
-        for node in gm.graph.nodes:
-            if not is_op(node, torch.ops.aten.linear):
-                continue
+        # Using callable function:
+        for node in filtered_nodes(gm.graph.nodes, is_linear_op):
             # process node
 
-        # Use:
-        for node in filtered_nodes(gm.graph.nodes, torch.ops.aten.linear):
+        # Using operations:
+        for node in filtered_nodes(gm.graph.nodes, ops=torch.ops.aten.linear):
+            # process node
+
+        # Using multiple operations:
+        for node in filtered_nodes(gm.graph.nodes, ops=[torch.ops.aten.linear, torch.ops.aten.bmm]):
             # process node
     """
-    for node in nodes:
-        if is_op(node, ops):
-            yield node
+    # Handle the case where target is a callable function
+    if callable(target) and not isinstance(target, (OpOverloadPacket, OpOverload)):
+        for node in nodes:
+            if target(node):
+                yield node
+    else:
+        # Handle the case where target or ops contains operations
+        operations = ops if ops is not None else target
+        for node in nodes:
+            if is_op(node, operations):
+                yield node
 
 
 def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
