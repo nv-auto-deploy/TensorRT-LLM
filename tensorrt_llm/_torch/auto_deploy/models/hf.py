@@ -474,13 +474,13 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             }
 
         # none_pixel_values = torch.zeros(0, 3, 336, 336)
-        none_pixel_values = torch.zeros(0, 3, 532, 532)
+        none_pixel_values = torch.zeros(2, 3, 532, 532)
         return {
             "pixel_values": (none_pixel_values, _get_img_dynamic_shape),
             # How to get this from the input processor? It seems there's no good way without
             # running a dummy input through the processor.
             # "image_sizes": (torch.zeros(0, 2), _get_img_sizes_dynamic_shape),
-            "image_sizes": (torch.zeros(0, 2), None),
+            "image_sizes": (torch.zeros(2, 2), None),
         }
 
 

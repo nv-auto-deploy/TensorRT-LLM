@@ -47,14 +47,14 @@ def _process_patch_embeds_meta(
     hidden_size: int,
     max_widht: int,
 ):
-    B = (image_sizes // patch_size).prod(dim=1).sum()
+    # B = (image_sizes // patch_size).prod(dim=1).sum()
     device = patch_embeds.device
     return (
         # Leading 1 = `unsqueeze(0)`.
         # The symbolic tracing will actually not complain if `1` is missing - I guess because
         # the number of elements in the underlying tensor is the same?
-        torch.empty(1, B, hidden_size, device=device),
-        torch.empty(hidden_size, device=device, dtype=torch.int64),
+        torch.empty(1, 2888, hidden_size, device=device),
+        torch.empty(2888, device=device, dtype=torch.int64),
     )
 
 
@@ -157,6 +157,8 @@ def _unfold_to_2d_grid(
         permuted_tensor.append(grid)
 
     image_features = torch.cat(permuted_tensor, dim=0)
+
+    return image_features
 
 
 @_unfold_to_2d_grid.register_fake
