@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from accelerate import init_empty_weights, load_checkpoint_in_model
+from accelerate import init_empty_weights
 from accelerate.utils import modeling
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
@@ -163,6 +163,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # we want to recursively update model_config from model_kwargs here.
         model_config = self.autoconfig_from_pretrained(self.model, trust_remote_code=True)
         model_config = self._recursive_update_config(model_config, self.model_kwargs)
+        _propagate_dtype_to_subconfigs(model_config, ["vision_config", "text_config"])
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             model = self.automodel_from_config(model_config, trust_remote_code=True)
@@ -309,17 +310,50 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
     def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
         """Load the checkpoint into the model."""
-        # identify the most relevant checkpoint file
-        ckpt_file = self._get_checkpoint_file(self.model)
-        # reuse the load checkpoint utility from accelerate
-        with hf_load_state_dict_with_device(device):
-            # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
-            # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
-            # which collects local model params, syncs weights from checkpoint, and applies them via
-            # model.load_state_dict.
-            # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
-            # model-transformed weights,leading to unexpected key mismatches or format issues.
-            load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
+        index_json_path = self._get_checkpoint_file(self.model)
+        checkpoint_dir = os.path.dirname(index_json_path)
+
+        # 2. Manually load and process the index file to map shards.
+        with open(index_json_path, "r") as f:
+            index_data = json.load(f)
+
+        weight_map = index_data["weight_map"]
+        from collections import defaultdict
+
+        from safetensors import safe_open
+
+        # Invert the map to group tensor names by the file they are in.
+        shards = defaultdict(list)
+        for tensor_name, shard_file in weight_map.items():
+            shards[shard_file].append(tensor_name)
+
+        # 3. Load all tensors from their respective shards into one dictionary.
+        state_dict = {}
+        for shard_file, tensor_names in shards.items():
+            shard_path = os.path.join(checkpoint_dir, shard_file)
+            # Use safe_open to efficiently load only the needed tensors from each shard.
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for tensor_name in tensor_names:
+                    state_dict[tensor_name] = f.get_tensor(tensor_name)
+
+        # 4. Perform the key remapping on the now fully assembled state_dict.
+        conversion_mapping = {
+            "^language_model.model": "model.language_model",
+            "^vision_tower": "model.vision_tower",
+            "^multi_modal_projector": "model.multi_modal_projector",
+            "^language_model.lm_head": "lm_head",
+        }
+        import re
+
+        keys_to_process = list(state_dict.keys())
+        for key in keys_to_process:
+            new_key = key
+            for pattern, replacement in conversion_mapping.items():
+                new_key = re.sub(pattern, replacement, new_key)
+
+            if new_key != key:
+                state_dict[new_key] = state_dict.pop(key)
+        model.load_state_dict(state_dict)
 
     def _load_quantization_config(self, fetched_dir: str):
         """Load the quantization config from the model directory if not done already."""
@@ -384,6 +418,8 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         pixel_values: torch.Tensor,
+        # How to get this programmatically?
+        image_sizes: torch.Tensor,
     ):
         """A simple forward pass for the model to functionalize the args.
 
@@ -394,18 +430,18 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             input_ids=input_ids,
             position_ids=position_ids,
             pixel_values=pixel_values,
+            image_sizes=image_sizes,
         )
 
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:
         """Return a dictionary of example inputs for the model."""
 
-        def _prep_seq(text, img1, img2):
+        def _prep_seq(text, *images):
             return [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": img1},
-                        {"type": "image", "image": img2},
+                        *({"type": "image", "image": img} for img in images),
                         {"type": "text", "text": text},
                     ],
                 }
@@ -415,13 +451,13 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         batch_messages = [
             _prep_seq(
                 "Describe what you see in the two images and their differences.",
-                Image.new("RGB", (16, 16), color=(128, 128, 128)),
-                Image.new("RGB", (16, 16), color=(64, 64, 64)),
+                Image.new("RGB", (512, 512), color=(128, 128, 128)),
+                # Image.new("RGB", (64, 64), color=(64, 64, 64)),
             ),
             _prep_seq(
                 "What are the main differences between these two images?",
-                Image.new("RGB", (16, 16), color=(255, 0, 0)),
-                Image.new("RGB", (16, 16), color=(0, 255, 0)),
+                Image.new("RGB", (512, 512), color=(255, 0, 0)),
+                # Image.new("RGB", (64, 64), color=(0, 255, 0)),
             ),
         ]
 
@@ -437,8 +473,9 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         )
 
         return {
-            "input_ids": inputs["input_ids"],
-            "pixel_values": inputs["pixel_values"],
+            # "input_ids": inputs["input_ids"],
+            # "pixel_values": inputs["pixel_values"],
+            **inputs
         }
 
     def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, DynamicShapeCallback]]:
@@ -451,7 +488,7 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             input.
         """
 
-        def _get_dynamic_shape():
+        def _get_img_dynamic_shape():
             return {
                 # TODO (lucaslie): how to set default values for dynamic shapes?
                 0: Dim("img_batch_size", max=10),
@@ -459,5 +496,29 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
                 3: Dim("img_width", min=32, max=2048),
             }
 
-        none_pixel_values = torch.zeros(0, 3, 336, 336)
-        return {"pixel_values": (none_pixel_values, _get_dynamic_shape)}
+        # !! Somehow, during export, when `make_fake_inputs` is called, the `FakeTensor`
+        # corresponding to `image_sizes` is deduced to have a fixed shape (4, 2) - 4 coming from
+        # the `get_example_inputs` having 4 images across 2 requests, whereas the other tensors
+        # all are symbolically traced to have shapes where the dynamic shapes are reflected with
+        # `torch.SymInt`.
+        def _get_img_sizes_dynamic_shape():
+            return {
+                0: Dim("img_batch_size", max=10),
+            }
+
+        # none_pixel_values = torch.zeros(0, 3, 336, 336)
+        none_pixel_values = torch.zeros(2, 3, 532, 532)
+        return {
+            "pixel_values": (none_pixel_values, _get_img_dynamic_shape),
+            # How to get this from the input processor? It seems there's no good way without
+            # running a dummy input through the processor.
+            "image_sizes": (torch.zeros(2, 2), _get_img_sizes_dynamic_shape),
+            # "image_sizes": (torch.zeros(2, 2), None),
+        }
+
+
+def _propagate_dtype_to_subconfigs(model_config, subconfig_names: list[str]):
+    for name in subconfig_names:
+        config = getattr(model_config, name, None)
+        if config is not None:
+            config.torch_dtype = model_config.torch_dtype

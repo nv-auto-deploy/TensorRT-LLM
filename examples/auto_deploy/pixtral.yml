@@ -1,0 +1,29 @@
+args:
+  model: mistralai/Mistral-Small-3.1-24B-Instruct-2503
+  world_size: 0
+  runtime: demollm # or: trtllm
+  compile_backend: torch-simple # not tested: torch-compile, torch-opt
+  attn_page_size: 64
+  max_input_len: 4096
+  max_seq_len: 8192
+  attn_backend: flashinfer
+  model_factory: AutoModelForImageTextToText
+  # skip_loading_weights: true
+  # uncomment below to quickly initialize/load a smaller, random weight model
+  skip_loading_weights: false
+  model_kwargs:
+    text_config:
+      _attn_implementation: eager
+    vision_config:
+      _attn_implementation: sdpa
+prompt:
+  batch_size: 1
+  queries:
+    - - role: user
+        content:
+          - type: text
+            text: Please describe the natural scenery you see in the following images
+          - type: image
+            url: https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png
+          - type: image
+            url: https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png

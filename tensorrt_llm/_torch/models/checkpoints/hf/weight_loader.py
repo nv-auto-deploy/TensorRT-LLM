@@ -24,6 +24,9 @@ class HfWeightLoader(BaseWeightLoader):
 
     def load_weights(self, checkpoint_dir: str) -> dict[str, Any]:
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
+        print(f"==== BEFORE: {len(weight_files)}")
+        weight_files = [x for x in weight_files if "consolidated" not in x]
+        print(f"==== AFTER: {len(weight_files)}")
         if weight_files:
             # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
             # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
