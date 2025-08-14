@@ -56,7 +56,7 @@ def _process_patch_embeds_meta(
         # The symbolic tracing will actually not complain if `1` is missing - I guess because
         # the number of elements in the underlying tensor is the same?
         torch.empty(1, B, hidden_size, device=device),
-        torch.empty(2888, device=device, dtype=torch.int64),
+        torch.empty(B, device=device, dtype=torch.int64),
     )
 
 
@@ -85,6 +85,11 @@ def _pixtral_forward(
     )
 
     patch_embeds = self.ln_pre(patch_embeds)
+
+    # Constrain sequence length to be size-like and > 1 for export guards.
+    _seq_len = patch_embeds.shape[1]
+    torch._check_is_size(_seq_len)
+    torch._check(_seq_len > 1)
 
     kwargs["position_ids"] = position_ids
 
