@@ -11,6 +11,35 @@ from transformers.models.mistral3.modeling_mistral3 import (
 from ...export.interface import BaseExportPatch, ExportPatchRegistry
 
 
+def _patched_m3_get_image_features_flat(
+    self,
+    pixel_values: torch.FloatTensor,
+    image_sizes: torch.Tensor,
+    vision_feature_layer: Optional[Union[int, list[int]]] = None,
+    **kwargs,
+):
+    vision_feature_layer = (
+        vision_feature_layer
+        if vision_feature_layer is not None
+        else self.config.vision_feature_layer
+    )
+
+    kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    image_outputs = self.vision_tower(
+        pixel_values, image_sizes=image_sizes, output_hidden_states=True, **kwargs
+    )
+
+    if isinstance(vision_feature_layer, int):
+        selected_image_feature = image_outputs.hidden_states[vision_feature_layer]
+    else:
+        hs_pool = [image_outputs.hidden_states[layer_idx] for layer_idx in vision_feature_layer]
+        selected_image_feature = torch.cat(hs_pool, dim=-1)
+
+    image_features = self.multi_modal_projector(selected_image_feature.squeeze(0), image_sizes)
+    image_features = image_features.squeeze(0)
+    return image_features
+
+
 def _mistral_forward(
     self,
     input_ids: torch.LongTensor = None,
@@ -75,7 +104,10 @@ def _mistral_forward(
             vision_feature_layer=vision_feature_layer,
             image_sizes=image_sizes,
         )
-        image_features = torch.cat(image_features, dim=0)
+        # HF returns a list of tensors; our patch may already return a single tensor.
+        # Only concatenate when a list/tuple is returned.
+        if isinstance(image_features, (list, tuple)):
+            image_features = torch.cat(image_features, dim=0)
 
         special_image_mask = (input_ids == self.config.image_token_id).unsqueeze(-1)
         special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -131,15 +163,18 @@ class Mistral3ModelPatch(BaseExportPatch):
         """Apply the Mistral3Model patch."""
         # Store original forward method
         self.original_values["Mistral3Model.forward"] = Mistral3Model.forward
+        self.original_values["Mistral3Model.get_image_features"] = Mistral3Model.get_image_features
 
         # Apply patch by replacing the forward method
         Mistral3Model._original_forward = Mistral3Model.forward  # type: ignore
         Mistral3Model.forward = _mistral_forward  # type: ignore
+        Mistral3Model.get_image_features = _patched_m3_get_image_features_flat
 
     def _revert_patch(self):
         """Revert the Mistral3Model patch."""
         # Restore original forward method.
         Mistral3Model.forward = self.original_values["Mistral3Model.forward"]  # type: ignore
+        Mistral3Model.get_image_features = self.original_values["Mistral3Model.get_image_features"]
 
         # Clean up the temporary attribute.
         if hasattr(Mistral3Model, "_original_forward"):

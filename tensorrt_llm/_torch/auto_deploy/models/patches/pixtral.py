@@ -26,10 +26,12 @@ def _process_patch_embeds(
     hidden_size: int,
     max_width: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    patch_embeds_list = [
-        embed[..., : (size[0] // patch_size), : (size[1] // patch_size)]
-        for embed, size in zip(patch_embeds, image_sizes)
-    ]
+    patch_embeds_list = []
+    for embed, size in zip(patch_embeds, image_sizes):
+        # size is a 1-D tensor [H, W]; convert to Python ints for indexing
+        h = int((size[0] // patch_size).item())
+        w = int((size[1] // patch_size).item())
+        patch_embeds_list.append(embed[..., :h, :w])
 
     # flatten to a single sequence
     patch_embeds = torch.cat([p.flatten(1).T for p in patch_embeds_list], dim=0).unsqueeze(0)
@@ -47,13 +49,13 @@ def _process_patch_embeds_meta(
     hidden_size: int,
     max_widht: int,
 ):
-    # B = (image_sizes // patch_size).prod(dim=1).sum()
+    B = (image_sizes // patch_size).prod(dim=1).sum()
     device = patch_embeds.device
     return (
         # Leading 1 = `unsqueeze(0)`.
         # The symbolic tracing will actually not complain if `1` is missing - I guess because
         # the number of elements in the underlying tensor is the same?
-        torch.empty(1, 2888, hidden_size, device=device),
+        torch.empty(1, B, hidden_size, device=device),
         torch.empty(2888, device=device, dtype=torch.int64),
     )
 
@@ -111,22 +113,21 @@ def _pixtral_forward(
 def generate_block_attention_mask(num_ids_per_image, tensor):
     dtype = tensor.dtype
     device = tensor.device
-    seq_len = tensor.shape[1]
 
-    idx = torch.arange(seq_len, device=device)
-    block_end_idx = num_ids_per_image.cumsum(-1)
-    block_start_idx = torch.cat(
-        [
-            num_ids_per_image.new_zeros((1,)),
-            num_ids_per_image[:-1],
-        ]
-    ).cumsum(-1)
+    if not isinstance(num_ids_per_image, torch.Tensor):
+        num_ids_per_image = torch.as_tensor(num_ids_per_image, device=device, dtype=torch.long)
+    else:
+        num_ids_per_image = num_ids_per_image.to(device=device, dtype=torch.long)
 
-    # Build a mask where positions outside each [start, end) block are 1, inside are 0.
-    mask = torch.ones((seq_len, seq_len), device=device, dtype=dtype)
-    for start, end in zip(block_start_idx, block_end_idx):
-        block = (idx >= start) & (idx < end)
-        mask[block.unsqueeze(0) & block.unsqueeze(1)] = 0
+    # Build per-token block ids: [0 repeated n0, 1 repeated n1, ...]
+    block_ids = torch.repeat_interleave(
+        torch.arange(num_ids_per_image.numel(), device=device), num_ids_per_image
+    )
+    # same_block[i, j] is True if tokens i and j belong to the same image block
+    same_block = block_ids[:, None] == block_ids[None, :]
+
+    # Mask: 0 inside blocks, 1 outside blocks (match previous function's output), tensor-only
+    mask = (~same_block).to(dtype)
 
     return mask
 
