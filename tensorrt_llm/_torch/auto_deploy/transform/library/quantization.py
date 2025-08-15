@@ -1,3 +1,4 @@
+import itertools
 from functools import partial
 from typing import Tuple
 
@@ -43,6 +44,8 @@ def _insert_quantized_linear(
     submod = gm.get_submodule(modname)
     setattr(submod, attrname, new_param)
 
+    scale_groups = quantization_impl.scale_names()
+
     # check modelopt quantizers from graph
     if is_quantized_graph:
         input_params, weight_params, output_params = get_quantization_params_from_linear_node(node)
@@ -55,7 +58,7 @@ def _insert_quantized_linear(
             user.replace_all_uses_with(node)
 
         # when loading the state_dict, we need to convert input amax to input scale
-        input_scale_name = quantization_impl.scale_names()[0]
+        input_scale_name = quantization_impl.scale_names()[0][0]
         gm._register_load_state_dict_pre_hook(
             partial(
                 quantization_impl.convert_amax_hook,
@@ -74,7 +77,7 @@ def _insert_quantized_linear(
 
     with gm.graph.inserting_before(node):
         scales = {}
-        for scale_name in quantization_impl.scale_names():
+        for scale_name in itertools.chain.from_iterable(scale_groups):
             scales[scale_name] = gm.graph.create_node("get_attr", modname + "." + scale_name)
 
     custom_kwargs = quantization_impl.build_custom_kwargs_for_linear(
@@ -84,6 +87,15 @@ def _insert_quantized_linear(
     # attach recompute fns (by scale_name) so sharding can use them later
     node.meta.setdefault("scale_recalc", {})
     node.meta["scale_recalc"].update(quantization_impl.scale_recalc_registry())
+
+    # 2) attach fusion info for later fusion pass
+    node.meta.setdefault("fuse", {})
+    node.meta["fuse"].update(
+        {
+            "fn": quantization_impl.fuse_linear_weights,  # callable(weights, **scale_lists) -> (fused_w, fused_bufs)
+            "scale_names": scale_groups,
+        }
+    )
 
     node.target = quantization_impl.custom_op()
     node.kwargs = {**node.kwargs, **custom_kwargs}
@@ -165,14 +177,17 @@ def _insert_quantized_bmm(
     # Insert scale nodes
     with gm.graph.inserting_before(node):
         scales = {}
-        for scale_name in quantization_impl.scale_names():
+        for scale_name in itertools.chain.from_iterable(quantization_impl.scale_names()):
             scale_buffer_name = get_scale_name(scale_name)
             scales[scale_name] = gm.graph.create_node(
                 "get_attr", f"{scale_name_prefix}{scale_buffer_name}"
             )
 
     # Update node arguments and kwargs
-    scale_values = [scales[scale_name] for scale_name in quantization_impl.scale_names()]
+    scale_values = [
+        scales[scale_name]
+        for scale_name in itertools.chain.from_iterable(quantization_impl.scale_names())
+    ]
     node.args = (*node.args, *scale_values)
     return True
 

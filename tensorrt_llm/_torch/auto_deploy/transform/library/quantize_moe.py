@@ -1,4 +1,5 @@
 from functools import partial
+from itertools import chain
 from typing import Callable, List, Tuple
 
 import torch
@@ -30,7 +31,7 @@ def _quantize_moe_node(
     """
     w1_names, w2_names, w3_names = _extract_moe_weight_param_lists(node)
 
-    scale_keys = quant_impl.scale_names()
+    scale_keys = list(chain.from_iterable(quant_impl.scale_names()))
 
     def quantize_param_list(weight_names: List[str]) -> Tuple[List[Node], List[List[Node]]]:
         new_attrs = []

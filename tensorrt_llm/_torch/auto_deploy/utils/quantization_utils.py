@@ -118,8 +118,9 @@ class QuantizationImpl:
         raise NotImplementedError("Abstract Interface")
 
     @staticmethod
-    def scale_names() -> List[str]:
-        """Returns the list of names of the scales for this quantization."""
+    def scale_names() -> List[List[str]]:
+        """Returns the list of names of the scales for this quantization.
+        Containing input scale_names and weight scale_names separating"""
         return []
 
     @staticmethod
@@ -198,8 +199,8 @@ class FP8QuantizationImpl(QuantizationImpl):
         )
 
     @staticmethod
-    def scale_names() -> List[str]:
-        return ["input_scale", "weight_scale"]
+    def scale_names() -> List[List[str]]:
+        return [["input_scale"], ["weight_scale"]]
 
     @staticmethod
     def default_scales(original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
@@ -289,8 +290,8 @@ class FP4QuantizationImpl(QuantizationImpl):
         return torch.empty((m, n // 2), dtype=torch.uint8, device=original_weight.device)
 
     @staticmethod
-    def scale_names() -> List[str]:
-        return ["input_scale", "weight_scale", "alpha"]
+    def scale_names() -> List[List[str]]:
+        return [["input_scale"], ["weight_scale", "alpha"]]
 
     @staticmethod
     def default_scales(original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
@@ -502,8 +503,8 @@ class FP8BMMQuantizationImpl(QuantizationImpl):
         )
 
     @staticmethod
-    def scale_names() -> List[str]:
-        return ["input_scale", "weight_scale"]
+    def scale_names() -> List[List[str]]:
+        return [["input_scale"], ["weight_scale"]]
 
     @staticmethod
     def default_scales(original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:

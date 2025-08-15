@@ -1,5 +1,6 @@
 import operator
 from collections import defaultdict
+from itertools import chain
 from typing import List, Tuple
 
 import torch
@@ -12,8 +13,8 @@ from ...utils.node_utils import (
     extract_param_names_from_lin_node,
     get_op_overload_packet,
     is_linear_op,
+    is_op,
 )
-from ...utils.quantization_utils import QuantizationImpl
 from .._graph import canonicalize_graph
 
 
@@ -41,8 +42,6 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
     sizes_unfused = [p.size(0) for p in params_unfused]
     key_fused = f"fused_weight_{idx}"
 
-    quantization_impls = [QuantizationImpl.create(n) for n in linear_nodes]
-
     def fuse_weights(tensors: List[torch.Tensor]) -> torch.Tensor:
         """Fuse weights of linear nodes."""
         return torch.cat(tensors, dim=0)
@@ -51,22 +50,32 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
         """Split the output tensor of the fused linear node to obtain the original outputs."""
         return tuple(t.contiguous() for t in torch.split(tensor, sizes_unfused, dim=-1))
 
-    if all(
-        q is not None and quantization_impls[0].target_op() == q.target_op()
-        for q in quantization_impls
-    ):
+    scale_groups = None
+    if all(is_op(n, torch.ops.auto_deploy.custom_quant_linear) for n in linear_nodes):
+        # Sanity: same fusion function & same scale_names across branches
+        fuse_infos = [n.meta.get("fuse", {}) for n in linear_nodes]
+        if any("fn" not in fi or "scale_names" not in fi for fi in fuse_infos):
+            ad_logger.warning(f"Missing fuse info for some nodes, skipping fusion: {keys_unfused}")
+            return
+
+        fuse_fn = fuse_infos[0]["fn"]
+        scale_groups = fuse_infos[0]["scale_names"]
+        if any(fi["fn"] is not fuse_fn or fi["scale_names"] != scale_groups for fi in fuse_infos):
+            ad_logger.warning(f"Mixed fusion contracts in {keys_unfused}, skipping.")
+            return
+        # TODO: check quant format type is the same across all fused GEMMs
+        scale_names = list(chain.from_iterable(scale_groups))
+
         scales = {}
         for weight_key in keys_unfused:
             key = weight_key.rsplit(".", 1)[0]
 
-            for scale_name in quantization_impls[0].scale_names():
+            for scale_name in scale_names:
                 buffer_name = key + "." + scale_name
                 scales.setdefault(scale_name, []).append(gm.get_buffer(buffer_name))
 
         try:
-            weights_fused, buffer_fused = quantization_impls[0].fuse_linear_weights(
-                params_unfused, **scales
-            )
+            weights_fused, buffer_fused = fuse_fn(params_unfused, **scales)
         except NotImplementedError as e:
             ad_logger.warning(f"Cannot fuse ops {keys_unfused}, skipping: {e}")
             return
@@ -76,11 +85,11 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
             fused_buffer_name = key_fused + "_" + scale_name
             gm.register_buffer(fused_buffer_name, buffer)
 
-    elif all(q is None for q in quantization_impls):
-        param_fused = nn.Parameter(fuse_weights([gm.get_parameter(k) for k in keys_unfused]))
-    else:
+    elif any(is_op(n, torch.ops.auto_deploy.custom_quant_linear) for n in linear_nodes):
         ad_logger.warning(f"Cannot fuse ops {keys_unfused} for mixed-precision linear nodes.")
         return
+    else:
+        param_fused = nn.Parameter(fuse_weights([gm.get_parameter(k) for k in keys_unfused]))
 
     setattr(gm, key_fused, param_fused)
 
@@ -89,12 +98,11 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
 
     with gm.graph.inserting_before(linear_nodes[0]):
         get_param_node = gm.graph.get_attr(key_fused, torch.Tensor)
-        if quantization_impls[0]:
-            for scale_name in quantization_impls[0].scale_names():
-                # Creates new nodes for the fused scales so the unfused linear ops can be fully erased.
-                fused_kwargs[scale_name] = gm.graph.create_node(
-                    "get_attr", key_fused + "_" + scale_name
-                )
+        if scale_groups:
+            for group, kwarg_name in zip(scale_groups, ["input_scale", "weight_scale"]):
+                fused_kwargs[kwarg_name] = [
+                    gm.graph.create_node("get_attr", f"{key_fused}_{name}") for name in group
+                ]
 
     # add new linear node + split node
     with gm.graph.inserting_before(linear_nodes[0]):
@@ -117,10 +125,10 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
 
 
 def fuse_gemms(gm: GraphModule) -> None:
-    ad_logger.info("GEMM fusion")
     ad_logger.debug("Before GEMM fusion: " + str(gm))
     # sort linear nodes by parent node
     linear_nodes = defaultdict(list)
+    num_gemm_fusions = 0
     for node in gm.graph.nodes:
         # TODO: we don't handle bias for now...
         if is_linear_op(node, include_quantization=True) and node.args[2] is None:
@@ -137,9 +145,11 @@ def fuse_gemms(gm: GraphModule) -> None:
                 f"Found linear nodes to fuse: {lin_children} with parent node: {parent_node}"
             )
             _insert_fused_gemm(gm, idx := idx + 1, parent_node, lin_children)
+            num_gemm_fusions += 1
 
         # clean up and return
         canonicalize_graph(gm)
 
+    ad_logger.info(f"Found {num_gemm_fusions} GEMM fusions")
     ad_logger.debug("After GEMM fusion: " + str(gm))
     torch.cuda.empty_cache()

@@ -15,6 +15,7 @@ from ..utils.logger import ad_logger
 from .library import (
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
+    fuse_gemms,
     fuse_rmsnorm,
     insert_cached_attention,
     resize_kv_cache,
@@ -77,7 +78,7 @@ class InferenceOptimizer:
 
         # run GEMM fusion
         # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-        # fuse_gemms(egm)
+        fuse_gemms(egm)
 
         # check if we can fuse allreduce, residual and rmsnorm
         fuse_allreduce_residual_rmsnorm(egm)
