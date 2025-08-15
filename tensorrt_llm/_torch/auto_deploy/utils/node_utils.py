@@ -422,3 +422,12 @@ def extract_op_args(node: Node, *arg_names):
         raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
 
     return [_get(n) for n in arg_names]
+
+
+def is_node_in_module(node: Node, module_name: str) -> bool:
+    """Check if the node is in the given module."""
+    try:
+        nn_module_list = list(node.meta["nn_module_stack"].keys())[-1]
+        return module_name in nn_module_list
+    except Exception:
+        return False

@@ -1,9 +1,13 @@
 """High-level entrypoint to transform a model into an efficient inference model."""
 
 import gc
+from functools import partial
 
 import torch
 import torch.nn as nn
+
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_node_in_module
+from tensorrt_llm._torch.auto_deploy.utils.pattern_matcher import Match
 
 from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
@@ -38,6 +42,17 @@ from .library import (
 )
 
 
+def accept_match_fn(match: Match, name_to_skip: str) -> bool:
+    """
+    Accept a match if it does not contain a node with the given name scope.
+    """
+    for node in match.nodes:
+        if is_node_in_module(node, name_to_skip):
+            ad_logger.info(f"REJECTING MATCH: {match}")
+            return False
+    return True
+
+
 class InferenceOptimizer:
     def __init__(self, factory: ModelFactory, ad_config: AutoDeployConfig):
         self.factory = factory
@@ -68,24 +83,26 @@ class InferenceOptimizer:
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
         ############################################################################################
+        # Create both forward and backward visualizations of the initial graph
+        # visualize_model(egm, filename="initial_graph.svg", max_nodes=1000)
 
         # Match MoE pattern
         match_moe_pattern(egm)
 
         # Match repeat_kv pattern
-        match_repeat_kv(egm)
+        match_repeat_kv(egm, partial(accept_match_fn, name_to_skip="visual"))
 
         # Match eager attention pattern
-        match_eager_attention(egm)
+        match_eager_attention(egm, partial(accept_match_fn, name_to_skip="visual"))
 
         # Match grouped attention pattern
-        match_grouped_attention(egm)
+        match_grouped_attention(egm, partial(accept_match_fn, name_to_skip="visual"))
 
         # Match attention layout expected by our backend
         match_attention_layout(egm, AttentionRegistry.get(self.ad_config.attn_backend))
 
         # Match rope
-        match_rope_pattern(egm)
+        match_rope_pattern(egm, partial(accept_match_fn, name_to_skip="visual"))
 
         # Match RoPE layout expected by our backend
         match_rope_layout(
@@ -205,6 +222,8 @@ class InferenceOptimizer:
             dynamic_shapes=cm.dynamic_shapes,
             compiler_kwargs=compiler_kwargs,
         )
+        # visualize_model(egm_compiled, max_nodes=1000)
+
         cm.info.reset()
 
         torch.cuda.empty_cache()

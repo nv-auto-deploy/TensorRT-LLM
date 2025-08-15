@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from accelerate import init_empty_weights, load_checkpoint_in_model
+from accelerate import init_empty_weights
 from accelerate.utils import modeling
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
@@ -310,16 +310,58 @@ class AutoModelForCausalLMFactory(ModelFactory):
     def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
         """Load the checkpoint into the model."""
         # identify the most relevant checkpoint file
-        ckpt_file = self._get_checkpoint_file(self.model)
+        index_json_path = self._get_checkpoint_file(self.model)
+        checkpoint_dir = os.path.dirname(index_json_path)
+
+        # 2. Manually load and process the index file to map shards.
+        with open(index_json_path, "r") as f:
+            index_data = json.load(f)
+
+        weight_map = index_data["weight_map"]
+        from collections import defaultdict
+
+        from safetensors import safe_open
+
+        # Invert the map to group tensor names by the file they are in.
+        shards = defaultdict(list)
+        for tensor_name, shard_file in weight_map.items():
+            shards[shard_file].append(tensor_name)
+
+        # 3. Load all tensors from their respective shards into one dictionary.
+        state_dict = {}
+        for shard_file, tensor_names in shards.items():
+            shard_path = os.path.join(checkpoint_dir, shard_file)
+            # Use safe_open to efficiently load only the needed tensors from each shard.
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for tensor_name in tensor_names:
+                    state_dict[tensor_name] = f.get_tensor(tensor_name)
+
+        # 4. Perform the key remapping on the now fully assembled state_dict.
+        conversion_mapping = {
+            "^visual": "model.visual",
+            r"^model(?!\.(language_model|visual))": "model.language_model",
+        }
+        import re
+
+        keys_to_process = list(state_dict.keys())
+        for key in keys_to_process:
+            new_key = key
+            for pattern, replacement in conversion_mapping.items():
+                new_key = re.sub(pattern, replacement, new_key)
+
+            if new_key != key:
+                state_dict[new_key] = state_dict.pop(key)
+
         # reuse the load checkpoint utility from accelerate
-        with hf_load_state_dict_with_device(device):
-            # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
-            # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
-            # which collects local model params, syncs weights from checkpoint, and applies them via
-            # model.load_state_dict.
-            # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
-            # model-transformed weights,leading to unexpected key mismatches or format issues.
-            load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
+        # with hf_load_state_dict_with_device(device):
+        #     # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
+        #     # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
+        #     # which collects local model params, syncs weights from checkpoint, and applies them via
+        #     # model.load_state_dict.
+        #     # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
+        #     # model-transformed weights,leading to unexpected key mismatches or format issues.
+        #     load_checkpoint_in_model(model, checkpoint=state_dict, full_state_dict=False)
+        model.load_state_dict(state_dict)
 
     def _load_quantization_config(self, fetched_dir: str):
         """Load the quantization config from the model directory if not done already."""
@@ -384,16 +426,21 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor = None,
+        attention_mask: torch.Tensor = None,
     ):
         """A simple forward pass for the model to functionalize the args.
 
         This follows the standard function signature as expected by factory.py.
         """
+        attention_mask = torch.ones_like(input_ids)
         return type(model).forward(
             model,
             input_ids=input_ids,
             position_ids=position_ids,
             pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
         )
 
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:
@@ -438,7 +485,12 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
 
         return {
             "input_ids": inputs["input_ids"],
-            "pixel_values": inputs["pixel_values"],
+            "pixel_values": torch.zeros(
+                14308, 1176
+            ),  # Example shape for export (will be dynamic at runtime)
+            "image_grid_thw": torch.tensor(
+                [[1, 98, 146], [1, 98, 146]], dtype=torch.long
+            ),  # Example grid for export (will be dynamic at runtime)
         }
 
     def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, DynamicShapeCallback]]:
@@ -451,13 +503,31 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             input.
         """
 
-        def _get_dynamic_shape():
+        # Use dynamic shapes to handle variable-sized multimodal inputs
+        # This allows different image sizes and batch sizes to work properly
+
+        # Example tensors with reasonable default sizes
+        pixel_values_tensor = torch.zeros(14308, 1176)  # Example size for export
+        image_grid_thw_tensor = torch.tensor([[1, 98, 146]], dtype=torch.long)  # Example grid size
+
+        # Define dynamic shapes based on PyTorch's constraint analysis
+        # PyTorch has determined the exact mathematical constraints from the model
+
+        def pixel_values_dynamic_shape():
+            # PyTorch constraint analysis shows num_patches must be divisible by 4
+            # Use the suggested approach: num_patches = 4 * _num_patches
+            _num_patches = Dim("_num_patches", min=1, max=25000)
+            num_patches = 4 * _num_patches
             return {
-                # TODO (lucaslie): how to set default values for dynamic shapes?
-                0: Dim("img_batch_size", max=10),
-                2: Dim("img_height", min=32, max=2048),
-                3: Dim("img_width", min=32, max=2048),
+                0: num_patches,  # Number of image patches (must be multiple of 4)
             }
 
-        none_pixel_values = torch.zeros(0, 3, 336, 336)
-        return {"pixel_values": (none_pixel_values, _get_dynamic_shape)}
+        def image_grid_thw_dynamic_shape():
+            return {
+                0: Dim("_num_images", min=1, max=10),
+            }
+
+        return {
+            "pixel_values": (pixel_values_tensor, pixel_values_dynamic_shape),
+            "image_grid_thw": (image_grid_thw_tensor, image_grid_thw_dynamic_shape),
+        }
