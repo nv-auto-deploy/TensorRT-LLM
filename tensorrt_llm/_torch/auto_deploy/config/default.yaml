@@ -91,6 +91,9 @@ transforms:
     stage: cache_init
   insert_cached_attention:
     stage: cache_init
+  insert_cached_mla_attention:
+    stage: cache_init
+    attn_backend: MultiHeadLatentAttention
   initialize_cache:
     stage: cache_init
   resize_kv_cache:

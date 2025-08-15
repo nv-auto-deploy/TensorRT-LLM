@@ -143,6 +143,6 @@ class FuseRMSNorm(BaseTransform):
 
         cnt = patterns.apply(graph)
 
-        info = TransformInfo(skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True)
+        info = TransformInfo(skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=False)
 
         return gm, info

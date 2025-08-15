@@ -92,10 +92,8 @@ class InsertCachedAttention(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         """Replace uncached source attention node with corresponding cached attn node."""
-        if self.config.attn_backend is not None:
-            attn_descriptor = AttentionRegistry.get(self.config.attn_backend)
-        else:
-            attn_descriptor = AttentionRegistry.get(shared_config.attn_backend)
+        attn_descriptor = AttentionRegistry.get(self.config.attn_backend)
+
         cache_config = factory.get_cache_config()
 
         # Get all attention nodes and their info objects
@@ -182,6 +180,17 @@ class InsertCachedAttention(BaseTransform):
         )
 
         return gm, info
+
+
+@TransformRegistry.register("insert_cached_mla_attention")
+class InsertCachedMLAAttention(InsertCachedAttention):
+    """
+    A transform to insert cached MLA attention into the graph module.
+
+    This class is identical to InsertCachedAttention and inherits all its behavior.
+    """
+
+    pass
 
 
 class ResizeKVCacheConfig(TransformConfig):

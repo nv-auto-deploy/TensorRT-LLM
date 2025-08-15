@@ -55,6 +55,15 @@ class InferenceOptimizer:
             self.ad_config.transforms[
                 "resize_kv_cache"
             ].free_mem_ratio = self.ad_config.free_mem_ratio
+        if "insert_cached_attention" in self.ad_config.transforms:
+            self.ad_config.transforms[
+                "insert_cached_attention"
+            ].attn_backend = self.ad_config.attn_backend
+        if "insert_cached_mla_attention" in self.ad_config.transforms:
+            self.ad_config.transforms[
+                "insert_cached_mla_attention"
+            ].attn_backend = self.ad_config.mla_backend
+
         # TODO: (hg)Missing MLA here. Figure out how to add MLA since duplicate transforms are not allowed.
         # Old code:
         # detect attention op and replace with cache-aware op
@@ -71,7 +80,7 @@ class InferenceOptimizer:
             ].compile_backend = self.ad_config.compile_backend
 
         new_optimizer = ModularInferenceOptimizer(self.factory, self.ad_config.transforms)
-        # TODO: (hg) move this
+        # TODO: (hg) move this. let match_rope_layout and match_atten_layout use this shared config
         new_optimizer.shared_config.attn_backend = self.ad_config.attn_backend
 
         egm = new_optimizer(cm)
