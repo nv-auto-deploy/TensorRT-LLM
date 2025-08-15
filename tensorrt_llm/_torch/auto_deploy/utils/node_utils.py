@@ -249,6 +249,7 @@ def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
 
     if include_quantization:
         lin_ops.update(QUANT_LINEAR_OPS)
+        lin_ops.update([torch.ops.auto_deploy.custom_quant_linear])
     return is_op(node, lin_ops)
 
 

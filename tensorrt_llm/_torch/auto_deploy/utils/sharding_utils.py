@@ -50,6 +50,33 @@ def _load_hook_remove(
     state_dict.pop(key, None)
 
 
+def _scale_shard_hook_impl(
+    state_dict,
+    prefix,
+    local_metadata,
+    strict,
+    missing_keys,
+    unexpected_keys,
+    error_msgs,
+    *,
+    key: str,
+    fn,  # recalc_fn(buf, shape, dim, rank, world_size) -> Tensor
+    shape: torch.Size,
+    d: int,
+    r: int,
+    ws: int,
+):
+    if key in state_dict:
+        state_dict[key] = fn(state_dict[key], shape, d, r, ws)
+
+
+def _get_attr_qual_and_name(get_attr_node: torch.fx.Node) -> tuple[str, str]:
+    assert get_attr_node.op == "get_attr"
+    qual = get_attr_node.target  # e.g., "layer0.linear.weight_scale"
+    mod_qual, _, buf_name = qual.rpartition(".")  # ("layer0.linear", "weight_scale")
+    return mod_qual, buf_name
+
+
 def _insert_sharded_matmul(
     gm: GraphModule,
     node: Node,
@@ -65,8 +92,6 @@ def _insert_sharded_matmul(
     """
     assert dim in [0, 1], "Only dim 0 and 1 are supported for sharding"
     assert add_dist or dim == 0, "For dim=1 sharding, dist_op is required."
-
-    quantization_impl = QuantizationImpl.create(node)
 
     def split_tensor(
         t: torch.Tensor,
@@ -105,7 +130,7 @@ def _insert_sharded_matmul(
             if remove
             else nn.Parameter(
                 split_tensor(gm.get_parameter(param_key)).detach().clone(),
-                requires_grad=quantization_impl is None,
+                requires_grad=False,
             )
         )
 
@@ -141,25 +166,49 @@ def _insert_sharded_matmul(
         set_new_param(submod, bias_key, remove=True)
         gm._register_load_state_dict_pre_hook(partial(_load_hook_remove, param_key=bias_key))
 
-    if quantization_impl:
-        scales = {}
-        for scale_name in quantization_impl.scale_names():
-            scales[scale_name] = submod.get_buffer(scale_name)
-        scales["weight_shape"] = weight_new_shape
-        sharded_scales = quantization_impl.shard_scales(dim, rank, world_size, **scales)
-        for k, v in sharded_scales.items():
-            submod.register_buffer(k, v)
+    # Handle quantized node: derive scale sharding purely from the custom op node
+    if is_op(node, torch.ops.auto_deploy.custom_quant_linear):
+        # scales referenced by the op
+        input_scales = list(node.kwargs.get("input_scale", []))
+        weight_scales = list(node.kwargs.get("weight_scale", []))
 
-        gm._register_load_state_dict_pre_hook(
-            partial(
-                quantization_impl.shard_load_hook,
-                weight_name=weight_key,
-                weight_shape=weight_new_shape,
-                dim=dim,
-                rank=rank,
-                world_size=world_size,
+        # recompute registry from insert-time (by scale_name)
+        recalc_map: dict[str, callable] = node.meta.get("scale_recalc", {})
+
+        def _apply_recalc_for_scale(get_attr_node: Node, weight_shape: torch.Size):
+            if get_attr_node.op != "get_attr":
+                return
+            s_mod_qual, s_name = _get_attr_qual_and_name(get_attr_node)
+            if s_mod_qual != modname:
+                return
+            recalc_fn = recalc_map.get(s_name, None)
+            if recalc_fn is None:
+                return
+
+            buf = submod.get_buffer(s_name)
+            sharded_buf = recalc_fn(buf, weight_shape, dim, rank, world_size)
+            submod.register_buffer(s_name, sharded_buf)
+
+            # add a generic load hook to shard incoming checkpoints the same way
+            qual = f"{s_mod_qual}.{s_name}"
+
+            # TODO:(fridah-nv) avoid duplicated load_hook registration?
+            gm._register_load_state_dict_pre_hook(
+                partial(
+                    _scale_shard_hook_impl,
+                    key=qual,
+                    fn=recalc_fn,
+                    shape=weight_new_shape,
+                    d=dim,
+                    r=rank,
+                    ws=world_size,
+                )
             )
-        )
+
+        for s in input_scales:
+            _apply_recalc_for_scale(s, weight_new_shape)
+        for s in weight_scales:
+            _apply_recalc_for_scale(s, weight_new_shape)
 
     # no comm node needed for single device
     if not add_dist:

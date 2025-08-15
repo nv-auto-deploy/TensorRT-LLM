@@ -81,6 +81,10 @@ def _insert_quantized_linear(
         scales,
     )
 
+    # attach recompute fns (by scale_name) so sharding can use them later
+    node.meta.setdefault("scale_recalc", {})
+    node.meta["scale_recalc"].update(quantization_impl.scale_recalc_registry())
+
     node.target = quantization_impl.custom_op()
     node.kwargs = {**node.kwargs, **custom_kwargs}
 

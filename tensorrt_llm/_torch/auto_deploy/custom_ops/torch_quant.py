@@ -12,7 +12,7 @@ FORMAT_NVFP4 = 1
 
 # scale layouts
 PER_TENSOR = 0
-PER_CHANNEL_OUT = 1
+PER_BLOCK = 1
 
 # FP4 tables (E2M1)
 e2m1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5])
@@ -175,19 +175,30 @@ def custom_quant_linear(
     weight_scale: List[torch.Tensor],  # Tensor?[]
     input_zp: List[torch.Tensor],  # Tensor?[]
     weight_zp: List[torch.Tensor],  # Tensor?[]
-    format_type: int = FORMAT_FP8,  # which quant format this call uses
-    input_scale_type: int = PER_TENSOR,
-    weight_scale_type: int = PER_TENSOR,
-    input_zp_type: int = 0,
-    weight_zp_type: int = 0,
+    format_type: int,  # which quant format this call uses
+    input_scale_type: List[int],
+    weight_scale_type: List[int],
+    # input_zp_type: List[int],
+    # weight_zp_type: List[int],
 ) -> torch.Tensor:
     """
-    Reference (eager) implementation for multiple quant formats via `format_type`.
-    For FP8:
-      - input_scale[0] and weight_scale[0] are required (amax/448 style)
-      - input_zp / weight_zp ignored
-      - supports PER_TENSOR and PER_CHANNEL_OUT for weights
+    Multi-format eager reference via `format_type`.
+    - FP8:
+        input_scale[0], weight_scale[0]; types are PER_TENSOR.
+    - NVFP4:
+        input_scale[0] = s_in2           (PER_TENSOR)
+        weight_scale[0] = CUTLASS vector (PER_BLOCK)
+        weight_scale[1] = alpha = s_in2*s_w2 (PER_TENSOR)
     """
+    if len(input_scale_type) != len(input_scale):
+        raise ValueError(
+            f"len(input_scale_type) ({len(input_scale_type)}) must equal len(input_scale) ({len(input_scale)})."
+        )
+    if len(weight_scale_type) != len(weight_scale):
+        raise ValueError(
+            f"len(weight_scale_type) ({len(weight_scale_type)}) must equal len(weight_scale) ({len(weight_scale)})."
+        )
+
     if format_type == FORMAT_FP8:
         if weight_quantized.dtype != torch.float8_e4m3fn:
             raise TypeError("FP8 path requires weight_quantized.dtype == float8_e4m3fn")
@@ -201,7 +212,7 @@ def custom_quant_linear(
         input_deq = _from_fp8(input_fp8, s_in, in_dtype)
 
         weight_deq = _dequant_weight_fp8(
-            weight_quantized, s_w, weight_scale_type, out_features, in_dtype
+            weight_quantized, s_w, weight_scale_type[0], out_features, in_dtype
         )
 
         out = torch.matmul(input_deq.reshape(-1, in_features), weight_deq.t())

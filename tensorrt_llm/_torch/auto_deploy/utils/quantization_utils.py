@@ -31,6 +31,9 @@ except ImportError:
 FORMAT_FP8 = 0
 FORMAT_NVFP4 = 1
 
+PER_TENSOR = 0
+PER_BLOCK = 1
+
 
 def modelopt_fp4_scale_to_cutlass_fp4_scale(modelopt_scale: torch.Tensor) -> torch.Tensor:
     """Converts the modelopt FP4 per-block weight scale to the cutlass format (padded and swizzled)."""
@@ -177,6 +180,11 @@ class QuantizationImpl:
         """Default: no extra kwargs. Each impl overrides to pass the right inputs/scales/zps/format."""
         return {}
 
+    @staticmethod
+    def scale_recalc_registry() -> dict[str, callable]:
+        """Return {scale_name -> recalc_fn(buf, weight_shape, dim, rank, world_size) -> Tensor}"""
+        return {}
+
 
 class FP8QuantizationImpl(QuantizationImpl):
     @staticmethod
@@ -209,6 +217,8 @@ class FP8QuantizationImpl(QuantizationImpl):
             input_zp=[],
             weight_zp=[],
             format_type=FORMAT_FP8,
+            input_scale_type=[PER_TENSOR],
+            weight_scale_type=[PER_TENSOR],
         )
 
     @staticmethod
@@ -248,6 +258,11 @@ class FP8QuantizationImpl(QuantizationImpl):
             "weight_scale": new_weight_scale,
             "input_scale": input_scale[0].clone(),
         }
+
+    @staticmethod
+    def scale_recalc_registry() -> dict[str, callable]:
+        # FP8 uses PER_TENSOR scales only – nothing to recompute for sharding
+        return {}
 
 
 def _shard_fp4_weight_scale(weight_scale, sharded_uint8_weight_shape, dim, rank, world_size):
@@ -316,6 +331,8 @@ class FP4QuantizationImpl(QuantizationImpl):
             input_zp=[],
             weight_zp=[],
             format_type=FORMAT_NVFP4,
+            input_scale_type=[PER_TENSOR],
+            weight_scale_type=[PER_TENSOR, PER_BLOCK],
         )
 
     @staticmethod
@@ -411,6 +428,16 @@ class FP4QuantizationImpl(QuantizationImpl):
             "weight_scale": fused_weight_scale,
             "alpha": alpha[0],
             "input_scale": input_scale[0].clone(),
+        }
+
+    @staticmethod
+    def scale_recalc_registry() -> dict[str, callable]:
+        return {
+            "weight_scale": lambda buf,
+            weight_shape,
+            dim,
+            rank,
+            world_size: _shard_fp4_weight_scale(buf, weight_shape, dim, rank, world_size)
         }
 
 

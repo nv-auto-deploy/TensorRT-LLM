@@ -12,6 +12,10 @@ scaling_vector_size = 16
 FORMAT_FP8 = 0
 FORMAT_NVFP4 = 1
 
+# scale layouts
+PER_TENSOR = 0
+PER_BLOCK = 1
+
 SCALING_VECTOR_SIZE = 16  # NVFP4 block size along K
 
 
@@ -134,9 +138,11 @@ def test_quant_linear_fp8_matches_fused_op(bias):
         bias,
         [torch.tensor(1.0, device="cuda")],
         [weight_scale],
-        [],
-        [],
+        [],  # input_zp
+        [],  # weight_zp
         format_type=FORMAT_FP8,
+        input_scale_type=[PER_TENSOR],
+        weight_scale_type=[PER_TENSOR],
     )
 
     assert out_unified.shape == out_fused.shape
@@ -196,6 +202,8 @@ def test_quant_linear_nvfp4_matches_fused_op(bias):
         [],  # input_zp
         [],  # weight_zp
         format_type=FORMAT_NVFP4,
+        input_scale_type=[PER_TENSOR],
+        weight_scale_type=[PER_TENSOR, PER_BLOCK],
     )
 
     assert out_unified.shape == out_fused.shape
