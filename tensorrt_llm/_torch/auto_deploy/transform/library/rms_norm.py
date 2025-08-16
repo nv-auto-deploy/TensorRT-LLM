@@ -70,7 +70,7 @@ class FuseRMSNormConfig(TransformConfig):
     """Configuration for the RMSNorm fusion transform."""
 
     backend: str = Field(
-        default="triton",
+        default="flashinfer",
         description="Backend to use for RMSNorm computation ('flashinfer' or 'triton').",
     )
 
