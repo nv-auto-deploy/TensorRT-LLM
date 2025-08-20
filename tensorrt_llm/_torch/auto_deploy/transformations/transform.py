@@ -153,17 +153,6 @@ class InferenceOptimizer:
         move_to_device(egm, cm.device)
         cm.to(cm.device)
 
-        # export and save the model using torch.export
-        try:
-            exported_program = torch.export.export(
-                egm,
-                cm.args,
-                dynamic_shapes=cm.dynamic_shapes,
-            )
-            torch.export.save(exported_program, "qwen2.5_VL_7B_instruct.pth")
-        except Exception as e:
-            ad_logger.warning(f"Failed to export model with torch.export: {e}")
-
         ############################################################################################
         # RUN POST-LOAD FUSION AND OPTIMIZATIONS
         ############################################################################################
