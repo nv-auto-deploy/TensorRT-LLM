@@ -5,10 +5,13 @@ from .dist import *
 from .flashinfer_attention import *
 from .flashinfer_rope import *
 from .linear import *
+from .matmul import *
 from .mla import *
+from .mul import *
 from .quant import *
 from .qwen_ops import *
 from .rms_norm import *
+from .softmax import *
 from .torch_attention import *
 from .torch_backend_attention import *
 from .torch_moe import *

@@ -18,7 +18,8 @@ def simple(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tenso
 
     This wrapper avoids exposing this view op during the export graph.
     """
-    return torch.ops.aten.linear(input, weight, bias)
+    output = torch.ops.aten.linear(input, weight, bias)
+    return output
 
 
 @simple.register_fake
