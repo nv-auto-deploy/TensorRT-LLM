@@ -5,6 +5,33 @@ from typing import Tuple
 import torch
 
 
+def _estimate_cu_window_seqlens_size(
+    grid_thw: torch.Tensor,
+    hidden_states: torch.Tensor,
+    spatial_merge_size: int,
+    window_size: int,
+    patch_size: int,
+    spatial_merge_unit: int,
+) -> int:
+    """
+    Estimate the number of entries in cu_window_seqlens (i.e., number of windows + 1),
+    using only symbolic-shape-visible values (safe for fake/meta tensors).
+
+    Derivation:
+      - Let vit_window = window_size // spatial_merge_size // patch_size
+      - Each window covers at most vit_window^2 LLM tokens (i.e., patches)
+      - num_patches_total = seq_len // spatial_merge_unit
+      - windows_estimate = ceil(num_patches_total / (vit_window^2))
+      - cu_window_seqlens length = windows_estimate + 1
+    """
+    # Safe upper bound: each window has at least one token, so the number of
+    # windows cannot exceed the total number of LLM patches (seq_len/spatial_merge_unit).
+    # Keep symbolic shape math intact (no int() casts, no Python max on SymInt).
+    seq_len = hidden_states.shape[0]
+    num_patches_total = seq_len // spatial_merge_unit
+    return 1 + num_patches_total
+
+
 @torch.library.custom_op(
     "auto_deploy::qwen_vision_data_dependent_ops", mutates_args=(), device_types=["cuda", "cpu"]
 )
@@ -125,8 +152,14 @@ def qwen_vision_data_dependent_ops(
     cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
 
     # Pad cu_window_seqlens to match fake op shape estimate
-    seq_len = hidden_states.shape[0]
-    expected_size = 500
+    expected_size = _estimate_cu_window_seqlens_size(
+        grid_thw=grid_thw,
+        hidden_states=hidden_states,
+        spatial_merge_size=spatial_merge_size,
+        window_size=window_size,
+        patch_size=patch_size,
+        spatial_merge_unit=spatial_merge_unit,
+    )
     actual_size = cu_window_seqlens.shape[0]
 
     if actual_size < expected_size:
@@ -193,8 +226,16 @@ def qwen_vision_data_dependent_ops_fake(
     pos_emb_cos = torch.zeros(seq_len, emb_dim, device=device, dtype=torch.float32)
     pos_emb_sin = torch.zeros(seq_len, emb_dim, device=device, dtype=torch.float32)
 
-    # Fake cu_window_seqlens: fixed size with some reasonable cumulative values
-    cu_window_seqlens = torch.zeros(500, device=device, dtype=dtype)
+    # Fake cu_window_seqlens: estimated size based on visible shapes (monotonic dummy values)
+    expected_size = _estimate_cu_window_seqlens_size(
+        grid_thw=grid_thw,
+        hidden_states=hidden_states,
+        spatial_merge_size=spatial_merge_size,
+        window_size=window_size,
+        patch_size=patch_size,
+        spatial_merge_unit=spatial_merge_unit,
+    )
+    cu_window_seqlens = torch.arange(expected_size, device=device, dtype=dtype)
 
     # Fake cu_seqlens: [num_images + 1]
     cu_seqlens = torch.cumsum(grid_thw[:, 1] * grid_thw[:, 2] * grid_thw[:, 0], dim=0)
