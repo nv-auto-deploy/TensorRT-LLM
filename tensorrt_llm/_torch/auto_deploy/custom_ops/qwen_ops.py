@@ -126,7 +126,7 @@ def qwen_vision_data_dependent_ops(
 
     # Pad cu_window_seqlens to match fake op shape estimate
     seq_len = hidden_states.shape[0]
-    expected_size = 100
+    expected_size = 500
     actual_size = cu_window_seqlens.shape[0]
 
     if actual_size < expected_size:
@@ -190,11 +190,11 @@ def qwen_vision_data_dependent_ops_fake(
 
     # Fake position embeddings: separate cos and sin tensors with doubled embedding dim
     emb_dim = 80  # head_dim for Qwen2.5-VL
-    pos_emb_cos = torch.zeros(seq_len, emb_dim, device=device, dtype=hidden_states.dtype)
-    pos_emb_sin = torch.zeros(seq_len, emb_dim, device=device, dtype=hidden_states.dtype)
+    pos_emb_cos = torch.zeros(seq_len, emb_dim, device=device, dtype=torch.float32)
+    pos_emb_sin = torch.zeros(seq_len, emb_dim, device=device, dtype=torch.float32)
 
     # Fake cu_window_seqlens: fixed size with some reasonable cumulative values
-    cu_window_seqlens = torch.zeros(100, device=device, dtype=dtype)
+    cu_window_seqlens = torch.zeros(500, device=device, dtype=dtype)
 
     # Fake cu_seqlens: [num_images + 1]
     cu_seqlens = torch.cumsum(grid_thw[:, 1] * grid_thw[:, 2] * grid_thw[:, 0], dim=0)
@@ -243,6 +243,8 @@ def qwen_prepare_attention_mask(
     # cu_seqlens has padding values replaced with zeros in the patch file
     # When both indices are 0 (padding), the slice [0:0] is empty and won't modify the mask
     for i in range(1, len(cu_seqlens)):
+        if cu_seqlens[i] == -100:
+            break
         attention_mask[
             ..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]
         ] = 0
