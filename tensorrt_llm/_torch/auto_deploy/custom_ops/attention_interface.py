@@ -10,13 +10,16 @@ and operates on a purely functional paradigm that is compatible with the torch c
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, fields
-from typing import Dict, List, Literal, Optional, Protocol, Sequence, Tuple, Type, Union
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Literal, Optional, Protocol, Sequence, Tuple, Type, Union
 
 import torch
 from torch._ops import OpOverloadPacket
 from torch.export import Dim
 from torch.fx import Node
+
+DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
+DynamicShapeCallback = Callable[[], DynamicShape]
 
 
 @dataclass
@@ -34,7 +37,7 @@ class SequenceInfo:
     between arguments that are originally part of the model/graph and arguments that are needed for
     the attention operator when we switch to cached+flattened attention.
 
-    # ORIGINAL MODEL ARGUMENTS #####################################################################
+    ### ORIGINAL MODEL ARGUMENTS ###################################################################
     - input_ids: [id_0, ..., id_{s_total-1}]
       flattened sequence of [b, 1] or [1, s_total]. We use [b, 1] to denote generate-only batches.
     - position_ids: [pos_0, ..., pos_{s_total-1}]
@@ -44,7 +47,17 @@ class SequenceInfo:
     NOTE: ``input_ids`` and ``position_ids`` are initially expected to be of shape [b, seq_len]
     before we switch to cached+flattened attention.
 
-    # EXTRA ARGUMENTS NEEDED FOR ATTENTION OPERATORS FOR FLATTENED SEQUENCES + CACHES ##############
+    ### EXTRA ARGUMENTS PROVIDED TO THE INTERFACE ##################################################
+    Those are extra arguments that can be provided to the interface and they are stored as follows:
+    - _extra_args: dictionary of extra arguments with currently active values.
+    - _extra_none_inputs: dictionary of none inputs to the extra arguments.
+      NOTE: we assume that extra arguments are *optional* arguments to the model. However, we
+            cannot represent them via `None` since fx graphs require a fixed input type. Instead,
+            we require a special placeholder tensor to represent the `None` input.
+    - _extra_dynamic_shapes_callbacks: dictionary of callbacks to initialize the dynamic shapes of
+      the extra arguments.
+
+    ### CACHE ARGUMENTS NEEDED FOR ATTENTION OPERATORS FOR FLATTENED SEQUENCES + CACHES ############
     - seq_len: [s_0, s_1, ..., s_{b-1}] such that s_total = sum(s_i)
       Describes how long each sequence is. For example,
       input_ids[:s_0] will correspond to sequence 0 in the batch and input_ids[s_0:s_1] will
@@ -88,17 +101,6 @@ class SequenceInfo:
     # then the maximum number of sequences possible in the batch is min (max_batch_size, max_num_tokens).
     max_num_tokens: Optional[int] = None
 
-    ## [UPDATE WITH CARE] TENSOR FIELDS THAT WILL BE PASSED TO PREPARE_METADATA OP #################
-    # input_ids MUST ALWAYS BE THE FIRST FIELD
-    input_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.int))
-    position_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.long))
-
-    seq_len: torch.Tensor = field(default_factory=lambda: torch.ones(1, dtype=torch.int))
-    input_pos: torch.Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.int))
-    cache_loc: torch.Tensor = field(default_factory=lambda: torch.arange(1, dtype=torch.int))
-    pages_per_seq: torch.Tensor = field(default_factory=lambda: torch.ones(1, dtype=torch.int))
-    ################################################################################################
-
     ## PRIVATE FIELDS ##############################################################################
     _sequence_lengths: List[int] = field(default_factory=list)
     _num_pages: int = 1
@@ -122,23 +124,36 @@ class SequenceInfo:
             self.max_batch_size,
             (total_tokens) // self.page_size + (total_tokens % self.page_size > 0),
         )
-        self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
-        self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.long)
-        self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
-        self.input_pos = torch.empty_like(self.seq_len)
-        self.cache_loc = torch.empty(self.num_pages, dtype=torch.int)
-        self.pages_per_seq = torch.empty_like(self.seq_len)
-        assert self.num_pages >= self.max_batch_size, (
-            "num_pages must be greater than max_batch_size"
-        )
-        # dynamic shape descriptors for tensor args
-        self._dynamic_shapes: Optional[Tuple[Dict[str, Dim]]] = None
+        # sanity check
+        assert self.num_pages >= self.max_batch_size, "num_pages can't be less than max_batch_size"
 
         # keep a list-like object of sequence lengths for simplicity as well
         self._sequence_lengths = [0] * self.max_batch_size
 
         # indicator if extra args are activated that are needed for cached attention backends
         self._is_cached_attn = False
+
+        ### TENSOR FIELDS/ARGS FOR UNCACHED AND CACHED ATTENTION ###################################
+        # UNCACHED TENSOR FIELDS
+        self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
+        self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.long)
+        self._uncached_arg_names = ["input_ids", "position_ids"]
+        self._uncached_dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
+
+        # EXTRA TENSOR FIELDS
+        self._extra_args: Dict[str, torch.Tensor] = {}
+        self._extra_none_inputs: Dict[str, torch.Tensor] = {}
+        self._extra_dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
+        self._extra_dynamic_shapes_callbacks: Dict[str, DynamicShapeCallback] = {}
+
+        # CACHED TENSOR FIELDS (for cached attention backends)
+        self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
+        self.input_pos = torch.empty_like(self.seq_len)
+        self.cache_loc = torch.empty(self.num_pages, dtype=torch.int)
+        self.pages_per_seq = torch.empty_like(self.seq_len)
+        self._cached_arg_names = ["seq_len", "input_pos", "cache_loc", "pages_per_seq"]
+        self._cached_dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
+        ############################################################################################
 
         # call reset once to initialize the tensors
         self.reset()
@@ -147,52 +162,78 @@ class SequenceInfo:
     def device(self) -> torch.device:
         return self.input_pos.device
 
+    def _named_args(
+        self, include_extra_args: bool = True, include_cached_args: bool = True
+    ) -> Dict[str, torch.Tensor]:
+        args: Dict[str, torch.Tensor] = {}
+        for name in self._uncached_arg_names:
+            args[name] = getattr(self, name)
+
+        if include_extra_args:
+            args.update(self._extra_args)
+
+        if include_cached_args:
+            for name in self._cached_arg_names:
+                args[name] = getattr(self, name)
+
+        return args
+
+    @property
+    def named_args(self) -> Dict[str, torch.Tensor]:
+        """Return a dictionary of named arguments."""
+        return self._named_args(include_extra_args=True, include_cached_args=self._is_cached_attn)
+
+    @property
+    def named_standard_args(self) -> Dict[str, torch.Tensor]:
+        """Return a dictionary of named standard arguments."""
+        return self._named_args(include_extra_args=False, include_cached_args=self._is_cached_attn)
+
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
-        args = []
-        for f in fields(self):
-            val = getattr(self, f.name)
-            if isinstance(val, torch.Tensor):
-                args.append(val)
-            if len(args) >= self._num_uncached_attn_args and not self._is_cached_attn:
-                break
-        return tuple(args)
+        """Return a tuple of arguments."""
+        return tuple(self.named_args.values())
 
     @property
-    def _num_uncached_attn_args(self) -> int:
-        """Return the number of original graph arguments expected by the model."""
-        return 2
+    def extra_args_for_prepare_metadata(self) -> Tuple:
+        """Return a tuple of extra (const, non-tensor) arguments for the prepare_metadata op."""
+        return (self.page_size,)
 
     @property
-    def _cached_attn_arg_names(self) -> List[str]:
-        """Return extra arg names for the prepare_metadata op beyond input_ids and position_ids.
-
-        These extra args are needed once we switch from regular attention to inserting cached
-        attention ops in the model.
-        """
-        return [f.name for f in fields(self) if isinstance(getattr(self, f.name), torch.Tensor)][
-            self._num_uncached_attn_args :
-        ]
-
-    @property
-    def dynamic_shapes(self) -> Tuple[Dict[str, Dim]]:
+    def named_dynamic_shapes(self) -> Dict[str, Dict[str, Dim]]:
         """Return dynamic shapes of sequence info tensors.
 
         NOTE: will be lazily initialized since the Dim object is not picklable for multi-processing.
         """
-        if self._dynamic_shapes is None:
-            # set up shape for input_ids and position_ids
-            dynamic_shapes = ({}, {})
+        # lazy initialization of dynamic shapes with Dim objects
+        if self._uncached_dynamic_shapes is None:
+            # set up shape for uncached args (same for all, i.e., batch_size and seq_len)
+            bs_seq_len_shape: DynamicShape = {}
             if self.max_batch_size > 1:
-                dynamic_shapes[0][0] = Dim("batch_size", max=self.max_batch_size)
-            dynamic_shapes[0][1] = Dim("seq_len", max=self.max_seq_len)
-            # set up shape for position_ids (same as input_ids)
-            dynamic_shapes[1].update(dynamic_shapes[0])
-            # set up shape for extra args
-            if self._is_cached_attn:
-                dynamic_shapes += ({},) * len(self._cached_attn_arg_names)
-            self._dynamic_shapes = dynamic_shapes
-        return self._dynamic_shapes
+                bs_seq_len_shape[0] = Dim("batch_size", max=self.max_batch_size)
+            bs_seq_len_shape[1] = Dim("seq_len", max=self.max_seq_len)
+            self._uncached_dynamic_shapes = {k: bs_seq_len_shape for k in self._uncached_arg_names}
+
+        named_dynamic_shapes = self._uncached_dynamic_shapes.copy()
+
+        # add dynamic shapes for extra args
+        if self._extra_dynamic_shapes is None:
+            self._extra_dynamic_shapes = {
+                k: callback() for k, callback in self._extra_dynamic_shapes_callbacks.items()
+            }
+        named_dynamic_shapes.update(self._extra_dynamic_shapes)
+
+        # fixed shape for remaining cached attention args
+        if self._is_cached_attn:
+            if self._cached_dynamic_shapes is None:
+                self._cached_dynamic_shapes = {k: {} for k in self._cached_arg_names}
+            named_dynamic_shapes.update(self._cached_dynamic_shapes)
+
+        return named_dynamic_shapes
+
+    @property
+    def dynamic_shapes(self) -> Tuple[DynamicShape, ...]:
+        """Return dynamic shapes of sequence info tensors."""
+        return tuple(self.named_dynamic_shapes.values())
 
     @property
     def num_sequences(self) -> int:
@@ -305,26 +346,18 @@ class SequenceInfo:
         """
         assert not self._is_cached_attn, "Cached+flattened attention already activated"
         self._is_cached_attn = True
-        return self._cached_attn_arg_names
+        return self._cached_arg_names.copy()
 
     def to(self, *args, **kwargs) -> None:
-        for f in fields(self):
-            val = getattr(self, f.name)
-            if isinstance(val, torch.Tensor):
-                setattr(self, f.name, val.to(*args, **kwargs))
+        for k in self._uncached_arg_names + self._cached_arg_names:
+            setattr(self, k, getattr(self, k).to(*args, **kwargs))
 
-    def sync(self, other: "SequenceInfo") -> None:
-        for f in fields(self):
-            val = getattr(self, f.name)
-            val_other = getattr(other, f.name)
-            if f.name in ["input_ids", "position_ids"]:
-                setattr(self, f.name, val_other.to(self.device))
-            elif f.name == "_sequence_lengths":
-                self._sequence_lengths = val_other
-            elif isinstance(val, torch.Tensor):
-                val[: len(val_other)] = val_other.to(self.device)
-            else:
-                assert val == val_other, f"Field {f.name} mismatch: {val} != {val_other}."
+        def _move_dict(d: Dict[str, torch.Tensor]) -> None:
+            for k, v in d.items():
+                d[k] = v.to(*args, **kwargs)
+
+        _move_dict(self._extra_args)
+        _move_dict(self._extra_none_inputs)
 
     def reset(self) -> None:
         """Reset the sequence information.
@@ -342,25 +375,30 @@ class SequenceInfo:
         self.cache_loc[:] = torch.arange(self.num_pages, dtype=torch.int, device=self.device)
         self.pages_per_seq.fill_(1)
 
-    def set_example_sequence(self) -> None:
+    def set_example_sequence(self, input_ids: Optional[torch.Tensor] = None, **kwargs) -> None:
         """Set an example sequence useful for testing and export purposes."""
         self.reset()
-        bs, seq_len = min(2, self.max_batch_size), min(4, self.max_seq_len)
-        input_ids = torch.ones(
-            bs,
-            seq_len,
-            dtype=torch.int,
-            device=self.device,
+
+        # use a best guess default for input_ids if not provided
+        if input_ids is None:
+            bs, seq_len = min(2, self.max_batch_size), min(4, self.max_seq_len)
+            input_ids = torch.ones(
+                bs,
+                seq_len,
+                dtype=torch.int,
+                device=self.device,
+            )
+
+        # make sure that all extra arguments are provided
+        assert self._extra_args.keys() <= kwargs.keys(), (
+            f"Missing extra args: {self._extra_args.keys() - kwargs.keys()}"
         )
-        self.nest_sequences(input_ids)
 
-        # unflatten if we are not yet using cached+flattened attention
-        if not self._is_cached_attn:
-            self.input_ids = self.input_ids.view(bs, seq_len)
-            self.position_ids = self.position_ids.view(bs, seq_len)
+        self.nest_sequences(input_ids, **kwargs)
 
-    def _set_max_num_tokens_sample(self) -> None:
+    def set_max_num_tokens_sample(self) -> None:
         """Set an example sequence with max_num_tokens."""
+        # TODO: understand what this implies for extra arguments
         self.reset()
         seq_len = self.max_num_tokens // self.max_batch_size
         input_ids = torch.ones(
@@ -396,42 +434,16 @@ class SequenceInfo:
         else:
             self.position_ids = self.position_ids.view(1, -1)
 
-    def nest_sequences(self, input_ids: Sequence[Sequence[int]]) -> None:
-        """Create and store a flattened list of input_ids from the provided list of sequences.
-
-        This i/f will also update any relevant sequence information.
-        """
-        # set new sequence lengths
-        seq_lens = [len(ids) for ids in input_ids]
-        self.seq_len.zero_()
-        self.seq_len[: len(seq_lens)].copy_(torch.tensor(seq_lens), non_blocking=True)
-        # We'll preserve the dtype of the input_ids tensor if it is a tensor, otherwise we'll use int
-        dtype = input_ids.dtype if isinstance(input_ids, torch.Tensor) else torch.int
-        # set new input_ids as new tensor from flattened input_ids
-        ids_list = [
-            val
-            for lst in input_ids
-            for val in (lst.detach().tolist() if isinstance(lst, torch.Tensor) else lst)
+    def _generate_position_ids(self) -> torch.Tensor:
+        """Generate position ids from current input_pos and sequence lengths."""
+        position_ids_list = [
+            num
+            for in_pos, seq_len in zip(self.input_positions, self.sequence_lengths)
+            for num in range(in_pos, in_pos + seq_len)
         ]
-        self.input_ids = torch.tensor(ids_list, dtype=dtype).to(self.device)
+        return torch.tensor(position_ids_list, dtype=torch.long).to(self.device)
 
-        # set derivative properties
-        self._sequence_lengths = seq_lens
-
-        # use [b,1] shape to indicate generate-only batch, otherwise use [1,total_len]
-        if self.is_generate:
-            self.input_ids = self.input_ids.view(-1, 1, *self.input_ids.shape[1:])
-        else:
-            self.input_ids = self.input_ids.view(1, -1, *self.input_ids.shape[1:])
-
-        # update position_ids
-        self._update_position_ids()
-
-    def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
-        t_squeezed = t_nested.squeeze(1) if self.is_generate else t_nested.squeeze(0)
-        return list(torch.split(t_squeezed, self.sequence_lengths))
-
-    def update_pos(self, seq_len: Union[torch.Tensor, List[int], int], reset: bool = False) -> None:
+    def _update_input_pos(self, seq_len: Union[torch.Tensor, List[int], int]) -> None:
         """Update the starting position for each sequence in the cache.
 
         If ``reset=True`, ``input_pos`` will be reset to zero before updating.
@@ -439,17 +451,11 @@ class SequenceInfo:
         if not isinstance(seq_len, torch.Tensor):
             seq_len = torch.tensor(seq_len, dtype=torch.int)
         bs = len(seq_len) if seq_len.dim() > 0 else self.max_batch_size
+        self.input_pos[:bs] = seq_len.to(self.device)
 
-        if reset:
-            self.input_pos[:bs] = seq_len.to(self.device)
-        else:
-            self.input_pos[:bs] += seq_len.to(self.device)
-
-        # update position_ids
-        self._update_position_ids()
-
-    def assign_cache_loc(self, page_assignments: Sequence[Sequence[int]]) -> None:
+    def _assign_pages_per_seq(self, page_assignments: Sequence[Sequence[int]]) -> None:
         """Set the cache location and pages_per_seq tensors from page assignments."""
+        assert len(page_assignments) == self.num_sequences
         cache_loc_flat = torch.tensor(
             [p_idx for pages in page_assignments for p_idx in pages], dtype=torch.int
         )
@@ -457,6 +463,151 @@ class SequenceInfo:
 
         pages_per_seq = torch.tensor([len(p) for p in page_assignments], dtype=torch.int)
         self.pages_per_seq[: len(pages_per_seq)].copy_(pages_per_seq, non_blocking=True)
+
+    @staticmethod
+    def _flatten(nested_seqs: Sequence[Sequence[int]]) -> List[int]:
+        return [
+            val
+            for lst in nested_seqs
+            for val in (lst.detach().tolist() if isinstance(lst, torch.Tensor) else lst)
+        ]
+
+    def _shape_for_forward(self, tnsr: torch.Tensor) -> torch.Tensor:
+        """Shape the tensor for the forward pass based on the current attention mode.
+
+        Args:
+            tnsr: The tensor to shape assumed to be in shape [batch_size*seq_len, ...]
+
+        Returns:
+            The shaped tensor flattened or unflattened based on the current attention mode.
+        """
+        # check if we are still running uncached attention in which case we are also still
+        # operate on unflattened tensors with explicit [batch_size, seq_len, ...] shape
+        if not self._is_cached_attn:
+            bs = len(self.sequence_lengths)
+            sl = self.sequence_lengths[0]
+            return tnsr.view(bs, sl, *tnsr.shape[2:])
+
+        # use [b,1] shape to indicate generate-only batch, otherwise use [1,total_len]
+        if self.is_generate:
+            return tnsr.view(-1, 1, *tnsr.shape[1:])
+        else:
+            return tnsr.view(1, -1, *tnsr.shape[1:])
+
+    def nest_sequences(
+        self,
+        input_ids: Sequence[Sequence[int]],
+        position_ids: Optional[Sequence[Sequence[int]]] = None,
+        input_pos: Optional[Union[torch.Tensor, Sequence[int], int]] = None,
+        page_assignments: Optional[Sequence[Sequence[int]]] = None,
+        **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
+    ) -> None:
+        """Create and store a flattened list of input_ids from the provided list of sequences.
+
+        Args:
+            input_ids: List of sequences of input_ids.
+            position_ids: List of sequences of position_ids for each token.
+            input_pos: Absolute starting position in the cache for each sequence.
+            page_assignments: List of sequences of page assignments for each sequence.
+            extra_args: Extra arguments to be stored in the interface.
+
+        This i/f will ensure that all sequence info args are updated accordingly.
+        """
+
+        # set new sequence lengths
+        seq_lens = [len(ids) for ids in input_ids]
+        self.seq_len.zero_()
+        self.seq_len[: len(seq_lens)].copy_(torch.tensor(seq_lens), non_blocking=True)
+        self._sequence_lengths = seq_lens
+
+        # We'll preserve the dtype of the input_ids tensor if it is a tensor, otherwise we'll use int
+        dtype = input_ids.dtype if isinstance(input_ids, torch.Tensor) else torch.int
+
+        # set new input_ids as new tensor from flattened input_ids
+        self.input_ids = torch.tensor(self._flatten(input_ids), dtype=dtype).to(self.device)
+        self.input_ids = self._shape_for_forward(self.input_ids)
+
+        # check for position_ids/input_pos update
+        assert position_ids is None or input_pos is None, (
+            "Cannot provide both position_ids and input_pos"
+        )
+        # check for updated input_pos
+        if input_pos is not None:
+            self._update_input_pos(input_pos)
+
+        # check for updated position_ids
+        if position_ids is None:
+            # none provided,simple update position_ids based on new sequence lengths and
+            # current input_pos assuming that input_pos is the starting position id for each
+            # sequence and position_ids are consecutive.
+            self.position_ids = self._generate_position_ids()
+        elif not isinstance(position_ids, torch.Tensor):
+            # nest position_ids to be consistent with input_ids
+            seq_lens_p = [len(ids) for ids in position_ids]
+            assert len(seq_lens_p) == len(seq_lens), f"{seq_lens_p=} != {seq_lens=}"
+            position_ids_flat = self._flatten(position_ids)
+            self.position_ids = torch.tensor(
+                position_ids_flat, dtype=torch.long, device=self.device
+            )
+        else:
+            self.position_ids = position_ids
+
+        # final shape for position_ids
+        self.position_ids = self._shape_for_forward(self.position_ids)
+
+        # sanity check on final shape of position_ids and input_ids
+        assert self.position_ids.shape[:2] == self.input_ids.shape[:2], (
+            f"{self.position_ids.shape[:2]=} != {self.input_ids.shape[:2]=}"
+        )
+
+        # check for updated page_assignments
+        if page_assignments is not None:
+            self._assign_pages_per_seq(page_assignments)
+
+        # go through all extra arguments and update them
+        for name, none_input in self._extra_none_inputs.items():
+            if name in extra_args:
+                arg = extra_args.pop(name)
+                if not isinstance(arg, torch.Tensor):
+                    if len(arg) > 1:
+                        arg = torch.cat(arg)
+                    else:
+                        arg = arg[0]
+                self._extra_args[name] = arg.to(self.device)
+            else:
+                self._extra_args[name] = none_input
+
+        # TODO (lucaslie): how strict do we wanna be here? Should we just warn/ignore instead?
+        assert not extra_args, f"Extra arguments {extra_args.keys()} not found"
+
+    def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
+        t_squeezed = t_nested.squeeze(1) if self.is_generate else t_nested.squeeze(0)
+        return list(torch.split(t_squeezed, self.sequence_lengths))
+
+    def add_extra_arg(
+        self,
+        name: str,
+        none_input: torch.Tensor,
+        dynamic_shape_callback: Optional[DynamicShapeCallback] = None,
+    ) -> None:
+        """Add an extra argument to the sequence info object.
+
+        Args:
+            name: The name of the extra argument.
+            none_input: None input value of the extra argument.
+            dynamic_shape_callback: The callback to get the dynamic shape of the extra argument.
+
+        Note that the extra argument is expected to be a tensor.
+        """
+        assert name not in self._named_args().keys(), f"Extra argument {name} already exists"
+
+        self._extra_args[name] = none_input.to(self.device)
+        self._extra_none_inputs[name] = none_input.to(self.device)
+
+        if dynamic_shape_callback is None:
+            self._extra_dynamic_shapes_callbacks[name] = lambda: {}
+        else:
+            self._extra_dynamic_shapes_callbacks[name] = dynamic_shape_callback
 
 
 Constant = Union[int, float, str, None]
