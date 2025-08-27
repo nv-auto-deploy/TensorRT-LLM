@@ -418,10 +418,9 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
             return
 
         kwargs = {
-            'skip_special_tokens':
-            self.sampling_params.skip_special_tokens,
-            'spaces_between_special_tokens':
-            self.sampling_params.spaces_between_special_tokens
+            'skip_special_tokens': self.sampling_params.skip_special_tokens,
+            # 'spaces_between_special_tokens':
+            # self.sampling_params.spaces_between_special_tokens
         }
         if self.sampling_params.detokenize and self.tokenizer is not None:
             for beam_output in self.outputs:

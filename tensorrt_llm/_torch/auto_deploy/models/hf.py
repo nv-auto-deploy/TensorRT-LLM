@@ -64,7 +64,7 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
 @ModelFactoryRegistry.register("AutoModelForCausalLM")
 class AutoModelForCausalLMFactory(ModelFactory):
     _tokenizer_defaults = {
-        "legacy": False,
+        # "legacy": False,
         "padding_side": "left",
         "truncation_side": "left",
         "trust_remote_code": True,

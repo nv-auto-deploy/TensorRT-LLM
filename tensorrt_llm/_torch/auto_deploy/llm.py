@@ -4,7 +4,7 @@ from typing import List, Optional
 from ...executor.result import CompletionOutput
 from ...inputs.registry import create_input_processor
 from ...llmapi.llm import RequestOutput, _TorchLLM
-from ...llmapi.tokenizer import TokenizerBase, tokenizer_factory
+from ...llmapi.tokenizer import TokenizerBase
 from .distributed import common as dist_ad
 from .llm_args import LlmArgs
 from .shim.demollm import DemoGenerationExecutor
@@ -24,7 +24,7 @@ class LLM(_TorchLLM):
             return None
 
         factory = self.args.create_factory()
-        return tokenizer_factory(factory.init_tokenizer())
+        return factory.init_tokenizer()
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """We don't need to validate args for AutoDeploy backend for now."""
