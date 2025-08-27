@@ -3,7 +3,7 @@
 import os
 import types
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -374,6 +374,24 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             if hasattr(text_config, "num_hidden_layers"):
                 self._sharding_config["num_hidden_layers"] = text_config.num_hidden_layers
 
+    def __init__(
+        self,
+        *args,
+        example_image_dims: tuple[int, int] = (16, 16),
+        example_input_names: Sequence[str] = ("input_ids", "pixel_values"),
+        **kwargs,
+    ):
+        """Constructor.
+
+        Args:
+            example_image_dims: Tuple of (height, width) to use for making example inputs to the
+                the transformers input processor.
+            example_input_names: Names (str) of the values to keep in the input processor's outputs.
+        """
+        super().__init__(*args, **kwargs)
+        self._example_image_dims = example_image_dims
+        self._example_input_names = example_input_names
+
     @property
     def automodel_from_config(self):
         return AutoModelForImageTextToText.from_config
@@ -426,17 +444,19 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
                 }
             ]
 
-        # Create a batch of conversations (batch_size = 2)
+        # Create a batch of conversations (batch_size = 2).
+        # Note that we explicitly use 2 images in the examples to avoid potential shape specialization(s)
+        # in `torch.compile` / `torch.export`.
         batch_messages = [
             _prep_seq(
                 "Describe what you see in the two images and their differences.",
-                Image.new("RGB", (16, 16), color=(128, 128, 128)),
-                Image.new("RGB", (16, 16), color=(64, 64, 64)),
+                Image.new("RGB", self._example_image_dims, color=(128, 128, 128)),
+                Image.new("RGB", self._example_image_dims, color=(64, 64, 64)),
             ),
             _prep_seq(
                 "What are the main differences between these two images?",
-                Image.new("RGB", (16, 16), color=(255, 0, 0)),
-                Image.new("RGB", (16, 16), color=(0, 255, 0)),
+                Image.new("RGB", self._example_image_dims, color=(255, 0, 0)),
+                Image.new("RGB", self._example_image_dims, color=(0, 255, 0)),
             ),
         ]
 
@@ -451,10 +471,7 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             return_attention_mask=False,
         )
 
-        return {
-            "input_ids": inputs["input_ids"],
-            "pixel_values": inputs["pixel_values"],
-        }
+        return {name: inputs[name] for name in self._example_input_names}
 
     def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, Optional[DynamicShapeCallback]]]:
         """Return a dictionary of extra inputs for the model.
