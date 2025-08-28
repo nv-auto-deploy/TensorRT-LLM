@@ -1,7 +1,10 @@
 """Interface to initialize and load HF models."""
 
+import json
 import os
+import re
 import types
+from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -12,6 +15,7 @@ from accelerate.utils import modeling
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
 from PIL import Image
+from safetensors import safe_open
 from torch._prims_common import DeviceLikeType
 from transformers import (
     AutoConfig,
@@ -99,6 +103,11 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # set sharding config source to huggingface
         self._sharding_config["source"] = ShardingConfigSource.HUGGINGFACE
 
+        # Some models' transformers implementation has changed in between when safetensors were produced
+        # and / or uploaded to HuggingFace hub. When building the model, we will try to determine whether
+        # a mapping of the parameter names exists and hold that information in this attribute.
+        self._checkpoint_conversion_mapping: Optional[Dict[str, str]] = None
+
     @property
     def autoconfig_from_pretrained(self):
         return AutoConfig.from_pretrained
@@ -168,6 +177,12 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         # if present, initialize sharding config. We need head_dim for colwise sharding.
         self._set_sharding_config(model.config)
+        self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+
+        # post-init --> this must be called explicitly for HF models the way we initialize them since
+        # this "gets lost" with the init_empty_weights context manager.
+        if hasattr(model, "post_init"):
+            model.post_init()
 
         # patch forward method
         model.forward = types.MethodType(self._simple_forward, model)
@@ -326,6 +341,11 @@ class AutoModelForCausalLMFactory(ModelFactory):
         """Load the checkpoint into the model."""
         # identify the most relevant checkpoint file
         ckpt_file = self._get_checkpoint_file(self.model)
+
+        if self._checkpoint_conversion_mapping:
+            self._load_checkpoint_remapped(model, device)
+            return
+
         # reuse the load checkpoint utility from accelerate
         with hf_load_state_dict_with_device(device):
             # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
@@ -335,6 +355,42 @@ class AutoModelForCausalLMFactory(ModelFactory):
             # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
             # model-transformed weights,leading to unexpected key mismatches or format issues.
             load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
+
+    def _load_checkpoint_remapped(self, model, device):
+        index_json_path = self._get_checkpoint_file(self.model)
+        checkpoint_dir = os.path.dirname(index_json_path)
+
+        # 2. Manually load and process the index file to map shards.
+        with open(index_json_path, "r") as f:
+            index_data = json.load(f)
+
+        weight_map = index_data["weight_map"]
+        # Invert the map to group tensor names by the file they are in.
+        shards = defaultdict(list)
+        for tensor_name, shard_file in weight_map.items():
+            shards[shard_file].append(tensor_name)
+
+        # 3. Load all tensors from their respective shards into one dictionary.
+        state_dict = {}
+        for shard_file, tensor_names in shards.items():
+            shard_path = os.path.join(checkpoint_dir, shard_file)
+            # Use safe_open to efficiently load only the needed tensors from each shard.
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for tensor_name in tensor_names:
+                    state_dict[tensor_name] = f.get_tensor(tensor_name)
+
+        # 4. Perform the key remapping on the now fully assembled state_dict.
+        conversion_mapping = self._checkpoint_conversion_mapping
+        keys_to_process = list(state_dict.keys())
+        for key in keys_to_process:
+            new_key = key
+            for pattern, replacement in conversion_mapping.items():
+                new_key = re.sub(pattern, replacement, new_key)
+
+            if new_key != key:
+                state_dict[new_key] = state_dict.pop(key)
+
+        model.load_state_dict(state_dict)
 
     def _load_quantization_config(self, fetched_dir: str):
         """Load the quantization config from the model directory if not done already."""
