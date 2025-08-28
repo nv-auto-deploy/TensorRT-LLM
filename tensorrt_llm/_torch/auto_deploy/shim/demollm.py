@@ -121,6 +121,7 @@ class DemoEngine(ADEngine):
         batch_size = sequence_info.num_sequences
         new_tokens = [[] for _ in range(batch_size)]  # [batch_size][max_seq_len]
         stop_tokens = sampling_params._get_stop_words()
+        stop_tokens.append([sampling_params.end_id])
         idxs_stop = [sampling_params.max_tokens - 1] * batch_size
         gen_logits = [] if sampling_params.return_generation_logits else None
         context_logits: Optional[List[torch.Tensor]] = None
