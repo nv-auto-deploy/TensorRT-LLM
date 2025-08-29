@@ -1,10 +1,8 @@
 """Interface to initialize and load HF models."""
 
-import json
 import os
 import re
 import types
-from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -15,7 +13,6 @@ from accelerate.utils import modeling
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
 from PIL import Image
-from safetensors import safe_open
 from torch._prims_common import DeviceLikeType
 from transformers import (
     AutoConfig,
@@ -342,55 +339,29 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # identify the most relevant checkpoint file
         ckpt_file = self._get_checkpoint_file(self.model)
 
-        if self._checkpoint_conversion_mapping:
-            self._load_checkpoint_remapped(model, device)
-            return
+        load_handle = model.register_load_state_dict_pre_hook(self._remap_param_names_load_hook)
+        # Ensure it's the first one.
+        model._load_state_dict_pre_hooks.move_to_end(key=load_handle.id, last=False)
+
+        get_handle = model.register_state_dict_post_hook(
+            _StateDictParamNameConverter(self._checkpoint_conversion_mapping)
+        )
+        # Ensure it's the first one.
+        model._state_dict_hooks.move_to_end(key=get_handle.id, last=False)
 
         # reuse the load checkpoint utility from accelerate
-        with hf_load_state_dict_with_device(device):
-            # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
-            # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
-            # which collects local model params, syncs weights from checkpoint, and applies them via
-            # model.load_state_dict.
-            # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
-            # model-transformed weights,leading to unexpected key mismatches or format issues.
-            load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
-
-    def _load_checkpoint_remapped(self, model, device):
-        index_json_path = self._get_checkpoint_file(self.model)
-        checkpoint_dir = os.path.dirname(index_json_path)
-
-        # 2. Manually load and process the index file to map shards.
-        with open(index_json_path, "r") as f:
-            index_data = json.load(f)
-
-        weight_map = index_data["weight_map"]
-        # Invert the map to group tensor names by the file they are in.
-        shards = defaultdict(list)
-        for tensor_name, shard_file in weight_map.items():
-            shards[shard_file].append(tensor_name)
-
-        # 3. Load all tensors from their respective shards into one dictionary.
-        state_dict = {}
-        for shard_file, tensor_names in shards.items():
-            shard_path = os.path.join(checkpoint_dir, shard_file)
-            # Use safe_open to efficiently load only the needed tensors from each shard.
-            with safe_open(shard_path, framework="pt", device="cpu") as f:
-                for tensor_name in tensor_names:
-                    state_dict[tensor_name] = f.get_tensor(tensor_name)
-
-        # 4. Perform the key remapping on the now fully assembled state_dict.
-        conversion_mapping = self._checkpoint_conversion_mapping
-        keys_to_process = list(state_dict.keys())
-        for key in keys_to_process:
-            new_key = key
-            for pattern, replacement in conversion_mapping.items():
-                new_key = re.sub(pattern, replacement, new_key)
-
-            if new_key != key:
-                state_dict[new_key] = state_dict.pop(key)
-
-        model.load_state_dict(state_dict)
+        try:
+            with hf_load_state_dict_with_device(device):
+                # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
+                # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
+                # which collects local model params, syncs weights from checkpoint, and applies them via
+                # model.load_state_dict.
+                # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
+                # model-transformed weights,leading to unexpected key mismatches or format issues.
+                load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
+        finally:
+            load_handle.remove()
+            get_handle.remove()
 
     def _load_quantization_config(self, fetched_dir: str):
         """Load the quantization config from the model directory if not done already."""
@@ -406,6 +377,63 @@ class AutoModelForCausalLMFactory(ModelFactory):
         if reader is not None:
             self._quant_config_reader = reader
             self.model_kwargs = deep_merge_dicts(self.model_kwargs, extra_model_kwargs)
+
+    def _remap_param_names_load_hook(self, model, state_dict, *args, **kwargs) -> None:
+        """Hook to handle potential param name conversions.
+
+        Some models' transformers implementation can change in between when safetensors were produced
+        and / or uploaded to HuggingFace hub. This hook applies the mapping (when present) to reflect
+        these differences.
+        """
+        conversion_mapping = self._checkpoint_conversion_mapping
+        if conversion_mapping:
+            keys_to_process = list(state_dict.keys())
+            for key in keys_to_process:
+                new_key = key
+                for pattern, replacement in conversion_mapping.items():
+                    new_key = re.sub(pattern, replacement, new_key)
+
+                if new_key != key:
+                    state_dict[new_key] = state_dict.pop(key)
+
+
+class _StateDictParamNameConverter:
+    """Helper class for applying param name conversions to a state dict.
+
+    The reason this is a class instead of a method of factory like `_remap_param_names_load_hook`
+    is because PyTorch tries to set an `_from_public_api` attribute on hooks, and bound instance
+    methods cannot have attributes set on them without major hacks.
+    """
+
+    def __init__(self, conversion_mapping: Optional[Dict[str, str]]):
+        conversion_mapping = conversion_mapping or {}
+
+        # NOTE: most of the code in this class is forked from `PreTrainedModel.save_pretrained`.
+        reverse_key_mapping = {v: k for k, v in conversion_mapping.items()}
+        self._mapping = reverse_key_mapping
+
+    def __call__(self, module, state_dict, *args, **kwargs) -> None:
+        """Hook to handle potential param name conversions.
+
+        For the same reasons as the `load` hook, we define one to for `state_dict`. This is to silence
+        potentially misleading warnings about certain parameter names not being used, because the
+        `accelerate` library's logic for determining which keys are unexpected bases it on the keys
+        in the `module.state_dict()` return value, not on what `module.load_state_dict()` returns.
+        """
+        if self._mapping:
+            keys_to_process = list(state_dict.keys())
+            for key in keys_to_process:
+                new_key = key
+                for pattern, replacement in self._mapping.items():
+                    replacement = replacement.lstrip("^")  # strip off un-needed chars and patterns
+                    replacement = re.sub(r"\(.*\)", "", replacement)
+                    new_key, n_replace = re.subn(pattern, replacement, key)
+                    # Early exit of the loop
+                    if n_replace > 0:
+                        break
+
+                if new_key != key:
+                    state_dict[new_key] = state_dict.pop(key)
 
 
 @ModelFactoryRegistry.register("AutoModelForImageTextToText")
