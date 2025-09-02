@@ -10,24 +10,6 @@ from tensorrt_llm._torch.auto_deploy.models import factory, hf
 
 @factory.ModelFactoryRegistry.register("Mistral3VLM")
 class Mistral3VLM(hf.AutoModelForImageTextToTextFactory):
-    def __init__(self, *args, **kwargs):
-        if kwargs.get("example_input_names"):
-            raise ValueError(f"`example_input_names` cannot be specified for {type(self)}.")
-
-        example_image_dims = kwargs.pop("example_image_dims", (64, 64))
-        for i, dim in enumerate(example_image_dims):
-            if dim < 32:
-                raise ValueError(
-                    f"The {i}-th example image dimension {dim} needs to be larger than 32."
-                )
-
-        super().__init__(
-            *args,
-            example_image_dims=example_image_dims,
-            example_input_names=["input_ids", "pixel_values", "image_sizes"],
-            **kwargs,
-        )
-
     def get_extra_inputs(
         self,
     ) -> Dict[str, Tuple[torch.Tensor, attention_interface.DynamicShapeCallback]]:
@@ -46,7 +28,6 @@ class Mistral3VLM(hf.AutoModelForImageTextToTextFactory):
 
         return extra_inputs
 
-    # ? Is this necessary if mistral3's forward is patched in e.g. `models/patches/foo.py`?
     @staticmethod
     def _simple_forward(
         model: torch.nn.Module,
@@ -66,3 +47,10 @@ class Mistral3VLM(hf.AutoModelForImageTextToTextFactory):
             pixel_values=pixel_values,
             image_sizes=image_sizes,
         )
+
+    @property
+    def _example_image_dims(self) -> Tuple[int, int]:
+        # The pixtral processor requires a minimum image size, which is larger than the default (16, 16)
+        # in the parent class.
+        # TODO: figure this out on the model config somehow (patch size value, etc.).
+        return (64, 64)

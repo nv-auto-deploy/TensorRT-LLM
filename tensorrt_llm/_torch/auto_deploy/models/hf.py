@@ -4,7 +4,7 @@ import os
 import re
 import types
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -175,11 +175,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # if present, initialize sharding config. We need head_dim for colwise sharding.
         self._set_sharding_config(model.config)
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
-
-        # post-init --> this must be called explicitly for HF models the way we initialize them since
-        # this "gets lost" with the init_empty_weights context manager.
-        if hasattr(model, "post_init"):
-            model.post_init()
 
         # patch forward method
         model.forward = types.MethodType(self._simple_forward, model)
@@ -458,24 +453,6 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             if hasattr(text_config, "num_hidden_layers"):
                 self._sharding_config["num_hidden_layers"] = text_config.num_hidden_layers
 
-    def __init__(
-        self,
-        *args,
-        example_image_dims: tuple[int, int] = (16, 16),
-        example_input_names: Sequence[str] = ("input_ids", "pixel_values"),
-        **kwargs,
-    ):
-        """Constructor.
-
-        Args:
-            example_image_dims: Tuple of (height, width) to use for making example inputs to the
-                the transformers input processor.
-            example_input_names: Names (str) of the values to keep in the input processor's outputs.
-        """
-        super().__init__(*args, **kwargs)
-        self._example_image_dims = example_image_dims
-        self._example_input_names = example_input_names
-
     @property
     def automodel_from_config(self):
         return AutoModelForImageTextToText.from_config
@@ -555,7 +532,15 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             return_attention_mask=False,
         )
 
-        return {name: inputs[name] for name in self._example_input_names}
+        # We should have no need for the attention mask, and it can actually cause issues in
+        # downstream code.
+        inputs.pop("attention_mask", None)
+
+        # NOTES:
+        # 1. `inputs` is dict-like, but not a dict (hence the dict unpacking below).
+        # 2. Although `get_extra_inputs` allows implementations to specify "extra inputs", the example
+        #    values still need to be returned by `get_example_inputs`.
+        return {**inputs}
 
     def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, Optional[DynamicShapeCallback]]]:
         """Return a dictionary of extra inputs for the model.
@@ -577,3 +562,10 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
 
         none_pixel_values = torch.zeros(0, 3, 336, 336)
         return {"pixel_values": (none_pixel_values, _get_dynamic_shape)}
+
+    @property
+    def _example_image_dims(self) -> Tuple[int, int]:
+        # Some specializations (children) of this class may override this if their models have
+        # assumptions on the image dimensions. For example, they may have a lower bound due to
+        # the patch size they use.
+        return (16, 16)

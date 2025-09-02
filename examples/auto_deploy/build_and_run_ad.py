@@ -261,7 +261,6 @@ def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> List[List[
 def main(config: Optional[ExperimentConfig] = None):
     if config is None:
         config = CliApp.run(ExperimentConfig)
-
     ad_logger.info(f"{config=}")
 
     if config.dry_run:

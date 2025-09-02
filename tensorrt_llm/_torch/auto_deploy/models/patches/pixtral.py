@@ -24,7 +24,7 @@ from ...export.interface import BaseExportPatch, ExportPatchRegistry
 #    methods cannot be decorated.
 
 
-@torch.library.custom_op("auto_deploy::process_pixtral_patch_embeds", mutates_args={})
+@torch.library.custom_op("auto_deploy::pixtral_process_patch_embeds", mutates_args={})
 def _process_patch_embeds(
     patch_embeds: torch.Tensor,
     image_sizes: torch.Tensor,
@@ -80,7 +80,7 @@ def _pixtral_forward(
 
     # pass images through initial convolution independently
     patch_embeds = self.patch_conv(pixel_values)
-    patch_embeds, position_ids = torch.ops.auto_deploy.process_pixtral_patch_embeds(
+    patch_embeds, position_ids = torch.ops.auto_deploy.pixtral_process_patch_embeds(
         patch_embeds=patch_embeds,
         image_sizes=image_sizes,
         patch_size=self.patch_size,
@@ -143,7 +143,7 @@ def generate_block_attention_mask(num_ids_per_image, tensor):
     return mask
 
 
-@torch.library.custom_op("auto_deploy::unfold_to_2d_grid", mutates_args={})
+@torch.library.custom_op("auto_deploy::pixtral_unfold_to_2d_grid", mutates_args={})
 def _unfold_to_2d_grid(
     image_features: torch.Tensor,
     image_sizes: torch.Tensor,
@@ -191,7 +191,7 @@ def _unfold_to_2d_grid_meta(
 def _patch_merger_forward(
     self, image_features: torch.Tensor, image_sizes: torch.Tensor
 ) -> torch.Tensor:
-    unfolded_features = torch.ops.auto_deploy.unfold_to_2d_grid(
+    unfolded_features = torch.ops.auto_deploy.pixtral_unfold_to_2d_grid(
         image_features=image_features,
         image_sizes=image_sizes,
         patch_size=self.patch_size,
@@ -216,34 +216,16 @@ class PixtralVisionModelPatch(BaseExportPatch):
 
     def _apply_patch(self):
         """Apply the PixtralVisionModel patch."""
-        # Store original forward method
         self.original_values["PixtralVisionModel.forward"] = PixtralVisionModel.forward
         self.original_values["Mistral3PatchMerger.forward"] = Mistral3PatchMerger.forward
         self.original_values["PixtralRMSNorm.forward"] = PixtralRMSNorm.forward
 
-        # Apply patch by replacing the forward method
-        PixtralVisionModel._original_forward = PixtralVisionModel.forward  # type: ignore
-        PixtralVisionModel.forward = _pixtral_forward  # type: ignore
-
-        Mistral3PatchMerger._original_forward = Mistral3PatchMerger.forward
+        PixtralVisionModel.forward = _pixtral_forward
         Mistral3PatchMerger.forward = _patch_merger_forward
-
-        PixtralRMSNorm._original_forward = PixtralRMSNorm.forward
         PixtralRMSNorm.forward = _pixtral_rms_norm_forward
 
     def _revert_patch(self):
         """Revert the PixtralVisionModel patch."""
-        # Restore original forward method.
-        PixtralVisionModel.forward = self.original_values["PixtralVisionModel.forward"]  # type: ignore
+        PixtralVisionModel.forward = self.original_values["PixtralVisionModel.forward"]
         Mistral3PatchMerger.forward = self.original_values["Mistral3PatchMerger.forward"]
         PixtralRMSNorm.forward = self.original_values["PixtralRMSNorm.forward"]
-
-        # Clean up the temporary attribute.
-        if hasattr(PixtralVisionModel, "_original_forward"):
-            delattr(PixtralVisionModel, "_original_forward")
-
-        if hasattr(Mistral3PatchMerger, "_original_forward"):
-            delattr(Mistral3PatchMerger, "_original_forward")
-
-        if hasattr(PixtralRMSNorm, "_original_forward"):
-            delattr(PixtralRMSNorm, "_original_forward")

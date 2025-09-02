@@ -50,8 +50,6 @@ def _mistral_forward(
     position_ids: Optional[torch.LongTensor] = None,
     past_key_values: Optional[list[torch.FloatTensor]] = None,
     inputs_embeds: Optional[torch.FloatTensor] = None,
-    # // !!! \\
-    # @reviewer: How to assert this is -1? Should we be checking in the mistral factory instead?
     vision_feature_layer: Optional[Union[int, list[int]]] = None,
     use_cache: Optional[bool] = None,
     output_attentions: Optional[bool] = None,
@@ -123,6 +121,15 @@ def _mistral_forward(
     # Decide by whether there is any non-zero pixel_values.
     has_image: torch.Tensor = (pixel_values is not None) and torch.any(pixel_values != 0)
 
+    # `torch.cond` serves 2 purposes here:
+    # 1. It lets the export stage know that there could be both image and no-image branches.
+    #    Without this, the export stage would just assume that whatever the example input contains
+    #    is representative of _all_ inputs at runtime. This means that, if we export it with images
+    #    in the inputs, it would crash when called without images (i.e. in text-only mode).
+    # 2. It introduces a subgraph, which the pattern matcher will ignore. This is important as we
+    #    do not want the vision model's attention ops to be converted by the pattern matcher to have
+    #    KV cache enabled on them, as it would be both unnecessary to do so and potentially bad for
+    #    performance.
     inputs_embeds = torch.cond(
         has_image,
         _vision_branch,
@@ -159,21 +166,14 @@ class Mistral3ModelPatch(BaseExportPatch):
 
     def _apply_patch(self):
         """Apply the Mistral3Model patch."""
-        # Store original forward method
         self.original_values["Mistral3Model.forward"] = Mistral3Model.forward
         self.original_values["Mistral3Model.get_image_features"] = Mistral3Model.get_image_features
 
-        # Apply patch by replacing the forward method
-        Mistral3Model._original_forward = Mistral3Model.forward  # type: ignore
-        Mistral3Model.forward = _mistral_forward  # type: ignore
+        Mistral3Model.forward = _mistral_forward
         Mistral3Model.get_image_features = _get_image_features_flat
 
     def _revert_patch(self):
         """Revert the Mistral3Model patch."""
         # Restore original forward method.
-        Mistral3Model.forward = self.original_values["Mistral3Model.forward"]  # type: ignore
+        Mistral3Model.forward = self.original_values["Mistral3Model.forward"]
         Mistral3Model.get_image_features = self.original_values["Mistral3Model.get_image_features"]
-
-        # Clean up the temporary attribute.
-        if hasattr(Mistral3Model, "_original_forward"):
-            delattr(Mistral3Model, "_original_forward")
