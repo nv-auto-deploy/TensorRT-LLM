@@ -21,7 +21,6 @@ def _get_config_dict() -> SettingsConfigDict:
     return SettingsConfigDict(
         arbitrary_types_allowed=True,
         extra="forbid",
-        yaml_file=str(files("tensorrt_llm._torch.auto_deploy.config") / "default.yaml"),
         nested_model_default_partial_update=True,
     )
 
@@ -184,6 +183,12 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     visualize: bool = Field(default=False, description="Whether to visualize the model graph.")
 
     ### NEW INFERENCE OPTIMIZER CONFIG #############################################################
+    mode: Literal["graph"] = Field(
+        default="graph",
+        description="The mode to use for the inference optimizer. Currently, we "
+        "support only the 'graph' mode, i.e., full-graph capture + optimization.",
+    )
+
     transforms: Dict[str, TransformConfig] = Field(
         default_factory=dict,
         description="A dictionary of transform configurations. The key is the transform name and "
@@ -232,6 +237,14 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     def to_llm_args(self) -> "LlmArgs":
         """Convert the arguments to a LlmArgs instance that is used for the LLM API."""
         return LlmArgs(**self.to_dict())
+
+    ### PRIVATE METHODS ############################################################################
+    @classmethod
+    def _get_yaml_default_from_mode(cls, mode: Optional[str]) -> Optional[str]:
+        mapping = {
+            "graph": str(files("tensorrt_llm._torch.auto_deploy.config") / "default.yaml"),
+        }
+        return mapping.get(mode)
 
 
 class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):

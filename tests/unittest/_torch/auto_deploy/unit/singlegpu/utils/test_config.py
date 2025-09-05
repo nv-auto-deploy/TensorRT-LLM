@@ -159,7 +159,7 @@ args:
     option: "off"
 """)
 
-    # Inner config (for args.yaml_configs)
+    # Inner config (for args.yaml_extra)
     files["inner_config"] = temp_dir / "inner_config.yaml"
     files["inner_config"].write_text("""
 simple:
@@ -183,7 +183,7 @@ def test_no_yaml_configs():
 
 def test_single_yaml_config(basic_yaml_files):
     """Test loading a single yaml config file."""
-    settings = BasicSettings(yaml_configs=[basic_yaml_files["config1"]])
+    settings = BasicSettings(yaml_extra=[basic_yaml_files["config1"]])
 
     assert settings.simple.value == 200
     assert settings.simple.name == "config1"
@@ -195,9 +195,7 @@ def test_single_yaml_config(basic_yaml_files):
 def test_multiple_yaml_configs_merging(basic_yaml_files):
     """Test merging multiple yaml configs in order."""
     # Order: config1, config2 (config2 should override config1)
-    settings = BasicSettings(
-        yaml_configs=[basic_yaml_files["config1"], basic_yaml_files["config2"]]
-    )
+    settings = BasicSettings(yaml_extra=[basic_yaml_files["config1"], basic_yaml_files["config2"]])
 
     assert settings.simple.value == 200  # from config1
     assert settings.simple.name == "config2"  # overridden by config2
@@ -210,7 +208,7 @@ def test_partial_yaml_config(basic_yaml_files):
     """Test partial yaml config with some missing fields."""
     with pytest.raises(ValidationError):
         # Should fail because 'name' is missing from simple
-        BasicSettings(yaml_configs=[basic_yaml_files["partial"]])
+        BasicSettings(yaml_extra=[basic_yaml_files["partial"]])
 
 
 # Default YAML file tests
@@ -229,7 +227,7 @@ def test_default_yaml_file_loading(basic_yaml_files):
 def test_default_yaml_with_additional_configs(basic_yaml_files):
     """Test default yaml file with additional configs."""
     SettingsWithDefaultYaml = create_settings_with_default_yaml(basic_yaml_files["default"])
-    settings = SettingsWithDefaultYaml(yaml_configs=[basic_yaml_files["config1"]])
+    settings = SettingsWithDefaultYaml(yaml_extra=[basic_yaml_files["config1"]])
 
     # Additional configs should override default
     assert settings.simple.value == 200  # from config1
@@ -243,7 +241,7 @@ def test_multiple_additional_configs_with_default(basic_yaml_files):
     """Test multiple additional configs with default yaml file."""
     SettingsWithDefaultYaml = create_settings_with_default_yaml(basic_yaml_files["default"])
     settings = SettingsWithDefaultYaml(
-        yaml_configs=[basic_yaml_files["config1"], basic_yaml_files["config2"]]
+        yaml_extra=[basic_yaml_files["config1"], basic_yaml_files["config2"]]
     )
 
     # Order: default.yaml, config1.yaml, config2.yaml
@@ -271,7 +269,7 @@ def test_nested_default_yaml(nested_yaml_files):
 def test_nested_with_outer_yaml_configs(nested_yaml_files):
     """Test nested settings with yaml configs at outer level."""
     NestedSettings = create_nested_settings(nested_yaml_files["nested_default"])
-    settings = NestedSettings(yaml_configs=[nested_yaml_files["nested_override1"]])
+    settings = NestedSettings(yaml_extra=[nested_yaml_files["nested_override1"]])
 
     # Outer config should override inner defaults
     assert settings.args.simple.value == 150
@@ -286,7 +284,7 @@ def test_nested_with_inner_yaml_configs(nested_yaml_files):
     """Test nested settings with yaml configs at inner level."""
     NestedSettings = create_nested_settings(nested_yaml_files["nested_default"])
     # Create nested settings with inner yaml configs
-    settings = NestedSettings(args=BasicSettings(yaml_configs=[nested_yaml_files["inner_config"]]))
+    settings = NestedSettings(args=BasicSettings(yaml_extra=[nested_yaml_files["inner_config"]]))
 
     # Inner yaml configs should be processed
     assert settings.args.simple.value == 300
@@ -302,10 +300,10 @@ def test_nested_precedence_outer_over_inner(nested_yaml_files):
     NestedSettings = create_nested_settings(nested_yaml_files["nested_default"])
     # Both outer and inner yaml configs
     # Outer yaml config gets converted to init arguments for inner settings ("args")
-    # The yaml_configs for the inner settings are passed in as yaml setting with lower precedence
+    # The yaml_extra for the inner settings are passed in as yaml setting with lower precedence
     settings = NestedSettings(
-        yaml_configs=[nested_yaml_files["nested_override1"]],
-        args={"yaml_configs": [nested_yaml_files["inner_config"]]},
+        yaml_extra=[nested_yaml_files["nested_override1"]],
+        args={"yaml_extra": [nested_yaml_files["inner_config"]]},
     )
 
     # Outer should take precedence over inner
@@ -322,8 +320,8 @@ def test_inner_init_precedence_over_outer_yaml(nested_yaml_files):
     NestedSettings = create_nested_settings(nested_yaml_files["nested_default"])
     # Both outer and inner yaml configs
     settings = NestedSettings(
-        yaml_configs=[nested_yaml_files["nested_override1"]],
-        args=BasicSettings(yaml_configs=[nested_yaml_files["inner_config"]]),
+        yaml_extra=[nested_yaml_files["nested_override1"]],
+        args=BasicSettings(yaml_extra=[nested_yaml_files["inner_config"]]),
     )
 
     # Initialized BasicSettings takes precedence over yaml since it's a init argument
@@ -342,7 +340,7 @@ def test_init_overrides_yaml(basic_yaml_files):
     init_option = OptionModel(name="init_option", option="on")
 
     settings = BasicSettings(
-        simple=init_simple, option=init_option, yaml_configs=[basic_yaml_files["config1"]]
+        simple=init_simple, option=init_option, yaml_extra=[basic_yaml_files["config1"]]
     )
 
     # Init values should override yaml
@@ -359,7 +357,7 @@ def test_env_overrides_yaml(basic_yaml_files):
         os.environ,
         {"SIMPLE": '{"value": 888, "name": "env_value"}', "OPTION": '{"name": "env_option"}'},
     ):
-        settings = BasicSettings(yaml_configs=[basic_yaml_files["config1"]])
+        settings = BasicSettings(yaml_extra=[basic_yaml_files["config1"]])
 
         # Environment should override yaml
         assert settings.simple.value == 888
@@ -372,7 +370,7 @@ def test_env_overrides_yaml(basic_yaml_files):
 def test_partial_env_override(basic_yaml_files):
     """Test partial environment variable override."""
     with patch.dict(os.environ, {"SIMPLE": '{"flag": true}', "OPTION": '{"option": "on"}'}):
-        settings = BasicSettings(yaml_configs=[basic_yaml_files["config1"]])
+        settings = BasicSettings(yaml_extra=[basic_yaml_files["config1"]])
 
         # Mix of env and yaml values
         assert settings.simple.value == 200  # from yaml
@@ -383,6 +381,22 @@ def test_partial_env_override(basic_yaml_files):
 
 
 # Error handling tests
+def test_deprecated_yaml_configs_field_error(basic_yaml_files):
+    """Test that using deprecated yaml_configs field raises ValueError."""
+    with pytest.raises(
+        ValueError, match=r"The 'yaml_configs' field is deprecated.*Please use 'yaml_extra' instead"
+    ):
+        BasicSettings(yaml_configs=[basic_yaml_files["config1"]])
+
+
+def test_empty_yaml_configs_allowed():
+    """Test that empty yaml_configs list doesn't raise error."""
+    # Empty yaml_configs should not raise error (but validation will still fail for missing fields)
+    with pytest.raises(ValidationError):
+        # Should fail validation for missing required fields, not for yaml_configs deprecation
+        BasicSettings(yaml_configs=[])
+
+
 def test_missing_yaml_file(temp_dir):
     """Test handling of missing yaml file."""
     missing_file = temp_dir / "missing.yaml"
@@ -390,7 +404,7 @@ def test_missing_yaml_file(temp_dir):
     # Should not raise error for missing file (gracefully ignored)
     with pytest.raises(ValidationError):
         # But should still fail validation for missing required fields
-        BasicSettings(yaml_configs=[missing_file])
+        BasicSettings(yaml_extra=[missing_file])
 
 
 def test_invalid_yaml_syntax(temp_dir):
@@ -407,7 +421,7 @@ option:
 """)
 
     with pytest.raises(ValidationError):
-        BasicSettings(yaml_configs=[invalid_yaml])
+        BasicSettings(yaml_extra=[invalid_yaml])
 
 
 def test_malformed_yaml_file(temp_dir):
@@ -426,7 +440,7 @@ option:
 """)
 
     with pytest.raises(Exception):  # Should raise yaml parsing error
-        BasicSettings(yaml_configs=[malformed_yaml])
+        BasicSettings(yaml_extra=[malformed_yaml])
 
 
 # Deep merging tests
@@ -454,7 +468,7 @@ option:
   # name should remain from base
 """)
 
-    settings = BasicSettings(yaml_configs=[base_yaml, override_yaml])
+    settings = BasicSettings(yaml_extra=[base_yaml, override_yaml])
 
     # Deep merge should preserve non-overridden values
     assert settings.simple.value == 200  # overridden
@@ -500,7 +514,7 @@ option:
   option: "off"
 """)
 
-    settings = BasicSettings(yaml_configs=[yaml1, yaml2, yaml3])
+    settings = BasicSettings(yaml_extra=[yaml1, yaml2, yaml3])
 
     # Final result should be deep merge of all three
     assert settings.simple.value == 200  # from yaml2
@@ -603,7 +617,7 @@ extra_field: "default_extra_value"
 def test_nested_dict_deep_merge_basic(dict_config_yaml_files):
     """Test basic deep merging of nested dictionaries."""
     # Test with only inner config
-    settings = SomeNestedSettings(args={"yaml_configs": [dict_config_yaml_files["inner_config"]]})
+    settings = SomeNestedSettings(args={"yaml_extra": [dict_config_yaml_files["inner_config"]]})
 
     # Should have k1 and k2 from inner config
     assert len(settings.args.configs) == 2
@@ -631,8 +645,8 @@ def test_nested_dict_deep_merge_with_outer_yaml(dict_config_yaml_files):
     # Create settings with both inner and outer configs
     # Use args as dict to allow deep merging, not as explicitly initialized object
     settings = SomeNestedSettings(
-        yaml_configs=[dict_config_yaml_files["outer_config"]],
-        args={"yaml_configs": [dict_config_yaml_files["inner_config"]]},
+        yaml_extra=[dict_config_yaml_files["outer_config"]],
+        args={"yaml_extra": [dict_config_yaml_files["inner_config"]]},
     )
 
     # Should have k1 (merged), k2 (from inner), and k3 (from outer)
@@ -671,8 +685,8 @@ def test_nested_dict_deep_merge_with_default_yaml(dict_config_yaml_files):
 
     # Create settings with default yaml and additional outer config
     settings = SomeNestedSettingsWithDefaultYaml(
-        yaml_configs=[dict_config_yaml_files["outer_config"]],
-        args={"yaml_configs": [dict_config_yaml_files["inner_config"]]},
+        yaml_extra=[dict_config_yaml_files["outer_config"]],
+        args={"yaml_extra": [dict_config_yaml_files["inner_config"]]},
     )
 
     # Should have k1 (from outer, overriding both default and inner),
@@ -734,8 +748,8 @@ extra_field: "partial_extra_value"
     # Test with multiple yaml configs: default -> outer -> partial_override
     # and inner config for args
     settings = SomeNestedSettingsWithDefaultYaml(
-        yaml_configs=[dict_config_yaml_files["outer_config"], partial_override],
-        args={"yaml_configs": [dict_config_yaml_files["inner_config"]]},
+        yaml_extra=[dict_config_yaml_files["outer_config"], partial_override],
+        args={"yaml_extra": [dict_config_yaml_files["inner_config"]]},
     )
 
     # Should have all keys
@@ -764,8 +778,8 @@ def test_nested_dict_explicit_init_vs_yaml_precedence(dict_config_yaml_files):
     # When we pass an explicitly initialized SomeSettings object,
     # it should take precedence over outer yaml configs
     settings = SomeNestedSettings(
-        yaml_configs=[dict_config_yaml_files["outer_config"]],
-        args=SomeSettings(yaml_configs=[dict_config_yaml_files["inner_config"]]),
+        yaml_extra=[dict_config_yaml_files["outer_config"]],
+        args=SomeSettings(yaml_extra=[dict_config_yaml_files["inner_config"]]),
     )
 
     # Should only have k1 and k2 from inner config (explicit init takes precedence)
@@ -823,7 +837,7 @@ simple:
 
     SettingsWithDefaultYaml = create_settings_with_default_yaml(default_config)
     # Simulate CLI usage: default + user + experiment configs
-    settings = SettingsWithDefaultYaml(yaml_configs=[user_config, experiment_config])
+    settings = SettingsWithDefaultYaml(yaml_extra=[user_config, experiment_config])
 
     # Should have proper precedence
     assert settings.simple.value == 999  # from experiment (highest priority)
@@ -834,10 +848,10 @@ simple:
 
 
 def test_empty_yaml_configs_list():
-    """Test with empty yaml_configs list."""
-    # Should behave same as no yaml_configs
+    """Test with empty yaml_extra list."""
+    # Should behave same as no yaml_extra
     with pytest.raises(ValidationError):
-        BasicSettings(yaml_configs=[])
+        BasicSettings(yaml_extra=[])
 
 
 def test_relative_and_absolute_paths(basic_yaml_files, temp_dir):
@@ -854,7 +868,7 @@ def test_relative_and_absolute_paths(basic_yaml_files, temp_dir):
     SettingsWithDefaultYaml = create_settings_with_default_yaml(relative_default)
 
     settings = SettingsWithDefaultYaml(
-        yaml_configs=[
+        yaml_extra=[
             relative_config,  # absolute path (Path object)
             basic_yaml_files["config2"],  # absolute path (Path object)
         ]

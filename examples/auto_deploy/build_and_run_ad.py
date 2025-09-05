@@ -3,6 +3,7 @@
 from typing import Any, Dict, Iterator, List, Optional, Union
 
 import torch
+import yaml
 from omegaconf import OmegaConf
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import (
@@ -225,8 +226,8 @@ def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> List[List[
 
 def main(config: Optional[ExperimentConfig] = None):
     if config is None:
-        config = CliApp.run(ExperimentConfig)
-    ad_logger.info(f"{config=}")
+        config: ExperimentConfig = CliApp.run(ExperimentConfig)
+    ad_logger.info(f"AD EXPERIMENT CONFIG:\n{yaml.dump(config.model_dump())}")
 
     if config.dry_run:
         return
