@@ -3,6 +3,7 @@
 from typing import Any, Dict, Iterator, List, Optional, Union
 
 import torch
+import yaml
 from omegaconf import OmegaConf
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import (
@@ -208,7 +209,7 @@ def build_llm_from_config(config: ExperimentConfig) -> LLM:
         "demollm": DemoLLM,
         "trtllm": LLM,
     }
-    llm = llm_lookup[config.args.runtime](**config.args.to_dict())
+    llm = llm_lookup[config.args.runtime](**config.args.to_llm_kwargs())
     return llm
 
 
@@ -225,8 +226,8 @@ def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> List[List[
 
 def main(config: Optional[ExperimentConfig] = None):
     if config is None:
-        config = CliApp.run(ExperimentConfig)
-    ad_logger.info(f"{config=}")
+        config: ExperimentConfig = CliApp.run(ExperimentConfig)
+    ad_logger.info(f"AD EXPERIMENT CONFIG:\n{yaml.dump(config.model_dump())}")
 
     if config.dry_run:
         return
