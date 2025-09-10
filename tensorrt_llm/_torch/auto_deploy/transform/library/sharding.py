@@ -109,6 +109,7 @@ def _append_simple_shard(
     tp_shards: List[TPShardingInfo] = []
     for node_group in nodes_linear.values():
         for n in node_group:
+            module_name = n.args[1].target
             tp_shards.append(
                 TPShardingInfo.from_node(
                     n,
@@ -117,6 +118,7 @@ def _append_simple_shard(
                     world_size=world_size,
                     dist_op="all_gather",
                     min_local_shape=1,
+                    module_name=module_name,
                 )
             )
     sharding_config.tp_transforms.extend(tp_shards)
@@ -202,6 +204,16 @@ class Sharding(BaseTransform):
         ):
             ad_logger.info("Applying sharding from config")
             factory_info = detect_sharding_from_factory_config(gm, sharding_config)
+            # print the sharding config
+            ad_logger.info("Sharding config:")
+            for tp_transform in sharding_config.tp_transforms:
+                ad_logger.info(f"TP transform: {tp_transform}")
+            for bmm_transform in sharding_config.bmm_transforms:
+                ad_logger.info(f"BMM transform: {bmm_transform}, {bmm_transform.module_name}")
+            for ep_transform in sharding_config.ep_transforms:
+                ad_logger.info(f"EP transform: {ep_transform}, {ep_transform.module_name}")
+
+            exit()
             return gm, factory_info
 
         ad_logger.info(
@@ -239,6 +251,17 @@ class Sharding(BaseTransform):
             and ep_info.has_valid_shapes
             and dp_bmm_info.has_valid_shapes,
         )
+
+        # print the sharding config
+        ad_logger.info("Sharding config:")
+        for tp_transform in sharding_config.tp_transforms:
+            ad_logger.info(f"TP transform: {tp_transform}")
+        for bmm_transform in sharding_config.bmm_transforms:
+            ad_logger.info(f"BMM transform: {bmm_transform}")
+        for ep_transform in sharding_config.ep_transforms:
+            ad_logger.info(f"EP transform: {ep_transform}")
+
+        exit()
         return gm, info
 
 
@@ -322,6 +345,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op=None,
                             min_local_shape=min_local_shape,
+                            module_name=module_name,
                         )
                     )
                 elif config == "rowwise":
@@ -333,6 +357,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_reduce",
                             min_local_shape=min_local_shape,
+                            module_name=module_name,
                         )
                     )
                     num_row_col_shards += 1
@@ -353,6 +378,7 @@ def detect_sharding_from_factory_config(
                                     world_size=world_size,
                                     dist_op=None,
                                     min_local_shape=min_local_shape,
+                                    module_name=module_name,
                                 )
                             )
                         elif col_row_action == "rowwise":
@@ -364,6 +390,7 @@ def detect_sharding_from_factory_config(
                                     world_size=world_size,
                                     dist_op="all_reduce",
                                     min_local_shape=min_local_shape,
+                                    module_name=module_name,
                                 )
                             )
                             num_row_col_shards += 1
@@ -383,6 +410,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_gather",
                             min_local_shape=1,
+                            module_name=module_name,
                         )
                     )
                     num_simple_shards += 1
@@ -533,14 +561,14 @@ def detect_column_row_shard(
         num_shards += 1
 
         if sharding_config.simple_shard_only:
-            ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
+            ad_logger.info(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
             _append_simple_shard(nodes_linear, rank, world_size, sharding_config)
             num_simple_shards += 1
             continue
 
         # simple shard when we have != 2 groups of linear nodes
         if len(nodes_linear) != 2:
-            ad_logger.debug(f"Linear groups: {nodes_linear}")
+            ad_logger.info(f"Linear groups: {nodes_linear}")
             _append_simple_shard(nodes_linear, rank, world_size, sharding_config)
             num_simple_shards += 1
             continue
@@ -571,7 +599,7 @@ def detect_column_row_shard(
 
         # check if any unaccounted nodes are left. If so, do a simply shard
         if unaccounted_nodes or attention_related_nodes:
-            ad_logger.debug(f"Unaccounted nodes: {unaccounted_nodes}")
+            ad_logger.info(f"Unaccounted nodes: {unaccounted_nodes}")
             _append_simple_shard(nodes_linear, rank, world_size, sharding_config)
             num_simple_shards += 1
             continue
@@ -584,7 +612,7 @@ def detect_column_row_shard(
             if len(attention_nodes) > 1:
                 # Column-row shard boundary region detection is probably wrong - there should be
                 # only one attention operation. Fall back to simple shard.
-                ad_logger.debug(f"More than one attention node: {unaccounted_nodes}")
+                ad_logger.info(f"More than one attention node: {unaccounted_nodes}")
                 _append_simple_shard(nodes_linear, rank, world_size, sharding_config)
                 num_simple_shards += 1
                 continue
@@ -599,6 +627,7 @@ def detect_column_row_shard(
                     dist_op = "all_reduce"
                 else:
                     dist_op = None
+                module_name = n.args[1].target
                 sharding_config.tp_transforms.append(
                     TPShardingInfo.from_node(
                         n,
@@ -607,6 +636,7 @@ def detect_column_row_shard(
                         world_size=world_size,
                         dist_op=dist_op,
                         min_local_shape=min_local_shape,
+                        module_name=module_name,
                     )
                 )
         num_row_col_shards += 1

@@ -228,6 +228,7 @@ class TPShardingInfo(ShardingTransformInfo):
     split_dim: SplitDimension
     dist_op: Optional[Literal["all_reduce", "all_gather"]] = None
     min_local_shape: int = 1
+    module_name: Optional[str] = None
 
     @classmethod
     def from_node(cls, node: Node, **kwargs) -> "TPShardingInfo":
