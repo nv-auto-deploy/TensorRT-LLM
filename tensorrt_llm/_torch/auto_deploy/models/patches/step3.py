@@ -151,7 +151,7 @@ def _forward_moe(self, hidden_states: torch.Tensor):
         w3_weight=[self.up_proj.weight[i] for i in range(self.num_experts)],  # up projection
     )
     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-    return final_hidden_states, router_logits
+    return final_hidden_states  # NOTE: only return hidden states for step 3
 
 
 CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
