@@ -2,6 +2,8 @@ import types
 from typing import Dict, Optional, Union
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint
 from transformers import AutoModelForCausalLM
 from transformers.cache_utils import Cache, DynamicCache
@@ -112,8 +114,50 @@ def forward_no_mask(
     )
 
 
+def _forward_moe(self, hidden_states: torch.Tensor):
+    # check if we can apply the patch
+    use_original_forward = False
+    if not all(isinstance(expert.act_fn, nn.SiLU) for expert in self.experts):
+        use_original_forward = True
+
+    if any(getattr(mod, "bias", None) is not None for mod in self.experts.modules()):
+        use_original_forward = True
+
+    # rely on original forward instead
+    if use_original_forward:
+        return self._original_forward(hidden_states)
+
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    if self.training and self.jitter_noise > 0:
+        hidden_states *= torch.empty_like(hidden_states).uniform_(
+            1.0 - self.jitter_noise, 1.0 + self.jitter_noise
+        )
+    hidden_states = hidden_states.view(-1, hidden_dim)
+    # router_logits: (batch * sequence_length, n_experts)
+    router_logits = self.gate(hidden_states)
+
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+    # NOTE: no routing weight normalization unlike Mixtral!
+    # routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    # we cast back to the input dtype
+    routing_weights = routing_weights.to(hidden_states.dtype)
+
+    final_hidden_states = torch.ops.auto_deploy.torch_moe(
+        hidden_states,
+        selected_experts,
+        routing_weights,
+        w1_weight=[self.gate_proj.weight[i] for i in range(self.num_experts)],  # gate projection
+        w2_weight=[self.down_proj.weight[i] for i in range(self.num_experts)],  # down projection
+        w3_weight=[self.up_proj.weight[i] for i in range(self.num_experts)],  # up projection
+    )
+    final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+    return final_hidden_states, router_logits
+
+
 CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
     "Step3Model": forward_no_mask,
+    "Step3vMoEMLP": _forward_moe,
 }
 _from_config_original = AutoModelForCausalLM.from_config
 
