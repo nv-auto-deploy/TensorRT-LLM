@@ -97,7 +97,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
     }
 
     _model_defaults = {
-        "use_cache": False,
+        # "use_cache": False,
     }
 
     def __init__(self, *args, **kwargs):
@@ -134,7 +134,14 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         model.forward method directly to create the patch. Instead we use the type of the model to
         get the forward method to keep the patch composable with other forward patches.
         """
-        return type(model).forward(model, input_ids=input_ids, position_ids=position_ids)
+        og_shape = input_ids.shape[:2]
+        ret = type(model).forward(
+            model,
+            input_ids=input_ids.view(1, -1),
+            position_ids=position_ids.view(1, -1),
+        )
+        ret["logits"] = ret["logits"].view(*og_shape, -1)
+        return ret
 
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]
