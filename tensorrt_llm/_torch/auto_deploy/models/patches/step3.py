@@ -2,7 +2,6 @@ import types
 from typing import Dict, Optional, Union
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from transformers import AutoModelForCausalLM
@@ -115,17 +114,17 @@ def forward_no_mask(
 
 
 def _forward_moe(self, hidden_states: torch.Tensor):
-    # check if we can apply the patch
-    use_original_forward = False
-    if not all(isinstance(expert.act_fn, nn.SiLU) for expert in self.experts):
-        use_original_forward = True
+    # # check if we can apply the patch
+    # use_original_forward = False
+    # if not all(isinstance(expert.act_fn, nn.SiLU) for expert in self.experts):
+    #     use_original_forward = True
 
-    if any(getattr(mod, "bias", None) is not None for mod in self.experts.modules()):
-        use_original_forward = True
+    # if any(getattr(mod, "bias", None) is not None for mod in self.experts.modules()):
+    #     use_original_forward = True
 
-    # rely on original forward instead
-    if use_original_forward:
-        return self._original_forward(hidden_states)
+    # # rely on original forward instead
+    # if use_original_forward:
+    #     return self._original_forward(hidden_states)
 
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     if self.training and self.jitter_noise > 0:
