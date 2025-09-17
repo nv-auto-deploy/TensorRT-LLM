@@ -7,6 +7,7 @@ from torch import nn
 from transformers.models.bamba.modeling_bamba import (
     BambaMixer,
     BambaModel,
+    BambaPreTrainedModel,
     HybridMambaAttentionDynamicCache,
     apply_mask_to_padding_states,
     pad_tensor_by_size,
@@ -384,12 +385,12 @@ def _ssm_transform_meta(
 # is called by `post_init`) is called before we run `forward`.
 def _bamba_pretrained_model_init_weights(self, module):
     # ARGH python does not like this.
-    super()._init_weights(module)
+    super(BambaPreTrainedModel, self)._init_weights(module)
     if isinstance(module, BambaMixer):
         module.dt_bias.data.fill_(1.0)
         # ? Why is this even necessary? `BambaMixer.__init__` already sets
-        # A = torch.arange(1, self.num_heads + 1)
-        # self.A_log = nn.Parameter(torch.log(A))
+        A = torch.arange(1, module.num_heads + 1)
+        self.A_log = nn.Parameter(torch.log(A))
         # module.A_log.data = torch.log(torch.arange(1, module.num_heads + 1))
         module.D.data.fill_(1.0)
 
@@ -427,3 +428,7 @@ class BambaModelPatch(BaseExportPatch):
         # BambaPreTrainedModel._init_weights = self.original_values[
         #     "BambaPreTrainedModel._init_weights"
         # ]
+
+
+# NOTE: patch that is used during build model time
+BambaPreTrainedModel._init_weights = _bamba_pretrained_model_init_weights

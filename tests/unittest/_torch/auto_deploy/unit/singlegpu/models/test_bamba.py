@@ -1,19 +1,30 @@
 import torch  # noqa
+import torch.export as te
 from torch.export import Dim  # noqa
-from transformers import AutoTokenizer
-
+import pytest
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig
 from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device  # noqa
 
-MODEL_DIR = (
-    "/home/scratch.williamz_gpu/code/trtc/builder/hf_cache/hub/models--ibm-ai-platform--Bamba-9B-v2/"
-    "snapshots/b42852dc9eb96c8ae3359dc8df0e4c3f5c37eb21"
-)
+MODEL_DIR = "ibm-ai-platform/Bamba-9B-v2"
 EXAMPLE_INPUT = "Mamba is a snake with the following properties:"
 
 
-def test_bamba_patches():
+@pytest.mark.parametrize(
+    "model_on_meta_during_export",
+    [
+        True,
+        # False,
+    ],
+)
+@pytest.mark.parametrize(
+    "export_func",
+    [
+        "torch_export_to_gm",
+        # "torch_export",
+    ],
+)
+def test_bamba_patches(model_on_meta_during_export: bool, export_func: str):
     llm_args = AutoDeployConfig(
         **{
             "model": MODEL_DIR,
@@ -23,29 +34,85 @@ def test_bamba_patches():
             "attn_backend": "flashinfer",
             "model_factory": "AutoModelForCausalLM",
             "model_kwargs": {
-                "use_cache": True,
+                "use_cache": False,
+                "torch_dtype": "bfloat16",
+                "num_hidden_layers": 10,
             },
             "max_seq_len": 512,
+            "skip_loading_weights": False,
         },
     )
 
     factory = llm_args.create_factory()
     model = factory.build_model("meta")
-    factory.load_or_random_init(model, device="cuda")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-
-    _verify_generation(factory, model, tokenizer)
+    tokenizer = factory.init_tokenizer()
 
     # 1. Export wants min batch size of 2 (to avoid specialization during export).
     # 2. Can't get `padding` / `truncation` to work without other steps so just use the same prompt
     #    twice in order for the tokenizer not to complain when creating the tensor.
     message = [EXAMPLE_INPUT] * 2
-    inputs = tokenizer(message, return_tensors="pt", return_token_type_ids=False).to(model.device)
+    inputs = tokenizer(message, return_tensors="pt", return_token_type_ids=False).to("cuda")
 
     input_ids = inputs["input_ids"]
     position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).repeat(
         input_ids.shape[0], 1
     )
+    dynamic_shapes = (
+        {0: Dim("batch_size", min=0, max=8), 1: Dim("seq_len", min=0, max=512)},
+        {
+            0: Dim("batch_size", min=0, max=8),
+            1: Dim("seq_len", min=0, max=512),
+        },
+    )
+
+    def _run_torch_export_to_gm():
+        return torch_export_to_gm(
+            model,
+            args=(input_ids, position_ids),
+            dynamic_shapes=dynamic_shapes,
+            patch_list=[
+                "bamba",
+                # For "unsupported scalarType".
+                "autocast_noop",
+            ],
+        )
+
+    def _run_torch_export():
+        with apply_export_patches(patch_list=["bamba", "autocast_noop"]):
+            with torch.inference_mode():
+                ep = te.export(
+                    model,
+                    args=(input_ids, position_ids),
+                    dynamic_shapes=dynamic_shapes,
+                    strict=False,
+                )
+            egm = ep.module()
+        return egm
+
+    def _run_export():
+        if export_func == "torch_export_to_gm":
+            return _run_torch_export_to_gm()
+        else:
+            return _run_torch_export()
+
+    if model_on_meta_during_export:
+        gm = _run_export()
+        factory.load_or_random_init(gm, device="cuda")
+        move_to_device(gm, "cuda")
+
+    factory.load_or_random_init(model, device="cuda")
+
+    print("====== EXPORTING GRAPH MODULE ======")
+    if not model_on_meta_during_export:
+        gm = _run_export()
+        move_to_device(gm, "cuda")
+
+    gm.model.A_log = model.model.A_log
+
+    # let's do a comparison of every state dict item between the model and the gm
+    torch.testing.assert_close(model.state_dict(), gm.state_dict(), rtol=0.0, atol=0.0)
+
+    _verify_generation(factory, model, tokenizer)
 
     outputs_for_comparison = {}
     with torch.inference_mode():
@@ -54,26 +121,6 @@ def test_bamba_patches():
             outputs_for_comparison["patched"] = model(
                 input_ids=input_ids, position_ids=position_ids
             )
-
-    dynamic_shapes = (
-        {0: Dim("batch_size", min=0, max=8), 1: Dim("seq_len", min=0, max=512)},
-        {
-            0: Dim("batch_size", min=0, max=8),
-            1: Dim("seq_len", min=0, max=512),
-        },
-    )
-    print("====== EXPORTING GRAPH MODULE ======")
-    gm = torch_export_to_gm(
-        model,
-        args=(input_ids, position_ids),
-        dynamic_shapes=dynamic_shapes,
-        patch_list=[
-            "bamba",
-            # For "unsupported scalarType".
-            "autocast_noop",
-        ],
-    )
-    move_to_device(gm, model.device)
 
     with torch.inference_mode():
         outputs_for_comparison["gm"] = gm(input_ids, position_ids)
@@ -94,6 +141,7 @@ def test_bamba_patches():
             diff = torch.abs(outs.logits - out_original.logits)
             print(f"abs diff: {diff}")
             print(f"average diff: {diff.mean()}")
+            print(f"{comp=}")
 
 
 # NOTE: remember to augment `_simple_forward` to pass `*args, **kwargs`.
