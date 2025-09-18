@@ -76,7 +76,7 @@ class _FlashInferPlanner:
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer,
             "NHD",
-            backend="fa2",
+            backend="trtllm-gen",
         )
         self.decode_wrapper = self._init_decode_wrapper()
 
@@ -302,13 +302,9 @@ def flashinfer_mha_with_cache(
         pp,
     )
     # Forward optional sinks and sliding_window to FlashInfer if supported
-    # Normalize sinks to per-request List[Tensor] with expected domain (probability mass)
+    # Normalize sinks to a single per-head tensor (length == num_heads)
     if sinks is not None and isinstance(sinks, torch.Tensor):
-        sinks_mass = torch.exp(sinks.to(dtype=q.dtype, device=q.device))
-        # replicate per request
-        num_seq = int(qo_indptr.numel() - 1) if isinstance(qo_indptr, torch.Tensor) else q.shape[0]
-        num_seq = max(1, num_seq)
-        sinks_arg_list = [sinks_mass for _ in range(num_seq)]
+        sinks_arg_list = sinks.to(dtype=torch.float32, device=q.device)
     else:
         sinks_arg_list = None
 
@@ -319,7 +315,7 @@ def flashinfer_mha_with_cache(
             k_scale=k_scale,
             v_scale=v_scale,
             sinks=sinks_arg_list,
-            sliding_window=sliding_window,
+            window_left=sliding_window,
         )
     except TypeError:
         # Try passing only sinks
@@ -328,18 +324,7 @@ def flashinfer_mha_with_cache(
                 q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale, sinks=sinks_arg_list
             )
         except TypeError:
-            # Try passing only sliding window under a possible alternate name
-            try:
-                y = wrapper.run(
-                    q,
-                    (k_cache, v_cache),
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                    window_left=sliding_window,
-                )
-            except TypeError:
-                # Fall back to no optional args
-                y = wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale)
+            raise TypeError("ERROR****")
 
     return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
 
