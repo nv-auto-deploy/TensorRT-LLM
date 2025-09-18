@@ -68,8 +68,7 @@ def _segment_sum(input_tensor):
     return tensor_segsum
 
 
-@torch.library.custom_op("auto_deploy::torch_ssm_transform", mutates_args={})
-def _torch_ssm_transform(
+def _torch_ssm_transform_prefill(
     hidden_states: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
@@ -77,23 +76,22 @@ def _torch_ssm_transform(
     D: torch.Tensor,
     dt: torch.Tensor,
     dt_bias: torch.Tensor,
-    ssm_state_size: int,
-    # NOTE: `torch` custom ops do not like `Tuple` inputs. Using `List` is the suggested WAR.
-    time_step_limit: List[float],
-    batch_size: int,
-    seq_len: int,
-    head_dim: int,
-    num_heads: int,
-    n_groups: int,
+    time_step_limit: List[
+        float
+    ],  # NOTE: `torch` custom ops do not like `Tuple` inputs. Using `List` is the suggested WAR.
     chunk_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # retrieve some shape information
+    batch_size, seq_len, num_heads, head_dim = hidden_states.shape
+    n_groups, ssm_state_size = B.shape[2:]
+
     # !! This is the uncached code path from the original implementation.
     # begin ssd naive implementation without einsums
     dt = nn.functional.softplus(dt + dt_bias)
     dt = torch.clamp(dt, time_step_limit[0], time_step_limit[1])
-    hidden_states = hidden_states.reshape(batch_size, seq_len, -1, head_dim).float()
-    B = B.reshape(batch_size, seq_len, -1, ssm_state_size).float()
-    C = C.reshape(batch_size, seq_len, -1, ssm_state_size).float()
+    hidden_states = hidden_states.reshape(batch_size, seq_len, num_heads, head_dim).float()
+    B = B.reshape(batch_size, seq_len, n_groups, ssm_state_size).float()
+    C = C.reshape(batch_size, seq_len, n_groups, ssm_state_size).float()
     B = B.repeat_interleave(num_heads // n_groups, dim=2, output_size=num_heads)
     C = C.repeat_interleave(num_heads // n_groups, dim=2, output_size=num_heads)
     pad_size = (chunk_size - seq_len % chunk_size) % chunk_size
@@ -160,9 +158,29 @@ def _torch_ssm_transform(
     # Cutting off padded chunks
     if pad_size > 0:
         y = y[:, :seq_len, :, :]
-    y = y.reshape(batch_size, seq_len, -1)
+    y = y.reshape(batch_size, seq_len, num_heads, head_dim)
 
     return y, ssm_state
+
+
+@torch.library.custom_op("auto_deploy::torch_ssm_transform", mutates_args={})
+def _torch_ssm_transform(
+    hidden_states: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    time_step_limit: List[
+        float
+    ],  # NOTE: `torch` custom ops do not like `Tuple` inputs. Using `List` is the suggested WAR.
+    chunk_size: int,
+) -> torch.Tensor:
+    y, _ = _torch_ssm_transform_prefill(
+        hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size
+    )
+    return y
 
 
 @_torch_ssm_transform.register_fake
@@ -174,20 +192,10 @@ def _torch_ssm_transform_meta(
     D: torch.Tensor,
     dt: torch.Tensor,
     dt_bias: torch.Tensor,
-    ssm_state_size: int,
-    # NOTE: `torch` custom ops do not like `Tuple` inputs. Using `List` is the suggested WAR.
     time_step_limit: List[float],
-    batch_size: int,
-    seq_len: int,
-    head_dim: int,
-    num_heads: int,
-    n_groups: int,
     chunk_size: int,
-):
-    return (
-        torch.empty_like(hidden_states),
-        torch.empty(batch_size, num_heads, head_dim, ssm_state_size, dtype=hidden_states.dtype),
-    )
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
 
 
 @torch.library.custom_op("auto_deploy::torch_causal_conv1d", mutates_args={})
