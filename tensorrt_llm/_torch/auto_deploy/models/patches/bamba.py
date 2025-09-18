@@ -78,8 +78,21 @@ def _bamba_mixer_torch_forward(
             )
             cache_params.conv_states[self.layer_idx].copy_(conv_states)
 
+        # hidden_states_B_C = self.act(
+        #     self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2)
+        # )
+
         hidden_states_B_C = self.act(
-            self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2)
+            torch.ops.auto_deploy.torch_causal_conv1d(
+                hidden_states_B_C,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                self.conv1d.stride[0],
+                self.conv1d.padding[0],
+                self.conv1d.dilation[0],
+                self.conv1d.groups,
+                self.conv1d.padding_mode,
+            )
         )
 
     hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
@@ -115,7 +128,7 @@ def _bamba_mixer_torch_forward(
             cached_ssm_state=cache_params.ssm_states[self.layer_idx],
         )
     else:
-        y, ssm_state = torch.ops.auto_deploy.ssm_transform(
+        y, ssm_state = torch.ops.auto_deploy.torch_ssm_transform(
             hidden_states=hidden_states,
             A=A,
             B=B,

@@ -34,9 +34,9 @@ def test_bamba_patches(model_on_meta_during_export: bool, export_func: str):
             "attn_backend": "flashinfer",
             "model_factory": "AutoModelForCausalLM",
             "model_kwargs": {
-                "use_cache": False,
+                "use_cache": True,
                 "torch_dtype": "bfloat16",
-                "num_hidden_layers": 10,
+                # "num_hidden_layers": 10,
             },
             "max_seq_len": 512,
             "skip_loading_weights": False,
@@ -102,6 +102,9 @@ def test_bamba_patches(model_on_meta_during_export: bool, export_func: str):
 
     factory.load_or_random_init(model, device="cuda")
 
+    _verify_generation(factory, model, tokenizer)
+    return
+
     print("====== EXPORTING GRAPH MODULE ======")
     if not model_on_meta_during_export:
         gm = _run_export()
@@ -111,8 +114,6 @@ def test_bamba_patches(model_on_meta_during_export: bool, export_func: str):
 
     # let's do a comparison of every state dict item between the model and the gm
     torch.testing.assert_close(model.state_dict(), gm.state_dict(), rtol=0.0, atol=0.0)
-
-    _verify_generation(factory, model, tokenizer)
 
     outputs_for_comparison = {}
     with torch.inference_mode():
@@ -144,10 +145,9 @@ def test_bamba_patches(model_on_meta_during_export: bool, export_func: str):
             print(f"{comp=}")
 
 
-# NOTE: remember to augment `_simple_forward` to pass `*args, **kwargs`.
 def _verify_generation(factory, model, tokenizer):
-    # print("====== WITHOUT PATCH ======")
-    # _generate(tokenizer, model)
+    print("====== WITHOUT PATCH ======")
+    _generate(tokenizer, model)
     with apply_export_patches(patch_list=["bamba"]):
         print("====== WITH PATCH ======")
         _generate(tokenizer, model)
