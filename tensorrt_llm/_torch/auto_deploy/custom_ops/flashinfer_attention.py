@@ -247,8 +247,10 @@ def flashinfer_mha_with_cache(
     workspace_buffer: torch.Tensor,
     # CONSTANTS
     scale: Optional[float],
-    k_scale: float,
-    v_scale: float,
+    sinks: Optional[torch.Tensor],
+    sliding_window: Optional[int] = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> torch.Tensor:
     # reshape to standard [b*s, n_heads, head_dim] layout
     head_dim = k_cache.shape[-1]
@@ -299,7 +301,45 @@ def flashinfer_mha_with_cache(
         paged_kv_last_page_len,
         pp,
     )
-    y = wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale)
+    # Forward optional sinks and sliding_window to FlashInfer if supported
+    # Normalize sinks to per-request List[Tensor] with expected domain (probability mass)
+    if sinks is not None and isinstance(sinks, torch.Tensor):
+        sinks_mass = torch.exp(sinks.to(dtype=q.dtype, device=q.device))
+        # replicate per request
+        num_seq = int(qo_indptr.numel() - 1) if isinstance(qo_indptr, torch.Tensor) else q.shape[0]
+        num_seq = max(1, num_seq)
+        sinks_arg_list = [sinks_mass for _ in range(num_seq)]
+    else:
+        sinks_arg_list = None
+
+    try:
+        y = wrapper.run(
+            q,
+            (k_cache, v_cache),
+            k_scale=k_scale,
+            v_scale=v_scale,
+            sinks=sinks_arg_list,
+            sliding_window=sliding_window,
+        )
+    except TypeError:
+        # Try passing only sinks
+        try:
+            y = wrapper.run(
+                q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale, sinks=sinks_arg_list
+            )
+        except TypeError:
+            # Try passing only sliding window under a possible alternate name
+            try:
+                y = wrapper.run(
+                    q,
+                    (k_cache, v_cache),
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    window_left=sliding_window,
+                )
+            except TypeError:
+                # Fall back to no optional args
+                y = wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale)
 
     return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
 
@@ -324,8 +364,10 @@ def flashinfer_mha_with_cache_fake(
     workspace_buffer: torch.Tensor,
     # CONSTANTS
     scale: Optional[float],
-    k_scale: float,
-    v_scale: float,
+    sinks: Optional[torch.Tensor],
+    sliding_window: Optional[int] = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> torch.Tensor:
     return torch.empty_like(q.contiguous())
 
@@ -418,8 +460,14 @@ class FlashInferAttention(AttentionDescriptor):
             ad_logger.warning("Provided scale is not a float. Using default scale instead.")
             scale = None
 
+        # Get sinks and sliding_window from args or kwargs (optional)
+        sinks = extract_op_args(source_attn_node, "sinks")[0]
+        sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
+
         return [
             scale,  # softmax scale
+            sinks,  # sinks tensor; converted to list at runtime for FlashInfer
+            sliding_window,  # sliding window
             1.0,  # k_scale
             1.0,  # v_scale
         ]

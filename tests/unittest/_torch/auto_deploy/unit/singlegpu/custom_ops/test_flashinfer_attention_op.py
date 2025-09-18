@@ -38,6 +38,122 @@ def _attention_with_fp8_kv_cache(
     return ref.transpose(1, 2)
 
 
+@pytest.mark.parametrize("use_sinks", [False, True])
+@pytest.mark.parametrize("sliding_window", [None])
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_flashinfer_attention_op_decode_with_sinks_and_sliding_window(
+    use_sinks, sliding_window, dtype, device
+):
+    D_HEAD = 64
+    N_HEADS = 4
+    BATCH_SIZE = 1
+    PREFILL_SEQ_LEN = 6
+    SEQ_LEN = 1
+
+    q = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=dtype, device=device)
+    k = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=dtype, device=device)
+    v = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=dtype, device=device)
+
+    MAX_SEQ_LEN = 32
+    k_cache = torch.randn(BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD, dtype=dtype, device=device)
+    v_cache = torch.randn(BATCH_SIZE, MAX_SEQ_LEN, N_HEADS, D_HEAD, dtype=dtype, device=device)
+
+    # prefill positions
+    seq_len_tensor = torch.tensor([SEQ_LEN] * BATCH_SIZE, dtype=torch.int32, device=device)
+    offsets = torch.tensor([PREFILL_SEQ_LEN] * BATCH_SIZE, device=device, dtype=torch.int)
+    qo_indptr = torch.cat(
+        (torch.zeros_like(seq_len_tensor[:1]), torch.cumsum(seq_len_tensor, 0))
+    ).to(torch.int32)
+    paged_kv_indptr = torch.arange(0, BATCH_SIZE + 1, dtype=torch.int32, device=device)
+    paged_kv_indices = torch.arange(BATCH_SIZE).int().to(device)
+    paged_kv_last_page_len = offsets + seq_len_tensor
+
+    # planner workspace
+    workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
+    _GlobalFlashInferPlanner.init_workspace(workspace)
+
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * SEQ_LEN,
+    )
+
+    # Build sinks tensor if needed (shape [N_HEADS])
+    sinks = None
+    if use_sinks:
+        sinks = torch.randn(N_HEADS, dtype=torch.float32, device=device)
+
+    out = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
+        q,
+        k,
+        v,
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        batch_indices,
+        positions,
+        k_cache,
+        v_cache,
+        workspace,
+        None,  # scale
+        sinks,  # sinks (Optional[Tensor])
+        sliding_window,  # sliding window
+        1.0,
+        1.0,
+    )
+
+    # Construct a simple reference using torch SDPA with causal disabled (decode with fully available KV)
+    q_ref = q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
+    k_ref = k_cache[:, : PREFILL_SEQ_LEN + SEQ_LEN, :, :]
+    v_ref = v_cache[:, : PREFILL_SEQ_LEN + SEQ_LEN, :, :]
+    k_ref[:, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + SEQ_LEN, :, :] = k.view(
+        BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD
+    )
+    v_ref[:, PREFILL_SEQ_LEN : PREFILL_SEQ_LEN + SEQ_LEN, :, :] = v.view(
+        BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD
+    )
+
+    # Apply sliding window mask if requested
+    attn_mask = None
+    if sliding_window is not None and sliding_window > 0:
+        s_k = PREFILL_SEQ_LEN + SEQ_LEN
+        # allow only the last `sliding_window` keys
+        mask = torch.ones(1, s_k, dtype=torch.bool, device=device)
+        mask[:, max(0, s_k - sliding_window) : s_k] = False
+        attn_mask = torch.zeros(1, s_k, device=device, dtype=q_ref.dtype)
+        attn_mask.masked_fill_(mask, float("-inf"))
+
+    scores = torch.matmul(q_ref.transpose(1, 2), k_ref.transpose(1, 2).transpose(-2, -1)) * (
+        1.0 / (D_HEAD**0.5)
+    )
+    if attn_mask is not None:
+        scores = scores + attn_mask
+
+    if use_sinks:
+        # Incorporate sinks like triton tests: add sinks to softmax denominator per head
+        logits_max = torch.max(scores, dim=-1, keepdim=True).values
+        exp_scores = torch.exp(scores - logits_max)
+        # sinks is per-head; broadcast to [B, N, S_q=1, 1] then exp(sink - max)
+        sinks_f32 = sinks.to(dtype=torch.float32)
+        sinks_exp = torch.exp(sinks_f32.view(1, -1, 1, 1) - logits_max)
+        denom = exp_scores.sum(dim=-1, keepdim=True) + sinks_exp
+        probs = (exp_scores / denom).to(q_ref.dtype)
+        ref_out = torch.matmul(probs, v_ref.transpose(1, 2))
+    else:
+        probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q_ref.dtype)
+        ref_out = torch.matmul(probs, v_ref.transpose(1, 2))
+
+    ref_out = ref_out.transpose(1, 2).contiguous().view(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD)
+
+    assert torch.allclose(
+        out.cpu().to(torch.float32), ref_out.cpu().to(torch.float32), atol=1e-2, rtol=1e-2
+    )
+
+
 @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5095416")
 @pytest.mark.parametrize("seq_length", [8, 32, 2048])
 @pytest.mark.parametrize("n_heads", [8])
@@ -107,9 +223,11 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         # BUFFERS
         workspace,
         # CONSTANTS
-        None,
-        1.0,
-        1.0,
+        None,  # scale
+        None,  # sinks
+        None,  # sliding_window
+        1.0,  # k_scale
+        1.0,  # v_scale
     )
 
     # Use torch backend as clean reference
@@ -237,9 +355,11 @@ def test_flashinfer_attention_op_decode(
         # BUFFERS
         workspace,
         # CONSTANTS
-        None,
-        1.0,
-        1.0,
+        None,  # scale
+        None,  # sinks
+        None,  # sliding_window
+        1.0,  # k_scale
+        1.0,  # v_scale
     )
 
     assert torch.allclose(
@@ -356,9 +476,11 @@ def test_flashinfer_attention_context_and_generate(
         # BUFFERS
         workspace,
         # CONSTANTS
-        None,
-        1.0,
-        1.0,
+        None,  # scale
+        None,  # sinks
+        None,  # sliding_window
+        1.0,  # k_scale
+        1.0,  # v_scale
     )
 
     # Generate reference outputs
@@ -431,9 +553,11 @@ def test_flashinfer_attention_context_and_generate(
         # BUFFERS
         workspace,
         # CONSTANTS
-        None,
-        1.0,
-        1.0,
+        None,  # scale
+        None,  # sinks
+        None,  # sliding_window
+        1.0,  # k_scale
+        1.0,  # v_scale
     )
 
     # Generate reference outputs
@@ -540,9 +664,11 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         # BUFFERS
         workspace,
         # CONSTANTS
-        None,
-        1.0,
-        1.0,
+        None,  # scale
+        None,  # sinks
+        None,  # sliding_window
+        1.0,  # k_scale
+        1.0,  # v_scale
     )
 
     # Generate ref
@@ -687,9 +813,11 @@ def test_flashinfer_attention_with_fp8_cache(
         # BUFFERS
         workspace,
         # CONSTANTS
-        None,
-        K_SCALE,
-        V_SCALE,
+        None,  # scale
+        None,  # sinks
+        None,  # sliding_window
+        K_SCALE,  # k_scale
+        V_SCALE,  # v_scale
     )
 
     y = flashinfer_output.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
@@ -784,9 +912,11 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         # BUFFERS
         workspace,
         # CONSTANTS
-        None,
-        1.0,
-        1.0,
+        None,  # scale
+        None,  # sinks
+        None,  # sliding_window
+        1.0,  # k_scale
+        1.0,  # v_scale
     )
 
     # Compute reference
@@ -867,9 +997,11 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         # BUFFERS
         workspace,
         # CONSTANTS
-        None,
-        1.0,
-        1.0,
+        None,  # scale
+        None,  # sinks
+        None,  # sliding_window
+        1.0,  # k_scale
+        1.0,  # v_scale
     )
 
     # Compute reference
