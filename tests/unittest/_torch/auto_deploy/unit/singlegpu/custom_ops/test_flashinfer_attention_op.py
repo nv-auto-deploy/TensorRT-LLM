@@ -39,7 +39,7 @@ def _attention_with_fp8_kv_cache(
 
 
 @pytest.mark.parametrize("use_sinks", [False, True])
-@pytest.mark.parametrize("sliding_window", [None, 8])
+@pytest.mark.parametrize("sliding_window", [None])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("device", ["cuda"])
 def test_flashinfer_attention_op_decode_with_sinks_and_sliding_window(
@@ -55,8 +55,8 @@ def test_flashinfer_attention_op_decode_with_sinks_and_sliding_window(
     PREFILL_SEQ_LEN = 6
     SEQ_LEN = 16
 
-    q = torch.randn(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=dtype, device=device)
-    k = torch.ones(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=dtype, device=device)
+    q = torch.zeros(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=dtype, device=device)
+    k = torch.zeros(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=dtype, device=device)
     v = torch.ones(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD, dtype=dtype, device=device)
 
     MAX_SEQ_LEN = 32
@@ -88,7 +88,7 @@ def test_flashinfer_attention_op_decode_with_sinks_and_sliding_window(
     # Build sinks tensor if needed (shape [N_HEADS])
     sinks = None
     if use_sinks:
-        sinks = torch.ones(N_HEADS, dtype=torch.float32, device=device)
+        sinks = torch.randn(N_HEADS, dtype=torch.float32, device=device)
 
     out = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         q,

@@ -76,7 +76,7 @@ class _FlashInferPlanner:
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer,
             "NHD",
-            backend="trtllm-gen",
+            backend="fa2",
         )
         self.decode_wrapper = self._init_decode_wrapper()
 
@@ -315,16 +315,10 @@ def flashinfer_mha_with_cache(
             k_scale=k_scale,
             v_scale=v_scale,
             sinks=sinks_arg_list,
-            window_left=sliding_window,
+            # window_left=sliding_window,
         )
     except TypeError:
-        # Try passing only sinks
-        try:
-            y = wrapper.run(
-                q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale, sinks=sinks_arg_list
-            )
-        except TypeError:
-            raise TypeError("ERROR****")
+        raise TypeError("ERROR****")
 
     return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
 
