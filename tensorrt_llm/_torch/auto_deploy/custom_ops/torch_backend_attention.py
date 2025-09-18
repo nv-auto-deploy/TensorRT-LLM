@@ -362,6 +362,7 @@ def torch_backend_prepare_metadata(
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
     pages_per_seq: torch.Tensor,
+    slot_idx: torch.Tensor,
     page_size: int,
 ) -> List[torch.Tensor]:
     """Prepare metadata for torch backend attention (similar to triton backend)."""
