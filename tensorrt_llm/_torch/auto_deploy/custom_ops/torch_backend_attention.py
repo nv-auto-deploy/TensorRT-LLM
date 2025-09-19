@@ -379,7 +379,7 @@ def torch_backend_prepare_metadata(
 
 @torch_backend_prepare_metadata.register_fake
 def torch_backend_prepare_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
     num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
     return (

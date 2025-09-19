@@ -61,7 +61,7 @@ def test_generate_only_with_slot_mapping(conv_env):
     gathered_before = conv_state_cache.clone().index_select(0, slot_idx)
 
     # Run cached op
-    y = torch.ops.auto_deploy.torch_cached_causal_conv1d_with_cache(
+    y = torch.ops.auto_deploy.torch_cached_causal_conv1d(
         x,
         w,
         b,
@@ -116,7 +116,7 @@ def test_context_flattened_and_state_writeback(conv_env):
     seq_len = torch.tensor(lens, device=device, dtype=torch.int32)
     seq_start = torch.tensor([0, lens[0]], device=device, dtype=torch.int32)
 
-    y = torch.ops.auto_deploy.torch_cached_causal_conv1d_with_cache(
+    y = torch.ops.auto_deploy.torch_cached_causal_conv1d(
         x,
         w,
         b,

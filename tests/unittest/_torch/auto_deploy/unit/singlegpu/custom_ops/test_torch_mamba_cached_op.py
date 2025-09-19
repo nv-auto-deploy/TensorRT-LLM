@@ -70,7 +70,7 @@ def test_generate_only_with_slot_mapping(mamba_env):
     gathered_before = ssm_state_cache.clone().index_select(0, slot_idx)
 
     # Run cached op
-    y = torch.ops.auto_deploy.torch_cached_mamba_with_cache(
+    y = torch.ops.auto_deploy.torch_cached_ssm_transform(
         hidden_states,
         A,
         B,
@@ -132,7 +132,7 @@ def test_context_flattened_and_state_writeback(mamba_env):
     seq_len = torch.tensor(lens, device=device, dtype=torch.int32)
     seq_start = torch.tensor([0, lens[0]], device=device, dtype=torch.int32)
 
-    y = torch.ops.auto_deploy.torch_cached_mamba_with_cache(
+    y = torch.ops.auto_deploy.torch_cached_ssm_transform(
         hidden_states,
         A,
         B,
@@ -184,7 +184,7 @@ def test_prepare_metadata(mamba_env):
     slot_idx = torch.tensor([2, 0, 1, 3], device=device, dtype=torch.int32)
     page_size = 128
 
-    out = torch.ops.auto_deploy.torch_mamba_prepare_metadata(
+    out = torch.ops.auto_deploy.torch_ssm_prepare_metadata(
         input_ids,
         position_ids,
         seq_len,

@@ -1,4 +1,4 @@
-"""Custom op collection for cached mamba mixer (linear attention) in pure PyTorch.
+"""Custom op collection for cached mamba2 ssm transform (linear attention) in pure PyTorch.
 
 This file contains two kinds of functionality:
 1) Low-level cached SSM ops (decode + prefill) that operate on dense [batch, seq_len] inputs.
@@ -105,56 +105,13 @@ def _update_ssm_state_cache(ssm_cache: torch.Tensor, ssm_state: torch.Tensor) ->
     ssm_cache.copy_(ssm_state)
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_ssm_transform", mutates_args={})
-def _torch_cached_ssm_transform(
-    hidden_states: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    D: torch.Tensor,
-    dt: torch.Tensor,
-    dt_bias: torch.Tensor,
-    time_step_limit: List[float],
-    chunk_size: int,
-    ssm_state_cache: torch.Tensor,
-) -> torch.Tensor:
-    batch_size, seq_len = hidden_states.shape[:2]
-
-    if seq_len == 1:
-        y, updated_ssm_state = _torch_cached_ssm_transform_decode(
-            hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size, ssm_state_cache
-        )
-    else:
-        y, updated_ssm_state = _torch_ssm_transform_prefill(
-            hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size
-        )
-    _update_ssm_state_cache(ssm_state_cache, updated_ssm_state)
-    return y
-
-
-@_torch_cached_ssm_transform.register_fake
-def _torch_cached_ssm_transform_meta(
-    hidden_states: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    D: torch.Tensor,
-    dt: torch.Tensor,
-    dt_bias: torch.Tensor,
-    time_step_limit: List[float],
-    chunk_size: int,
-    ssm_state_cache: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
 # ---------------------------------------------------------------
 # Metadata + flattened cached op that integrates with the AD i/f
 # ---------------------------------------------------------------
 
 
-@torch.library.custom_op("auto_deploy::torch_mamba_prepare_metadata", mutates_args=())
-def torch_mamba_prepare_metadata(
+@torch.library.custom_op("auto_deploy::torch_ssm_prepare_metadata", mutates_args=())
+def _torch_ssm_prepare_metadata(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     seq_len: torch.Tensor,
@@ -164,7 +121,7 @@ def torch_mamba_prepare_metadata(
     slot_idx: torch.Tensor,
     page_size: int,
 ) -> List[torch.Tensor]:
-    """Prepare metadata for Mamba cached SSM.
+    """Prepare metadata for cached SSM transform.
 
     Returns a tuple of (seq_len_sanitized, seq_start, slot_idx_sanitized).
     """
@@ -182,8 +139,8 @@ def torch_mamba_prepare_metadata(
     return (seq_len_sanitized, seq_start, slot_idx_sanitized)
 
 
-@torch_mamba_prepare_metadata.register_fake
-def torch_mamba_prepare_metadata_fake(
+@_torch_ssm_prepare_metadata.register_fake
+def _torch_ssm_prepare_metadata_fake(
     input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
     # Use the same sanitization logic to determine sizes in fake mode
@@ -196,8 +153,8 @@ def torch_mamba_prepare_metadata_fake(
     )
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_mamba_with_cache", mutates_args=())
-def torch_cached_mamba_with_cache(
+@torch.library.custom_op("auto_deploy::torch_cached_ssm_transform", mutates_args={})
+def _torch_cached_ssm_transform(
     # INPUTS (dense but may be flattened across sequences)
     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
     A: torch.Tensor,  # [num_heads]
@@ -215,7 +172,7 @@ def torch_cached_mamba_with_cache(
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
 ) -> torch.Tensor:
-    """Flattened cached Mamba SSM op that respects slot-indexed state caches.
+    """Flattened cached SSM transform op that respects slot-indexed state caches.
 
     This op supports two layouts from the attention interface:
     - Generate-only: hidden_states is [b, 1, H, D]. We'll gather caches using slot_idx[:b].
@@ -300,8 +257,8 @@ def torch_cached_mamba_with_cache(
     return y
 
 
-@torch_cached_mamba_with_cache.register_fake
-def torch_cached_mamba_with_cache_fake(
+@_torch_cached_ssm_transform.register_fake
+def _torch_cached_ssm_transform_fake(
     hidden_states: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
@@ -322,8 +279,8 @@ def torch_cached_mamba_with_cache_fake(
     )
 
 
-@AttentionRegistry.register("torch_mamba")
-class TorchBackendMamba(AttentionDescriptor):
+@AttentionRegistry.register("torch_ssm")
+class TorchBackendSSM(AttentionDescriptor):
     @classmethod
     def is_paged(cls) -> bool:
         return False
@@ -344,12 +301,12 @@ class TorchBackendMamba(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.torch_cached_mamba_with_cache
+        return torch.ops.auto_deploy.torch_cached_ssm_transform
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
         # Returns (seq_len, seq_start, slot_idx)
-        return torch.ops.auto_deploy.torch_mamba_prepare_metadata, 3
+        return torch.ops.auto_deploy.torch_ssm_prepare_metadata, 3
 
     @classmethod
     def get_cache_initializers(

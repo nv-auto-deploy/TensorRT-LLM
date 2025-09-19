@@ -51,7 +51,7 @@ def _bamba_mixer_torch_forward(
 
     if use_caching:
         hidden_states_B_C = self.act(
-            torch.ops.auto_deploy.torch_cached_causal_conv1d_with_cache(
+            torch.ops.auto_deploy.torch_cached_causal_conv1d(
                 hidden_states_B_C,
                 self.conv1d.weight,
                 self.conv1d.bias,
@@ -96,7 +96,7 @@ def _bamba_mixer_torch_forward(
 
     if use_caching:
         # Use new flattened cached op for both cache updates and outputs
-        y = torch.ops.auto_deploy.torch_cached_mamba_with_cache(
+        y = torch.ops.auto_deploy.torch_cached_ssm_transform(
             hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
             A=A,
             B=B.view(batch_size, seq_len, -1, self.ssm_state_size),

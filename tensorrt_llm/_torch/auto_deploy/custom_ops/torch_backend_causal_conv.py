@@ -132,60 +132,6 @@ def _torch_causal_conv1d_decode(
     return y, updated_cache
 
 
-def _update_conv_state_cache(conv_cache: torch.Tensor, new_state: torch.Tensor) -> None:
-    conv_cache.copy_(new_state)
-
-
-@torch.library.custom_op("auto_deploy::torch_cached_causal_conv1d", mutates_args={})
-def _torch_cached_causal_conv1d(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    stride: int = 1,
-    padding: int = 0,
-    dilation: int = 1,
-    groups: int = 1,
-    padding_mode: str = "zeros",
-    conv_state_cache: torch.Tensor = None,
-) -> torch.Tensor:
-    batch_size, seq_len, _ = input.shape
-
-    if seq_len == 1:
-        y, updated_state = _torch_causal_conv1d_decode(
-            input,
-            weight,
-            bias,
-            stride,
-            padding,
-            dilation,
-            groups,
-            padding_mode,
-            conv_state_cache,
-        )
-    else:
-        y, updated_state = _torch_causal_conv1d_prefill(
-            input, weight, bias, stride, padding, dilation, groups, padding_mode
-        )
-
-    _update_conv_state_cache(conv_state_cache, updated_state)
-    return y
-
-
-@_torch_cached_causal_conv1d.register_fake
-def _torch_cached_causal_conv1d_meta(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    stride: int = 1,
-    padding: int = 0,
-    dilation: int = 1,
-    groups: int = 1,
-    padding_mode: str = "zeros",
-    conv_state_cache: torch.Tensor = None,
-) -> torch.Tensor:
-    return torch.empty_like(input)
-
-
 # ---------------------------------------------------------------
 # Metadata + flattened cached op that integrates with the AD i/f
 # ---------------------------------------------------------------
@@ -231,8 +177,8 @@ def torch_causal_conv_prepare_metadata_fake(
     )
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_causal_conv1d_with_cache", mutates_args=())
-def torch_cached_causal_conv1d_with_cache(
+@torch.library.custom_op("auto_deploy::torch_cached_causal_conv1d", mutates_args={})
+def _torch_cached_causal_conv1d(
     # INPUTS (dense but may be flattened across sequences)
     input: torch.Tensor,  # [b, s, c_in]
     weight: torch.Tensor,  # [c_out, c_in/groups, k]
@@ -318,8 +264,8 @@ def torch_cached_causal_conv1d_with_cache(
     return y
 
 
-@torch_cached_causal_conv1d_with_cache.register_fake
-def torch_cached_causal_conv1d_with_cache_fake(
+@_torch_cached_causal_conv1d.register_fake
+def _torch_cached_causal_conv1d_fake(
     input: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
@@ -360,7 +306,7 @@ class TorchBackendCausalConv(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.torch_cached_causal_conv1d_with_cache
+        return torch.ops.auto_deploy.torch_cached_causal_conv1d
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:

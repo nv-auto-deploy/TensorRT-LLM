@@ -293,7 +293,7 @@ class SequenceInfo:
         ``insert_cached_attention`` to extract the constant arguments and add them to the
         ``prepare_metadata`` node/op.
         """
-        return (getattr(self, k) for k in self._cached_constants)
+        return tuple(getattr(self, k) for k in self._cached_constants)
 
     @property
     def named_dynamic_shapes(self) -> Dict[str, Dict[str, Dim]]:
