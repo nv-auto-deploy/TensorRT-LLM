@@ -42,8 +42,16 @@ def _bamba_mixer_torch_forward(
 
     # 2. Convolution sequence transformation (cached/uncached handled inside the op)
     if use_caching:
+        # Prepare dense metadata for cached flattened op
+        seq_len_t = torch.full((batch_size,), seq_len, device=input_states.device, dtype=torch.int)
+        seq_start_t = torch.arange(
+            0, batch_size * seq_len, seq_len, device=input_states.device, dtype=torch.int
+        )
+        slot_idx_t = torch.arange(batch_size, device=input_states.device, dtype=torch.long)
+
+    if use_caching:
         hidden_states_B_C = self.act(
-            torch.ops.auto_deploy.torch_cached_causal_conv1d(
+            torch.ops.auto_deploy.torch_cached_causal_conv1d_with_cache(
                 hidden_states_B_C,
                 self.conv1d.weight,
                 self.conv1d.bias,
@@ -52,6 +60,9 @@ def _bamba_mixer_torch_forward(
                 self.conv1d.dilation[0],
                 self.conv1d.groups,
                 self.conv1d.padding_mode,
+                seq_len_t,
+                seq_start_t,
+                slot_idx_t,
                 cache_params.conv_states[self.layer_idx],
             )
         )
@@ -84,13 +95,6 @@ def _bamba_mixer_torch_forward(
     A = -torch.exp(self.A_log.float())  # [num_heads]
 
     if use_caching:
-        # Prepare dense metadata for cached flattened op
-        seq_len_t = torch.full((batch_size,), seq_len, device=input_states.device, dtype=torch.int)
-        seq_start_t = torch.arange(
-            0, batch_size * seq_len, seq_len, device=input_states.device, dtype=torch.int
-        )
-        slot_idx_t = torch.arange(batch_size, device=input_states.device, dtype=torch.long)
-
         # Use new flattened cached op for both cache updates and outputs
         y = torch.ops.auto_deploy.torch_cached_mamba_with_cache(
             hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
