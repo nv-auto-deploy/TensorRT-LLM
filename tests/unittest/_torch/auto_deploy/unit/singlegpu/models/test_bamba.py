@@ -29,7 +29,7 @@ EXAMPLE_INPUT2 = "Tiger is a cat with the following properties:"
 #     ],
 # )
 def test_bamba_patches(
-    model_on_meta_during_export: bool = False,
+    model_on_meta_during_export: bool = True,
     export_func: str = "torch_export_to_gm",
     use_cache: bool = True,
 ):

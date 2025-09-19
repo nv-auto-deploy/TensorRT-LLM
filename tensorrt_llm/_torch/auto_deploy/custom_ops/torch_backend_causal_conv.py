@@ -288,7 +288,8 @@ def _torch_cached_causal_conv1d_fake(
 class TorchBackendCausalConv(AttentionDescriptor):
     @classmethod
     def is_paged(cls) -> bool:
-        return False
+        # TODO: we should refine our notion of "is_paged" --> seems counterintuitive for ssm nows
+        return True
 
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
@@ -297,8 +298,10 @@ class TorchBackendCausalConv(AttentionDescriptor):
 
     @classmethod
     def get_num_qkv_args(cls) -> int:
-        # torch_causal_conv1d signature has 8 relevant arguments
-        return 8
+        # torch_causal_conv1d signature has 2 relevant tensor arguments
+        # TODO: with bias it can be 3!!
+        # TODO: double-check how we handle the rest...
+        return 2
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:

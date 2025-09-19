@@ -283,7 +283,8 @@ def _torch_cached_ssm_transform_fake(
 class TorchBackendSSM(AttentionDescriptor):
     @classmethod
     def is_paged(cls) -> bool:
-        return False
+        # TODO: we should refine our notion of "is_paged" --> seems counterintuitive for ssm now
+        return True
 
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
@@ -292,8 +293,9 @@ class TorchBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_num_qkv_args(cls) -> int:
-        # torch_ssm_transform signature has 9 relevant arguments
-        return 9
+        # torch_ssm_transform signature has 7 relevant arguments
+        # TODO: double-check how we handle the rest...
+        return 7
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
