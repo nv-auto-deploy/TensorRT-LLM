@@ -105,7 +105,15 @@ def _bamba_mixer_torch_forward(
     A = -torch.exp(self.A_log.float())  # [num_heads]
 
     if use_caching:
-        y = torch.ops.auto_deploy.torch_cached_ssm_transform(
+        # Prepare dense metadata for cached flattened op
+        seq_len_t = torch.full((batch_size,), seq_len, device=input_states.device, dtype=torch.int)
+        seq_start_t = torch.arange(
+            0, batch_size * seq_len, seq_len, device=input_states.device, dtype=torch.int
+        )
+        slot_idx_t = torch.arange(batch_size, device=input_states.device, dtype=torch.long)
+
+        # Use new flattened cached op for both cache updates and outputs
+        y = torch.ops.auto_deploy.torch_cached_mamba_with_cache(
             hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
             A=A,
             B=B.view(batch_size, seq_len, -1, self.ssm_state_size),
@@ -115,6 +123,9 @@ def _bamba_mixer_torch_forward(
             dt_bias=self.dt_bias,
             time_step_limit=list(self.time_step_limit),
             chunk_size=self.chunk_size,
+            seq_len=seq_len_t,
+            seq_start=seq_start_t,
+            slot_idx=slot_idx_t,
             ssm_state_cache=cache_params.ssm_states[self.layer_idx],
         )
     else:

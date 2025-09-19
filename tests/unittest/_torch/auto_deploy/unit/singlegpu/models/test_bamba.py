@@ -29,7 +29,9 @@ EXAMPLE_INPUT2 = "Tiger is a cat with the following properties:"
 #     ],
 # )
 def test_bamba_patches(
-    model_on_meta_during_export: bool = False, export_func: str = "torch_export_to_gm"
+    model_on_meta_during_export: bool = False,
+    export_func: str = "torch_export_to_gm",
+    use_cache: bool = True,
 ):
     llm_args = AutoDeployConfig(
         **{
@@ -40,7 +42,8 @@ def test_bamba_patches(
             "attn_backend": "flashinfer",
             "model_factory": "AutoModelForCausalLM",
             "model_kwargs": {
-                "use_cache": True,
+                # "use_cache": True,
+                "use_cache": use_cache,
                 "torch_dtype": "bfloat16",
                 # "num_hidden_layers": 10,
             },
