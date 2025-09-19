@@ -38,45 +38,24 @@ def _bamba_mixer_torch_forward(
         [self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
     )
 
-    use_precomputed_states = (
-        cache_params is not None
-        and cache_params.has_previous_state
-        and seq_len == 1
-        and cache_params.conv_states[self.layer_idx].shape[0]
-        == cache_params.ssm_states[self.layer_idx].shape[0]
-        == batch_size
-        and cache_position is not None
-        and cache_position[0] > 0
-    )
-
     use_caching = cache_params is not None
 
-    # 2. Convolution sequence transformation
-    if use_precomputed_states:
-        cache_params.conv_states[self.layer_idx] = cache_params.conv_states[self.layer_idx].roll(
-            shifts=-1, dims=-1
-        )
-        cache_params.conv_states[self.layer_idx][:, :, -1] = hidden_states_B_C[:, 0, :].to(
-            cache_params.conv_states[self.layer_idx].device
-        )
-
-        # We need to guarantee that anything regarding the cache is on the same device
-        conv_states = cache_params.conv_states[self.layer_idx].to(device=self.conv1d.weight.device)
-
-        hidden_states_B_C = torch.sum(conv_states * self.conv1d.weight.squeeze(1), dim=-1)
-        if self.use_conv_bias:
-            hidden_states_B_C = hidden_states_B_C + self.conv1d.bias
-        hidden_states_B_C = self.act(hidden_states_B_C)
-    else:
-        # Init cache
-        if cache_params is not None:
-            hidden_states_B_C_transposed = hidden_states_B_C.transpose(1, 2)
-            conv_states = nn.functional.pad(
-                hidden_states_B_C_transposed,
-                (self.conv_kernel_size - hidden_states_B_C_transposed.shape[-1], 0),
+    # 2. Convolution sequence transformation (cached/uncached handled inside the op)
+    if use_caching:
+        hidden_states_B_C = self.act(
+            torch.ops.auto_deploy.torch_cached_causal_conv1d(
+                hidden_states_B_C,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                self.conv1d.stride[0],
+                self.conv1d.padding[0],
+                self.conv1d.dilation[0],
+                self.conv1d.groups,
+                self.conv1d.padding_mode,
+                cache_params.conv_states[self.layer_idx],
             )
-            cache_params.conv_states[self.layer_idx].copy_(conv_states)
-
+        )
+    else:
         hidden_states_B_C = self.act(
             torch.ops.auto_deploy.torch_causal_conv1d(
                 hidden_states_B_C,
