@@ -95,6 +95,7 @@ class ShardingTransformExecutor(BaseTransform):
         info = TransformInfo(
             skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
         )
+        # exit()
         return gm, info
 
 
@@ -209,11 +210,11 @@ class Sharding(BaseTransform):
             for tp_transform in sharding_config.tp_transforms:
                 ad_logger.info(f"TP transform: {tp_transform}")
             for bmm_transform in sharding_config.bmm_transforms:
-                ad_logger.info(f"BMM transform: {bmm_transform}, {bmm_transform.module_name}")
+                ad_logger.info(f"BMM transform: {bmm_transform}")
             for ep_transform in sharding_config.ep_transforms:
-                ad_logger.info(f"EP transform: {ep_transform}, {ep_transform.module_name}")
+                ad_logger.info(f"EP transform: {ep_transform}")
 
-            exit()
+            # exit()
             return gm, factory_info
 
         ad_logger.info(
@@ -261,7 +262,7 @@ class Sharding(BaseTransform):
         for ep_transform in sharding_config.ep_transforms:
             ad_logger.info(f"EP transform: {ep_transform}")
 
-        exit()
+        # exit()
         return gm, info
 
 
@@ -315,6 +316,8 @@ def detect_sharding_from_factory_config(
     num_simple_shards = 0
     num_row_col_shards = 0
 
+    ad_logger.info(f"Applying sharding from factory config: {tp_plan}")
+
     for lin_node in filtered_nodes(gm.graph.nodes, is_linear_op):
         # use node's weight name to get the module name
         module_name = lin_node.args[1].target
@@ -336,7 +339,21 @@ def detect_sharding_from_factory_config(
                 num_shards += 1
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
-                if config == "colwise":
+                if "mlp" in module_name:
+                    # Simple shard (row + all_gather)
+                    sharding_config.tp_transforms.append(
+                        TPShardingInfo.from_node(
+                            lin_node,
+                            split_dim=SplitDimension.COLUMN,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op="all_gather",
+                            min_local_shape=1,
+                            module_name=module_name,
+                        )
+                    )
+                    num_simple_shards += 1
+                elif config == "colwise":
                     sharding_config.tp_transforms.append(
                         TPShardingInfo.from_node(
                             lin_node,

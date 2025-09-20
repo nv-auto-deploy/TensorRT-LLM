@@ -73,6 +73,13 @@ def _insert_sharded_matmul(
     assert dim in [0, 1], "Only dim 0 and 1 are supported for sharding"
     assert add_dist or dim == 0, "For dim=1 sharding, dist_op is required."
 
+    # print shapes of all args of the node
+    ad_logger.info("Shapes of all args of the node:")
+    for arg in node.args:
+        if hasattr(arg, "meta") and "val" in arg.meta:
+            if arg.meta["val"] is not None:
+                ad_logger.info(f"Shape of arg {arg}: {arg.meta['val'].shape}")
+
     def split_tensor(
         t: torch.Tensor,
         d: int = dim,
@@ -89,6 +96,7 @@ def _insert_sharded_matmul(
                 + f"Splitting tensor to {num_groups} chunks"
             )
             return torch.tensor_split(t, max_split_size, dim=d)[r // num_groups]
+
         return torch.tensor_split(t, ws, dim=d)[r]
 
     num_users = num_users_of_weight_node(node)
