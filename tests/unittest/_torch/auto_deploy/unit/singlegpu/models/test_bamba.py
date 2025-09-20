@@ -36,7 +36,8 @@ def test_bamba_patches(model_on_meta_during_export: bool, export_func: str):
             "model_kwargs": {
                 "use_cache": False,
                 "torch_dtype": "bfloat16",
-                "num_hidden_layers": 10,
+                # "_attn_implementation": "eager",
+                # "num_hidden_layers": 10,
             },
             "max_seq_len": 512,
             "skip_loading_weights": False,
@@ -46,6 +47,11 @@ def test_bamba_patches(model_on_meta_during_export: bool, export_func: str):
     factory = llm_args.create_factory()
     model = factory.build_model("meta")
     tokenizer = factory.init_tokenizer()
+
+    # Seed for determinism
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
 
     # 1. Export wants min batch size of 2 (to avoid specialization during export).
     # 2. Can't get `padding` / `truncation` to work without other steps so just use the same prompt
@@ -70,11 +76,11 @@ def test_bamba_patches(model_on_meta_during_export: bool, export_func: str):
             model,
             args=(input_ids, position_ids),
             dynamic_shapes=dynamic_shapes,
-            patch_list=[
-                "bamba",
-                # For "unsupported scalarType".
-                "autocast_noop",
-            ],
+            # patch_list=[
+            #    "bamba",
+            #     # For "unsupported scalarType".
+            #    "autocast_noop",
+            # ],
         )
 
     def _run_torch_export():

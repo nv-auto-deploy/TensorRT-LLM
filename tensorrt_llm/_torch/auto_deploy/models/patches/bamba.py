@@ -153,6 +153,18 @@ def _bamba_model_update_mamba_mask(self, attention_mask, cache_position):
     return None
 
 
+def _bamba_model_update_causal_mask(
+    self,
+    attention_mask,
+    input_tensor,
+    cache_position,
+    past_key_values,
+    output_attentions,
+):
+    # Force attention to use causal mode without explicit masks
+    return None
+
+
 @torch.library.custom_op("auto_deploy::ssm_transform", mutates_args={})
 def _ssm_transform(
     hidden_states: torch.Tensor,
@@ -270,8 +282,8 @@ def _ssm_transform_meta(
     chunk_size: int,
 ):
     return (
-        torch.empty_like(hidden_states),
-        torch.empty(batch_size, num_heads, head_dim, ssm_state_size, dtype=hidden_states.dtype),
+        torch.empty_like(hidden_states, dtype=torch.float32),
+        torch.empty(batch_size, num_heads, head_dim, ssm_state_size, dtype=torch.float32),
     )
 
 
@@ -376,8 +388,8 @@ def _ssm_transform_meta(
     cached_ssm_state: torch.Tensor,
 ):
     return (
-        torch.empty_like(hidden_states),
-        torch.empty(batch_size, num_heads, head_dim, ssm_state_size, dtype=hidden_states.dtype),
+        torch.empty_like(hidden_states, dtype=torch.float32),
+        torch.empty(batch_size, num_heads, head_dim, ssm_state_size, dtype=torch.float32),
     )
 
 
@@ -413,17 +425,20 @@ class BambaModelPatch(BaseExportPatch):
     def _apply_patch(self):
         self.original_values["BambaMixer.torch_forward"] = BambaMixer.torch_forward
         self.original_values["BambaModel._update_mamba_mask"] = BambaModel._update_mamba_mask
+        self.original_values["BambaModel._update_causal_mask"] = BambaModel._update_causal_mask
         # NOTE: there is `HybridMambaAttentionDynamicCache.__bool__` to save.
         # self.original_values["BambaPreTrainedModel._init_weights"] = BambaPreTrainedModel._init_weights
 
         BambaMixer.torch_forward = _bamba_mixer_torch_forward
         BambaModel._update_mamba_mask = _bamba_model_update_mamba_mask
+        BambaModel._update_causal_mask = _bamba_model_update_causal_mask
         HybridMambaAttentionDynamicCache.__bool__ = _cache_bool
         # BambaPreTrainedModel._init_weights = _bamba_pretrained_model_init_weights
 
     def _revert_patch(self):
         BambaMixer.torch_forward = self.original_values["BambaMixer.torch_forward"]
         BambaModel._update_mamba_mask = self.original_values["BambaModel._update_mamba_mask"]
+        BambaModel._update_causal_mask = self.original_values["BambaModel._update_causal_mask"]
         del HybridMambaAttentionDynamicCache.__bool__
         # BambaPreTrainedModel._init_weights = self.original_values[
         #     "BambaPreTrainedModel._init_weights"
