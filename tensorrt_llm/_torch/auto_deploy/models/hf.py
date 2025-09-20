@@ -235,6 +235,12 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         if hasattr(model_config, "num_hidden_layers"):
             self._sharding_config["num_hidden_layers"] = model_config.num_hidden_layers
 
+        ad_logger.info(f"Sharding config: {self._sharding_config}")
+        ad_logger.info(f"Model config: {model_config}")
+        ad_logger.info(f"Model config base_model_tp_plan: {model_config.base_model_tp_plan}")
+        ad_logger.info(f"Model config class type: {type(model_config)}")
+        exit()
+
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or an empty dict if not quantized."""
         if self._quant_config_reader is not None:
