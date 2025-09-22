@@ -1,6 +1,8 @@
 import types
 from typing import Any, Dict, List, Optional, Tuple
 
+import torch
+
 from ...executor.result import CompletionOutput
 from ...inputs.registry import DefaultInputProcessor, ExtraProcessedInputs
 from ...llmapi.llm import RequestOutput, _TorchLLM
@@ -66,11 +68,17 @@ class ADInputProcessor(DefaultInputProcessor):
         # check if multi_modal_data has already been pre-processed/added to the inputs
         # for example, this might be the case when invoking AD via trtllm-serve
         elif "multi_modal_data" in inputs:
+            images = inputs["multi_modal_data"]["image"]
+            if images is not None and isinstance(images[0], torch.Tensor):
+                # The default multimodal input loader will normalize images to [0, 1] when the requested
+                # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
+                do_rescale = False
             all_args = self.processor(
                 text=inputs["prompt"],
-                images=inputs["multi_modal_data"]["image"],
+                images=images,
                 return_dict=True,
                 return_tensors="pt",
+                do_rescale=do_rescale,
             )
         else:
             all_args = None
