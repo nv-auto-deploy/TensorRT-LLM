@@ -76,6 +76,7 @@ class InferenceOptimizer:
             # instantiate transform
             transform = TransformRegistry.get(t_name)(t_config)
             # run transform
+
             gm = transform(gm, cm, self.factory, self.shared_config)
 
         ############################################################################################

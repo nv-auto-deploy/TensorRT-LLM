@@ -95,6 +95,7 @@ class ShardingTransformExecutor(BaseTransform):
         info = TransformInfo(
             skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
         )
+        # print(f"gm: {gm}\ninfo: {info}")
         # exit()
         return gm, info
 
@@ -167,6 +168,7 @@ class Sharding(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        # shared_config.world_size = 2
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
 
         if world_size < 2:
@@ -495,7 +497,7 @@ def detect_column_row_shard(
     splitting, e.g., the individual heads into smaller shards.
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
-
+    sharding_config.world_size = 2
     rank, world_size = sharding_config.rank, sharding_config.world_size
     if world_size < 2:
         ad_logger.info("Skipping TP sharding for single device")
@@ -551,6 +553,32 @@ def detect_column_row_shard(
     num_shards = 0
     num_simple_shards = 0
     num_row_col_shards = 0
+
+    # all_nodes = list(gm.graph.nodes)
+    # linear_nodes = list(filtered_nodes(gm.graph.nodes, is_linear_op))
+    # view_nodes = list(filtered_nodes(gm.graph.nodes, ops={torch.ops.aten.view}))
+    # linear_shapes = [(n, n.meta["val"].shape if "val" in n.meta else None) for n in linear_nodes]
+    # view_shapes = [(n, n.meta["val"].shape if "val" in n.meta else None) for n in view_nodes]
+    # nodes_with_shapes = [(n, n.meta["val"] if hasattr(n, "meta") and "val" in n.meta else None) for n in all_nodes]
+    # nodes_with_shapes = [(n, val.shape if val is not None and hasattr(val, "shape") else None)
+    # for n, val in nodes_with_shapes]
+
+    # for n in gm.graph.nodes:
+    #     if is_op(n, {torch.ops.aten.view}):
+    #         view_shape = n.args[1]
+    #         if len(view_shape) == 4 and view_shape[2] != -1:
+    #             args = list(n.args)
+    #             args[1] = [view_shape[0], view_shape[1], -1, view_shape[3]]
+    #             n.args = tuple(args)
+    #         if "val" in n.meta:
+    #             # view shape is [batch, seq, num_heads, head_dim]
+    #             # replace the num_heads dimension (third dimension) with implicit shape -1
+    #             new_shape = list(n.meta["val"].shape)
+    #             new_shape[2] //= 2
+    #             n.meta["val"] = n.meta["val"].new_empty(new_shape)
+    #             print(f"n: {n}, new_shape: {n.meta['val'].shape}")
+    #             # n.meta["val"].shape
+
     for n_start, n_end in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         # we iterate through all nodes between the two boundary nodes and store linear nodes
         # sorted by their input activation node. We also store remaining nodes.
@@ -645,17 +673,30 @@ def detect_column_row_shard(
                 else:
                     dist_op = None
                 module_name = n.args[1].target
-                sharding_config.tp_transforms.append(
-                    TPShardingInfo.from_node(
-                        n,
-                        split_dim=i,
-                        rank=rank,
-                        world_size=world_size,
-                        dist_op=dist_op,
-                        min_local_shape=min_local_shape,
-                        module_name=module_name,
+                if "mlp" in module_name or "mlp" in module_name:
+                    sharding_config.tp_transforms.append(
+                        TPShardingInfo.from_node(
+                            n,
+                            split_dim=SplitDimension.COLUMN,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op="all_gather",
+                            min_local_shape=1,
+                            module_name=module_name,
+                        )
                     )
-                )
+                else:
+                    sharding_config.tp_transforms.append(
+                        TPShardingInfo.from_node(
+                            n,
+                            split_dim=i,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op=dist_op,
+                            min_local_shape=min_local_shape,
+                            module_name=module_name,
+                        )
+                    )
         num_row_col_shards += 1
 
     ad_logger.info(

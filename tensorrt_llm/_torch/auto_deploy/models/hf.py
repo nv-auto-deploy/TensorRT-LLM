@@ -226,6 +226,8 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self._sharding_config["head_dim"] = 1
         if hasattr(model_config, "base_model_tp_plan"):
             self._sharding_config["tp_plan"] = model_config.base_model_tp_plan
+        else:
+            print("model_config.base_model_tp_plan is not set")
         if hasattr(model_config, "head_dim") and model_config.head_dim is not None:
             self._sharding_config["head_dim"] = model_config.head_dim
         elif hasattr(model_config, "hidden_size") and hasattr(model_config, "num_attention_heads"):
@@ -236,10 +238,10 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
             self._sharding_config["num_hidden_layers"] = model_config.num_hidden_layers
 
         ad_logger.info(f"Sharding config: {self._sharding_config}")
-        ad_logger.info(f"Model config: {model_config}")
+        # ad_logger.info(f"Model config: {model_config}")
         ad_logger.info(f"Model config base_model_tp_plan: {model_config.base_model_tp_plan}")
         ad_logger.info(f"Model config class type: {type(model_config)}")
-        exit()
+        # exit()
 
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or an empty dict if not quantized."""
