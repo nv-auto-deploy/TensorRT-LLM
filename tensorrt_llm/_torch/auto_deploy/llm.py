@@ -41,6 +41,9 @@ class ADInputProcessor(DefaultInputProcessor):
             }
         # check for messages field and if yes, use the apply_chat_template method
         if "messages" in inputs:
+            # multi_modal_data should not be present in the messages field
+            assert "multi_modal_data" not in inputs, f"unexpected multi_modal_data key in {inputs=}"
+
             # TODO: we don't really need this but it makes for a good sanity check. Consider
             # removing this in the future if we need to speed things up.
             prompt = self.processor.apply_chat_template(
@@ -60,6 +63,19 @@ class ADInputProcessor(DefaultInputProcessor):
                 return_attention_mask=False,
                 **kwargs,
             )
+        # check if multi_modal_data has already been pre-processed/added to the inputs
+        # for example, this might be the case when invoking AD via trtllm-serve
+        elif "multi_modal_data" in inputs:
+            all_args = self.processor(
+                text=inputs["prompt"],
+                images=inputs["multi_modal_data"]["image"],
+                return_dict=True,
+                return_tensors="pt",
+            )
+        else:
+            all_args = None
+
+        if all_args is not None:
             # TODO: is there a more reliable way to avoid the attention_mask here?
             all_args.pop("attention_mask", None)
 
