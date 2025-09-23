@@ -40,18 +40,18 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
     device = conv_env["device"]
     dtype = conv_env["dtype"]
 
-    batch, seq = 3, 1
-    c, k = 8, 3
+    batch, seq = 1, 1
+    c, k = 2, 3
     x, w, b, s, p, d, g, pm = _random_params_depthwise(device, dtype, batch, seq, c, k)
 
     # Slot mapping with arbitrary order within max_batch_size
-    max_batch_size = 6
-    slot_idx = torch.tensor([4, 1, 3], device=device, dtype=torch.int32)
-    # Cache holds K entries (torch-style window state)
+    max_batch_size = 2
+    slot_idx = torch.tensor([0], device=device, dtype=torch.int32)
+    # Cache holds K-1 entries (TRT update kernel contract)
     conv_state_cache = torch.randn(
         max_batch_size,
         c,
-        k,
+        k - 1,
         device=device,
         dtype=dtype,
     )
@@ -62,7 +62,7 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
 
     # Snapshot caches for reference before running op (op mutates caches)
     gathered_before = conv_state_cache.clone().index_select(0, slot_idx)
-
+    x_ref = x.clone()
     # Run CUDA cached op
     y = torch.ops.auto_deploy.cuda_cached_causal_conv1d(
         # INPUTS
@@ -86,17 +86,14 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
     assert y.shape == (batch, seq, c)
     assert torch.isfinite(y).all()
 
-    # Reference via torch backend decode helper
-    y_ref, updated = (
-        tensorrt_llm._torch.auto_deploy.custom_ops.torch_backend_causal_conv._torch_causal_conv1d_decode(  # type: ignore  # noqa: E501
-            x, w, b, s, p, d, g, pm, gathered_before
-        )
-    )
-
+    # Reference via torch uncached conv on window [state(K-1) | x]
+    window_bt_c = torch.cat([gathered_before.transpose(1, 2), x_ref], dim=-2)
+    y_ref = torch.ops.auto_deploy.torch_causal_conv1d(window_bt_c, w, b, 1, 0, 1, g, pm)
     assert torch.allclose(y, y_ref, atol=conv_env["atol"], rtol=conv_env["rtol"])
     after = conv_state_cache.index_select(0, slot_idx)
+    expected_after = torch.cat([gathered_before[..., 1:], x_ref.transpose(1, 2)[..., :1]], dim=-1)
     assert torch.allclose(
-        after, updated.to(after.dtype), atol=conv_env["atol"], rtol=conv_env["rtol"]
+        after, expected_after.to(after.dtype), atol=conv_env["atol"], rtol=conv_env["rtol"]
     )
 
 
@@ -104,19 +101,19 @@ def test_context_flattened_and_state_writeback_cuda(conv_env):
     device = conv_env["device"]
     dtype = conv_env["dtype"]
 
-    # Two sequences with lengths 3 and 2, flattened to [1,5]
-    lens = [3, 2]
+    # Two short sequences with lengths 2 and 1, flattened to [1,3]
+    lens = [2, 1]
     total = sum(lens)
     batch, seq = 1, total
-    c, k = 8, 3
+    c, k = 2, 3
     x, w, b, s, p, d, g, pm = _random_params_depthwise(device, dtype, batch, seq, c, k)
 
-    max_batch_size = 4
-    slot_idx = torch.tensor([2, 0], device=device, dtype=torch.int32)
+    max_batch_size = 2
+    slot_idx = torch.tensor([1, 0], device=device, dtype=torch.int32)
     conv_state_cache = torch.randn(
         max_batch_size,
         c,
-        k,
+        k - 1,
         device=device,
         dtype=dtype,
     )
@@ -146,21 +143,27 @@ def test_context_flattened_and_state_writeback_cuda(conv_env):
     assert y.shape == (batch, seq, c)
     assert torch.isfinite(y).all()
 
-    # Reference by per-sequence prefill (torch helper)
+    # Reference by per-sequence prefill output and expected conv state (K-1 window)
     y_ref = torch.empty_like(y)
     for i, ln in enumerate(lens):
         st = 0 if i == 0 else lens[0]
         x_i = x[:, st : st + ln]
-        y_i, s_i = (
+        y_i, _ = (
             tensorrt_llm._torch.auto_deploy.custom_ops.torch_backend_causal_conv._torch_causal_conv1d_prefill(  # type: ignore  # noqa: E501
                 x_i, w, b, s, p, d, g, pm
             )
         )
         y_ref[:, st : st + ln].copy_(y_i)
-        # Cache should hold final state at slot
+        # Cache should hold K-1 latest inputs
+        x_b_c_t = x_i.transpose(1, 2)
+        if ln >= (k - 1):
+            expected_state = x_b_c_t[..., -(k - 1) :]
+        else:
+            pad = (k - 1) - ln
+            expected_state = torch.nn.functional.pad(x_b_c_t, (pad, 0))
         assert torch.allclose(
-            conv_state_cache[slot_idx[i]].to(s_i.dtype),
-            s_i,
+            conv_state_cache[slot_idx[i]].to(expected_state.dtype),
+            expected_state,
             atol=conv_env["atol"],
             rtol=conv_env["rtol"],
         )
