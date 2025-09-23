@@ -152,6 +152,34 @@ def _triton_cached_ssm_transform(
     return y
 
 
+@_triton_cached_ssm_transform.register_fake
+def _triton_cached_ssm_transform_fake(
+    # INPUTS (dense but may be flattened across sequences)
+    hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
+    A: torch.Tensor,  # [num_heads]
+    B: torch.Tensor,  # [b, s, n_groups, ssm_state_size]
+    C: torch.Tensor,  # [b, s, n_groups, ssm_state_size]
+    D: torch.Tensor,  # [num_heads]
+    dt: torch.Tensor,  # [b, s, num_heads]
+    dt_bias: torch.Tensor,  # [num_heads]
+    # METADATA
+    seq_len: torch.Tensor,  # [num_seq]
+    seq_start: torch.Tensor,  # [num_seq]
+    slot_idx: torch.Tensor,  # [num_seq]
+    # CACHES
+    ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
+    # CONSTANTS
+    time_step_limit: List[float],
+    chunk_size: int,
+):
+    # Return a correctly-shaped tensor for tracing with fake tensors
+    return torch.empty_like(
+        hidden_states,
+        memory_format=torch.contiguous_format,
+        dtype=torch.float32,
+    )
+
+
 ## Note: we reuse the existing metadata custom op and its registered fake from torch backend.
 
 
