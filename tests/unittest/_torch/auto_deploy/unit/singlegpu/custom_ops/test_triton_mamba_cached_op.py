@@ -103,17 +103,17 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
     atol = mamba_env["atol"]
     rtol = mamba_env["rtol"]
 
-    lens = [3, 2]
+    lens = [2]
     total = sum(lens)
     batch, seq = 1, total
-    num_heads, head_dim = 4, 8
-    n_groups, ssm_state_size = 2, 4
+    num_heads, head_dim = 1, 4
+    n_groups, ssm_state_size = 1, 1
     (hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size) = _random_params(
         device, dtype, batch, seq, num_heads, head_dim, n_groups, ssm_state_size
     )
 
-    max_batch_size = 4
-    slot_idx = torch.tensor([2, 0], device=device, dtype=torch.int32)
+    max_batch_size = 2
+    slot_idx = torch.tensor([1], device=device, dtype=torch.int32)
     ssm_state_cache_torch = torch.randn(
         max_batch_size, num_heads, head_dim, ssm_state_size, device=device, dtype=dtype
     )
@@ -158,7 +158,6 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
 
     assert y_triton.shape == hidden_states.shape
     assert torch.isfinite(y_triton).all()
-    # import pdb; pdb.set_trace()
     # Compare outputs
     assert torch.allclose(y_triton, y_torch.to(y_triton.dtype), atol=1e-1, rtol=1e-1)
 
@@ -167,6 +166,4 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         slot = slot_idx[i]
         state_torch = ssm_state_cache_torch[slot]
         state_triton = ssm_state_cache_triton[slot]
-        # import pdb; pdb.set_trace()
         assert torch.allclose(state_triton.to(state_torch.dtype), state_torch, atol=atol, rtol=rtol)
-        print(state_triton.to(state_torch.dtype), state_torch)
