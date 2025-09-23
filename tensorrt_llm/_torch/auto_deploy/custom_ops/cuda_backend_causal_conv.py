@@ -15,6 +15,8 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
+from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+
 from ..utils.node_utils import extract_op_args
 from .attention_interface import (
     AttentionDescriptor,
@@ -56,26 +58,23 @@ def _cuda_causal_conv1d_prefill(
     groups: int,
     padding_mode: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Prefill path using TRT-LLM forward kernel, produces initial cache state.
-
-    Returns (y, conv_state) where y: [B, T, C_out] and conv_state: [B, C_in, K].
-    """
+    """Prefill path using TRT-LLM forward kernel; returns (y, conv_state[K-1])."""
     assert padding_mode == "zeros", "padding_mode must be zeros"
-    # Use uncached op implemented via CUDA path: auto_deploy.torch_causal_conv1d
-    # which itself leverages TRT-LLM under the hood during deployment.
-    y = torch.ops.auto_deploy.torch_causal_conv1d(
-        input,
-        weight,
-        bias,
-        stride,
-        padding,
-        dilation,
-        groups,
-        padding_mode,
+    # Shapes: convert input to [B, C, T]
+    x_b_c_t = input.transpose(1, 2).contiguous()
+    k = weight.shape[-1]
+    # Weight to [C, K]
+    w2d = weight.squeeze(1) if weight.ndim == 3 else weight
+    w2d = w2d.contiguous()
+    # Initialize state [B, C, K-1] to zeros
+    conv_state = torch.zeros(
+        x_b_c_t.shape[0], x_b_c_t.shape[1], k - 1, device=x_b_c_t.device, dtype=x_b_c_t.dtype
     )
-
-    kernel_size = weight.shape[-1]
-    conv_state = _build_conv_state_from_sequence(input, kernel_size)
+    # Run TRT forward (in-place on x_b_c_t and conv_state)
+    torch.ops.trtllm.causal_conv1d_fwd(
+        x_b_c_t, w2d, bias, conv_state, None, None, None, False, PAD_SLOT_ID
+    )
+    y = x_b_c_t.transpose(1, 2)
     return y, conv_state
 
 
@@ -103,8 +102,9 @@ def _cuda_causal_conv1d_decode(
     assert seq_len == 1, "decode path expects seq_len == 1"
 
     kernel_size = weight.shape[-1]
-    assert conv_state_cache.shape[-1] == kernel_size, (
-        "conv_state_cache's last dim must equal kernel_size"
+    # TRT update expects state len >= K-1
+    assert conv_state_cache.shape[-1] >= kernel_size - 1, (
+        "conv_state_cache's last dim must be >= kernel_size - 1"
     )
 
     # TRT-LLM update kernel expects depthwise form: weight [dim, width], groups == dim
@@ -133,35 +133,13 @@ def _cuda_causal_conv1d_decode(
     #                                       activation_val, cache_seqlens,
     #                                       conv_state_indices, pad_slot_id)
     # We set activation to None and other optional args to None to get a plain linear conv.
-    activation_val = False
-    cache_seqlens = None
-    conv_state_indices = None
-    # PAD_SLOT_ID is defined in tensorrt_llm._torch.modules.mamba; use -1 as default to avoid accidental padding
-    pad_slot_id = -1
-
-    # Clone cache to avoid in-place mutation on a view of the global tensor slice
-    updated_cache = conv_state_cache.clone()
-
-    # Convert input to [B, C, T] expected by TRT-LLM kernels (x layout in their ops is [B, dim, seqlen])
+    # Convert input to [B, C, T]
     x_b_c_t = input.transpose(1, 2).contiguous()
-
-    # Perform in-place update of updated_cache and compute output; result is in x_b_c_t
+    updated_cache = conv_state_cache.clone()
     torch.ops.trtllm.causal_conv1d_update(
-        x_b_c_t,
-        updated_cache,
-        # weight is expected [dim, width]
-        weight_2d,
-        bias,
-        activation_val,
-        cache_seqlens,
-        conv_state_indices,
-        pad_slot_id,
+        x_b_c_t, updated_cache, weight_2d, bias, False, None, None, PAD_SLOT_ID
     )
-
-    # x_b_c_t now holds the output over the processed window in [B, C_out, 1]
-    # Convert to [B, 1, C_out]
     y = x_b_c_t.transpose(1, 2)
-
     return y, updated_cache
 
 
@@ -221,7 +199,7 @@ def _cuda_cached_causal_conv1d(
     seq_start: torch.Tensor,  # [num_seq]
     slot_idx: torch.Tensor,  # [num_seq]
     # CACHES
-    conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k]
+    conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k-1]
     # CONSTANTS
     stride: int,
     padding: int,
@@ -368,7 +346,7 @@ class CudaBackendCausalConv(AttentionDescriptor):
             return torch.empty(
                 si.max_batch_size,
                 in_channels,
-                kernel_size,
+                max(1, kernel_size - 1),
                 device=si.device,
                 dtype=cache_config.dtype or inp_fake.dtype,
             )
