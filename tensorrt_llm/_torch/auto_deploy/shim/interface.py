@@ -56,6 +56,8 @@ class CachedSequenceInterface:
         self._caches = {
             name: get_cache(self.info) for name, get_cache in self._cache_initializers.items()
         }
+        for name, cache in self._caches.items():
+            print(f"{name=}, {cache.shape=}, {cache.dtype=}, {cache.device=}")
         return len(self._caches)
 
     def current_cache_size_bytes(self) -> int:
@@ -73,7 +75,8 @@ class CachedSequenceInterface:
         self.info.num_pages = new_num_pages
         for name, cache in self._caches.items():
             # We assume cache is a tensor of shape (max_batch_size, page_size, n_heads, head_dim)
-            if "cache" in name:
+            if "k_cache" in name or "v_cache" in name:
+                print("resizing cache", name)
                 current_shape = cache.shape
                 new_shape = (new_num_pages, *current_shape[1:])
                 cache.resize_(new_shape)

@@ -28,6 +28,7 @@ DynamicShapeCallback = Callable[[], DynamicShape]
 class CacheConfig:
     """A dataclass to hold information how to configure the cache."""
 
+    # dtype of the cache
     dtype: Optional[torch.dtype] = None
 
 
@@ -522,6 +523,7 @@ class SequenceInfo:
 
         # vanilla slot indices
         slot_idx = list(range(len(input_ids)))
+        #        breakpoint()
 
         self.nest_sequences(
             input_ids,
@@ -537,6 +539,9 @@ class SequenceInfo:
         # TODO (lucaslie): understand what this implies for extra arguments
         seq_len = self.max_num_tokens // self.max_batch_size
         input_ids = torch.ones(self.max_batch_size, seq_len, dtype=torch.int).tolist()
+        print(
+            f"setting max_num_tokens_sample: {self.max_num_tokens=}, {self.max_batch_size=}, {seq_len=}"
+        )
         self.set_example_sequence(input_ids)
 
     def set_generate_only_batch(self) -> None:
@@ -581,6 +586,10 @@ class SequenceInfo:
             # pin the memory on the host
             tnsr_host = torch.tensor(tnsr_like, dtype=tnsr_device.dtype, pin_memory=True)
 
+            if tnsr_device.numel() < tnsr_host.numel():
+                print("WARNING: tnsr_device.numel() < tnsr_like.numel()")
+                print(f"{name=}, {tnsr_device.numel()=}, {tnsr_host.numel()=}")
+                tnsr_device.resize_(tnsr_host.numel())
             # reset/copy to the device in a non-blocking fashion
             if reset:
                 tnsr_device.zero_()
