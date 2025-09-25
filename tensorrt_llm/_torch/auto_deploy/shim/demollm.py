@@ -238,11 +238,11 @@ class DemoEngine(ADEngine):
         logits_shape = logits.shape
         logits = logits.view(-1, logits_shape[-1])  # sampling_batch expects 2D logits
         if isinstance(sampling_params.top_k, int):
-            # Fallback to a default seed if not set
-            if cls._generator is None:
-                cls._generator = torch.Generator(device=logits.device)
-                cls._generator.manual_seed(42)
-            idx_next, probs = top_k_sampling_batch(logits, sampling_params.top_k, cls._generator)
+            # # Fallback to a default seed if not set
+            # if cls._generator is None:
+            #     cls._generator = torch.Generator(device=logits.device)
+            #     cls._generator.manual_seed(42)
+            idx_next, probs = top_k_sampling_batch(logits, sampling_params.top_k)
         else:
             idx_next, probs = greedy_search_sampling_batch(logits)
         idx_next = idx_next.view(logits_shape[:-1])

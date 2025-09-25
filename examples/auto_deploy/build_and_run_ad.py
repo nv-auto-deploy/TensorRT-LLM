@@ -38,7 +38,7 @@ class PromptConfig(BaseModel):
     and the sampling parameters.
     """
 
-    batch_size: int = Field(default=1, description="Number of queries")
+    batch_size: int = Field(default=2, description="Number of queries")
     queries: Union[PromptInput, List[PromptInput]] = Field(
         default_factory=lambda: [
             # OPTION 1: simple text prompt
