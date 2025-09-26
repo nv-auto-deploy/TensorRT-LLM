@@ -529,7 +529,6 @@ class MatchAttentionLayout(BaseTransform):
 
         # List of SDPA operations to look for
         sdpa_ops = {
-            torch.ops.auto_deploy.torch_attention_sdpa,
             torch.ops.auto_deploy.torch_attention_grouped_sdpa,
         }
 
