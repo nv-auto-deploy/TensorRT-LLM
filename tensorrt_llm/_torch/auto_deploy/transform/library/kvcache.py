@@ -160,6 +160,9 @@ class InsertCachedAttention(BaseTransform):
         m_arg_keys = list(cm.info.named_standard_args.keys())
         m_const_args = cm.info.const_args_for_prepare_metadata
 
+        # TODO (lucaslie): input_ids is not guaranteed anymore... we have to see what we can do...
+        m_arg_keys[0] = "inputs_embeds"
+
         # insert metadata computation and extract each argument as a node
         metadata_nodes = self._process_get_metadata(gm, m_arg_keys, m_const_args)
 
@@ -225,10 +228,6 @@ class ResizeKVCacheConfig(TransformConfig):
     free_mem_ratio: float = Field(
         description="The fraction of available memory to occupy.", default=0.8
     )
-    args_only: bool = Field(
-        description="Use ``*cm.args`` (default) or use ``**cm.named_args`` for the forward pass.",
-        default=True,
-    )
 
 
 @TransformRegistry.register("resize_kv_cache")
@@ -243,13 +242,6 @@ class ResizeKVCache(BaseTransform):
     @classmethod
     def get_config_class(cls) -> Type[TransformConfig]:
         return ResizeKVCacheConfig
-
-    def _run_forward(self, gm: GraphModule, cm: CachedSequenceInterface):
-        """Run a forward pass to get the memory usage."""
-        if self.config.args_only:
-            gm(*cm.args)
-        else:
-            gm(**cm.named_args)
 
     def _apply(
         self,
@@ -287,7 +279,7 @@ class ResizeKVCache(BaseTransform):
         free_mem_pre, _ = _get_mem_info_in_mb()
         self._log_info(f"Free memory before forward pass (MB): {free_mem_pre}")
 
-        self._run_forward(gm, cm)
+        gm(**cm.named_args)
 
         free_mem_post, _ = _get_mem_info_in_mb()
         self._log_info(f"Free memory after forward pass (MB): {free_mem_post}")

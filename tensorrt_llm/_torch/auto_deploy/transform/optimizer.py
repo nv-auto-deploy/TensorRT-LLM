@@ -69,7 +69,7 @@ class InferenceOptimizer:
 
         # start with an empty fake graph module if not provided
         if gm is None:
-            gm = self._init_gm()
+            gm = nn.Module()
 
         # iterate over all transforms sorted by stage in the config
         for t_name, t_config in self.config.items():
