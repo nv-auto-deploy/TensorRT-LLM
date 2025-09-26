@@ -1,6 +1,6 @@
 """A patch for the Mistral3Model to make it compatible with torch.export."""
 
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import torch
 from transformers.models.mistral3.modeling_mistral3 import (
@@ -169,11 +169,89 @@ class Mistral3ModelPatch(BaseExportPatch):
         self.original_values["Mistral3Model.forward"] = Mistral3Model.forward
         self.original_values["Mistral3Model.get_image_features"] = Mistral3Model.get_image_features
 
-        Mistral3Model.forward = _mistral_forward
-        Mistral3Model.get_image_features = _get_image_features_flat
+        # Mistral3Model.forward = _mistral_forward
+        # Mistral3Model.get_image_features = _get_image_features_flat
 
     def _revert_patch(self):
         """Revert the Mistral3Model patch."""
         # Restore original forward method.
-        Mistral3Model.forward = self.original_values["Mistral3Model.forward"]
-        Mistral3Model.get_image_features = self.original_values["Mistral3Model.get_image_features"]
+        # Mistral3Model.forward = self.original_values["Mistral3Model.forward"]
+        # Mistral3Model.get_image_features = self.original_values["Mistral3Model.get_image_features"]
+
+
+def _mistral3_forward2(
+    self,
+    input_ids: torch.LongTensor = None,
+    pixel_values: torch.FloatTensor = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[Any] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    vision_feature_layer: Optional[Union[int, list[int]]] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    image_sizes: torch.Tensor = None,
+    **kwargs,
+) -> Union[tuple, Mistral3ModelOutputWithPast]:
+    output_attentions = (
+        output_attentions if output_attentions is not None else self.config.output_attentions
+    )
+    output_hidden_states = (
+        output_hidden_states
+        if output_hidden_states is not None
+        else self.config.output_hidden_states
+    )
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+    vision_feature_layer = (
+        vision_feature_layer
+        if vision_feature_layer is not None
+        else self.config.vision_feature_layer
+    )
+
+    if (input_ids is None) ^ (inputs_embeds is not None):
+        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    if inputs_embeds is None:
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+
+    if pixel_values is not None:
+        image_features = self.get_image_features(
+            pixel_values=pixel_values,
+            vision_feature_layer=vision_feature_layer,
+            image_sizes=image_sizes,
+        )
+        image_features = torch.cat(image_features, dim=0).to(
+            inputs_embeds.device, inputs_embeds.dtype
+        )
+        special_image_mask = self.get_placeholder_mask(
+            input_ids, inputs_embeds=inputs_embeds, image_features=image_features
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+
+    outputs = self.language_model(
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        # NOTE: avoid kwargs that end up in kwargs dict instead of as explicit arguments!
+        # --> this confuses torch.export with dynamic shapes.
+        # output_attentions=output_attentions,
+        # output_hidden_states=output_hidden_states,
+        # return_dict=True,
+        cache_position=cache_position,
+        **kwargs,
+    )
+    return Mistral3ModelOutputWithPast(
+        last_hidden_state=outputs.last_hidden_state,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+        image_hidden_states=image_features if pixel_values is not None else None,
+    )
+
+
+Mistral3Model.forward = _mistral3_forward2

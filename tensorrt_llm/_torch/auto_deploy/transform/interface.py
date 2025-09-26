@@ -80,7 +80,7 @@ class TransformConfig(BaseModel):
     ### OPTIONAL CONFIG ###########################################################################
     run_per_gm: bool = Field(
         description="Whether to run the transform per graph (sub)module or on whole module.",
-        default=False,
+        default=True,
     )
     enabled: bool = Field(
         default=True,

@@ -160,6 +160,9 @@ class InsertCachedAttention(BaseTransform):
         m_arg_keys = list(cm.info.named_standard_args.keys())
         m_const_args = cm.info.const_args_for_prepare_metadata
 
+        # TODO (lucaslie): input_ids is not guaranteed anymore... we have to see what we can do...
+        m_arg_keys[0] = "inputs_embeds"
+
         # insert metadata computation and extract each argument as a node
         metadata_nodes = self._process_get_metadata(gm, m_arg_keys, m_const_args)
 

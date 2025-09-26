@@ -1,7 +1,9 @@
 """A simple wrapper transform to export a model to a graph module."""
 
+import types
 from typing import List, Optional, Tuple, Type
 
+import torch
 from pydantic import Field
 from torch.fx import GraphModule
 
@@ -65,15 +67,48 @@ class ExportToGM(BaseTransform):
         # set the example sequence
         cm.info.set_example_sequence(**factory.get_example_inputs())
 
+        # update example sequence
+        # kwargs = cm.named_args
+        # kwargs["inputs_embeds"] = model.get_input_embeddings()(kwargs.pop("input_ids"))
+
+        # do some more kwargs
+        kwargs = {}
+        kwargs["attention_mask"] = None
+        kwargs["position_ids"] = cm.named_args["position_ids"]
+        kwargs["past_key_values"] = None
+        kwargs["inputs_embeds"] = model.get_input_embeddings()(cm.named_args["input_ids"])
+        kwargs["use_cache"] = None
+        kwargs["cache_position"] = None
+
+        # do some dummy dynamic shapes
+        d_shapes = {}
+        d_shapes["attention_mask"] = None
+        d_shapes["position_ids"] = cm.named_dynamic_shapes["position_ids"]
+        d_shapes["past_key_values"] = None
+        d_shapes["inputs_embeds"] = cm.named_dynamic_shapes["input_ids"]
+        d_shapes["use_cache"] = None
+        d_shapes["cache_position"] = None
+
         # export the model to a graph module
         gm = torch_export_to_gm(
             model,
             args=(),
-            kwargs=cm.named_args,
-            dynamic_shapes=cm.named_dynamic_shapes,
+            kwargs=kwargs,
+            dynamic_shapes=d_shapes,
             clone=self.config.clone_state_dict,
             strict=self.config.strict,
             patch_list=self.config.patch_list,
+        )
+
+        # some more stuff
+        gm.embed_tokens = model.get_input_embeddings()
+        gm.get_input_embeddings = types.MethodType(model.get_input_embeddings.__func__, gm)
+
+        # add a dummy node to the graph for making the embedding module "sticky/impure"
+        # TODO (lucaslie): is there a better way to make it "sticky"?
+        n_embed_tokens = gm.graph.get_attr("embed_tokens.weight")
+        gm.graph.call_function(
+            torch._assert, args=(n_embed_tokens, "Avoid embedding getting deleted from graph.")
         )
 
         # this is a clean graph by definition since it was just exported

@@ -2,8 +2,9 @@
 
 from typing import Tuple, Type
 
+import torch.nn as nn
 from pydantic import Field
-from torch.fx import GraphModule
+from torch.fx import Graph, GraphModule
 
 from ...models import ModelFactory, hf
 from ...shim.interface import CachedSequenceInterface
@@ -47,12 +48,20 @@ class BuildModel(BaseTransform):
         model = factory.build_model(self.config.device)
 
         # as wrapper to satisfy the interface we will register the model as a submodule
-        gm.add_module("factory_model", model)
+        # gm.add_module("factory_model", model)
+
+        # get text model
+        text_model = model.get_submodule("model.language_model")
+        gm = GraphModule(nn.Module(), Graph())
+        gm.add_module("factory_model", text_model)
+        model.model.language_model = gm
+
+        cm.info.use_strict_args = False
 
         # by convention, we say this fake graph module is always clean
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
 
-        return gm, info
+        return model, info
 
 
 @TransformRegistry.register("build_and_load_factory_model")

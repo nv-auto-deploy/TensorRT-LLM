@@ -21,12 +21,17 @@ class Mistral3VLM(hf.AutoModelForImageTextToTextFactory):
             The dynamic shape callback is a function that returns the dynamic shape of the extra
             input.
         """
+        return {}
         extra_inputs = super().get_extra_inputs()
         # Reuse the same dynamic batch dimension for `image_sizes`.
         batch_dim = extra_inputs["pixel_values"][1]()[0]
         extra_inputs["image_sizes"] = (torch.zeros(0, 2, dtype=torch.long), lambda: {0: batch_dim})
 
         return extra_inputs
+
+    def get_example_inputs(self) -> Dict[str, torch.Tensor]:
+        """Return a dictionary of example inputs for the model."""
+        return {}
 
     @property
     def _example_image_dims(self) -> Tuple[int, int]:
