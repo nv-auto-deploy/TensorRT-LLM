@@ -1,4 +1,6 @@
 import contextlib
+import importlib.util
+import sys
 import types
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -10,36 +12,35 @@ from transformers import AutoModelForCausalLM
 from tensorrt_llm._torch.auto_deploy.models.patches.bamba import _bamba_mixer_torch_forward
 
 
-def rmsnorm_patch(self, hidden_states, gate=None):
-    return _rmsnorm_ref(
-        x=hidden_states,
-        weight=self.weight,
-        z=gate,
-        eps=self.variance_epsilon,
-        group_size=self.group_size,
-    )
-
-
 # Forked from:
 # https://github.com/state-spaces/mamba/blob/6b32be06d026e170b3fdaf3ae6282c5a6ff57b06/mamba_ssm/ops/triton/layernorm_gated.py
 # NOTES:
 # 1. At time of writing (09/25/2025), the nano nemotron v2 modeling code expects `mamba_ssm`
 #    to be installed so as to be able to make use of its grouped gated RMS norm operation.
 #    We therefore replace it with one that uses einops + pytorch.
-# 2. Arguments / code paths unused by nemotron H have been removed for clarity.
-def _rmsnorm_ref(x, weight, z=None, eps=1e-5, group_size=None):
+def _rms_norm_ref(
+    x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True, upcast=True
+):
     dtype = x.dtype
+    # N = x.shape[-1]
     weight = weight.float()
-    # Always gate before normalizing.
-    if z is not None:
+    bias = bias.float() if bias is not None else None
+    if upcast:
+        x = x.float()
+        z = z.float() if z is not None else z
+    if z is not None and not norm_before_gate:
         x = x * F.silu(z)
     if group_size is None:
         rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
-        out = x * rstd * weight
+        out = (x * rstd * weight) + bias if bias is not None else (x * rstd * weight)
     else:
         x_group = rearrange(x, "... (g d) -> ... g d", d=group_size)
         rstd = 1 / torch.sqrt((x_group.square()).mean(dim=-1, keepdim=True) + eps)
         out = rearrange(x_group * rstd, "... g d -> ... (g d)") * weight
+        if bias is not None:
+            out = out + bias
+    if z is not None and norm_before_gate:
+        out *= F.silu(z)
     return out.to(dtype)
 
 
@@ -90,7 +91,6 @@ def _nemotron_h_block_forward(
 _from_config_original = AutoModelForCausalLM.from_config
 
 CUSTOM_MODULE_PATCHES: Dict[str, List[Tuple[str, Callable]]] = {
-    "MambaRMSNormGated": [("forward", rmsnorm_patch)],
     "NemotronHMamba2Mixer": [("forward", _bamba_mixer_torch_forward)],
     "NemotronHModel": [
         ("_update_causal_mask", _nemotron_h_model_update_causal_mask),
@@ -114,3 +114,12 @@ def get_model_from_config_patched(config, **kwargs):
 
 # TODO: figure out how this can be incorporated into the export patch system
 AutoModelForCausalLM.from_config = get_model_from_config_patched
+
+# TODO: figure out how this can be incorporated into the export patch system
+# Only patch if the module isn't available
+_mamba_ssm_module = "mamba_ssm"
+_mamba_ssm_submodule = f"{_mamba_ssm_module}.ops.triton.layernorm_gated"
+if importlib.util.find_spec(_mamba_ssm_module) is None:
+    stub_mod = types.ModuleType(_mamba_ssm_submodule)
+    stub_mod.rmsnorm_fn = _rms_norm_ref
+    sys.modules[_mamba_ssm_submodule] = stub_mod

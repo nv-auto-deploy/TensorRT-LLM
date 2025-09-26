@@ -1,58 +1,55 @@
 import torch  # noqa
 import torch.export as te
 from torch.export import Dim  # noqa
+import pytest
 
-# import pytest
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig
 from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device  # noqa
+from _model_test_utils import get_small_model_config
 
-# MODEL_DIR = "ibm-ai-platform/Bamba-9B-v2"
-MODEL_DIR = (
-    "/home/scratch.williamz_gpu/code/trtc/builder/hf_cache/hub/"
-    "models--nvidia--NVIDIA-Nemotron-Nano-9B-v2/snapshots/dc376c20a64208fc2cb4667e00af485eeced8ae4"
-)
 # NOTE: find example inputs with the same tokenization length to avoid seq concat.
 EXAMPLE_INPUT = "Mamba is a snake with the following properties:"
-# EXAMPLE_INPUT = "Boa is a snake with the following properties:"
 EXAMPLE_INPUT2 = "Tiger is a cat with the following properties:"
 
 
-# @pytest.mark.parametrize(
-#     "model_on_meta_during_export",
-#     [
-#         True,
-#         False,
-#     ],
-# )
-# @pytest.mark.parametrize(
-#     "export_func",
-#     [
-#         "torch_export_to_gm",
-#         "torch_export",
-#     ],
-# )
-def test_bamba_patches(
-    model_on_meta_during_export: bool = True,
-    export_func: str = "torch_export_to_gm",
-    use_cache: bool = True,
-):
-    llm_args = AutoDeployConfig(
-        **{
-            "model": MODEL_DIR,
-            "world_size": 0,
-            "runtime": "demollm",
-            "compile_backend": "torch-simple",
-            "attn_backend": "flashinfer",
-            "model_factory": "AutoModelForCausalLM",
+@pytest.mark.parametrize(
+    "model_dir,run_verify_generation",
+    [
+        pytest.param("ibm-ai-platform/Bamba-9B-v2", True),
+        pytest.param("nvidia/NVIDIA-Nemotron-Nano-12B-v2", False),
+    ],
+)
+def test_bamba_patches(model_dir: str, run_verify_generation: bool):
+    # NOTE: set to False if you want to locally test the full model
+    use_small_config: bool = True
+
+    model_on_meta_during_export = True
+    use_cache: bool = True
+    export_func: str = "torch_export_to_gm"
+
+    common_kwargs = {
+        "world_size": 0,
+        "runtime": "demollm",
+        "compile_backend": "torch-simple",
+        "attn_backend": "flashinfer",
+        "model_factory": "AutoModelForCausalLM",
+        "max_seq_len": 512,
+    }
+
+    if use_small_config:
+        llm_args = get_small_model_config(model_dir, **common_kwargs)["args"]
+        llm_args["model_kwargs"]["use_cache"] = use_cache
+    else:
+        llm_args = {
+            "model": model_dir,
+            **common_kwargs,
             "model_kwargs": {
                 "use_cache": use_cache,
                 "torch_dtype": "bfloat16",
             },
-            "max_seq_len": 512,
-            "skip_loading_weights": False,
-        },
-    )
+        }
+    llm_args = AutoDeployConfig(**llm_args)
 
     torch.manual_seed(0)
     if torch.cuda.is_available():
@@ -83,14 +80,12 @@ def test_bamba_patches(
     def _run_torch_export_to_gm():
         return torch_export_to_gm(
             model,
-            # args=(input_ids, position_ids),
             args=tuple(),
             kwargs={"input_ids": input_ids, "position_ids": position_ids},
             dynamic_shapes=dynamic_shapes,
             patch_list=[
                 "bamba",
-                # For "unsupported scalarType".
-                "autocast_noop",
+                "autocast_noop",  # For "unsupported scalarType".
             ],
         )
 
@@ -99,8 +94,7 @@ def test_bamba_patches(
             with torch.inference_mode():
                 ep = te.export(
                     model,
-                    # args=(input_ids, position_ids),
-                    args=tuple(),
+                    args=(),
                     kwargs={"input_ids": input_ids, "position_ids": position_ids},
                     dynamic_shapes=dynamic_shapes,
                     strict=False,
@@ -118,18 +112,15 @@ def test_bamba_patches(
         gm = _run_export()
         factory.load_or_random_init(gm, device="cuda")
         move_to_device(gm, "cuda")
-
-    factory.load_or_random_init(model, device="cuda")
-
-    # _verify_generation(factory, model, tokenizer)
-    # return
-
-    print("====== EXPORTING GRAPH MODULE ======")
-    if not model_on_meta_during_export:
+        factory._to_maybe_random(model, "cuda")
+        model.load_state_dict(gm.state_dict())
+    else:
+        factory.load_or_random_init(model, device="cuda")
         gm = _run_export()
         move_to_device(gm, "cuda")
 
-    # gm.model.A_log = model.model.A_log
+    if run_verify_generation:
+        _verify_generation(factory, model, tokenizer)
 
     # let's do a comparison of every state dict item between the model and the gm
     torch.testing.assert_close(model.state_dict(), gm.state_dict(), rtol=0.0, atol=0.0)
@@ -145,23 +136,15 @@ def test_bamba_patches(
     with torch.inference_mode():
         outputs_for_comparison["gm"] = gm(input_ids=input_ids, position_ids=position_ids)
 
-    atol, rtol = 1e-5, 1e-5
+    atol, rtol = 1e-3, 1e-3
     for comp, outs in outputs_for_comparison.items():
         print(f"====== COMPARISON ({comp}) ======")
-        try:
-            torch.testing.assert_close(
-                outs,
-                out_original,
-                rtol=rtol,
-                atol=atol,
-            )
-            print("Passed!")
-        except AssertionError as e:
-            print(e)
-            diff = torch.abs(outs.logits - out_original.logits)
-            print(f"abs diff: {diff}")
-            print(f"average diff: {diff.mean()}")
-            print(f"{comp=}")
+        torch.testing.assert_close(
+            outs,
+            out_original,
+            rtol=rtol,
+            atol=atol,
+        )
 
 
 def _verify_generation(factory, model, tokenizer):
