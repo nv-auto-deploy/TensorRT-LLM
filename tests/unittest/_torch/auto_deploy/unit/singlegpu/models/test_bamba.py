@@ -49,10 +49,6 @@ def test_bamba_patches():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(0)
 
-    torch.manual_seed(0)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(0)
-
     factory = llm_args.create_factory()
     model = factory.build_model("meta")
     tokenizer = factory.init_tokenizer()
