@@ -122,9 +122,13 @@ def _cuda_cached_causal_conv1d(
     num_seq = seq_len.shape[0]
 
     # Split by lengths: assume prefills first, decodes after
-    prefill_mask = seq_len > 1
-    num_prefill = int(prefill_mask.sum().item())
-    num_decode = num_seq - num_prefill
+    if s == 1:
+        num_prefill = 0
+        num_decode = num_seq
+    else:
+        prefill_mask = seq_len > 1
+        num_prefill = int(prefill_mask.sum().item())
+        num_decode = num_seq - num_prefill
 
     # Flatten tokens
     bs = b * s

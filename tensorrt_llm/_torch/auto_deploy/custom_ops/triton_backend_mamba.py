@@ -67,9 +67,13 @@ def _triton_cached_ssm_transform(
     head_dim = hidden_states.shape[3]
     ssm_state_size = B.shape[3]
 
-    prefill_mask = seq_len > 1
-    num_prefill = int(prefill_mask.sum().item())
-    num_decode = num_seq - num_prefill
+    if s == 1:
+        num_prefill = 0
+        num_decode = num_seq
+    else:
+        prefill_mask = seq_len > 1
+        num_prefill = int(prefill_mask.sum().item())
+        num_decode = num_seq - num_prefill
 
     # Prefill: concatenate tokens at the front and run combined scan
     if num_prefill > 0:
