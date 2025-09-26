@@ -139,11 +139,9 @@ def _triton_cached_ssm_transform(
         A_full = A[..., None, None].expand(num_heads, head_dim, ssm_state_size)
         D_full = D[..., None].expand(num_heads, head_dim)
 
-        ssm_batch = ssm_state_cache.index_select(0, slot_idx_decode)
-        updated_state = ssm_batch.clone()
         dt_bias_zero = torch.zeros_like(dt_bias_hp)
         y_dec = selective_state_update(
-            updated_state,
+            ssm_state_cache,
             x_decode,
             dt_pre,
             A_full,
@@ -153,10 +151,10 @@ def _triton_cached_ssm_transform(
             z=None,
             dt_bias=dt_bias_zero,
             dt_softplus=False,
+            state_batch_indices=slot_idx_decode,
         )  # [nd, H, D]
 
         y_flat.index_copy_(0, decode_idx, y_dec.to(y_flat.dtype))
-        ssm_state_cache.index_copy_(0, slot_idx_decode, updated_state.to(ssm_state_cache.dtype))
 
     return y
 
