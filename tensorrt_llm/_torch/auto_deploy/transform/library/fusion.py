@@ -11,7 +11,7 @@ from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils.cuda_mem_tracker import cuda_memory_tracker
+from ...utils.cuda_mem_tracker import CUDAMemFragProbe, cuda_memory_tracker
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     extract_param_names_from_lin_node,
@@ -243,16 +243,18 @@ class FuseGemms(BaseTransform):
         # fuse linear nodes
         idx = -1
         num_matches = 0
-        with cuda_memory_tracker():
-            for parent_node, lin_children in linear_nodes.items():
-                if len(lin_children) < 2:
-                    continue
-                if not check_same_children(parent_node, is_linear_op):
-                    # Mixed children (e.g., quantized or non-linear) — skip fusion
-                    continue
-                # linear nodes to fuse
-                _insert_fused_gemm(gm, idx := idx + 1, parent_node, lin_children)
-                num_matches += 1
+        with CUDAMemFragProbe(tag="fuse_gemms", printer=self._log_info) as probe:
+            with cuda_memory_tracker():
+                for parent_node, lin_children in linear_nodes.items():
+                    if len(lin_children) < 2:
+                        continue
+                    if not check_same_children(parent_node, is_linear_op):
+                        # Mixed children (e.g., quantized or non-linear) — skip fusion
+                        continue
+                    # linear nodes to fuse
+                    _insert_fused_gemm(gm, idx := idx + 1, parent_node, lin_children)
+                    num_matches += 1
+        probe.print_report()
 
         torch.cuda.empty_cache()
 
