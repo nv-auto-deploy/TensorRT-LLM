@@ -3,7 +3,7 @@
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.export as te
@@ -195,6 +195,58 @@ def _clean_up_assertions(gm: fx.GraphModule):
     canonicalize_graph(gm)
 
 
+def run_forward_for_capture(
+    model: nn.Module,
+    capture_fn: Callable[..., nn.Module],
+    args: Optional[Tuple[Any, ...]] = None,
+    kwargs: Optional[Dict[str, Any]] = None,
+    clone: bool = False,  # clone or don't clone the model state_dict
+    *,
+    patch_configs: Optional[Dict[str, Union[dict, Any]]] = None,
+    patch_list: Optional[List[str]] = None,
+) -> nn.Module:
+    """torch's export with wrapping into GraphModule + useful additions to the resulting module.
+
+    This utility improves over stock torch.export.export in the following aspects:
+
+        1. Provide patches for certain corner cases that torch.export does not support.
+        2. Standardize the export process to strictly run on the meta device.
+        3. Automatically extract the GraphModule from the exported program.
+        4. Retain load hooks for state_dict loading from the original module.
+        5. Manage parameter aliasing in the model.
+        6. Remove assertions from the graph.
+
+    Args:
+        model: The model to export
+        capture_fn: The closure to run the model with.
+        args: Arguments for the model
+        kwargs: Keyword arguments for the model
+        clone: Whether to clone the model state_dict
+        dynamic_shapes: Dynamic shapes for the export
+        strict: Whether to use strict mode for export
+        patch_configs: Optional patch configurations. If None, all registered patches
+                      will be applied with default settings.
+        patch_list: Optional list of patch names to apply with default settings.
+    """
+    # run capture with patches and lifted to meta
+    with apply_export_patches(patch_configs, patch_list), lift_to_meta(model) as state_dict:
+        # clean up args, kwargs and move to correct device
+        args, kwargs = tree_to((args or (), kwargs or {}), device="meta")
+
+        # NOTE (lucaslie): export is VERY sensitive to the location of the inference_mode
+        # context manager. Do NOT move it unless absolutely necessary.
+        with torch.inference_mode():
+            mod_after_capture = capture_fn(model, args, kwargs)
+
+        # load state_dict into egm
+        # NOTE: export might have removed unused params/buffers (hence we allow unexpected keys)
+        load_buffers_and_params(
+            mod_after_capture, state_dict, strict_missing=True, strict_unexpected=False, clone=clone
+        )
+
+    return mod_after_capture
+
+
 def torch_export_to_gm(
     model: nn.Module,
     args: Optional[Tuple[Any, ...]] = None,
@@ -230,23 +282,16 @@ def torch_export_to_gm(
                    Cannot be used together with patch_configs.
     """
 
-    # run export with patches and lifted to meta
-    with apply_export_patches(patch_configs, patch_list), lift_to_meta(model) as state_dict:
-        # clean up args, kwargs and move to correct device
-        args, kwargs = tree_to((args or (), kwargs or {}), device="meta")
-
-        # NOTE (lucaslie): export is VERY sensitive to the location of the inference_mode
-        # context manager. Do NOT move it unless absolutely necessary.
-        with torch.inference_mode():
-            ep = te.export(model, args, kwargs, dynamic_shapes=dynamic_shapes, strict=strict)
+    def _capture_fn(model, args, kwargs):
+        ep = te.export(model, args, kwargs, dynamic_shapes=dynamic_shapes, strict=strict)
         egm = ep.module()
         assert isinstance(egm, fx.GraphModule)
+        return egm
 
-        # load state_dict into egm
-        # NOTE: export might have removed unused params/buffers (hence we allow unexpected keys)
-        load_buffers_and_params(
-            egm, state_dict, strict_missing=True, strict_unexpected=False, clone=clone
-        )
+    # run capture with export
+    egm = run_forward_for_capture(
+        model, _capture_fn, args, kwargs, clone, patch_list=patch_list, patch_configs=patch_configs
+    )
 
     # Export strips away all methods not traced during forward. The model could have
     # load hooks that contain logic for correct state_dict loading. We need to add those

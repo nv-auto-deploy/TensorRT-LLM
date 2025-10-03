@@ -53,7 +53,7 @@ def _process_patch_embeds_meta(
     image_sizes: torch.Tensor,
     patch_size: int,
     hidden_size: int,
-    max_widht: int,
+    max_width: int,
 ):
     B = (image_sizes // patch_size).prod(dim=1).sum()
     device = patch_embeds.device
@@ -216,16 +216,16 @@ class PixtralVisionModelPatch(BaseExportPatch):
 
     def _apply_patch(self):
         """Apply the PixtralVisionModel patch."""
-        self.original_values["PixtralVisionModel.forward"] = PixtralVisionModel.forward
+        # self.original_values["PixtralVisionModel.forward"] = PixtralVisionModel.forward
         self.original_values["Mistral3PatchMerger.forward"] = Mistral3PatchMerger.forward
         self.original_values["PixtralRMSNorm.forward"] = PixtralRMSNorm.forward
 
-        PixtralVisionModel.forward = _pixtral_forward
+        # PixtralVisionModel.forward = _pixtral_forward
         Mistral3PatchMerger.forward = _patch_merger_forward
         PixtralRMSNorm.forward = _pixtral_rms_norm_forward
 
     def _revert_patch(self):
         """Revert the PixtralVisionModel patch."""
-        PixtralVisionModel.forward = self.original_values["PixtralVisionModel.forward"]
+        # PixtralVisionModel.forward = self.original_values["PixtralVisionModel.forward"]
         Mistral3PatchMerger.forward = self.original_values["Mistral3PatchMerger.forward"]
         PixtralRMSNorm.forward = self.original_values["PixtralRMSNorm.forward"]

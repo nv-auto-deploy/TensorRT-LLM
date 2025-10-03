@@ -46,6 +46,18 @@ class BuildModel(BaseTransform):
         # build the model
         model = factory.build_model(self.config.device)
 
+        # as wrapper to satisfy the interface we will register the model as a submodule
+        # gm.add_module("factory_model", model)
+
+        # # get text model
+        # text_model = model.get_submodule("model.language_model")
+        # mod = GraphModule(nn.Module(), Graph())
+        # mod.add_module("factory_model", text_model)
+        # model.model.language_model = mod
+
+        # # set strict args to False
+        cm.info.use_strict_args = False
+
         # by convention, we say the model is always clean
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
 

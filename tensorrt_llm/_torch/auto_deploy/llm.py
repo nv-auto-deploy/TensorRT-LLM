@@ -92,6 +92,7 @@ class ADInputProcessor(DefaultInputProcessor):
             assert token_ids.shape[0] == 1, "messages should be unbatched at this point."
             if all_args:
                 extra_processed_inputs = {"multimodal_data": all_args}
+                all_args["pixel_values"] = all_args["pixel_values"].to(torch.bfloat16)
             else:
                 extra_processed_inputs = None
             return token_ids[0].tolist(), extra_processed_inputs
