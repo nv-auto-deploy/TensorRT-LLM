@@ -200,6 +200,11 @@ class CUDAGraphRunner:
                 initial_inputs: Dict[str, Any],
                 postprocess_fn: Optional[Callable] = None):
         """Captures the forward pass for a given batch size."""
+        import os
+        import time
+
+        from ...logger import logger
+
         engine = self._get_engine()
         batch_size = key[0]
         # [CUDA graph spec decode padding]
@@ -244,26 +249,115 @@ class CUDAGraphRunner:
                 capture_inputs['attn_metadata'].use_spec_decoding = True
             return forward_fn(capture_inputs)
 
+        # Start timing CUDA graph capture
+        capture_start_time = time.time()
+        logger.info(f"[PyTorch Backend] Starting CUDA graph capture for "
+                    f"batch_size={batch_size}, draft_len={max_draft_len}")
+
+        # Enable profiling if requested via environment variable
+        enable_profiling = os.environ.get("TRTLLM_PROFILE_CUDA_GRAPH_CAPTURE",
+                                          "0") == "1"
+        profile_dir = os.environ.get("TRTLLM_PROFILE_DIR",
+                                     "./cuda_graph_profiles")
+
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:
         # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
         # This also lets us initialize states in the attn_metadata.
+        warmup_start_time = time.time()
         graph = torch.cuda.CUDAGraph()
+
+        if enable_profiling:
+            os.makedirs(profile_dir, exist_ok=True)
+            trace_file = os.path.join(
+                profile_dir,
+                f"pt_backend_bs{batch_size}_draft{max_draft_len}.json")
+            logger.info(
+                f"[PyTorch Backend]   -> Profiling enabled, trace: {trace_file}"
+            )
+
         with with_multi_stream(True), piecewise_cuda_graph(False):
-            for _ in range(self.WARMUP_STEPS):
-                _setup_spec_decoding_and_forward(key, forward_fn,
-                                                 capture_inputs)
+            # Warmup phase with optional profiling
+            if enable_profiling:
+                with torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        record_shapes=True,
+                        with_stack=True,
+                ) as prof:
+                    for _ in range(self.WARMUP_STEPS):
+                        _setup_spec_decoding_and_forward(
+                            key, forward_fn, capture_inputs)
+                        if postprocess_fn is not None:
+                            postprocess_fn(capture_inputs)
+                warmup_trace = os.path.join(
+                    profile_dir,
+                    f"pt_backend_bs{batch_size}_draft{max_draft_len}_warmup.json"
+                )
+                prof.export_chrome_trace(warmup_trace)
+                logger.info(
+                    f"[PyTorch Backend]   -> Warmup trace saved: {warmup_trace}"
+                )
+            else:
+                for _ in range(self.WARMUP_STEPS):
+                    _setup_spec_decoding_and_forward(key, forward_fn,
+                                                     capture_inputs)
+                    if postprocess_fn is not None:
+                        postprocess_fn(capture_inputs)
+
+            warmup_time = time.time() - warmup_start_time
+            logger.info(
+                f"[PyTorch Backend]   -> Warmup ({self.WARMUP_STEPS} iterations) "
+                f"took {warmup_time:.4f}s")
+
+            actual_capture_start = time.time()
+
+            # Capture phase with optional profiling
+            if enable_profiling:
+                with torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        record_shapes=True,
+                        with_stack=True,
+                ) as prof:
+                    with torch.cuda.graph(graph, pool=self.memory_pool):
+                        output = _setup_spec_decoding_and_forward(
+                            key, forward_fn, capture_inputs)
+                    if postprocess_fn is not None:
+                        postprocess_fn(capture_inputs)
+                capture_trace = os.path.join(
+                    profile_dir,
+                    f"pt_backend_bs{batch_size}_draft{max_draft_len}_capture.json"
+                )
+                prof.export_chrome_trace(capture_trace)
+                logger.info(
+                    f"[PyTorch Backend]   -> Capture trace saved: {capture_trace}"
+                )
+            else:
+                with torch.cuda.graph(graph, pool=self.memory_pool):
+                    output = _setup_spec_decoding_and_forward(
+                        key, forward_fn, capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
-            with torch.cuda.graph(graph, pool=self.memory_pool):
-                output = _setup_spec_decoding_and_forward(
-                    key, forward_fn, capture_inputs)
-            if postprocess_fn is not None:
-                postprocess_fn(capture_inputs)
+
+            actual_capture_time = time.time() - actual_capture_start
+            logger.info(
+                f"[PyTorch Backend]   -> Graph capture took {actual_capture_time:.4f}s"
+            )
 
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
+
+        total_capture_time = time.time() - capture_start_time
+        logger.info(
+            f"[PyTorch Backend] Completed CUDA graph capture for batch_size={batch_size} "
+            f"in {total_capture_time:.4f}s (warmup: {warmup_time:.4f}s, "
+            f"capture: {actual_capture_time:.4f}s)")
 
     def replay(self, key: Tuple[int, int, int],
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
