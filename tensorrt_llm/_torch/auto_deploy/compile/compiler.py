@@ -89,12 +89,14 @@ def compile_and_capture(
         ad_logger.warning(f"Backend '{backend}' not found. Falling back to 'torch-simple' backend.")
         backend = "torch-simple"
 
-    ad_logger.info(f"Compiling for {backend} backend...")
+    ad_logger.info(f"  -> Starting AutoDeploy compilation for {backend} backend...")
 
     compiler_cls = BackendRegistry.get(backend)
     compiled_module = compiler_cls(gm, args, kwargs, dynamic_shapes, compiler_kwargs).compile()
 
     elapsed_time += time.time()
-    ad_logger.info(f"Compile time with backend {backend}: {elapsed_time:.6f} seconds")
+    ad_logger.info(
+        f"  -> AutoDeploy compilation completed in {elapsed_time:.6f} seconds with backend {backend}"
+    )
 
     return compiled_module

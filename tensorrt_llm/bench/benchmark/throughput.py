@@ -410,7 +410,30 @@ def throughput_command(
         kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
         kwargs['backend'] = options.backend
 
+        # Start comprehensive compilation timing for pytorch and _autodeploy backends
+        compilation_start_time = None
+        if options.backend in ["pytorch", "_autodeploy"]:
+            import time
+            compilation_start_time = time.time()
+            logger.info("=" * 80)
+            logger.info(
+                f"= STARTING COMPLETE MODEL COMPILATION ({options.backend.upper()} BACKEND)"
+            )
+            logger.info("=" * 80)
+            logger.info(
+                "This includes model initialization, torch.compile, CUDA graph capture, and warmup..."
+            )
+            logger.info("  -> Starting model loading and initialization...")
+
+        model_load_start_time = time.time(
+        ) if compilation_start_time is not None else None
         llm = get_llm(runtime_config, kwargs)
+
+        if model_load_start_time is not None:
+            model_load_time = time.time() - model_load_start_time
+            logger.info(
+                f"  -> Model loading and initialization completed in {model_load_time:.6f} seconds"
+            )
 
         sampler_args = {
             "end_id": options.eos_id,
@@ -426,9 +449,16 @@ def throughput_command(
 
         # Perform warmup if requested.
         if options.warmup > 0:
-            logger.info("Setting up for warmup...")
+            if compilation_start_time is not None:
+                logger.info(
+                    "  -> Starting warmup phase (includes CUDA graph capture)..."
+                )
+            else:
+                logger.info("Setting up for warmup...")
             warmup_dataset = generate_warmup_dataset(requests, options.warmup)
-            logger.info("Running warmup.")
+
+            warmup_start_time = time.time(
+            ) if compilation_start_time is not None else None
             asyncio.run(
                 async_benchmark(llm,
                                 sampling_params,
@@ -441,7 +471,31 @@ def throughput_command(
             # Since the benchmark calls asyncio.run() multiple times (e.g., during warmup),
             # we must reset it to ensure it attaches to the correct event loop.
             llm._executor._iter_stats_result = None
-            logger.info("Warmup done.")
+
+            if warmup_start_time is not None:
+                warmup_time = time.time() - warmup_start_time
+                logger.info(
+                    f"  -> Warmup phase completed in {warmup_time:.6f} seconds")
+            else:
+                logger.info("Warmup done.")
+
+        # Complete compilation timing measurement
+        if compilation_start_time is not None:
+            total_compilation_time = time.time() - compilation_start_time
+            logger.info("=" * 80)
+            logger.info(
+                f"= COMPLETE MODEL COMPILATION FINISHED ({options.backend.upper()} BACKEND)"
+            )
+            logger.info("=" * 80)
+            logger.info(
+                f"Total compilation time (including warmup/CUDA graphs): {total_compilation_time:.6f} seconds"
+            )
+            logger.info("This includes:")
+            logger.info("  - Model loading and initialization")
+            logger.info("  - torch.compile() or AutoDeploy compilation")
+            logger.info("  - CUDA graph capture during warmup")
+            logger.info("  - Memory allocation and optimization setup")
+            logger.info("=" * 80)
 
         iteration_writer = options.iteration_writer
         with iteration_writer.capture():

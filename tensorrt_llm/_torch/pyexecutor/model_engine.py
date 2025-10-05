@@ -5,6 +5,7 @@ import gc
 import inspect
 import math
 import os
+import time
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -240,6 +241,11 @@ class PyTorchModelEngine(ModelEngine):
                     capture_num_tokens=self._piecewise_cuda_graph_num_tokens,
                     max_num_streams=pytorch_backend_config.
                     torch_compile_max_num_streams)
+
+                # Measure compilation time for PyTorch backend
+                torch_compile_start_time = time.time()
+                logger.info("  -> Starting torch.compile() phase...")
+
                 if isinstance(self.model, DecoderModelForCausalLM):
                     self.model.model = torch.compile(
                         self.model.model,
@@ -252,6 +258,12 @@ class PyTorchModelEngine(ModelEngine):
                         backend=self._torch_compile_backend,
                         fullgraph=pytorch_backend_config.torch_compile_fullgraph
                     )
+
+                torch_compile_time = time.time() - torch_compile_start_time
+                logger.info(
+                    f"  -> torch.compile() completed in {torch_compile_time:.6f} seconds"
+                )
+
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
