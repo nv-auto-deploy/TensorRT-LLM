@@ -5,8 +5,11 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch._prims_common import DeviceLikeType
 
+from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
+from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 
 from ...._utils import mpi_rank, mpi_world_size
 from ....bindings.internal.batch_manager import CacheType
@@ -117,7 +120,13 @@ class ADEngine(ModelEngine):
         build_and_optimize = InferenceOptimizer(factory=factory, ad_config=ad_config)
 
         # construct engine
-        return cls(build_and_optimize, seq_info, device, max_beam_width)
+        return cls(
+            build_and_optimize,
+            seq_info,
+            device,
+            max_beam_width,
+            vocab_size_padded=getattr(factory, "vocab_size_padded", None),
+        )
 
     @torch.inference_mode()
     def __init__(
@@ -126,6 +135,7 @@ class ADEngine(ModelEngine):
         seq_info: SequenceInfo,
         device: DeviceLikeType,
         max_beam_width: int = 1,
+        vocab_size_padded: Optional[int] = None,
     ) -> None:
         """Initialize the engine with model and sequence information."""
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
@@ -159,6 +169,12 @@ class ADEngine(ModelEngine):
 
         # start fresh with fixed seed
         torch.manual_seed(42)
+
+        self._vocab_size_padded = vocab_size_padded
+
+    @property
+    def vocab_size_padded(self) -> Optional[int]:
+        return self._vocab_size_padded
 
     @nvtx_range("ad_prepare_inputs")
     def _prepare_inputs(
@@ -297,7 +313,7 @@ class ADEngine(ModelEngine):
         return {"logits": logits_flat}
 
 
-def create_autodeploy_executor(ad_config: LlmArgs):
+def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[TokenizerBase] = None):
     """Create an AutoDeploy executor from the given configuration and checkpoint directory.
 
     This is the entrypoint API to the _autodeploy backend.
@@ -391,6 +407,23 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     )
     sampler = TorchSampler(sampler_args)
 
+    # Guided (istructured) decoding.
+    guided_decoder = None
+    if (
+        (guided_decoding_backend := ad_config.guided_decoding_backend) is not None
+    ) and dist_mapping.is_last_pp_rank():
+        vocab_size_padded = engine.vocab_size_padded
+        if vocab_size_padded is None:
+            raise RuntimeError("Could not determine the vocabulary size.")
+        guided_decoding_config = get_guided_decoding_config(
+            guided_decoding_backend=guided_decoding_backend, tokenizer=tokenizer
+        )
+        guided_decoder = GuidedDecoder(
+            guided_decoding_config=guided_decoding_config,
+            max_num_sequences=ad_config.max_batch_size,
+            vocab_size_padded=vocab_size_padded,
+        )
+
     # creating the executor object
     py_executor = PyExecutor(
         resource_manager,
@@ -404,5 +437,6 @@ def create_autodeploy_executor(ad_config: LlmArgs):
         max_batch_size=ad_config.max_batch_size,
         max_draft_len=max_draft_len,
         max_beam_width=ad_config.max_beam_width,
+        guided_decoder=guided_decoder,
     )
     return py_executor
