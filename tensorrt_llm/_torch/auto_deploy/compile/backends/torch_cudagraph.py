@@ -68,23 +68,105 @@ class CapturedGraph(nn.Module):
 
     def _capture_one_graph(self, *args, **kwargs) -> torch.cuda.CUDAGraph:
         """Capture and return one cuda graph."""
-        # warm-up and invoke autotuner
-        with CudaGraphWarmUpPhase(), autotune():
-            for _ in range(3):
-                self.model(*args, **kwargs)
+        import os
+        import time
+
+        # Determine batch size from first batched input
+        all_args_flat = _args_kwargs_flatten_spec(self._in_spec, *args, **kwargs)
+        batch_size = all_args_flat[0].shape[0] if len(all_args_flat) > 0 else "unknown"
+
+        # Enable profiling if requested via environment variable
+        enable_profiling = os.environ.get("TRTLLM_PROFILE_CUDA_GRAPH_CAPTURE", "0") == "1"
+        profile_dir = os.environ.get("TRTLLM_PROFILE_DIR", "./cuda_graph_profiles")
+
+        # Check if this is a torch-compiled model to reduce warmup iterations
+        # For compiled models, the first iteration does the compilation,
+        # so we only need 1 warmup iteration instead of 3
+        warmup_iters = getattr(self, "_warmup_iters", 3)
+
+        capture_start_time = time.time()
+        ad_logger.info(f"[AutoDeploy Backend]   -> Starting capture for batch_size={batch_size}")
+
+        if enable_profiling:
+            os.makedirs(profile_dir, exist_ok=True)
+            ad_logger.info(
+                f"[AutoDeploy Backend]     -> Profiling enabled for batch_size={batch_size}"
+            )
+
+        # warm-up and invoke autotuner with optional profiling
+        warmup_start_time = time.time()
+        if enable_profiling:
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                with_stack=True,
+            ) as prof:
+                with CudaGraphWarmUpPhase(), autotune():
+                    for _ in range(warmup_iters):
+                        self.model(*args, **kwargs)
+            warmup_trace = os.path.join(profile_dir, f"ad_backend_bs{batch_size}_warmup.json")
+            prof.export_chrome_trace(warmup_trace)
+            ad_logger.info(f"[AutoDeploy Backend]     -> Warmup trace saved: {warmup_trace}")
+        else:
+            with CudaGraphWarmUpPhase(), autotune():
+                for _ in range(warmup_iters):
+                    self.model(*args, **kwargs)
+
+        warmup_time = time.time() - warmup_start_time
+        ad_logger.info(
+            f"[AutoDeploy Backend]     -> Warmup ({warmup_iters} iterations) "
+            f"took {warmup_time:.4f}s"
+        )
 
         # capture graph now
         torch.cuda.synchronize()
+        actual_capture_start = time.time()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
-            # compute output
-            out = self.model(*args, **kwargs)
-            # write out into output buffer up to out batch size
-            out_flat = tree_flatten_spec(out, self._out_spec)
-            for o_buffer, o in zip(self._out_buffer_flat, out_flat):
-                o_buffer[: o.shape[0]] = o
+
+        if enable_profiling:
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                with_stack=True,
+            ) as prof:
+                with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
+                    # compute output
+                    out = self.model(*args, **kwargs)
+                    # write out into output buffer up to out batch size
+                    out_flat = tree_flatten_spec(out, self._out_spec)
+                    for o_buffer, o in zip(self._out_buffer_flat, out_flat):
+                        o_buffer[: o.shape[0]] = o
+            capture_trace = os.path.join(profile_dir, f"ad_backend_bs{batch_size}_capture.json")
+            prof.export_chrome_trace(capture_trace)
+            ad_logger.info(f"[AutoDeploy Backend]     -> Capture trace saved: {capture_trace}")
+        else:
+            with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
+                # compute output
+                out = self.model(*args, **kwargs)
+                # write out into output buffer up to out batch size
+                out_flat = tree_flatten_spec(out, self._out_spec)
+                for o_buffer, o in zip(self._out_buffer_flat, out_flat):
+                    o_buffer[: o.shape[0]] = o
+
         torch.cuda.synchronize()
+        actual_capture_time = time.time() - actual_capture_start
+        ad_logger.info(f"[AutoDeploy Backend]     -> Graph capture took {actual_capture_time:.4f}s")
+
         self._cuda_graph_mem_pool = self._cuda_graph_mem_pool or graph.pool()
+
+        total_time = time.time() - capture_start_time
+        ad_logger.info(
+            f"[AutoDeploy Backend]   -> Completed capture for batch_size={batch_size} "
+            f"in {total_time:.4f}s (warmup: {warmup_time:.4f}s, "
+            f"capture: {actual_capture_time:.4f}s)"
+        )
+
         return graph
 
     def capture_graph(self, *args, **kwargs):
@@ -131,8 +213,16 @@ class CapturedGraph(nn.Module):
         self._out_buffer_flat, self._out_spec = tree_flatten(out)
 
         # capture graph now for a range of batch sizes
+        import time
+
+        total_capture_start = time.time()
+        ad_logger.info(
+            f"[AutoDeploy Backend] Starting CUDA graph captures for "
+            f"{len(self.cuda_graph_batch_sizes)} batch sizes"
+        )
+
         for bs in self.cuda_graph_batch_sizes:
-            ad_logger.info(f"Capturing graph for batch size: {bs}")
+            ad_logger.info(f"[AutoDeploy Backend] Capturing graph for batch size: {bs}")
 
             # setup args, kwargs
             inputs_truncated = [in_buffer[:bs] for in_buffer in self._input_buffers]
@@ -141,6 +231,13 @@ class CapturedGraph(nn.Module):
             # capture graph for truncated inputs
             combined_shape = sum((input.shape for input in inputs_truncated), start=())
             self.cudagraphs[combined_shape] = self._capture_one_graph(*args, **kwargs)
+
+        total_capture_time = time.time() - total_capture_start
+        avg_time = total_capture_time / len(self.cuda_graph_batch_sizes)
+        ad_logger.info(
+            f"[AutoDeploy Backend] Completed all CUDA graph captures in "
+            f"{total_capture_time:.4f}s ({avg_time:.4f}s per batch size)"
+        )
 
     def forward(self, *args, **kwargs) -> Any:
         """Run the compiled graph."""
