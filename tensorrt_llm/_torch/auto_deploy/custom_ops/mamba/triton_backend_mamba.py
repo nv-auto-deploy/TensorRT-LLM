@@ -178,9 +178,6 @@ def _triton_cached_ssm(
                 ssm_state_cache[slot_idx[:num_prefill]],
                 0,
             )
-            chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
-                cu_seqlens, chunk_size
-            )
 
         else:
             chunk_indices = None
