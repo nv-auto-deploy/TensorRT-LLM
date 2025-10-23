@@ -24,7 +24,7 @@ moe_ext = load(
     name="moe_cuda_jit",
     sources=[
         os.path.join(THIS_DIR, "moe_binding.cpp"),
-        os.path.join(THIS_DIR, "moe_op.cu"),
+        os.path.join(THIS_DIR, "moe_op_grouped.cu"),
     ],
     extra_cflags=["-O3"],
     extra_cuda_cflags=[
