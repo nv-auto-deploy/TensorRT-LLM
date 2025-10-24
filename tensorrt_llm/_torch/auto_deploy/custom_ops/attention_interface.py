@@ -594,6 +594,8 @@ class SequenceInfo:
         input_pos: Optional[Union[Sequence[int], int]] = None,
         page_assignments: Optional[Sequence[Sequence[int]]] = None,
         slot_idx: Optional[Sequence[int]] = None,
+        dummy_page: Optional[int] = None,
+        dummy_slot: Optional[int] = None,
         **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
     ) -> None:
         """Create and store sequence information for the next forward pass.
@@ -604,6 +606,8 @@ class SequenceInfo:
             input_pos: Absolute starting position in the cache for each sequence.
             page_assignments: List of sequences of page assignments for each sequence.
             slot_idx: List of slot indices for each sequence.
+            dummy_page: Dummy page index to use for the cache locations for unused pages.
+            dummy_slot: Dummy slot index to use for the slot indices for unused slots.
             extra_args: Extra arguments to be stored in the interface.
 
         This i/f will ensure that all sequence info args are updated accordingly. Reset values are
@@ -630,14 +634,16 @@ class SequenceInfo:
             cache_loc, pages_per_seq = self._get_cache_locations_and_pages_per_sequence(
                 page_assignments
             )
-            free_cache_loc = self._get_unique_value(set(cache_loc), self.num_pages)
-            self._store_arg("cache_loc", cache_loc, reset_val=free_cache_loc)
+            if dummy_page is None:
+                dummy_page = self._get_unique_value(set(cache_loc), self.num_pages)
+            self._store_arg("cache_loc", cache_loc, reset_val=dummy_page)
             self._store_arg("pages_per_seq", pages_per_seq, reset_val=1)
 
         # check for updated slot_idx
         if slot_idx is not None:
-            free_slot_idx = self._get_unique_value(set(slot_idx), self.max_batch_size)
-            self._store_arg("slot_idx", slot_idx, reset_val=free_slot_idx)
+            if dummy_slot is None:
+                dummy_slot = self._get_unique_value(set(slot_idx), self.max_batch_size)
+            self._store_arg("slot_idx", slot_idx, reset_val=dummy_slot)
 
         ### UPDATE MAIN INPUTS #####################################################################
         # set new input_ids and make sure to flatten it

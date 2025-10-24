@@ -171,6 +171,11 @@ class ADEngine(ModelEngine):
             ResourceManagerType.KV_CACHE_MANAGER
         )
 
+        # seq slot manager
+        seq_slot_manager: SeqSlotManager = resource_manager.get_resource_manager(
+            ResourceManagerType.SEQ_SLOT_MANAGER
+        )
+
         # requests in order of context, generate
         context_requests = scheduled_requests.context_requests
         gen_requests = [r for r in scheduled_requests.generation_requests if not r.draft_tokens]
@@ -246,6 +251,8 @@ class ADEngine(ModelEngine):
             input_pos=input_pos,
             page_assignments=page_assignments,
             slot_idx=slot_idx,
+            dummy_page=None,  # TODO: get dummy_page from a dummy request
+            dummy_slot=next(iter(seq_slot_manager.slot_manager.free_slots), 0),
             **extra_args,
         )
         # scatter the new tokens into the input_ids tensor if provided
