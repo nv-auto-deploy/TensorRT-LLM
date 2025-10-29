@@ -11,7 +11,21 @@ from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_r
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
-def _insert_fused_moe_ops(gm: GraphModule) -> int:
+def _insert_fused_moe_ops(gm: GraphModule, backend: str = "auto") -> int:
+    """
+    Insert fused MoE ops into the graph, replacing torch_moe with backend-specific implementations.
+
+    Args:
+        gm: GraphModule to transform
+        backend: MoE backend to use - "auto" (default), "trtllm", "triton", or "flashinfer"
+            - "auto": Uses trtllm for gated_mlp, triton for mlp
+            - "trtllm": Uses TensorRT-LLM's fused MoE (gated_mlp only)
+            - "triton": Uses Triton's fused MoE
+            - "flashinfer": Uses FlashInfer's CUTLASS fused MoE
+
+    Returns:
+        Number of fused MoE ops inserted
+    """
     fused_key_counter = 0
     graph = gm.graph
 
@@ -32,25 +46,63 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
                 "w3_weight",
             )
         )
+
+        # Determine which backend to use
+        if backend == "auto":
+            if mlp_style_val == "gated_mlp":
+                selected_backend = "trtllm"
+            else:  # mlp
+                selected_backend = "triton"
+        else:
+            selected_backend = backend
+
         if mlp_style_val == "gated_mlp":
-            fused_w_up_experts = torch.stack(
-                [
-                    torch.cat(
-                        [gm.get_parameter(w3_node.target), gm.get_parameter(w1_node.target)], dim=-2
-                    )
-                    for w1_node, w3_node in zip(w1_list, w3_list)
-                ],
-                dim=0,
-            )
-            new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
-            # TRTLLM fused MoE op supports gated MLP only.
-            replacement_op = torch.ops.auto_deploy.trtllm_moe_fused
+            if selected_backend == "flashinfer":
+                # FlashInfer expects [w3, w1] concatenated (matching their test pattern)
+                fused_w_up_experts = torch.stack(
+                    [
+                        torch.cat(
+                            [gm.get_parameter(w3_node.target), gm.get_parameter(w1_node.target)],
+                            dim=-2,
+                        )
+                        for w1_node, w3_node in zip(w1_list, w3_list)
+                    ],
+                    dim=0,
+                )
+                new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
+                replacement_op = torch.ops.auto_deploy.flashinfer_moe_fused
+            else:
+                # TRTLLM and Triton expect [w3, w1] concatenated
+                fused_w_up_experts = torch.stack(
+                    [
+                        torch.cat(
+                            [gm.get_parameter(w3_node.target), gm.get_parameter(w1_node.target)],
+                            dim=-2,
+                        )
+                        for w1_node, w3_node in zip(w1_list, w3_list)
+                    ],
+                    dim=0,
+                )
+                new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
+                if selected_backend == "trtllm":
+                    replacement_op = torch.ops.auto_deploy.trtllm_moe_fused
+                elif selected_backend == "triton":
+                    replacement_op = torch.ops.auto_deploy.triton_moe_fused
+                else:
+                    raise ValueError(f"Backend '{selected_backend}' does not support gated_mlp")
 
         elif mlp_style_val == "mlp":
             fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
             new_key_w_up = f"fused_moe_w1_stacked_{fused_key_counter}"
-            # Triton fused MoE op supports mlp only.
-            replacement_op = torch.ops.auto_deploy.triton_moe_fused
+            # Select replacement op based on backend
+            if selected_backend == "triton":
+                replacement_op = torch.ops.auto_deploy.triton_moe_fused
+            elif selected_backend == "flashinfer":
+                replacement_op = torch.ops.auto_deploy.flashinfer_moe_fused
+            elif selected_backend == "trtllm":
+                raise ValueError("TRTLLM backend does not support mlp style, only gated_mlp")
+            else:
+                raise ValueError(f"Unknown backend: {selected_backend}")
 
         else:
             raise ValueError(f"Unknown mlp_style: {mlp_style_val}")
@@ -740,8 +792,20 @@ def _stack_fp8_moe_weights(gm: GraphModule) -> int:
 class FuseMoe(BaseTransform):
     """
     Scan the FX graph and replace all calls to torch.ops.auto_deploy.torch_moe with
-    torch.ops.auto_deploy.trtllm_moe_fused.
+    backend-specific fused MoE implementations.
+
+    Supports backends: "auto" (default), "trtllm", "triton", or "flashinfer".
     """
+
+    def __init__(self, backend: str = "auto"):
+        """
+        Initialize FuseMoe transform.
+
+        Args:
+            backend: MoE backend to use - "auto", "trtllm", "triton", or "flashinfer"
+        """
+        super().__init__()
+        self.backend = backend
 
     def _apply(
         self,
@@ -751,7 +815,7 @@ class FuseMoe(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         with cuda_memory_tracker():
-            fused_key_counter = _insert_fused_moe_ops(gm)
+            fused_key_counter = _insert_fused_moe_ops(gm, backend=self.backend)
 
         info = TransformInfo(
             skipped=False, num_matches=fused_key_counter, is_clean=False, has_valid_shapes=False
