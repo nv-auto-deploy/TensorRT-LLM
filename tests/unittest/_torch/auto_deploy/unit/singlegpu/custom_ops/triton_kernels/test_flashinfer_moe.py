@@ -6,7 +6,6 @@ is imported to avoid tvm_ffi conflicts! Therefore, we delay TensorRT-LLM import
 until inside the test function.
 """
 
-import pytest
 import torch
 
 # Import FlashInfer FIRST (but don't import TensorRT-LLM yet!)
@@ -18,18 +17,16 @@ try:
 except ImportError:
     FLASHINFER_AVAILABLE = False
 
+import ctypes
+import os
+
+ctypes.CDLL(
+    os.environ.get("FLASHINFER_MOE_SO_PATH"),
+    mode=ctypes.RTLD_GLOBAL,
+)
+
 
 def test_flashinfer_moe_matches_torch_moe_gated_mlp():
-    """Test flashinfer_moe_fused against torch_moe reference for gated MLP with Swiglu (FP16)."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for flashinfer_moe test")
-    if not FLASHINFER_AVAILABLE:
-        pytest.skip("FlashInfer is not available")
-
-    print("\n" + "=" * 70)
-    print("Testing FlashInfer MoE Integration")
-    print("=" * 70)
-
     device = "cuda"
     dtype = torch.float16
 
@@ -85,26 +82,6 @@ def test_flashinfer_moe_matches_torch_moe_gated_mlp():
     print(f"  w2_stacked: {w2_stacked.shape}")
     print(f"  selected_experts: {selected_experts.shape}")
     print(f"  routing_weights: {routing_weights.shape}")
-
-    # First call FlashInfer DIRECTLY to initialize it (before custom op)
-    # This is required to avoid tvm_ffi conflicts - FlashInfer must initialize first!
-    print("\n[0/3] Initializing FlashInfer with direct call...")
-    selected_experts_int32 = selected_experts.to(torch.int32).contiguous()
-    output_direct = torch.empty_like(x)
-    result_direct = cutlass_fused_moe(
-        input=x.contiguous(),
-        token_selected_experts=selected_experts_int32,
-        token_final_scales=routing_weights.contiguous(),
-        fc1_expert_weights=w3_w1_stacked.contiguous(),
-        fc2_expert_weights=w2_stacked.contiguous(),
-        output_dtype=x.dtype,
-        quant_scales=None,
-        output=output_direct,
-        activation_type=ActivationType.Swiglu,
-    )
-    if isinstance(result_direct, list):
-        output_direct = result_direct[0]
-    print("      ✓ Direct FlashInfer initialization complete!")
 
     # NOW safe to import TensorRT-LLM (AFTER FlashInfer is initialized)
     print("\nImporting TensorRT-LLM custom ops...")
