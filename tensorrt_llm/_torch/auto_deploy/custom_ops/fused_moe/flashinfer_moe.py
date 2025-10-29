@@ -63,17 +63,17 @@ def flashinfer_fused_moe(
     act_fn = act_fn.lower()
 
     if mlp_style == "gated_mlp":
-        # For Swiglu/gated MLP (FlashInfer uses Swiglu, not Silu)
+        # Gated MLP uses Silu: silu(x @ w1.T) * (x @ w3.T)
         if act_fn == "silu":
-            activation_type = ActivationType.Swiglu
+            activation_type = ActivationType.Silu
         else:
             raise ValueError(f"Unsupported activation '{act_fn}' for gated_mlp. Use 'silu'.")
     elif mlp_style == "mlp":
         # For non-gated MLP with ReLU^2
-        if act_fn in ("relu", "relu2"):
+        if act_fn == "relu2":
             activation_type = ActivationType.Relu2
         else:
-            raise ValueError(f"Unsupported activation '{act_fn}' for mlp. Use 'relu' or 'relu2'.")
+            raise ValueError(f"Unsupported activation '{act_fn}' for mlp. Use 'relu2'.")
     else:
         raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
 
@@ -193,7 +193,7 @@ def flashinfer_quant_fp8_moe(
 
     # Determine activation type
     if act_fn.lower() == "silu":
-        activation_type = ActivationType.Swiglu
+        activation_type = ActivationType.Silu
     else:
         raise ValueError(f"Unsupported activation '{act_fn}' for FP8 gated_mlp. Use 'silu'.")
 
@@ -209,9 +209,6 @@ def flashinfer_quant_fp8_moe(
         fc1_expert_biases=None,
         fc2_expert_biases=None,
         input_sf=None,
-        swiglu_alpha=None,
-        swiglu_beta=None,
-        swiglu_limit=None,
         tp_size=1,
         tp_rank=0,
         ep_size=1,

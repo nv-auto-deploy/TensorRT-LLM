@@ -1,29 +1,51 @@
 """Main entrypoint to build, test, and prompt AutoDeploy inference models."""
 
-from typing import Any, Dict, Iterator, List, Optional, Union
+# CRITICAL: Control symbol visibility & import order to avoid tvm_ffi conflicts
+# Set RTLD_GLOBAL for ALL future dynamic library loads
+import ctypes  # noqa: E402
+import os  # noqa: E402
+import sys  # noqa: E402
 
-import torch
-import yaml
-from omegaconf import OmegaConf
-from pydantic import BaseModel, Field, field_validator, model_validator
-from pydantic_settings import (
-    BaseSettings,
-    CliApp,
-    CliImplicitFlag,
-    CliUnknownArgs,
-    SettingsConfigDict,
+# Ensure all future dlopens use RTLD_GLOBAL so FlashInfer and TRT-LLM share symbols
+if hasattr(sys, "setdlopenflags"):
+    sys.setdlopenflags(os.RTLD_GLOBAL | os.RTLD_NOW)
+
+# Import FlashInfer FIRST so its DSO is loaded globally before TRT-LLM
+from flashinfer.fused_moe import cutlass_fused_moe  # noqa: F401, E402
+from flashinfer.fused_moe.core import ActivationType  # noqa: F401, E402
+
+# Optionally hard-preload the FlashInfer MoE kernel SO if path is known
+_moe_so_path = os.environ.get("FLASHINFER_MOE_SO_PATH")
+if _moe_so_path and os.path.exists(_moe_so_path):
+    ctypes.CDLL(_moe_so_path, mode=ctypes.RTLD_GLOBAL)
+
+from typing import Any, Dict, Iterator, List, Optional, Union  # noqa: E402
+
+import torch  # noqa: E402
+import yaml  # noqa: E402
+from omegaconf import OmegaConf  # noqa: E402
+from pydantic import BaseModel, Field, field_validator, model_validator  # noqa: E402
+from pydantic_settings import (  # noqa: E402
+    BaseSettings,  # noqa: E402
+    CliApp,  # noqa: E402
+    CliImplicitFlag,  # noqa: E402
+    CliUnknownArgs,  # noqa: E402
+    SettingsConfigDict,  # noqa: E402
 )
 
-from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig, DemoLLM
-from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
-from tensorrt_llm._torch.auto_deploy.utils._config import (
-    DynamicYamlMixInForSettings,
-    deep_merge_dicts,
+from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig, DemoLLM  # noqa: E402
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs  # noqa: E402
+from tensorrt_llm._torch.auto_deploy.utils._config import (  # noqa: E402
+    DynamicYamlMixInForSettings,  # noqa: E402
+    deep_merge_dicts,  # noqa: E402
 )
-from tensorrt_llm._torch.auto_deploy.utils.benchmark import benchmark, store_benchmark_results
-from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
-from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm._torch.auto_deploy.utils.benchmark import (  # noqa: E402
+    benchmark,
+    store_benchmark_results,
+)
+from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger  # noqa: E402
+from tensorrt_llm.llmapi.llm import RequestOutput  # noqa: E402
+from tensorrt_llm.sampling_params import SamplingParams  # noqa: E402
 
 # Global torch config, set the torch compile cache to fix up to llama 405B
 torch._dynamo.config.cache_size_limit = 20
