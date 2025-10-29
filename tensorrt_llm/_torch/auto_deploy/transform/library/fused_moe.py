@@ -1,14 +1,21 @@
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Type
 
 import torch
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 
 def _insert_fused_moe_ops(gm: GraphModule, backend: str = "auto") -> int:
@@ -33,7 +40,7 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: str = "auto") -> int:
         if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
 
-        (mlp_style_val,) = extract_op_args(node, "mlp_style")
+        (mlp_style_val, act_fn_val) = extract_op_args(node, "mlp_style", "act_fn")
 
         hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = (
             extract_op_args(
@@ -127,6 +134,10 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: str = "auto") -> int:
                     graph.get_attr(new_key_w_up),
                     graph.get_attr(new_key_w_down),
                 ),
+                kwargs={
+                    "mlp_style": mlp_style_val,
+                    "act_fn": act_fn_val,
+                },
             )
 
         node.replace_all_uses_with(new_node)
@@ -788,6 +799,15 @@ def _stack_fp8_moe_weights(gm: GraphModule) -> int:
     return fused_key_counter
 
 
+class FuseMoeConfig(TransformConfig):
+    """Configuration for FP8 linear fusion transform."""
+
+    backend: str = Field(
+        default="auto",
+        description="Backend to use for MoE computation (default: 'auto').",
+    )
+
+
 @TransformRegistry.register("fuse_moe")
 class FuseMoe(BaseTransform):
     """
@@ -797,15 +817,11 @@ class FuseMoe(BaseTransform):
     Supports backends: "auto" (default), "trtllm", "triton", or "flashinfer".
     """
 
-    def __init__(self, backend: str = "auto"):
-        """
-        Initialize FuseMoe transform.
+    config: FuseMoeConfig
 
-        Args:
-            backend: MoE backend to use - "auto", "trtllm", "triton", or "flashinfer"
-        """
-        super().__init__()
-        self.backend = backend
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseMoeConfig
 
     def _apply(
         self,
@@ -815,7 +831,7 @@ class FuseMoe(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         with cuda_memory_tracker():
-            fused_key_counter = _insert_fused_moe_ops(gm, backend=self.backend)
+            fused_key_counter = _insert_fused_moe_ops(gm, backend=self.config.backend)
 
         info = TransformInfo(
             skipped=False, num_matches=fused_key_counter, is_clean=False, has_valid_shapes=False

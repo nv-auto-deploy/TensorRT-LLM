@@ -116,6 +116,7 @@ transforms:
   fuse_moe:
     stage: post_load_fusion
     enabled: true
+    backend: flashinfer
   fuse_fp8_moe:
     stage: post_load_fusion
     enabled: true
