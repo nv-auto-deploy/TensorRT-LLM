@@ -32,7 +32,7 @@
 #include <random>
 #include <utility>
 
-#include "tensorrt_llm/common/NvInferRuntime.h"
+#include <NvInferRuntime.h>
 
 namespace tensorrt_llm::kernels
 {

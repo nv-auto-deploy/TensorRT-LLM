@@ -48,7 +48,7 @@
 #endif
 
 #include "../include/moe_kernels.h"
-#include "moe_util_kernels.h"
+#include "../include/moe_util_kernels.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -1026,7 +1026,7 @@ __device__ auto quantizePackedFPXValue(ComputeElem& post_act_val, float global_s
     // expert
     auto sf_out = cvt_quant_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF, NumThreadsPerSF>(
         std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx, std::nullopt /* numRows */,
-        num_cols / VecSize, act_sf_expert, QuantizationSFLayout::SWIZZLED_128x4);
+        num_cols / VecSize, act_sf_expert, QuantizationSFLayout::SWIZZLED);
 
     // Do the conversion and set the output and scaling factor
     auto func = [&]()
@@ -1068,7 +1068,7 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id, int
     // expert
     auto sf_out = cvt_quant_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF, NumThreadsPerSF>(
         std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx, std::nullopt /* numRows */,
-        num_cols / VecSize, act_sf_expert, QuantizationSFLayout::SWIZZLED_128x4);
+        num_cols / VecSize, act_sf_expert, QuantizationSFLayout::SWIZZLED);
     if (sf_out)
     {
         if (input_sf)
@@ -1077,7 +1077,7 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id, int
                 = cvt_quant_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF, NumThreadsPerSF>(
                     std::nullopt /* batchIdx */, source_token_id, elem_idx, std::nullopt /* numRows */,
                     num_cols / VecSize, const_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(input_sf),
-                    QuantizationSFLayout::SWIZZLED_128x4);
+                    QuantizationSFLayout::SWIZZLED);
             *sf_out = *sf_in;
         }
         else
