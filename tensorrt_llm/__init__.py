@@ -13,6 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# CRITICAL: Control symbol visibility & import order to avoid tvm_ffi conflicts
+# Set RTLD_GLOBAL for ALL future dynamic library loads
+import ctypes
+import os
+import sys
+
+if hasattr(sys, "setdlopenflags"):
+    sys.setdlopenflags(os.RTLD_LOCAL | os.RTLD_NOW)
+
+# Import FlashInfer FIRST so its DSO is loaded globally before TRT-LLM
+try:
+    from flashinfer.fused_moe import cutlass_fused_moe  # noqa: F401
+    from flashinfer.fused_moe.core import ActivationType  # noqa: F401
+except ImportError:
+    # FlashInfer might not be installed, continue without it
+    pass
+
+# Optionally hard-preload the FlashInfer MoE kernel SO if path is known
+_moe_so_path = os.environ.get("FLASHINFER_MOE_SO_PATH")
+if _moe_so_path and os.path.exists(_moe_so_path):
+    ctypes.CDLL(_moe_so_path, mode=ctypes.RTLD_LOCAL)
+
 
 def _add_trt_llm_dll_directory():
     import platform
