@@ -1,7 +1,35 @@
 """Tests for basic graph sharding."""
 
+import os
+import sys
 from functools import partial
 from typing import Type
+
+# Add paths for relative imports when running as standalone script
+if __name__ == "__main__":
+    # Add parent directories to sys.path for imports
+    # Directory structure: tests/unittest/_torch/auto_deploy/unit/multigpu/transformations/library/
+    # Helper modules are in: tests/unittest/_torch/auto_deploy/_utils_test/
+    # Utils modules are in: tests/utils/
+    current_dir = os.path.dirname(os.path.abspath(__file__))  # library
+    transformations_dir = os.path.dirname(current_dir)  # transformations
+    multigpu_dir = os.path.dirname(transformations_dir)  # multigpu
+    unit_dir = os.path.dirname(multigpu_dir)  # unit
+    auto_deploy_dir = os.path.dirname(unit_dir)  # auto_deploy
+    _torch_dir = os.path.dirname(auto_deploy_dir)  # _torch
+    unittest_dir = os.path.dirname(_torch_dir)  # unittest
+    tests_dir = os.path.dirname(unittest_dir)  # tests (root test directory)
+
+    utils_dir = os.path.join(auto_deploy_dir, "_utils_test")  # _utils_test
+
+    # Add all necessary paths
+    sys.path.insert(0, tests_dir)  # For utils.llm_data imports
+    sys.path.insert(0, utils_dir)  # For _model_test_utils, etc.
+    sys.path.insert(0, current_dir)  # For local imports
+    sys.path.append(tests_dir)
+    sys.path.append(utils_dir)
+    sys.path.append(unittest_dir)
+    sys.path.append(tests_dir)
 
 import pytest
 import torch
@@ -411,5 +439,331 @@ def test_sharding_pattern_detection(
     _run_pattern_detection_job(model_cls, bias, 0, world_size, from_config)
 
 
+def _run_numerical_correctness_job(
+    model_cls: nn.Module,
+    bias: bool,
+    from_config: bool,
+    rank: int,
+    world_size: int,
+    fixed_weight_init: bool = True,
+) -> None:
+    """Test numerical correctness by comparing sharded vs non-sharded model outputs.
+
+    Args:
+        fixed_weight_init: If True, uses deterministic weight initialization for debugging.
+                          If False, uses random initialization (same weights for both models).
+
+    Fixed mode (easier debugging):
+    - Each shard i of a weight tensor is initialized with constant value i
+    - Input is initialized to all ones
+    - Expected output: each position should have value = sum of shard indices * num_features
+
+    Random mode (realistic testing):
+    - Weights and biases initialized randomly (torch.randn) with fixed seed=42
+    - Same weights used for both sharded and non-sharded models (same seed on all ranks)
+    - Input initialized randomly with fixed seed=123
+    """
+    # init model and input
+    batch_size = 4
+    sequence_len = 8
+    num_features = 32
+
+    # GQA specific parameters
+    num_heads = 4
+    num_key_value_heads = 1
+
+    # Create model
+    if model_cls == GQA_Block:
+        model = model_cls(
+            num_attention_heads=num_heads,
+            hidden_size=num_features,
+            num_key_value_heads=num_key_value_heads,
+        ).to(device="cuda", dtype=torch.float16)
+    elif model_cls == FP8MLP:
+        model = model_cls(num_features, num_features, bias=bias).to("cuda")
+    else:
+        model = model_cls(num_features, num_features, bias=bias).to(
+            device="cuda", dtype=torch.float16
+        )
+
+    # Initialize weights
+    if fixed_weight_init:
+        # Deterministic initialization for easier debugging
+        # For each weight tensor of shape [M, N], set shard i to value i
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if "weight" in name and param.dim() >= 2:
+                    M = param.shape[0]
+                    local_M = M // world_size
+                    # Initialize each shard with its rank value
+                    for i in range(world_size):
+                        start_idx = i * local_M
+                        end_idx = (i + 1) * local_M if i < world_size - 1 else M
+                        param[start_idx:end_idx] = float(i)
+                elif "bias" in name:
+                    # Set bias to zero for simplicity
+                    param.zero_()
+    else:
+        # Random initialization with fixed seed for reproducibility
+        # All ranks use the same seed to ensure identical weights
+        torch.manual_seed(42)
+        with torch.no_grad():
+            for param in model.parameters():
+                # For FP8, initialize in float16 then convert
+                # Need to use param.data.copy_() to modify the tensor in-place
+                orig_dtype = param.dtype
+                if orig_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                    # Create temporary float16 tensor with same shape
+                    temp = torch.randn_like(param, dtype=torch.float16)
+                    # Copy initialized values back to parameter
+                    param.data.copy_(temp.to(orig_dtype))
+                else:
+                    # For regular dtypes, create random tensor and copy
+                    param.data.copy_(torch.randn_like(param))
+
+    # Create input
+    if fixed_weight_init:
+        # All ones for predictable output
+        x = torch.ones(batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16)
+    else:
+        # Random input with fixed seed
+        torch.manual_seed(123)
+        x = torch.randn(batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16)
+
+    # Compute reference output from non-sharded model (on rank 0)
+    with torch.no_grad():
+        if rank == 0:
+            y_ref = model(x).clone()
+        else:
+            # Create dummy tensor with correct shape on other ranks
+            y_ref = torch.zeros(
+                batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16
+            )
+
+    # Broadcast reference output to all ranks
+    torch.distributed.broadcast(y_ref, src=0)
+
+    # Create and run sharded model
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "use_sharding_from_factory": from_config,
+            },
+            "sharding_transform_executor": {
+                "stage": "sharding",
+            },
+        },
+    )(None, gm)
+
+    with torch.no_grad():
+        y_shard = gm_transformed(x)
+
+    # Determine tolerance based on model precision
+    if model_cls == FP8MLP:
+        # FP8 has lower precision, needs larger tolerance
+        atol = 1e-1
+        rtol = 1e-1
+    else:
+        # FP16 models
+        atol = 1e-3
+        rtol = 1e-3
+
+    # Debug output
+    if rank == 0:
+        print(f"\n{'=' * 60}")
+        print(f"Numerical Correctness Test: {model_cls.__name__}")
+        print(f"{'=' * 60}")
+        print("Configuration:")
+        print(f"  world_size: {world_size}")
+        print(f"  bias: {bias}")
+        print(f"  from_config: {from_config}")
+        print(f"  fixed_weight_init: {fixed_weight_init}")
+
+        if fixed_weight_init:
+            print("\nWeight initialization (fixed/deterministic for debugging):")
+            print("  - Each shard i initialized with constant value i")
+            print("  - Input: all ones")
+            print("\nExpected behavior for single Linear layer:")
+            print(
+                f"  - For world_size=2, output should be: (0 + 1) * num_features / 2 = {num_features // 2}"
+            )
+            print("  - For world_size=N, output should be: sum(0..N-1) * num_features / N")
+        else:
+            print("\nWeight initialization (random for realistic testing):")
+            print("  - Random weights/biases (torch.randn) with seed=42 (same for all ranks)")
+            print("  - Random input with seed=123")
+            print("  - Applies to both 2D weight matrices and 1D bias vectors")
+
+        print("\nActual output samples (first element of each):")
+        print(f"  y_ref[0,0,0] = {y_ref[0, 0, 0].item():.4f}")
+        print(f"  y_shard[0,0,0] = {y_shard[0, 0, 0].item():.4f}")
+        print("\nOutput statistics:")
+        print(
+            f"  y_ref  - min: {y_ref.min().item():.4f}, max: {y_ref.max().item():.4f}, mean: {y_ref.mean().item():.4f}"
+        )
+        print(
+            f"  y_shard - min: {y_shard.min().item():.4f}, max: {y_shard.max().item():.4f}, "
+            f"mean: {y_shard.mean().item():.4f}"
+        )
+
+    # Compare outputs
+    try:
+        torch.testing.assert_close(y_shard.to(dtype=y_ref.dtype), y_ref, atol=atol, rtol=rtol)
+        if rank == 0:
+            print("\n✓ Numerical correctness test PASSED")
+            print(f"  Max absolute difference: {(y_shard - y_ref).abs().max().item():.6f}")
+            print(f"  Mean absolute difference: {(y_shard - y_ref).abs().mean().item():.6f}")
+            print(f"{'=' * 60}\n")
+    except AssertionError as e:
+        if rank == 0:
+            print("\n✗ Numerical correctness test FAILED")
+            print(f"  Max absolute difference: {(y_shard - y_ref).abs().max().item():.6f}")
+            print(f"  Mean absolute difference: {(y_shard - y_ref).abs().mean().item():.6f}")
+            print(f"  Tolerance: atol={atol}, rtol={rtol}")
+            print("\nDifference map (first few elements):")
+            diff = (y_shard - y_ref).abs()
+            print(f"  Diff[0,0,:5] = {diff[0, 0, :5]}")
+            print(f"{'=' * 60}\n")
+        raise e
+
+
+@pytest.mark.parametrize("device_count", get_device_counts())
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("from_config", [False, True])
+@pytest.mark.parametrize("fixed_weight_init", [True, False])
+@pytest.mark.parametrize(
+    "model_cls",
+    (
+        (MLP, "torch_dist_all_reduce"),
+        (FP8MLP),
+        (nn.Linear),
+        (GQA_Block),
+    ),
+)
+def test_sharding_numerical_correctness(
+    model_cls: Type[nn.Module],
+    bias: bool,
+    device_count: int,
+    from_config: bool,
+    fixed_weight_init: bool,
+):
+    """Test that sharded model produces numerically correct outputs compared to non-sharded model.
+
+    This test validates that tensor parallel sharding preserves numerical accuracy by:
+    1. Computing reference output from non-sharded model on rank 0
+    2. Computing output from sharded model distributed across ranks
+    3. Comparing outputs with precision-appropriate tolerances
+
+    Tolerances are adjusted based on model precision:
+    - FP8 models: atol=1e-1, rtol=1e-1 (lower precision)
+    - FP16 models: atol=1e-3, rtol=1e-3 (standard precision)
+
+    Weight initialization modes:
+    - fixed_weight_init=True: Deterministic initialization for debugging
+    - fixed_weight_init=False: Random initialization for realistic testing
+    """
+    dist_common.spawn_multiprocess_job(
+        job=partial(
+            _run_numerical_correctness_job,
+            model_cls,
+            bias,
+            from_config,
+            fixed_weight_init=fixed_weight_init,
+        ),
+        size=device_count,
+    )
+
+
 if __name__ == "__main__":
-    _run_pattern_detection_job(nn.Linear, False, 0, 8, False)
+    """Run the numerical correctness test as a standalone script with torchrun.
+    """
+    import argparse
+
+    import torch.distributed as dist
+
+    parser = argparse.ArgumentParser(description="Run TP sharding numerical correctness test")
+    parser.add_argument(
+        "--bias",
+        type=str,
+        required=True,
+        choices=["True", "False"],
+        help="Whether to use bias in linear layers",
+    )
+    parser.add_argument(
+        "--from_config",
+        type=str,
+        required=True,
+        choices=["True", "False"],
+        help="Whether to use config-based sharding detection",
+    )
+    parser.add_argument(
+        "--model_cls",
+        type=str,
+        required=True,
+        choices=["MLP", "FP8MLP", "Linear", "GQA_Block"],
+        help="Model class to test",
+    )
+    parser.add_argument(
+        "--fixed_weight_init",
+        type=str,
+        required=True,
+        choices=["True", "False"],
+        help="Use fixed/deterministic weight init (True) or random init (False)",
+    )
+
+    args = parser.parse_args()
+
+    # Convert string boolean arguments to actual booleans
+    bias = args.bias == "True"
+    from_config = args.from_config == "True"
+    fixed_weight_init = args.fixed_weight_init == "True"
+
+    # Map model class string to actual class
+    model_cls_map = {
+        "MLP": MLP,
+        "FP8MLP": FP8MLP,
+        "Linear": nn.Linear,
+        "GQA_Block": GQA_Block,
+    }
+    model_cls = model_cls_map[args.model_cls]
+
+    # Initialize distributed environment
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+    # Get rank and world_size from torch.distributed
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    # Set CUDA device
+    torch.cuda.set_device(rank)
+
+    if rank == 0:
+        print("Running numerical correctness test with:")
+        print(f"  model_cls: {args.model_cls}")
+        print(f"  bias: {bias}")
+        print(f"  from_config: {from_config}")
+        print(f"  fixed_weight_init: {fixed_weight_init}")
+        print(f"  world_size: {world_size}")
+
+    # Run the numerical correctness job
+    try:
+        _run_numerical_correctness_job(
+            model_cls=model_cls,
+            bias=bias,
+            from_config=from_config,
+            rank=rank,
+            world_size=world_size,
+            fixed_weight_init=fixed_weight_init,
+        )
+        if rank == 0:
+            print("\n✓ Test completed successfully!")
+    except Exception as e:
+        if rank == 0:
+            print(f"\n✗ Test failed with error: {e}")
+        raise
+    finally:
+        dist.destroy_process_group()

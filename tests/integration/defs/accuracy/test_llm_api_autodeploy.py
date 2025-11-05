@@ -184,12 +184,14 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
                               use_beam_search=beam_width > 1)
 
     @pytest.mark.skip_less_device_memory(32000)
-    def test_auto_dtype(self):
-        pytest.skip("Nemotron-MOE is not in CI yet")
+    @pytest.mark.parametrize("world_size", [2])
+    def test_auto_dtype(self, world_size):
+        # pytest.skip("Nemotron-MOE is not in CI yet")
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
+                           world_size=world_size,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
