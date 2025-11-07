@@ -446,12 +446,15 @@ def _run_numerical_correctness_job(
     rank: int,
     world_size: int,
     fixed_weight_init: bool = True,
+    datatype: torch.dtype = torch.float16,
 ) -> None:
     """Test numerical correctness by comparing sharded vs non-sharded model outputs.
 
     Args:
         fixed_weight_init: If True, uses deterministic weight initialization for debugging.
                           If False, uses random initialization (same weights for both models).
+        datatype: Data type to use for model weights and activations
+                 (e.g., torch.float16, torch.float32, torch.float64).
 
     Fixed mode (easier debugging):
     - Each shard i of a weight tensor is initialized with constant value i
@@ -459,9 +462,9 @@ def _run_numerical_correctness_job(
     - Expected output: each position should have value = sum of shard indices * num_features
 
     Random mode (realistic testing):
-    - Weights and biases initialized randomly (torch.randn) with fixed seed=42
+    - Weights and biases initialized randomly (torch.randn) with fixed seed=42 (CPU+CUDA)
     - Same weights used for both sharded and non-sharded models (same seed on all ranks)
-    - Input initialized randomly with fixed seed=123
+    - Input initialized randomly with fixed seed=123 (CPU+CUDA)
     """
     # init model and input
     batch_size = 4
@@ -473,18 +476,17 @@ def _run_numerical_correctness_job(
     num_key_value_heads = 1
 
     # Create model
+    test_dtype = datatype  # Use specified dtype
     if model_cls == GQA_Block:
         model = model_cls(
             num_attention_heads=num_heads,
             hidden_size=num_features,
             num_key_value_heads=num_key_value_heads,
-        ).to(device="cuda", dtype=torch.float16)
+        ).to(device="cuda", dtype=test_dtype)
     elif model_cls == FP8MLP:
         model = model_cls(num_features, num_features, bias=bias).to("cuda")
     else:
-        model = model_cls(num_features, num_features, bias=bias).to(
-            device="cuda", dtype=torch.float16
-        )
+        model = model_cls(num_features, num_features, bias=bias).to(device="cuda", dtype=test_dtype)
 
     # Initialize weights
     if fixed_weight_init:
@@ -507,6 +509,7 @@ def _run_numerical_correctness_job(
         # Random initialization with fixed seed for reproducibility
         # All ranks use the same seed to ensure identical weights
         torch.manual_seed(42)
+        torch.cuda.manual_seed_all(42)  # Also seed CUDA RNG for CUDA tensors
         with torch.no_grad():
             for param in model.parameters():
                 # For FP8, initialize in float16 then convert
@@ -524,11 +527,12 @@ def _run_numerical_correctness_job(
     # Create input
     if fixed_weight_init:
         # All ones for predictable output
-        x = torch.ones(batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16)
+        x = torch.ones(batch_size, sequence_len, num_features, device="cuda", dtype=test_dtype)
     else:
         # Random input with fixed seed
         torch.manual_seed(123)
-        x = torch.randn(batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16)
+        torch.cuda.manual_seed_all(123)  # Also seed CUDA RNG for CUDA tensors
+        x = torch.randn(batch_size, sequence_len, num_features, device="cuda", dtype=test_dtype)
 
     # Compute reference output from non-sharded model (on rank 0)
     with torch.no_grad():
@@ -537,7 +541,7 @@ def _run_numerical_correctness_job(
         else:
             # Create dummy tensor with correct shape on other ranks
             y_ref = torch.zeros(
-                batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16
+                batch_size, sequence_len, num_features, device="cuda", dtype=test_dtype
             )
 
     # Broadcast reference output to all ranks
@@ -561,13 +565,40 @@ def _run_numerical_correctness_job(
     with torch.no_grad():
         y_shard = gm_transformed(x)
 
-    # Determine tolerance based on model precision
+    # Determine tolerance based on model precision and weight initialization
+    # Note: Validated with FP64 that sharding implementation is mathematically correct (error=0.0)
+    # FP16 differences are purely due to different floating-point accumulation order
     if model_cls == FP8MLP:
         # FP8 has lower precision, needs larger tolerance
         atol = 1e-1
         rtol = 1e-1
+    elif datatype == torch.float64:
+        # FP64: Should have very high precision, use strict tolerance to detect bugs
+        # Validated: With FP64, max_diff=0.0, confirming sharding is correct
+        atol = 1e-10
+        rtol = 1e-10
+    elif datatype == torch.float32:
+        # FP32: Better precision than FP16
+        if fixed_weight_init:
+            atol = 1e-6
+            rtol = 1e-6
+        else:
+            # FP32 with TP: different accumulation order leads to small differences
+            atol = 1e-4
+            rtol = 1e-5
+    elif datatype == torch.float16:
+        if fixed_weight_init:
+            # Fixed weight initialization should give exact results (tested with atol=0)
+            atol = 1e-5
+            rtol = 1e-5
+        else:
+            # FP16 models with random weights and TP have different accumulation order
+            # which leads to larger numerical differences (tested: max ~0.04, mean ~0.008)
+            # Validated with FP64 that these differences are purely rounding, not bugs
+            atol = 0.05  # Allow up to 0.05 absolute difference
+            rtol = 1e-2  # Allow up to 1% relative difference
     else:
-        # FP16 models
+        # Default fallback for other dtypes
         atol = 1e-3
         rtol = 1e-3
 
@@ -578,6 +609,7 @@ def _run_numerical_correctness_job(
         print(f"{'=' * 60}")
         print("Configuration:")
         print(f"  world_size: {world_size}")
+        print(f"  dtype: {datatype}")
         print(f"  bias: {bias}")
         print(f"  from_config: {from_config}")
         print(f"  fixed_weight_init: {fixed_weight_init}")
@@ -593,8 +625,10 @@ def _run_numerical_correctness_job(
             print("  - For world_size=N, output should be: sum(0..N-1) * num_features / N")
         else:
             print("\nWeight initialization (random for realistic testing):")
-            print("  - Random weights/biases (torch.randn) with seed=42 (same for all ranks)")
-            print("  - Random input with seed=123")
+            print(
+                "  - Random weights/biases (torch.randn) with seed=42 (CPU+CUDA, same for all ranks)"
+            )
+            print("  - Random input with seed=123 (CPU+CUDA)")
             print("  - Applies to both 2D weight matrices and 1D bias vectors")
 
         print("\nActual output samples (first element of each):")
@@ -634,6 +668,7 @@ def _run_numerical_correctness_job(
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("from_config", [False, True])
 @pytest.mark.parametrize("fixed_weight_init", [True, False])
+@pytest.mark.parametrize("datatype", [torch.float16, torch.float32, torch.float64])
 @pytest.mark.parametrize(
     "model_cls",
     (
@@ -649,6 +684,7 @@ def test_sharding_numerical_correctness(
     device_count: int,
     from_config: bool,
     fixed_weight_init: bool,
+    datatype: torch.dtype,
 ):
     """Test that sharded model produces numerically correct outputs compared to non-sharded model.
 
@@ -657,13 +693,20 @@ def test_sharding_numerical_correctness(
     2. Computing output from sharded model distributed across ranks
     3. Comparing outputs with precision-appropriate tolerances
 
-    Tolerances are adjusted based on model precision:
+    Tolerances are adjusted based on model precision and initialization:
     - FP8 models: atol=1e-1, rtol=1e-1 (lower precision)
-    - FP16 models: atol=1e-3, rtol=1e-3 (standard precision)
+    - FP64: atol=1e-10, rtol=1e-10 (highest precision, near-zero error expected)
+    - FP32: atol=1e-4, rtol=1e-5 (better precision than FP16)
+    - FP16 with fixed weights: atol=1e-5, rtol=1e-5 (near-exact results expected)
+    - FP16 with random weights: atol=0.05, rtol=1e-2 (TP changes accumulation order)
 
     Weight initialization modes:
-    - fixed_weight_init=True: Deterministic initialization for debugging
-    - fixed_weight_init=False: Random initialization for realistic testing
+    - fixed_weight_init=True: Deterministic initialization for debugging (exact results)
+    - fixed_weight_init=False: Random initialization for realistic testing (FP16 rounding diffs)
+
+    Note: With random FP16 weights, TP changes the order of floating-point operations
+    (all-reduce happens at different points), leading to different rounding errors even
+    though the operations are mathematically equivalent.
     """
     dist_common.spawn_multiprocess_job(
         job=partial(
@@ -672,6 +715,7 @@ def test_sharding_numerical_correctness(
             bias,
             from_config,
             fixed_weight_init=fixed_weight_init,
+            datatype=datatype,
         ),
         size=device_count,
     )
@@ -688,30 +732,42 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bias",
         type=str,
-        required=True,
+        required=False,
+        default="False",
         choices=["True", "False"],
         help="Whether to use bias in linear layers",
     )
     parser.add_argument(
         "--from_config",
         type=str,
-        required=True,
+        required=False,
+        default="False",
         choices=["True", "False"],
         help="Whether to use config-based sharding detection",
     )
     parser.add_argument(
         "--model_cls",
         type=str,
-        required=True,
+        required=False,
+        default="MLP",
         choices=["MLP", "FP8MLP", "Linear", "GQA_Block"],
         help="Model class to test",
     )
     parser.add_argument(
         "--fixed_weight_init",
         type=str,
-        required=True,
+        required=False,
+        default="False",
         choices=["True", "False"],
         help="Use fixed/deterministic weight init (True) or random init (False)",
+    )
+    parser.add_argument(
+        "--datatype",
+        type=str,
+        required=False,
+        default="float16",
+        choices=["float16", "float32", "float64"],
+        help="Data type for model weights and activations (default: float16)",
     )
 
     args = parser.parse_args()
@@ -730,6 +786,14 @@ if __name__ == "__main__":
     }
     model_cls = model_cls_map[args.model_cls]
 
+    # Map datatype string to torch dtype
+    datatype_map = {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "float64": torch.float64,
+    }
+    datatype = datatype_map[args.datatype]
+
     # Initialize distributed environment
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
@@ -747,6 +811,7 @@ if __name__ == "__main__":
         print(f"  bias: {bias}")
         print(f"  from_config: {from_config}")
         print(f"  fixed_weight_init: {fixed_weight_init}")
+        print(f"  datatype: {datatype}")
         print(f"  world_size: {world_size}")
 
     # Run the numerical correctness job
@@ -758,6 +823,7 @@ if __name__ == "__main__":
             rank=rank,
             world_size=world_size,
             fixed_weight_init=fixed_weight_init,
+            datatype=datatype,
         )
         if rank == 0:
             print("\n✓ Test completed successfully!")

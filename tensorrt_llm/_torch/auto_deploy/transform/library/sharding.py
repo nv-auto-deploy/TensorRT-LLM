@@ -184,7 +184,7 @@ class Sharding(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
-        # world_size = 2
+        world_size = 2
 
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")

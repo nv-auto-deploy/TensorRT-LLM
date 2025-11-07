@@ -76,7 +76,7 @@ transforms:
   # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
   detect_sharding:
     stage: sharding
-    simple_shard_only: false
+    simple_shard_only: true
     sharding_source: ['factory','heuristic']
     support_partial_config: true
     sharding_dims: ['ep', 'bmm']
