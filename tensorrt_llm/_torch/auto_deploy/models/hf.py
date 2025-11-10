@@ -128,7 +128,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
     def chunk_size(self) -> Optional[int]:
         """Returns the chunk size for this model."""
         model_config, _ = self._get_model_config()
-        return getattr(model_config, "vocab_size", None)
+        return getattr(model_config, "chunk_size", None)
 
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]
