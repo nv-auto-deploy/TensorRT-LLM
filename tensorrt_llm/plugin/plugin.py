@@ -585,9 +585,16 @@ class CustomAllReduceHelper:
             workspace_size = os.getenv("FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE",
                                        "1000000000")
             return int(workspace_size)
+        # Increased workspace size to handle larger batches
+        # Can be overridden with TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE env var
+        # Default: 67MB to support max_num_tokens=8192 * hidden=4096 * 2 bytes (bf16)
+        # Results in 3 * 67MB * tp_size per GPU lamport allocation
+        workspace_size = os.getenv("TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE")
+        if workspace_size:
+            return int(workspace_size)
         if tp_size <= 2:
-            return 16_000_000
-        return 8_000_000
+            return 67_108_864  # Exactly 64 MiB
+        return 67_108_864
 
     @staticmethod
     def max_workspace_size_lowprecision(tp_size: int) -> int:
@@ -696,21 +703,30 @@ class CustomAllReduceHelper:
         is_p2p_supported = can_access_peer(mapping)
         ipc_buffers_size = size * mapping.tp_size
         ipc_buffers = IpcMemory(mapping, ipc_buffers_size, is_p2p_supported)
-        ipc_barriers = IpcMemory(mapping, 256 * mapping.tp_size,
+        # kBarrierFlagCount (256) * tp_size * sizeof(int) per GPU
+        # The extra * mapping.tp_size is needed because each GPU needs space for
+        # kBarrierFlagCount * NRanks integers in the barrier flags array
+        ipc_barriers = IpcMemory(mapping,
+                                 256 * mapping.tp_size * mapping.tp_size * 4,
                                  is_p2p_supported)
-        lamport_buffers_size = size * mapping.tp_size
-        lamport_buffers = IpcMemory(mapping, 3 * lamport_buffers_size,
+        # For fusion allreduce: Each GPU needs 3 sub-buffers, each storing data for all ranks
+        # So each GPU needs 3 * size * tp_size bytes total
+        lamport_buffer_per_gpu = 3 * size * mapping.tp_size
+        lamport_buffers = IpcMemory(mapping, lamport_buffer_per_gpu,
                                     is_p2p_supported)
         if is_p2p_supported:
             lamport_initialize(
                 lamport_buffers.local_ptr,
-                3 * lamport_buffers_size,
+                lamport_buffer_per_gpu,
             )
-        flag_buffer = torch.tensor([0, 0, 0, lamport_buffers_size, 0],
+        # Create flag buffer: [counter, unused, flag, comm_size, clear_size]
+        # comm_size is the stride between sub-buffers (size of one sub-buffer across all ranks)
+        flag_buffer = torch.tensor([0, 0, 0, size * mapping.tp_size, 0],
                                    dtype=torch.int,
                                    device="cuda")
         buffers = [ipc_buffers, ipc_barriers, lamport_buffers, flag_buffer]
 
+        # Workspace layout for TP=4: [ipc(4), barriers(4), lamport(4), flag(1)] = 13 pointers
         return buffers, torch.tensor(
             ipc_buffers.serialize() + ipc_barriers.serialize() +
             lamport_buffers.serialize() + [flag_buffer.data_ptr()],
