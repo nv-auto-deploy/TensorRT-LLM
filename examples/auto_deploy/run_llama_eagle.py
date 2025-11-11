@@ -1,24 +1,32 @@
-"""Test models with Eagle3 speculative decoding using TRT-LLM engine directly.
+"""Test models with Eagle3 speculative decoding using TRT-LLM or AutoDeploy backend.
 
-This script tests models using the TRT-LLM engine with optional Eagle3 speculative decoding.
+This script tests models using either the TRT-LLM engine directly or the AutoDeploy backend,
+with optional Eagle3 speculative decoding.
 
 Usage:
-    # Use specific model with downloaded Eagle3 adapter (for Llama-3.1-8B)
+    # TRT-LLM backend (default) with downloaded Eagle3 adapter
     python run_trtllm_llama_eagle.py --model meta-llama/Llama-3.1-8B-Instruct \
         --speculative-model-dir /lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy\
             /autodeploy_data/hf_home\
             /hub/models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B/snapshots/ada412b672e293d682423de84a095447bf38a637
 
-    # Auto-download Eagle3 adapter (only supported for Llama-3.1-8B-Instruct)
+    # TRT-LLM backend with auto-download Eagle3 adapter (only for Llama-3.1-8B-Instruct)
     python run_trtllm_llama_eagle.py --model meta-llama/Llama-3.1-8B-Instruct --auto-download-eagle
 
-    # Disable speculative decoding (baseline mode)
-    python run_trtllm_llama_eagle.py --model meta-llama/Llama-3.1-8B-Instruct --no-eagle
+    # AutoDeploy backend with Eagle3 adapter
+    python run_trtllm_llama_eagle.py --backend autodeploy --model meta-llama/Llama-3.1-8B-Instruct \
+        --auto-download-eagle
+
+    # Disable speculative decoding (baseline mode) with either backend
+    python run_trtllm_llama_eagle.py --backend trtllm --model meta-llama/Llama-3.1-8B-Instruct --no-eagle
 """
 
 import argparse
 import os
 import sys
+
+from build_and_run_ad import ExperimentConfig
+from build_and_run_ad import main as ad_main
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import EagleDecodingConfig, KvCacheConfig
@@ -248,31 +256,166 @@ def test_llama_eagle_with_trtllm(
         raise
 
 
+def test_llama_eagle_with_autodeploy(
+    model: str, speculative_model_dir: str = None, enable_eagle: bool = True
+):
+    """Test model with AutoDeploy backend.
+
+    Args:
+        model: Model name or HuggingFace model ID or local path
+        speculative_model_dir: Path to Eagle3 speculative model (optional)
+        enable_eagle: Whether to enable Eagle3 speculative decoding
+    """
+    print(f"\n{'=' * 80}")
+    print("AutoDeploy Test Configuration")
+    print("=" * 80)
+    print(f"Base Model: {model}")
+    speculative_info = speculative_model_dir if speculative_model_dir else "None (baseline mode)"
+    print(f"Speculative Model: {speculative_info}")
+    print("Eagle3 One Model: False")
+    print("=" * 80 + "\n")
+
+    # Configure Eagle3 speculative decoding
+    eagle3_config = None
+    if enable_eagle and speculative_model_dir:
+        eagle3_config = EagleDecodingConfig(
+            max_draft_len=3, speculative_model_dir=speculative_model_dir, eagle3_one_model=False
+        )
+        print(f"[TRACE] Created EagleDecodingConfig: {eagle3_config}")
+        print(f"[TRACE] Speculative model dir: {speculative_model_dir}")
+    else:
+        print("[TRACE] Running without speculative decoding (baseline mode)")
+
+    # Test prompts
+    prompts = [
+        "What is the capital of France?",
+        "Explain what machine learning is in one sentence.",
+    ]
+
+    # Configure AutoDeploy LLM arguments
+    llm_args = {
+        "model": model,
+        "skip_loading_weights": False,  # We want to load weights
+        "speculative_config": eagle3_config,
+        "runtime": "trtllm",  # AutoDeploy runtime
+        "world_size": 1,
+    }
+
+    # Configure experiment with prompts
+    experiment_config = {
+        "args": llm_args,
+        "benchmark": {"enabled": False},  # Disable benchmarking
+        "prompt": {
+            "batch_size": 1,
+            "queries": prompts,
+        },
+    }
+
+    # Create ExperimentConfig
+    spec_mode = "Eagle3" if (enable_eagle and speculative_model_dir) else "baseline"
+    print(f"\n[TRACE] Creating ExperimentConfig ({spec_mode} mode)...")
+    print(f"[TRACE] Model: {model}")
+
+    try:
+        cfg = ExperimentConfig(**experiment_config)
+        print("[TRACE] ExperimentConfig created successfully!")
+    except Exception as e:
+        print("\n[ERROR] ===== FAILED! =====")
+        print(f"[ERROR] Failed to create ExperimentConfig: {type(e).__name__}: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+        print("\n[DEBUG HINTS]:")
+        print("1. Check if all llm_args fields are valid for AutoDeploy's LlmArgs")
+        print("2. Verify the model path is correct")
+        print("3. Check if speculative_config is supported by AutoDeploy")
+
+        raise
+
+    # Add sampling parameters
+    cfg.prompt.sp_kwargs = {
+        "max_tokens": 100,
+        "top_k": None,
+        "temperature": 0.0,
+    }
+
+    # Run the experiment
+    print(f"\n[TRACE] Starting AutoDeploy generation ({spec_mode} mode)...")
+
+    try:
+        result = ad_main(cfg)
+
+        print("\n[TRACE] ===== SUCCESS! =====")
+        print(f"[TRACE] Generation completed with {model} using AutoDeploy!")
+
+        # Check if we got valid outputs
+        if "prompts_and_outputs" in result:
+            print(f"\n[TRACE] Generated {len(result['prompts_and_outputs'])} outputs:")
+            for i, (prompt, output) in enumerate(result["prompts_and_outputs"]):
+                print(f"\n[TRACE] Output {i}:")
+                print(f"  Prompt: {prompt}")
+                print(f"  Response: {output}")
+
+        return result
+
+    except Exception as e:
+        print("\n[ERROR] ===== FAILED! =====")
+        print(f"[ERROR] Generation failed: {type(e).__name__}: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+        print("\n[DEBUG HINTS]:")
+        print("1. Check if 'speculative_config' is supported in AutoDeploy LlmArgs")
+        print("2. Verify sufficient GPU memory for generation")
+        print("3. Check if AutoDeploy backend supports Eagle3")
+        print("4. Try running with --no-eagle to test baseline first")
+
+        raise
+
+
 def main():
     """Main entry point with argument parsing."""
     parser = argparse.ArgumentParser(
-        description="Test models with Eagle3 speculative decoding using TRT-LLM",
+        description="Test models with Eagle3 speculative decoding using TRT-LLM or AutoDeploy backend",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Use Llama-3.1-8B with downloaded Eagle3 adapter (recommended if already downloaded)
+  # Use TRT-LLM backend (default) with downloaded Eagle3 adapter
   %(prog)s --model meta-llama/Llama-3.1-8B-Instruct \\
       --speculative-model-dir /lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/\\
 autodeploy_data/hf_home/hub/models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B/snapshots/ada412b672e293d682423de84a095447bf38a637
 
-  # Auto-download Eagle3 adapter for Llama-3.1-8B (simplest option for Llama-3.1-8B)
+  # Use TRT-LLM backend with auto-download Eagle3 adapter (simplest option for Llama-3.1-8B)
   %(prog)s --model meta-llama/Llama-3.1-8B-Instruct --auto-download-eagle
 
-  # Run in baseline mode without speculative decoding
+  # Use AutoDeploy backend with auto-download Eagle3 adapter
+  %(prog)s --backend autodeploy --model meta-llama/Llama-3.1-8B-Instruct --auto-download-eagle
+
+  # Run in baseline mode without speculative decoding (TRT-LLM)
   %(prog)s --model meta-llama/Llama-3.1-8B-Instruct --no-eagle
 
+  # Run in baseline mode without speculative decoding (AutoDeploy)
+  %(prog)s --backend autodeploy --model meta-llama/Llama-3.1-8B-Instruct --no-eagle
+
 Notes:
+  - --backend: Choose 'trtllm' (default) or 'autodeploy'
   - Use exactly ONE of: --auto-download-eagle, --speculative-model-dir, or --no-eagle
   - --auto-download-eagle: Downloads Eagle3 adapter for Llama-3.1-8B-Instruct
   - --speculative-model-dir: Uses an already-downloaded local directory path
   - --no-eagle: Runs in baseline mode without speculative decoding
   - If none specified, defaults to baseline mode
         """,
+    )
+
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["trtllm", "autodeploy"],
+        default="trtllm",
+        help="Backend to use: 'trtllm' for TRT-LLM engine directly, "
+        "'autodeploy' for AutoDeploy backend (default: trtllm)",
     )
 
     parser.add_argument(
@@ -314,12 +457,22 @@ Notes:
             model_name=args.model,
         )
 
-    # Run the test
-    result = test_llama_eagle_with_trtllm(
-        model=args.model,
-        speculative_model_dir=speculative_model_path,
-        enable_eagle=not args.no_eagle,
-    )
+    # Run the test with the appropriate backend
+    if args.backend == "trtllm":
+        result = test_llama_eagle_with_trtllm(
+            model=args.model,
+            speculative_model_dir=speculative_model_path,
+            enable_eagle=not args.no_eagle,
+        )
+    elif args.backend == "autodeploy":
+        result = test_llama_eagle_with_autodeploy(
+            model=args.model,
+            speculative_model_dir=speculative_model_path,
+            enable_eagle=not args.no_eagle,
+        )
+    else:
+        print(f"[ERROR] Unknown backend: {args.backend}")
+        sys.exit(1)
 
     return result
 
