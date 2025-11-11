@@ -20,8 +20,9 @@ from torch._prims_common import DeviceLikeType
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
+from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy
+from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, DecodingBaseConfig
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 
 from ...._utils import mpi_rank, mpi_world_size
@@ -100,6 +101,8 @@ class ADEngine(ModelEngine):
     def build_from_config(cls, ad_config: LlmArgs):
         """Build the ADEngine using the LlmArgs that gets passed through from the LLM."""
 
+        print(f"[TRACE] Building ADEngine from config: {ad_config}")
+
         max_batch_size = ad_config.max_batch_size
         max_seq_len = ad_config.max_seq_len
         attn_page_size = ad_config.attn_page_size
@@ -130,7 +133,13 @@ class ADEngine(ModelEngine):
         build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
 
         # construct engine
-        return cls(build_and_optimize, seq_info, device, max_beam_width)
+        return cls(
+            build_and_optimize,
+            seq_info,
+            device,
+            max_beam_width,
+            spec_config=ad_config.speculative_config,
+        )
 
     @torch.inference_mode()
     def __init__(
@@ -139,6 +148,7 @@ class ADEngine(ModelEngine):
         seq_info: SequenceInfo,
         device: DeviceLikeType,
         max_beam_width: int = 1,
+        spec_config: Optional[DecodingBaseConfig] = None,
     ) -> None:
         """Initialize the engine with model and sequence information."""
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
@@ -159,6 +169,8 @@ class ADEngine(ModelEngine):
         self.max_beam_width = max_beam_width
         self.enable_attention_dp = False
 
+        print(f"[TRACE] Spec config in ADEngine.__init__: {spec_config}")
+
         # construct cache sequence interface
         self.cache_seq_interface = CachedSequenceInterface(
             sequence_info=seq_info,
@@ -177,9 +189,17 @@ class ADEngine(ModelEngine):
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
         new_tokens: Optional[torch.Tensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
     ) -> List[bool]:
         """Prepare inputs for AD Model from scheduled requests."""
         # cache manager
+
+        print(
+            f"[TRACE] Preparing inputs for AD Model from scheduled requests: {scheduled_requests}"
+        )
+        print(f"[TRACE] Context requests length: {len(scheduled_requests.context_requests)}")
+        print(f"[TRACE] Generation requests length: {len(scheduled_requests.generation_requests)}")
+
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
@@ -338,6 +358,18 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         if ad_config.speculative_config is None
         else ad_config.speculative_config.max_total_draft_tokens
     )
+
+    print(f"[TRACE] Max draft len: {max_draft_len}")
+    print(f"[TRACE] Max total draft tokens: {max_total_draft_tokens}")
+
+    has_draft_model_engine = False
+    has_spec_drafter = False
+    if ad_config.speculative_config is not None:
+        has_draft_model_engine = ad_config.speculative_config.spec_dec_mode.has_draft_model()
+        has_spec_drafter = ad_config.speculative_config.spec_dec_mode.has_spec_drafter()
+
+    print(f"[TRACE] Has draft model engine: {has_draft_model_engine}")
+    print(f"[TRACE] Has spec drafter: {has_spec_drafter}")
 
     # initialize model engine
     engine = ADEngine.build_from_config(ad_config=ad_config)

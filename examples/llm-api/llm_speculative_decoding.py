@@ -33,10 +33,18 @@ def run_MTP(model: Optional[str] = None):
 
 
 def run_Eagle3():
+
+    speculative_model_dir = "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/autodeploy_data/hf_home/hub/models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B/snapshots/ada412b672e293d682423de84a095447bf38a637"
+
+    print(
+        f"[TRACE] Running Eagle3 with model: meta-llama/Llama-3.1-8B-Instruct")
+    print(f"[TRACE] Speculative model dir: {speculative_model_dir}")
+    print(f"[TRACE] Eagle3 one model: False")
+
     spec_config = EagleDecodingConfig(
         max_draft_len=3,
-        speculative_model_dir="yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
-        eagle3_one_model=True)
+        speculative_model_dir=speculative_model_dir,
+        eagle3_one_model=False)
 
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
 
@@ -47,7 +55,7 @@ def run_Eagle3():
     )
 
     for prompt in prompts:
-        response = llm.generate(prompt, SamplingParams(max_tokens=10))
+        response = llm.generate(prompt, SamplingParams(max_tokens=100))
         print(response.outputs[0].text)
 
 
