@@ -434,6 +434,7 @@ def _process_ssm_sharding(
             rank=rank,
             world_size=world_size,
             dist_op="all_reduce",
+            allreduce_strategy=sharding_config.allreduce_strategy,
         )
     )
     return 1
@@ -605,6 +606,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_reduce",
                             min_local_shape=min_local_shape,
+                            allreduce_strategy=sharding_config.allreduce_strategy,
                         )
                     )
                     num_row_col_shards += 1
@@ -649,6 +651,7 @@ def detect_sharding_from_factory_config(
                                     world_size=world_size,
                                     dist_op="all_reduce",
                                     min_local_shape=min_local_shape,
+                                    allreduce_strategy=sharding_config.allreduce_strategy,
                                 )
                             )
                             num_row_col_shards += 1
@@ -963,6 +966,7 @@ def detect_column_row_shard(
                 world_size=world_size,
                 dist_op="all_reduce",
                 min_local_shape=min_local_shape,
+                allreduce_strategy=sharding_config.allreduce_strategy,
             )
         )
 
