@@ -566,7 +566,7 @@ class ShardingTransformInfo(BaseModel, ABC):
     target_node: str
     rank: int
     world_size: int
-    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
+    allreduce_strategy: AllReduceStrategy  # REQUIRED: must be explicitly passed
 
     @field_validator("allreduce_strategy", mode="before")
     @classmethod
@@ -696,6 +696,8 @@ class ParameterUpdateInfo(ShardingTransformInfo):
     rank: int
     world_size: int
     args: tuple
+    # ParameterUpdateInfo doesn't insert distributed ops, so strategy doesn't matter
+    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
@@ -984,8 +986,8 @@ def _insert_sharded_moe(
     node: Node,
     rank: int,
     world_size: int,
+    allreduce_strategy: AllReduceStrategy,  # REQUIRED: must be explicitly passed
     scale_names: Sequence[str] = (),
-    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
 ):
     """Update the torch_moe node with sharded weight lists,
     sharded `selected_experts` and `final_scales(router_logics)`.
@@ -1091,7 +1093,7 @@ def _insert_sharded_mxfp4_mlp_ep(
     node: Node,
     rank: int,
     world_size: int,
-    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+    allreduce_strategy: AllReduceStrategy,  # REQUIRED: must be explicitly passed
 ):
     """
     Transform a call to auto_deploy::triton_mxfp4_moe into:
@@ -1165,7 +1167,7 @@ class EPShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply EP sharding transformation to the graph module."""
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, [], self.allreduce_strategy)
+        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.allreduce_strategy, [])
 
 
 class MXFP4EPShardingInfo(EPShardingInfo):
@@ -1196,7 +1198,7 @@ class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         _insert_sharded_moe(
-            gm, node, self.rank, self.world_size, self.scale_names(), self.allreduce_strategy
+            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.scale_names()
         )
 
 
@@ -1214,7 +1216,7 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         _insert_sharded_moe(
-            gm, node, self.rank, self.world_size, self.scale_names(), self.allreduce_strategy
+            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.scale_names()
         )
 
 

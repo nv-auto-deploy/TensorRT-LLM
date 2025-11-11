@@ -133,6 +133,7 @@ def _process_simple_shard(
                         world_size=world_size,
                         dist_op="all_gather",
                         min_local_shape=1,
+                        allreduce_strategy=sharding_config.allreduce_strategy,
                     )
                 )
             )
@@ -360,6 +361,7 @@ def _process_ssm_sharding(
             dist_op=None,
             min_local_shape=min_local_shape,
             fused_weight_dims=fused_weight_dims["in_proj"],
+            allreduce_strategy=sharding_config.allreduce_strategy,
         )
     )
 
@@ -398,6 +400,7 @@ def _process_ssm_sharding(
                 dist_op=None,
                 min_local_shape=min_local_shape,
                 fused_weight_dims=fused_dims,
+                allreduce_strategy=sharding_config.allreduce_strategy,
             )
         )
 
@@ -461,6 +464,7 @@ def _process_column_sharding(
                 world_size=world_size,
                 dist_op=None,  # for column sharding, no dist op is performed
                 min_local_shape=min_local_shape,
+                allreduce_strategy=sharding_config.allreduce_strategy,
             )
         )
 
@@ -594,6 +598,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op=None,
                             min_local_shape=min_local_shape,
+                            allreduce_strategy=sharding_config.allreduce_strategy,
                         )
                     )
                     num_row_col_shards += 1
@@ -620,6 +625,7 @@ def detect_sharding_from_factory_config(
                             dist_op=None,
                             min_local_shape=min_local_shape,
                             layer_type=LayerType.MAMBA,
+                            allreduce_strategy=sharding_config.allreduce_strategy,
                         )
                     )
                     num_row_col_shards += 1
@@ -640,6 +646,7 @@ def detect_sharding_from_factory_config(
                                     world_size=world_size,
                                     dist_op=None,
                                     min_local_shape=min_local_shape,
+                                    allreduce_strategy=sharding_config.allreduce_strategy,
                                 )
                             )
                         elif col_row_action == "rowwise":
@@ -671,6 +678,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_gather",
                             min_local_shape=1,
+                            allreduce_strategy=sharding_config.allreduce_strategy,
                         )
                     )
                     num_simple_shards += 1
@@ -686,6 +694,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_gather",
                             min_local_shape=1,
+                            allreduce_strategy=sharding_config.allreduce_strategy,
                         )
                     )
                 # after successful match, break the loop
@@ -1085,6 +1094,7 @@ def detect_ep_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Transfo
                 node,
                 rank=rank,
                 world_size=world_size,
+                allreduce_strategy=sharding_config.allreduce_strategy,
             )
         )
         num_moe_patterns += 1

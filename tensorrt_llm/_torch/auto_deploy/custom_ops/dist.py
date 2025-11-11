@@ -37,6 +37,14 @@ def all_reduce(t: torch.Tensor, strategy: str = "AUTO") -> torch.Tensor:
     efficient all_reduce ops one should write/replace it with a fused op.
     """
     if trtllm_dist.is_trtllm_op_available():
+        # Debug logging to see what strategy is actually passed
+        if not hasattr(all_reduce, "_logged_strategies"):
+            all_reduce._logged_strategies = set()
+        if strategy not in all_reduce._logged_strategies:
+            from tensorrt_llm.logger import logger
+
+            logger.info(f"[DEBUG] torch_dist_all_reduce called with strategy='{strategy}'")
+            all_reduce._logged_strategies.add(strategy)
         return trtllm_dist.trtllm_allreduce(t, op=dist.ReduceOp.SUM, strategy=strategy)
     t_res = t.clone()
     dist.all_reduce(t_res, op=dist.ReduceOp.SUM)

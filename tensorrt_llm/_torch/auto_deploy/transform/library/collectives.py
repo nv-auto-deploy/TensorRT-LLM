@@ -17,7 +17,11 @@ from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformReg
 
 
 def _allreduce_residual_rmsnorm_pattern(
-    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 0.1253
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 0.1253,
+    strategy: str = "AUTO",
 ):
     """
     Reference PyTorch composition of:
@@ -28,7 +32,7 @@ def _allreduce_residual_rmsnorm_pattern(
     """
 
     input_dtype = x.dtype
-    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x)
+    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x, strategy)
     add = residual + hidden_states
 
     hidden_states = add.to(torch.float32)
@@ -41,7 +45,11 @@ def _allreduce_residual_rmsnorm_pattern(
 
 
 def _allreduce_residual_rmsnorm_pattern2(
-    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 0.1253
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 0.1253,
+    strategy: str = "AUTO",
 ):
     """
     Reference PyTorch composition of:
@@ -52,7 +60,7 @@ def _allreduce_residual_rmsnorm_pattern2(
     """
 
     input_dtype = x.dtype
-    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x)
+    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x, strategy)
     add = hidden_states + residual
 
     hidden_states = add.to(torch.float32)
@@ -65,9 +73,13 @@ def _allreduce_residual_rmsnorm_pattern2(
 
 
 def _allreduce_residual_rmsnorm_repl(
-    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    strategy: str = "AUTO",
 ):
-    return torch.ops.dist.fused_allreduce_residual_rmsnorm(x, residual, weight, eps)
+    return torch.ops.dist.fused_allreduce_residual_rmsnorm(x, residual, weight, eps, strategy)
 
 
 @TransformRegistry.register("fuse_allreduce_residual_rmsnorm")
@@ -90,6 +102,7 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             torch.randn(bsz, hidden, device="meta", dtype=torch.bfloat16),  # residual
             torch.randn(hidden, device="meta", dtype=torch.bfloat16),  # weight
             0.1253,  # eps
+            "AUTO",  # strategy
         ]
 
         register_ad_pattern(
@@ -98,7 +111,7 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             patterns=patterns,
             dummy_args=dummy_args,
             op_ignore_types={torch.ops.aten.to.dtype: (torch.dtype,)},
-            scalar_workaround={"eps": 0.1253},
+            scalar_workaround={"eps": 0.1253, "strategy": "AUTO"},
         )
         register_ad_pattern(
             search_fn=_allreduce_residual_rmsnorm_pattern2,
@@ -106,7 +119,7 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             patterns=patterns,
             dummy_args=dummy_args,
             op_ignore_types={torch.ops.aten.to.dtype: (torch.dtype,)},
-            scalar_workaround={"eps": 0.1253},
+            scalar_workaround={"eps": 0.1253, "strategy": "AUTO"},
         )
 
         num_matches = patterns.apply(gm.graph)

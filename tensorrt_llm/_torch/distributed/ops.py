@@ -614,6 +614,9 @@ class AllReduce(nn.Module):
 
         if self.mapping.tp_size > 1:
             # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
+            logger.info(
+                f"[DEBUG] AllReduce.__init__: tp_size={self.mapping.tp_size}, strategy={self.strategy}, strategy_type={type(self.strategy)}, SYMM_MEM={AllReduceStrategy.SYMM_MEM}, comparison={self.strategy == AllReduceStrategy.SYMM_MEM}"
+            )
             if self.strategy == AllReduceStrategy.SYMM_MEM:
                 try:
                     symm_mem = SymmetricMemoryAllReduce(
