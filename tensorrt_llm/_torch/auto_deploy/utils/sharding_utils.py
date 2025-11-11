@@ -238,6 +238,7 @@ def _insert_sharded_mamba(
     quantization_cb: Optional[
         Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
     ] = None,
+    precision: Optional[torch.dtype] = None,
 ) -> bool:
     """
     To shard Mamba layer, first column-shard the first linear layer: entry_node,
@@ -342,6 +343,7 @@ def _insert_sharded_mamba(
         min_local_shape=min_local_shape,
         fused_weight_dims=entry_fused_dims,
         quantization_cb=quantization_cb,
+        precision=precision,
     )
 
     # Get all weight nodes in the subgraph except for out_proj
@@ -407,6 +409,7 @@ def _shard_parameter_node(
     quantization_cb: Optional[
         Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
     ] = None,
+    precision: Optional[torch.dtype] = None,
 ) -> None:
     """Replace the node with parametrized weight tensor with a new node that accepts sharded weights.
 
@@ -486,11 +489,16 @@ def _shard_parameter_node(
         return
 
     # figure out the right dist op
-    dist_lookup = {
-        0: (torch.ops.auto_deploy.torch_dist_all_gather.default, -1),
-        1: (torch.ops.auto_deploy.torch_dist_all_reduce.default,),
-    }
-    fn_dist, *dist_args = dist_lookup[dim]
+    if dim == 0:
+        # Column sharding: use all_gather
+        fn_dist = torch.ops.auto_deploy.torch_dist_all_gather.default
+        dist_args = (-1,)
+    elif dim == 1:
+        # Row sharding: use all_reduce with mixed precision support
+        fn_dist = torch.ops.auto_deploy.torch_dist_all_reduce_mp.default
+        dist_args = (precision,)
+    else:
+        raise ValueError(f"Unsupported sharding dimension: {dim}")
 
     # add reduction node
     with gm.graph.inserting_after(node):
@@ -567,12 +575,16 @@ class LayerType(Enum):
 class WeightShardingInfo(ShardingTransformInfo):
     """Configuration for TP sharding transformations."""
 
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
     split_dim: SplitDimension
     dist_op: Optional[Literal["all_reduce", "all_gather"]] = None
     min_local_shape: int = 1
     layer_type: LayerType = LayerType.MLP
     # used for TP sharding of fused weights
     fused_weight_dims: Optional[list] = None
+    # All-reduce precision: None (use input dtype), torch.float32, or torch.float64
+    precision: Optional[torch.dtype] = None
 
     def quantization_cb(
         self,
@@ -628,6 +640,7 @@ class WeightShardingInfo(ShardingTransformInfo):
                 if isinstance(self.fused_weight_dims, dict)
                 else None,
                 quantization_cb=self.quantization_cb,
+                precision=self.precision,
             )
         else:
             _shard_parameter_node(
@@ -640,6 +653,7 @@ class WeightShardingInfo(ShardingTransformInfo):
                 min_local_shape=self.min_local_shape,
                 fused_weight_dims=self.fused_weight_dims,
                 quantization_cb=self.quantization_cb,
+                precision=self.precision,
             )
 
 
@@ -1201,6 +1215,8 @@ class ShardingDim(Enum):
 class ShardingConfig(BaseModel):
     """Configuration for sharding the model."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     factory_source: ShardingConfigSource = Field(default=ShardingConfigSource.UNKNOWN)
     rank: int = Field(default=0)
     world_size: int = Field(default=1)
@@ -1213,6 +1229,7 @@ class ShardingConfig(BaseModel):
     sharding_dims: List[ShardingDim] = Field(
         default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
+    all_reduce_precision: Optional[torch.dtype] = Field(default=None)
     weight_sharding_transforms: List[WeightShardingInfo] = Field(default_factory=list)
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)

@@ -19,10 +19,10 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
 import operator
 import re
 from collections import defaultdict
-from typing import DefaultDict, Dict, List, Set, Tuple, Type
+from typing import DefaultDict, Dict, List, Optional, Set, Tuple, Type
 
 import torch
-from pydantic import Field
+from pydantic import ConfigDict, Field
 from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory, ShardingConfigSource
@@ -131,6 +131,7 @@ def _process_simple_shard(
                         world_size=world_size,
                         dist_op="all_gather",
                         min_local_shape=1,
+                        precision=sharding_config.all_reduce_precision,
                     )
                 )
             )
@@ -139,6 +140,8 @@ def _process_simple_shard(
 
 class ShardingTransformConfig(TransformConfig):
     """Configuration for sharding transformations."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     simple_shard_only: bool = Field(default=False)
     sharding_source: List[ShardingSource] = Field(
@@ -149,6 +152,8 @@ class ShardingTransformConfig(TransformConfig):
     sharding_dims: List[ShardingDim] = Field(
         default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
+    # All-reduce precision for TP sharding: None (use input dtype), torch.float32, or torch.float64
+    all_reduce_precision: Optional[str] = Field(default=None)
 
 
 @TransformRegistry.register("detect_sharding")
@@ -184,7 +189,7 @@ class Sharding(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
-        world_size = 2
+        # world_size = 2
 
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
@@ -206,6 +211,26 @@ class Sharding(BaseTransform):
         sharding_config.support_partial_config = self.config.support_partial_config
         sharding_config.sharding_dims = self.config.sharding_dims
         sharding_config.sharding_source = self.config.sharding_source
+
+        # Convert all_reduce_precision from string to torch.dtype if specified
+        if self.config.all_reduce_precision is not None:
+            dtype_map = {
+                "float16": torch.float16,
+                "float32": torch.float32,
+                "float64": torch.float64,
+                "bfloat16": torch.bfloat16,
+            }
+            if isinstance(self.config.all_reduce_precision, str):
+                sharding_config.all_reduce_precision = dtype_map.get(
+                    self.config.all_reduce_precision, None
+                )
+            else:
+                sharding_config.all_reduce_precision = self.config.all_reduce_precision
+        else:
+            sharding_config.all_reduce_precision = None
+
+        ad_logger.info(f"\n\nSharding config: {sharding_config}\n\n")
+        # sharding_config.simple_shard_only = True
 
         sharding_config.validate_config()
 
@@ -345,6 +370,7 @@ def _process_ssm_sharding(
             dist_op=None,
             min_local_shape=min_local_shape,
             fused_weight_dims=fused_weight_dims["in_proj"],
+            precision=sharding_config.all_reduce_precision,
         )
     )
 
@@ -383,6 +409,7 @@ def _process_ssm_sharding(
                 dist_op=None,
                 min_local_shape=min_local_shape,
                 fused_weight_dims=fused_dims,
+                precision=sharding_config.all_reduce_precision,
             )
         )
 
@@ -419,6 +446,7 @@ def _process_ssm_sharding(
             rank=rank,
             world_size=world_size,
             dist_op="all_reduce",
+            precision=sharding_config.all_reduce_precision,
         )
     )
     return 1
@@ -445,6 +473,7 @@ def _process_column_sharding(
                 world_size=world_size,
                 dist_op=None,  # for column sharding, no dist op is performed
                 min_local_shape=min_local_shape,
+                precision=sharding_config.all_reduce_precision,
             )
         )
 
@@ -578,6 +607,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op=None,
                             min_local_shape=min_local_shape,
+                            precision=sharding_config.all_reduce_precision,
                         )
                     )
                     num_row_col_shards += 1
@@ -590,6 +620,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_reduce",
                             min_local_shape=min_local_shape,
+                            precision=sharding_config.all_reduce_precision,
                         )
                     )
                     num_row_col_shards += 1
@@ -603,6 +634,7 @@ def detect_sharding_from_factory_config(
                             dist_op=None,
                             min_local_shape=min_local_shape,
                             layer_type=LayerType.MAMBA,
+                            precision=sharding_config.all_reduce_precision,
                         )
                     )
                     num_row_col_shards += 1
@@ -623,6 +655,7 @@ def detect_sharding_from_factory_config(
                                     world_size=world_size,
                                     dist_op=None,
                                     min_local_shape=min_local_shape,
+                                    precision=sharding_config.all_reduce_precision,
                                 )
                             )
                         elif col_row_action == "rowwise":
@@ -634,6 +667,7 @@ def detect_sharding_from_factory_config(
                                     world_size=world_size,
                                     dist_op="all_reduce",
                                     min_local_shape=min_local_shape,
+                                    precision=sharding_config.all_reduce_precision,
                                 )
                             )
                             num_row_col_shards += 1
@@ -653,6 +687,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_gather",
                             min_local_shape=1,
+                            precision=sharding_config.all_reduce_precision,
                         )
                     )
                     num_simple_shards += 1
@@ -668,6 +703,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_gather",
                             min_local_shape=1,
+                            precision=sharding_config.all_reduce_precision,
                         )
                     )
                 # after successful match, break the loop
@@ -948,6 +984,7 @@ def detect_column_row_shard(
                 world_size=world_size,
                 dist_op="all_reduce",
                 min_local_shape=min_local_shape,
+                precision=sharding_config.all_reduce_precision,
             )
         )
 

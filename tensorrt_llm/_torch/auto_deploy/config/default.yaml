@@ -76,11 +76,14 @@ transforms:
   # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
   detect_sharding:
     stage: sharding
-    simple_shard_only: true
+    simple_shard_only: false
     sharding_source: ['factory','heuristic']
     support_partial_config: true
     sharding_dims: ['ep', 'bmm']
     requires_shape_prop: true
+    # All-reduce precision for TP sharding (null = use input dtype, "float32", "float64", "bfloat16")
+    # Higher precision improves numerical accuracy but increases communication cost
+    all_reduce_precision: None
   # TODO: (hg) need to ensure run_shape_prop after sharding.
   sharding_transform_executor:
     stage: sharding

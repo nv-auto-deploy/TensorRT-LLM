@@ -246,6 +246,8 @@ class AccuracyTask:
         )
         hypothesis_testing_params.assert_passing(accuracy)
 
+        return accuracy
+
 
 class CnnDailymail(AccuracyTask):
     DATASET = "cnn_dailymail"

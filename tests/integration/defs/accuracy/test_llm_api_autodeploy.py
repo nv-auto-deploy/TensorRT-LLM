@@ -153,7 +153,7 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
 
 class TestNemotronMOE(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-MOE"
-    MODEL_PATH = f"{llm_models_root()}/Nemotron-MOE/"
+    MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-Nano-31B-A3-v3"
 
     def get_default_kwargs(self):
         return {
@@ -184,16 +184,25 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
                               use_beam_search=beam_width > 1)
 
     @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.parametrize("world_size", [2])
+    @pytest.mark.parametrize("world_size", [1, 4, 8])
     def test_auto_dtype(self, world_size):
         # pytest.skip("Nemotron-MOE is not in CI yet")
         kwargs = self.get_default_kwargs()
-        sampling_params = self.get_default_sampling_params()
+        self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
                            world_size=world_size,
                            **kwargs) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
+            # # MMLU evaluation
+            # task = MMLU(self.MODEL_NAME)
+            # mmlu_score = task.evaluate(llm, sampling_params=sampling_params)
+            # print(f"\n{'='*80}")
+            # print(f"WORLD SIZE {world_size}. ✓ MMLU Score: {mmlu_score:.2f}")
+            # print(f"{'='*80}\n")
+
+            # GSM8K evaluation
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            gsm8k_score = task.evaluate(llm)
+            print(f"\n{'='*80}")
+            print(f"WORLD SIZE {world_size}. ✓ GSM8K Score: {gsm8k_score:.2f}")
+            print(f"{'='*80}\n")

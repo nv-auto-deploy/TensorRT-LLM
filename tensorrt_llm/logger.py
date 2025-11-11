@@ -57,6 +57,7 @@ class Logger(metaclass=Singleton):
         if invalid_severity:
             min_severity = self.DEFAULT_LEVEL
 
+        min_severity = "internal_error"
         self._min_severity = min_severity
         self._trt_logger = trt.Logger(severity_map[min_severity][0])
         self._logger = logging.getLogger(self.PREFIX)
