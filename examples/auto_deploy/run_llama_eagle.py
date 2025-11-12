@@ -162,6 +162,7 @@ def test_llama_eagle_with_trtllm(
         eagle3_config = EagleDecodingConfig(
             max_draft_len=3, speculative_model_dir=speculative_model_dir, eagle3_one_model=False
         )
+
         print(f"[TRACE] Created EagleDecodingConfig: {eagle3_config}")
         print(f"[TRACE] Speculative model dir: {speculative_model_dir}")
     else:
@@ -186,7 +187,8 @@ def test_llama_eagle_with_trtllm(
     print(f"[TRACE] Model: {model}")
 
     try:
-        llm = LLM(model=model, speculative_config=eagle3_config, kv_cache_config=kv_cache_config)
+        # Try to use flashinfer attention backend to match AutoDeploy's attn
+        llm = LLM(model=model, speculative_config=eagle3_config, kv_cache_config=kv_cache_config, attn_backend="flashinfer")
         print("[TRACE] LLM instance created successfully!")
 
     except Exception as e:

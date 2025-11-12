@@ -108,14 +108,24 @@ def get_spec_metadata(spec_config,
     return None
 
 
-def get_spec_resource_manager(model_engine, draft_model_engine=None):
-    spec_config = model_engine.spec_config
+def _get_spec_resource_manager(spec_config, model_config, max_num_requests, 
+                               max_seq_len, max_num_tokens, draft_model_config=None):
+    """Internal function to create spec resource manager from individual fields.
+    
+    Args:
+        spec_config: Speculative decoding configuration
+        model_config: Model configuration (with torch_dtype, hidden_size, num_hidden_layers)
+        max_num_requests: Maximum number of requests
+        max_seq_len: Maximum sequence length
+        max_num_tokens: Maximum number of tokens
+        draft_model_config: Draft model configuration (optional, for Eagle3/MTP Eagle modes)
+    
+    Returns:
+        Resource manager instance or None
+    """
     if spec_config is None:
         return None
-    model_config = model_engine.model.config
-    max_num_requests = model_engine.batch_size
-    max_seq_len = model_engine.max_seq_len
-    max_num_tokens = model_engine.max_num_tokens
+    
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_eagle_one_model():
         if spec_config.use_relaxed_acceptance_for_thinking:
@@ -135,10 +145,10 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_requests,
         )
     if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
-        assert draft_model_engine is not None, "Draft model engine is required for Eagle3 and MTP Eagle two model flow."
+        assert draft_model_config is not None, "Draft model config is required for Eagle3 and MTP Eagle two model flow."
         return Eagle3ResourceManager(
             spec_config,
-            draft_model_engine.model.config.torch_dtype,
+            draft_model_config.torch_dtype,
             model_config.hidden_size,
             max_num_requests,
             max_seq_len,
@@ -147,7 +157,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     if spec_dec_mode.is_save_hidden_states():
         return Eagle3ResourceManager(
             spec_config,
-            model_engine.model.config.torch_dtype,
+            model_config.torch_dtype,
             model_config.hidden_size,
             max_num_requests,
             max_seq_len,
@@ -158,6 +168,42 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
     return None
+
+
+def get_spec_resource_manager(model_engine, draft_model_engine=None):
+    """Create spec resource manager from model engine objects.
+    
+    This function extracts the necessary fields from the engine objects and calls
+    _get_spec_resource_manager() to create the resource manager.
+    
+    Args:
+        model_engine: The main model engine (PyTorchModelEngine)
+        draft_model_engine: The draft model engine (optional, for two-model speculative decoding)
+    
+    Returns:
+        Resource manager instance or None
+    """
+    spec_config = model_engine.spec_config
+    if spec_config is None:
+        return None
+    
+    model_config = model_engine.model.config
+    max_num_requests = model_engine.batch_size
+    max_seq_len = model_engine.max_seq_len
+    max_num_tokens = model_engine.max_num_tokens
+    
+    draft_model_config = None
+    if draft_model_engine is not None:
+        draft_model_config = draft_model_engine.model.config
+    
+    return _get_spec_resource_manager(
+        spec_config=spec_config,
+        model_config=model_config,
+        max_num_requests=max_num_requests,
+        max_seq_len=max_seq_len,
+        max_num_tokens=max_num_tokens,
+        draft_model_config=draft_model_config,
+    )
 
 
 def get_spec_decoder(sampler_args: TorchSampler.Args,
@@ -175,19 +221,31 @@ def get_spec_decoder(sampler_args: TorchSampler.Args,
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
 
-def get_spec_drafter(model_engine,
-                     draft_model_engine,
-                     sampler,
-                     spec_resource_manager,
-                     guided_decoder: Optional[GuidedDecoder] = None):
-    spec_config = model_engine.spec_config
+def _get_spec_drafter(spec_config,
+                      max_num_requests,
+                      draft_model_engine,
+                      sampler,
+                      spec_resource_manager,
+                      guided_decoder: Optional[GuidedDecoder] = None):
+    """Internal function to create spec drafter from individual fields.
+    
+    Args:
+        spec_config: Speculative decoding configuration
+        max_num_requests: Maximum number of requests
+        draft_model_engine: Draft model engine (optional, for two-model speculative decoding)
+        sampler: Sampler instance
+        spec_resource_manager: Spec resource manager instance
+        guided_decoder: Guided decoder instance (optional)
+    
+    Returns:
+        Drafter instance or None
+    """
     if spec_config is None:
         return None
 
     if spec_config.spec_dec_mode.is_user_provided():
         return spec_config.drafter
 
-    max_num_requests = model_engine.batch_size
     if spec_config.spec_dec_mode.is_draft_target(
     ) or spec_config.spec_dec_mode.is_eagle3(
     ) or spec_config.spec_dec_mode.is_mtp_eagle():
@@ -207,6 +265,42 @@ def get_spec_drafter(model_engine,
         return SaveHiddenStatesDrafter(spec_config, spec_resource_manager)
 
     return None
+
+
+def get_spec_drafter(model_engine,
+                     draft_model_engine,
+                     sampler,
+                     spec_resource_manager,
+                     guided_decoder: Optional[GuidedDecoder] = None):
+    """Create spec drafter from model engine objects.
+    
+    This function extracts the necessary fields from the engine objects and calls
+    _get_spec_drafter() to create the drafter.
+    
+    Args:
+        model_engine: The main model engine (PyTorchModelEngine)
+        draft_model_engine: Draft model engine (optional, for two-model speculative decoding)
+        sampler: Sampler instance
+        spec_resource_manager: Spec resource manager instance
+        guided_decoder: Guided decoder instance (optional)
+    
+    Returns:
+        Drafter instance or None
+    """
+    spec_config = model_engine.spec_config
+    if spec_config is None:
+        return None
+    
+    max_num_requests = model_engine.batch_size
+    
+    return _get_spec_drafter(
+        spec_config=spec_config,
+        max_num_requests=max_num_requests,
+        draft_model_engine=draft_model_engine,
+        sampler=sampler,
+        spec_resource_manager=spec_resource_manager,
+        guided_decoder=guided_decoder,
+    )
 
 
 def get_num_spec_layers(spec_config):

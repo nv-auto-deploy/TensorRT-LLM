@@ -197,13 +197,18 @@ class PyTorchModelEngine(ModelEngine):
                 max_seq_len=self.max_seq_len,
                 lora_config=lora_config,
             )
+
+            print("Loading model with loader")
             self.model, moe_load_balancer = loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
+
+            print("Model loaded: ", self.model)
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
             self.model = model
         if drafting_loop_wrapper is not None:
+            print("Applying drafting loop wrapper to model")
             self.model = drafting_loop_wrapper(self.model)
             self.model_is_wrapped = True
         else:
@@ -2491,7 +2496,13 @@ class PyTorchModelEngine(ModelEngine):
         with their target models. Here, we set up such weights by invoking
         self.model.load_weights_from_target_model if such a method exists.
         """
+
+        print(f"[TRACE] load_weights_from_target_model. Type of self.model: {type(self.model)}")
+        print(f"[TRACE] load_weights_from_target_model. Type of target_model: {type(target_model)}")
+        print(f"[TRACE] load_weights_from_target_model. Target model: {target_model}")
+
         loader = getattr(self.model, "load_weights_from_target_model", None)
+        print(f"[TRACE] load_weights_from_target_model. Loader: {loader}")
         if callable(loader):
             loader(target_model)
 

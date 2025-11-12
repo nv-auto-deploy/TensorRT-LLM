@@ -317,6 +317,7 @@ class ModelDrafter(Drafter):
                     resource_manager,
                     new_tensors_device=previous_tensors)
         else:
+            print(f"[TRACE] Draft model engine forward pass with engine: {self.draft_model_engine}")
             outputs = self.draft_model_engine.forward(
                 draft_batch,
                 resource_manager,

@@ -645,6 +645,217 @@ class KvCacheCreator:
             draft_kv_cache_manager.shutdown()
         del resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
 
+# TODO: Reconcile this with _create_kv_cache_manager(). Maybe can refactor logic into a helper function that
+# creates a single KV Cache Manager with captured state from the KVCacheCreator. Then can call this function
+# from the existing code with KVCacheCreator.
+def create_draft_kv_cache_manager(
+    draft_model_engine: PyTorchModelEngine,
+    *,
+    mapping: Mapping,
+    tokens_per_block: int,
+    max_seq_len: int,
+    max_batch_size: int,
+    kv_cache_config: KvCacheConfig,
+    speculative_config: Optional[SpeculativeConfig],
+    sparse_attention_config: Optional[SparseAttentionConfig],
+    max_num_tokens: int,
+    max_beam_width: int,
+    kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+    estimating_kv_cache: bool = False,
+) -> KVCacheManager:
+    """
+    Create a KV cache manager for a draft model engine.
+    
+    This is a standalone function that creates a KV cache manager specifically for
+    draft models, useful when the target model has its own KV cache mechanism
+    (e.g., ADEngine with _CacheManagerWithFakePool).
+    
+    Args:
+        draft_model_engine: The PyTorchModelEngine for the draft model
+        mapping: The tensor parallelism mapping
+        tokens_per_block: Number of tokens per KV cache block
+        max_seq_len: Maximum sequence length
+        max_batch_size: Maximum batch size
+        kv_cache_config: KV cache configuration
+        speculative_config: Speculative decoding configuration
+        sparse_attention_config: Sparse attention configuration
+        max_num_tokens: Maximum number of tokens
+        max_beam_width: Maximum beam width
+        kv_connector_manager: Optional KV cache connector manager
+        estimating_kv_cache: Whether we're estimating KV cache size
+        
+    Returns:
+        A KVCacheManager instance for the draft model, or None if draft_model_engine is None
+    """
+        
+    assert draft_model_engine.model.model_config.is_generation, \
+        "Only construct KV cache for generation models."
+    
+    # Get the appropriate KV cache manager class
+    kv_cache_manager_cls = get_kv_cache_manager_cls(draft_model_engine.model.model_config)
+    
+    # Extract configuration from draft model
+    config = draft_model_engine.model.model_config.pretrained_config
+    quant_config = draft_model_engine.model.model_config.quant_config
+    
+    hidden_size = config.hidden_size
+    num_attention_heads = config.num_attention_heads
+    num_key_value_heads = getattr(config, 'num_key_value_heads', num_attention_heads)
+    head_dim = getattr(config, "head_dim", None)
+    if not isinstance(head_dim, int):
+        head_dim = hidden_size // num_attention_heads
+    
+    # Determine KV cache dtype
+    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
+        kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
+    elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache():
+        kv_cache_dtype = tensorrt_llm.bindings.DataType.NVFP4
+    else:
+        kv_cache_dtype = str_dtype_to_binding(
+            torch_dtype_to_str(draft_model_engine.dtype))
+    
+    num_hidden_layers = config.num_hidden_layers
+    
+    # Create the appropriate KV cache manager based on model type
+    if is_mla(config):
+        kv_cache_manager = kv_cache_manager_cls(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+            num_layers=num_hidden_layers,
+            num_kv_heads=1,
+            head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+            spec_config=speculative_config,
+            max_beam_width=max_beam_width,
+            is_draft=True,  # Always True for draft models
+            kv_connector_manager=kv_connector_manager if not estimating_kv_cache else None,
+            sparse_attn_config=sparse_attention_config,
+        )
+    elif is_nemotron_hybrid(config):
+        if max_beam_width > 1:
+            raise ValueError(
+                "MambaHybridCacheManager + beam search is not supported yet."
+            )
+        
+        if not estimating_kv_cache and kv_connector_manager is not None:
+            raise NotImplementedError(
+                "Connector manager is not supported for MambaHybridCacheManager."
+            )
+        
+        num_layers = config.hybrid_override_pattern.count("*")
+        layer_mask = [char == "*" for char in config.hybrid_override_pattern]
+        mamba_num_layers = config.hybrid_override_pattern.count("M")
+        mamba_layer_mask = [char == "M" for char in config.hybrid_override_pattern]
+        
+        kv_cache_manager = kv_cache_manager_cls(
+            # mamba cache parameters
+            config.ssm_state_size,
+            config.conv_kernel,
+            config.mamba_num_heads,
+            config.n_groups,
+            config.mamba_head_dim,
+            mamba_num_layers,
+            mamba_layer_mask,
+            config.torch_dtype,
+            draft_model_engine.model.model_config.quant_config.mamba_ssm_cache_dtype,
+            # kv cache parameters
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=num_layers,
+            layer_mask=layer_mask,
+            num_kv_heads=num_key_value_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+            spec_config=speculative_config,
+        )
+    elif is_qwen3_next(config):
+        if max_beam_width > 1:
+            raise ValueError(
+                "MambaHybridCacheManager + beam search is not supported yet."
+            )
+        
+        if not estimating_kv_cache and kv_connector_manager is not None:
+            raise NotImplementedError(
+                "Connector manager is not supported for MambaHybridCacheManager."
+            )
+        
+        mamba_layer_mask = [
+            True if i % config.full_attention_interval
+            != config.full_attention_interval - 1 else False
+            for i in range(num_hidden_layers)
+        ]
+        layer_mask = [
+            False if i % config.full_attention_interval
+            != config.full_attention_interval - 1 else True
+            for i in range(num_hidden_layers)
+        ]
+        num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
+            config.full_attention_interval - 1)
+        num_layers = num_hidden_layers - num_mamba_layers
+        
+        kv_cache_manager = kv_cache_manager_cls(
+            # mamba cache parameters
+            config.linear_key_head_dim,
+            config.linear_conv_kernel_dim,
+            config.linear_num_value_heads,
+            config.linear_num_key_heads,
+            config.linear_value_head_dim,
+            num_mamba_layers,
+            mamba_layer_mask,
+            config.torch_dtype,
+            draft_model_engine.model.model_config.quant_config.mamba_ssm_cache_dtype,
+            # kv cache parameters
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=num_layers,
+            layer_mask=layer_mask,
+            num_kv_heads=num_key_value_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+            spec_config=speculative_config,
+        )
+    else:
+        # Standard model (most common case)
+        # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCacheManager
+        is_vswa = kv_cache_config.max_attention_window is not None and len(
+            set(kv_cache_config.max_attention_window)) > 1
+        binding_model_config = draft_model_engine.model.model_config.get_bindings_model_config(
+            tokens_per_block=tokens_per_block) if is_vswa else None
+        
+        kv_cache_manager = kv_cache_manager_cls(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=num_hidden_layers,
+            num_kv_heads=num_key_value_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+            spec_config=speculative_config,
+            max_num_tokens=max_num_tokens,
+            model_config=binding_model_config,
+            max_beam_width=max_beam_width,
+            is_draft=True,  # Always True for draft models
+            kv_connector_manager=kv_connector_manager if not estimating_kv_cache else None,
+            sparse_attn_config=sparse_attention_config,
+        )
+    
+    return kv_cache_manager
+
 
 def create_py_executor_instance(
     *,
@@ -765,7 +976,9 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
+    print(f"[TRACE] Creating resource manager with resources: {resources}")
     resource_manager = ResourceManager(resources)
+    print(f"[TRACE] Resource manager created: {resource_manager}")
 
     # Make sure the kv cache manager is always invoked last as it could
     # depend on the results of other resource managers.
@@ -773,6 +986,7 @@ def create_py_executor_instance(
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
+    print(f"[TRACE] Resource manager after moving kv cache manager to end: {resource_manager}")
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
     scheduler_capacity = max_num_sequences

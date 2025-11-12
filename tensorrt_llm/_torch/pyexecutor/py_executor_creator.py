@@ -357,6 +357,8 @@ def create_py_executor(
                                  draft_spec_config._allow_greedy_draft_tokens
                                  and llm_args.attn_backend == "TRTLLM")
 
+            print(f"[TRACE] Use chain drafter: {use_chain_drafter}")
+
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:
 
@@ -371,6 +373,8 @@ def create_py_executor(
                 drafting_loop_wrapper = None
 
             draft_llm_args = copy.copy(llm_args)
+
+            print("Constructing draft model engine. Checkpoint loader: ", draft_llm_args.checkpoint_loader)
             if spec_config.load_format == "dummy":
                 draft_llm_args.load_format = LoadFormat.DUMMY
 
@@ -610,6 +614,7 @@ def create_py_executor(
                                    spec_resource_manager=spec_resource_manager,
                                    guided_decoder=guided_decoder)
 
+    print(f"[TRACE] Drafter in PyExecutor creator: {drafter}")
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES if estimating_kv_cache else
             ExecutorMemoryType.EXTRA_RESOURCES, RestoreMode.PINNED):

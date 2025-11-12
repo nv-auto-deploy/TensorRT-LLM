@@ -47,6 +47,8 @@ class Eagle3ResourceManager(BaseResourceManager):
         else:
             self.max_total_draft_tokens = self.max_draft_len
 
+
+        print(f"Max num tokens: {max_num_tokens}, Max num requests: {max_num_requests}, Max seq len: {self.max_seq_len}")
         # empty hidden states tensor
         max_num_tokens = min(max_num_tokens,
                              max_num_requests * self.max_seq_len)

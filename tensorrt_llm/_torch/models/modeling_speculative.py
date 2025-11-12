@@ -1,3 +1,4 @@
+import inspect
 from typing import Dict, Generic, List, Optional, Tuple
 
 import torch
@@ -214,6 +215,8 @@ class Eagle3DraftModel(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+
+        print(f"[TRACE] Eagle3DraftModel forward pass with embed_tokens: {self.embed_tokens}")
         assert self.embed_tokens is not None
 
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -282,6 +285,8 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.apply_eagle3_fc(spec_metadata.get_hidden_states())
+
+        print("[TRACE] Eagle3ForCausalLM forward pass with model: ", self.model)
         output, _ = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -291,12 +296,16 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
             hidden_states=hidden_states,
         )
 
+        print("Got past the self.model() call in Eagle3ForCausalLM forward pass")
+
         return self.logits_processor.forward(
             output,
             self.lm_head,
             attn_metadata,
             return_context_logits,
         )
+
+        print("Got past the self.logits_processor.forward() call in Eagle3ForCausalLM forward pass")
 
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
         new_weights = {}
@@ -317,9 +326,25 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
 
     def load_weights_from_target_model(self,
                                        target_model: torch.nn.Module) -> None:
+
+        print("[TRACE] load_weights_from_target_model. Eagle3ForCausalLM.load_weights_from_target_model")
+        print(f"[TRACE] load_weights_from_target_model. Type of self.model: {type(self.model)}")
+        print(f"[TRACE] load_weights_from_target_model. Type of target_model: {type(target_model)}")
+        print(f"[TRACE] load_weights_from_target_model. Target model: {target_model}")
+        print(f"[TRACE] load_weights_from_target_model. self.model.embed_tokens: {self.model.embed_tokens}")
+        print(f"[TRACE] load_weights_from_target_model. target_model.model.embed_tokens: {target_model.model.embed_tokens}")
+
+        print("load_lm_head_from_target: ", self.load_lm_head_from_target)
         if self.model.embed_tokens is None:
+            print("Setting self.model.embed_tokens to target_model.model.embed_tokens")
+            print("target_model.model.embed_tokens: ", target_model.model.embed_tokens)
+            print("type of target_model.model.embed_tokens: ", type(target_model.model.embed_tokens))
+            print("weights of target_model.model.embed_tokens: ", target_model.model.embed_tokens.weight)
+            print("forward of target_model.model.embed_tokens: ", inspect.getsource(target_model.model.embed_tokens.forward))
             self.model.embed_tokens = target_model.model.embed_tokens
         if self.load_lm_head_from_target:
+            print("Setting self.lm_head to target_model.lm_head")
+            print("target_model.lm_head: ", target_model.lm_head)
             self.lm_head = target_model.lm_head
 
     def apply_eagle3_fc(self, hidden_states: torch.Tensor) -> torch.Tensor:
