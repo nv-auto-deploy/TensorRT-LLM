@@ -1,24 +1,24 @@
-"""Test models with Eagle3 speculative decoding using TRT-LLM or AutoDeploy backend.
+"""Test models with speculative decoding using TRT-LLM or AutoDeploy backend.
 
 This script tests models using either the TRT-LLM engine directly or the AutoDeploy backend,
-with optional Eagle3 speculative decoding.
+with optional speculative decoding.
 
 Usage:
-    # TRT-LLM backend (default) with downloaded Eagle3 adapter
-    python run_trtllm_llama_eagle.py --model meta-llama/Llama-3.1-8B-Instruct \
+    # TRT-LLM backend (default) with downloaded speculative model adapter
+    python run_llama_spec_dec.py --model meta-llama/Llama-3.1-8B-Instruct \
         --speculative-model-dir /lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy\
             /autodeploy_data/hf_home\
-            /hub/models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B/snapshots/ada412b672e293d682423de84a095447bf38a637
+            /hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6
 
-    # TRT-LLM backend with auto-download Eagle3 adapter (only for Llama-3.1-8B-Instruct)
-    python run_trtllm_llama_eagle.py --model meta-llama/Llama-3.1-8B-Instruct --auto-download-eagle
+    # TRT-LLM backend with auto-download speculative model adapter (only for Llama-3.1-8B-Instruct)
+    python run_llama_spec_dec.py --model meta-llama/Llama-3.1-8B-Instruct --auto-download-draft-model
 
-    # AutoDeploy backend with Eagle3 adapter
-    python run_trtllm_llama_eagle.py --backend autodeploy --model meta-llama/Llama-3.1-8B-Instruct \
-        --auto-download-eagle
+    # AutoDeploy backend with speculative model adapter
+    python run_llama_spec_dec.py --backend autodeploy --model meta-llama/Llama-3.1-8B-Instruct \
+        --auto-download-draft-model
 
     # Disable speculative decoding (baseline mode) with either backend
-    python run_trtllm_llama_eagle.py --backend trtllm --model meta-llama/Llama-3.1-8B-Instruct --no-eagle
+    python run_llama_spec_dec.py --backend trtllm --model meta-llama/Llama-3.1-8B-Instruct --no-spec-dec
 """
 
 import argparse
@@ -29,7 +29,7 @@ from build_and_run_ad import ExperimentConfig
 from build_and_run_ad import main as ad_main
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import EagleDecodingConfig, KvCacheConfig
+from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
 
 
 def download_model(model_id: str, cache_dir: str = None):
@@ -80,14 +80,16 @@ def download_model(model_id: str, cache_dir: str = None):
 
 
 def ensure_speculative_model(
-    speculative_model_dir: str = None, auto_download_eagle: bool = False, model_name: str = None
+    speculative_model_dir: str = None,
+    auto_download_draft_model: bool = False,
+    model_name: str = None,
 ):
     """Ensure speculative model is available, downloading if necessary.
 
     Args:
-        speculative_model_dir: Path to local Eagle3 speculative model directory
-        auto_download_eagle: If True, auto-download default Eagle3 model (Llama-3.1-8B only)
-        model_name: Base model name to validate Eagle compatibility
+        speculative_model_dir: Path to local speculative model directory
+        auto_download_draft_model: If True, auto-download default speculative model (Llama-3.1-8B only)
+        model_name: Base model name to validate speculative model compatibility
 
     Returns:
         Path to speculative model, or None if disabled
@@ -95,30 +97,32 @@ def ensure_speculative_model(
     Raises:
         SystemExit: If both flags are specified or if any operation fails
     """
-    # Default Eagle3 model for auto-download (only for Llama-3.1-8B-Instruct)
-    DEFAULT_EAGLE_MODEL = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
+    # Default speculative model for auto-download (only for Llama-3.1-8B-Instruct)
+    DEFAULT_SPEC_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     DEFAULT_BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
     # Check for conflicting flags
-    if auto_download_eagle and speculative_model_dir:
-        print("[ERROR] Cannot specify both --auto-download-eagle and --speculative-model-dir")
+    if auto_download_draft_model and speculative_model_dir:
+        print("[ERROR] Cannot specify both --auto-download-draft-model and --speculative-model-dir")
         print("[ERROR] Please use only one of these options")
         sys.exit(1)
 
-    # Case 1: Auto-download Eagle3 model
-    if auto_download_eagle:
+    # Case 1: Auto-download speculative model
+    if auto_download_draft_model:
         # Validate that we're using the right base model
         if model_name and DEFAULT_BASE_MODEL not in model_name:
-            print(f"[WARNING] Auto-download Eagle is only supported for {DEFAULT_BASE_MODEL}")
+            print(
+                f"[WARNING] Auto-download speculative model is only supported for {DEFAULT_BASE_MODEL}"
+            )
             print(f"[WARNING] You specified: {model_name}")
-            print("[WARNING] The Eagle adapter may not be compatible with your model")
+            print("[WARNING] The speculative model adapter may not be compatible with your model")
 
-        print(f"[INFO] Auto-downloading Eagle3 adapter: {DEFAULT_EAGLE_MODEL}")
+        print(f"[INFO] Auto-downloading speculative model adapter: {DEFAULT_SPEC_MODEL}")
         print(f"[INFO] This adapter is designed for: {DEFAULT_BASE_MODEL}")
 
         # Download the model (this will raise an exception if it fails)
-        eagle_path = download_model(DEFAULT_EAGLE_MODEL)
-        return eagle_path
+        spec_model_path = download_model(DEFAULT_SPEC_MODEL)
+        return spec_model_path
 
     # Case 2: Use specified speculative model directory
     if speculative_model_dir:
@@ -137,15 +141,15 @@ def ensure_speculative_model(
     return None
 
 
-def test_llama_eagle_with_trtllm(
-    model: str, speculative_model_dir: str = None, enable_eagle: bool = True
+def test_llama_spec_dec_with_trtllm(
+    model: str, speculative_model_dir: str = None, enable_spec_dec: bool = True
 ):
     """Test model with TRT-LLM engine directly.
 
     Args:
         model: Model name or HuggingFace model ID
-        speculative_model_dir: Path to Eagle3 speculative model (optional)
-        enable_eagle: Whether to enable Eagle3 speculative decoding
+        speculative_model_dir: Path to speculative model (optional)
+        enable_spec_dec: Whether to enable speculative decoding
     """
     print(f"\n{'=' * 80}")
     print("TRT-LLM Test Configuration")
@@ -153,17 +157,16 @@ def test_llama_eagle_with_trtllm(
     print(f"Base Model: {model}")
     speculative_info = speculative_model_dir if speculative_model_dir else "None (baseline mode)"
     print(f"Speculative Model: {speculative_info}")
-    print("Eagle3 One Model: False")
     print("=" * 80 + "\n")
 
-    # Configure Eagle3 speculative decoding
-    eagle3_config = None
-    if enable_eagle and speculative_model_dir:
-        eagle3_config = EagleDecodingConfig(
-            max_draft_len=3, speculative_model_dir=speculative_model_dir, eagle3_one_model=False
+    # Configure speculative decoding (using DraftTargetDecodingConfig)
+    spec_config = None
+    if enable_spec_dec and speculative_model_dir:
+        spec_config = DraftTargetDecodingConfig(
+            max_draft_len=2, speculative_model_dir=speculative_model_dir
         )
 
-        print(f"[TRACE] Created EagleDecodingConfig: {eagle3_config}")
+        print(f"[TRACE] Created DraftTargetDecodingConfig: {spec_config}")
         print(f"[TRACE] Speculative model dir: {speculative_model_dir}")
     else:
         print("[TRACE] Running without speculative decoding (baseline mode)")
@@ -182,13 +185,18 @@ def test_llama_eagle_with_trtllm(
     ]
 
     # Create TRT-LLM instance
-    spec_mode = "Eagle3" if (enable_eagle and speculative_model_dir) else "baseline"
+    spec_mode = "speculative" if (enable_spec_dec and speculative_model_dir) else "baseline"
     print(f"\n[TRACE] Creating LLM instance ({spec_mode} mode)...")
     print(f"[TRACE] Model: {model}")
 
     try:
         # Try to use flashinfer attention backend to match AutoDeploy's attn
-        llm = LLM(model=model, speculative_config=eagle3_config, kv_cache_config=kv_cache_config, attn_backend="flashinfer")
+        llm = LLM(
+            model=model,
+            speculative_config=spec_config,
+            kv_cache_config=kv_cache_config,
+            attn_backend="flashinfer",
+        )
         print("[TRACE] LLM instance created successfully!")
 
     except Exception as e:
@@ -202,7 +210,7 @@ def test_llama_eagle_with_trtllm(
         print("1. Check if the model name is correct and accessible")
         print("2. Verify the speculative model directory is correct")
         print("3. Ensure sufficient GPU memory is available")
-        print("4. Try running with --no-eagle to test baseline first")
+        print("4. Try running with --no-spec-dec to test baseline first")
 
         raise
 
@@ -258,15 +266,15 @@ def test_llama_eagle_with_trtllm(
         raise
 
 
-def test_llama_eagle_with_autodeploy(
-    model: str, speculative_model_dir: str = None, enable_eagle: bool = True
+def test_llama_spec_dec_with_autodeploy(
+    model: str, speculative_model_dir: str = None, enable_spec_dec: bool = True
 ):
     """Test model with AutoDeploy backend.
 
     Args:
         model: Model name or HuggingFace model ID or local path
-        speculative_model_dir: Path to Eagle3 speculative model (optional)
-        enable_eagle: Whether to enable Eagle3 speculative decoding
+        speculative_model_dir: Path to speculative model (optional)
+        enable_spec_dec: Whether to enable speculative decoding
     """
     print(f"\n{'=' * 80}")
     print("AutoDeploy Test Configuration")
@@ -274,16 +282,15 @@ def test_llama_eagle_with_autodeploy(
     print(f"Base Model: {model}")
     speculative_info = speculative_model_dir if speculative_model_dir else "None (baseline mode)"
     print(f"Speculative Model: {speculative_info}")
-    print("Eagle3 One Model: False")
     print("=" * 80 + "\n")
 
-    # Configure Eagle3 speculative decoding
-    eagle3_config = None
-    if enable_eagle and speculative_model_dir:
-        eagle3_config = EagleDecodingConfig(
-            max_draft_len=3, speculative_model_dir=speculative_model_dir, eagle3_one_model=False
+    # Configure speculative decoding (using DraftTargetDecodingConfig)
+    spec_config = None
+    if enable_spec_dec and speculative_model_dir:
+        spec_config = DraftTargetDecodingConfig(
+            max_draft_len=2, speculative_model_dir=speculative_model_dir
         )
-        print(f"[TRACE] Created EagleDecodingConfig: {eagle3_config}")
+        print(f"[TRACE] Created DraftTargetDecodingConfig: {spec_config}")
         print(f"[TRACE] Speculative model dir: {speculative_model_dir}")
     else:
         print("[TRACE] Running without speculative decoding (baseline mode)")
@@ -298,7 +305,7 @@ def test_llama_eagle_with_autodeploy(
     llm_args = {
         "model": model,
         "skip_loading_weights": False,  # We want to load weights
-        "speculative_config": eagle3_config,
+        "speculative_config": spec_config,
         "runtime": "trtllm",  # AutoDeploy runtime
         "world_size": 1,
     }
@@ -314,7 +321,7 @@ def test_llama_eagle_with_autodeploy(
     }
 
     # Create ExperimentConfig
-    spec_mode = "Eagle3" if (enable_eagle and speculative_model_dir) else "baseline"
+    spec_mode = "speculative" if (enable_spec_dec and speculative_model_dir) else "baseline"
     print(f"\n[TRACE] Creating ExperimentConfig ({spec_mode} mode)...")
     print(f"[TRACE] Model: {model}")
 
@@ -371,8 +378,8 @@ def test_llama_eagle_with_autodeploy(
         print("\n[DEBUG HINTS]:")
         print("1. Check if 'speculative_config' is supported in AutoDeploy LlmArgs")
         print("2. Verify sufficient GPU memory for generation")
-        print("3. Check if AutoDeploy backend supports Eagle3")
-        print("4. Try running with --no-eagle to test baseline first")
+        print("3. Check if AutoDeploy backend supports speculative decoding")
+        print("4. Try running with --no-spec-dec to test baseline first")
 
         raise
 
@@ -380,33 +387,33 @@ def test_llama_eagle_with_autodeploy(
 def main():
     """Main entry point with argument parsing."""
     parser = argparse.ArgumentParser(
-        description="Test models with Eagle3 speculative decoding using TRT-LLM or AutoDeploy backend",
+        description="Test models with speculative decoding using TRT-LLM or AutoDeploy backend",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Use TRT-LLM backend (default) with downloaded Eagle3 adapter
+  # Use TRT-LLM backend (default) with downloaded speculative model adapter
   %(prog)s --model meta-llama/Llama-3.1-8B-Instruct \\
       --speculative-model-dir /lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/\\
-autodeploy_data/hf_home/hub/models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B/snapshots/ada412b672e293d682423de84a095447bf38a637
+autodeploy_data/hf_home/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6
 
-  # Use TRT-LLM backend with auto-download Eagle3 adapter (simplest option for Llama-3.1-8B)
-  %(prog)s --model meta-llama/Llama-3.1-8B-Instruct --auto-download-eagle
+  # Use TRT-LLM backend with auto-download speculative model adapter (simplest option for Llama-3.1-8B)
+  %(prog)s --model meta-llama/Llama-3.1-8B-Instruct --auto-download-draft-model
 
-  # Use AutoDeploy backend with auto-download Eagle3 adapter
-  %(prog)s --backend autodeploy --model meta-llama/Llama-3.1-8B-Instruct --auto-download-eagle
+  # Use AutoDeploy backend with auto-download speculative model adapter
+  %(prog)s --backend autodeploy --model meta-llama/Llama-3.1-8B-Instruct --auto-download-draft-model
 
   # Run in baseline mode without speculative decoding (TRT-LLM)
-  %(prog)s --model meta-llama/Llama-3.1-8B-Instruct --no-eagle
+  %(prog)s --model meta-llama/Llama-3.1-8B-Instruct --no-spec-dec
 
   # Run in baseline mode without speculative decoding (AutoDeploy)
-  %(prog)s --backend autodeploy --model meta-llama/Llama-3.1-8B-Instruct --no-eagle
+  %(prog)s --backend autodeploy --model meta-llama/Llama-3.1-8B-Instruct --no-spec-dec
 
 Notes:
   - --backend: Choose 'trtllm' (default) or 'autodeploy'
-  - Use exactly ONE of: --auto-download-eagle, --speculative-model-dir, or --no-eagle
-  - --auto-download-eagle: Downloads Eagle3 adapter for Llama-3.1-8B-Instruct
+  - Use exactly ONE of: --auto-download-draft-model, --speculative-model-dir, or --no-spec-dec
+  - --auto-download-draft-model: Downloads speculative model adapter for Llama-3.1-8B-Instruct
   - --speculative-model-dir: Uses an already-downloaded local directory path
-  - --no-eagle: Runs in baseline mode without speculative decoding
+  - --no-spec-dec: Runs in baseline mode without speculative decoding
   - If none specified, defaults to baseline mode
         """,
     )
@@ -431,46 +438,46 @@ Notes:
         "--speculative-model-dir",
         type=str,
         default=None,
-        help="Path to local Eagle3 speculative model directory. "
-        "Cannot be used with --auto-download-eagle",
+        help="Path to local speculative model directory. "
+        "Cannot be used with --auto-download-draft-model",
     )
 
     parser.add_argument(
-        "--auto-download-eagle",
+        "--auto-download-draft-model",
         action="store_true",
-        help="Auto-download Eagle3 adapter for Llama-3.1-8B-Instruct (yuhuili/EAGLE3-LLaMA3.1-Instruct-8B). "
+        help="Auto-download speculative model adapter for Llama-3.1-8B-Instruct (TinyLlama/TinyLlama-1.1B-Chat-v1.0). "
         "Cannot be used with --speculative-model-dir",
     )
 
     parser.add_argument(
-        "--no-eagle",
+        "--no-spec-dec",
         action="store_true",
-        help="Disable Eagle3 speculative decoding (baseline mode)",
+        help="Disable speculative decoding (baseline mode)",
     )
 
     args = parser.parse_args()
 
     # Ensure speculative model is available
     speculative_model_path = None
-    if not args.no_eagle:
+    if not args.no_spec_dec:
         speculative_model_path = ensure_speculative_model(
             speculative_model_dir=args.speculative_model_dir,
-            auto_download_eagle=args.auto_download_eagle,
+            auto_download_draft_model=args.auto_download_draft_model,
             model_name=args.model,
         )
 
     # Run the test with the appropriate backend
     if args.backend == "trtllm":
-        result = test_llama_eagle_with_trtllm(
+        result = test_llama_spec_dec_with_trtllm(
             model=args.model,
             speculative_model_dir=speculative_model_path,
-            enable_eagle=not args.no_eagle,
+            enable_spec_dec=not args.no_spec_dec,
         )
     elif args.backend == "autodeploy":
-        result = test_llama_eagle_with_autodeploy(
+        result = test_llama_spec_dec_with_autodeploy(
             model=args.model,
             speculative_model_dir=speculative_model_path,
-            enable_eagle=not args.no_eagle,
+            enable_spec_dec=not args.no_spec_dec,
         )
     else:
         print(f"[ERROR] Unknown backend: {args.backend}")
