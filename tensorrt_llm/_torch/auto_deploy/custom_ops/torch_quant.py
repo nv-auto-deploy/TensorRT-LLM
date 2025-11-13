@@ -319,3 +319,42 @@ def _fake(
     N_half = weight_quantized.shape[-2]
     N = N_half * 2
     return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)
+
+
+@torch.library.custom_op("auto_deploy::torch_fake_quant_mo_linear", mutates_args=())
+def torch_fake_quant_mo_linear(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    b: Optional[torch.Tensor],
+    amax_in: torch.Tensor,
+    amax_w: torch.Tensor,
+    num_bits: int,
+    group_size: int,
+    unsigned: bool,
+    narrow_range: bool,
+) -> torch.Tensor:
+    a_in = torch.ops.aten.detach.default(amax_in)
+    a_w = torch.ops.aten.detach.default(amax_w)
+    q_in = torch.ops.tensorrt.quantize_op.default(
+        x, a_in, num_bits, group_size, unsigned, narrow_range
+    )
+    q_w = torch.ops.tensorrt.quantize_op.default(
+        w, a_w, num_bits, group_size, unsigned, narrow_range
+    )
+    out = torch.ops.auto_deploy.torch_linear_simple.default(q_in, q_w, b)
+    return out
+
+
+@torch_fake_quant_mo_linear.register_fake
+def _fake(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    b: Optional[torch.Tensor],
+    amax_in: torch.Tensor,
+    amax_w: torch.Tensor,
+    num_bits: int,
+    group_size: int,
+    unsigned: bool,
+    narrow_range: bool,
+) -> torch.Tensor:
+    return torch.ops.auto_deploy.torch_linear_simple.default(x, w.to(x.dtype), b)
