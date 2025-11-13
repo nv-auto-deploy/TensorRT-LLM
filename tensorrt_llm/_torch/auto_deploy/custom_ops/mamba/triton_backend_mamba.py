@@ -51,7 +51,7 @@ def _triton_ssm_prepare_metadata(
     slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
     # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
     # reference implementation to support chunked prefill.
-    use_initial_states = input_pos > 0
+    use_initial_states = input_pos[:num_seq] > 0
 
     device = position_ids.device
 
@@ -73,10 +73,15 @@ def _triton_ssm_prepare_metadata(
             dim=0,
         )
         chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(cu_seqlens, chunk_size)
+        seq_idx_prefill = torch.repeat_interleave(
+            torch.arange(num_prefill, device=device, dtype=torch.int32),
+            seq_len_sanitized[:num_prefill],
+        ).view(1, -1)
     else:
         num_prefill = 0
         num_prefill_tokens = 0
         num_decode = num_seq
+        seq_idx_prefill = torch.empty(1, 0, dtype=torch.int32, device=device)
     batch_info_tensor = torch.tensor(
         [num_prefill, num_prefill_tokens, num_decode], dtype=torch.int32
     )  # host tensor
@@ -89,6 +94,7 @@ def _triton_ssm_prepare_metadata(
         cu_seqlens,
         chunk_indices,
         chunk_offsets,
+        seq_idx_prefill,
         batch_info_tensor,
     )
 
@@ -100,15 +106,50 @@ def _triton_ssm_prepare_metadata_fake(
     # Use the same sanitization logic to determine sizes in fake mode
     seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     num_seq = len(seq_len_sanitized)
+    device = slot_idx.device
+    # Always-correct shapes
+    seq_len_fake = torch.empty_like(seq_len_sanitized)
+    seq_start_fake = torch.empty_like(seq_len_sanitized)
+    slot_idx_fake = torch.empty(num_seq, dtype=torch.long, device=device)
+    use_initial_states_fake = torch.empty(num_seq, dtype=torch.bool, device=device)
+    cu_seqlens_fake = torch.empty(num_seq + 1, dtype=torch.int32, device=device)
+
+    # Token-dependent shapes (prefill vs decode)
+    _, s = position_ids.shape[:2]
+    if s > 1:
+        prefill_mask = seq_len_sanitized > 1
+        num_prefill = int(prefill_mask.sum().item())
+        num_prefill_tokens = int(seq_len_sanitized[:num_prefill].sum().item())
+        cu_seqlens_runtime = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=device),
+                torch.cumsum(seq_len_sanitized[:num_prefill].to(torch.int32), dim=0),
+            ],
+            dim=0,
+        )
+        chunk_indices_rt, chunk_offsets_rt = cu_seqlens_to_chunk_indices_offsets(
+            cu_seqlens_runtime, chunk_size
+        )
+        chunk_indices_fake = torch.empty_like(chunk_indices_rt)
+        chunk_offsets_fake = torch.empty_like(chunk_offsets_rt)
+        seq_idx_prefill_fake = torch.empty(1, num_prefill_tokens, dtype=torch.int32, device=device)
+    else:
+        chunk_indices_fake = torch.empty(0, dtype=torch.int32, device=device)
+        chunk_offsets_fake = torch.empty(0, dtype=torch.int32, device=device)
+        seq_idx_prefill_fake = torch.empty(1, 0, dtype=torch.int32, device=device)
+
+    batch_info_tensor_fake = torch.empty(3, dtype=torch.int32)
+
     return (
-        torch.empty_like(seq_len_sanitized),
-        torch.empty_like(seq_len_sanitized),
-        torch.empty(num_seq, dtype=torch.long, device=slot_idx.device),
-        torch.empty(num_seq, dtype=torch.bool, device=slot_idx.device),
-        torch.empty(num_seq + 1, dtype=torch.int32, device=slot_idx.device),  # cu seqlens
-        torch.empty(num_seq, dtype=torch.int32, device=slot_idx.device),  # chunk indices
-        torch.empty(num_seq, dtype=torch.int32, device=slot_idx.device),  # chunk offsets
-        torch.empty(2, dtype=torch.int32),  # batch info tensor
+        seq_len_fake,
+        seq_start_fake,
+        slot_idx_fake,
+        use_initial_states_fake,
+        cu_seqlens_fake,
+        chunk_indices_fake,
+        chunk_offsets_fake,
+        seq_idx_prefill_fake,
+        batch_info_tensor_fake,
     )
 
 
@@ -130,7 +171,8 @@ def _triton_cached_ssm(
     cu_seqlens: torch.Tensor,  # [num_seq + 1]
     chunk_indices: torch.Tensor,  # [num_seq + 1]
     chunk_offsets: torch.Tensor,  # [num_seq + 1]
-    batch_info_tensor: torch.Tensor,  # [2]
+    seq_idx_prefill: torch.Tensor,  # [1, num_prefill]
+    batch_info_tensor: torch.Tensor,  # [3]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
     # CONSTANTS
@@ -146,7 +188,6 @@ def _triton_cached_ssm(
     b, s, num_heads, head_dim = hidden_states.shape
     # Flatten tokens for indexing/scatter
     bs = b * s
-    device = hidden_states.device
     hs_flat = hidden_states.reshape(bs, *hidden_states.shape[2:])  # [bs, H, D]
     B_flat = B.reshape(bs, *B.shape[2:])  # [bs, G, N]
     C_flat = C.reshape(bs, *C.shape[2:])  # [bs, G, N]
@@ -157,19 +198,14 @@ def _triton_cached_ssm(
 
     ssm_state_size = B.shape[3]
 
-    [num_prefill, num_prefill_tokens, num_decode] = batch_info_tensor.tolist()
+    num_prefill, num_prefill_tokens, num_decode = batch_info_tensor.tolist()
 
     # Prefill: concatenate tokens at the front and run combined scan
     if num_prefill > 0:
-        seq_len_prefill = seq_len[:num_prefill]
-
         hs_prefill = hs_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, H, D]
         B_prefill = B_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, G, N]
         C_prefill = C_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, G, N]
         dt_prefill = dt_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, H]
-
-        seq_ids = torch.arange(num_prefill, device=device, dtype=torch.int32)
-        seq_idx_prefill = torch.repeat_interleave(seq_ids, seq_len_prefill).view(1, -1)
 
         initial_states = None
         if torch.any(use_initial_states[:num_prefill]):
@@ -178,10 +214,6 @@ def _triton_cached_ssm(
                 ssm_state_cache[slot_idx[:num_prefill]],
                 0,
             )
-            chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
-                cu_seqlens, chunk_size
-            )
-
         else:
             chunk_indices = None
             chunk_offsets = None
@@ -264,7 +296,8 @@ def _triton_cached_ssm_fake(
     cu_seqlens: torch.Tensor,  # [num_seq + 1]
     chunk_indices: torch.Tensor,  # [num_seq + 1]
     chunk_offsets: torch.Tensor,  # [num_seq + 1]
-    batch_info_tensor: torch.Tensor,  # [2]
+    seq_idx_prefill: torch.Tensor,  # [1, num_prefill]
+    batch_info_tensor: torch.Tensor,  # [3]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
     # CONSTANTS
@@ -308,8 +341,8 @@ class TritonBackendSSM(AttentionDescriptor):
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
         # Returns: seq_len, seq_start, slot_idx, use_initial_states,
-        # cu_seqlens, chunk_indices, chunk_offsets, batch_info_tensor
-        return torch.ops.auto_deploy.triton_ssm_prepare_metadata, 8
+        # cu_seqlens, chunk_indices, chunk_offsets, seq_idx_prefill, batch_info_tensor
+        return torch.ops.auto_deploy.triton_ssm_prepare_metadata, 9
 
     @classmethod
     def get_cache_initializers(

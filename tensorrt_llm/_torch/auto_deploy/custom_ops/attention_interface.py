@@ -144,6 +144,9 @@ class SequenceInfo:
         self.page_size = page_size if page_size > 0 else max_seq_len
         self.vocab_size_padded = vocab_size_padded
         self.chunk_size = chunk_size
+        # Chunk size is an input to a custom op, so we need to set a default value if it is not provided.
+        if self.chunk_size is None:
+            self.chunk_size = 128
         # NOTE (lucaslie): WAR to address issue when using flashinfer attention with
         # (max_batch_size, max_seq_len) input in trtllm runtime.
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
@@ -204,6 +207,8 @@ class SequenceInfo:
         # NOTE: order of keys is relevant here!
         self._uncached_arg_names = ("input_ids", "position_ids")
         self._cached_arg_names = ("seq_len", "input_pos", "cache_loc", "pages_per_seq", "slot_idx")
+        # page_size is the size of attentionkv-cache pages.
+        # chunk_size is used in mamba prefill kernels to split the context into chunks.
         self._cached_constants = ("page_size", "chunk_size")
         ############################################################################################
 
