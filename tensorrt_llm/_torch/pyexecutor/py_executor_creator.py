@@ -374,9 +374,12 @@ def create_py_executor(
 
             draft_llm_args = copy.copy(llm_args)
 
-            print("Constructing draft model engine. Checkpoint loader: ", draft_llm_args.checkpoint_loader)
+            print("Constructing draft model engine. Checkpoint loader: ",
+                  draft_llm_args.checkpoint_loader)
             if spec_config.load_format == "dummy":
                 draft_llm_args.load_format = LoadFormat.DUMMY
+
+            print(f"[TRACE] Dist: {dist}")
 
             draft_model_engine = PyTorchModelEngine(
                 model_path=spec_config.speculative_model_dir,

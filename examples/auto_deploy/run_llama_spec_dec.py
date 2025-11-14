@@ -185,7 +185,7 @@ def test_llama_spec_dec_with_trtllm(
     # Configure KV cache
     # Allocate 80% of free GPU memory for KV cache
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.8,
+        free_gpu_memory_fraction=0.3,
     )
     print("[TRACE] Created KvCacheConfig with free_gpu_memory_fraction=0.8")
 
@@ -201,6 +201,7 @@ def test_llama_spec_dec_with_trtllm(
             speculative_config=spec_config,
             kv_cache_config=kv_cache_config,
             attn_backend="flashinfer",
+            tensor_parallel_size=2,
         )
         print("[TRACE] LLM instance created successfully!")
 
@@ -304,7 +305,7 @@ def test_llama_spec_dec_with_autodeploy(
         "skip_loading_weights": False,  # We want to load weights
         "speculative_config": spec_config,
         "runtime": "trtllm",  # AutoDeploy runtime
-        "world_size": 1,
+        "world_size": 2,
     }
 
     # Configure experiment with prompts

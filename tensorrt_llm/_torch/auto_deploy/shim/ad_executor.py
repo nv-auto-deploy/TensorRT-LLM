@@ -21,7 +21,7 @@ from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.pyexecutor._util import create_draft_kv_cache_manager
+from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import is_mla
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.llm_request import get_draft_token_length
@@ -173,10 +173,113 @@ def construct_draft_llm_args(
     return draft_llm_args
 
 
-def get_max_num_tokens(max_num_tokens: Optional[int], max_seq_len: int, batch_size: int) -> int:
-    if max_num_tokens is not None:
-        return max_num_tokens
+# Used for compatibility with interfaces that expect max_num_tokens to be an int.
+def get_max_num_tokens(num_tokens_limit: Optional[int], max_seq_len: int, batch_size: int) -> int:
+    if num_tokens_limit is not None:
+        return num_tokens_limit
     return max_seq_len * batch_size
+
+
+def create_draft_kv_cache_manager_maybe(
+    draft_model_engine: Optional[PyTorchModelEngine],
+    ad_config: LlmArgs,
+    dist_mapping: Mapping,
+) -> Optional[KVCacheManager]:
+    if draft_model_engine is None or not draft_model_engine.model.model_config.is_generation:
+        return None
+
+    # Get the appropriate KV cache manager class
+    kv_cache_manager_cls = get_kv_cache_manager_cls(draft_model_engine.model.model_config)
+
+    return _create_kv_cache_manager(
+        model_engine=draft_model_engine,
+        kv_cache_manager_cls=kv_cache_manager_cls,
+        mapping=dist_mapping,
+        kv_cache_config=ad_config.kv_cache_config,
+        tokens_per_block=ad_config.attn_page_size,
+        max_seq_len=ad_config.max_seq_len,
+        max_batch_size=ad_config.max_batch_size,
+        spec_config=ad_config.speculative_config,
+        sparse_attn_config=ad_config.sparse_attention_config,
+        max_num_tokens=ad_config.max_num_tokens,
+        max_beam_width=ad_config.max_beam_width,
+        is_draft=True,
+        kv_connector_manager=None,  # KV connector not supported with draft models in AutoDeploy
+        estimating_kv_cache=False,
+    )
+
+
+def create_spec_resource_manager(
+    engine: "ADEngine",
+    draft_model_engine: Optional[PyTorchModelEngine] = None,
+):
+    """
+    Create a speculative resource manager for the given ADEngine and optional draft model.
+
+    This is a convenience helper that extracts the necessary configuration from the engine
+    objects to create the spec resource manager, rather than requiring all parameters to be
+    passed explicitly.
+
+    Args:
+        engine: The ADEngine (target model engine) that stores ad_config
+        draft_model_engine: Optional draft model engine for speculative decoding
+
+    Returns:
+        A spec resource manager or None if speculative config is not set
+    """
+    max_num_tokens = get_max_num_tokens(
+        engine.llm_args.max_num_tokens, engine.llm_args.max_seq_len, engine.ad_config.max_batch_size
+    )
+
+    return _get_spec_resource_manager(
+        spec_config=engine.spec_config,
+        model_config=engine.model_config,
+        max_num_requests=engine.get_max_num_sequences(),
+        max_seq_len=engine.llm_args.max_seq_len,
+        max_num_tokens=max_num_tokens,
+        draft_model_engine=draft_model_engine,
+    )
+
+
+def get_spec_drafter(
+    model_engine: "ADEngine",
+    draft_model_engine,
+    sampler,
+    spec_resource_manager,
+    guided_decoder: Optional[GuidedDecoder] = None,
+):
+    """
+    Create a speculative drafter for the given ADEngine.
+
+    This is a convenience helper that extracts spec_config and max_num_requests
+    from the ADEngine and delegates to _get_spec_drafter, similar to the
+    get_spec_drafter function in tensorrt_llm._torch.speculative.utils but
+    adapted for ADEngine.
+
+    Args:
+        model_engine: The ADEngine (target model engine)
+        draft_model_engine: Draft model engine for speculative decoding
+        sampler: The sampler instance
+        spec_resource_manager: Speculative resource manager
+        guided_decoder: Optional guided decoder for structured generation
+
+    Returns:
+        A speculative drafter or None if speculative config is not set
+    """
+    spec_config = model_engine.spec_config
+    if spec_config is None:
+        return None
+
+    max_num_requests = model_engine.get_max_num_sequences()
+
+    return _get_spec_drafter(
+        spec_config=spec_config,
+        max_num_requests=max_num_requests,
+        draft_model_engine=draft_model_engine,
+        sampler=sampler,
+        spec_resource_manager=spec_resource_manager,
+        guided_decoder=guided_decoder,
+    )
 
 
 class ADEngine(ModelEngine):
@@ -192,12 +295,12 @@ class ADEngine(ModelEngine):
         return self.cache_seq_interface.device
 
     @property
-    def runtime_draft_len(self):
-        return self.spec_config.max_draft_len if self.spec_config is not None else 0
-
-    @property
     def run_with_spec_decode(self):
         return self.spec_config is not None
+
+    @property
+    def model_config(self):
+        return self.ad_config.create_factory()._get_model_config()
 
     @classmethod
     def build_from_config(cls, ad_config: LlmArgs):
@@ -426,7 +529,6 @@ class ADEngine(ModelEngine):
                 input_pos.append(num_tokens_seen)
             else:
                 print(f"length of request.py_draft_tokens: {len(request.py_draft_tokens)}")
-                print(f"runtime draft len (configured at init): {self.runtime_draft_len}")
                 print(f"py_batch_idx: {request.py_batch_idx}")
 
                 gather_indices_to_extend = [
@@ -602,6 +704,146 @@ class ADEngine(ModelEngine):
         return {"logits": logits_flat}
 
 
+def create_draft_model_engine_maybe(
+    ad_config: LlmArgs,
+    engine,
+    dist_mapping: Mapping,
+    mpi_dist: MPIDist,
+    max_draft_len: int,
+    max_total_draft_tokens: int,
+) -> Optional[PyTorchModelEngine]:
+    """Create a draft model engine for speculative decoding.
+
+    Args:
+        ad_config: The AutoDeploy LLM configuration
+        engine: The target model engine (ADEngine)
+        dist_mapping: The distributed mapping configuration
+        mpi_dist: The MPI distribution object
+        max_draft_len: Maximum draft length for speculative decoding
+        max_total_draft_tokens: Maximum total draft tokens
+
+    Returns:
+        PyTorchModelEngine configured as a draft model, or None if not needed
+    """
+    spec_config = ad_config.speculative_config
+    if spec_config is None or not spec_config.spec_dec_mode.has_draft_model():
+        return None
+
+    has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
+    print(f"[TRACE] Has spec drafter: {has_spec_drafter}")
+
+    draft_spec_config = copy.copy(spec_config)
+
+    use_chain_drafter = (
+        ad_config.guided_decoding_backend is None
+        and draft_spec_config._allow_chain_drafter
+        and draft_spec_config._allow_greedy_draft_tokens
+        and ad_config.attn_backend == "TRTLLM"
+    )
+
+    print(f"[TRACE] Use chain drafter: {use_chain_drafter}")
+    print("[TRACE] ad_config.guided_decoding_backend: ", ad_config.guided_decoding_backend)
+    print(
+        "[TRACE] draft_spec_config._allow_chain_drafter: ",
+        draft_spec_config._allow_chain_drafter,
+    )
+    print(
+        "[TRACE] draft_spec_config._allow_greedy_draft_tokens: ",
+        draft_spec_config._allow_greedy_draft_tokens,
+    )
+    print("[TRACE] ad_config.attn_backend: ", ad_config.attn_backend)
+    if use_chain_drafter:
+
+        def drafting_loop_wrapper(model):
+            from tensorrt_llm._torch.speculative.drafting_loops import ChainDrafter
+
+            return ChainDrafter(max_draft_len, max_total_draft_tokens, model)
+    else:
+        drafting_loop_wrapper = None
+
+    enable_chunked_context = ad_config.enable_chunked_prefill
+    if ad_config.attn_backend == "FLASHINFER_STAR_ATTENTION":
+        enable_chunked_context = False
+
+    kv_cache_config = ad_config.kv_cache_config
+
+    # chunk_unit_size may be changed to 64 when using flash mla
+    attn_runtime_features = AttentionRuntimeFeatures(
+        chunked_prefill=enable_chunked_context,
+        cache_reuse=kv_cache_config.enable_block_reuse,
+        has_speculative_draft_tokens=has_spec_drafter,
+        chunk_size=engine.llm_args.max_num_tokens,
+    )
+
+    # Construct TorchLlmArgs for the draft model
+    draft_llm_args = construct_draft_llm_args(
+        ad_config=ad_config,
+        draft_spec_config=draft_spec_config,
+        enable_chunked_context=enable_chunked_context,
+    )
+
+    print(
+        f"[AUTODEPLOY] Creating draft_model_engine with model_path: {draft_spec_config.speculative_model_dir}"
+    )
+    print(f"[TRACE] Dist: {mpi_dist}")
+
+    draft_model_engine = PyTorchModelEngine(
+        model_path=draft_spec_config.speculative_model_dir,
+        llm_args=draft_llm_args,
+        mapping=dist_mapping,
+        attn_runtime_features=attn_runtime_features,
+        dist=mpi_dist,
+        spec_config=draft_spec_config,
+        is_draft_model=True,
+        drafting_loop_wrapper=drafting_loop_wrapper,
+    )
+
+    # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
+    if draft_spec_config.spec_dec_mode.is_mtp_eagle():
+        draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
+
+    draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
+
+    # The goal here is to share the embed_tokens and lm_head weights between the draft model and the target model.
+    # This is done by referencing the submodules from the target model in the draft model.
+    # This code expects that the submodules in the target model have a forward() function,
+    # which is not the case when the target model is an ADEngine.
+    # We need to ensure compatibility with this case.
+
+    share_embedding_weights(engine, draft_model_engine)
+
+    # If the model is an MLA model, we need to set
+    # draft_model_engine.attn_runtime_features.chunked_prefill to False
+    target_model_config = engine.model_config
+    print(f"[TRACE] Engine model pretrained config: {target_model_config}")
+    print(f"[TRACE] Is MLA: {is_mla(target_model_config)}")
+
+    if is_mla(target_model_config):
+        draft_model_engine.attn_runtime_features.chunked_prefill = False
+
+    return draft_model_engine
+
+
+def share_embedding_weights(
+    target_model_engine: "ADEngine", draft_model_engine: PyTorchModelEngine
+):
+    return
+    submodule = target_model_engine.model.model.embed_tokens
+
+    # Note: This simple forward function implementation assumes tp=1.
+    # TODO: Handle the tp>1 case.
+
+    # assert target_model_engine.ad_config.world_size <= 1, \
+    #     f"This code assumes tp<=1. World size: {target_model_engine.ad_config.world_size}"
+
+    def new_embedding_forward(self, input_ids):
+        return F.embedding(input_ids, self.weight)
+
+    submodule.forward = types.MethodType(new_embedding_forward, submodule)
+
+    draft_model_engine.load_weights_from_target_model(target_model_engine.model)
+
+
 def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[TokenizerBase] = None):
     """Create an AutoDeploy executor from the given configuration and tokenizer.
     The tokenizer is required for guided decoding.
@@ -635,127 +877,18 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     print(f"[TRACE] Max draft len: {max_draft_len}")
     print(f"[TRACE] Max total draft tokens: {max_total_draft_tokens}")
 
-    has_draft_model_engine = False
-    has_spec_drafter = False
-    if ad_config.speculative_config is not None:
-        has_draft_model_engine = ad_config.speculative_config.spec_dec_mode.has_draft_model()
-        has_spec_drafter = ad_config.speculative_config.spec_dec_mode.has_spec_drafter()
-
-    print(f"[TRACE] Has draft model engine: {has_draft_model_engine}")
-    print(f"[TRACE] Has spec drafter: {has_spec_drafter}")
-
     # initialize model engine
     engine = ADEngine.build_from_config(ad_config=ad_config)
 
-    if has_draft_model_engine:
-        draft_spec_config = copy.copy(ad_config.speculative_config)
-
-        use_chain_drafter = (
-            ad_config.guided_decoding_backend is None
-            and draft_spec_config._allow_chain_drafter
-            and draft_spec_config._allow_greedy_draft_tokens
-            and ad_config.attn_backend == "TRTLLM"
-        )
-
-        print(f"[TRACE] Use chain drafter: {use_chain_drafter}")
-        print("[TRACE] ad_config.guided_decoding_backend: ", ad_config.guided_decoding_backend)
-        print(
-            "[TRACE] draft_spec_config._allow_chain_drafter: ",
-            draft_spec_config._allow_chain_drafter,
-        )
-        print(
-            "[TRACE] draft_spec_config._allow_greedy_draft_tokens: ",
-            draft_spec_config._allow_greedy_draft_tokens,
-        )
-        print("[TRACE] ad_config.attn_backend: ", ad_config.attn_backend)
-        if use_chain_drafter:
-
-            def drafting_loop_wrapper(model):
-                from tensorrt_llm._torch.speculative.drafting_loops import ChainDrafter
-
-                return ChainDrafter(max_draft_len, max_total_draft_tokens, model)
-        else:
-            drafting_loop_wrapper = None
-
-        enable_chunked_context = ad_config.enable_chunked_prefill
-        if ad_config.attn_backend == "FLASHINFER_STAR_ATTENTION":
-            enable_chunked_context = False
-
-        kv_cache_config = ad_config.kv_cache_config
-
-        # chunk_unit_size may be changed to 64 when using flash mla
-        attn_runtime_features = AttentionRuntimeFeatures(
-            chunked_prefill=enable_chunked_context,
-            cache_reuse=kv_cache_config.enable_block_reuse,
-            has_speculative_draft_tokens=has_draft_model_engine or has_spec_drafter,
-            chunk_size=engine.llm_args.max_num_tokens,
-        )
-
-        # Construct TorchLlmArgs for the draft model
-        draft_llm_args = construct_draft_llm_args(
-            ad_config=ad_config,
-            draft_spec_config=draft_spec_config,
-            enable_chunked_context=enable_chunked_context,
-        )
-
-        print(
-            f"[AUTODEPLOY] Creating draft_model_engine with model_path: {draft_spec_config.speculative_model_dir}"
-        )
-        draft_model_engine = PyTorchModelEngine(
-            model_path=draft_spec_config.speculative_model_dir,
-            llm_args=draft_llm_args,
-            mapping=dist_mapping,
-            attn_runtime_features=attn_runtime_features,
-            dist=mpi_dist,
-            spec_config=draft_spec_config,
-            is_draft_model=True,
-            drafting_loop_wrapper=drafting_loop_wrapper,
-        )
-
-        # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
-        if draft_spec_config.spec_dec_mode.is_mtp_eagle():
-            draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
-        draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
-
-        # Note: This loads weights from the target model, which in this case is an ADEngine.
-        # It is possible that ADEngine optimizations mess up the shared weights if we are not careful.
-        # TODO: Understand this case and test it.
-
-        # The goal here is to share the embed_tokens and lm_head weights between the draft model and the target model.
-        # This is done by referencing the submodules from the target model in the draft model.
-        # This code expects that the submodules in the target model have a forward() function,
-        # which is not the case when the target model is an ADEngine.
-        # We need to ensure compatibility with this case.
-
-        submodule = engine.model.model.embed_tokens
-
-        # Note: This simple forward function implementation assumes tp=1.
-        # TODO: Handle the tp>1 case.
-
-        assert ad_config.world_size <= 1, "This code assumes tp<=1. TODO: Handle the tp>1 case."
-
-        def new_embedding_forward(self, input_ids):
-            return F.embedding(input_ids, self.weight)
-
-        submodule.forward = types.MethodType(new_embedding_forward, submodule)
-
-        draft_model_engine.load_weights_from_target_model(engine.model)
-
-    else:
-        draft_model_engine = None
-
-    # TODO: If the model is an MLA model, we need to set
-    # draft_model_engine.attn_runtime_features.chunked_prefill to False
+    draft_model_engine = create_draft_model_engine_maybe(
+        ad_config=ad_config,
+        engine=engine,
+        dist_mapping=dist_mapping,
+        mpi_dist=mpi_dist,
+        max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
+    )
     print("[TRACE] AD Config: ", ad_config)
-
-    # Get pretrained_config from the factory since ADEngine.model is a GraphModule without model_config
-    factory = ad_config.create_factory()
-    target_model_config, _ = factory._get_model_config()
-    print(f"[TRACE] Engine model pretrained config: {target_model_config}")
-    print(f"[TRACE] Is MLA: {is_mla(target_model_config)}")
-
-    if draft_model_engine is not None and is_mla(target_model_config):
-        draft_model_engine.attn_runtime_features.chunked_prefill = False
 
     # check kvcache config for partial block reuse
     # TODO: copy_on_partial_reuse is not supported yet, see
@@ -780,9 +913,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         )
 
     # resource managers
-    # ADEngine creates its own KV cache manager (_CacheManagerWithFakePool)
-    # since it manages KV cache differently from PyTorchModelEngine
-
     print(
         f"[TRACE] engine.cache_seq_interface.info.num_pages: {engine.cache_seq_interface.info.num_pages}"
     )
@@ -798,35 +928,13 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     )
     seq_slot_manager = SeqSlotManager(max_num_sequences=max_num_sequences)
 
-    # Create KV cache manager for draft model if it exists
-    # Draft model uses standard PyTorchModelEngine, so it needs a standard KV cache manager
-    draft_kv_cache_manager = None
-    if draft_model_engine is not None and draft_model_engine.model.model_config.is_generation:
-        draft_kv_cache_manager = create_draft_kv_cache_manager(
-            draft_model_engine,
-            mapping=dist_mapping,
-            tokens_per_block=ad_config.attn_page_size,
-            max_seq_len=ad_config.max_seq_len,
-            max_batch_size=ad_config.max_batch_size,
-            kv_cache_config=ad_config.kv_cache_config,
-            speculative_config=ad_config.speculative_config,
-            sparse_attention_config=ad_config.sparse_attention_config,
-            max_num_tokens=ad_config.max_num_tokens,
-            max_beam_width=ad_config.max_beam_width,
-            kv_connector_manager=None,  # KV connector not supported with draft models in AutoDeploy
-            estimating_kv_cache=False,
-        )
+    draft_kv_cache_manager = create_draft_kv_cache_manager_maybe(
+        draft_model_engine, ad_config, dist_mapping
+    )
 
-    # Create spec resource manager using the internal function with explicit parameters
-    # This allows us to work with ADEngine which doesn't have the same attribute structure as PyTorchModelEngine
-    draft_model_config = draft_model_engine.model.config if draft_model_engine is not None else None
-    spec_resource_manager = _get_spec_resource_manager(
-        spec_config=ad_config.speculative_config,
-        model_config=target_model_config,
-        max_num_requests=ad_config.max_batch_size,
-        max_seq_len=ad_config.max_seq_len,
-        max_num_tokens=engine.llm_args.max_num_tokens,
-        draft_model_config=draft_model_config,
+    spec_resource_manager = create_spec_resource_manager(
+        engine=engine,
+        draft_model_engine=draft_model_engine,
     )
 
     resource_manager = ResourceManager(
@@ -838,8 +946,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         }
     )
 
-    # For some reason it does not look like the draft KV Cache Manager is moved to the end.
-    # in the PyTorchModelEngine implementation. So we do the same.
     resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # TODO: consider passing through scheduler_config arguments here. Not doing this for now since
@@ -877,7 +983,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     )
     sampler = TorchSampler(sampler_args)
 
-    # Guided (istructured) decoding.
+    # Guided (structured) decoding.
     guided_decoder = None
     if (
         (guided_decoding_backend := ad_config.guided_decoding_backend) is not None
@@ -896,15 +1002,11 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
             vocab_size_padded=vocab_size_padded,
         )
 
-    # Create spec drafter using the internal function with explicit parameters
-    # This allows us to work with ADEngine which doesn't have the same attribute structure as PyTorchModelEngine
-    drafter = _get_spec_drafter(
-        spec_config=ad_config.speculative_config,
-        max_num_requests=ad_config.max_batch_size,
+    drafter = get_spec_drafter(
+        model_engine=engine,
         draft_model_engine=draft_model_engine,
         sampler=sampler,
         spec_resource_manager=spec_resource_manager,
-        guided_decoder=guided_decoder,
     )
 
     print(f"[TRACE] Drafter in AutoDeploy executor: {drafter}")
