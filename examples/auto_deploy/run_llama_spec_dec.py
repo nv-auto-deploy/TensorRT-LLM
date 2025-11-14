@@ -32,7 +32,7 @@ from build_and_run_ad import main as ad_main
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
 
-NUM_DRAFT_TOKENS = 1
+NUM_DRAFT_TOKENS = 3
 
 # Test prompts
 prompts = [
