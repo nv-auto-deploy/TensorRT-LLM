@@ -10,13 +10,13 @@
 # limitations under the License.
 
 import copy
+import types
 from collections import defaultdict
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-import types
 from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
@@ -24,13 +24,23 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeat
 from tensorrt_llm._torch.pyexecutor._util import create_draft_kv_cache_manager
 from tensorrt_llm._torch.pyexecutor.config_utils import is_mla
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
+from tensorrt_llm._torch.pyexecutor.llm_request import get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
-from tensorrt_llm._torch.speculative import (SpecMetadata,
-                                              _get_spec_drafter,
-                                              _get_spec_resource_manager)
+from tensorrt_llm._torch.speculative import (
+    SpecMetadata,
+    _get_spec_drafter,
+    _get_spec_resource_manager,
+    get_spec_metadata,
+)
+from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, DecodingBaseConfig, LoadFormat, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    ContextChunkingPolicy,
+    DecodingBaseConfig,
+    LoadFormat,
+    TorchLlmArgs,
+)
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 
 from ...._utils import mpi_rank, mpi_world_size
@@ -40,7 +50,7 @@ from ...distributed import MPIDist
 from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager, ResourceManagerType
-from ...pyexecutor.sampler import TorchSampler
+from ...pyexecutor.sampler import SampleStateTensors, TorchSampler
 from ...pyexecutor.scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,
@@ -110,29 +120,42 @@ def construct_draft_llm_args(
     """
     # Extract common fields as a dict
     common_fields = {
-        'model': draft_spec_config.speculative_model_dir,
-        'tokenizer': ad_config.tokenizer,
-        'max_batch_size': ad_config.max_batch_size,
-        'max_seq_len': ad_config.max_seq_len,
-        'max_beam_width': ad_config.max_beam_width,
-        'max_num_tokens': ad_config.max_num_tokens,
-        'max_input_len': ad_config.max_input_len,
-        'kv_cache_config': ad_config.kv_cache_config,
-        'enable_chunked_prefill': enable_chunked_context,
-        'attn_backend': ad_config.attn_backend,
-        'disable_overlap_scheduler': ad_config.disable_overlap_scheduler,
-        'speculative_config': draft_spec_config,
-        'checkpoint_loader': getattr(ad_config, 'draft_checkpoint_loader', None),
+        "model": draft_spec_config.speculative_model_dir,
+        "tokenizer": ad_config.tokenizer,
+        "max_batch_size": ad_config.max_batch_size,
+        "max_seq_len": ad_config.max_seq_len,
+        "max_beam_width": ad_config.max_beam_width,
+        "max_num_tokens": ad_config.max_num_tokens,
+        "max_input_len": ad_config.max_input_len,
+        "kv_cache_config": ad_config.kv_cache_config,
+        "enable_chunked_prefill": enable_chunked_context,
+        "attn_backend": ad_config.attn_backend,
+        "disable_overlap_scheduler": ad_config.disable_overlap_scheduler,
+        "speculative_config": draft_spec_config,
+        "checkpoint_loader": getattr(ad_config, "draft_checkpoint_loader", None),
     }
 
     # Add other fields that may exist in ad_config
     optional_fields = [
-        'dtype', 'trust_remote_code', 'sparse_attention_config',
-        'lora_config', 'scheduler_config', 'garbage_collection_gen0_threshold',
-        'skip_tokenizer_init', 'tokenizer_mode', 'revision', 'tokenizer_revision',
-        'tensor_parallel_size', 'pipeline_parallel_size', 'context_parallel_size',
-        'gpus_per_node', 'enable_lora', 'guided_decoding_backend',
-        'peft_cache_config', 'cache_transceiver_config', 'decoding_config',
+        "dtype",
+        "trust_remote_code",
+        "sparse_attention_config",
+        "lora_config",
+        "scheduler_config",
+        "garbage_collection_gen0_threshold",
+        "skip_tokenizer_init",
+        "tokenizer_mode",
+        "revision",
+        "tokenizer_revision",
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "context_parallel_size",
+        "gpus_per_node",
+        "enable_lora",
+        "guided_decoding_backend",
+        "peft_cache_config",
+        "cache_transceiver_config",
+        "decoding_config",
     ]
 
     for field in optional_fields:
@@ -150,6 +173,12 @@ def construct_draft_llm_args(
     return draft_llm_args
 
 
+def get_max_num_tokens(max_num_tokens: Optional[int], max_seq_len: int, batch_size: int) -> int:
+    if max_num_tokens is not None:
+        return max_num_tokens
+    return max_seq_len * batch_size
+
+
 class ADEngine(ModelEngine):
     """The AutoDeploy Engine (ADEngine) is the main engine interface to execute AutoDeploy models.
 
@@ -161,6 +190,10 @@ class ADEngine(ModelEngine):
     @property
     def _device(self) -> DeviceLikeType:
         return self.cache_seq_interface.device
+
+    @property
+    def runtime_draft_len(self):
+        return self.spec_config.max_draft_len if self.spec_config is not None else 0
 
     @classmethod
     def build_from_config(cls, ad_config: LlmArgs):
@@ -202,8 +235,8 @@ class ADEngine(ModelEngine):
             build_and_optimize,
             seq_info,
             device,
+            ad_config,
             max_beam_width,
-            spec_config=ad_config.speculative_config,
         )
 
     @torch.inference_mode()
@@ -212,8 +245,8 @@ class ADEngine(ModelEngine):
         get_inference_model: GetInferenceModel,
         seq_info: SequenceInfo,
         device: DeviceLikeType,
+        ad_config: LlmArgs,
         max_beam_width: int = 1,
-        spec_config: Optional[DecodingBaseConfig] = None,
     ) -> None:
         """Initialize the engine with model and sequence information."""
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
@@ -228,15 +261,16 @@ class ADEngine(ModelEngine):
         self.llm_args.batch_wait_timeout_iters = 0
         self.llm_args.batch_wait_max_tokens_ratio = 0.0
         self.llm_args.max_num_tokens = seq_info.max_num_tokens
+        self.llm_args.max_seq_len = seq_info.max_seq_len
         self.iter_counter = 0
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
         self.max_beam_width = max_beam_width
         self.enable_attention_dp = False
 
-        print(f"[TRACE] Spec config in ADEngine.__init__: {spec_config}")
-
-        self.spec_config = spec_config
+        self.ad_config = ad_config
+        self.spec_config = ad_config.speculative_config
+        print(f"[TRACE] Spec config in ADEngine.__init__: {self.spec_config}")
 
         # construct cache sequence interface
         self.cache_seq_interface = CachedSequenceInterface(
@@ -255,7 +289,7 @@ class ADEngine(ModelEngine):
         self,
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
-        new_tokens: Optional[torch.Tensor] = None,
+        new_tensors_device: Optional[SampleStateTensors] = None,
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> List[bool]:
         """Prepare inputs for AD Model from scheduled requests."""
@@ -267,13 +301,60 @@ class ADEngine(ModelEngine):
         print(f"[TRACE] Context requests length: {len(scheduled_requests.context_requests)}")
         print(f"[TRACE] Generation requests length: {len(scheduled_requests.generation_requests)}")
 
+        assert self.spec_config.spec_dec_mode.support_overlap_scheduler(), (
+            f"{self.spec_config.spec_dec_mode.decoding_type} must support the overlap scheduler currently"
+        )
+
+        new_tokens, new_tokens_lens, next_draft_tokens = None, None, None
+        if new_tensors_device is not None:
+            print(f"[TRACE] new_tensors_device type: {type(new_tensors_device)}")
+            new_tokens = new_tensors_device.new_tokens
+            print(f"new_tokens: {new_tokens}")
+            print(f"new_tokens.shape: {new_tokens.shape}")
+
+            # Note(govind): The following if statement should always be true if we are using
+            # the overlap scheduler with speculative decoding.
+            if isinstance(new_tensors_device, SampleStateTensorsMTP):
+                assert self.ad_config.speculative_config is not None
+                new_tokens_lens = len(new_tensors_device.new_tokens_lens)  # [batch]
+                next_draft_tokens = new_tensors_device.next_draft_tokens  # [batch, draft_len]
+                print(f"new_tokens_lens (length): {new_tokens_lens}")
+                print(f"next_draft_tokens: {next_draft_tokens}")
+
+        # TODO(govind): Manage guided decoding + speculative decoding together.
+
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
 
+        print(f"[TRACE] KV cache manager: {kv_cache_manager}")
         # requests in order of context, generate
         context_requests = scheduled_requests.context_requests
-        gen_requests = [r for r in scheduled_requests.generation_requests if not r.draft_tokens]
+        gen_requests = scheduled_requests.generation_requests
+        extend_requests = []
+        first_draft_requests = []
+        generation_requests = []
+
+        # separate requests into extend requests (contains draft tokens) and other
+        # generation requests (requests that do not have draft tokens)
+        for request in gen_requests:
+            if get_draft_token_length(request) > 0 or next_draft_tokens is not None:
+                extend_requests.append(request)
+            else:
+                generation_requests.append(request)
+
+            assert not request.py_is_first_draft, (
+                "first draft requests should not be here, ADEngine only supports target models in spec dec"
+            )
+
+        print(f"[TRACE] Extend requests: {extend_requests}")
+        print(f"[TRACE] First draft requests: {first_draft_requests}")
+        print(
+            f"[TRACE] Generation requests (not extend or first draft requests): {generation_requests}"
+        )
+
+        if new_tokens is not None:
+            print(f"[TRACE] New tokens shape: {new_tokens.shape}")
 
         # info to be extracted
         input_ids: List[List[int]] = []
@@ -281,7 +362,7 @@ class ADEngine(ModelEngine):
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
         slot_idx: List[int] = []
-        flat_gather_idx: List[int] = []
+        flat_gather_indices: List[int] = []
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
         dummy_token = -1
@@ -317,15 +398,60 @@ class ADEngine(ModelEngine):
 
         # look at generate requests next
         # TODO: we should also handle extend requests (for speculative decoding) here
-        for request in gen_requests:
+
+        for request in extend_requests:
+            if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
+                print("Processing possibly non-dummy request")
+                print(
+                    f"new_tokens: {new_tokens}, request.is_dummy: {request.is_dummy},\
+                        request.py_batch_idx: {request.py_batch_idx},\
+                        request.max_beam_num_tokens: {request.max_beam_num_tokens}"
+                )
+                input_ids.append(
+                    [request.get_token(0, request.get_num_tokens(0) - 1)]
+                    + [token for token in request.py_draft_tokens]
+                )
+                num_tokens_seen = request.max_beam_num_tokens - 1
+                input_pos.append(num_tokens_seen)
+            else:
+                print(f"length of request.py_draft_tokens: {len(request.py_draft_tokens)}")
+                print(f"runtime draft len (configured at init): {self.runtime_draft_len}")
+
+                # I think the following may only work for batch size=1.
+                gather_indices_to_extend = [
+                    x * new_tokens_lens + len(input_ids)
+                    for x in range(len(request.py_draft_tokens) + 1)
+                ]
+
+                print(f"gather_indices_to_extend: {gather_indices_to_extend}")
+                flat_gather_indices.extend(gather_indices_to_extend)
+                dummy_draft_tokens = [dummy_token for _ in range(len(request.py_draft_tokens))]
+                print(dummy_draft_tokens)
+                input_ids.append([dummy_token] + dummy_draft_tokens)
+
+                num_tokens_seen = request.max_beam_num_tokens - 1
+                input_pos.append(num_tokens_seen)
+
+            last_logit_only.append(False)
+
+        for request in generation_requests:
+            print("About to append the following to input_pos:")
+            print("Request.max_beam_num_tokens: ", request.max_beam_num_tokens)
+            print("Request.py_draft_tokens: ", request.py_draft_tokens)
+
             # new_tokens are provided when the overlap scheduler is enabled.
             if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
                 input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
                 input_pos.append(request.max_beam_num_tokens - 1)
+
             else:
                 input_ids.append([dummy_token])
                 input_pos.append(request.max_beam_num_tokens)
-                flat_gather_idx.append(request.py_batch_idx)
+                flat_gather_indices.append(request.py_batch_idx)
+
+            print("Got to here0")
+            print(f"[TRACE] request.seq_slot: {request.seq_slot}")
+            print(f"[TRACE] request.py_batch_idx: {request.py_batch_idx}")
 
             request.py_batch_idx = request.seq_slot
 
@@ -340,6 +466,7 @@ class ADEngine(ModelEngine):
             cache_indices = kv_cache_manager.get_cache_indices(request)
             page_assignments.append(cache_indices)
 
+        print("Finished for loop over generation requests.")
         # update the sequence info object now
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
@@ -348,19 +475,35 @@ class ADEngine(ModelEngine):
             slot_idx=slot_idx,
             **extra_args,
         )
+
+        print(f"[TRACE] input_ids: {input_ids}")
+        print(f"[TRACE] input_pos: {input_pos}")
+        print(f"[TRACE] page_assignments: {page_assignments}")
+        print(f"[TRACE] flat_gather_idx: {flat_gather_indices}")
+        print(f"new_tokens (unflattened): {new_tokens}")
+
+        print(
+            f"[TRACE] sequence info (before rescatter): {self.cache_seq_interface.info.named_args}"
+        )
         # scatter the new tokens into the input_ids tensor if provided
         if new_tokens is not None:
             self.cache_seq_interface.info.rescatter_input_ids(
                 ungathered_input_ids=new_tokens.flatten(),  # ensure it's flattened
-                gather_idx=flat_gather_idx,
+                gather_idx=flat_gather_indices,
                 scatter_ref=dummy_token,
             )
+
+        print(
+            f"[TRACE] sequence info (after rescatter): {self.cache_seq_interface.info.named_args}"
+        )
 
         return last_logit_only
 
     @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
+        print("[TRACE] In _compute_logits(). Running model with named args")
+        print(f"[TRACE] Named args: {self.cache_seq_interface.info.named_args}")
         logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
 
         # return a list of tensors
@@ -380,19 +523,57 @@ class ADEngine(ModelEngine):
         cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
-        # convert requests and store in sequence info object
-        new_tokens = getattr(new_tensors_device, "new_tokens", None)
-        last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager, new_tokens)
 
+        spec_metadata = None
+        if self.enable_spec_decode:
+            spec_resource_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER
+            )
+
+            batch_size = scheduled_requests.batch_size
+            max_num_tokens = get_max_num_tokens(
+                self.llm_args.max_num_tokens, self.llm_args.max_seq_len, batch_size
+            )
+
+            target_model_config, _ = self.ad_config.create_factory()._get_model_config()
+
+            spec_metadata = get_spec_metadata(
+                spec_config=self.spec_config,
+                model_config=target_model_config,
+                max_num_requests=batch_size,
+                max_num_tokens=max_num_tokens,
+                spec_resource_manager=spec_resource_manager,
+                is_draft_model=False,
+            )
+
+        # convert requests and store in sequence info object
+
+        last_logit_only = self._prepare_inputs(
+            scheduled_requests, resource_manager, new_tensors_device, spec_metadata
+        )
+
+        print("[TRACE] In forward(). Finished preparing inputs. Now computing logits.")
         # compute all logits
         logits = self._compute_logits()
 
+        print(f"[TRACE] logits: {logits}")
+        print(f"length of logits: {len(logits)}")
+
+        print(
+            "[TRACE] In forward(). Finished computing logits. Now gathering and concatenating logits."
+        )
+
+        print(f"[TRACE] last_logit_only: {last_logit_only}")
+        print("About to gather and concatenate logits.")
         # gather+cat logits
         logits_flat = torch.cat(
             [ls_one_seq[-last_only:] for ls_one_seq, last_only in zip(logits, last_logit_only)],
             dim=0,
         )
 
+        print(
+            f"[TRACE] In forward(). Finished gathering and concatenating logits. Flattened logits: {logits_flat}"
+        )
         return {"logits": logits_flat}
 
 
@@ -444,22 +625,30 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     if has_draft_model_engine:
         draft_spec_config = copy.copy(ad_config.speculative_config)
 
-        use_chain_drafter = (ad_config.guided_decoding_backend is None
-                                 and draft_spec_config._allow_chain_drafter and
-                                 draft_spec_config._allow_greedy_draft_tokens
-                                 and ad_config.attn_backend == "TRTLLM")
+        use_chain_drafter = (
+            ad_config.guided_decoding_backend is None
+            and draft_spec_config._allow_chain_drafter
+            and draft_spec_config._allow_greedy_draft_tokens
+            and ad_config.attn_backend == "TRTLLM"
+        )
 
         print(f"[TRACE] Use chain drafter: {use_chain_drafter}")
         print("[TRACE] ad_config.guided_decoding_backend: ", ad_config.guided_decoding_backend)
-        print("[TRACE] draft_spec_config._allow_chain_drafter: ", draft_spec_config._allow_chain_drafter)
-        print("[TRACE] draft_spec_config._allow_greedy_draft_tokens: ", draft_spec_config._allow_greedy_draft_tokens)
+        print(
+            "[TRACE] draft_spec_config._allow_chain_drafter: ",
+            draft_spec_config._allow_chain_drafter,
+        )
+        print(
+            "[TRACE] draft_spec_config._allow_greedy_draft_tokens: ",
+            draft_spec_config._allow_greedy_draft_tokens,
+        )
         print("[TRACE] ad_config.attn_backend: ", ad_config.attn_backend)
         if use_chain_drafter:
+
             def drafting_loop_wrapper(model):
                 from tensorrt_llm._torch.speculative.drafting_loops import ChainDrafter
 
-                return ChainDrafter(max_draft_len,
-                                    max_total_draft_tokens, model)
+                return ChainDrafter(max_draft_len, max_total_draft_tokens, model)
         else:
             drafting_loop_wrapper = None
 
@@ -484,7 +673,9 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
             enable_chunked_context=enable_chunked_context,
         )
 
-        print(f"[AUTODEPLOY] Creating draft_model_engine with model_path: {draft_spec_config.speculative_model_dir}")
+        print(
+            f"[AUTODEPLOY] Creating draft_model_engine with model_path: {draft_spec_config.speculative_model_dir}"
+        )
         draft_model_engine = PyTorchModelEngine(
             model_path=draft_spec_config.speculative_model_dir,
             llm_args=draft_llm_args,
@@ -520,11 +711,10 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
 
         def new_embedding_forward(self, input_ids):
             return F.embedding(input_ids, self.weight)
+
         submodule.forward = types.MethodType(new_embedding_forward, submodule)
 
-
-        draft_model_engine.load_weights_from_target_model(
-            engine.model)
+        draft_model_engine.load_weights_from_target_model(engine.model)
 
     else:
         draft_model_engine = None
@@ -567,6 +757,13 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # resource managers
     # ADEngine creates its own KV cache manager (_CacheManagerWithFakePool)
     # since it manages KV cache differently from PyTorchModelEngine
+
+    print(
+        f"[TRACE] engine.cache_seq_interface.info.num_pages: {engine.cache_seq_interface.info.num_pages}"
+    )
+    print(f"[TRACE] ad_config.attn_page_size: {ad_config.attn_page_size}")
+    print(f"[TRACE] ad_config.max_seq_len: {ad_config.max_seq_len}")
+    print(f"[TRACE] ad_config.max_batch_size: {ad_config.max_batch_size}")
     kv_cache_manager = _CacheManagerWithFakePool(
         ad_config.kv_cache_config,
         num_blocks=engine.cache_seq_interface.info.num_pages,
@@ -684,7 +881,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         spec_resource_manager=spec_resource_manager,
         guided_decoder=guided_decoder,
     )
-
 
     print(f"[TRACE] Drafter in AutoDeploy executor: {drafter}")
 

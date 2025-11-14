@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import os
+import shlex
 import sys
 
 from build_and_run_ad import ExperimentConfig
@@ -30,6 +31,8 @@ from build_and_run_ad import main as ad_main
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
+
+NUM_DRAFT_TOKENS = 1
 
 
 def download_model(model_id: str, cache_dir: str = None):
@@ -163,7 +166,7 @@ def test_llama_spec_dec_with_trtllm(
     spec_config = None
     if enable_spec_dec and speculative_model_dir:
         spec_config = DraftTargetDecodingConfig(
-            max_draft_len=2, speculative_model_dir=speculative_model_dir
+            max_draft_len=NUM_DRAFT_TOKENS, speculative_model_dir=speculative_model_dir
         )
 
         print(f"[TRACE] Created DraftTargetDecodingConfig: {spec_config}")
@@ -181,7 +184,6 @@ def test_llama_spec_dec_with_trtllm(
     # Test prompts
     prompts = [
         "What is the capital of France?",
-        "Explain what machine learning is in one sentence.",
     ]
 
     # Create TRT-LLM instance
@@ -215,8 +217,8 @@ def test_llama_spec_dec_with_trtllm(
         raise
 
     # Configure sampling parameters
-    sampling_params = SamplingParams(max_tokens=100)
-    print("[TRACE] Sampling parameters: max_tokens=100")
+    sampling_params = SamplingParams(max_tokens=10)
+    print("[TRACE] Sampling parameters: max_tokens=10")
 
     # Run generation
     print(f"\n[TRACE] Starting generation with {len(prompts)} prompts...")
@@ -288,7 +290,7 @@ def test_llama_spec_dec_with_autodeploy(
     spec_config = None
     if enable_spec_dec and speculative_model_dir:
         spec_config = DraftTargetDecodingConfig(
-            max_draft_len=2, speculative_model_dir=speculative_model_dir
+            max_draft_len=NUM_DRAFT_TOKENS, speculative_model_dir=speculative_model_dir
         )
         print(f"[TRACE] Created DraftTargetDecodingConfig: {spec_config}")
         print(f"[TRACE] Speculative model dir: {speculative_model_dir}")
@@ -296,10 +298,7 @@ def test_llama_spec_dec_with_autodeploy(
         print("[TRACE] Running without speculative decoding (baseline mode)")
 
     # Test prompts
-    prompts = [
-        "What is the capital of France?",
-        "Explain what machine learning is in one sentence.",
-    ]
+    prompts = ["What is the capital of France?"]
 
     # Configure AutoDeploy LLM arguments
     llm_args = {
@@ -344,7 +343,7 @@ def test_llama_spec_dec_with_autodeploy(
 
     # Add sampling parameters
     cfg.prompt.sp_kwargs = {
-        "max_tokens": 100,
+        "max_tokens": 10,
         "top_k": None,
         "temperature": 0.0,
     }
@@ -487,4 +486,6 @@ Notes:
 
 
 if __name__ == "__main__":
+    cmd = " ".join(shlex.quote(arg) for arg in sys.argv)
+    print(f"Run command: {cmd}")
     main()

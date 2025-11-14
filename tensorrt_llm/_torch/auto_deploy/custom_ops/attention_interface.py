@@ -622,6 +622,8 @@ class SequenceInfo:
 
         # set new sequence lengths --> resetting the remaining entries to zero is important to help
         # us discern the actual number of sequences in the batch.
+        print("About to store seq_len")
+        print("input_ids: ", input_ids)
         self._store_arg("seq_len", [len(ids) for ids in input_ids], reset_val=0)
 
         # check for updated input_pos (i.e. cache start position)
@@ -688,6 +690,13 @@ class SequenceInfo:
 
         # re-scatter the provided input ids into the input_ids tensor
         input_ids_device = self._args_device["input_ids"]
+
+        print("About to scatter input_ids")
+        print("gather_idx: ", gather_idx)
+        print("gather_ids_device: ", gather_ids_device)
+        print("ungathered_input_ids: ", ungathered_input_ids)
+        print("packed_input_ids: ", packed_input_ids)
+        print("scatter_ref: ", scatter_ref)
         input_ids_device.masked_scatter_(input_ids_device == scatter_ref, packed_input_ids)
 
     @nvtx_range("ad_unnest_sequences")

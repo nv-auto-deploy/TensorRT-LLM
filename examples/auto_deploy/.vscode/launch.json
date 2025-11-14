@@ -8,8 +8,8 @@
             "program": "build_and_run_ad.py",
             "args": [
                 "--model=meta-llama/Meta-Llama-3.1-8B-Instruct",
-                "--args.world-size=2",
-                "--args.runtime=demollm",
+                "--args.world-size=1",
+                "--args.runtime=trtllm",
                 "--args.transforms.compile-model.backend=torch-simple",
                 "--args.attn-page-size=16",
                 "--args.transforms.insert-cached-attention.backend=flashinfer",
@@ -19,6 +19,8 @@
                 "--args.model-kwargs.num-hidden-layers=3",
                 "--args.model-kwargs.num-attention-heads=32",
                 "--prompt.sp-kwargs.max-tokens=128",
+                "--args.speculative-config.max-draft-len=2",
+                "--args.speculative-config.speculative-model-dir=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/autodeploy_data/hf_home/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6",
                 // "--yaml-extra=config.yaml", // uncomment to load a custom extra yaml config file
                 // "--dry-run", // uncomment to print the final config and return
             ],

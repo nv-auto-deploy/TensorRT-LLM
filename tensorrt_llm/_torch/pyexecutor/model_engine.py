@@ -1232,15 +1232,41 @@ class PyTorchModelEngine(ModelEngine):
         """
         Prepare inputs for Pytorch Model.
         """
+        print(
+            f"[TRACE] PyTorch ModelEngine._prepare_tp_inputs. is_draft_model: {self.is_draft_model}"
+        )
+        print(
+            f"[TRACE] PyTorch ModelEngine._prepare_tp_inputs. Context request count: {len(scheduled_requests.context_requests)} "
+        )
+        print(
+            f"[TRACE] PyTorch ModelEngine._prepare_tp_inputs. Generation request count: {len(scheduled_requests.generation_requests)} "
+        )
         new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
         if new_tensors_device is not None:
+            #print("new_tensors_device:")
+            #print(f"new_tensors_device: {new_tensors_device}")
+            #print(f"new_tensors_device.new_tokens: {new_tensors_device.new_tokens}")
+            print(
+                f"new_tensors_device.new_tokens.shape: {new_tensors_device.new_tokens.shape}"
+            )
+
+            print(
+                f"new_tensors_device.log_probs: {new_tensors_device.log_probs}")
+            if new_tensors_device.log_probs is not None:
+                print(
+                    f"new_tensors_device.log_probs.shape: {new_tensors_device.log_probs.shape}"
+                )
+
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
             # When using overlap scheduler with speculative decoding, the target model's inputs would be SampleStateTensorsMTP.
+
             if isinstance(new_tensors_device, SampleStateTensorsMTP):
                 assert self.enable_spec_decode and not self.is_draft_model
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
+                print(f"new_tokens_lens_device: {new_tokens_lens_device}")
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
+                print(f"next_draft_tokens_device: {next_draft_tokens_device}")
 
         # Must be before the update of py_batch_idx
         if self.guided_decoder is not None:
@@ -1342,6 +1368,8 @@ class PyTorchModelEngine(ModelEngine):
                 first_draft_requests.append(request)
             else:
                 generation_requests.append(request)
+
+        # I Guess this ensures that extend dummy requests come at the end.
         extend_requests += extend_dummy_requests
 
         spec_config = self.spec_config if self.enable_spec_decode else None
@@ -2342,6 +2370,8 @@ class PyTorchModelEngine(ModelEngine):
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer)
 
+            print("Inputs: ", inputs)
+            print("Gather ids: ", gather_ids)
             self.iter_counter += 1
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not maybe_graph:
@@ -2497,9 +2527,15 @@ class PyTorchModelEngine(ModelEngine):
         self.model.load_weights_from_target_model if such a method exists.
         """
 
-        print(f"[TRACE] load_weights_from_target_model. Type of self.model: {type(self.model)}")
-        print(f"[TRACE] load_weights_from_target_model. Type of target_model: {type(target_model)}")
-        print(f"[TRACE] load_weights_from_target_model. Target model: {target_model}")
+        print(
+            f"[TRACE] load_weights_from_target_model. Type of self.model: {type(self.model)}"
+        )
+        print(
+            f"[TRACE] load_weights_from_target_model. Type of target_model: {type(target_model)}"
+        )
+        print(
+            f"[TRACE] load_weights_from_target_model. Target model: {target_model}"
+        )
 
         loader = getattr(self.model, "load_weights_from_target_model", None)
         print(f"[TRACE] load_weights_from_target_model. Loader: {loader}")

@@ -329,6 +329,9 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
         return_probs: bool,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if group_logit_indices is None:
+            print("[TRACE] group_logit_indices is None")
+            print(f"[TRACE] logits.size(0): {logits.size(0)}")
+            print(f"[TRACE] len(strategies): {len(strategies)}")
             assert logits.size(0) == len(strategies)
         else:
             logits = logits[group_logit_indices]

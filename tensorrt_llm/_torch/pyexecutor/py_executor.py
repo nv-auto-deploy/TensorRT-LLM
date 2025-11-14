@@ -1414,8 +1414,17 @@ class PyExecutor:
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
+                    print(
+                        f"[TRACE] In executor_loop_overlap, Calling forward step with previous_tensors_device."
+                    )
                     batch_outputs = self._forward_step(scheduled_batch,
                                                        previous_tensors_device)
+
+                    print(
+                        f"[TRACE] In executor_loop_overlap, Forward step completed."
+                    )
+
+                    print(f"[TRACE] Batch outputs: {batch_outputs}")
 
                     if target_inputs is not None:
                         self._process_draft_results(scheduled_batch,
@@ -1885,6 +1894,19 @@ class PyExecutor:
                 gather_context_logits=gather_context_logits,
                 cache_indirection_buffer=cache_indirection_buffer)
 
+        if new_tensors_device is not None:
+            print(
+                f"[TRACE] In PyExecutor._forward_step, new_tensors_device is not None."
+            )
+            print(
+                f"[TRACE] In PyExecutor._forward_step, new_tensors_device.new_tokens.shape: {new_tensors_device.new_tokens.shape}"
+            )
+            if new_tensors_device.log_probs is not None:
+                print(
+                    f"[TRACE] In PyExecutor._forward_step, new_tensors_device.log_probs.shape: {new_tensors_device.log_probs.shape}"
+                )
+
+        print(f"[TRACE] In PyExecutor._forward_step, Calling forward function.")
         try:
             gather_context_logits = any(
                 a.py_return_context_logits
@@ -1893,6 +1915,8 @@ class PyExecutor:
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device, gather_context_logits,
                               cache_indirection_buffer)
+
+            print(f"[TRACE] PyExecutor._forward_step, outputs: {outputs}")
 
             self._kv_connector_wait_for_save()
 
@@ -2381,9 +2405,20 @@ class PyExecutor:
                     self._prepare_draft_requests()
 
             if has_draft_batch:
+                print(f"[TRACE] Generating draft tokens with overlap")
                 target_inputs, draft_outputs, draft_batch = self.drafter.generate_draft_tokens_with_overlap(
                     scheduled_batch, self.resource_manager,
                     previous_tensors.device if previous_tensors else None)
+
+                print(
+                    f"[TRACE] In _handle_speculative_decoding, draft outputs: {draft_outputs}"
+                )
+                print(
+                    f"[TRACE] In _handle_speculative_decoding, draft batch: {draft_batch}"
+                )
+                print(
+                    f"[TRACE] In _handle_speculative_decoding, target inputs: {target_inputs}"
+                )
 
                 self.has_previous_draft_tokens = target_inputs is not None and target_inputs.next_draft_tokens is not None
             else:
