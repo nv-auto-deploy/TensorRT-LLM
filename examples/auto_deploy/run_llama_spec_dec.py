@@ -34,6 +34,14 @@ from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
 
 NUM_DRAFT_TOKENS = 1
 
+# Test prompts
+prompts = [
+    "What is the capital of France?",
+    "Please explain the concept of gravity in simple words and a single sentence.",
+    "What is the capital of Norway?",
+    "What is the highest mountain in the world?",
+]
+
 
 def download_model(model_id: str, cache_dir: str = None):
     """Download a model from Hugging Face Hub.
@@ -181,11 +189,6 @@ def test_llama_spec_dec_with_trtllm(
     )
     print("[TRACE] Created KvCacheConfig with free_gpu_memory_fraction=0.8")
 
-    # Test prompts
-    prompts = [
-        "What is the capital of France?",
-    ]
-
     # Create TRT-LLM instance
     spec_mode = "speculative" if (enable_spec_dec and speculative_model_dir) else "baseline"
     print(f"\n[TRACE] Creating LLM instance ({spec_mode} mode)...")
@@ -217,25 +220,23 @@ def test_llama_spec_dec_with_trtllm(
         raise
 
     # Configure sampling parameters
-    sampling_params = SamplingParams(max_tokens=10)
-    print("[TRACE] Sampling parameters: max_tokens=10")
+    sampling_params = SamplingParams(max_tokens=100)
+    print("[TRACE] Sampling parameters: max_tokens=100")
 
     # Run generation
-    print(f"\n[TRACE] Starting generation with {len(prompts)} prompts...")
+    print(f"\n[TRACE] Starting generation with {len(prompts)} prompts in batch...")
 
     try:
+        # Generate responses for all prompts in batch
+        print(f"\n[TRACE] Processing {len(prompts)} prompts in batch...")
+        responses = llm.generate(prompts, sampling_params)
+
+        # Process results
         results = []
-        for i, prompt in enumerate(prompts):
-            print(f"\n[TRACE] Processing prompt {i + 1}/{len(prompts)}: {prompt[:50]}...")
-
-            # Generate response
-            response = llm.generate(prompt, sampling_params)
-
-            # Extract output text
+        for i, (prompt, response) in enumerate(zip(prompts, responses)):
             output_text = response.outputs[0].text
             results.append((prompt, output_text))
-
-            print(f"[TRACE] Generated {len(output_text)} characters")
+            print(f"[TRACE] Generated {len(output_text)} characters for prompt {i + 1}")
 
         print("\n[TRACE] ===== SUCCESS! =====")
         print(f"[TRACE] Generation completed with {model} using TRT-LLM!")
@@ -297,9 +298,6 @@ def test_llama_spec_dec_with_autodeploy(
     else:
         print("[TRACE] Running without speculative decoding (baseline mode)")
 
-    # Test prompts
-    prompts = ["What is the capital of France?"]
-
     # Configure AutoDeploy LLM arguments
     llm_args = {
         "model": model,
@@ -314,7 +312,7 @@ def test_llama_spec_dec_with_autodeploy(
         "args": llm_args,
         "benchmark": {"enabled": False},  # Disable benchmarking
         "prompt": {
-            "batch_size": 1,
+            "batch_size": 4,
             "queries": prompts,
         },
     }
@@ -343,7 +341,7 @@ def test_llama_spec_dec_with_autodeploy(
 
     # Add sampling parameters
     cfg.prompt.sp_kwargs = {
-        "max_tokens": 10,
+        "max_tokens": 50,
         "top_k": None,
         "temperature": 0.0,
     }

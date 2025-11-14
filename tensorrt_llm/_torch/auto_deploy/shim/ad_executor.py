@@ -195,6 +195,10 @@ class ADEngine(ModelEngine):
     def runtime_draft_len(self):
         return self.spec_config.max_draft_len if self.spec_config is not None else 0
 
+    @property
+    def run_with_spec_decode(self):
+        return self.spec_config is not None
+
     @classmethod
     def build_from_config(cls, ad_config: LlmArgs):
         """Build the ADEngine using the LlmArgs that gets passed through from the LLM."""
@@ -301,7 +305,9 @@ class ADEngine(ModelEngine):
         print(f"[TRACE] Context requests length: {len(scheduled_requests.context_requests)}")
         print(f"[TRACE] Generation requests length: {len(scheduled_requests.generation_requests)}")
 
-        assert self.spec_config.spec_dec_mode.support_overlap_scheduler(), (
+        assert (
+            self.spec_config is None or self.spec_config.spec_dec_mode.support_overlap_scheduler()
+        ), (
             f"{self.spec_config.spec_dec_mode.decoding_type} must support the overlap scheduler currently"
         )
 
@@ -309,17 +315,22 @@ class ADEngine(ModelEngine):
         if new_tensors_device is not None:
             print(f"[TRACE] new_tensors_device type: {type(new_tensors_device)}")
             new_tokens = new_tensors_device.new_tokens
-            print(f"new_tokens: {new_tokens}")
-            print(f"new_tokens.shape: {new_tokens.shape}")
+            # print(f"new_tokens: {new_tokens}")
+            # print(f"new_tokens.shape: {new_tokens.shape}")
 
             # Note(govind): The following if statement should always be true if we are using
             # the overlap scheduler with speculative decoding.
             if isinstance(new_tensors_device, SampleStateTensorsMTP):
                 assert self.ad_config.speculative_config is not None
-                new_tokens_lens = len(new_tensors_device.new_tokens_lens)  # [batch]
+                new_tokens_lens = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens = new_tensors_device.next_draft_tokens  # [batch, draft_len]
+                print(f"new_tokens_lens: {new_tokens_lens}")
+                new_tokens_lens = len(new_tokens_lens)
                 print(f"new_tokens_lens (length): {new_tokens_lens}")
+                print(f"new_tokens: {new_tokens}")
+                print(f"new_tokens.shape: {new_tokens.shape}")
                 print(f"next_draft_tokens: {next_draft_tokens}")
+                print(f"next_draft_tokens.shape: {next_draft_tokens.shape}")
 
         # TODO(govind): Manage guided decoding + speculative decoding together.
 
@@ -362,7 +373,7 @@ class ADEngine(ModelEngine):
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
         slot_idx: List[int] = []
-        flat_gather_indices: List[int] = []
+        all_gather_indices: List[int] = []
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
         dummy_token = -1
@@ -416,15 +427,15 @@ class ADEngine(ModelEngine):
             else:
                 print(f"length of request.py_draft_tokens: {len(request.py_draft_tokens)}")
                 print(f"runtime draft len (configured at init): {self.runtime_draft_len}")
+                print(f"py_batch_idx: {request.py_batch_idx}")
 
-                # I think the following may only work for batch size=1.
                 gather_indices_to_extend = [
-                    x * new_tokens_lens + len(input_ids)
+                    x * new_tokens_lens + request.py_batch_idx
                     for x in range(len(request.py_draft_tokens) + 1)
                 ]
 
                 print(f"gather_indices_to_extend: {gather_indices_to_extend}")
-                flat_gather_indices.extend(gather_indices_to_extend)
+                all_gather_indices.append(gather_indices_to_extend)
                 dummy_draft_tokens = [dummy_token for _ in range(len(request.py_draft_tokens))]
                 print(dummy_draft_tokens)
                 input_ids.append([dummy_token] + dummy_draft_tokens)
@@ -432,7 +443,15 @@ class ADEngine(ModelEngine):
                 num_tokens_seen = request.max_beam_num_tokens - 1
                 input_pos.append(num_tokens_seen)
 
+            request.py_batch_idx = request.seq_slot
+
+            slot_idx.append(request.seq_slot)
+
             last_logit_only.append(False)
+
+            # get cache indices
+            cache_indices = kv_cache_manager.get_cache_indices(request)
+            page_assignments.append(cache_indices)
 
         for request in generation_requests:
             print("About to append the following to input_pos:")
@@ -447,7 +466,7 @@ class ADEngine(ModelEngine):
             else:
                 input_ids.append([dummy_token])
                 input_pos.append(request.max_beam_num_tokens)
-                flat_gather_indices.append(request.py_batch_idx)
+                all_gather_indices.append(request.py_batch_idx)
 
             print("Got to here0")
             print(f"[TRACE] request.seq_slot: {request.seq_slot}")
@@ -476,10 +495,16 @@ class ADEngine(ModelEngine):
             **extra_args,
         )
 
+        all_gather_indices = [
+            gather_idx
+            for seq_gather_indices in all_gather_indices
+            for gather_idx in seq_gather_indices
+        ]
+
         print(f"[TRACE] input_ids: {input_ids}")
         print(f"[TRACE] input_pos: {input_pos}")
         print(f"[TRACE] page_assignments: {page_assignments}")
-        print(f"[TRACE] flat_gather_idx: {flat_gather_indices}")
+        print(f"[TRACE] flat_gather_indices: {all_gather_indices}")
         print(f"new_tokens (unflattened): {new_tokens}")
 
         print(
@@ -489,7 +514,7 @@ class ADEngine(ModelEngine):
         if new_tokens is not None:
             self.cache_seq_interface.info.rescatter_input_ids(
                 ungathered_input_ids=new_tokens.flatten(),  # ensure it's flattened
-                gather_idx=flat_gather_indices,
+                gather_idx=all_gather_indices,
                 scatter_ref=dummy_token,
             )
 
@@ -525,7 +550,7 @@ class ADEngine(ModelEngine):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
 
         spec_metadata = None
-        if self.enable_spec_decode:
+        if self.run_with_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER
             )
