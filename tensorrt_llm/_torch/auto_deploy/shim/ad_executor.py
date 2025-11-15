@@ -10,13 +10,11 @@
 # limitations under the License.
 
 import copy
-import types
 from collections import defaultdict
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
@@ -120,7 +118,7 @@ def construct_draft_llm_args(
     """
     # Extract common fields as a dict
     common_fields = {
-        "model": draft_spec_config.speculative_model_dir,
+        "model": ad_config.model,
         "tokenizer": ad_config.tokenizer,
         "max_batch_size": ad_config.max_batch_size,
         "max_seq_len": ad_config.max_seq_len,
@@ -169,6 +167,8 @@ def construct_draft_llm_args(
     # Handle load_format separately
     if draft_spec_config.load_format == "dummy":
         draft_llm_args.load_format = LoadFormat.DUMMY
+
+    draft_llm_args.tensor_parallel_size = ad_config.world_size
 
     return draft_llm_args
 
@@ -476,7 +476,7 @@ class ADEngine(ModelEngine):
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
         slot_idx: List[int] = []
-        all_gather_indices: List[int] = []
+        all_gather_indices: List[List[int]] = []
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
         dummy_token = -1
@@ -568,9 +568,8 @@ class ADEngine(ModelEngine):
             else:
                 input_ids.append([dummy_token])
                 input_pos.append(request.max_beam_num_tokens)
-                all_gather_indices.append(request.py_batch_idx)
+                all_gather_indices.append([request.py_batch_idx])
 
-            print("Got to here0")
             print(f"[TRACE] request.seq_slot: {request.seq_slot}")
             print(f"[TRACE] request.py_batch_idx: {request.py_batch_idx}")
 
@@ -597,7 +596,7 @@ class ADEngine(ModelEngine):
             **extra_args,
         )
 
-        all_gather_indices = [
+        flat_gather_indices = [
             gather_idx
             for seq_gather_indices in all_gather_indices
             for gather_idx in seq_gather_indices
@@ -606,7 +605,7 @@ class ADEngine(ModelEngine):
         print(f"[TRACE] input_ids: {input_ids}")
         print(f"[TRACE] input_pos: {input_pos}")
         print(f"[TRACE] page_assignments: {page_assignments}")
-        print(f"[TRACE] flat_gather_indices: {all_gather_indices}")
+        print(f"[TRACE] flat_gather_indices: {flat_gather_indices}")
         print(f"new_tokens (unflattened): {new_tokens}")
 
         print(
@@ -616,7 +615,7 @@ class ADEngine(ModelEngine):
         if new_tokens is not None:
             self.cache_seq_interface.info.rescatter_input_ids(
                 ungathered_input_ids=new_tokens.flatten(),  # ensure it's flattened
-                gather_idx=all_gather_indices,
+                gather_idx=flat_gather_indices,
                 scatter_ref=dummy_token,
             )
 
@@ -787,6 +786,17 @@ def create_draft_model_engine_maybe(
     )
     print(f"[TRACE] Dist: {mpi_dist}")
 
+    print(
+        f"[TRACE] Calling draft_model_engine constructor in create_autodeploy_executor "
+        f"with the following arguments:\n"
+        f"[TRACE] model_path: {draft_spec_config.speculative_model_dir}\n"
+        f"[TRACE] llm_args: {draft_llm_args}\n"
+        f"[TRACE] mapping: {dist_mapping}\n"
+        f"[TRACE] attn_runtime_features: {attn_runtime_features}\n"
+        f"[TRACE] dist: {mpi_dist}\n"
+        f"[TRACE] spec_config: {draft_spec_config}\n"
+        f"[TRACE] is_draft_model: True"
+    )
     draft_model_engine = PyTorchModelEngine(
         model_path=draft_spec_config.speculative_model_dir,
         llm_args=draft_llm_args,
@@ -810,7 +820,9 @@ def create_draft_model_engine_maybe(
     # which is not the case when the target model is an ADEngine.
     # We need to ensure compatibility with this case.
 
-    share_embedding_weights(engine, draft_model_engine)
+    assert ad_config.speculative_config.spec_dec_mode.is_draft_target(), (
+        "Currently, the code is only supported for draft target mode."
+    )
 
     # If the model is an MLA model, we need to set
     # draft_model_engine.attn_runtime_features.chunked_prefill to False
@@ -824,26 +836,6 @@ def create_draft_model_engine_maybe(
     return draft_model_engine
 
 
-def share_embedding_weights(
-    target_model_engine: "ADEngine", draft_model_engine: PyTorchModelEngine
-):
-    return
-    submodule = target_model_engine.model.model.embed_tokens
-
-    # Note: This simple forward function implementation assumes tp=1.
-    # TODO: Handle the tp>1 case.
-
-    # assert target_model_engine.ad_config.world_size <= 1, \
-    #     f"This code assumes tp<=1. World size: {target_model_engine.ad_config.world_size}"
-
-    def new_embedding_forward(self, input_ids):
-        return F.embedding(input_ids, self.weight)
-
-    submodule.forward = types.MethodType(new_embedding_forward, submodule)
-
-    draft_model_engine.load_weights_from_target_model(target_model_engine.model)
-
-
 def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[TokenizerBase] = None):
     """Create an AutoDeploy executor from the given configuration and tokenizer.
     The tokenizer is required for guided decoding.
@@ -853,8 +845,12 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # initialize process groups
     world_size = mpi_world_size()
     rank = mpi_rank()
+    print(f"[TRACE] World size: {world_size}")
+    print(f"[TRACE] Rank: {rank}")
     dist_mapping = Mapping(rank=rank, world_size=world_size, tp_size=world_size)
+    print(f"[TRACE] Dist mapping: {dist_mapping}")
     mpi_dist = MPIDist(dist_mapping)
+    print(f"[TRACE] MPI dist: {mpi_dist}")
     ad_logger.set_rank(rank)
     torch.cuda.set_device(rank)
     port = mpi_dist.broadcast(dist.get_free_port())  # use MPI broadcast to pick a free port

@@ -305,7 +305,7 @@ def test_llama_spec_dec_with_autodeploy(
         "skip_loading_weights": False,  # We want to load weights
         "speculative_config": spec_config,
         "runtime": "trtllm",  # AutoDeploy runtime
-        "world_size": 2,
+        "world_size": 1,  # 2 GPUs
     }
 
     # Configure experiment with prompts

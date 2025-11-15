@@ -381,6 +381,16 @@ def create_py_executor(
 
             print(f"[TRACE] Dist: {dist}")
 
+            print(
+                f"[TRACE] Calling draft_model_engine constructor in create_py_executor with the following arguments:\n"
+                f"[TRACE] model_path: {spec_config.speculative_model_dir}\n"
+                f"[TRACE] llm_args: {draft_llm_args}\n"
+                f"[TRACE] mapping: {mapping}\n"
+                f"[TRACE] attn_runtime_features: {attn_runtime_features}\n"
+                f"[TRACE] dist: {dist}\n"
+                f"[TRACE] spec_config: {draft_spec_config}\n"
+                f"[TRACE] is_draft_model: True")
+
             draft_model_engine = PyTorchModelEngine(
                 model_path=spec_config.speculative_model_dir,
                 llm_args=draft_llm_args,

@@ -2403,11 +2403,14 @@ class PyTorchModelEngine(ModelEngine):
                         with MoeLoadBalancerIterContext(moe_load_balancer):
                             outputs = self.cuda_graph_runner.replay(key, inputs)
 
+            print(f"Got to here0")
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
+            print(f"Got to here1")
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
+            print(f"Got to here2")
             return outputs
 
     def model_forward(self, **kwargs):
@@ -2438,6 +2441,7 @@ class PyTorchModelEngine(ModelEngine):
         if inputs.get('spec_metadata', None):
             gather_ids = inputs['spec_metadata'].gather_ids
 
+        print("About to call model_forward in PyTorchModelEngine")
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
         outputs = self.model_forward(
@@ -2445,6 +2449,7 @@ class PyTorchModelEngine(ModelEngine):
             return_context_logits=gather_ids is not None
             or gather_context_logits,
         )
+        print("Finished call to model_forward in PyTorchModelEngine")
 
         if self.without_logits:
             return outputs
