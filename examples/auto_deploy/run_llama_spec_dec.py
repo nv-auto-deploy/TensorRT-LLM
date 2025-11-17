@@ -51,7 +51,7 @@ except ImportError:
 DEFAULT_NUM_DRAFT_TOKENS = 3
 DEFAULT_TP_SIZE = 1  # Tensor parallelism / world size
 DEFAULT_BATCH_SIZE = 1
-
+KV_CACHE_FRACTION = 0.6
 # Test prompts
 prompts = [
     "What is the capital of France?",
@@ -333,11 +333,10 @@ def test_llama_spec_dec_with_trtllm(
         print("[TRACE] Running without speculative decoding (baseline mode)")
 
     # Configure KV cache
-    # Allocate 80% of free GPU memory for KV cache
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.3,
+        free_gpu_memory_fraction=KV_CACHE_FRACTION,
     )
-    print("[TRACE] Created KvCacheConfig with free_gpu_memory_fraction=0.8")
+    print(f"[TRACE] Created KvCacheConfig with free_gpu_memory_fraction={KV_CACHE_FRACTION}")
 
     # Create TRT-LLM instance
     spec_mode = "speculative" if (enable_spec_dec and speculative_model_dir) else "baseline"
@@ -465,6 +464,13 @@ def test_llama_spec_dec_with_autodeploy(
     else:
         print("[TRACE] Running without speculative decoding (baseline mode)")
 
+    # Configure KV cache
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=KV_CACHE_FRACTION,
+    )
+
+    print("[TRACE] Created KvCacheConfig with free_gpu_memory_fraction=0.3")
+
     # Configure AutoDeploy LLM arguments
     llm_args = {
         "model": model,
@@ -472,6 +478,7 @@ def test_llama_spec_dec_with_autodeploy(
         "speculative_config": spec_config,
         "runtime": "trtllm",  # AutoDeploy runtime
         "world_size": world_size,
+        "kv_cache_config": kv_cache_config,
     }
 
     # Configure experiment with prompts
