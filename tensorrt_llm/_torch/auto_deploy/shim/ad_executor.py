@@ -476,6 +476,8 @@ class ADEngine(ModelEngine):
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
         slot_idx: List[int] = []
+
+        # gather indices are used to gather tokens in new_tokens into input_ids
         all_gather_indices: List[List[int]] = []
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
@@ -766,7 +768,6 @@ def create_draft_model_engine_maybe(
 
     kv_cache_config = ad_config.kv_cache_config
 
-    # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,
         cache_reuse=kv_cache_config.enable_block_reuse,

@@ -1368,8 +1368,6 @@ class PyTorchModelEngine(ModelEngine):
                 first_draft_requests.append(request)
             else:
                 generation_requests.append(request)
-
-        # I Guess this ensures that extend dummy requests come at the end.
         extend_requests += extend_dummy_requests
 
         spec_config = self.spec_config if self.enable_spec_decode else None
