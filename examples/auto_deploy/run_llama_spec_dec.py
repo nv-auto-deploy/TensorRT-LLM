@@ -19,12 +19,18 @@ Usage:
 
     # Disable speculative decoding (baseline mode) with either backend
     python run_llama_spec_dec.py --backend trtllm --model meta-llama/Llama-3.1-8B-Instruct --no-spec-dec
+
+    # Configure world size (tensor parallelism), batch size, and num draft tokens
+    python run_llama_spec_dec.py --model meta-llama/Llama-3.1-8B-Instruct --auto-download-draft-model \
+        --world-size 4 --batch-size 2 --num-draft-tokens 5
 """
 
 import argparse
 import os
 import shlex
 import sys
+import threading
+import time
 
 from build_and_run_ad import ExperimentConfig
 from build_and_run_ad import main as ad_main
@@ -32,7 +38,19 @@ from build_and_run_ad import main as ad_main
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
 
-NUM_DRAFT_TOKENS = 3
+try:
+    import pynvml
+
+    PYNVML_AVAILABLE = True
+except ImportError:
+    PYNVML_AVAILABLE = False
+    print("[WARNING] pynvml not available. GPU memory monitoring disabled.")
+    print("[HINT] Install with: pip install nvidia-ml-py3")
+
+# Default configuration values
+DEFAULT_NUM_DRAFT_TOKENS = 3
+DEFAULT_TP_SIZE = 1  # Tensor parallelism / world size
+DEFAULT_BATCH_SIZE = 1
 
 # Test prompts
 prompts = [
@@ -41,6 +59,123 @@ prompts = [
     "What is the capital of Norway?",
     "What is the highest mountain in the world?",
 ]
+
+
+class GPUMemoryMonitor:
+    """GPU memory monitor that continuously polls GPU memory usage.
+
+    Based on TensorRT-LLM's GPU monitoring utilities from:
+    - tests/integration/defs/perf/gpu_clock_lock.py
+    - tests/unittest/utils/util.py
+    """
+
+    def __init__(self, gpu_id=0, interval_ms=100):
+        """Initialize GPU memory monitor.
+
+        Args:
+            gpu_id: GPU index to monitor
+            interval_ms: Polling interval in milliseconds
+        """
+        if not PYNVML_AVAILABLE:
+            self.enabled = False
+            return
+
+        self.enabled = True
+        self.gpu_id = gpu_id
+        self.interval_ms = interval_ms
+        self.is_monitoring = False
+        self.max_memory_used_mb = 0
+        self.memory_samples_mb = []
+
+        # Initialize NVML
+        try:
+            pynvml.nvmlInit()
+            self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+            self.gpu_name = pynvml.nvmlDeviceGetName(self.gpu_handle)
+        except Exception as e:
+            print(f"[WARNING] Failed to initialize NVML: {e}")
+            self.enabled = False
+
+    def _poll_memory(self):
+        """Poll current GPU memory usage."""
+        if not self.enabled:
+            return
+
+        try:
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.gpu_handle)
+            memory_used_mb = mem_info.used / (1024**2)
+            self.memory_samples_mb.append(memory_used_mb)
+            if memory_used_mb > self.max_memory_used_mb:
+                self.max_memory_used_mb = memory_used_mb
+        except Exception as e:
+            print(f"[WARNING] Error polling GPU memory: {e}")
+
+    def _monitoring_thread(self):
+        """Background thread that continuously polls GPU memory."""
+        interval_sec = self.interval_ms / 1000.0
+        while self.is_monitoring:
+            self._poll_memory()
+            time.sleep(interval_sec)
+        # Final poll
+        self._poll_memory()
+
+    def start(self):
+        """Start monitoring in background thread."""
+        if not self.enabled:
+            return
+
+        self.is_monitoring = True
+        self.max_memory_used_mb = 0
+        self.memory_samples_mb = []
+        self.thread = threading.Thread(target=self._monitoring_thread, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        """Stop monitoring and return results."""
+        if not self.enabled:
+            return None
+
+        self.is_monitoring = False
+        self.thread.join()
+
+        avg_memory_mb = (
+            sum(self.memory_samples_mb) / len(self.memory_samples_mb)
+            if self.memory_samples_mb
+            else 0
+        )
+        return {
+            "max_memory_mb": self.max_memory_used_mb,
+            "avg_memory_mb": avg_memory_mb,
+            "samples": len(self.memory_samples_mb),
+        }
+
+    def __enter__(self):
+        """Enter context manager."""
+        self.start()
+        return self
+
+    def __exit__(self, *args):
+        """Exit context manager and print statistics."""
+        results = self.stop()
+        if results:
+            print(f"\n{'=' * 80}")
+            print(f"GPU Memory Statistics (GPU {self.gpu_id}: {self.gpu_name})")
+            print(f"{'=' * 80}")
+            print(
+                f"  Max Memory Used:  {results['max_memory_mb']:>10.2f} MB  ({results['max_memory_mb'] / 1024:.2f} GB)"
+            )
+            print(
+                f"  Avg Memory Used:  {results['avg_memory_mb']:>10.2f} MB  ({results['avg_memory_mb'] / 1024:.2f} GB)"
+            )
+            print(f"  Samples Collected: {results['samples']:>9}")
+            print(f"{'=' * 80}\n")
+
+        # Shutdown NVML
+        if self.enabled:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
 
 
 def download_model(model_id: str, cache_dir: str = None):
@@ -153,7 +288,12 @@ def ensure_speculative_model(
 
 
 def test_llama_spec_dec_with_trtllm(
-    model: str, speculative_model_dir: str = None, enable_spec_dec: bool = True
+    model: str,
+    speculative_model_dir: str = None,
+    enable_spec_dec: bool = True,
+    tensor_parallel_size: int = DEFAULT_TP_SIZE,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    num_draft_tokens: int = DEFAULT_NUM_DRAFT_TOKENS,
 ):
     """Test model with TRT-LLM engine directly.
 
@@ -161,6 +301,9 @@ def test_llama_spec_dec_with_trtllm(
         model: Model name or HuggingFace model ID
         speculative_model_dir: Path to speculative model (optional)
         enable_spec_dec: Whether to enable speculative decoding
+        tensor_parallel_size: Number of GPUs for tensor parallelism
+        batch_size: Number of prompts to process in batch
+        num_draft_tokens: Number of draft tokens for speculative decoding
     """
     print(f"\n{'=' * 80}")
     print("TRT-LLM Test Configuration")
@@ -168,13 +311,20 @@ def test_llama_spec_dec_with_trtllm(
     print(f"Base Model: {model}")
     speculative_info = speculative_model_dir if speculative_model_dir else "None (baseline mode)"
     print(f"Speculative Model: {speculative_info}")
+    print(f"Tensor Parallel Size: {tensor_parallel_size}")
+    print(f"Batch Size: {batch_size}")
+    print(f"Num Draft Tokens: {num_draft_tokens}")
     print("=" * 80 + "\n")
+
+    # Select prompts based on batch size
+    selected_prompts = prompts[:batch_size]
+    print(f"[INFO] Using {len(selected_prompts)} prompts (requested batch_size: {batch_size})")
 
     # Configure speculative decoding (using DraftTargetDecodingConfig)
     spec_config = None
     if enable_spec_dec and speculative_model_dir:
         spec_config = DraftTargetDecodingConfig(
-            max_draft_len=NUM_DRAFT_TOKENS, speculative_model_dir=speculative_model_dir
+            max_draft_len=num_draft_tokens, speculative_model_dir=speculative_model_dir
         )
 
         print(f"[TRACE] Created DraftTargetDecodingConfig: {spec_config}")
@@ -201,7 +351,7 @@ def test_llama_spec_dec_with_trtllm(
             speculative_config=spec_config,
             kv_cache_config=kv_cache_config,
             attn_backend="flashinfer",
-            tensor_parallel_size=2,
+            tensor_parallel_size=tensor_parallel_size,
         )
         print("[TRACE] LLM instance created successfully!")
 
@@ -224,17 +374,18 @@ def test_llama_spec_dec_with_trtllm(
     sampling_params = SamplingParams(max_tokens=100)
     print("[TRACE] Sampling parameters: max_tokens=100")
 
-    # Run generation
-    print(f"\n[TRACE] Starting generation with {len(prompts)} prompts in batch...")
+    # Run generation with GPU memory monitoring
+    print(f"\n[TRACE] Starting generation with {len(selected_prompts)} prompts in batch...")
 
     try:
-        # Generate responses for all prompts in batch
-        print(f"\n[TRACE] Processing {len(prompts)} prompts in batch...")
-        responses = llm.generate(prompts, sampling_params)
+        # Generate responses for all prompts in batch with memory monitoring
+        print(f"\n[TRACE] Processing {len(selected_prompts)} prompts in batch...")
+        with GPUMemoryMonitor(gpu_id=0, interval_ms=100):
+            responses = llm.generate(selected_prompts, sampling_params)
 
         # Process results
         results = []
-        for i, (prompt, response) in enumerate(zip(prompts, responses)):
+        for i, (prompt, response) in enumerate(zip(selected_prompts, responses)):
             output_text = response.outputs[0].text
             results.append((prompt, output_text))
             print(f"[TRACE] Generated {len(output_text)} characters for prompt {i + 1}")
@@ -271,7 +422,12 @@ def test_llama_spec_dec_with_trtllm(
 
 
 def test_llama_spec_dec_with_autodeploy(
-    model: str, speculative_model_dir: str = None, enable_spec_dec: bool = True
+    model: str,
+    speculative_model_dir: str = None,
+    enable_spec_dec: bool = True,
+    world_size: int = DEFAULT_TP_SIZE,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    num_draft_tokens: int = DEFAULT_NUM_DRAFT_TOKENS,
 ):
     """Test model with AutoDeploy backend.
 
@@ -279,6 +435,9 @@ def test_llama_spec_dec_with_autodeploy(
         model: Model name or HuggingFace model ID or local path
         speculative_model_dir: Path to speculative model (optional)
         enable_spec_dec: Whether to enable speculative decoding
+        world_size: Number of GPUs for tensor parallelism
+        batch_size: Number of prompts to process in batch
+        num_draft_tokens: Number of draft tokens for speculative decoding
     """
     print(f"\n{'=' * 80}")
     print("AutoDeploy Test Configuration")
@@ -286,13 +445,20 @@ def test_llama_spec_dec_with_autodeploy(
     print(f"Base Model: {model}")
     speculative_info = speculative_model_dir if speculative_model_dir else "None (baseline mode)"
     print(f"Speculative Model: {speculative_info}")
+    print(f"World Size: {world_size}")
+    print(f"Batch Size: {batch_size}")
+    print(f"Num Draft Tokens: {num_draft_tokens}")
     print("=" * 80 + "\n")
+
+    # Select prompts based on batch size
+    selected_prompts = prompts[:batch_size]
+    print(f"[INFO] Using {len(selected_prompts)} prompts (requested batch_size: {batch_size})")
 
     # Configure speculative decoding (using DraftTargetDecodingConfig)
     spec_config = None
     if enable_spec_dec and speculative_model_dir:
         spec_config = DraftTargetDecodingConfig(
-            max_draft_len=NUM_DRAFT_TOKENS, speculative_model_dir=speculative_model_dir
+            max_draft_len=num_draft_tokens, speculative_model_dir=speculative_model_dir
         )
         print(f"[TRACE] Created DraftTargetDecodingConfig: {spec_config}")
         print(f"[TRACE] Speculative model dir: {speculative_model_dir}")
@@ -305,7 +471,7 @@ def test_llama_spec_dec_with_autodeploy(
         "skip_loading_weights": False,  # We want to load weights
         "speculative_config": spec_config,
         "runtime": "trtllm",  # AutoDeploy runtime
-        "world_size": 1,  # 2 GPUs
+        "world_size": world_size,
     }
 
     # Configure experiment with prompts
@@ -313,8 +479,8 @@ def test_llama_spec_dec_with_autodeploy(
         "args": llm_args,
         "benchmark": {"enabled": False},  # Disable benchmarking
         "prompt": {
-            "batch_size": 4,
-            "queries": prompts,
+            "batch_size": batch_size,
+            "queries": selected_prompts,
         },
     }
 
@@ -347,11 +513,12 @@ def test_llama_spec_dec_with_autodeploy(
         "temperature": 0.0,
     }
 
-    # Run the experiment
+    # Run the experiment with GPU memory monitoring
     print(f"\n[TRACE] Starting AutoDeploy generation ({spec_mode} mode)...")
 
     try:
-        result = ad_main(cfg)
+        with GPUMemoryMonitor(gpu_id=0, interval_ms=100):
+            result = ad_main(cfg)
 
         print("\n[TRACE] ===== SUCCESS! =====")
         print(f"[TRACE] Generation completed with {model} using AutoDeploy!")
@@ -406,6 +573,10 @@ autodeploy_data/hf_home/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshot
   # Run in baseline mode without speculative decoding (AutoDeploy)
   %(prog)s --backend autodeploy --model meta-llama/Llama-3.1-8B-Instruct --no-spec-dec
 
+  # Use custom world size, batch size, and num draft tokens
+  %(prog)s --model meta-llama/Llama-3.1-8B-Instruct --auto-download-draft-model \\
+      --world-size 4 --batch-size 2 --num-draft-tokens 5
+
 Notes:
   - --backend: Choose 'trtllm' (default) or 'autodeploy'
   - Use exactly ONE of: --auto-download-draft-model, --speculative-model-dir, or --no-spec-dec
@@ -413,6 +584,9 @@ Notes:
   - --speculative-model-dir: Uses an already-downloaded local directory path
   - --no-spec-dec: Runs in baseline mode without speculative decoding
   - If none specified, defaults to baseline mode
+  - --world-size: Number of GPUs for tensor parallelism (default: 1)
+  - --batch-size: Number of prompts to process (default: 1, max: 4)
+  - --num-draft-tokens: Number of draft tokens for speculative decoding (default: 3)
         """,
     )
 
@@ -453,6 +627,30 @@ Notes:
         help="Disable speculative decoding (baseline mode)",
     )
 
+    parser.add_argument(
+        "--world-size",
+        type=int,
+        default=DEFAULT_TP_SIZE,
+        help=f"Number of GPUs for tensor parallelism (default: {DEFAULT_TP_SIZE}). "
+        "For trtllm backend, this sets tensor_parallel_size. "
+        "For autodeploy backend, this sets world_size",
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Number of prompts to process in batch (default: {DEFAULT_BATCH_SIZE}). "
+        "If less than 4, a prefix of the default prompts will be used",
+    )
+
+    parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        default=DEFAULT_NUM_DRAFT_TOKENS,
+        help=f"Number of draft tokens for speculative decoding (default: {DEFAULT_NUM_DRAFT_TOKENS})",
+    )
+
     args = parser.parse_args()
 
     # Ensure speculative model is available
@@ -470,12 +668,18 @@ Notes:
             model=args.model,
             speculative_model_dir=speculative_model_path,
             enable_spec_dec=not args.no_spec_dec,
+            tensor_parallel_size=args.world_size,
+            batch_size=args.batch_size,
+            num_draft_tokens=args.num_draft_tokens,
         )
     elif args.backend == "autodeploy":
         result = test_llama_spec_dec_with_autodeploy(
             model=args.model,
             speculative_model_dir=speculative_model_path,
             enable_spec_dec=not args.no_spec_dec,
+            world_size=args.world_size,
+            batch_size=args.batch_size,
+            num_draft_tokens=args.num_draft_tokens,
         )
     else:
         print(f"[ERROR] Unknown backend: {args.backend}")
