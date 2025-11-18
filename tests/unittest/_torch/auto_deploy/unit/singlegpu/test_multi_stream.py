@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -6,25 +6,39 @@ from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
-stream_dict = {"linear_aux_stream": torch.cuda.Stream()}
+stream_dict = {"aux_stream": torch.cuda.Stream()}
 event_dict = {
     "aux_stream_event": torch.cuda.Event(),
     "main_stream_event": torch.cuda.Event(),
 }
 
 
+@torch.library.custom_op("auto_deploy::record_event", mutates_args=())
+def record_event(event_name: str) -> None:
+    event = event_dict[event_name]
+    event.record()
+
+
+@torch.library.custom_op("auto_deploy::wait_event", mutates_args=())
+def wait_event(event_name: str) -> None:
+    event = event_dict[event_name]
+    event.wait()
+
+
 @torch.library.custom_op("auto_deploy::multi_stream_linear", mutates_args=())
 def multi_stream_linear(
-    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+    input: torch.Tensor, weight0: torch.Tensor, weight1: torch.Tensor
 ) -> torch.Tensor:
-    output = torch.ops.aten.linear(input, weight, bias)
+    output = torch.ops.aten.linear(input, weight0)
+    output = torch.ops.aten.linear(output, weight1)
     return output
 
 
 @multi_stream_linear.register_fake
-def multi_stream_linear_fake(input, weight, bias):
+def multi_stream_linear_fake(input, weight0, weight1):
     """Fake implementation of multi_stream_linear."""
-    return torch.ops.aten.linear(input, weight, bias)
+    output = torch.ops.aten.linear(input, weight0)
+    return torch.ops.aten.linear(output, weight1)
 
 
 def aux_stream_wrapper(
@@ -33,12 +47,12 @@ def aux_stream_wrapper(
     **kwargs: Dict[str, Any],
 ) -> Callable:
     stream_name = kwargs.pop("stream_name")
-    event_dict["main_stream_event"].record()
+    torch.ops.auto_deploy.record_event("main_stream_event")
     with torch.cuda.stream(stream_dict[stream_name]):
-        event_dict["main_stream_event"].wait()
+        torch.ops.auto_deploy.wait_event("main_stream_event")
         output = fn(*args)
-        event_dict["aux_stream_event"].record()
-    event_dict["aux_stream_event"].wait()
+        torch.ops.auto_deploy.record_event("aux_stream_event")
+    torch.ops.auto_deploy.wait_event("aux_stream_event")
     return output
 
 
@@ -88,17 +102,17 @@ def replace_multi_stream_linear_with_aux_stream_wrapper(
 class ParallelTwoLinear(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.fc1 = nn.Linear(in_dim, out_dim)
+        self.fc10 = nn.Linear(in_dim, in_dim)
+        self.fc11 = nn.Linear(in_dim, out_dim)
         self.fc2 = nn.Linear(in_dim, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return multi_stream_linear(x, self.fc1.weight, self.fc1.bias) + self.fc2(x)
+        y0 = self.fc2(x)
+        y1 = multi_stream_linear(x, self.fc10.weight, self.fc11.weight)
+        return y0 + y1
 
 
 in_dim, out_dim = 128, 256
-aux_stream = torch.cuda.Stream()
-event0 = torch.cuda.Event()
-event1 = torch.cuda.Event()
 
 model = ParallelTwoLinear(in_dim, out_dim).eval().to("cuda")
 
@@ -115,7 +129,7 @@ ref_output = model(test_x)
 
 # pattern matching and replace
 gm, num_replaced = replace_multi_stream_linear_with_aux_stream_wrapper(
-    gm, aux_stream_wrapper, "linear_aux_stream"
+    gm, aux_stream_wrapper, "aux_stream"
 )
 print(f"Replaced {num_replaced} nodes")
 print(gm.graph)
@@ -133,6 +147,8 @@ static_x.copy_(test_x)
 graph.replay()
 
 assert torch.allclose(static_output, ref_output)
+for i in range(100):
+    gm(torch.randn(4, in_dim).to("cuda"))
 
 for i in range(100):
     graph.replay()
