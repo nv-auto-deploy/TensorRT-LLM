@@ -31,7 +31,6 @@ from tensorrt_llm._torch.speculative import (
     _get_spec_resource_manager,
     get_spec_metadata,
 )
-from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
@@ -306,8 +305,6 @@ class ADEngine(ModelEngine):
     def build_from_config(cls, ad_config: LlmArgs):
         """Build the ADEngine using the LlmArgs that gets passed through from the LLM."""
 
-        print(f"[TRACE] Building ADEngine from config: {ad_config}")
-
         max_batch_size = ad_config.max_batch_size
         max_seq_len = ad_config.max_seq_len
         attn_page_size = ad_config.attn_page_size
@@ -377,7 +374,6 @@ class ADEngine(ModelEngine):
 
         self.ad_config = ad_config
         self.spec_config = ad_config.speculative_config
-        print(f"[TRACE] Spec config in ADEngine.__init__: {self.spec_config}")
 
         # construct cache sequence interface
         self.cache_seq_interface = CachedSequenceInterface(
@@ -402,38 +398,7 @@ class ADEngine(ModelEngine):
         """Prepare inputs for AD Model from scheduled requests."""
         # cache manager
 
-        print(
-            f"[TRACE] Preparing inputs for AD Model from scheduled requests: {scheduled_requests}"
-        )
-        print(f"[TRACE] Context requests length: {len(scheduled_requests.context_requests)}")
-        print(f"[TRACE] Generation requests length: {len(scheduled_requests.generation_requests)}")
-
-        assert (
-            self.spec_config is None or self.spec_config.spec_dec_mode.support_overlap_scheduler()
-        ), (
-            f"{self.spec_config.spec_dec_mode.decoding_type} must support the overlap scheduler currently"
-        )
-
-        new_tokens, new_tokens_lens, next_draft_tokens = None, None, None
-        if new_tensors_device is not None:
-            print(f"[TRACE] new_tensors_device type: {type(new_tensors_device)}")
-            new_tokens = new_tensors_device.new_tokens
-            # print(f"new_tokens: {new_tokens}")
-            # print(f"new_tokens.shape: {new_tokens.shape}")
-
-            # Note(govind): The following if statement should always be true if we are using
-            # the overlap scheduler with speculative decoding.
-            if isinstance(new_tensors_device, SampleStateTensorsMTP):
-                assert self.ad_config.speculative_config is not None
-                new_tokens_lens = new_tensors_device.new_tokens_lens  # [batch]
-                next_draft_tokens = new_tensors_device.next_draft_tokens  # [batch, draft_len]
-                print(f"new_tokens_lens: {new_tokens_lens}")
-                new_tokens_lens = len(new_tokens_lens)
-                print(f"new_tokens_lens (length): {new_tokens_lens}")
-                print(f"new_tokens: {new_tokens}")
-                print(f"new_tokens.shape: {new_tokens.shape}")
-                print(f"next_draft_tokens: {next_draft_tokens}")
-                print(f"next_draft_tokens.shape: {next_draft_tokens.shape}")
+        new_tokens = new_tensors_device.new_tokens if new_tensors_device is not None else None
 
         # TODO(govind): Manage guided decoding + speculative decoding together.
 
@@ -441,13 +406,9 @@ class ADEngine(ModelEngine):
             ResourceManagerType.KV_CACHE_MANAGER
         )
 
-        print(f"[TRACE] KV cache manager: {kv_cache_manager}")
         # requests in order of context, generate
         context_requests = scheduled_requests.context_requests
         gen_requests = scheduled_requests.generation_requests
-
-        if new_tokens is not None:
-            print(f"[TRACE] New tokens shape: {new_tokens.shape}")
 
         # info to be extracted
         input_ids: List[List[int]] = []
@@ -521,35 +482,21 @@ class ADEngine(ModelEngine):
             if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
                 # No overlap scheduler or dummy request
                 if is_extend:
-                    print("Processing possibly non-dummy request")
-                    print(
-                        f"new_tokens: {new_tokens}, request.is_dummy: {request.is_dummy},\
-                            request.py_batch_idx: {request.py_batch_idx},\
-                            request.max_beam_num_tokens: {request.max_beam_num_tokens}"
-                    )
                     input_ids = [request.get_token(0, request.get_num_tokens(0) - 1)] + [
                         token for token in request.py_draft_tokens
                     ]
                 else:
-                    print("About to append the following to input_pos:")
-                    print("Request.max_beam_num_tokens: ", request.max_beam_num_tokens)
-                    print("Request.py_draft_tokens: ", request.py_draft_tokens)
                     input_ids = [request.get_token(0, request.get_num_tokens(0) - 1)]
                 gather_indices = []
             else:
                 # Overlap scheduler enabled
                 if is_extend:
-                    print(f"length of request.py_draft_tokens: {len(request.py_draft_tokens)}")
-                    print(f"py_batch_idx: {request.py_batch_idx}")
-
                     gather_indices = [
-                        x * new_tokens_lens + request.py_batch_idx
+                        x * new_tokens.shape[1] + request.py_batch_idx
                         for x in range(len(request.py_draft_tokens) + 1)
                     ]
 
-                    print(f"gather_indices_to_append: {gather_indices}")
                     dummy_draft_tokens = [dummy_token for _ in range(len(request.py_draft_tokens))]
-                    print(dummy_draft_tokens)
                     input_ids = [dummy_token] + dummy_draft_tokens
                 else:
                     gather_indices = [request.py_batch_idx]
@@ -566,9 +513,6 @@ class ADEngine(ModelEngine):
             input_pos.append(num_tokens_seen)
             all_gather_indices.append(gather_indices_to_append)
 
-            print(f"[TRACE] request.seq_slot: {request.seq_slot}")
-            print(f"[TRACE] request.py_batch_idx: {request.py_batch_idx}")
-
             # Common operations
             request.py_batch_idx = request.seq_slot
             slot_idx.append(request.seq_slot)
@@ -578,7 +522,6 @@ class ADEngine(ModelEngine):
             cache_indices = kv_cache_manager.get_cache_indices(request)
             page_assignments.append(cache_indices)
 
-        print("Finished for loop over generation requests.")
         # update the sequence info object now
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
@@ -594,15 +537,6 @@ class ADEngine(ModelEngine):
             for gather_idx in seq_gather_indices
         ]
 
-        print(f"[TRACE] input_ids: {input_ids}")
-        print(f"[TRACE] input_pos: {input_pos}")
-        print(f"[TRACE] page_assignments: {page_assignments}")
-        print(f"[TRACE] flat_gather_indices: {flat_gather_indices}")
-        print(f"new_tokens (unflattened): {new_tokens}")
-
-        print(
-            f"[TRACE] sequence info (before rescatter): {self.cache_seq_interface.info.named_args}"
-        )
         # scatter the new tokens into the input_ids tensor if provided
         if new_tokens is not None:
             self.cache_seq_interface.info.rescatter_input_ids(
@@ -611,17 +545,11 @@ class ADEngine(ModelEngine):
                 scatter_ref=dummy_token,
             )
 
-        print(
-            f"[TRACE] sequence info (after rescatter): {self.cache_seq_interface.info.named_args}"
-        )
-
         return last_logit_only
 
     @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
-        print("[TRACE] In _compute_logits(). Running model with named args")
-        print(f"[TRACE] Named args: {self.cache_seq_interface.info.named_args}")
         logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
 
         # return a list of tensors
@@ -670,28 +598,15 @@ class ADEngine(ModelEngine):
             scheduled_requests, resource_manager, new_tensors_device, spec_metadata
         )
 
-        print("[TRACE] In forward(). Finished preparing inputs. Now computing logits.")
         # compute all logits
         logits = self._compute_logits()
 
-        print(f"[TRACE] logits: {logits}")
-        print(f"length of logits: {len(logits)}")
-
-        print(
-            "[TRACE] In forward(). Finished computing logits. Now gathering and concatenating logits."
-        )
-
-        print(f"[TRACE] last_logit_only: {last_logit_only}")
-        print("About to gather and concatenate logits.")
         # gather+cat logits
         logits_flat = torch.cat(
             [ls_one_seq[-last_only:] for ls_one_seq, last_only in zip(logits, last_logit_only)],
             dim=0,
         )
 
-        print(
-            f"[TRACE] In forward(). Finished gathering and concatenating logits. Flattened logits: {logits_flat}"
-        )
         return {"logits": logits_flat}
 
 
@@ -721,7 +636,6 @@ def create_draft_model_engine_maybe(
         return None
 
     has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
-    print(f"[TRACE] Has spec drafter: {has_spec_drafter}")
 
     draft_spec_config = copy.copy(spec_config)
 
@@ -732,17 +646,6 @@ def create_draft_model_engine_maybe(
         and ad_config.attn_backend == "TRTLLM"
     )
 
-    print(f"[TRACE] Use chain drafter: {use_chain_drafter}")
-    print("[TRACE] ad_config.guided_decoding_backend: ", ad_config.guided_decoding_backend)
-    print(
-        "[TRACE] draft_spec_config._allow_chain_drafter: ",
-        draft_spec_config._allow_chain_drafter,
-    )
-    print(
-        "[TRACE] draft_spec_config._allow_greedy_draft_tokens: ",
-        draft_spec_config._allow_greedy_draft_tokens,
-    )
-    print("[TRACE] ad_config.attn_backend: ", ad_config.attn_backend)
     if use_chain_drafter:
 
         def drafting_loop_wrapper(model):
@@ -772,22 +675,6 @@ def create_draft_model_engine_maybe(
         enable_chunked_context=enable_chunked_context,
     )
 
-    print(
-        f"[AUTODEPLOY] Creating draft_model_engine with model_path: {draft_spec_config.speculative_model_dir}"
-    )
-    print(f"[TRACE] Dist: {mpi_dist}")
-
-    print(
-        f"[TRACE] Calling draft_model_engine constructor in create_autodeploy_executor "
-        f"with the following arguments:\n"
-        f"[TRACE] model_path: {draft_spec_config.speculative_model_dir}\n"
-        f"[TRACE] llm_args: {draft_llm_args}\n"
-        f"[TRACE] mapping: {dist_mapping}\n"
-        f"[TRACE] attn_runtime_features: {attn_runtime_features}\n"
-        f"[TRACE] dist: {mpi_dist}\n"
-        f"[TRACE] spec_config: {draft_spec_config}\n"
-        f"[TRACE] is_draft_model: True"
-    )
     draft_model_engine = PyTorchModelEngine(
         model_path=draft_spec_config.speculative_model_dir,
         llm_args=draft_llm_args,
@@ -818,8 +705,6 @@ def create_draft_model_engine_maybe(
     # If the model is an MLA model, we need to set
     # draft_model_engine.attn_runtime_features.chunked_prefill to False
     target_model_config = engine.model_config
-    print(f"[TRACE] Engine model pretrained config: {target_model_config}")
-    print(f"[TRACE] Is MLA: {is_mla(target_model_config)}")
 
     if is_mla(target_model_config):
         draft_model_engine.attn_runtime_features.chunked_prefill = False
@@ -836,12 +721,8 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # initialize process groups
     world_size = mpi_world_size()
     rank = mpi_rank()
-    print(f"[TRACE] World size: {world_size}")
-    print(f"[TRACE] Rank: {rank}")
     dist_mapping = Mapping(rank=rank, world_size=world_size, tp_size=world_size)
-    print(f"[TRACE] Dist mapping: {dist_mapping}")
     mpi_dist = MPIDist(dist_mapping)
-    print(f"[TRACE] MPI dist: {mpi_dist}")
     ad_logger.set_rank(rank)
     torch.cuda.set_device(rank)
     port = mpi_dist.broadcast(dist.get_free_port())  # use MPI broadcast to pick a free port
@@ -861,9 +742,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         else ad_config.speculative_config.max_total_draft_tokens
     )
 
-    print(f"[TRACE] Max draft len: {max_draft_len}")
-    print(f"[TRACE] Max total draft tokens: {max_total_draft_tokens}")
-
     # initialize model engine
     engine = ADEngine.build_from_config(ad_config=ad_config)
 
@@ -875,7 +753,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         max_draft_len=max_draft_len,
         max_total_draft_tokens=max_total_draft_tokens,
     )
-    print("[TRACE] AD Config: ", ad_config)
 
     # check kvcache config for partial block reuse
     # TODO: copy_on_partial_reuse is not supported yet, see
@@ -900,12 +777,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         )
 
     # resource managers
-    print(
-        f"[TRACE] engine.cache_seq_interface.info.num_pages: {engine.cache_seq_interface.info.num_pages}"
-    )
-    print(f"[TRACE] ad_config.attn_page_size: {ad_config.attn_page_size}")
-    print(f"[TRACE] ad_config.max_seq_len: {ad_config.max_seq_len}")
-    print(f"[TRACE] ad_config.max_batch_size: {ad_config.max_batch_size}")
     kv_cache_manager = _CacheManagerWithFakePool(
         ad_config.kv_cache_config,
         num_blocks=engine.cache_seq_interface.info.num_pages,
@@ -995,8 +866,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         sampler=sampler,
         spec_resource_manager=spec_resource_manager,
     )
-
-    print(f"[TRACE] Drafter in AutoDeploy executor: {drafter}")
 
     # creating the executor object
     py_executor = PyExecutor(

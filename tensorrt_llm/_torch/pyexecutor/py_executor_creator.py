@@ -306,9 +306,6 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-    print(f"[TRACE] Has draft model engine: {has_draft_model_engine}")
-    print(f"[TRACE] Has spec drafter: {has_spec_drafter}")
-
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,
@@ -357,8 +354,6 @@ def create_py_executor(
                                  draft_spec_config._allow_greedy_draft_tokens
                                  and llm_args.attn_backend == "TRTLLM")
 
-            print(f"[TRACE] Use chain drafter: {use_chain_drafter}")
-
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:
 
@@ -374,22 +369,8 @@ def create_py_executor(
 
             draft_llm_args = copy.copy(llm_args)
 
-            print("Constructing draft model engine. Checkpoint loader: ",
-                  draft_llm_args.checkpoint_loader)
             if spec_config.load_format == "dummy":
                 draft_llm_args.load_format = LoadFormat.DUMMY
-
-            print(f"[TRACE] Dist: {dist}")
-
-            print(
-                f"[TRACE] Calling draft_model_engine constructor in create_py_executor with the following arguments:\n"
-                f"[TRACE] model_path: {spec_config.speculative_model_dir}\n"
-                f"[TRACE] llm_args: {draft_llm_args}\n"
-                f"[TRACE] mapping: {mapping}\n"
-                f"[TRACE] attn_runtime_features: {attn_runtime_features}\n"
-                f"[TRACE] dist: {dist}\n"
-                f"[TRACE] spec_config: {draft_spec_config}\n"
-                f"[TRACE] is_draft_model: True")
 
             draft_model_engine = PyTorchModelEngine(
                 model_path=spec_config.speculative_model_dir,
@@ -627,7 +608,6 @@ def create_py_executor(
                                    spec_resource_manager=spec_resource_manager,
                                    guided_decoder=guided_decoder)
 
-    print(f"[TRACE] Drafter in PyExecutor creator: {drafter}")
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES if estimating_kv_cache else
             ExecutorMemoryType.EXTRA_RESOURCES, RestoreMode.PINNED):

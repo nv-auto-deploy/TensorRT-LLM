@@ -198,17 +198,14 @@ class PyTorchModelEngine(ModelEngine):
                 lora_config=lora_config,
             )
 
-            print("Loading model with loader")
             self.model, moe_load_balancer = loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
 
-            print("Model loaded: ", self.model)
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
             self.model = model
         if drafting_loop_wrapper is not None:
-            print("Applying drafting loop wrapper to model")
             self.model = drafting_loop_wrapper(self.model)
             self.model_is_wrapped = True
         else:
@@ -1232,31 +1229,8 @@ class PyTorchModelEngine(ModelEngine):
         """
         Prepare inputs for Pytorch Model.
         """
-        print(
-            f"[TRACE] PyTorch ModelEngine._prepare_tp_inputs. is_draft_model: {self.is_draft_model}"
-        )
-        print(
-            f"[TRACE] PyTorch ModelEngine._prepare_tp_inputs. Context request count: {len(scheduled_requests.context_requests)} "
-        )
-        print(
-            f"[TRACE] PyTorch ModelEngine._prepare_tp_inputs. Generation request count: {len(scheduled_requests.generation_requests)} "
-        )
         new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
         if new_tensors_device is not None:
-            #print("new_tensors_device:")
-            #print(f"new_tensors_device: {new_tensors_device}")
-            #print(f"new_tensors_device.new_tokens: {new_tensors_device.new_tokens}")
-            print(
-                f"new_tensors_device.new_tokens.shape: {new_tensors_device.new_tokens.shape}"
-            )
-
-            print(
-                f"new_tensors_device.log_probs: {new_tensors_device.log_probs}")
-            if new_tensors_device.log_probs is not None:
-                print(
-                    f"new_tensors_device.log_probs.shape: {new_tensors_device.log_probs.shape}"
-                )
-
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
             # When using overlap scheduler with speculative decoding, the target model's inputs would be SampleStateTensorsMTP.
@@ -1264,9 +1238,7 @@ class PyTorchModelEngine(ModelEngine):
             if isinstance(new_tensors_device, SampleStateTensorsMTP):
                 assert self.enable_spec_decode and not self.is_draft_model
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
-                print(f"new_tokens_lens_device: {new_tokens_lens_device}")
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
-                print(f"next_draft_tokens_device: {next_draft_tokens_device}")
 
         # Must be before the update of py_batch_idx
         if self.guided_decoder is not None:
@@ -2368,8 +2340,6 @@ class PyTorchModelEngine(ModelEngine):
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer)
 
-            print("Inputs: ", inputs)
-            print("Gather ids: ", gather_ids)
             self.iter_counter += 1
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not maybe_graph:
@@ -2401,14 +2371,11 @@ class PyTorchModelEngine(ModelEngine):
                         with MoeLoadBalancerIterContext(moe_load_balancer):
                             outputs = self.cuda_graph_runner.replay(key, inputs)
 
-            print(f"Got to here0")
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
-            print(f"Got to here1")
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
-            print(f"Got to here2")
             return outputs
 
     def model_forward(self, **kwargs):
@@ -2439,7 +2406,6 @@ class PyTorchModelEngine(ModelEngine):
         if inputs.get('spec_metadata', None):
             gather_ids = inputs['spec_metadata'].gather_ids
 
-        print("About to call model_forward in PyTorchModelEngine")
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
         outputs = self.model_forward(
@@ -2447,7 +2413,6 @@ class PyTorchModelEngine(ModelEngine):
             return_context_logits=gather_ids is not None
             or gather_context_logits,
         )
-        print("Finished call to model_forward in PyTorchModelEngine")
 
         if self.without_logits:
             return outputs
@@ -2530,18 +2495,7 @@ class PyTorchModelEngine(ModelEngine):
         self.model.load_weights_from_target_model if such a method exists.
         """
 
-        print(
-            f"[TRACE] load_weights_from_target_model. Type of self.model: {type(self.model)}"
-        )
-        print(
-            f"[TRACE] load_weights_from_target_model. Type of target_model: {type(target_model)}"
-        )
-        print(
-            f"[TRACE] load_weights_from_target_model. Target model: {target_model}"
-        )
-
         loader = getattr(self.model, "load_weights_from_target_model", None)
-        print(f"[TRACE] load_weights_from_target_model. Loader: {loader}")
         if callable(loader):
             loader(target_model)
 

@@ -791,9 +791,7 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
-    print(f"[TRACE] Creating resource manager with resources: {resources}")
     resource_manager = ResourceManager(resources)
-    print(f"[TRACE] Resource manager created: {resource_manager}")
 
     # Make sure the kv cache manager is always invoked last as it could
     # depend on the results of other resource managers.
@@ -801,9 +799,6 @@ def create_py_executor_instance(
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
-    print(
-        f"[TRACE] Resource manager after moving kv cache manager to end: {resource_manager}"
-    )
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
     scheduler_capacity = max_num_sequences

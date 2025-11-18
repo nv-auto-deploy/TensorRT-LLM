@@ -221,7 +221,6 @@ class BaseWorker(GenerationExecutor):
             return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
                                  executor_config)
 
-        print(f"[TRACE] Creating engine with llm_args: {self.llm_args}")
         self.engine = _create_py_executor(
         ) if self.llm_args is not None else _create_engine(
             self._executor_config)
