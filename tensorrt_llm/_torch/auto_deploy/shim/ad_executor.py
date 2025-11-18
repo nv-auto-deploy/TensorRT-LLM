@@ -445,27 +445,6 @@ class ADEngine(ModelEngine):
         # requests in order of context, generate
         context_requests = scheduled_requests.context_requests
         gen_requests = scheduled_requests.generation_requests
-        extend_requests = []
-        first_draft_requests = []
-        generation_requests = []
-
-        # separate requests into extend requests (contains draft tokens) and other
-        # generation requests (requests that do not have draft tokens)
-        for request in gen_requests:
-            if get_draft_token_length(request) > 0 or next_draft_tokens is not None:
-                extend_requests.append(request)
-            else:
-                generation_requests.append(request)
-
-            assert not request.py_is_first_draft, (
-                "first draft requests should not be here, ADEngine only supports target models in spec dec"
-            )
-
-        print(f"[TRACE] Extend requests: {extend_requests}")
-        print(f"[TRACE] First draft requests: {first_draft_requests}")
-        print(
-            f"[TRACE] Generation requests (not extend or first draft requests): {generation_requests}"
-        )
 
         if new_tokens is not None:
             print(f"[TRACE] New tokens shape: {new_tokens.shape}")
@@ -513,75 +492,86 @@ class ADEngine(ModelEngine):
                     extra_args[k].append(v)
 
         # look at generate requests next
-        # TODO: we should also handle extend requests (for speculative decoding) here
+        # Define helper functions to reduce code duplication
+        def _compute_num_tokens_seen(request) -> int:
+            """Compute num_tokens_seen based on request type and state.
 
-        for request in extend_requests:
-            if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
-                print("Processing possibly non-dummy request")
-                print(
-                    f"new_tokens: {new_tokens}, request.is_dummy: {request.is_dummy},\
-                        request.py_batch_idx: {request.py_batch_idx},\
-                        request.max_beam_num_tokens: {request.max_beam_num_tokens}"
-                )
-                input_ids.append(
-                    [request.get_token(0, request.get_num_tokens(0) - 1)]
-                    + [token for token in request.py_draft_tokens]
-                )
-                num_tokens_seen = request.max_beam_num_tokens - 1
-                input_pos.append(num_tokens_seen)
+            Captures new_tokens from outer scope.
+            """
+            is_extend = get_draft_token_length(request) > 0
+
+            if is_extend:
+                return request.max_beam_num_tokens - 1
             else:
-                print(f"length of request.py_draft_tokens: {len(request.py_draft_tokens)}")
-                print(f"py_batch_idx: {request.py_batch_idx}")
+                # Generation request
+                if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
+                    return request.max_beam_num_tokens - 1
+                else:
+                    return request.max_beam_num_tokens  # no -1
 
-                gather_indices_to_extend = [
-                    x * new_tokens_lens + request.py_batch_idx
-                    for x in range(len(request.py_draft_tokens) + 1)
-                ]
+        def _build_input_ids(request) -> Tuple[List[int], List[int]]:
+            """Build input_ids and gather indices for a request.
+            Gather indices are used to gather tokens in new_tokens into input_ids in the case of the overlap scheduler.
 
-                print(f"gather_indices_to_extend: {gather_indices_to_extend}")
-                all_gather_indices.append(gather_indices_to_extend)
-                dummy_draft_tokens = [dummy_token for _ in range(len(request.py_draft_tokens))]
-                print(dummy_draft_tokens)
-                input_ids.append([dummy_token] + dummy_draft_tokens)
+            Captures new_tokens, new_tokens_lens, and dummy_token from outer scope.
+            Returns (input_ids, gather_indices_to_append).
+            """
+            is_extend = get_draft_token_length(request) > 0
 
-                num_tokens_seen = request.max_beam_num_tokens - 1
-                input_pos.append(num_tokens_seen)
-
-            request.py_batch_idx = request.seq_slot
-
-            slot_idx.append(request.seq_slot)
-
-            last_logit_only.append(False)
-
-            # get cache indices
-            cache_indices = kv_cache_manager.get_cache_indices(request)
-            page_assignments.append(cache_indices)
-
-        for request in generation_requests:
-            print("About to append the following to input_pos:")
-            print("Request.max_beam_num_tokens: ", request.max_beam_num_tokens)
-            print("Request.py_draft_tokens: ", request.py_draft_tokens)
-
-            # new_tokens are provided when the overlap scheduler is enabled.
             if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
-                input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
-                input_pos.append(request.max_beam_num_tokens - 1)
-
+                # No overlap scheduler or dummy request
+                if is_extend:
+                    print("Processing possibly non-dummy request")
+                    print(
+                        f"new_tokens: {new_tokens}, request.is_dummy: {request.is_dummy},\
+                            request.py_batch_idx: {request.py_batch_idx},\
+                            request.max_beam_num_tokens: {request.max_beam_num_tokens}"
+                    )
+                    input_ids = [request.get_token(0, request.get_num_tokens(0) - 1)] + [
+                        token for token in request.py_draft_tokens
+                    ]
+                else:
+                    print("About to append the following to input_pos:")
+                    print("Request.max_beam_num_tokens: ", request.max_beam_num_tokens)
+                    print("Request.py_draft_tokens: ", request.py_draft_tokens)
+                    input_ids = [request.get_token(0, request.get_num_tokens(0) - 1)]
+                gather_indices = []
             else:
-                input_ids.append([dummy_token])
-                input_pos.append(request.max_beam_num_tokens)
-                all_gather_indices.append([request.py_batch_idx])
+                # Overlap scheduler enabled
+                if is_extend:
+                    print(f"length of request.py_draft_tokens: {len(request.py_draft_tokens)}")
+                    print(f"py_batch_idx: {request.py_batch_idx}")
+
+                    gather_indices = [
+                        x * new_tokens_lens + request.py_batch_idx
+                        for x in range(len(request.py_draft_tokens) + 1)
+                    ]
+
+                    print(f"gather_indices_to_append: {gather_indices}")
+                    dummy_draft_tokens = [dummy_token for _ in range(len(request.py_draft_tokens))]
+                    print(dummy_draft_tokens)
+                    input_ids = [dummy_token] + dummy_draft_tokens
+                else:
+                    gather_indices = [request.py_batch_idx]
+                    input_ids = [dummy_token]
+
+            return input_ids, gather_indices
+
+        # Process all generation requests in a single unified loop
+        for request in gen_requests:
+            num_tokens_seen = _compute_num_tokens_seen(request)
+            input_ids_for_request, gather_indices_to_append = _build_input_ids(request)
+
+            input_ids.append(input_ids_for_request)
+            input_pos.append(num_tokens_seen)
+            all_gather_indices.append(gather_indices_to_append)
 
             print(f"[TRACE] request.seq_slot: {request.seq_slot}")
             print(f"[TRACE] request.py_batch_idx: {request.py_batch_idx}")
 
+            # Common operations
             request.py_batch_idx = request.seq_slot
-
-            # store seq slot idx
-            # TODO: double-check if this is correct for the overlap scheduler
             slot_idx.append(request.seq_slot)
-
-            # return all logits
             last_logit_only.append(False)
 
             # get cache indices
