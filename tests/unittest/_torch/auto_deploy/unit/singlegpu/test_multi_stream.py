@@ -41,13 +41,22 @@ def multi_stream_linear_fake(input, weight0, weight1):
     return torch.ops.aten.linear(output, weight1)
 
 
+def node_wrapper_with_record_event(
+    fn: Callable,
+    *args: Tuple[Any, ...],
+    **kwargs: Dict[str, Any],
+) -> Callable:
+    torch.ops.auto_deploy.record_event("main_stream_event")
+    output = fn(*args, **kwargs)
+    return output
+
+
 def aux_stream_wrapper(
     fn: Callable,
     *args: Tuple[Any, ...],
     **kwargs: Dict[str, Any],
 ) -> Callable:
     stream_name = kwargs.pop("stream_name")
-    torch.ops.auto_deploy.record_event("main_stream_event")
     with torch.cuda.stream(stream_dict[stream_name]):
         torch.ops.auto_deploy.wait_event("main_stream_event")
         output = fn(*args)
@@ -81,6 +90,21 @@ def replace_multi_stream_linear_with_aux_stream_wrapper(
             target_nodes.append(n)
 
     for n in target_nodes:
+        target_input_node = None
+        for input_node in n.all_input_nodes:
+            if len(input_node.users) > 1:
+                target_input_node = input_node
+                break
+        if target_input_node is None:
+            raise ValueError(f"Target input node not found for node {n}")
+        with graph.inserting_before(target_input_node):
+            new_node = graph.call_function(
+                node_wrapper_with_record_event,
+                args=(target_input_node.target, *target_input_node.args),
+                kwargs=target_input_node.kwargs,
+            )
+            target_input_node.replace_all_uses_with(new_node)
+            graph.erase_node(target_input_node)
         with graph.inserting_after(n):
             kwargs = n.kwargs.copy()
             kwargs["stream_name"] = stream_name
@@ -107,6 +131,7 @@ class ParallelTwoLinear(nn.Module):
         self.fc2 = nn.Linear(in_dim, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.nn.functional.relu(x)
         y0 = self.fc2(x)
         y1 = multi_stream_linear(x, self.fc10.weight, self.fc11.weight)
         return y0 + y1
@@ -114,7 +139,11 @@ class ParallelTwoLinear(nn.Module):
 
 in_dim, out_dim = 128, 256
 
-model = ParallelTwoLinear(in_dim, out_dim).eval().to("cuda")
+model = (
+    nn.Sequential(ParallelTwoLinear(in_dim, out_dim), ParallelTwoLinear(out_dim, out_dim))
+    .eval()
+    .to("cuda")
+)
 
 # Example input used for export
 example_input = torch.randn(4, in_dim).to("cuda")
