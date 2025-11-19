@@ -1,28 +1,14 @@
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Tuple
 
 import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.multi_stream import (
+    aux_stream_wrapper,
+    record_event_wrapper,
+)
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
-
-stream_dict = {"aux_stream": torch.cuda.Stream()}
-event_dict = {
-    "aux_stream_event": torch.cuda.Event(),
-    "main_stream_event": torch.cuda.Event(),
-}
-
-
-@torch.library.custom_op("auto_deploy::record_event", mutates_args=())
-def record_event(event_name: str) -> None:
-    event = event_dict[event_name]
-    event.record()
-
-
-@torch.library.custom_op("auto_deploy::wait_event", mutates_args=())
-def wait_event(event_name: str) -> None:
-    event = event_dict[event_name]
-    event.wait()
 
 
 @torch.library.custom_op("auto_deploy::multi_stream_linear", mutates_args=())
@@ -41,32 +27,8 @@ def multi_stream_linear_fake(input, weight0, weight1):
     return torch.ops.aten.linear(output, weight1)
 
 
-def node_wrapper_with_record_event(
-    fn: Callable,
-    *args: Tuple[Any, ...],
-    **kwargs: Dict[str, Any],
-) -> Callable:
-    torch.ops.auto_deploy.record_event("main_stream_event")
-    output = fn(*args, **kwargs)
-    return output
-
-
-def aux_stream_wrapper(
-    fn: Callable,
-    *args: Tuple[Any, ...],
-    **kwargs: Dict[str, Any],
-) -> Callable:
-    stream_name = kwargs.pop("stream_name")
-    with torch.cuda.stream(stream_dict[stream_name]):
-        torch.ops.auto_deploy.wait_event("main_stream_event")
-        output = fn(*args)
-        torch.ops.auto_deploy.record_event("aux_stream_event")
-    torch.ops.auto_deploy.wait_event("aux_stream_event")
-    return output
-
-
 def replace_multi_stream_linear_with_aux_stream_wrapper(
-    gm: GraphModule, aux_stream_wrapper: Callable[..., Any], stream_name: str
+    gm: GraphModule, aux_stream_wrapper: Callable[..., Any]
 ) -> Tuple[GraphModule, int]:
     """Traverse ``gm`` and replace all ``auto_deploy::multi_stream_linear`` ops with ``aux_stream_wrapper``.
 
@@ -99,17 +61,15 @@ def replace_multi_stream_linear_with_aux_stream_wrapper(
             raise ValueError(f"Target input node not found for node {n}")
         with graph.inserting_before(target_input_node):
             new_node = graph.call_function(
-                node_wrapper_with_record_event,
+                record_event_wrapper,
                 args=(target_input_node.target, *target_input_node.args),
                 kwargs=target_input_node.kwargs,
             )
             target_input_node.replace_all_uses_with(new_node)
             graph.erase_node(target_input_node)
         with graph.inserting_after(n):
-            kwargs = n.kwargs.copy()
-            kwargs["stream_name"] = stream_name
             new_node = graph.call_function(
-                aux_stream_wrapper, args=(n.target, *n.args), kwargs=kwargs
+                aux_stream_wrapper, args=(n.target, *n.args), kwargs=n.kwargs
             )
         n.replace_all_uses_with(new_node)
         graph.erase_node(n)
@@ -157,9 +117,7 @@ test_x = torch.randn(4, in_dim).to("cuda")
 ref_output = model(test_x)
 
 # pattern matching and replace
-gm, num_replaced = replace_multi_stream_linear_with_aux_stream_wrapper(
-    gm, aux_stream_wrapper, "aux_stream"
-)
+gm, num_replaced = replace_multi_stream_linear_with_aux_stream_wrapper(gm, aux_stream_wrapper)
 print(f"Replaced {num_replaced} nodes")
 print(gm.graph)
 y = gm(test_x)
