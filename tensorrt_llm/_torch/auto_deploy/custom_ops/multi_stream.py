@@ -68,9 +68,9 @@ def record_event_wrapper(
     fn: Callable,
     *args: Tuple[Any, ...],
     **kwargs: Dict[str, Any],
-) -> Callable:
-    torch.ops.auto_deploy.record_event(cuda_stream_manager.MAIN_STREAM_NAME)
+) -> torch.Tensor:
     output = fn(*args, **kwargs)
+    torch.ops.auto_deploy.record_event(cuda_stream_manager.MAIN_STREAM_NAME)
     return output
 
 
@@ -78,11 +78,50 @@ def aux_stream_wrapper(
     fn: Callable,
     *args: Tuple[Any, ...],
     **kwargs: Dict[str, Any],
-) -> Callable:
+):
     stream_name = cuda_stream_manager.AUX_STREAM_NAME
     with torch.cuda.stream(cuda_stream_manager.streams[stream_name]):
         torch.ops.auto_deploy.wait_event(cuda_stream_manager.MAIN_STREAM_NAME)
-        output = fn(*args)
+        output = fn(*args, **kwargs)
         torch.ops.auto_deploy.record_event(cuda_stream_manager.AUX_STREAM_NAME)
     torch.ops.auto_deploy.wait_event(cuda_stream_manager.AUX_STREAM_NAME)
     return output
+
+
+@torch.library.custom_op("auto_deploy::trtllm_moe_fused_aux", mutates_args=())
+def trtllm_moe_fused_aux(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    w3_w1_stacked_weight: torch.Tensor,
+    w2_stacked_weight: torch.Tensor,
+    mlp_style: str = "gated_mlp",
+    act_fn: str = "silu",
+) -> torch.Tensor:
+    with torch.cuda.stream(cuda_stream_manager.streams[cuda_stream_manager.AUX_STREAM_NAME]):
+        torch.ops.auto_deploy.wait_event(cuda_stream_manager.MAIN_STREAM_NAME)
+        output = torch.ops.auto_deploy.trtllm_moe_fused(
+            x,
+            selected_experts,
+            routing_weights,
+            w3_w1_stacked_weight,
+            w2_stacked_weight,
+            mlp_style,
+            act_fn,
+        )
+        torch.ops.auto_deploy.record_event(cuda_stream_manager.AUX_STREAM_NAME)
+    torch.ops.auto_deploy.wait_event(cuda_stream_manager.AUX_STREAM_NAME)
+    return output
+
+
+@trtllm_moe_fused_aux.register_fake
+def trtllm_moe_fused_aux_fake(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    w3_w1_stacked_weight: torch.Tensor,
+    w2_stacked_weight: torch.Tensor,
+    mlp_style: str = "gated_mlp",
+    act_fn: str = "silu",
+) -> torch.Tensor:
+    return torch.empty_like(x)

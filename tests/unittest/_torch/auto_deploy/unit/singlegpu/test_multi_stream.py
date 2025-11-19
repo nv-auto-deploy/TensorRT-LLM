@@ -1,4 +1,4 @@
-from typing import Any, Callable, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -27,9 +27,7 @@ def multi_stream_linear_fake(input, weight0, weight1):
     return torch.ops.aten.linear(output, weight1)
 
 
-def replace_multi_stream_linear_with_aux_stream_wrapper(
-    gm: GraphModule, aux_stream_wrapper: Callable[..., Any]
-) -> Tuple[GraphModule, int]:
+def replace_multi_stream_linear_with_aux_stream_wrapper(gm: GraphModule) -> Tuple[GraphModule, int]:
     """Traverse ``gm`` and replace all ``auto_deploy::multi_stream_linear`` ops with ``aux_stream_wrapper``.
 
     The replacement preserves the original args/kwargs of the node.
@@ -117,7 +115,7 @@ test_x = torch.randn(4, in_dim).to("cuda")
 ref_output = model(test_x)
 
 # pattern matching and replace
-gm, num_replaced = replace_multi_stream_linear_with_aux_stream_wrapper(gm, aux_stream_wrapper)
+gm, num_replaced = replace_multi_stream_linear_with_aux_stream_wrapper(gm)
 print(f"Replaced {num_replaced} nodes")
 print(gm.graph)
 y = gm(test_x)
