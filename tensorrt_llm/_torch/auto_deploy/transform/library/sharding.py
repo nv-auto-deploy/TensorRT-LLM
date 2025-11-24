@@ -16,6 +16,7 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
+import math
 import re
 from typing import Dict, List, Tuple, Type, Union
 
@@ -452,7 +453,9 @@ def _process_column_sharding(
         # we are probably in fused QKV case with single linear node and 3 slice nodes
         assert len(linear_nodes) == 1
         linear_node = linear_nodes[0]
-        assert all(s.args[1] == 2 for s in linear_node.users), "Expecting slice nodes with dim=3"
+        assert all(
+            s.args[1] == 2 for s in filtered_nodes(linear_node.users, ops=[torch.ops.aten.slice])
+        ), "Expecting slice nodes to slice tensor over dim=2"
         fused_weight_dims = [s.args[3] - s.args[2] for s in linear_node.users]
         weight_dim = linear_node.meta["val"].shape[2]
         if sum(fused_weight_dims) != weight_dim:
@@ -464,8 +467,9 @@ def _process_column_sharding(
                 )
                 return
 
+    added_nodes: int = 0
     for linear_node in linear_nodes:
-        sharding_config.add(
+        added_nodes += sharding_config.add(
             WeightShardingInfo.from_node(
                 linear_node,
                 split_dim=SplitDimension.COLUMN,
@@ -477,6 +481,9 @@ def _process_column_sharding(
                 layer_type=LayerType.MLP if min_local_shape == 1 else LayerType.ATTENTION,
             )
         )
+    if added_nodes == 0:
+        ad_logger.debug("No nodes were added for column sharding. Skipping.")
+        return 0
 
     nodes_to_validate = [
         n for n in subgraph_nodes if is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape])
@@ -518,7 +525,72 @@ def _process_column_sharding(
                 )
             )
         else:
-            for slice_node in linear_node.users:
+            slice_nodes = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.slice))
+            # check if the number of slice nodes match the number of fused weight dims
+            assert len(fused_weight_dims) == len(slice_nodes), (
+                "Expecting the number of slice nodes to match the number of fused weight dims"
+            )
+            # check if the min_local_shape condition:
+            # If we are dealing with fused QKV, with num_kv_heads not divisible by world_size,
+            # we need to adjust the start and end of the slice to ensure the local shape i
+            # s divisible by min_local_shape (head_dim)
+            if min_local_shape > 1:
+                assert len(slice_nodes) == 3, "Expecting exactly 3 slice nodes for fused QKV"
+                assert min(fused_weight_dims) % min_local_shape == 0, (
+                    "Fused weight dim must be divisible by min_local_shape"
+                )
+                num_kv_heads = min(fused_weight_dims) // min_local_shape
+                num_kv_heads_per_rank = math.ceil(num_kv_heads / world_size)
+                GQA_head_ratio = max(fused_weight_dims) // min(fused_weight_dims)
+                # process first slice node: Q
+                slice_node = slice_nodes[0]
+                args = list(slice_node.args)
+                assert args[2] == 0, "Q slice node should start with index 0"
+                assert args[3] == num_kv_heads * GQA_head_ratio * min_local_shape, (
+                    "Q slice node should end with num_kv_heads*GQA_head_ratio*min_local_shape"
+                )
+                args[2] = 0
+                args[3] = num_kv_heads_per_rank * GQA_head_ratio * min_local_shape
+                prev_end = args[3]
+                sharding_config.add(
+                    ParameterUpdateInfo(
+                        rank=rank,
+                        world_size=world_size,
+                        target_node=slice_node.name,
+                        args=tuple(args),
+                    )
+                )
+                # process second slice node: K
+                slice_node = slice_nodes[1]
+                args = list(slice_node.args)
+                args[2] = prev_end
+                args[3] = prev_end + num_kv_heads_per_rank * min_local_shape
+                prev_end = args[3]
+                sharding_config.add(
+                    ParameterUpdateInfo(
+                        rank=rank,
+                        world_size=world_size,
+                        target_node=slice_node.name,
+                        args=tuple(args),
+                    )
+                )
+                # process third slice node: V
+                slice_node = slice_nodes[2]
+                args = list(slice_node.args)
+                args[2] = prev_end
+                args[3] = prev_end + num_kv_heads_per_rank * min_local_shape
+                sharding_config.add(
+                    ParameterUpdateInfo(
+                        rank=rank,
+                        world_size=world_size,
+                        target_node=slice_node.name,
+                        args=tuple(args),
+                    )
+                )
+                return
+
+            for i in range(len(fused_weight_dims)):
+                slice_node = slice_nodes[i]
                 args = list(slice_node.args)
                 args[2] = args[2] // world_size
                 args[3] = args[3] // world_size
@@ -699,19 +771,9 @@ def detect_sharding_from_factory_config(
                     )
                     num_simple_shards += 1
                 else:
-                    ad_logger.warning(
-                        f"Unsupported sharding action {config}. Fallback to simple shard"
-                    )
-                    sharding_config.add(
-                        WeightShardingInfo.from_node(
-                            lin_node,
-                            split_dim=SplitDimension.COLUMN,
-                            rank=rank,
-                            world_size=world_size,
-                            dist_op="all_gather",
-                            min_local_shape=1,
-                            layer_type=layer_type,
-                        )
+                    ad_logger.debug(
+                        f"Unsupported sharding action {config}. "
+                        f"Linear node {lin_node} will not be sharded."
                     )
                 # after successful match, break the loop
                 break

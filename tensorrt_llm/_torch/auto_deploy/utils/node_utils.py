@@ -234,7 +234,7 @@ def filtered_nodes(
     Args:
         nodes: Iterable of nodes to filter (e.g., gm.graph.nodes)
         target: Either a callable function that takes a Node and returns bool,
-               or operation(s) to match against (deprecated, use ops parameter)
+               or operations to match against
         ops: Operation(s) to match against (preferred over target for operations)
 
     Yields:
@@ -523,6 +523,20 @@ def predecessors(
     preds = []
     seen = set()
     for arg in node.args:
+        if isinstance(arg, Iterable):
+            for a in arg:
+                if isinstance(a, Node):
+                    if ((not include) or (include and include(a))) and (
+                        not exclude or not exclude(a)
+                    ):
+                        if a not in seen:
+                            preds.append(a)
+                            seen.add(a)
+                    if depth > 1:
+                        for p in predecessors(a, depth - 1, include, exclude):
+                            if p not in seen:
+                                preds.append(p)
+                                seen.add(p)
         if isinstance(arg, Node):
             if ((not include) or (include and include(arg))) and (not exclude or not exclude(arg)):
                 if arg not in seen:
@@ -572,9 +586,9 @@ def subgraph(
     """
     Returns a list of nodes in a subgraph in computation DAG defined as either:
     1. all nodes succeeding any of the node in sources and preceding any of the
-      nodes in sinks. In this case, it is built by a BFS traversal from sinks,
+      nodes in sinks. In this case, it is built by a reverse BFS traversal from sinks,
       where the sources list acts as a boundary. We do it in this order (and not
-      from sources to sinks) to include nodes like weights or other inputs (they
+      from sinks to sources) to include nodes like weights or other inputs (they
       are not successors of sinks, so otherwise they wouldn't be included).
     2. all nodes succeeding any of the node in sources, bounded by (BFS search
       not extending further than) boundary_condition.
@@ -587,7 +601,6 @@ def subgraph(
     """
     subgraph_nodes = []
     seen = set()
-
     # differentiate between cases 1, 2, and 3 by checking if sinks and sources are provided
     if sinks is not None and sources is not None:
         # case 1
@@ -644,6 +657,11 @@ def subgraph(
             if isinstance(arg, Node) and arg not in seen:
                 seen.add(arg)
                 queue.append(arg)
+            elif isinstance(arg, Iterable):
+                for a in arg:
+                    if isinstance(a, Node) and a not in seen:
+                        seen.add(a)
+                        queue.append(a)
 
     return subgraph_nodes
 
@@ -654,7 +672,7 @@ def get_layer_after_linear_node(
     """Get the layer after a linear node."""
 
     def boundary_condition(node: Node) -> bool:
-        return is_any_lin_op(node)  # or is_op(node, ops=[torch.ops.aten.arange, torch.ops.aten.to])
+        return is_any_lin_op(node) or is_op(node, torch.ops.aten.sym_size)
 
     # If the last linear node is the output embedding, it cannot be a part of any layer
     if "lm_head" in extract_weight_node(linear_nodes[-1]).name:
@@ -707,12 +725,41 @@ def get_layer_after_linear_node(
     return layer_subgraph
 
 
-def draw_graph(gm: GraphModule, filename: str):
+def topological_layers(g: Graph) -> List[List[Node]]:
     """
-    Dump graphmodule to SVG file using PyTorch's built-in drawer.
-    """
-    from torch.fx.passes.graph_drawer import FxGraphDrawer
+    Returns layers: list[list[Node]]:
+    A list of lists of nodes, containing all nodes in the graph.
+    layers[i] contains all nodes reachable from the graph root in i hops,
+    that is, i iterations of BFS from the root.
 
-    drawer = FxGraphDrawer(gm, filename)
-    with open(f"{filename}.svg", "wb") as f:
-        f.write(drawer.get_dot_graph().create_svg())
+    """
+    if isinstance(g, GraphModule):
+        g = g.graph
+    layers = []
+
+    n_args = {n: predecessors(n) for n in g.nodes}
+    roots = [n for n, p in n_args.items() if len(p) == 0]
+    unvisited = set(g.nodes).difference(roots)
+    cur_layer = roots
+    layers.append(cur_layer)
+    while len(unvisited) > 0:
+        next_layer = []
+        # "stripe off" all nodes visible from current layers
+        for n in cur_layer:
+            for m in n.users:
+                n_args[m].remove(n)
+                if len(n_args[m]) == 0:
+                    next_layer.append(m)
+                    unvisited.remove(m)
+        layers.append(next_layer)
+        cur_layer = next_layer
+    return layers
+
+
+def get_node_depth(g: Union[Graph, list[list[Node]]], node: Node) -> int:
+    """Get the depth of a node in the graph."""
+    if isinstance(g, Graph):
+        layers = topological_layers(g)
+    else:
+        layers = g
+    return next((i for i, layer in enumerate(layers) if node in layer), None)
