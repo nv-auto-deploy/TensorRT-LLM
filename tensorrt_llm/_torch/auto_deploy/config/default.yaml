@@ -122,13 +122,16 @@ transforms:
     backend: trtllm
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
+
   # TODO (lucaslie): add backend selection as part of configurable inference optimizers
   fuse_rmsnorm:
     stage: post_load_fusion
     rmsnorm_backend: triton
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
-
+  weight_casting:
+    stage: post_load_fusion
+    enabled: true
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
