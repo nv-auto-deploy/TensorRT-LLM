@@ -1,4 +1,5 @@
 runtime: trtllm
+world_size: 8
 compile_backend: torch-cudagraph
 max_batch_size: 384
 max_seq_len: 65536 # tunable

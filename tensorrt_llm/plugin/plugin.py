@@ -587,7 +587,7 @@ class CustomAllReduceHelper:
             return int(workspace_size)
         if tp_size <= 2:
             return 16_000_000
-        return 8_000_000
+        return 64 * 1024 * 1024
 
     @staticmethod
     def max_workspace_size_lowprecision(tp_size: int) -> int:
