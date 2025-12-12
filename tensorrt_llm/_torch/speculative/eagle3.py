@@ -273,6 +273,10 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.hidden_states_read_indices[:self.num_tokens], :]
         if not self.is_first_draft:
             hidden_states = hidden_states[:, :self.hidden_size]
+
+        print(
+            f"In get_hidden_states(), hidden_states.shape: {hidden_states.shape}"
+        )
         return hidden_states
 
 

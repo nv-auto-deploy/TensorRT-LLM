@@ -204,6 +204,12 @@ class PyTorchModelEngine(ModelEngine):
             )
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
+
+            if self.is_draft_model:
+                print(f"model_path: {model_path}")
+                print(f"llm_args: {llm_args}")
+                print(f"model: {self.model}")
+                print(f"moe_load_balancer: {moe_load_balancer}")
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
