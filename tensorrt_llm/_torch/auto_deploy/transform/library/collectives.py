@@ -1,3 +1,6 @@
+"""Transformations for fusing collective operations."""
+
+import os
 from typing import Tuple
 
 import torch
@@ -5,6 +8,7 @@ from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils.logger import ad_logger
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
@@ -14,6 +18,40 @@ from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformReg
 # * version above with fused GEMMs (i.e. with a split node)
 # * all_reduce(pointwise_op(linear(x)))
 # * ...
+
+
+def _dump_allreduce_nodes(gm: GraphModule, prefix: str, rank: int):
+    """Dump all allreduce nodes to help debug fusion issues."""
+    dump_dir = os.environ.get("TRTLLM_DUMP_IR_DIR", "")
+    if not dump_dir:
+        return
+
+    os.makedirs(dump_dir, exist_ok=True)
+    filepath = os.path.join(dump_dir, f"{prefix}_rank{rank}.txt")
+
+    with open(filepath, "w") as f:
+        f.write(f"=== {prefix} ===\n\n")
+
+        # Find all allreduce nodes
+        allreduce_count = 0
+        for node in gm.graph.nodes:
+            if node.op == "call_function":
+                target_str = str(node.target)
+                if "all_reduce" in target_str.lower():
+                    allreduce_count += 1
+                    f.write(f"AllReduce Node #{allreduce_count}:\n")
+                    f.write(f"  Name: {node.name}\n")
+                    f.write(f"  Target: {node.target}\n")
+                    f.write(f"  Args: {node.args}\n")
+                    f.write(f"  Users: {[u.name for u in node.users]}\n")
+                    f.write("\n")
+
+        f.write(f"\nTotal allreduce nodes: {allreduce_count}\n")
+        f.write("\n" + "=" * 80 + "\n\n")
+        f.write("Full Graph:\n")
+        f.write(str(gm.graph))
+
+    ad_logger.info(f"Dumped IR to {filepath} ({allreduce_count} allreduce nodes)")
 
 
 def _allreduce_residual_rmsnorm_pattern(
@@ -81,6 +119,10 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        # Dump IR before fusion if TRTLLM_DUMP_IR_DIR is set
+        rank = shared_config.local_rank
+        _dump_allreduce_nodes(gm, "before_fusion", rank)
+
         patterns = ADPatternMatcherPass()
 
         # Dummy shapes for tracing
@@ -110,6 +152,9 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         )
 
         num_matches = patterns.apply(gm.graph)
+
+        # Dump IR after fusion if TRTLLM_DUMP_IR_DIR is set
+        _dump_allreduce_nodes(gm, "after_fusion", rank)
 
         info = TransformInfo(
             skipped=False,
