@@ -23,7 +23,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
-from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 
@@ -319,7 +318,7 @@ class Qwen3NextConfig(PretrainedConfig):
         self.mlp_only_layers = mlp_only_layers
 
 
-AutoConfig.register("qwen3_next", Qwen3NextConfig)
+#AutoConfig.register("qwen3_next", Qwen3NextConfig)
 
 
 class Qwen3NextGate(nn.Module):
