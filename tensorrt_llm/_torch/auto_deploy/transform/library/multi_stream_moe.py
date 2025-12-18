@@ -1,7 +1,7 @@
 """Transform for multi-stream execution of MoE layers that have shared experts and routed experts."""
 
 from threading import RLock
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.fx import GraphModule
@@ -97,6 +97,17 @@ def record_event_wrapper(
     output = fn(*args, **kwargs)
     torch.ops.auto_deploy.record_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
     return output
+
+
+# skip during compilation
+@torch._dynamo.disable
+def record_event_wrapper2(
+    t: torch.Tensor,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    device = device or torch.cuda.current_device()
+    torch.ops.auto_deploy.record_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
+    return t
 
 
 @torch._dynamo.disable
@@ -272,40 +283,25 @@ def _execute_op_in_aux_stream(
     gm: GraphModule, op_dict: Dict[Callable, Callable]
 ) -> Tuple[GraphModule, int]:
     graph = gm.graph
-    num_replaced = 0
 
     # Collect targets first to avoid mutating while iterating
     target_nodes = [n for n in graph.nodes if is_op(n, op_dict.keys())]
 
     for n in target_nodes:
-        target_input_node = None
-        for input_node in n.all_input_nodes:
-            if input_node.target == torch.ops.aten.view.default:
-                target_input_node = input_node
-                break
-
-        assert target_input_node is not None, f"Target input node not found for node {n}"
-        with graph.inserting_before(target_input_node):
-            kwargs = target_input_node.kwargs.copy()
-            kwargs["device"] = torch.cuda.current_device()
-            new_node = graph.call_function(
-                record_event_wrapper,
-                args=(target_input_node.target, *target_input_node.args),
-                kwargs=kwargs,
+        with graph.inserting_before(n):
+            input_node_with_event = graph.call_function(
+                record_event_wrapper2, args=(n.args[0], torch.cuda.current_device())
             )
-        target_input_node.replace_all_uses_with(new_node)
-        graph.erase_node(target_input_node)
-        with graph.inserting_after(n):
-            new_node = graph.call_function(op_dict[n.target], args=n.args, kwargs=n.kwargs)
+
+            new_node = graph.call_function(
+                op_dict[n.target],
+                args=(input_node_with_event, *n.args[1:]),
+                kwargs=n.kwargs,
+            )
         n.replace_all_uses_with(new_node)
         graph.erase_node(n)
-        num_replaced += 1
-    if num_replaced:
-        graph.eliminate_dead_code()
-        graph.lint()
-        gm.recompile()
 
-    return gm, num_replaced
+    return gm, len(target_nodes)
 
 
 @TransformRegistry.register("multi_stream_moe")
