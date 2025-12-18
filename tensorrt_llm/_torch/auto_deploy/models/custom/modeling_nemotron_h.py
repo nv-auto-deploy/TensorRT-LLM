@@ -222,6 +222,8 @@ class NemotronHBlock(nn.Module):
         self.layer_idx = layer_idx
         self.residual_in_fp32 = config.residual_in_fp32
         self.norm = NemotronHRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        # TODO: better check needed
+        self.is_last_token_mixer_layer = self.config.num_hidden_layers - 2 == self.layer_idx
 
         # M: Mamba2, *: Attention, -: MLP
         self.block_type = config.layers_block_type[layer_idx]
@@ -244,6 +246,8 @@ class NemotronHBlock(nn.Module):
 
         hidden_states = self.mixer(hidden_states)
         hidden_states = residual + hidden_states
+        if self.is_last_token_mixer_layer:
+            hidden_states = torch.ops.auto_deploy.gatherable_hidden_states(hidden_states)
         return hidden_states
 
 
@@ -284,9 +288,8 @@ class NemotronHMOE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor):
         residuals = hidden_states
-        orig_shape = hidden_states.shape
         topk_indices, topk_weights = self.gate(hidden_states)
-        x_flat = hidden_states.view(-1, hidden_states.shape[-1])
+        x_flat = hidden_states
 
         # NOTE: So far we've seen that the dispatch order in eager code is the same as the node order in the exported
         # graph.
@@ -316,7 +319,7 @@ class NemotronHMOE(nn.Module):
             # Latent MOE: project back from latent space
             out_flat = self.fc2_latent_proj(out_flat)
 
-        routed_out = out_flat.view(*orig_shape)
+        routed_out = out_flat
         out = shared_out + routed_out
         return out
 
