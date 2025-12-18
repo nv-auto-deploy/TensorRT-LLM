@@ -20,10 +20,10 @@ enabling CUDA graph capture and reducing computation by only computing
 logits for the tokens that are actually needed.
 """
 
-from typing import Tuple
+from typing import List, Tuple
 
 import torch
-from torch.fx import GraphModule
+from torch.fx import GraphModule, Node
 
 from ...utils.node_utils import is_linear_op, is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
@@ -44,14 +44,18 @@ class GatherLogitsBeforeLmHeadTransform(BaseTransform):
     - Moves gather into the graph for better optimization
     """
 
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm,
-        factory,
-        shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        self._log_info("Applying GatherLogitsBeforeLmHead transform...")
+    def _detect_gatherable_states(self, gm: GraphModule) -> List[Node]:
+        """Detect gatherable hidden states in the graph."""
+
+        # check if we already have gatherable hidden states op in the graph
+        gatherable_nodes = gm.graph.find_nodes(
+            op="call_function",
+            target=torch.ops.auto_deploy.gatherable_hidden_states.default,
+        )
+
+        # in this case we don't need to apply the heuristic
+        if gatherable_nodes:
+            return gatherable_nodes
 
         # assume lm head node is the input to the output node
         lm_head_node = gm.graph.find_nodes(op="output")[0].all_input_nodes[0]
@@ -65,16 +69,42 @@ class GatherLogitsBeforeLmHeadTransform(BaseTransform):
             node_to_gather = lm_head_node
             self._log_info("lm_head node is not linear, using it as the node to gather")
 
+        with gm.graph.inserting_after(node_to_gather):
+            gatherable_node = gm.graph.call_function(
+                torch.ops.auto_deploy.gatherable_hidden_states.default,
+                args=(node_to_gather,),
+            )
+        node_to_gather.replace_all_uses_with(gatherable_node)
+        gatherable_node.replace_input_with(gatherable_node, node_to_gather)
+
+        return [gatherable_node]
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm,
+        factory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        self._log_info("Applying GatherLogitsBeforeLmHead transform...")
+
+        gatherable_nodes = self._detect_gatherable_states(gm)
+
         # Add logits_gather_mask as input in the graph and the sequence info interface
         logits_gather_indices_node = self._add_or_retrieve_input(gm, cm, "logits_gather_indices")
         logits_gather_info_node = self._add_or_retrieve_input(gm, cm, "logits_gather_info")
 
-        with gm.graph.inserting_after(node_to_gather):
-            gathered_node = gm.graph.call_function(
-                torch.ops.auto_deploy.gather_logits_before_lm_head.default,
-                args=(node_to_gather, logits_gather_indices_node, logits_gather_info_node),
-            )
-        node_to_gather.replace_all_uses_with(gathered_node)
-        gathered_node.replace_input_with(gathered_node, node_to_gather)
+        for node in gatherable_nodes:
+            with gm.graph.inserting_after(node):
+                gathered_node = gm.graph.call_function(
+                    torch.ops.auto_deploy.gather_logits_before_lm_head.default,
+                    args=(
+                        node.args[0],
+                        logits_gather_indices_node,
+                        logits_gather_info_node,
+                    ),
+                )
+            node.replace_all_uses_with(gathered_node)
+            gm.graph.erase_node(node)
 
-        return gm, TransformInfo(skipped=False, num_matches=1)
+        return gm, TransformInfo(skipped=False, num_matches=len(gatherable_nodes))

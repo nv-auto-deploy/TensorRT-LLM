@@ -1,6 +1,19 @@
 import torch
 
 
+@torch.library.custom_op("auto_deploy::gatherable_hidden_states", mutates_args=())
+def gatherable_hidden_states(
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Indicator op for gatherable hidden states."""
+    return hidden_states.clone()
+
+
+@gatherable_hidden_states.register_fake
+def gatherable_hidden_states_fake(hidden_states: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
 @torch.library.custom_op("auto_deploy::gather_logits_before_lm_head", mutates_args=())
 def gather_logits_before_lm_head(
     hidden_states: torch.Tensor,
