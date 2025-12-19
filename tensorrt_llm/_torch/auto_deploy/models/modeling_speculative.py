@@ -1,3 +1,12 @@
+"""
+Analogous to tensorrt_llm/_torch/models/modeling_speculative.py
+Utilities in this file are used to load an Eagle3 checkpoint
+from HuggingFace.
+
+The idea is to load an Eagle3 checkpoint as an ADEngine,
+and also to combine it with the target model's engine.
+"""
+
 #!/usr/bin/env python3
 import argparse
 from pathlib import Path
@@ -71,7 +80,7 @@ class Eagle3DecoderLayer(LlamaDecoderLayer):
         return hidden_states, residual
 
 
-class EagleModel(nn.Module):
+class Eagle3DraftModel(nn.Module):
     def __init__(self, config: LlamaConfig, eh_proj_before_attn: bool = False):
         super().__init__()
         # 1. Vocab Mappings
@@ -134,10 +143,10 @@ class EagleModel(nn.Module):
         return logits
 
 
-class EagleForward(torch.nn.Module):
+class Eagle3ForCausalLM(torch.nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
-        self.model = EagleModel(config)
+        self.model = Eagle3DraftModel(config)
 
     def forward(
         self,
@@ -208,7 +217,7 @@ def main():
 
     dtype = torch.float16
 
-    model = EagleForward(cfg)
+    model = Eagle3ForCausalLM(cfg)
     model.load_weights(state_dict)
     model.to(device, dtype=dtype)
     model.eval()
