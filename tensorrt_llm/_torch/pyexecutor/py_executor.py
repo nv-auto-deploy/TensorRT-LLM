@@ -1317,6 +1317,8 @@ class PyExecutor:
             iter_stats = None
             while True:
                 profile_step()
+
+                print(f"In executor_loop(). Iter: {self.iter_counter}")
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
@@ -1339,6 +1341,8 @@ class PyExecutor:
 
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
+
+                    print(f"Calling resource_manager.prepare_resources()...")
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     self._kv_connector_start_batch(scheduled_batch)

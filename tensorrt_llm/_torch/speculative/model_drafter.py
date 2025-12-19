@@ -761,10 +761,13 @@ class ModelDrafter(Drafter):
         # reset draft tokens accumulator
         self.draft_tokens_accumulator = {}
         # Generate remaining draft tokens iteratively
+
+        print(f"In _execute_draft_loop(). max_draft_len: {self.max_draft_len}")
         for i in range(self.max_draft_len - 1):
             if len(draft_batch.generation_requests) == 0:
                 break
 
+            print(f"Calling _execute_draft_iteration()... i: {i}")
             _, sample_state = self._execute_draft_iteration(
                 draft_batch, resource_manager, previous_draft_state, i + 1)
 

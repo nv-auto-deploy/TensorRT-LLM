@@ -238,6 +238,7 @@ class PyTorchModelEngine(ModelEngine):
         self._init_model_capacity()
 
         self.cuda_graph_config = self.llm_args.cuda_graph_config
+        self.cuda_graph_config = None  # disable cuda graphs
         cuda_graph_batch_sizes = self.cuda_graph_config.batch_sizes if self.cuda_graph_config else CudaGraphConfig.model_fields[
             'batch_sizes'].default
         cuda_graph_padding_enabled = self.cuda_graph_config.enable_padding if self.cuda_graph_config else CudaGraphConfig.model_fields[
@@ -261,6 +262,7 @@ class PyTorchModelEngine(ModelEngine):
         # Eagle3 draft model now does not support torch.compile
         self._torch_compile_enabled = torch_compile_enabled
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
+        self._torch_compile_piecewise_cuda_graph = False  # disable piecewise cuda graphs
 
         piecewise_cuda_graph_num_tokens = (
             torch_compile_piecewise_cuda_graph_num_tokens
@@ -2124,6 +2126,8 @@ class PyTorchModelEngine(ModelEngine):
             if isinstance(spec_metadata, Eagle3OneModelSpecMetadata):
                 spec_metadata.populate_sampling_params_for_one_model(
                     scheduled_requests.all_requests())
+
+            print(f"Calling spec_metadata.prepare()...")
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
@@ -2672,6 +2676,11 @@ class PyTorchModelEngine(ModelEngine):
             spec_tree_manager = None
             if isinstance(spec_resource_manager, Eagle3ResourceManager):
                 spec_tree_manager = spec_resource_manager.spec_tree_manager
+
+            print(
+                f"In forward(). is_draft_model: {self.is_draft_model}. spec_resource_manager: {spec_resource_manager}"
+            )
+            print("Setting up spec_metadata...")
             spec_metadata = self._set_up_spec_metadata(spec_resource_manager,
                                                        no_cache=kv_cache_manager
                                                        is None)

@@ -65,6 +65,16 @@ class InferenceOptimizer:
 
         # iterate over all transforms sorted by stage in the config
         for t_name, t_config in self.config.items():
+            if t_name == "export_to_gm":
+                print(f"\n[DEBUG] Dumping module code before {t_name} transform:")
+                try:
+                    import inspect
+
+                    print(inspect.getsource(type(mod)))
+                except Exception as e:
+                    print(f"[DEBUG] Could not get source code: {e}")
+                    print(mod)
+
             # instantiate transform
             transform = TransformRegistry.get(t_name)(t_config)
             # run transform

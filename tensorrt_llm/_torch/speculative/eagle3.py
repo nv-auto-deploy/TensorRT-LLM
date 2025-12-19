@@ -85,6 +85,9 @@ class Eagle3ResourceManager(BaseResourceManager):
                 slot_id = self.slot_manager.add_slot(req.request_id)
                 self.slot_ids.append(slot_id)
         # reset the flag before model forward
+        print(
+            f"In eagle3_resource_manager.prepare_resources(). Setting is_first_draft to True"
+        )
         self.is_first_draft = True
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
@@ -166,6 +169,9 @@ class Eagle3SpecMetadata(SpecMetadata):
 
     def prepare(self):
         is_first_draft = self.eagle3_resource_manager.is_first_draft
+        print(
+            f"In prepare(). is_draft_model: {self.is_draft_model}. is_first_draft: {is_first_draft}"
+        )
         spec_tree_manager = self.eagle3_resource_manager.spec_tree_manager
         # Update start indices
         # Here, we assume the sequence lengths (seq_lens) during the draft model
@@ -242,6 +248,9 @@ class Eagle3SpecMetadata(SpecMetadata):
             hidden_states_write_indices, dtype=torch.long, pin_memory=True)
         self.is_first_draft = is_first_draft and self.is_draft_model
         if self.is_draft_model:
+            print(
+                f"In prepare(). is_draft_model: {self.is_draft_model}. Setting eagle3_resource_manager.is_first_draft to False"
+            )
             self.eagle3_resource_manager.is_first_draft = False
 
         self.hidden_states_read_indices[:self.num_tokens].copy_(
@@ -257,6 +266,9 @@ class Eagle3SpecMetadata(SpecMetadata):
             layer_id: int,
             hidden_states: torch.Tensor,
             residual: Optional[torch.Tensor] = None) -> None:
+        print(
+            f"In maybe_capture_hidden_states(). layer_id: {layer_id}. hidden_states.shape: {hidden_states.shape}. residual.shape: {residual.shape if residual is not None else None}"
+        )
         token_idx = self.hidden_states_write_indices[:self.num_tokens]
         eagle3_hidden_states = self.eagle3_resource_manager.hidden_states
         for i, captured_layer_id in enumerate(self.layers_to_capture):
@@ -275,7 +287,7 @@ class Eagle3SpecMetadata(SpecMetadata):
             hidden_states = hidden_states[:, :self.hidden_size]
 
         print(
-            f"In get_hidden_states(), hidden_states.shape: {hidden_states.shape}"
+            f"In get_hidden_states(). Is first draft: {self.is_first_draft}. hidden_size: {self.hidden_size}. hidden_states.shape: {hidden_states.shape}"
         )
         return hidden_states
 

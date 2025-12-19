@@ -321,6 +321,7 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
         hidden_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        print(f"In Eagle3ForCausalLM.forward(). spec_metadata: {spec_metadata}")
         hidden_states = self.apply_eagle3_fc(spec_metadata.get_hidden_states())
         output, _ = self.model(
             input_ids=input_ids,
