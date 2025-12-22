@@ -62,10 +62,10 @@ class _FlashInferPlanner:
         self.cached_decode_wrappers = {}
         self.plan_params = None
 
-    def _init_decode_wrapper(self):
+    def _init_decode_wrapper(self, **kwargs):
         assert self.workspace_buffer is not None
         return flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            self.workspace_buffer, "NHD", use_tensor_cores=True
+            self.workspace_buffer, "NHD", use_tensor_cores=True, **kwargs
         )
 
     def init_workspace(self, workspace_buffer: torch.Tensor):
@@ -112,17 +112,18 @@ class _FlashInferPlanner:
 
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
         if cuda_graph_state.in_warm_up() and plan_params not in self.cached_decode_wrappers:
-            self.cached_decode_wrappers[plan_params] = self._init_decode_wrapper()
+            self.cached_decode_wrappers[plan_params] = self._init_decode_wrapper(
+                use_cuda_graph=True,
+                paged_kv_indptr_buffer=kv_page_indptr,
+                paged_kv_indices_buffer=kv_page_indices,
+                paged_kv_last_page_len_buffer=kv_last_page_len,
+            )
             _plan_decode(self.cached_decode_wrappers[plan_params])
 
         # check if we are in cuda graph capture and just return the pre-cached decode wrapper
         if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
             assert plan_params.is_generate, "Only generate is supported during cuda graph capture."
             wrapper = self.cached_decode_wrappers[plan_params]
-            # copy the metadata to the wrapper to ensure it is up-to-date for graph replay!
-            wrapper._paged_kv_indptr_buf.copy_(kv_page_indptr)
-            wrapper._paged_kv_indices_buf.copy_(kv_page_indices)
-            wrapper._paged_kv_last_page_len_buf.copy_(kv_last_page_len)
             return wrapper
 
         # check for re-planning
