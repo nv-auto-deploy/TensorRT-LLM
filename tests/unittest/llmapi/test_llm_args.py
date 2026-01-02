@@ -138,6 +138,30 @@ max_seq_len: 128
         assert llm_args.max_num_tokens == 256
         assert llm_args.max_seq_len == 128
 
+    def test_llm_args_with_model_kwargs_trt(self):
+        yaml_content = """
+model_kwargs:
+    num_hidden_layers: 2
+    """
+        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args = TrtLlmArgs(model=llama_model_path)
+        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
+                                                        dict_content)
+        llm_args = TrtLlmArgs(**llm_args_dict)
+        assert llm_args.model_kwargs['num_hidden_layers'] == 2
+
+    def test_llm_args_with_model_kwargs_pt(self):
+        yaml_content = """
+model_kwargs:
+    num_hidden_layers: 2
+    """
+        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args = TorchLlmArgs(model=llama_model_path)
+        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
+                                                        dict_content)
+        llm_args = TorchLlmArgs(**llm_args_dict)
+        assert llm_args.model_kwargs['num_hidden_layers'] == 2
+
 
 def check_defaults(py_config_cls, pybind_config_cls):
     py_config = py_config_cls()
@@ -444,6 +468,17 @@ class TestTorchLlmArgs:
         with pytest.raises(ValueError):
             args = TorchLlmArgs(model=llama_model_path)
             args.invalid_arg = 1
+
+    @print_traceback_on_error
+    def test_model_kwargs_with_num_hidden_layers(self):
+        """Test that model_kwargs can override num_hidden_layers."""
+        from tensorrt_llm._torch.model_config import ModelConfig
+
+        model_kwargs = {'num_hidden_layers': 2}
+
+        config = ModelConfig.from_pretrained(llama_model_path,
+                                             model_kwargs=model_kwargs)
+        assert config.pretrained_config.num_hidden_layers == 2
 
 
 class TestTrtLlmArgs:
