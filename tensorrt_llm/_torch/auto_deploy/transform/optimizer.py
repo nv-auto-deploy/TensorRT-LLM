@@ -6,10 +6,12 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.fx import GraphModule
 
 from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
+from ..utils.node_utils import draw_graph
 from .interface import (
     InferenceOptimizerConfig,
     SharedConfig,
@@ -69,6 +71,25 @@ class InferenceOptimizer:
             transform = TransformRegistry.get(t_name)(t_config)
             # run transform
             mod = transform(mod, cm, self.factory, self.shared_config)
+
+            # draw graph after each pass if the module is a GraphModule
+#            if isinstance(mod, GraphModule):
+#                try:
+#                    filename = f"graph_after_{t_name}"
+#                    # Try to use FXGraphDrawer (requires graphviz)
+#                    draw_graph(mod, filename)
+#                    print(f"Graph saved to {filename}.svg after transform: {t_name}")
+#                except Exception:
+#                    # Fallback: save graph as text representation
+#                    try:
+#                        filename_txt = f"{filename}.txt"
+#                        with open(filename_txt, "w") as f:
+#                            f.write(f"Graph after {t_name}\n")
+#                            f.write("=" * 80 + "\n\n")
+#                            f.write(str(mod.graph))
+#                        print(f"Graph saved to {filename_txt} after transform: {t_name} (text format)")
+#                    except Exception as e:
+#                        print(f"Warning: Failed to save graph after {t_name}: {e}")
 
         ############################################################################################
         # RETURN OPTIMIZED MODEL
