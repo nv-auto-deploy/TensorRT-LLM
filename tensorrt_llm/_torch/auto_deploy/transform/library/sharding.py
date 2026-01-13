@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, field_validator
 from torch.fx import GraphModule, Node
 
 from .....functional import AllReduceStrategy
+from .....mapping import Mapping
 from ...custom_ops.trtllm_dist import is_trtllm_op_available
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
@@ -149,6 +150,7 @@ class ShardingTransformConfig(TransformConfig):
     )
 
     process_grid: Dict[ShardingDim, int] = Field(default_factory=dict)
+    mapping: Mapping = Field(default_factory=Mapping)
 
     def validate_config(self, sources: Union[ShardingSource, List[ShardingSource]] = None) -> bool:
         init_process_grid_from_config(self)
