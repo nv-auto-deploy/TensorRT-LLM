@@ -130,8 +130,8 @@ def _move_single_gm_to_device(gm: GraphModule, device: torch.device) -> None:
         )
     if recompile_graph:
         # recompile graph to update self generated codes in subgraph
-        gm.graph.lint()
-        gm.recompile()
+        lint(gm)
+        recompile(gm)
 
 
 def move_to_device(mod: nn.Module, device: DeviceLikeType) -> None:
@@ -288,7 +288,7 @@ def _run_shape_prop_single_gm(
         ad_logger.warning("No fake tensors and no args available for shape propagation")
 
     # lint the graph
-    gm.graph.lint()
+    lint(gm)
 
 
 def run_shape_prop(
