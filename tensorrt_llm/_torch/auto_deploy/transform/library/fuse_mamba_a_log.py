@@ -31,7 +31,7 @@ from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import del_attr_by_name, get_attr_by_name, set_attr_by_name
+from ...utils._graph import get_attr_by_name, set_attr_by_name
 from ...utils.logger import ad_logger
 from ...utils.pattern_matcher import ADPatternMatcherPass
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
@@ -82,35 +82,6 @@ def _ensure_a_fused_param(gm: GraphModule, param_name: str) -> Optional[str]:
         nn.Parameter(a_fused, requires_grad=False),
     )
     return new_param_name
-
-
-def _remove_unused_a_log_params(gm: GraphModule) -> bool:
-    """Remove detached A_log parameters after fusion."""
-
-    def _is_a_log_node(node: Node) -> bool:
-        return (
-            node.op == "get_attr" and isinstance(node.target, str) and node.target.endswith("A_log")
-        )
-
-    used_a_log_targets = {str(node.target) for node in gm.graph.nodes if _is_a_log_node(node)}
-    removed = False
-
-    def _maybe_remove(name: str) -> None:
-        nonlocal removed
-        if not name.endswith("A_log") or name in used_a_log_targets:
-            return
-        try:
-            del_attr_by_name(gm, name)
-            removed = True
-        except AttributeError:
-            ad_logger.warning(f"Failed to delete unused parameter {name} from GraphModule.")
-
-    for name, _ in list(gm.named_parameters()):
-        _maybe_remove(name)
-    for name, _ in list(gm.named_buffers()):
-        _maybe_remove(name)
-
-    return removed
 
 
 def _has_a_log_attr(match: Match) -> bool:
@@ -205,13 +176,9 @@ class FuseMambaALog(BaseTransform):
         _register_fuse_a_log_patterns(patterns)
         num_matches = patterns.apply(gm.graph)
 
-        if num_matches > 0:
-            gm.graph.eliminate_dead_code()
-            _remove_unused_a_log_params(gm)
-
         return gm, TransformInfo(
             skipped=False,
             num_matches=num_matches,
             is_clean=num_matches == 0,
-            has_valid_shapes=True,
+            has_valid_shapes=num_matches == 0,
         )

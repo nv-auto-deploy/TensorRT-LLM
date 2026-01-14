@@ -636,7 +636,7 @@ class MatchMoePattern(BaseTransform):
             graph.erase_node(final_hidden_state_node)
 
             while _remove_dead_inplace_nodes_in_region(gm.graph, start_boundary, end_boundary):
-                gm.graph.eliminate_dead_code()
+                eliminate_dead_code(gm)
 
             num_moe_patterns += 1
 

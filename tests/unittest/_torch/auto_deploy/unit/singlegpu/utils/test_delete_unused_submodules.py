@@ -31,7 +31,10 @@ import torch.nn as nn
 from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.utils._graph import delete_all_unused_submodules
+from tensorrt_llm._torch.auto_deploy.utils._graph import (
+    canonicalize_graph,
+    delete_all_unused_submodules,
+)
 
 # =============================================================================
 # Test Models - All submodules are used in forward pass
@@ -197,11 +200,7 @@ def make_submodules_unused(gm: GraphModule, targets_to_remove: List[str]) -> Non
     for node in reversed(nodes_to_bypass):
         graph.erase_node(node)
 
-    # Use eliminate_dead_code to remove now-unused get_attr nodes
-    graph.eliminate_dead_code()
-
-    graph.lint()
-    gm.recompile()
+    canonicalize_graph(gm)
 
 
 # =============================================================================
