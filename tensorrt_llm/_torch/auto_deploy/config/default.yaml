@@ -65,6 +65,8 @@ transforms:
     stage: pattern_matcher
   quantize_hf_fp8_linear_from_config:
     stage: pattern_matcher
+  quantize_hf_fp8_moe:
+    stage: pattern_matcher
   quantize_fp8_bmm_from_config:
     stage: pattern_matcher
   quantize_fp8_from_graph:
@@ -133,7 +135,7 @@ transforms:
     enabled: false
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
-  # TODO (lucaslie): add backend selection as part of configurable inference optimizers
+  TODO (lucaslie): add backend selection as part of configurable inference optimizers
   fuse_rmsnorm:
     stage: post_load_fusion
     rmsnorm_backend: flashinfer
