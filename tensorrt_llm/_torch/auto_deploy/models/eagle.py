@@ -27,11 +27,32 @@ from typing import Dict, Type
 import torch.nn as nn
 from accelerate import init_empty_weights
 from torch._prims_common import DeviceLikeType
-from transformers import PreTrainedModel
+from transformers import PretrainedConfig, PreTrainedModel
 
 from .custom.modeling_eagle import Eagle3DrafterForCausalLM
 from .factory import ModelFactoryRegistry
 from .hf import AutoModelForCausalLMFactory
+
+
+class Eagle3Config(PretrainedConfig):
+    """Config for Eagle3 drafter models.
+
+    Extends PretrainedConfig with Eagle-specific parameters while preserving
+    all base model config values.
+    """
+
+    def __init__(self, config: PretrainedConfig = None, **kwargs):
+        # If a config object is passed, extract its values
+        if config is not None:
+            kwargs = {**config.to_dict(), **kwargs}
+
+        # Set Eagle-specific defaults if not provided
+        kwargs.setdefault("load_embedding_from_target", True)
+        kwargs.setdefault("load_lm_head_from_target", False)
+        kwargs.setdefault("num_capture_layers", 3)
+
+        # Initialize parent with all config values
+        super().__init__(**kwargs)
 
 
 @ModelFactoryRegistry.register("EagleDrafter")
@@ -48,7 +69,7 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
     """
 
     # Map config model_type -> Eagle drafter model class
-    _drafter_model_mapping: Dict[str, Type[PreTrainedModel]] = {
+    _drafter_mapping: Dict[str, Type[PreTrainedModel]] = {
         "llama": Eagle3DrafterForCausalLM,
     }
 
@@ -56,14 +77,17 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
         model_config, unused_kwargs = self._get_model_config()
 
         # Select the appropriate drafter class based on the base model type
-        match model_config.model_type:
-            case "llama":
-                drafter_cls = self._drafter_model_mapping["llama"]
-            case _:
-                raise ValueError(
-                    f"Unsupported model_type '{model_config.model_type}' for Eagle drafter. "
-                    f"Supported types: {list(self._drafter_model_mapping.keys())}"
-                )
+        model_type = model_config.model_type
+        if model_type not in self._drafter_mapping:
+            raise ValueError(
+                f"Unsupported model_type '{model_type}' for Eagle drafter. "
+                f"Supported types: {list(self._drafter_mapping.keys())}"
+            )
+        drafter_cls = self._drafter_mapping[model_type]
+
+        # Convert base config to Eagle3Config, preserving existing values
+        # and applying Eagle-specific defaults for missing attributes
+        model_config = Eagle3Config(model_config)
 
         # Build the model (same pattern as parent's _build_model)
         with (init_empty_weights if device == "meta" else nullcontext)():
