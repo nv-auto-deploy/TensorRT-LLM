@@ -162,6 +162,7 @@ def _is_impure_node(node: Node) -> bool:
             node.target._nondeterministic_seeded = True
 
 
+# TODO (lucaslie): consider upstreaming this to PyTorch
 def delete_all_unused_submodules(gm: GraphModule) -> None:
     """Optimized version of delete_all_unused_submodules with O(n+m) complexity.
 
@@ -232,12 +233,13 @@ def lint(gm: GraphModule) -> None:
     gm.graph.lint()
 
 
-def _canonicalize_single_gm(gm: GraphModule) -> None:
+def _canonicalize_single_gm(gm: GraphModule, run_recompile: bool = True) -> None:
     # clean up graph (needs to be done repeatedly until no more dead code)
     eliminate_dead_code(gm, is_impure_node=_is_impure_node)
 
-    # recompile to propagate all graph changes to the graph module
-    recompile(gm)
+    # recompile to propagate all graph changes to the graph module (optional)
+    if run_recompile:
+        recompile(gm)
 
     # clean up graph module
     delete_all_unused_submodules(gm)
@@ -246,23 +248,23 @@ def _canonicalize_single_gm(gm: GraphModule) -> None:
     lint(gm)
 
 
-def canonicalize_graph(mod: nn.Module) -> None:
+def canonicalize_graph(mod: nn.Module, run_recompile: bool = True) -> None:
     """Canonicalize the graph of the given GraphModule.
 
     Args:
         mod: The model containing GraphModules to canonicalize.
-    Returns:
-        The canonicalized (cleaned-up) model.
+        run_recompile: If True, run recompile to sync forward() with graph.
+                       If False, skip recompile (forward() may be stale).
     """
     ad_logger.debug(f"Before canonicalizing: {mod}")
 
     for _, subgm in reversed(list(named_graphmodules(mod))):
-        _canonicalize_single_gm(subgm)
+        _canonicalize_single_gm(subgm, run_recompile=run_recompile)
 
     ad_logger.debug(f"After canonicalizing: {mod}")
 
 
-def _run_shape_prop_single_gm(
+def _post_shape_prop_single_gm(
     gm: GraphModule,
     args_static: Optional[Tuple[Any, ...]] = None,
 ) -> None:
@@ -291,7 +293,7 @@ def _run_shape_prop_single_gm(
     lint(gm)
 
 
-def run_shape_prop(
+def post_shape_prop(
     mod: nn.Module,
     args_static: Optional[Tuple[Any, ...]] = None,
 ) -> None:
@@ -314,7 +316,7 @@ def run_shape_prop(
     ad_logger.debug(f"Before running shape propagation: {mod}")
 
     for _, subgm in reversed(list(named_graphmodules(mod))):
-        _run_shape_prop_single_gm(subgm, args_static=args_static if subgm is mod else None)
+        _post_shape_prop_single_gm(subgm, args_static=args_static if subgm is mod else None)
 
     ad_logger.debug(f"After running shape propagation: {mod}")
 
