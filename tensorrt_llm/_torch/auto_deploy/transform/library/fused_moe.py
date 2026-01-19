@@ -141,6 +141,8 @@ def _process_moe_node(
         w2_list,
         w3_list,
         apply_routing_on_input,
+        enable_alltoall,
+        dp_size,
     ) = extract_op_args(
         node,
         "x",
@@ -150,6 +152,8 @@ def _process_moe_node(
         "w2_weight",
         "w3_weight",
         "apply_routing_on_input",
+        "enable_alltoall",
+        "dp_size",
     )
 
     # Stack weights based on MLP style
@@ -214,6 +218,8 @@ def _process_moe_node(
             kwargs={
                 "is_gated_mlp": is_gated_mlp,
                 "act_fn": act_fn,
+                "enable_alltoall": enable_alltoall,
+                "dp_size": dp_size,
             },
         )
 
@@ -547,7 +553,6 @@ class MatchMoePattern(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
-
         # Preprocessing: Identify boundary nodes (e.g. residual connections) in the graph.
         boundary_nodes = identify_regions_between_residuals(gm)
 

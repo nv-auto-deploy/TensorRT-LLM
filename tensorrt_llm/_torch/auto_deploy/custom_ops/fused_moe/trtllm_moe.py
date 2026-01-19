@@ -34,6 +34,14 @@ def trtllm_moe_fused(
     w3_w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
+    enable_alltoall: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_int8_woq_per_channel: bool = False,
+    use_mxfp8_act_scaling: bool = False,
+    min_latency_mode: bool = False,
+    use_fused_finalize: bool = True,
+    dp_size: int = 1,
     act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     x_shape = x.shape
@@ -63,6 +71,14 @@ def trtllm_moe_fused(
                 f"Unsupported activation '{ActivationType(act_fn).name}' for mlp. Use 'relu2'."
             )
 
+    if enable_alltoall:
+        # Tuner parameters
+        tuner_num_tokens = x.shape[0] * dp_size
+        tuner_top_k = selected_experts.shape[1]
+    else:
+        tuner_num_tokens = None
+        tuner_top_k = None
+
     return torch.ops.trtllm.fused_moe(
         x,
         selected_experts,
@@ -73,7 +89,16 @@ def trtllm_moe_fused(
         fc2_expert_biases=None,
         output_dtype=x.dtype,
         quant_scales=quant_scales,
+        enable_alltoall=enable_alltoall,
+        tuner_num_tokens=tuner_num_tokens,
+        tuner_top_k=tuner_top_k,
         activation_type=activation_type,
+        use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+        use_w4_group_scaling=use_w4_group_scaling,
+        use_int8_woq_per_channel=use_int8_woq_per_channel,
+        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+        min_latency_mode=min_latency_mode,
+        use_fused_finalize=use_fused_finalize,
     )[0].view(x_shape)
 
 
