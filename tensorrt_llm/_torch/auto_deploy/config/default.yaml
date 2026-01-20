@@ -132,6 +132,9 @@ transforms:
     stage: post_load_fusion
     enabled: true
     backend: trtllm
+  fuse_hf_fp8_moe:
+    stage: post_load_fusion
+    enabled: true
   fuse_nvfp4_moe:
     stage: post_load_fusion
     enabled: true
