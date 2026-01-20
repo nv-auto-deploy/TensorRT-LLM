@@ -155,6 +155,16 @@ def _process_moe_node(
         "enable_alltoall",
         "dp_size",
     )
+    dp_rank, tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank = extract_op_args(
+        node,
+        "dp_rank",
+        "tp_size",
+        "tp_rank",
+        "ep_size",
+        "ep_rank",
+        "cluster_size",
+        "cluster_rank",
+    )
 
     # Stack weights based on MLP style
     if is_gated_mlp:
@@ -220,6 +230,13 @@ def _process_moe_node(
                 "act_fn": act_fn,
                 "enable_alltoall": enable_alltoall,
                 "dp_size": dp_size,
+                "dp_rank": dp_rank,
+                "tp_size": tp_size,
+                "tp_rank": tp_rank,
+                "ep_size": ep_size,
+                "ep_rank": ep_rank,
+                "cluster_size": cluster_size,
+                "cluster_rank": cluster_rank,
             },
         )
 

@@ -1499,7 +1499,7 @@ def _insert_sharded_moe(
     ep_size = moe_mapping.grid[ShardingDim.EP]
     tp_rank = moe_mapping.rank[ShardingDim.TP]
     tp_size = moe_mapping.grid[ShardingDim.TP]
-    dp_size = moe_mapping.grid[ShardingDim.DP]
+    # dp_size = moe_mapping.grid[ShardingDim.DP]
 
     # get attention grid to check for all-to-all paradigm.
     attention_mapping = config.mapping.layer_mappings[LayerType.ATTENTION]
@@ -1521,6 +1521,7 @@ def _insert_sharded_moe(
     final_scales = args[2]
     num_experts = len(args[3])
 
+    # if not moe_all_to_all:
     experts_per_rank = num_experts // ep_size
 
     with gm.graph.inserting_before(node):
@@ -1619,7 +1620,7 @@ def _insert_sharded_moe(
         True,  # is_gated_mlp
         int(ActivationType.Silu),  # act_fn
         False,  # apply_routing_on_input
-        False,  # enable_alltoall
+        moe_all_to_all,  # enable_alltoall
         False,  # use_deepseek_fp8_block_scale
         False,  # use_w4_group_scaling
         False,  # use_int8_woq_per_channel
@@ -1627,6 +1628,13 @@ def _insert_sharded_moe(
         False,  # min_latency_mode
         True,  # use_fused_finalize
         1,  # dp_size
+        0,  # dp_rank
+        1,  # tp_size
+        0,  # tp_rank
+        1,  # ep_size
+        0,  # ep_rank
+        1,  # cluster_size
+        0,  # cluster_rank
     ]
     cur_len = len(args)
     # # pad the remaining args with the default values
@@ -1634,7 +1642,14 @@ def _insert_sharded_moe(
     # # specify 9th argument to enable all-to-all
     # # and 16th argument to specify dp_size
     args[9] = moe_all_to_all
-    args[16] = dp_size
+    args[16] = attention_dp_size
+    args[17] = moe_mapping.rank[ShardingDim.DP]
+    args[18] = tp_size
+    args[19] = tp_rank
+    args[20] = ep_size
+    args[21] = ep_rank
+    args[22] = 1
+    args[23] = 0
     node.args = tuple(args)
 
     if moe_all_to_all:
