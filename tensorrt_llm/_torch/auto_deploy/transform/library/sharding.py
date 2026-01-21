@@ -1149,6 +1149,19 @@ def init_process_grid_from_config(
     rank, world_size = config.rank, config.world_size
     if len(config.process_grid) > 0:
         ad_logger.debug(f"EP + TP sharding process grid: {config.process_grid}")
+        # BUG FIX: Check if already initialized (values are dicts with 'p' and 'w' keys).
+        # This function expects process_grid values to be integers (e.g., {ShardingDim.TP: 1}),
+        # but after processing it overwrites config.process_grid with dict values
+        # (e.g., {ShardingDim.TP: {"p": 0, "w": 1}}). When detect_sharding runs per-gm
+        # with multiple subgraphs (e.g., EagleOneModel with target_model + draft_model),
+        # the second call would fail with "unsupported operand type(s) for %: 'int' and 'dict'"
+        # because it tries to do `rank % tp_size` where tp_size is now a dict.
+        # TODO: Consider refactoring to avoid mutating process_grid with a different type,
+        # or storing the expanded dict in a separate field. Also remove this AI comment after addressing :)
+        first_value = next(iter(config.process_grid.values()))
+        if isinstance(first_value, dict) and "p" in first_value and "w" in first_value:
+            ad_logger.debug("Process grid already initialized, skipping re-initialization")
+            return config.process_grid
         ep_size = config.process_grid[ShardingDim.EP]
         tp_size = config.process_grid[ShardingDim.TP]
         # the order of the keys (ep,tp) vs (tp,ep) determines how ranks
