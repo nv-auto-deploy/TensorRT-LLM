@@ -57,6 +57,7 @@ class CachedSequenceInterface:
         kv_cache_config: Optional[KvCacheConfig] = None,
         max_num_tokens: Optional[int] = None,
         vocab_size_padded: Optional[int] = None,
+        extra_seq_len_for_kv_cache: int = 0,
     ) -> None:
         """Initialize the CachedSequenceInterface.
 
@@ -68,6 +69,8 @@ class CachedSequenceInterface:
             max_num_tokens: Maximum total tokens across all sequences. If None, computed from
                 max_seq_len and max_batch_size.
             vocab_size_padded: Padded vocabulary size of the model.
+            extra_seq_len_for_kv_cache: Extra sequence length for KV cache sizing (for speculative
+                decoding and overlap scheduler). Defaults to 0.
         """
         # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired
         # device and not the actual device unlike, e.g., in SequenceInfo. We rely on the attribute
@@ -96,6 +99,13 @@ class CachedSequenceInterface:
         # Ordered dicts tracking resource handlers by type
         self._paged_cache_order: ResourceHandlerDict = {}  # Paged resources (kv caches)
         self._state_resource_order: ResourceHandlerDict = {}  # State resources (ssm states)
+        self._current_submodule_name: str = ""
+        self._extra_seq_len_for_kv_cache: int = extra_seq_len_for_kv_cache
+
+    @property
+    def max_seq_len_for_kv_cache(self) -> int:
+        """Return the max sequence length to use for KV cache allocation."""
+        return self.info.max_seq_len + self._extra_seq_len_for_kv_cache
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -204,7 +214,7 @@ class CachedSequenceInterface:
             "num_kv_heads": num_kv_heads_per_layer,  # per-layer bytes_per_token
             "head_dim": 1,  # all bytes in num_kv_heads
             "tokens_per_block": kv_cache_config.tokens_per_block,
-            "max_seq_len": self.info.max_seq_len,
+            "max_seq_len": self.max_seq_len_for_kv_cache,
             "max_batch_size": self.info.max_batch_size,
             "mapping": Mapping(),
             # NOTE (lucaslie): this is the only 1-byte dtype currently supported by the
@@ -434,6 +444,30 @@ class CachedSequenceInterface:
         ]
         ad_logger.info(f"Mem info for resize: {' | '.join(mem_info)}")
         ad_logger.info(f"Final Cache Mem: {' | '.join(mem_cache_info)}")
+
+    def set_current_submodule(self, submodule_name: str) -> None:
+        """Set the current submodule being processed.
+
+        This is used by transforms to add a suffix to cache names for non-root submodules,
+        avoiding naming collisions when multiple submodules have attention layers.
+
+        Args:
+            submodule_name: Name of the submodule (e.g., "", "target_model", "draft_model").
+                           Empty string means root module.
+        """
+        self._current_submodule_name = submodule_name
+
+    def get_cache_name_suffix(self) -> str:
+        """Get the cache name suffix for the current submodule.
+
+        Returns:
+            A suffix string like "_draft_model" for non-root submodules, or "" for root.
+            Using suffix (not prefix) ensures cache names still start with "k_cache_*"
+            for compatibility with existing code that checks startswith("k_cache_").
+        """
+        if self._current_submodule_name:
+            return f"_{self._current_submodule_name}"
+        return ""
 
     @property
     def kv_cache_manager(self) -> Optional[KVCacheManager]:

@@ -872,6 +872,11 @@ class SequenceInfo:
 
         ### UPDATE OTHER (DERIVATIVE) METADATA #####################################################
         # check for updated batch_info_tensor
+        # NOTE: We use seq_len > 1 to identify "prefill" (multi-token) vs "decode" (single-token).
+        # This is about kernel selection, not semantic prefill/decode:
+        # - "Prefill" kernel handles multiple tokens and reads from KV cache (works for spec dec verify)
+        # - "Decode" kernel expects exactly 1 token per sequence
+        # The prefill kernel correctly handles input_pos > 0 via seq_len_with_cache.
         if batch_info is None:
             num_prefill = sum(s_l > 1 for s_l in seq_len)
             num_prefill_tokens = sum(s_l for s_l in seq_len if s_l > 1)

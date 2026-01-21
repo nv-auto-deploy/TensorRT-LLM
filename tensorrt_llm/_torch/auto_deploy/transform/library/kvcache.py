@@ -195,6 +195,9 @@ class InsertCachedAttention(BaseTransform):
         # Register host-side prepare_metadata function for attention descriptor.
         self._process_metadata_host(cm)
 
+        # Get suffix for cache names (e.g., "_draft_model" for draft submodule)
+        cache_suffix = cm.get_cache_name_suffix()
+
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0
         for idx, attn_node in enumerate(source_attn_nodes):
@@ -206,7 +209,7 @@ class InsertCachedAttention(BaseTransform):
             for k, resource_handler in attn_descriptor.get_cache_initializers(
                 attn_node, cm.kv_cache_config
             ).items():
-                k_indexed = f"{k}_{idx}"
+                k_indexed = f"{k}{cache_suffix}_{idx}"
                 cm.add_resource(k_indexed, resource_handler)
                 cache_in_nodes.append(self._process_cache_node(gm, k_indexed))
 
