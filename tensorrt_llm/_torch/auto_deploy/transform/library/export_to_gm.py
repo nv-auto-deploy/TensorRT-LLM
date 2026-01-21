@@ -152,6 +152,8 @@ class ExportToGM(BaseTransform):
         for e_info in export_infos:
             sub_mod = mod.get_submodule(e_info.submodule_name)
 
+            # print(f"Sub module ({e_info.submodule_name}): {sub_mod}")
+
             # start by capturing the kwargs that are passed to the submodule for export
             with capture_forward_kwargs(sub_mod) as captured_kwargs:
                 run_forward_for_capture(

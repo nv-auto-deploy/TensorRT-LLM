@@ -14,6 +14,7 @@ from ...llmapi.llm_args import (
     _ParallelConfig,
 )
 from .models import ModelFactory, ModelFactoryRegistry
+from .models.eagle_one_model import EagleOneModelFactory
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
 
@@ -146,6 +147,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         """Skip tokenizer initialization in config. We do this in the AutoDeploy LLM class."""
         return self
 
+<<<<<<< HEAD
     ## !! Remnants (fields and validators) from the now removed `AutoDeployConfig`.
 
     ### MODEL AND TOKENIZER FACTORY ################################################################
@@ -337,3 +339,33 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             "transformers": str(config_path / "transformers.yaml"),
         }
         return mapping.get(mode)
+=======
+    def to_dict(self) -> Dict:
+        """Convert model to a dictionary such that cls(**self.to_dict()) == self."""
+        self_dict = super().to_dict()
+        self_dict.pop("build_config", None)
+        self_dict.pop("mpi_session", None)
+        return self_dict
+
+    def create_factory(self) -> ModelFactory:
+        target_factory = super().create_factory()
+
+        # Check if we need to wrap with EagleOneModelFactory for one-model Eagle
+        is_eagle_one_model = (
+            self.speculative_config is not None
+            and isinstance(self.speculative_config, EagleDecodingConfig)
+            and self.speculative_config.eagle3_one_model
+        )
+        if not is_eagle_one_model:
+            return target_factory
+
+        # Compute max_num_tokens if not set
+        max_num_tokens = self.max_num_tokens or self.max_batch_size * self.max_seq_len
+
+        return EagleOneModelFactory.build_from_target(
+            target_factory=target_factory,
+            speculative_config=self.speculative_config,
+            max_batch_size=self.max_batch_size,
+            max_num_tokens=max_num_tokens,
+        )
+>>>>>>> 19b13c554 (Init commit for eagle_load_one_model.)
