@@ -17,6 +17,7 @@
 """The model factory interface used by auto-deploy to build custom models."""
 
 import copy
+import time
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Type, final
@@ -310,9 +311,14 @@ class ModelFactory(ABC):
         ad_logger.info(f"Estimated parameters memory: {total_size_GB:.2f} GB")
 
         if not self.skip_loading_weights:
+            start_time = time.time()
             self.prefetch_checkpoint(force=True)
+            end_time = time.time()
+            ad_logger.info(f"taylor Prefetching time: {end_time - start_time:.2f} seconds")
+            start_time = time.time()
             self._load_checkpoint(model, device)
-
+            end_time = time.time()
+            ad_logger.info(f"taylor Loading checkpoint time: {end_time - start_time:.2f} seconds")
         ad_logger.info("Loading and initializing weights. Done.")
         free_mem_post, _ = get_mem_info_in_mb()
         ad_logger.info(f"Free memory after loading weights (MB): {free_mem_post}")
