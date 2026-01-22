@@ -528,7 +528,7 @@ class ADEngine(ModelEngine):
 
         if ENABLE_MULTI_DEVICE and mpi_world_size() > 1:
             comm = MPI.COMM_WORLD
-            global_start_time = comm.allreduce((local_start_time, mpi_rank()), op=MPI.MINLOC)
+            global_start_time = comm.allreduce((local_start_time, mpi_rank()), op=MPI.MINLOC)[0]
         else:
             global_start_time = local_start_time
 
@@ -541,7 +541,7 @@ class ADEngine(ModelEngine):
 
         if ENABLE_MULTI_DEVICE and mpi_world_size() > 1:
             comm = MPI.COMM_WORLD
-            global_end_time = comm.allreduce((local_end_time, mpi_rank()), op=MPI.MAXLOC)
+            global_end_time = comm.allreduce((local_end_time, mpi_rank()), op=MPI.MAXLOC)[0]
         else:
             global_end_time = local_end_time
 
