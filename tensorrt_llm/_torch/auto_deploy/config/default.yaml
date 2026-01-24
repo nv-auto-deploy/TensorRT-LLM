@@ -8,13 +8,13 @@ transforms:
     stage: factory
     run_per_gm: false
     device: meta
-    requires_clean_graph: false
+    pre_graph_cleanup: false
   export_to_gm:
     stage: export
     clone_state_dict: false
     strict: false
     run_per_gm: false
-    requires_clean_graph: false
+    pre_graph_cleanup: false
   cleanup_noop_slice:
     stage: post_export
   cleanup_noop_add:
@@ -32,10 +32,10 @@ transforms:
     stage: pattern_matcher
   match_repeat_kv:
     stage: pattern_matcher
-    run_shape_prop: true
+    post_shape_prop: true
   match_eager_attention:
     stage: pattern_matcher
-    requires_shape_prop: true
+    pre_shape_prop: true
   match_sdpa_to_torch_attention:
     stage: pattern_matcher
   match_grouped_attention:
@@ -82,16 +82,19 @@ transforms:
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    sharding_source: ['manual', 'factory', 'heuristic']
+    sharding_source: ['heuristic']
     support_partial_config: true
-    sharding_dims: ['tp', 'ep', 'bmm']
+    sharding_dims: ['TP', 'EP']
+    # grid order: PP, DP, EP, SP, TP
+    process_grid: {"attention": [1, 2, 1, 1, 1], "moe": [1, 1, 2, 1, 1], "mlp": [1, 1, 1, 1, 2]}
     shard_all_unprocessed: true
     allreduce_strategy: 'NCCL'
     dist_backend: auto
-    requires_shape_prop: true
+    pre_shape_prop: true
+    enable_attention_dp: true
   sharding_transform_executor:
     stage: sharding
-    run_shape_prop: true
+    post_shape_prop: true
   ############################################################################################
   # MOVE MODEL AND LOAD WEIGHTS
   ############################################################################################
@@ -117,6 +120,7 @@ transforms:
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+    enabled: false
   fuse_nvfp4_linear:
     stage: post_load_fusion
     backend: trtllm
@@ -138,7 +142,7 @@ transforms:
     stage: post_load_fusion
     rmsnorm_backend: flashinfer
     gated_rmsnorm_backend: triton
-    requires_shape_prop: true
+    pre_shape_prop: true
   fuse_add_rms_norm:
     stage: post_load_fusion
     enabled: true
@@ -152,6 +156,7 @@ transforms:
   visualize_namespace:
     stage: visualize
     enabled: false
+    pre_recompile_forward: true  # calls te.export()
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
@@ -180,6 +185,7 @@ transforms:
     stage: cache_init
     run_per_gm: false
     free_mem_ratio: 0.0
+    pre_recompile_forward: true  # calls mod(**args) for memory measurement
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################
@@ -193,3 +199,4 @@ transforms:
     run_per_gm: false
     cuda_graph_batch_sizes: null
     backend: torch-compile
+    pre_recompile_forward: true  # compilation needs forward

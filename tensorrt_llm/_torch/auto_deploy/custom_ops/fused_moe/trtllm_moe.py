@@ -16,7 +16,10 @@
 import torch
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm._utils import mpi_allgather
+from tensorrt_llm.mapping import Mapping
 
 
 @torch.library.custom_op("auto_deploy::trtllm_moe_fused", mutates_args=())
@@ -27,6 +30,21 @@ def trtllm_moe_fused(
     w3_w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
+    enable_alltoall: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_int8_woq_per_channel: bool = False,
+    use_mxfp8_act_scaling: bool = False,
+    min_latency_mode: bool = False,
+    use_fused_finalize: bool = True,
+    dp_size: int = 1,
+    dp_rank: int = 0,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
     act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     x_shape = x.shape
@@ -56,6 +74,100 @@ def trtllm_moe_fused(
                 f"Unsupported activation '{ActivationType(act_fn).name}' for mlp. Use 'relu2'."
             )
 
+    if enable_alltoall:  # and dp_size == ep_size and tp_size == 1:
+        top_k = selected_experts.shape[1]
+        num_experts = 8  # w3_w1_stacked_weight.shape[0]
+        hidden_size = x.shape[-1]
+        local_tokens = int(x.shape[0])
+        all_rank_tokens = mpi_allgather(local_tokens)
+        if isinstance(all_rank_tokens, list):
+            runtime_max_tokens_per_rank = max(all_rank_tokens)
+        else:
+            runtime_max_tokens_per_rank = local_tokens
+
+        ep_size = 2
+        top_k = 2
+        runtime_max_tokens_per_rank = 16
+        hidden_size = 4096
+        x_dtype = torch.bfloat16
+
+        max_num_tokens = runtime_max_tokens_per_rank * ep_size
+        workspace_size = MoeAlltoAll.calculate_required_workspace_size(
+            ep_size, top_k, max_num_tokens, hidden_size, x_dtype
+        )
+
+        # All-to-all runs across the DP group; map ranks into a size=ep_size group.
+        mapping = Mapping(
+            world_size=ep_size,
+            rank=ep_rank,
+            tp_size=ep_size,
+            moe_tp_size=1,
+            moe_ep_size=ep_size,
+            moe_cluster_size=1,
+        )
+        moe_a2a = MoeAlltoAll(
+            mapping=mapping,
+            max_num_tokens=max_num_tokens,
+            top_k=top_k,
+            num_experts=num_experts,
+            workspace_size_per_rank=workspace_size,
+        )
+
+        invalid_expert_id = num_experts
+        invalid_input_mask = (selected_experts < 0) | (selected_experts >= num_experts)
+        if invalid_input_mask.any():
+            selected_experts = selected_experts.clamp(0, num_experts - 1)
+            routing_weights = routing_weights.masked_fill(invalid_input_mask, 0.0)
+        recv_x, recv_selected, recv_weights = moe_a2a.dispatch(
+            selected_experts,
+            [x.contiguous(), selected_experts.contiguous(), routing_weights.contiguous()],
+            runtime_max_tokens_per_rank,
+            invalid_token_expert_id=invalid_expert_id,
+            expert_id_payload_index=1,
+        )
+
+        dispatched_x = recv_x.reshape(-1, hidden_size)
+        dispatched_selected = recv_selected.reshape(-1, top_k)
+        dispatched_weights = recv_weights.reshape(-1, top_k)
+        invalid_mask = dispatched_selected == invalid_expert_id
+        if invalid_mask.any():
+            dispatched_weights = dispatched_weights.masked_fill(invalid_mask, 0.0)
+
+        moe_out = torch.ops.trtllm.fused_moe(
+            dispatched_x,
+            dispatched_selected,
+            dispatched_weights,
+            fc1_expert_weights=w3_w1_stacked_weight,
+            fc1_expert_biases=None,
+            fc2_expert_weights=w2_stacked_weight,
+            fc2_expert_biases=None,
+            output_dtype=x.dtype,
+            quant_scales=quant_scales,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            cluster_size=cluster_size,
+            cluster_rank=cluster_rank,
+            enable_alltoall=enable_alltoall,
+            tuner_num_tokens=max_num_tokens,
+            tuner_top_k=top_k,
+            activation_type=activation_type,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4_group_scaling=use_w4_group_scaling,
+            use_int8_woq_per_channel=use_int8_woq_per_channel,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+            min_latency_mode=min_latency_mode,
+            use_fused_finalize=use_fused_finalize,
+        )[0]
+
+        moe_out = moe_out.view(ep_size, runtime_max_tokens_per_rank, hidden_size)
+        combined = moe_a2a.combine(moe_out, runtime_max_tokens_per_rank)
+        return combined.view(x_shape)
+
+    tuner_num_tokens = None
+    tuner_top_k = None
+
     return torch.ops.trtllm.fused_moe(
         x,
         selected_experts,
@@ -66,7 +178,22 @@ def trtllm_moe_fused(
         fc2_expert_biases=None,
         output_dtype=x.dtype,
         quant_scales=quant_scales,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        cluster_size=cluster_size,
+        cluster_rank=cluster_rank,
+        enable_alltoall=False,
+        tuner_num_tokens=tuner_num_tokens,
+        tuner_top_k=tuner_top_k,
         activation_type=activation_type,
+        use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+        use_w4_group_scaling=use_w4_group_scaling,
+        use_int8_woq_per_channel=use_int8_woq_per_channel,
+        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+        min_latency_mode=min_latency_mode,
+        use_fused_finalize=use_fused_finalize,
     )[0].view(x_shape)
 
 
@@ -78,6 +205,21 @@ def trtllm_moe_fused_fake(
     w3_w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
+    enable_alltoall: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_int8_woq_per_channel: bool = False,
+    use_mxfp8_act_scaling: bool = False,
+    min_latency_mode: bool = False,
+    use_fused_finalize: bool = True,
+    dp_size: int = 1,
+    dp_rank: int = 0,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
     act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     return torch.empty_like(x)

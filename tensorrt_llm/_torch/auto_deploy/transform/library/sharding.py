@@ -24,10 +24,13 @@ from enum import Enum, IntEnum
 from functools import partial
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Type, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
+
+from tensorrt_llm._torch.utils import ActivationType
 
 from .....functional import AllReduceStrategy
 from ...custom_ops.trtllm_dist import is_trtllm_op_available
@@ -78,13 +81,29 @@ class ShardingSource(Enum):
     MANUAL = "manual"
 
 
-class ShardingDim(Enum):
+class ShardingDim(IntEnum):
     """Enum for sharding dimension."""
 
-    SSM = "ssm"
-    TP = "tp"
-    EP = "ep"
-    BMM = "bmm"
+    # NOTE: The order of the dimensions matters:
+    # ordered from the outermost to the innermost dimension.
+    # Example: TP(2) + EP(2) + DP(2) = 8 ranks
+    # | rank | DP | EP | TP |
+    # | 0    | 0  | 0  | 0  |
+    # | 1    | 0  | 0  | 1  |
+    # | 2    | 0  | 1  | 0  |
+    # | 3    | 0  | 1  | 1  |
+    # | 4    | 1  | 0  | 0  |
+    # | 5    | 1  | 0  | 1  |
+    # | 6    | 1  | 1  | 0  |
+    # | 7    | 1  | 1  | 1  |
+    # It assumes that the closer ranks are physically closer
+    # e.g., on the same multi-gpu node.
+    # If desired, the order can be changed by reordering the dimensions.
+    PP = 0  # Pipeline parallelism
+    DP = 1  # Data parallelism
+    EP = 2  # Expert parallelism
+    SP = 3  # Sequence parallelism
+    TP = 4  # Tensor parallelism
 
 
 class SplitDimension(IntEnum):
@@ -106,14 +125,50 @@ class DistBackend(Enum):
     TORCH = "torch"
 
 
-class MLPType(Enum):
-    """Enum for MLP type."""
+class DistLayerMapping(BaseModel):
+    """Mapping for distributed layer sharding."""
 
-    GATED_MLP = "gated_mlp"  # explicit three weights: up, down, gate (in this order)
-    MLP = "mlp"  # two weights: up, down
-    FUSED_GATED_MLP = (
-        "fused_gated_mlp"  # fused three weights (two inputs) up_gate, down (in this order)
-    )
+    world_size: int = 1
+    global_rank: int = 0
+    grid: List[int] = Field(default_factory=list)
+    rank: List[int] = Field(default_factory=list)
+
+    def initialize(self, world_size: int, global_rank: int, grid: List[int] = None):
+        if grid is None:
+            # then we use TP-only grid
+            grid = [1] * (len(ShardingDim) - 1) + [world_size]
+        self.world_size = world_size
+        self.global_rank = global_rank
+        self.rank = [0] * len(ShardingDim)
+        # calculate per-dimension ranks (last dim is fastest-changing)
+        grid_rank = global_rank
+        for dim in range(len(ShardingDim) - 1, -1, -1):
+            grid_rank, self.rank[dim] = divmod(grid_rank, grid[dim])
+        self.grid = grid
+
+
+class DistMapping(BaseModel):
+    """Mapping for distributed sharding."""
+
+    world_size: int = 1
+    rank: int = 0
+    layer_mappings: Dict[LayerType, DistLayerMapping] = Field(default_factory=dict)
+
+    def initialize(self, world_size: int, rank: int, grid: Dict[LayerType, List[int]] = None):
+        self.world_size = world_size
+        self.rank = rank
+        for layer_type in LayerType:
+            # initialize default, TP-only grid
+            self.layer_mappings[layer_type] = DistLayerMapping()
+            layer_grid = None
+            if layer_type in grid:
+                # check if grid size matches world size
+                if (
+                    len(grid[layer_type]) == len(ShardingDim)
+                    and np.prod(grid[layer_type]) == self.world_size
+                ):
+                    layer_grid = grid[layer_type]
+            self.layer_mappings[layer_type].initialize(self.world_size, self.rank, layer_grid)
 
 
 ########################################################
@@ -135,7 +190,7 @@ class ShardingTransformConfig(TransformConfig):
         ]
     )
     sharding_dims: List[ShardingDim] = Field(
-        default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+        default_factory=lambda: [ShardingDim.TP, ShardingDim.EP]
     )
     shard_all_unprocessed: bool = Field(
         default=True,
@@ -149,10 +204,23 @@ class ShardingTransformConfig(TransformConfig):
         "LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC",
     )
 
-    process_grid: Dict[ShardingDim, int] = Field(default_factory=dict)
+    enable_attention_dp: bool = Field(
+        default=False,
+        description="When True, skip TP sharding as attention data parallelism is enabled.",
+    )
+
+    process_grid: Dict[LayerType, List[int]] = Field(default_factory=dict)
+
+    # TODO: Should be eventually replaced by the Trtllm-native Mapping class
+    mapping: DistMapping = Field(default_factory=DistMapping)
+
+    enable_attention_dp: bool = Field(
+        default=False,
+        description="When True, skip TP sharding as attention data parallelism is enabled.",
+    )
 
     def validate_config(self, sources: Union[ShardingSource, List[ShardingSource]] = None) -> bool:
-        init_process_grid_from_config(self)
+        self.mapping.initialize(self.world_size, self.rank, self.process_grid)
         if sources is None:
             sources = [ShardingSource.FACTORY, ShardingSource.MANUAL]
         if not isinstance(sources, list):
@@ -205,6 +273,29 @@ class ShardingTransformConfig(TransformConfig):
     def _validate_allreduce_strategy(cls, v):
         """Convert string names like 'AUTO' to AllReduceStrategy enum."""
         return validate_allreduce_strategy(v)
+
+    @field_validator("sharding_dims", mode="before")
+    @classmethod
+    def _validate_sharding_dims(cls, v):
+        """Allow enum tags like 'TP'/'EP' in config files."""
+        if v is None:
+            return v
+        if isinstance(v, (str, int, ShardingDim)):
+            v = [v]
+        if not isinstance(v, list):
+            return v
+        normalized = []
+        for item in v:
+            if isinstance(item, ShardingDim):
+                normalized.append(item)
+                continue
+            if isinstance(item, str):
+                key = item.strip().upper()
+                if key in ShardingDim.__members__:
+                    normalized.append(ShardingDim[key])
+                    continue
+            normalized.append(item)
+        return normalized
 
     dist_backend: DistBackend = Field(default=DistBackend.AUTO)
 
@@ -336,6 +427,131 @@ class ParameterUpdateInfo(ShardingTransformInfo):
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply the transformation to the graph module."""
         _update_node_args(node, self.args)
+
+
+class NodeInsertInfo(ShardingTransformInfo):
+    """Configuration for node insert transformations."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    new_node: Node
+    before: bool = Field(default=False)
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        """Validate the transformation configuration."""
+        return True
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        """Apply the transformation to the graph module."""
+        if self.before:
+            with gm.graph.inserting_before(node):
+                node.replace_all_uses_with(self.new_node)
+                self.new_node.replace_input_with(self.new_node, node)
+        else:
+            with gm.graph.inserting_after(node):
+                node.replace_all_uses_with(self.new_node)
+                self.new_node.replace_input_with(self.new_node, node)
+
+
+class TPtoDPTransformInfo(ShardingTransformInfo):
+    """Transform a TP-only MLP subgraph into DP by slicing and all-gathering."""
+
+    terminating_node: str
+    consumer_nodes: List[str]
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        """Validate the transformation configuration."""
+        if gm is None:
+            return True
+        for graph_node in gm.graph.nodes:
+            if graph_node.name == self.terminating_node:
+                return True
+        ad_logger.warning(
+            f"TPtoDPTransformInfo terminating node {self.terminating_node} not found."
+        )
+        return False
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        """Apply TP-to-DP sharding: slice hidden states + all_gather output."""
+        terminating_node = None
+        consumer_nodes = []
+        for graph_node in gm.graph.nodes:
+            if graph_node.name == self.terminating_node:
+                terminating_node = graph_node
+            if graph_node.name in self.consumer_nodes:
+                consumer_nodes.append(graph_node)
+        if terminating_node is None:
+            ad_logger.warning(
+                f"TPtoDPTransformInfo terminating node {self.terminating_node} not found."
+            )
+            return
+        if len(consumer_nodes) != len(self.consumer_nodes):
+            ad_logger.warning(
+                "TPtoDPTransformInfo: some consumer nodes not found. "
+                f"Expected {self.consumer_nodes}, found {[n.name for n in consumer_nodes]}."
+            )
+
+        with gm.graph.inserting_after(node):
+            batch_size_node = gm.graph.call_method("size", args=(node, 0))
+        with gm.graph.inserting_after(batch_size_node):
+            remainder_node = gm.graph.call_function(
+                operator.mod, args=(batch_size_node, self.config.world_size)
+            )
+        with gm.graph.inserting_after(remainder_node):
+            pad_size_node = gm.graph.call_function(
+                operator.sub, args=(self.config.world_size, remainder_node)
+            )
+        with gm.graph.inserting_after(pad_size_node):
+            pad_size_node = gm.graph.call_function(
+                operator.mod, args=(pad_size_node, self.config.world_size)
+            )
+        with gm.graph.inserting_after(pad_size_node):
+            dim1_node = gm.graph.call_method("size", args=(node, 1))
+        with gm.graph.inserting_after(dim1_node):
+            dim2_node = gm.graph.call_method("size", args=(node, 2))
+        with gm.graph.inserting_after(dim2_node):
+            pad_tensor_node = gm.graph.call_method(
+                "new_zeros", args=(node, (pad_size_node, dim1_node, dim2_node))
+            )
+        with gm.graph.inserting_after(pad_tensor_node):
+            padded_node = gm.graph.call_function(
+                torch.ops.aten.cat.default, args=((node, pad_tensor_node), 0)
+            )
+        with gm.graph.inserting_after(padded_node):
+            padded_batch_size_node = gm.graph.call_function(
+                operator.add, args=(batch_size_node, pad_size_node)
+            )
+        with gm.graph.inserting_after(padded_batch_size_node):
+            local_batch_size_node = gm.graph.call_function(
+                operator.floordiv, args=(padded_batch_size_node, self.config.world_size)
+            )
+        with gm.graph.inserting_after(local_batch_size_node):
+            local_batch_start_node = gm.graph.call_function(
+                operator.mul, args=(local_batch_size_node, self.config.rank)
+            )
+        with gm.graph.inserting_after(local_batch_start_node):
+            local_batch_end_node = gm.graph.call_function(
+                operator.mul, args=(local_batch_size_node, self.config.rank + 1)
+            )
+        with gm.graph.inserting_after(local_batch_end_node):
+            mask_node = gm.graph.call_function(
+                torch.ops.aten.slice.Tensor,
+                args=(padded_node, 0, local_batch_start_node, local_batch_end_node, 1),
+            )
+        for consumer in consumer_nodes:
+            consumer.replace_input_with(node, mask_node)
+
+        with gm.graph.inserting_after(terminating_node):
+            gather_node = gm.graph.call_function(
+                torch.ops.auto_deploy.torch_dist_all_gather.default,
+                args=(terminating_node, 0),  # Gather along batch dimension (0)
+            )
+        with gm.graph.inserting_after(gather_node):
+            unpad_node = gm.graph.call_function(
+                torch.ops.aten.slice.Tensor,
+                args=(gather_node, 0, 0, batch_size_node, 1),
+            )
+        terminating_node.replace_all_uses_with(unpad_node)
+        gather_node.replace_input_with(unpad_node, terminating_node)
 
 
 class QuantizationShardingMixin(ABC):
@@ -738,13 +954,27 @@ class Sharding(BaseTransform):
             f"Using allreduce strategy: {config.allreduce_strategy.name}, dist backend: {config.dist_backend}"
         )
 
-        if world_size < 2:
-            ad_logger.info("Skipping sharding for single device")
+        if world_size < 2:  # or config.enable_attention_dp:
+            reason = "single device" if world_size < 2 else "attention DP enabled"
+            ad_logger.info(f"Skipping sharding: {reason}")
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
         info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
+
+        if config.enable_attention_dp:
+            # only MoE all-to-all sharding is supported in attention DP mode
+            ad_logger.info("Attention DP is on. Only MoE all-to-all sharding is supported.")
+            moe_mapping = config.mapping.layer_mappings[LayerType.MOE]
+            ep_rank = moe_mapping.rank[ShardingDim.EP]
+            ad_logger.info(
+                f"Rank {config.rank}, EP rank {ep_rank}, process grid: {moe_mapping.grid}"
+            )
+            info += detect_ep_shard(gm, transform_container)
+            info += detect_dp_bmm_shard(gm, transform_container)
+            return gm, info
+
         for source in config.sharding_source:
             if source == ShardingSource.FACTORY:
                 if len(config.factory_config) == 0:
@@ -767,13 +997,10 @@ class Sharding(BaseTransform):
                 if ShardingDim.TP in config.sharding_dims:
                     info += detect_column_row_shard(gm, transform_container)
 
-                # run EP sharding across ranks
-                if ShardingDim.EP in config.sharding_dims:
-                    info += detect_ep_shard(gm, transform_container)
-
-                # run BMM sharding across ranks
-                if ShardingDim.BMM in config.sharding_dims:
-                    info += detect_dp_bmm_shard(gm, transform_container)
+            # run EP sharding across ranks
+            if ShardingDim.EP in config.sharding_dims:
+                info += detect_ep_shard(gm, transform_container)
+                info += detect_dp_bmm_shard(gm, transform_container)
 
         return gm, info
 
@@ -822,6 +1049,12 @@ class ShardingTransformExecutor(BaseTransform):
         for ep_transform in transforms.ep_transforms:
             if check_and_apply(ep_transform):
                 num_matches += 1
+        for tp_to_dp_transform in transforms.tp_to_dp_transforms:
+            if check_and_apply(tp_to_dp_transform):
+                num_matches += 1
+        for node_insert_transform in transforms.node_insert_transforms:
+            if check_and_apply(node_insert_transform):
+                num_matches += 1
 
         # post-sharding cleanup transformations
         for update_transform in transforms.parameter_update_transforms:
@@ -843,6 +1076,8 @@ class ShardingTransformContainer(BaseModel):
     config: ShardingTransformConfig = Field(default_factory=ShardingTransformConfig)
     weight_sharding_transforms: List[WeightShardingInfo] = Field(default_factory=list)
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
+    node_insert_transforms: List[NodeInsertInfo] = Field(default_factory=list)
+    tp_to_dp_transforms: List[TPtoDPTransformInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
 
@@ -850,6 +1085,8 @@ class ShardingTransformContainer(BaseModel):
         super().__init__(**kwargs)
         self._transform_list_dict = {
             WeightShardingInfo: self.weight_sharding_transforms,
+            NodeInsertInfo: self.node_insert_transforms,
+            TPtoDPTransformInfo: self.tp_to_dp_transforms,
             BMMShardingInfo: self.bmm_transforms,
             EPShardingInfo: self.ep_transforms,
             ParameterUpdateInfo: self.parameter_update_transforms,
@@ -1317,10 +1554,22 @@ def _insert_sharded_moe(
     NOTE: allreduce_strategy is MANDATORY.
     """
     # get 2D EP+TP process grid and corresponding ranks
-    ep_rank = config.process_grid[ShardingDim.EP]["p"]
-    ep_size = config.process_grid[ShardingDim.EP]["w"]
-    tp_rank = config.process_grid[ShardingDim.TP]["p"]
-    tp_size = config.process_grid[ShardingDim.TP]["w"]
+    moe_mapping = config.mapping.layer_mappings[LayerType.MOE]
+    ep_rank = moe_mapping.rank[ShardingDim.EP]
+    ep_size = moe_mapping.grid[ShardingDim.EP]
+    tp_rank = moe_mapping.rank[ShardingDim.TP]
+    tp_size = moe_mapping.grid[ShardingDim.TP]
+    # dp_size = moe_mapping.grid[ShardingDim.DP]
+
+    # get attention grid to check for all-to-all paradigm.
+    attention_mapping = config.mapping.layer_mappings[LayerType.ATTENTION]
+    attention_dp_size = attention_mapping.grid[ShardingDim.DP]
+
+    # check for all-to-all paradigm.
+    if ep_size > 1 and tp_size == 1 and attention_dp_size == ep_size:
+        moe_all_to_all = True
+    else:
+        moe_all_to_all = False
     allreduce_strategy = config.allreduce_strategy.name
     args = list(node.args)
     if allreduce_strategy is None:
@@ -1332,6 +1581,7 @@ def _insert_sharded_moe(
     final_scales = args[2]
     num_experts = len(args[3])
 
+    # if not moe_all_to_all:
     experts_per_rank = num_experts // ep_size
 
     with gm.graph.inserting_before(node):
@@ -1418,15 +1668,76 @@ def _insert_sharded_moe(
     ad_logger.debug(
         f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
     )
+    moe_all_to_all = True
+
+    # Calculate the number of scale arguments (3 * number of scale names)
+    # scale_names can be: [] for torch_moe, ["input_scale", "weight_scale"] for fp8,
+    # or ["input_scale", "weight_scale", "alpha"] for nvfp4
+    num_scale_args = len(scale_names) * 3  # 3 weight types (w1, w2, w3) per scale
+
+    # Position after the base 6 args (x, selected_experts, routing_weights, w1, w2, w3) and scale args
+    # torch_moe: args[0:6] are base, args[6:] are bool/int params
+    # torch_quant_fp8_moe: args[0:6] are base, args[6:12] are scales, args[12:] are bool/int params
+    # torch_quant_nvfp4_moe: args[0:6] are base, args[6:15] are scales, args[15:] are bool/int params
+    params_start_idx = 6 + num_scale_args
+
+    # Default parameters that come after scales (same order for all MoE ops)
+    # is_gated_mlp, act_fn, apply_routing_on_input, enable_alltoall,
+    # use_deepseek_fp8_block_scale, use_w4_group_scaling, use_int8_woq_per_channel,
+    # use_mxfp8_act_scaling, min_latency_mode, use_fused_finalize,
+    # dp_size, dp_rank, tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank
+    default_params = [
+        True,  # 0: is_gated_mlp
+        int(ActivationType.Silu),  # 1: act_fn
+        False,  # 2: apply_routing_on_input
+        moe_all_to_all,  # 3: enable_alltoall
+        False,  # 4: use_deepseek_fp8_block_scale
+        False,  # 5: use_w4_group_scaling
+        False,  # 6: use_int8_woq_per_channel
+        False,  # 7: use_mxfp8_act_scaling
+        False,  # 8: min_latency_mode
+        True,  # 9: use_fused_finalize
+        attention_dp_size,  # 10: dp_size
+        moe_mapping.rank[ShardingDim.DP],  # 11: dp_rank
+        1,  # 12: tp_size
+        0,  # 13: tp_rank
+        ep_size,  # 14: ep_size
+        ep_rank,  # 15: ep_rank
+        1,  # 16: cluster_size
+        0,  # 17: cluster_rank
+    ]
+
+    # Current length of args
+    cur_len = len(args)
+
+    # Extend args to have all the default parameters
+    # The target length is params_start_idx + len(default_params)
+    target_len = params_start_idx + len(default_params)
+
+    if cur_len < params_start_idx:
+        # Need to pad to params_start_idx first (should not normally happen)
+        args.extend([None] * (params_start_idx - cur_len))
+        cur_len = params_start_idx
+
+    if cur_len < target_len:
+        # Extend with default params for the missing arguments
+        args.extend(default_params[cur_len - params_start_idx :])
+    else:
+        # args is already long enough, just update the values
+        for i, val in enumerate(default_params):
+            if params_start_idx + i < len(args):
+                args[params_start_idx + i] = val
+
     node.args = tuple(args)
 
-    # -- add an all_reduce node --
-    with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(
-            torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node, allreduce_strategy)
-        )
-        node.replace_all_uses_with(dist_node)
-        dist_node.replace_input_with(dist_node, node)
+    # if not moe_all_to_all:
+    #     # -- add an all_reduce node --
+    #     with gm.graph.inserting_after(node):
+    #         dist_node = gm.graph.call_function(
+    #             torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node, allreduce_strategy)
+    #         )
+    #         node.replace_all_uses_with(dist_node)
+    #         dist_node.replace_input_with(dist_node, node)
 
     eliminate_dead_code(gm)
     # Expert weights registered via gm.register_parameter() are top-level attributes.
@@ -1817,6 +2128,68 @@ def _process_mla_sharding(
             dist_op="all_reduce",
             min_local_shape=layer_subgraph.min_local_shape,
             layer_type=layer_subgraph.layer_type,
+        )
+    )
+    return 1
+
+
+def _process_mlp_dp_sharding(
+    layer_subgraph: LayerSubgraph,
+    transform_container: ShardingTransformContainer,
+) -> int:
+    """
+    Process the MLP DP sharding from the MLP layer subgraph and update the view and split nodes accordingly.
+    Instead of sharding linear nodes and weight tensors, we distribute the input hidden states across TP ranks,
+    and then perform all-gather.
+
+    Since we assume that the input hidden states are initially replicated, all we need to do is mask them locally.
+
+    Therefore, this transformation is simply add two nodes:
+    - mask node to mask the input hidden states locally
+    - all-gather node to all-gather the input hidden states across TP ranks
+
+    Prior:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        up = self.up_proj(hidden_states) * self.activation(self.gate_proj(hidden_states))
+        out = self.down_proj(up)
+        return out
+
+    Posterior:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        ### the following nodes need to be added ###
+        batch_size = hidden_states.shape[0]
+        world_size = config.world_size
+        local_batch_size = batch_size // world_size
+        local_batch_start, local_batch_end = local_batch_size * rank, local_batch_size * (rank + 1)
+        hidden_states = hidden_states[local_batch_start:local_batch_end]
+
+        ### local compute unchanged ###
+        up = self.up_proj(hidden_states) * self.activation(self.gate_proj(hidden_states))
+        out = self.down_proj(up)
+
+        ### final all-gather node needs to be added ###
+        out = all_gather(out, [i for i in range(world_size)])
+        return out
+    """
+    config = transform_container.config
+    world_size = config.world_size
+    # get hidden states node
+    hidden_states_node = layer_subgraph.opening_nodes[0].args[0]
+
+    # get the current batch size
+    batch_size = shape(hidden_states_node)[0]
+    if batch_size is not None and batch_size % world_size != 0:
+        ad_logger.warning(
+            f"DP sharding expects batch_size % world_size == 0, got {batch_size} and {world_size}."
+        )
+
+    closing_node = layer_subgraph.terminating_node
+    transform_container.add(
+        TPtoDPTransformInfo(
+            target_node=hidden_states_node.name,
+            terminating_node=closing_node.name,
+            consumer_nodes=[n.name for n in layer_subgraph.opening_nodes],
+            config=config,
         )
     )
     return 1
@@ -2225,7 +2598,9 @@ def detect_column_row_shard(
     num_ssm_shards = 0
     num_mha_shards = 0
     num_mla_shards = 0
+    num_mlp_dp_shards = 0
     num_column_row_shards = 0
+
     for layer in layer_subgraphs:
         opening = layer.opening_nodes
         closing = layer.terminating_node
@@ -2234,6 +2609,25 @@ def detect_column_row_shard(
 
         attention_nodes = list(filtered_nodes(layer_subgraph, is_any_attention_op))
         min_local_shape = 1
+
+        # check if TP > 1 for this layer type
+        tp_size = config.mapping.layer_mappings[layer.layer_type].grid[ShardingDim.TP]
+        if tp_size == 1:
+            # we do data parallelism for this layer type
+            dp_size = config.mapping.layer_mappings[layer.layer_type].grid[ShardingDim.DP]
+            if dp_size > 1:
+                if layer.layer_type == LayerType.MLP:
+                    num_mlp_dp_shards += _process_mlp_dp_sharding(
+                        layer,
+                        transform_container,
+                    )
+                    continue
+                else:
+                    continue
+                    # raise NotImplementedError(f"DP for layer type {layer.layer_type} is not supported")
+            else:
+                # skip parallelism for this layer type
+                continue
 
         if config.simple_shard_only:
             ad_logger.debug(
@@ -2318,6 +2712,8 @@ def detect_column_row_shard(
         f"row-col: {num_column_row_shards} (including: ssm: {num_ssm_shards}, "
         f"mha: {num_mha_shards}, mla: {num_mla_shards})"
     )
+    if num_mlp_dp_shards > 0:
+        ad_logger.info(f"Heuristics found {num_mlp_dp_shards} MLP DP shards")
     return TransformInfo(
         skipped=False, num_matches=num_shards, is_clean=False, has_valid_shapes=False
     )

@@ -97,6 +97,22 @@ def torch_moe(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
+    # sharding-related parameters
+    enable_alltoall: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_int8_woq_per_channel: bool = False,
+    use_mxfp8_act_scaling: bool = False,
+    min_latency_mode: bool = False,
+    use_fused_finalize: bool = True,
+    dp_size: int = 1,
+    dp_rank: int = 0,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
 ) -> torch.Tensor:
     """
     Unified Mixture-of-Experts (MoE) operator that uses a Mixtral-style dispatch
@@ -160,6 +176,21 @@ def torch_moe_fake(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_int8_woq_per_channel: bool = False,
+    use_mxfp8_act_scaling: bool = False,
+    min_latency_mode: bool = False,
+    use_fused_finalize: bool = True,
+    dp_size: int = 1,
+    dp_rank: int = 0,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -246,6 +277,23 @@ def torch_quant_fp8_moe(
     w3_weight_scale: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
+    # sharding-related parameters
+    enable_alltoall: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_int8_woq_per_channel: bool = False,
+    use_mxfp8_act_scaling: bool = False,
+    min_latency_mode: bool = False,
+    use_fused_finalize: bool = True,
+    dp_size: int = 1,
+    dp_rank: int = 0,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
 ) -> torch.Tensor:
     """
     FP8 MoE op using quantized linear operations. Computes a Mixture-of-Experts layer similar to the reference
@@ -354,6 +402,22 @@ def torch_quant_fp8_moe_fake(
     w3_weight_scale: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_int8_woq_per_channel: bool = False,
+    use_mxfp8_act_scaling: bool = False,
+    min_latency_mode: bool = False,
+    use_fused_finalize: bool = True,
+    dp_size: int = 1,
+    dp_rank: int = 0,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -377,6 +441,23 @@ def torch_quant_nvfp4_moe(
     w3_alpha: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
+    # sharding-related parameters
+    enable_alltoall: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_int8_woq_per_channel: bool = False,
+    use_mxfp8_act_scaling: bool = False,
+    min_latency_mode: bool = False,
+    use_fused_finalize: bool = True,
+    dp_size: int = 1,
+    dp_rank: int = 0,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
 ) -> torch.Tensor:
     """
     FP4 MoE op using quantized linear operations.
@@ -501,6 +582,22 @@ def torch_quant_nvfp4_moe_fake(
     w3_alpha: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_int8_woq_per_channel: bool = False,
+    use_mxfp8_act_scaling: bool = False,
+    min_latency_mode: bool = False,
+    use_fused_finalize: bool = True,
+    dp_size: int = 1,
+    dp_rank: int = 0,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 

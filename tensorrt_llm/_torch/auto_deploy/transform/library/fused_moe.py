@@ -12,8 +12,9 @@ from tensorrt_llm._torch.utils import ActivationType
 from ...custom_ops.quant import TRTLLM_NVFP4_PACKING_FACTOR, TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
+from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code, get_attr_by_name
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
+from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
 from ..interface import (
     BaseTransform,
@@ -143,6 +144,8 @@ def _process_moe_node(
         w2_list,
         w3_list,
         apply_routing_on_input,
+        enable_alltoall,
+        dp_size,
     ) = extract_op_args(
         node,
         "x",
@@ -152,6 +155,18 @@ def _process_moe_node(
         "w2_weight",
         "w3_weight",
         "apply_routing_on_input",
+        "enable_alltoall",
+        "dp_size",
+    )
+    dp_rank, tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank = extract_op_args(
+        node,
+        "dp_rank",
+        "tp_size",
+        "tp_rank",
+        "ep_size",
+        "ep_rank",
+        "cluster_size",
+        "cluster_rank",
     )
 
     # Stack weights based on MLP style
@@ -216,6 +231,15 @@ def _process_moe_node(
             kwargs={
                 "is_gated_mlp": is_gated_mlp,
                 "act_fn": act_fn,
+                "enable_alltoall": enable_alltoall,
+                "dp_size": dp_size,
+                "dp_rank": dp_rank,
+                "tp_size": tp_size,
+                "tp_rank": tp_rank,
+                "ep_size": ep_size,
+                "ep_rank": ep_rank,
+                "cluster_size": cluster_size,
+                "cluster_rank": cluster_rank,
             },
         )
 
@@ -549,7 +573,6 @@ class MatchMoePattern(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
-
         # Preprocessing: Identify boundary nodes (e.g. residual connections) in the graph.
         boundary_nodes = identify_regions_between_residuals(gm)
 
@@ -1292,6 +1315,33 @@ class MatchBmmMoePattern(BaseTransform):
         return gm, info
 
 
+def remove_original_experts(gm: GraphModule, weight_lists: List[List[Node]]) -> None:
+    """Remove original expert submodules after weights have been stacked.
+
+    This function attempts to free GPU memory by deleting the original expert
+    submodules whose weights have been replaced by fused/stacked versions.
+
+    Args:
+        gm: The GraphModule containing the expert submodules
+        weight_lists: List of weight node lists (e.g., [w1_list, w2_list, w3_list])
+    """
+    # Flatten all weight lists/
+    weight_lists_flat = [w for weights in weight_lists for w in weights]
+
+    for w in weight_lists_flat:
+        w_param = get_attr_by_name(gm, w.target)
+        if w_param is not None:
+            owner_module, owner_module_path, param_name = get_submodule_of_param(gm, w.target)
+            owner_param = get_attr_by_name(owner_module, param_name)
+            if owner_param is w_param:
+                gm.delete_submodule(owner_module_path)
+            else:
+                # param w is not owned by owner_module, skip
+                continue
+        else:
+            continue
+
+
 def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
     """
     Stack per-expert FP8 weights and scales by materializing stacked tensors as parameters.
@@ -1335,9 +1385,16 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
         )
 
     def _stack(param_list, dim=0):
-        return torch.stack(
-            [get_param_or_buffer(element.target) for element in param_list], dim=dim
-        ).contiguous()
+        try:
+            tmp = torch.stack(
+                [get_param_or_buffer(element.target) for element in param_list], dim=dim
+            ).contiguous()
+            return tmp
+        except Exception as e:
+            print(f"Error stacking parameters: {e}")
+            print(f"param_list: {param_list}")
+            print(f"dim: {dim}")
+            raise e
 
     def _prepare_args_cutlass_format():
         if is_gated_mlp:
@@ -1515,13 +1572,12 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
             )
 
         node.replace_all_uses_with(new_node)
+        input_nodes = node.all_input_nodes
         graph.erase_node(node)
-
-    # Clean up after processing all nodes
-    # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
-    # will remove the parameters/buffers that are no longer referenced
-    eliminate_dead_code(gm)
-    delete_all_unused_submodules(gm)
+        for input_node in input_nodes:
+            if input_node.op == "get_attr" and len(input_node.users) == 0:
+                graph.erase_node(input_node)
+        remove_original_experts(gm, [w1_list, w2_list, w3_list])
 
     return fused_key_counter
 
