@@ -323,6 +323,23 @@ def flashinfer_mha_with_cache(
     k_scale: float,
     v_scale: float,
 ) -> torch.Tensor:
+    # DEBUG: Print dtypes once
+    if not hasattr(flashinfer_mha_with_cache, "_dtype_printed"):
+        print(
+            f"[DEBUG FlashInfer AD] q.dtype = {q.dtype}, k.dtype = {k.dtype}, v.dtype = {v.dtype}"
+        )
+        print(
+            f"[DEBUG FlashInfer AD] k_cache.dtype = {k_cache.dtype}, v_cache.dtype = {v_cache.dtype}"
+        )
+        print(
+            f"[DEBUG FlashInfer AD] CUDA compute capability = {torch.cuda.get_device_capability(0)}"
+        )
+        flashinfer_mha_with_cache._dtype_printed = True
+        flashinfer_mha_with_cache._call_count = 0
+        flashinfer_mha_with_cache._prefill_calls = 0
+        flashinfer_mha_with_cache._decode_calls = 0
+        flashinfer_mha_with_cache._mixed_calls = 0
+
     # reshape to standard [b*s, n_heads, head_dim] layout
     head_dim = k_cache.shape[-1]
     q_shape_og = q.shape
@@ -336,6 +353,23 @@ def flashinfer_mha_with_cache(
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
+
+    # DEBUG: Track prefill vs decode calls
+    if hasattr(flashinfer_mha_with_cache, "_call_count"):
+        flashinfer_mha_with_cache._call_count += 1
+        if num_prefill > 0 and num_decode > 0:
+            flashinfer_mha_with_cache._mixed_calls += 1
+        elif num_prefill > 0:
+            flashinfer_mha_with_cache._prefill_calls += 1
+        else:
+            flashinfer_mha_with_cache._decode_calls += 1
+        if flashinfer_mha_with_cache._call_count % 1000 == 0:
+            print(
+                f"[DEBUG FlashInfer] calls={flashinfer_mha_with_cache._call_count}, "
+                f"prefill_only={flashinfer_mha_with_cache._prefill_calls}, "
+                f"decode_only={flashinfer_mha_with_cache._decode_calls}, "
+                f"mixed={flashinfer_mha_with_cache._mixed_calls}"
+            )
 
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]

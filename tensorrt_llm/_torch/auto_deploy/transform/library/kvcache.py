@@ -186,6 +186,12 @@ class InsertCachedAttention(BaseTransform):
         # the transform config takes precedence over the factory config
         cache_config = self.config.cache_config | factory.get_cache_config()
 
+        # DEBUG: Check KV cache dtype
+        print(f"[DEBUG KV Cache] cache_config.dtype = {cache_config.dtype}")
+        print(
+            f"[DEBUG KV Cache] factory.get_cache_config().dtype = {factory.get_cache_config().dtype}"
+        )
+
         # Get all attention nodes and their info objects
         source_op = attn_descriptor.get_source_attention_op()
 

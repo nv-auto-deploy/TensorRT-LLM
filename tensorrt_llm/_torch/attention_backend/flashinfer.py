@@ -554,6 +554,15 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                         kv_cache,
                         out=out.view(-1, self.num_heads, self.head_dim))
 
+        # DEBUG: Print dtypes once
+        if not hasattr(self, "_dtype_printed"):
+            print(f"[DEBUG FlashInfer PT] q.dtype = {q.dtype}")
+            print(f"[DEBUG FlashInfer PT] kv_cache.dtype = {kv_cache.dtype}")
+            print(
+                f"[DEBUG FlashInfer PT] CUDA compute capability = {torch.cuda.get_device_capability(0)}"
+            )
+            self._dtype_printed = True
+
         # this will do nothing if the last forward pass had the same parameters
         plan_params = metadata.plan(self.num_heads,
                                     self.num_kv_heads,
