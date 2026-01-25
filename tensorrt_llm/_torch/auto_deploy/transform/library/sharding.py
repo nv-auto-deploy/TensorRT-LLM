@@ -30,7 +30,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.torch_moe import (
-    MOE_MAPPING_ALL_TO_ALL,
     MOE_MAPPING_CLUSTER_RANK,
     MOE_MAPPING_CLUSTER_SIZE,
     MOE_MAPPING_EP_RANK,
@@ -1565,7 +1564,7 @@ def _insert_sharded_moe(
     ep_rank = config.mapping.moe_ep_rank
     tp_size = config.mapping.moe_tp_size
     tp_rank = config.mapping.moe_tp_rank
-    moe_all_to_all = config.enable_attention_dp  # All-to-all when attention uses data parallelism
+    enable_alltoall = config.enable_attention_dp  # All-to-all when attention uses data parallelism
 
     allreduce_strategy = config.allreduce_strategy.name
     if allreduce_strategy is None:
@@ -1579,7 +1578,7 @@ def _insert_sharded_moe(
     experts_per_rank = num_experts // ep_size
 
     # =====================================================================================
-    # COMMON: Partition helper function
+    # Shard expert weights (same for both paradigms)
     # =====================================================================================
     def get_partition(lst, world_size, rank):
         """Partition a list of experts/scales across ranks."""
@@ -1590,9 +1589,6 @@ def _insert_sharded_moe(
         end = n if (rank == world_size - 1) else start + size_per_rank
         return lst[start:end], lst[:start] + lst[end:]
 
-    # =====================================================================================
-    # COMMON: Shard expert weights (same for both paradigms)
-    # =====================================================================================
     w_up_list_sharded, w_up_list_to_remove = get_partition(args[3], ep_size, ep_rank)
     w_down_list_sharded, w_down_list_to_remove = get_partition(args[4], ep_size, ep_rank)
     w_gate_list_sharded, w_gate_list_to_remove = get_partition(args[5], ep_size, ep_rank)
@@ -1623,7 +1619,7 @@ def _insert_sharded_moe(
     args[5] = w_gate_list_sharded
 
     # =====================================================================================
-    # COMMON: Shard scales for quantized ops
+    # Shard scales for quantized ops
     # =====================================================================================
     scales_to_remove = []
     for i in range(len(scale_names) * 3):  # 3 weight types (w1, w2, w3) per scale
@@ -1631,29 +1627,7 @@ def _insert_sharded_moe(
         args[6 + i] = sharded
         scales_to_remove.extend(to_remove)
 
-    # =====================================================================================
-    # COMMON: Build mapping_config for trtllm_moe_fused
-    # =====================================================================================
-    num_scale_args = len(scale_names) * 3
-    params_start_idx = 6 + num_scale_args  # Position after base args and scales
-
-    mapping_config = [0] * MOE_MAPPING_LENGTH
-    mapping_config[MOE_MAPPING_WORLD_SIZE] = config.mapping.world_size
-    mapping_config[MOE_MAPPING_TP_SIZE] = config.mapping.moe_tp_size
-    mapping_config[MOE_MAPPING_TP_RANK] = config.mapping.moe_tp_rank
-    mapping_config[MOE_MAPPING_EP_SIZE] = config.mapping.moe_ep_size
-    mapping_config[MOE_MAPPING_EP_RANK] = config.mapping.moe_ep_rank
-    mapping_config[MOE_MAPPING_CLUSTER_SIZE] = config.mapping.moe_cluster_size
-    mapping_config[MOE_MAPPING_CLUSTER_RANK] = config.mapping.moe_cluster_rank
-    mapping_config[MOE_MAPPING_MAX_NUM_TOKENS] = (
-        config.max_num_tokens * config.mapping.moe_ep_size if config.max_num_tokens > 0 else 0
-    )
-    mapping_config[MOE_MAPPING_ALL_TO_ALL] = 1 if moe_all_to_all else 0
-
-    # =====================================================================================
-    # PARADIGM-SPECIFIC: Handle expert IDs and routing weights
-    # =====================================================================================
-    if moe_all_to_all:
+    if enable_alltoall:
         # ---------------------------------------------------------------------------
         # ALL-TO-ALL PARADIGM
         # ---------------------------------------------------------------------------
@@ -1662,7 +1636,20 @@ def _insert_sharded_moe(
         # - trtllm_moe_fused handles dispatch/combine using global IDs
         # - No all_reduce needed (all-to-all handles communication)
         # ---------------------------------------------------------------------------
-        pass  # args[1] and args[2] unchanged
+        # args[1] and args[2] unchanged - keep global expert IDs and routing weights
+
+        # Build mapping_config for all-to-all dispatch/combine
+        mapping_config = [0] * MOE_MAPPING_LENGTH
+        mapping_config[MOE_MAPPING_WORLD_SIZE] = config.mapping.world_size
+        mapping_config[MOE_MAPPING_TP_SIZE] = config.mapping.moe_tp_size
+        mapping_config[MOE_MAPPING_TP_RANK] = config.mapping.moe_tp_rank
+        mapping_config[MOE_MAPPING_EP_SIZE] = config.mapping.moe_ep_size
+        mapping_config[MOE_MAPPING_EP_RANK] = config.mapping.moe_ep_rank
+        mapping_config[MOE_MAPPING_CLUSTER_SIZE] = config.mapping.moe_cluster_size
+        mapping_config[MOE_MAPPING_CLUSTER_RANK] = config.mapping.moe_cluster_rank
+        mapping_config[MOE_MAPPING_MAX_NUM_TOKENS] = (
+            config.max_num_tokens * config.mapping.moe_ep_size if config.max_num_tokens > 0 else 0
+        )
     else:
         # ---------------------------------------------------------------------------
         # ALL-REDUCE PARADIGM
@@ -1700,19 +1687,22 @@ def _insert_sharded_moe(
         args[2] = final_scales_local
 
     # =====================================================================================
-    # COMMON: Update node arguments with sharded weights and mapping_config
+    # Update node arguments with sharded weights and enable_alltoall/mapping_config
     # =====================================================================================
     # Use kwargs for optional parameters to avoid positional/keyword argument conflicts.
     # The node may already have kwargs from pattern matching (e.g., is_gated_mlp, act_fn).
-    # We preserve existing kwargs and add/update mapping_config.
+    # We preserve existing kwargs and add/update enable_alltoall and mapping_config.
 
     # Truncate positional args to only include required parameters (up to scales)
-    # Optional parameters (is_gated_mlp, act_fn, apply_routing_on_input, mapping_config)
+    # Optional parameters (is_gated_mlp, act_fn, apply_routing_on_input, enable_alltoall, mapping_config)
     # should be passed as kwargs only.
+
+    num_scale_args = len(scale_names) * 3
+    params_start_idx = 6 + num_scale_args  # Position after base args and scales
     if len(args) > params_start_idx:
         args = args[:params_start_idx]
 
-    # Build kwargs: start with existing node kwargs, then add mapping_config
+    # Build kwargs: start with existing node kwargs
     new_kwargs = dict(node.kwargs) if node.kwargs else {}
 
     # Set defaults for optional params if not already present
@@ -1723,18 +1713,22 @@ def _insert_sharded_moe(
     if "apply_routing_on_input" not in new_kwargs:
         new_kwargs["apply_routing_on_input"] = False
 
-    # Always set mapping_config (our sharding info)
-    new_kwargs["mapping_config"] = mapping_config
+    # Set enable_alltoall flag
+    new_kwargs["enable_alltoall"] = enable_alltoall
+
+    # Only set mapping_config when enable_alltoall=True (it's only needed for all-to-all path)
+    if enable_alltoall:
+        new_kwargs["mapping_config"] = mapping_config
 
     node.args = tuple(args)
     node.kwargs = new_kwargs
 
-    ad_logger.debug(f"Sharded MoE node {node.name}: all_to_all={moe_all_to_all}, ep_size={ep_size}")
+    ad_logger.debug(
+        f"Sharded MoE node {node.name}: enable_alltoall={enable_alltoall}, ep_size={ep_size}"
+    )
 
-    # =====================================================================================
-    # PARADIGM-SPECIFIC: Add all_reduce for non-all-to-all paradigm
-    # =====================================================================================
-    if not moe_all_to_all:
+    if not enable_alltoall:
+        # Add all_reduce for non-all-to-all paradigm
         with gm.graph.inserting_after(node):
             dist_node = gm.graph.call_function(
                 torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node, allreduce_strategy)
@@ -1743,7 +1737,7 @@ def _insert_sharded_moe(
             dist_node.replace_input_with(dist_node, node)
 
     # =====================================================================================
-    # COMMON: Cleanup unused expert weights and scales
+    # Cleanup unused expert weights and scales
     # =====================================================================================
     eliminate_dead_code(gm)
     for expert in (

@@ -18,7 +18,6 @@ from typing import List, Optional
 import torch
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.torch_moe import (
-    MOE_MAPPING_ALL_TO_ALL,
     MOE_MAPPING_CLUSTER_RANK,
     MOE_MAPPING_CLUSTER_SIZE,
     MOE_MAPPING_EP_RANK,
@@ -45,7 +44,8 @@ def trtllm_moe_fused(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
-    # Sharding configuration - see MOE_MAPPING_* constants for layout
+    enable_alltoall: bool = False,
+    # Sharding configuration (only used when enable_alltoall=True) - see MOE_MAPPING_* constants for layout
     mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     x_shape = x.shape
@@ -76,6 +76,7 @@ def trtllm_moe_fused(
             )
 
     # Extract sharding configuration with safe defaults
+    # Note: mapping_config is only populated when enable_alltoall=True
     def _get_config(idx: int, default: int = 1) -> int:
         return mapping_config[idx] if mapping_config and len(mapping_config) > idx else default
 
@@ -87,7 +88,6 @@ def trtllm_moe_fused(
     moe_cluster_size = _get_config(MOE_MAPPING_CLUSTER_SIZE, 1)
     moe_cluster_rank = _get_config(MOE_MAPPING_CLUSTER_RANK, 0)
     max_num_tokens_config = _get_config(MOE_MAPPING_MAX_NUM_TOKENS, 0)
-    enable_alltoall = _get_config(MOE_MAPPING_ALL_TO_ALL, 0) == 1
 
     # =================================================================================
     # MoE ALL-TO-ALL PATH
@@ -255,6 +255,7 @@ def trtllm_moe_fused_fake(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
     mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
@@ -294,6 +295,7 @@ def trtllm_quant_fp8_moe_fused(
     act_fn: int = int(ActivationType.Silu),
     # Additional kwargs for consistency with torch_quant_fp8_moe
     apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
     mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass FP8 (W8A8) MoE for gated and non-gated MLP.
@@ -386,6 +388,7 @@ def trtllm_quant_fp8_moe_fused_fake(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
     mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
@@ -409,6 +412,7 @@ def trtllm_quant_nvfp4_moe_fused(
     act_fn: int = int(ActivationType.Silu),
     # Additional kwargs for consistency with torch_quant_nvfp4_moe
     apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
     mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass NVFP4 W8A8 MoE for gated and non-gated MLP.
@@ -505,6 +509,7 @@ def trtllm_quant_nvfp4_moe_fused_fake(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
+    enable_alltoall: bool = False,
     mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
