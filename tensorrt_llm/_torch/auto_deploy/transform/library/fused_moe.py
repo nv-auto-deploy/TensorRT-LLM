@@ -562,6 +562,7 @@ class MatchMoePattern(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
+
         # Preprocessing: Identify boundary nodes (e.g. residual connections) in the graph.
         boundary_nodes = identify_regions_between_residuals(gm)
 
@@ -1374,16 +1375,9 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
         )
 
     def _stack(param_list, dim=0):
-        try:
-            tmp = torch.stack(
-                [get_param_or_buffer(element.target) for element in param_list], dim=dim
-            ).contiguous()
-            return tmp
-        except Exception as e:
-            print(f"Error stacking parameters: {e}")
-            print(f"param_list: {param_list}")
-            print(f"dim: {dim}")
-            raise e
+        return torch.stack(
+            [get_param_or_buffer(element.target) for element in param_list], dim=dim
+        ).contiguous()
 
     def _prepare_args_cutlass_format():
         if is_gated_mlp:
