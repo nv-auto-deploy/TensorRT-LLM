@@ -254,7 +254,6 @@ class MoeAlltoAll:
         """
         assert self._state.phase == "dispatched", "combine called before a successful dispatch"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
-
         output = torch.ops.trtllm.moe_a2a_combine(
             payload, self._state.local_num_tokens, self.workspace,
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,

@@ -86,7 +86,8 @@ transforms:
     support_partial_config: true
     sharding_dims: ['TP', 'EP']
     # grid order: PP, DP, EP, SP, TP
-    process_grid: {"attention": [1, 2, 1, 1, 1], "moe": [1, 1, 2, 1, 1], "mlp": [1, 1, 1, 1, 2]}
+    # process_grid: {"attention": [1, 2, 1, 1, 1], "moe": [1, 1, 2, 1, 1], "mlp": [1, 1, 1, 1, 2]}
+    # dist_mapping: {"tp": 2, "moe_tp": 2, "moe_ep": 1, "moe_cluster": 1}
     shard_all_unprocessed: true
     allreduce_strategy: 'NCCL'
     dist_backend: auto

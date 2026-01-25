@@ -30,7 +30,18 @@ import torch.nn as nn
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.torch_moe import (
+    MOE_MAPPING_CLUSTER_RANK,
+    MOE_MAPPING_CLUSTER_SIZE,
+    MOE_MAPPING_EP_RANK,
+    MOE_MAPPING_EP_SIZE,
+    MOE_MAPPING_LENGTH,
+    MOE_MAPPING_TP_RANK,
+    MOE_MAPPING_TP_SIZE,
+    MOE_MAPPING_WORLD_SIZE,
+)
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.mapping import Mapping
 
 from .....functional import AllReduceStrategy
 from ...custom_ops.trtllm_dist import is_trtllm_op_available
@@ -158,8 +169,8 @@ class DistMapping(BaseModel):
         self.world_size = world_size
         self.rank = rank
         for layer_type in LayerType:
-            # initialize default, TP-only grid
             self.layer_mappings[layer_type] = DistLayerMapping()
+            # initialize default, TP-only grid (layer_grid = None defaults to TP)
             layer_grid = None
             if layer_type in grid:
                 # check if grid size matches world size
@@ -168,6 +179,11 @@ class DistMapping(BaseModel):
                     and np.prod(grid[layer_type]) == self.world_size
                 ):
                     layer_grid = grid[layer_type]
+            else:
+                if layer_type == LayerType.MOE:
+                    # default grid for MoE is EP-only
+                    layer_grid = [1] * len(ShardingDim)
+                    layer_grid[ShardingDim.EP] = self.world_size
             self.layer_mappings[layer_type].initialize(self.world_size, self.rank, layer_grid)
 
 
@@ -177,6 +193,7 @@ class DistMapping(BaseModel):
 class ShardingTransformConfig(TransformConfig):
     """Configuration for sharding the model."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
     factory_source: ShardingConfigSource = Field(default=ShardingConfigSource.UNKNOWN)
     factory_config: Dict[str, Any] = Field(default_factory=dict)
     manual_config: Dict[str, Any] = Field(default_factory=dict)
@@ -209,18 +226,35 @@ class ShardingTransformConfig(TransformConfig):
         description="When True, skip TP sharding as attention data parallelism is enabled.",
     )
 
-    process_grid: Dict[LayerType, List[int]] = Field(default_factory=dict)
+    dist_mapping: dict[str, int] = Field(default_factory=dict)
 
-    # TODO: Should be eventually replaced by the Trtllm-native Mapping class
-    mapping: DistMapping = Field(default_factory=DistMapping)
+    mapping: Mapping = Field(default_factory=Mapping)
 
     enable_attention_dp: bool = Field(
         default=False,
         description="When True, skip TP sharding as attention data parallelism is enabled.",
     )
 
+    def _init_mapping(self):
+        # if enable_attention_dp = True, we enforce 1D parallelism TP = 1 and EP = world_size
+        if self.enable_attention_dp:
+            # Mapping class maps MoE_world_size = tp_size
+            self.dist_mapping["tp"] = self.world_size
+            self.dist_mapping["moe_tp"] = 1
+            self.dist_mapping["moe_ep"] = self.world_size
+            self.dist_mapping["moe_cluster"] = 1
+        # by default, we use 1D parallelism (TP-only for token mixers and FFN, EP-only for MoE)
+        self.mapping = Mapping(
+            world_size=self.world_size,
+            rank=self.rank,
+            tp_size=self.dist_mapping.get("tp", self.world_size),
+            moe_tp_size=self.dist_mapping.get("moe_tp", 1),
+            moe_ep_size=self.dist_mapping.get("moe_ep", self.world_size),
+            moe_cluster_size=self.dist_mapping.get("moe_cluster", 1),
+        )
+
     def validate_config(self, sources: Union[ShardingSource, List[ShardingSource]] = None) -> bool:
-        self.mapping.initialize(self.world_size, self.rank, self.process_grid)
+        self._init_mapping()
         if sources is None:
             sources = [ShardingSource.FACTORY, ShardingSource.MANUAL]
         if not isinstance(sources, list):
@@ -954,9 +988,8 @@ class Sharding(BaseTransform):
             f"Using allreduce strategy: {config.allreduce_strategy.name}, dist backend: {config.dist_backend}"
         )
 
-        if world_size < 2:  # or config.enable_attention_dp:
-            reason = "single device" if world_size < 2 else "attention DP enabled"
-            ad_logger.info(f"Skipping sharding: {reason}")
+        if world_size < 2:
+            ad_logger.info("Skipping sharding for a single device setup")
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -965,39 +998,46 @@ class Sharding(BaseTransform):
 
         if config.enable_attention_dp:
             # only MoE all-to-all sharding is supported in attention DP mode
-            ad_logger.info("Attention DP is on. Only MoE all-to-all sharding is supported.")
-            moe_mapping = config.mapping.layer_mappings[LayerType.MOE]
-            ep_rank = moe_mapping.rank[ShardingDim.EP]
-            ad_logger.info(
-                f"Rank {config.rank}, EP rank {ep_rank}, process grid: {moe_mapping.grid}"
-            )
-            info += detect_ep_shard(gm, transform_container)
-            info += detect_dp_bmm_shard(gm, transform_container)
-            return gm, info
-
-        for source in config.sharding_source:
-            if source == ShardingSource.FACTORY:
-                if len(config.factory_config) == 0:
-                    ad_logger.debug(
-                        "No factory config found. Skipping sharding from factory config"
+            # we already enforced 1D sharding (TP=1, EP=world_size) in init_mapping
+            if ShardingDim.EP in config.sharding_dims:
+                info += detect_ep_shard(gm, transform_container)
+        else:
+            # === TP sharding ===
+            # for TP sharding, we may have three different sharding sources:
+            # manual, factory, and/or heuristics.
+            for source in config.sharding_source:
+                if source == ShardingSource.FACTORY:
+                    if len(config.factory_config) == 0:
+                        ad_logger.debug(
+                            "No factory config found. Skipping sharding from factory config"
+                        )
+                        continue
+                    ad_logger.info("Applying sharding from factory config")
+                    info += detect_sharding_from_config(
+                        gm, transform_container, ShardingSource.FACTORY
                     )
-                    continue
-                ad_logger.info("Applying sharding from factory config")
-                info += detect_sharding_from_config(gm, transform_container, ShardingSource.FACTORY)
-            elif source == ShardingSource.MANUAL:
-                if len(config.manual_config) == 0:
-                    ad_logger.debug("No manual config found. Skipping sharding from manual config")
-                    continue
-                ad_logger.info("Applying sharding from manual config")
-                info += detect_sharding_from_config(gm, transform_container, ShardingSource.MANUAL)
+                elif source == ShardingSource.MANUAL:
+                    if len(config.manual_config) == 0:
+                        ad_logger.debug(
+                            "No manual config found. Skipping sharding from manual config"
+                        )
+                        continue
+                    ad_logger.info("Applying sharding from manual config")
+                    info += detect_sharding_from_config(
+                        gm, transform_container, ShardingSource.MANUAL
+                    )
 
-            elif source == ShardingSource.HEURISTIC:
-                ad_logger.info(f"Running autodeploy sharding heuristics: {config.sharding_dims}")
-                # run TP sharding across ranks
-                if ShardingDim.TP in config.sharding_dims:
-                    info += detect_column_row_shard(gm, transform_container)
+                elif source == ShardingSource.HEURISTIC:
+                    ad_logger.info(
+                        f"Running autodeploy sharding heuristics: {config.sharding_dims}"
+                    )
+                    # run TP sharding across ranks
+                    if ShardingDim.TP in config.sharding_dims:
+                        info += detect_column_row_shard(gm, transform_container)
 
-            # run EP sharding across ranks
+            # === EP sharding ===
+            # this is independent of sharding config. Currently,
+            # only heuristics (pattern matcher) is supported.
             if ShardingDim.EP in config.sharding_dims:
                 info += detect_ep_shard(gm, transform_container)
                 info += detect_dp_bmm_shard(gm, transform_container)
@@ -1298,47 +1338,6 @@ def _resolve_tp_cls_from_node(node: Node):
     return WeightShardingInfo
 
 
-def init_process_grid_from_config(
-    config: ShardingTransformConfig,
-) -> Dict[ShardingDim, Dict[str, int]]:
-    rank, world_size = config.rank, config.world_size
-    if len(config.process_grid) > 0:
-        ad_logger.debug(f"EP + TP sharding process grid: {config.process_grid}")
-        ep_size = config.process_grid[ShardingDim.EP]
-        tp_size = config.process_grid[ShardingDim.TP]
-        # the order of the keys (ep,tp) vs (tp,ep) determines how ranks
-        # are mapped to the 2D process grid
-        if list(config.process_grid.keys())[-1] == ShardingDim.TP:
-            tp_rank = rank % tp_size
-            ep_rank = rank // tp_size
-        else:
-            tp_rank = rank // ep_size
-            ep_rank = rank % ep_size
-
-        if ep_size * tp_size != world_size:
-            ad_logger.warning(
-                f"EP + TP sharding process grid {config.process_grid} "
-                f"does not match world size {world_size}. "
-                f"Skipping 2D sharding, applying only 1D EP sharding."
-            )
-            ep_size = world_size
-            tp_size = 1
-            ep_rank = rank
-            tp_rank = 0
-    else:
-        ep_size = world_size
-        tp_size = 1
-        ep_rank = rank
-        tp_rank = 0
-    process_grid = {
-        ShardingDim.EP: {"p": ep_rank, "w": ep_size},
-        ShardingDim.TP: {"p": tp_rank, "w": tp_size},
-    }
-    ad_logger.info(f"EP + TP sharding process grid: {process_grid}")
-    config.process_grid = process_grid
-    return process_grid
-
-
 ########################################################
 #  Sharding transform functions
 ########################################################
@@ -1554,19 +1553,26 @@ def _insert_sharded_moe(
     NOTE: allreduce_strategy is MANDATORY.
     """
     # get 2D EP+TP process grid and corresponding ranks
-    moe_mapping = config.mapping.layer_mappings[LayerType.MOE]
-    ep_rank = moe_mapping.rank[ShardingDim.EP]
-    ep_size = moe_mapping.grid[ShardingDim.EP]
-    tp_rank = moe_mapping.rank[ShardingDim.TP]
-    tp_size = moe_mapping.grid[ShardingDim.TP]
+    # moe_mapping = config.mapping.layer_mappings[LayerType.MOE]
+    # ep_rank = moe_mapping.rank[ShardingDim.EP]
+    # ep_size = moe_mapping.grid[ShardingDim.EP]
+    # tp_rank = moe_mapping.rank[ShardingDim.TP]
+    # tp_size = moe_mapping.grid[ShardingDim.TP]
     # dp_size = moe_mapping.grid[ShardingDim.DP]
 
     # get attention grid to check for all-to-all paradigm.
-    attention_mapping = config.mapping.layer_mappings[LayerType.ATTENTION]
-    attention_dp_size = attention_mapping.grid[ShardingDim.DP]
+    # attention_mapping = config.mapping.layer_mappings[LayerType.ATTENTION]
+    # attention_dp_size = attention_mapping.grid[ShardingDim.DP]
+
+    ep_size = config.mapping.moe_ep_size
+    ep_rank = config.mapping.moe_ep_rank
+    tp_size = config.mapping.moe_tp_size
+    tp_rank = config.mapping.moe_tp_rank
 
     # check for all-to-all paradigm.
-    if ep_size > 1 and tp_size == 1 and attention_dp_size == ep_size:
+    if config.enable_attention_dp:
+        # Currently, for attention DP, we only support 1D parallelism (EP = DP = world_size)
+        # We already enforced it in _init_mapping()
         moe_all_to_all = True
     else:
         moe_all_to_all = False
@@ -1668,7 +1674,6 @@ def _insert_sharded_moe(
     ad_logger.debug(
         f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
     )
-    moe_all_to_all = True
 
     # Calculate the number of scale arguments (3 * number of scale names)
     # scale_names can be: [] for torch_moe, ["input_scale", "weight_scale"] for fp8,
@@ -1681,30 +1686,23 @@ def _insert_sharded_moe(
     # torch_quant_nvfp4_moe: args[0:6] are base, args[6:15] are scales, args[15:] are bool/int params
     params_start_idx = 6 + num_scale_args
 
+    # Build mapping_config list from the Mapping object
+    mapping_config = [0] * MOE_MAPPING_LENGTH
+    mapping_config[MOE_MAPPING_WORLD_SIZE] = config.mapping.world_size
+    mapping_config[MOE_MAPPING_TP_SIZE] = config.mapping.tp_size
+    mapping_config[MOE_MAPPING_TP_RANK] = config.mapping.tp_rank
+    mapping_config[MOE_MAPPING_EP_SIZE] = config.mapping.moe_ep_size
+    mapping_config[MOE_MAPPING_EP_RANK] = config.mapping.moe_ep_rank
+    mapping_config[MOE_MAPPING_CLUSTER_SIZE] = config.mapping.moe_cluster_size
+    mapping_config[MOE_MAPPING_CLUSTER_RANK] = config.mapping.moe_cluster_rank
+
     # Default parameters that come after scales (same order for all MoE ops)
-    # is_gated_mlp, act_fn, apply_routing_on_input, enable_alltoall,
-    # use_deepseek_fp8_block_scale, use_w4_group_scaling, use_int8_woq_per_channel,
-    # use_mxfp8_act_scaling, min_latency_mode, use_fused_finalize,
-    # dp_size, dp_rank, tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank
+    # is_gated_mlp, act_fn, apply_routing_on_input, mapping_config
     default_params = [
         True,  # 0: is_gated_mlp
         int(ActivationType.Silu),  # 1: act_fn
         False,  # 2: apply_routing_on_input
-        moe_all_to_all,  # 3: enable_alltoall
-        False,  # 4: use_deepseek_fp8_block_scale
-        False,  # 5: use_w4_group_scaling
-        False,  # 6: use_int8_woq_per_channel
-        False,  # 7: use_mxfp8_act_scaling
-        False,  # 8: min_latency_mode
-        True,  # 9: use_fused_finalize
-        attention_dp_size,  # 10: dp_size
-        moe_mapping.rank[ShardingDim.DP],  # 11: dp_rank
-        1,  # 12: tp_size
-        0,  # 13: tp_rank
-        ep_size,  # 14: ep_size
-        ep_rank,  # 15: ep_rank
-        1,  # 16: cluster_size
-        0,  # 17: cluster_rank
+        mapping_config,  # 3: mapping_config (List[int])
     ]
 
     # Current length of args
@@ -1730,14 +1728,14 @@ def _insert_sharded_moe(
 
     node.args = tuple(args)
 
-    # if not moe_all_to_all:
-    #     # -- add an all_reduce node --
-    #     with gm.graph.inserting_after(node):
-    #         dist_node = gm.graph.call_function(
-    #             torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node, allreduce_strategy)
-    #         )
-    #         node.replace_all_uses_with(dist_node)
-    #         dist_node.replace_input_with(dist_node, node)
+    if not moe_all_to_all:
+        # -- add an all_reduce node --
+        with gm.graph.inserting_after(node):
+            dist_node = gm.graph.call_function(
+                torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node, allreduce_strategy)
+            )
+            node.replace_all_uses_with(dist_node)
+            dist_node.replace_input_with(dist_node, node)
 
     eliminate_dead_code(gm)
     # Expert weights registered via gm.register_parameter() are top-level attributes.

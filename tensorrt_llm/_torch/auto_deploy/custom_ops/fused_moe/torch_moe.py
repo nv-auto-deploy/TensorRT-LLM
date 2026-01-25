@@ -1,9 +1,23 @@
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.utils import ActivationType
+
+# MoE Mapping Configuration Indices
+# These indices define the layout of the mapping_config list parameter
+# that encodes sharding information for MoE operators.
+MOE_MAPPING_WORLD_SIZE = 0
+MOE_MAPPING_TP_SIZE = 1
+MOE_MAPPING_TP_RANK = 2
+MOE_MAPPING_EP_SIZE = 3
+MOE_MAPPING_EP_RANK = 4
+MOE_MAPPING_CLUSTER_SIZE = 5
+MOE_MAPPING_CLUSTER_RANK = 6
+# Future indices can be added here without breaking compatibility
+# e.g., MOE_MAPPING_PP_SIZE, MOE_MAPPING_CP_SIZE, etc.
+MOE_MAPPING_LENGTH = 7  # Current length of mapping_config
 
 
 def _resolve_torch_fn(act_fn: ActivationType) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -97,22 +111,8 @@ def torch_moe(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
-    # sharding-related parameters
-    enable_alltoall: bool = False,
-    use_deepseek_fp8_block_scale: bool = False,
-    use_w4_group_scaling: bool = False,
-    use_int8_woq_per_channel: bool = False,
-    use_mxfp8_act_scaling: bool = False,
-    min_latency_mode: bool = False,
-    use_fused_finalize: bool = True,
-    dp_size: int = 1,
-    dp_rank: int = 0,
-    tp_size: int = 1,
-    tp_rank: int = 0,
-    ep_size: int = 1,
-    ep_rank: int = 0,
-    cluster_size: int = 1,
-    cluster_rank: int = 0,
+    # Sharding configuration - see MOE_MAPPING_* constants for layout
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """
     Unified Mixture-of-Experts (MoE) operator that uses a Mixtral-style dispatch
@@ -176,21 +176,7 @@ def torch_moe_fake(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
-    enable_alltoall: bool = False,
-    use_deepseek_fp8_block_scale: bool = False,
-    use_w4_group_scaling: bool = False,
-    use_int8_woq_per_channel: bool = False,
-    use_mxfp8_act_scaling: bool = False,
-    min_latency_mode: bool = False,
-    use_fused_finalize: bool = True,
-    dp_size: int = 1,
-    dp_rank: int = 0,
-    tp_size: int = 1,
-    tp_rank: int = 0,
-    ep_size: int = 1,
-    ep_rank: int = 0,
-    cluster_size: int = 1,
-    cluster_rank: int = 0,
+    mapping_config: List[int] = [],
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -278,22 +264,8 @@ def torch_quant_fp8_moe(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
-    # sharding-related parameters
-    enable_alltoall: bool = False,
-    use_deepseek_fp8_block_scale: bool = False,
-    use_w4_group_scaling: bool = False,
-    use_int8_woq_per_channel: bool = False,
-    use_mxfp8_act_scaling: bool = False,
-    min_latency_mode: bool = False,
-    use_fused_finalize: bool = True,
-    dp_size: int = 1,
-    dp_rank: int = 0,
-    tp_size: int = 1,
-    tp_rank: int = 0,
-    ep_size: int = 1,
-    ep_rank: int = 0,
-    cluster_size: int = 1,
-    cluster_rank: int = 0,
+    # Sharding configuration - see MOE_MAPPING_* constants for layout
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """
     FP8 MoE op using quantized linear operations. Computes a Mixture-of-Experts layer similar to the reference
@@ -403,21 +375,7 @@ def torch_quant_fp8_moe_fake(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
-    enable_alltoall: bool = False,
-    use_deepseek_fp8_block_scale: bool = False,
-    use_w4_group_scaling: bool = False,
-    use_int8_woq_per_channel: bool = False,
-    use_mxfp8_act_scaling: bool = False,
-    min_latency_mode: bool = False,
-    use_fused_finalize: bool = True,
-    dp_size: int = 1,
-    dp_rank: int = 0,
-    tp_size: int = 1,
-    tp_rank: int = 0,
-    ep_size: int = 1,
-    ep_rank: int = 0,
-    cluster_size: int = 1,
-    cluster_rank: int = 0,
+    mapping_config: List[int] = [],
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -442,22 +400,8 @@ def torch_quant_nvfp4_moe(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
-    # sharding-related parameters
-    enable_alltoall: bool = False,
-    use_deepseek_fp8_block_scale: bool = False,
-    use_w4_group_scaling: bool = False,
-    use_int8_woq_per_channel: bool = False,
-    use_mxfp8_act_scaling: bool = False,
-    min_latency_mode: bool = False,
-    use_fused_finalize: bool = True,
-    dp_size: int = 1,
-    dp_rank: int = 0,
-    tp_size: int = 1,
-    tp_rank: int = 0,
-    ep_size: int = 1,
-    ep_rank: int = 0,
-    cluster_size: int = 1,
-    cluster_rank: int = 0,
+    # Sharding configuration - see MOE_MAPPING_* constants for layout
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """
     FP4 MoE op using quantized linear operations.
@@ -583,21 +527,7 @@ def torch_quant_nvfp4_moe_fake(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
-    enable_alltoall: bool = False,
-    use_deepseek_fp8_block_scale: bool = False,
-    use_w4_group_scaling: bool = False,
-    use_int8_woq_per_channel: bool = False,
-    use_mxfp8_act_scaling: bool = False,
-    min_latency_mode: bool = False,
-    use_fused_finalize: bool = True,
-    dp_size: int = 1,
-    dp_rank: int = 0,
-    tp_size: int = 1,
-    tp_rank: int = 0,
-    ep_size: int = 1,
-    ep_rank: int = 0,
-    cluster_size: int = 1,
-    cluster_rank: int = 0,
+    mapping_config: List[int] = [],
 ) -> torch.Tensor:
     return torch.empty_like(x)
 

@@ -172,7 +172,7 @@ def worker_main(
 
     mpi_comm().barrier()
 
-    if mpi_rank() == 1 and "VSCODE_DEBUGPY_ADAPTER_ENDPOINTS" in os.environ:
+    if mpi_rank() == 0 and "VSCODE_DEBUGPY_ADAPTER_ENDPOINTS" in os.environ:
         # cf. https://github.com/microsoft/vscode-python-debugger/blob/f64b217c4d2445f7f55255b102de1d94c19cf450/bundled/scripts/noConfigScripts/debugpy#L4
         os.environ["DEBUGPY_ADAPTER_ENDPOINTS"] = os.environ[
             "VSCODE_DEBUGPY_ADAPTER_ENDPOINTS"]

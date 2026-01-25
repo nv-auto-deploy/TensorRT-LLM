@@ -144,8 +144,7 @@ def _process_moe_node(
         w2_list,
         w3_list,
         apply_routing_on_input,
-        enable_alltoall,
-        dp_size,
+        mapping_config,
     ) = extract_op_args(
         node,
         "x",
@@ -155,18 +154,7 @@ def _process_moe_node(
         "w2_weight",
         "w3_weight",
         "apply_routing_on_input",
-        "enable_alltoall",
-        "dp_size",
-    )
-    dp_rank, tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank = extract_op_args(
-        node,
-        "dp_rank",
-        "tp_size",
-        "tp_rank",
-        "ep_size",
-        "ep_rank",
-        "cluster_size",
-        "cluster_rank",
+        "mapping_config",
     )
 
     # Stack weights based on MLP style
@@ -231,15 +219,7 @@ def _process_moe_node(
             kwargs={
                 "is_gated_mlp": is_gated_mlp,
                 "act_fn": act_fn,
-                "enable_alltoall": enable_alltoall,
-                "dp_size": dp_size,
-                "dp_rank": dp_rank,
-                "tp_size": tp_size,
-                "tp_rank": tp_rank,
-                "ep_size": ep_size,
-                "ep_rank": ep_rank,
-                "cluster_size": cluster_size,
-                "cluster_rank": cluster_rank,
+                "mapping_config": mapping_config,
             },
         )
 

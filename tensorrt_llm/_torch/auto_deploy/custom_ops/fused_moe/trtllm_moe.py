@@ -13,8 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import List, Optional
+
 import torch
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.torch_moe import (
+    MOE_MAPPING_CLUSTER_RANK,
+    MOE_MAPPING_CLUSTER_SIZE,
+    MOE_MAPPING_EP_RANK,
+    MOE_MAPPING_EP_SIZE,
+    MOE_MAPPING_TP_RANK,
+    MOE_MAPPING_TP_SIZE,
+    MOE_MAPPING_WORLD_SIZE,
+)
 from tensorrt_llm._torch.auto_deploy.custom_ops.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.utils import ActivationType
@@ -30,22 +41,9 @@ def trtllm_moe_fused(
     w3_w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
-    enable_alltoall: bool = False,
-    use_deepseek_fp8_block_scale: bool = False,
-    use_w4_group_scaling: bool = False,
-    use_int8_woq_per_channel: bool = False,
-    use_mxfp8_act_scaling: bool = False,
-    min_latency_mode: bool = False,
-    use_fused_finalize: bool = True,
-    dp_size: int = 1,
-    dp_rank: int = 0,
-    tp_size: int = 1,
-    tp_rank: int = 0,
-    ep_size: int = 1,
-    ep_rank: int = 0,
-    cluster_size: int = 1,
-    cluster_rank: int = 0,
     act_fn: int = int(ActivationType.Silu),
+    # Sharding configuration - see MOE_MAPPING_* constants for layout
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     x_shape = x.shape
     x = x.view(-1, x_shape[-1])
@@ -74,9 +72,25 @@ def trtllm_moe_fused(
                 f"Unsupported activation '{ActivationType(act_fn).name}' for mlp. Use 'relu2'."
             )
 
-    if enable_alltoall:  # and dp_size == ep_size and tp_size == 1:
+    # Extract sharding configuration with safe defaults
+    def _get_config(idx: int, default: int = 1) -> int:
+        return mapping_config[idx] if mapping_config and len(mapping_config) > idx else default
+
+    world_size = _get_config(MOE_MAPPING_WORLD_SIZE, 1)
+    moe_tp_size = _get_config(MOE_MAPPING_TP_SIZE, 1)
+    moe_tp_rank = _get_config(MOE_MAPPING_TP_RANK, 0)
+    moe_ep_size = _get_config(MOE_MAPPING_EP_SIZE, 1)
+    moe_ep_rank = _get_config(MOE_MAPPING_EP_RANK, 0)
+    moe_cluster_size = _get_config(MOE_MAPPING_CLUSTER_SIZE, 1)
+    moe_cluster_rank = _get_config(MOE_MAPPING_CLUSTER_RANK, 0)
+
+    # Determine if all-to-all is enabled based on mapping configuration
+    # All-to-all is enabled when: TP=1, MoE_TP=1, and MoE_EP=world_size
+    enable_alltoall = moe_tp_size == 1 and moe_ep_size == world_size
+
+    if enable_alltoall:
         top_k = selected_experts.shape[1]
-        num_experts = 8  # w3_w1_stacked_weight.shape[0]
+        num_experts = w3_w1_stacked_weight.shape[0]
         hidden_size = x.shape[-1]
         local_tokens = int(x.shape[0])
         all_rank_tokens = mpi_allgather(local_tokens)
@@ -85,24 +99,20 @@ def trtllm_moe_fused(
         else:
             runtime_max_tokens_per_rank = local_tokens
 
-        ep_size = 2
-        top_k = 2
-        runtime_max_tokens_per_rank = 16
-        hidden_size = 4096
-        x_dtype = torch.bfloat16
+        x_dtype = x.dtype
 
-        max_num_tokens = runtime_max_tokens_per_rank * ep_size
+        max_num_tokens = runtime_max_tokens_per_rank * moe_ep_size
         workspace_size = MoeAlltoAll.calculate_required_workspace_size(
-            ep_size, top_k, max_num_tokens, hidden_size, x_dtype
+            moe_ep_size, top_k, max_num_tokens, hidden_size, x_dtype
         )
 
-        # All-to-all runs across the DP group; map ranks into a size=ep_size group.
+        # Build Mapping object for MoeAlltoAll
         mapping = Mapping(
-            world_size=ep_size,
-            rank=ep_rank,
-            tp_size=ep_size,
+            world_size=moe_ep_size,
+            rank=moe_ep_rank,
+            tp_size=moe_ep_size,
             moe_tp_size=1,
-            moe_ep_size=ep_size,
+            moe_ep_size=moe_ep_size,
             moe_cluster_size=1,
         )
         moe_a2a = MoeAlltoAll(
@@ -143,28 +153,29 @@ def trtllm_moe_fused(
             fc2_expert_biases=None,
             output_dtype=x.dtype,
             quant_scales=quant_scales,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            cluster_size=cluster_size,
-            cluster_rank=cluster_rank,
+            tp_size=moe_tp_size,
+            tp_rank=moe_tp_rank,
+            ep_size=moe_ep_size,
+            ep_rank=moe_ep_rank,
+            cluster_size=moe_cluster_size,
+            cluster_rank=moe_cluster_rank,
             enable_alltoall=enable_alltoall,
             tuner_num_tokens=max_num_tokens,
             tuner_top_k=top_k,
             activation_type=activation_type,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4_group_scaling=use_w4_group_scaling,
-            use_int8_woq_per_channel=use_int8_woq_per_channel,
-            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-            min_latency_mode=min_latency_mode,
-            use_fused_finalize=use_fused_finalize,
+            use_deepseek_fp8_block_scale=False,
+            use_w4_group_scaling=False,
+            use_int8_woq_per_channel=False,
+            use_mxfp8_act_scaling=False,
+            min_latency_mode=False,
+            use_fused_finalize=True,
         )[0]
 
-        moe_out = moe_out.view(ep_size, runtime_max_tokens_per_rank, hidden_size)
+        moe_out = moe_out.view(moe_ep_size, runtime_max_tokens_per_rank, hidden_size)
         combined = moe_a2a.combine(moe_out, runtime_max_tokens_per_rank)
         return combined.view(x_shape)
 
+    # Non-all-to-all path
     tuner_num_tokens = None
     tuner_top_k = None
 
@@ -178,22 +189,22 @@ def trtllm_moe_fused(
         fc2_expert_biases=None,
         output_dtype=x.dtype,
         quant_scales=quant_scales,
-        tp_size=tp_size,
-        tp_rank=tp_rank,
-        ep_size=ep_size,
-        ep_rank=ep_rank,
-        cluster_size=cluster_size,
-        cluster_rank=cluster_rank,
+        tp_size=moe_tp_size,
+        tp_rank=moe_tp_rank,
+        ep_size=moe_ep_size,
+        ep_rank=moe_ep_rank,
+        cluster_size=moe_cluster_size,
+        cluster_rank=moe_cluster_rank,
         enable_alltoall=False,
         tuner_num_tokens=tuner_num_tokens,
         tuner_top_k=tuner_top_k,
         activation_type=activation_type,
-        use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-        use_w4_group_scaling=use_w4_group_scaling,
-        use_int8_woq_per_channel=use_int8_woq_per_channel,
-        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        min_latency_mode=min_latency_mode,
-        use_fused_finalize=use_fused_finalize,
+        use_deepseek_fp8_block_scale=False,
+        use_w4_group_scaling=False,
+        use_int8_woq_per_channel=False,
+        use_mxfp8_act_scaling=False,
+        min_latency_mode=False,
+        use_fused_finalize=True,
     )[0].view(x_shape)
 
 
@@ -205,22 +216,8 @@ def trtllm_moe_fused_fake(
     w3_w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
-    enable_alltoall: bool = False,
-    use_deepseek_fp8_block_scale: bool = False,
-    use_w4_group_scaling: bool = False,
-    use_int8_woq_per_channel: bool = False,
-    use_mxfp8_act_scaling: bool = False,
-    min_latency_mode: bool = False,
-    use_fused_finalize: bool = True,
-    dp_size: int = 1,
-    dp_rank: int = 0,
-    tp_size: int = 1,
-    tp_rank: int = 0,
-    ep_size: int = 1,
-    ep_rank: int = 0,
-    cluster_size: int = 1,
-    cluster_rank: int = 0,
     act_fn: int = int(ActivationType.Silu),
+    mapping_config: List[int] = [],
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
