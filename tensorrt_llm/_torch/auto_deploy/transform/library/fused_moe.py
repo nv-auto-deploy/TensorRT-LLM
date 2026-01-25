@@ -144,6 +144,7 @@ def _process_moe_node(
         w2_list,
         w3_list,
         apply_routing_on_input,
+        mapping_config,
     ) = extract_op_args(
         node,
         "x",
@@ -153,6 +154,7 @@ def _process_moe_node(
         "w2_weight",
         "w3_weight",
         "apply_routing_on_input",
+        "mapping_config",
     )
 
     # Stack weights based on MLP style
@@ -217,6 +219,7 @@ def _process_moe_node(
             kwargs={
                 "is_gated_mlp": is_gated_mlp,
                 "act_fn": act_fn,
+                "mapping_config": mapping_config,
             },
         )
 
@@ -550,7 +553,6 @@ class MatchMoePattern(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
-
         # Preprocessing: Identify boundary nodes (e.g. residual connections) in the graph.
         boundary_nodes = identify_regions_between_residuals(gm)
 
@@ -1363,9 +1365,16 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
         )
 
     def _stack(param_list, dim=0):
-        return torch.stack(
-            [get_param_or_buffer(element.target) for element in param_list], dim=dim
-        ).contiguous()
+        try:
+            tmp = torch.stack(
+                [get_param_or_buffer(element.target) for element in param_list], dim=dim
+            ).contiguous()
+            return tmp
+        except Exception as e:
+            print(f"Error stacking parameters: {e}")
+            print(f"param_list: {param_list}")
+            print(f"dim: {dim}")
+            raise e
 
     def _prepare_args_cutlass_format():
         if is_gated_mlp:

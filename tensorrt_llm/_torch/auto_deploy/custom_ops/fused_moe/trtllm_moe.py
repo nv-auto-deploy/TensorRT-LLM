@@ -13,10 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import List, Optional
+
 import torch
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.torch_moe import (
+    MOE_MAPPING_ALL_TO_ALL,
+    MOE_MAPPING_CLUSTER_RANK,
+    MOE_MAPPING_CLUSTER_SIZE,
+    MOE_MAPPING_EP_RANK,
+    MOE_MAPPING_EP_SIZE,
+    MOE_MAPPING_MAX_NUM_TOKENS,
+    MOE_MAPPING_TP_RANK,
+    MOE_MAPPING_TP_SIZE,
+    MOE_MAPPING_WORLD_SIZE,
+)
 from tensorrt_llm._torch.auto_deploy.custom_ops.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm._utils import mpi_allgather
+from tensorrt_llm.mapping import Mapping
 
 
 @torch.library.custom_op("auto_deploy::trtllm_moe_fused", mutates_args=())
@@ -28,6 +44,8 @@ def trtllm_moe_fused(
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    # Sharding configuration - see MOE_MAPPING_* constants for layout
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     x_shape = x.shape
     x = x.view(-1, x_shape[-1])
@@ -56,18 +74,174 @@ def trtllm_moe_fused(
                 f"Unsupported activation '{ActivationType(act_fn).name}' for mlp. Use 'relu2'."
             )
 
-    return torch.ops.trtllm.fused_moe(
-        x,
-        selected_experts,
-        routing_weights,
-        fc1_expert_weights=w3_w1_stacked_weight,
-        fc1_expert_biases=None,
-        fc2_expert_weights=w2_stacked_weight,
-        fc2_expert_biases=None,
-        output_dtype=x.dtype,
-        quant_scales=quant_scales,
-        activation_type=activation_type,
-    )[0].view(x_shape)
+    # Extract sharding configuration with safe defaults
+    def _get_config(idx: int, default: int = 1) -> int:
+        return mapping_config[idx] if mapping_config and len(mapping_config) > idx else default
+
+    _world_size = _get_config(MOE_MAPPING_WORLD_SIZE, 1)  # noqa: F841 - kept for debugging
+    moe_tp_size = _get_config(MOE_MAPPING_TP_SIZE, 1)
+    moe_tp_rank = _get_config(MOE_MAPPING_TP_RANK, 0)
+    moe_ep_size = _get_config(MOE_MAPPING_EP_SIZE, 1)
+    moe_ep_rank = _get_config(MOE_MAPPING_EP_RANK, 0)
+    moe_cluster_size = _get_config(MOE_MAPPING_CLUSTER_SIZE, 1)
+    moe_cluster_rank = _get_config(MOE_MAPPING_CLUSTER_RANK, 0)
+    max_num_tokens_config = _get_config(MOE_MAPPING_MAX_NUM_TOKENS, 0)
+    enable_alltoall = _get_config(MOE_MAPPING_ALL_TO_ALL, 0) == 1
+
+    # =================================================================================
+    # MoE ALL-TO-ALL PATH
+    # =================================================================================
+    # When enable_alltoall=True, expert parallelism uses all-to-all communication:
+    #
+    # COORDINATE SYSTEM:
+    #   - Input `selected_experts` are in GLOBAL coordinates (0 to global_num_experts-1)
+    #   - The sharding transform does NOT localize expert IDs when moe_all_to_all=True
+    #   - Expert weights are sharded: each GPU has `local_num_experts = global / ep_size`
+    #
+    # DATA FLOW:
+    #   1. DISPATCH: Route tokens to GPUs based on global expert IDs
+    #      - Token destined for global expert E goes to GPU (E // local_num_experts)
+    #      - Each GPU receives tokens meant for its local experts
+    #   2. LOCALIZE: Convert received expert IDs to local coordinates
+    #      - local_expert_id = global_expert_id - (ep_rank * local_num_experts)
+    #   3. COMPUTE: Run MoE with local expert weights and local expert IDs
+    #   4. COMBINE: Gather results back to original GPUs
+    #
+    # CONTRAST WITH EP + ALL-REDUCE (enable_alltoall=False):
+    #   - Expert IDs are pre-localized by sharding transform
+    #   - Routing weights for remote experts are zeroed out
+    #   - Each GPU computes partial results, all_reduce sums them
+    # =================================================================================
+    if enable_alltoall:
+        top_k = selected_experts.shape[1]
+        hidden_size = x.shape[-1]
+        x_dtype = x.dtype
+
+        # Expert weights are sharded - shape[0] gives LOCAL expert count
+        local_num_experts = w3_w1_stacked_weight.shape[0]
+        global_num_experts = local_num_experts * moe_ep_size
+
+        # Use configured max_num_tokens for workspace allocation
+        # This should be set to max_batch_size * max_seq_len * moe_ep_size in sharding.py
+        # Fallback to runtime calculation if not configured
+        if max_num_tokens_config > 0:
+            max_num_tokens = max_num_tokens_config
+        else:
+            local_tokens = int(x.shape[0])
+            all_rank_tokens = mpi_allgather(local_tokens)
+            if isinstance(all_rank_tokens, list):
+                runtime_max_tokens_per_rank = max(all_rank_tokens)
+            else:
+                runtime_max_tokens_per_rank = local_tokens
+            max_num_tokens = runtime_max_tokens_per_rank * moe_ep_size
+
+        workspace_size = MoeAlltoAll.calculate_required_workspace_size(
+            moe_ep_size, top_k, max_num_tokens, hidden_size, x_dtype
+        )
+
+        # Get runtime tokens per rank for actual dispatch/combine
+        local_tokens = int(x.shape[0])
+        all_rank_tokens = mpi_allgather(local_tokens)
+        if isinstance(all_rank_tokens, list):
+            runtime_max_tokens_per_rank = max(all_rank_tokens)
+        else:
+            runtime_max_tokens_per_rank = local_tokens
+
+        # Build Mapping object for MoeAlltoAll
+        # Note: rank is set to moe_ep_rank (position within EP group)
+        mapping = Mapping(
+            world_size=moe_ep_size,
+            rank=moe_ep_rank,
+            tp_size=moe_ep_size,
+            moe_tp_size=1,
+            moe_ep_size=moe_ep_size,
+            moe_cluster_size=1,
+        )
+        moe_a2a = MoeAlltoAll(
+            mapping=mapping,
+            max_num_tokens=max_num_tokens,
+            top_k=top_k,
+            num_experts=global_num_experts,  # Use GLOBAL expert count for dispatch
+            workspace_size_per_rank=workspace_size,
+        )
+
+        # Validate and clamp expert IDs (using GLOBAL range)
+        invalid_expert_id = global_num_experts
+        invalid_input_mask = (selected_experts < 0) | (selected_experts >= global_num_experts)
+        if invalid_input_mask.any():
+            selected_experts = selected_experts.clamp(0, global_num_experts - 1)
+            routing_weights = routing_weights.masked_fill(invalid_input_mask, 0.0)
+
+        # DISPATCH: Route tokens to correct GPUs based on global expert IDs
+        recv_x, recv_selected, recv_weights = moe_a2a.dispatch(
+            selected_experts,
+            [x.contiguous(), selected_experts.contiguous(), routing_weights.contiguous()],
+            runtime_max_tokens_per_rank,
+            invalid_token_expert_id=invalid_expert_id,
+            expert_id_payload_index=1,
+        )
+
+        dispatched_x = recv_x.reshape(-1, hidden_size)
+        dispatched_selected = recv_selected.reshape(-1, top_k)
+        dispatched_weights = recv_weights.reshape(-1, top_k)
+
+        # Handle invalid/padding tokens from dispatch
+        invalid_mask = (dispatched_selected < 0) | (dispatched_selected >= global_num_experts)
+        if invalid_mask.any():
+            dispatched_weights = dispatched_weights.masked_fill(invalid_mask, 0.0)
+            dispatched_selected = dispatched_selected.clamp(0, global_num_experts - 1)
+
+        # COMPUTE: Pass GLOBAL expert IDs to kernel - it handles localization internally
+        # Note: Manual localization doesn't work because the kernel's output format
+        # depends on ep_size/ep_rank for proper combine operation
+        moe_out = torch.ops.trtllm.fused_moe(
+            dispatched_x,
+            dispatched_selected,  # GLOBAL expert IDs
+            dispatched_weights,
+            fc1_expert_weights=w3_w1_stacked_weight,
+            fc1_expert_biases=None,
+            fc2_expert_weights=w2_stacked_weight,
+            fc2_expert_biases=None,
+            output_dtype=x.dtype,
+            quant_scales=quant_scales,
+            tp_size=moe_tp_size,
+            tp_rank=moe_tp_rank,
+            ep_size=moe_ep_size,
+            ep_rank=moe_ep_rank,
+            cluster_size=moe_cluster_size,
+            cluster_rank=moe_cluster_rank,
+            enable_alltoall=True,
+            tuner_num_tokens=max_num_tokens,
+            tuner_top_k=top_k,
+            activation_type=activation_type,
+            use_deepseek_fp8_block_scale=False,
+            use_w4_group_scaling=False,
+            use_int8_woq_per_channel=False,
+            use_mxfp8_act_scaling=False,
+            min_latency_mode=False,
+            use_fused_finalize=True,
+        )[0]
+
+        # COMBINE: Gather results back to original GPUs
+        moe_out = moe_out.view(moe_ep_size, runtime_max_tokens_per_rank, hidden_size)
+        combined = moe_a2a.combine(moe_out, runtime_max_tokens_per_rank)
+        return combined.view(x_shape)
+
+    else:
+        # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
+        # routing weights for remote experts are zeroed, all_reduce is added after this op
+        return torch.ops.trtllm.fused_moe(
+            x,
+            selected_experts,
+            routing_weights,
+            fc1_expert_weights=w3_w1_stacked_weight,
+            fc1_expert_biases=None,
+            fc2_expert_weights=w2_stacked_weight,
+            fc2_expert_biases=None,
+            output_dtype=x.dtype,
+            quant_scales=quant_scales,
+            activation_type=activation_type,
+        )[0].view(x_shape)
 
 
 @trtllm_moe_fused.register_fake
@@ -79,6 +253,7 @@ def trtllm_moe_fused_fake(
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    mapping_config: List[int] = [],
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
