@@ -1702,24 +1702,32 @@ def _insert_sharded_moe(
     # =====================================================================================
     # COMMON: Update node arguments with sharded weights and mapping_config
     # =====================================================================================
-    default_params = [
-        True,  # is_gated_mlp
-        int(ActivationType.Silu),  # act_fn
-        False,  # apply_routing_on_input
-        mapping_config,  # mapping_config (List[int])
-    ]
+    # Use kwargs for optional parameters to avoid positional/keyword argument conflicts.
+    # The node may already have kwargs from pattern matching (e.g., is_gated_mlp, act_fn).
+    # We preserve existing kwargs and add/update mapping_config.
 
-    target_len = params_start_idx + len(default_params)
-    if len(args) < params_start_idx:
-        args.extend([None] * (params_start_idx - len(args)))
-    if len(args) < target_len:
-        args.extend(default_params[len(args) - params_start_idx :])
-    else:
-        for i, val in enumerate(default_params):
-            if params_start_idx + i < len(args):
-                args[params_start_idx + i] = val
+    # Truncate positional args to only include required parameters (up to scales)
+    # Optional parameters (is_gated_mlp, act_fn, apply_routing_on_input, mapping_config)
+    # should be passed as kwargs only.
+    if len(args) > params_start_idx:
+        args = args[:params_start_idx]
+
+    # Build kwargs: start with existing node kwargs, then add mapping_config
+    new_kwargs = dict(node.kwargs) if node.kwargs else {}
+
+    # Set defaults for optional params if not already present
+    if "is_gated_mlp" not in new_kwargs:
+        new_kwargs["is_gated_mlp"] = True
+    if "act_fn" not in new_kwargs:
+        new_kwargs["act_fn"] = int(ActivationType.Silu)
+    if "apply_routing_on_input" not in new_kwargs:
+        new_kwargs["apply_routing_on_input"] = False
+
+    # Always set mapping_config (our sharding info)
+    new_kwargs["mapping_config"] = mapping_config
 
     node.args = tuple(args)
+    node.kwargs = new_kwargs
 
     ad_logger.debug(f"Sharded MoE node {node.name}: all_to_all={moe_all_to_all}, ep_size={ep_size}")
 

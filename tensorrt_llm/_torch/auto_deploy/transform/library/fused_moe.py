@@ -219,6 +219,7 @@ def _process_moe_node(
             kwargs={
                 "is_gated_mlp": is_gated_mlp,
                 "act_fn": act_fn,
+                "apply_routing_on_input": apply_routing_on_input,
                 "mapping_config": mapping_config,
             },
         )

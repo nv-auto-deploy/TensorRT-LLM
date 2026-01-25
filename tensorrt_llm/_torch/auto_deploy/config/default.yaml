@@ -89,7 +89,7 @@ transforms:
     allreduce_strategy: 'NCCL'
     dist_backend: auto
     requires_shape_prop: true
-    enable_attention_dp: false
+    enable_attention_dp: true
   sharding_transform_executor:
     stage: sharding
     run_shape_prop: true

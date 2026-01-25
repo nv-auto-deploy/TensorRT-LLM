@@ -44,6 +44,7 @@ def trtllm_moe_fused(
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
     # Sharding configuration - see MOE_MAPPING_* constants for layout
     mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
@@ -253,7 +254,8 @@ def trtllm_moe_fused_fake(
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
-    mapping_config: List[int] = [],
+    apply_routing_on_input: bool = False,
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -290,6 +292,9 @@ def trtllm_quant_fp8_moe_fused(
     fc2_dequant_scale: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    # Additional kwargs for consistency with torch_quant_fp8_moe
+    apply_routing_on_input: bool = False,
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass FP8 (W8A8) MoE for gated and non-gated MLP.
 
@@ -380,6 +385,8 @@ def trtllm_quant_fp8_moe_fused_fake(
     fc2_dequant_scale: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
@@ -400,6 +407,9 @@ def trtllm_quant_nvfp4_moe_fused(
     fc2_alpha: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    # Additional kwargs for consistency with torch_quant_nvfp4_moe
+    apply_routing_on_input: bool = False,
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass NVFP4 W8A8 MoE for gated and non-gated MLP.
 
@@ -494,5 +504,7 @@ def trtllm_quant_nvfp4_moe_fused_fake(
     fc2_alpha: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    apply_routing_on_input: bool = False,
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)

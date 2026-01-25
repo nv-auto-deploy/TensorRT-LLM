@@ -178,7 +178,7 @@ def torch_moe_fake(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
-    mapping_config: List[int] = [],
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -377,7 +377,7 @@ def torch_quant_fp8_moe_fake(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
-    mapping_config: List[int] = [],
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -529,7 +529,7 @@ def torch_quant_nvfp4_moe_fake(
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
-    mapping_config: List[int] = [],
+    mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
