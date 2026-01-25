@@ -82,13 +82,13 @@ transforms:
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    sharding_source: ['manual', 'factory', 'heuristic']
+    sharding_source: ['manual', 'factory']
     support_partial_config: true
     sharding_dims: ['TP','EP']
     shard_all_unprocessed: true
     allreduce_strategy: 'NCCL'
     dist_backend: auto
-    run_shape_prop: true
+    requires_shape_prop: true
     enable_attention_dp: false
   sharding_transform_executor:
     stage: sharding
@@ -120,7 +120,6 @@ transforms:
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
-    enabled: false
   fuse_nvfp4_linear:
     stage: post_load_fusion
     backend: trtllm
@@ -141,7 +140,7 @@ transforms:
     stage: post_load_fusion
     rmsnorm_backend: flashinfer
     gated_rmsnorm_backend: triton
-    pre_shape_prop: true
+    requires_shape_prop: true
   fuse_add_rms_norm:
     stage: post_load_fusion
     enabled: true
@@ -155,7 +154,6 @@ transforms:
   visualize_namespace:
     stage: visualize
     enabled: false
-    pre_recompile_forward: true  # calls te.export()
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
@@ -186,7 +184,6 @@ transforms:
     expect_mem_change: true
     run_per_gm: false
     free_mem_ratio: 0.0
-    pre_recompile_forward: true  # calls mod(**args) for memory measurement
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################
@@ -201,4 +198,3 @@ transforms:
     run_per_gm: false
     cuda_graph_batch_sizes: null
     backend: torch-compile
-    pre_recompile_forward: true  # compilation needs forward
