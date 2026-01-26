@@ -81,10 +81,12 @@ def _triton_ssm_prepare_metadata_fake(
     chunk_size: int,
 ):
     b, s = position_ids.shape[:2]
-    num_tokens = b * s
+    num_tokens = b
+    if s:
+        num_tokens = b * s
     device = cu_seqlen.device
     dtype = torch.int32
-    if s > 1:
+    if s and s > 1:
         # NOTE: this is only an upper bound for the shape in this case...
         return (
             torch.empty(num_tokens, dtype=dtype, device=device),  # chunk_indices
@@ -97,6 +99,19 @@ def _triton_ssm_prepare_metadata_fake(
             torch.empty(0, dtype=dtype, device=device),  # chunk_offsets
             torch.empty(1, 0, dtype=dtype, device=device),  # seq_idx_prefill
         )
+
+    # device = cu_seqlen.device
+    # dtype = torch.int32
+    # # Output sizes are data-dependent (depend on batch_info_host content at runtime).
+    # # Use unbacked symints to represent these truly dynamic sizes.
+    # ctx = torch.library.get_ctx()
+    # num_chunks = ctx.new_dynamic_size()  # size for chunk_indices and chunk_offsets
+    # num_prefill_tokens = ctx.new_dynamic_size()  # size for seq_idx_prefill dim 1
+    # return (
+    #     torch.empty(num_chunks, dtype=dtype, device=device),  # chunk_indices
+    #     torch.empty(num_chunks, dtype=dtype, device=device),  # chunk_offsets
+    #     torch.empty(1, num_prefill_tokens, dtype=dtype, device=device),  # seq_idx_prefill
+    # )
 
 
 @torch.library.custom_op("auto_deploy::triton_cached_ssm", mutates_args={})

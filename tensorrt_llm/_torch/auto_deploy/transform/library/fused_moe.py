@@ -14,6 +14,7 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code, get_attr_by_name
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
+from ...utils.logger import ad_logger
 from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
 from ..interface import (
@@ -1674,23 +1675,32 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
             return torch.empty(0, device=device, dtype=dtype)
 
     def _prepare_args_cutlass_format_nvfp4():
+        if not torch.all(w1_input_scale_stacked[0] == w1_input_scale_stacked):
+            ad_logger.warning(
+                "All w1 scales should have the same value."
+            )  # {w1_input_scale_stacked[0]} != {w1_input_scale_stacked}")
+        if not torch.all(w2_input_scale_stacked[0] == w2_input_scale_stacked):
+            ad_logger.warning(
+                "All w2 scales should have the same value."
+            )  # {w2_input_scale_stacked[0]} != {w2_input_scale_stacked}")
+
         if is_gated_mlp:
             # For gated MLP, concatenate w1 and w3 as [w3, w1]
             fc1_expert_weights = torch.cat([w3_stacked, w1_stacked], dim=1).contiguous()
             # Expect w3 input scale and alpha to be the same as w1
-            fc1_act_scale = w1_input_scale_stacked
+            fc1_act_scale = w1_input_scale_stacked.max(dim=0).values
             fc1_alpha_stacked = w1_alpha_stacked
             fc1_weight_blockscale_fp8_stacked = torch.cat(
                 [w3_weight_blockscale_fp8_stacked, w1_weight_blockscale_fp8_stacked], dim=1
             ).contiguous()
         else:
             fc1_expert_weights = w1_stacked
-            fc1_act_scale = w1_input_scale_stacked
+            fc1_act_scale = w1_input_scale_stacked.max(dim=0).values
             fc1_alpha_stacked = w1_alpha_stacked
             fc1_weight_blockscale_fp8_stacked = w1_weight_blockscale_fp8_stacked
 
         fc2_expert_weights = w2_stacked
-        fc2_act_scale = w2_input_scale_stacked
+        fc2_act_scale = w2_input_scale_stacked.max(dim=0).values
         fc2_weight_blockscale_fp8_stacked = w2_weight_blockscale_fp8_stacked
 
         new_key_fc1_expert_weights = f"nvfp4_moe_w3_w1_stacked_{fused_key_counter}"
