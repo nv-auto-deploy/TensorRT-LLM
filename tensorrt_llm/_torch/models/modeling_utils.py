@@ -569,6 +569,7 @@ class DecoderModelForCausalLM(nn.Module,
         # the old checkpoint format loading process. Once checkpoint format is unified
         # this method will be removed.
         preload_weight_modules = getattr(self, "preload_weight_modules", None)
+        start_time = time.time()
         if weight_mapper is None:
             _load_weights_impl(self,
                                weights,
@@ -584,6 +585,10 @@ class DecoderModelForCausalLM(nn.Module,
                                   params_map=params_map,
                                   preload_weight_modules=preload_weight_modules,
                                   allow_partial_loading=allow_partial_loading)
+        end_time = time.time()
+        logger.info(
+            f"taylor Loading weights to GPU: {end_time - start_time:.2f} seconds"
+        )
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
@@ -802,7 +807,6 @@ def run_concurrently(func,
     """
     from concurrent import futures
     with futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        # Submit all tasks
         future_to_result = {
             executor.submit(func, *arg): arg
             for arg in args_list
@@ -936,11 +940,13 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:
+        print("taylor) Loading weight serially!!!!!")
         for name, module in tqdm(list(
                 model.named_modules(remove_duplicate=False)),
-                                 desc="Loading weights"):
+                                 desc="Loading weights serially"):
             load_single_module(name, module)
     else:
+        print("taylor) Loading weight in parallel!!!!!")
         # remove_duplicate=False ensures original modules sharing weights with next_layer_layernorm are not skipped
         all_modules = dict(model.named_modules(remove_duplicate=False))
         serial_load_modules = []
@@ -1041,11 +1047,17 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:
+        start_time = time.time()
         for name, module in tqdm(list(
                 model.named_modules(remove_duplicate=False)),
                                  desc="Loading weights"):
             load_single_module(name, module)
+        end_time = time.time()
+        print(
+            f"rank {local_mpi_rank()} taylor Loading weight (cpu to gpu) serially time: {end_time - start_time:.2f} seconds"
+        )
     else:
+        print("taylor) Loading weight (cpu to gpu)in parallel!!!!!")
         # remove_duplicate=False ensures original modules sharing weights with next_layer_layernorm are not skipped
         all_modules = dict(model.named_modules(remove_duplicate=False))
         serial_load_modules = []

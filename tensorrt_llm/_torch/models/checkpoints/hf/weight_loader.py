@@ -1,6 +1,7 @@
 import glob
 import multiprocessing
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List
 
@@ -8,7 +9,6 @@ import psutil
 import safetensors
 import torch
 import tqdm
-import time
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     BaseWeightLoader
@@ -47,6 +47,7 @@ class HfWeightLoader(BaseWeightLoader):
             num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
             enable_prefetch = prefetch_size < psutil.virtual_memory(
             ).available * 0.9 and num_layers == 0
+            #enable_prefetch = False
             start_time = time.time()
             if enable_prefetch:
                 logger.info(
@@ -56,7 +57,9 @@ class HfWeightLoader(BaseWeightLoader):
                 # Ensure that all local ranks have finished prefetching before loading weights
                 local_mpi_barrier()
             end_time = time.time()
-            logger.info(f"taylor Prefetching time: {end_time - start_time:.2f} seconds")
+            print(
+                f"rank {local_mpi_rank()} taylor Prefetching time: {end_time - start_time:.2f} seconds"
+            )
             return self._load_weights_in_parallel(
                 weight_files, self._load_safetensors_file,
                 "Loading safetensors weights in parallel")
@@ -95,7 +98,9 @@ class HfWeightLoader(BaseWeightLoader):
                          reduce_func=weights.update,
                          pbar=pbar)
         end_time = time.time()
-        logger.info(f"taylor Loading weights in parallel time: {end_time - start_time:.2f} seconds")
+        print(
+            f"rank {local_mpi_rank()} taylor Loading weights to cpu in parallel time: {end_time - start_time:.2f} seconds"
+        )
         return weights
 
     @staticmethod
