@@ -81,6 +81,11 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
             backendType = executor::CacheTransceiverConfig::BackendType::NIXL;
             TLLM_LOG_INFO("Enable NIXL KV cache transport.");
         }
+        else if (common::getEnvUseMooncakeKvCache())
+        {
+            backendType = executor::CacheTransceiverConfig::BackendType::MOONCAKE;
+            TLLM_LOG_INFO("Enable MOONCAKE KV cache transport.");
+        }
         else if (common::getEnvUseMPIKvCache())
         {
             backendType = executor::CacheTransceiverConfig::BackendType::MPI;
@@ -203,8 +208,14 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL)
     {
         mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManagerPtrs, *mCacheState);
+            mCacheTransBufferManagerPtrs, *mCacheState, "nixl");
         TLLM_LOG_INFO("NIXL Connection Manager created");
+    }
+    else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE)
+    {
+        mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
+            mCacheTransBufferManagerPtrs, *mCacheState, "mooncake");
+        TLLM_LOG_INFO("MOONCAKE Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
     {
@@ -416,7 +427,8 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
     }
 }
 
-void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum)
+RequestStatuses CacheTransceiver::checkContextTransferStatus(
+    std::optional<int> const& atLeastRequestNum, bool markComplete)
 {
     bool blockAll = !atLeastRequestNum.has_value();
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
@@ -475,6 +487,8 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
         toCompleteIdSet.insert(request->mRequestId);
     }
 
+    RequestStatuses requestsStatus{};
+
     // Complete all the requests in toCompleteIdSet
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
@@ -488,7 +502,11 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
                 if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
                 {
                     future.get();
-                    request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+                    requestsStatus.completedRequestIds.insert(request->mRequestId);
+                    if (markComplete)
+                    {
+                        request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+                    }
                     it = mSenderFutures.erase(it);
                 }
                 else if (status == std::future_status::timeout)
@@ -503,6 +521,7 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
                         "Future returned unexpected status for request %ld. Marking as error", request->mRequestId);
 
                     request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    requestsStatus.errorRequestIds.insert(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
             }
@@ -511,6 +530,7 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
                 TLLM_LOG_ERROR(
                     "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                requestsStatus.errorRequestIds.insert(request->mRequestId);
                 it = mSenderFutures.erase(it);
             }
         }
@@ -519,6 +539,8 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
             ++it;
         }
     }
+
+    return requestsStatus;
 }
 
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)

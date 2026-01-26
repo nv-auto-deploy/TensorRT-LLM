@@ -12,10 +12,20 @@ from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
 from openai.types.chat import \
     ChatCompletionMessageParam as OpenAIChatCompletionMessageParam
-from openai.types.responses import (ResponseFunctionToolCall,
-                                    ResponseInputItemParam, ResponseOutputItem,
-                                    ResponsePrompt, ResponseReasoningItem,
-                                    ResponseStatus, ResponseTextConfig)
+from openai.types.responses import (
+    ResponseCodeInterpreterCallCodeDeltaEvent,
+    ResponseCodeInterpreterCallCodeDoneEvent,
+    ResponseCodeInterpreterCallCompletedEvent,
+    ResponseCodeInterpreterCallInProgressEvent,
+    ResponseCodeInterpreterCallInterpretingEvent, ResponseCompletedEvent,
+    ResponseContentPartAddedEvent, ResponseContentPartDoneEvent,
+    ResponseCreatedEvent, ResponseFormatTextConfig, ResponseFunctionToolCall,
+    ResponseInProgressEvent, ResponseInputItemParam, ResponseOutputItem,
+    ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponsePrompt,
+    ResponseReasoningItem, ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent, ResponseStatus, ResponseTextConfig,
+    ResponseWebSearchCallCompletedEvent, ResponseWebSearchCallInProgressEvent,
+    ResponseWebSearchCallSearchingEvent)
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
@@ -27,6 +37,7 @@ from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 
 
 def _logit_bias_to_embedding_bias(logit_bias: Optional[Dict[str, float]],
@@ -107,6 +118,7 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_request_id: Optional[int] = None
     encoded_opaque_state: Optional[str] = None
     draft_tokens: Optional[List[int]] = None
+    disagg_request_id: Optional[int] = None
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -181,36 +193,122 @@ class CompletionStreamResponse(OpenAIBaseModel):
 
 
 def _response_format_to_guided_decoding_params(
-    response_format: Optional[ResponseFormat]
+    response_format: Optional[ResponseFormat],
+    reasoning_parser: Optional[str] = None,
 ) -> Optional[GuidedDecodingParams]:
     if response_format is None:
-        return None
+        guided_decoding_params = None
     elif response_format.type == "text":
-        return None
+        guided_decoding_params = None
     elif response_format.type == "json":
         if response_format.schema is None:
             raise ValueError(
-                "The 'schema' field is required when response_format.type is 'json'."
+                f"response_format.schema is required for response_format.type == {response_format.type!r}, but got None."
             )
-        return GuidedDecodingParams(json=response_format.schema)
+        guided_decoding_params = GuidedDecodingParams(
+            json=response_format.schema)
     elif response_format.type == "json_schema":
         if response_format.json_schema is None:
             raise ValueError(
-                "The 'json_schema' field is required when response_format.type is 'json_schema'."
+                f"response_format.json_schema is required for response_format.type == {response_format.type!r}, but got None."
             )
-        return GuidedDecodingParams(json=response_format.json_schema)
+        guided_decoding_params = GuidedDecodingParams(
+            json=response_format.json_schema)
     elif response_format.type == "json_object":
-        return GuidedDecodingParams(json_object=True)
+        guided_decoding_params = GuidedDecodingParams(json_object=True)
     elif response_format.type == "regex":
-        return GuidedDecodingParams(regex=response_format.regex)
+        if response_format.regex is None:
+            raise ValueError(
+                f"response_format.regex is required for response_format.type == {response_format.type!r}, but got None."
+            )
+        guided_decoding_params = GuidedDecodingParams(
+            regex=response_format.regex)
     elif response_format.type == "ebnf":
-        return GuidedDecodingParams(grammar=response_format.ebnf)
+        if response_format.ebnf is None:
+            raise ValueError(
+                f"response_format.ebnf is required for response_format.type == {response_format.type!r}, but got None."
+            )
+        guided_decoding_params = GuidedDecodingParams(
+            grammar=response_format.ebnf)
     elif response_format.type == "structural_tag":
-        return GuidedDecodingParams(
+        guided_decoding_params = GuidedDecodingParams(
             structural_tag=response_format.model_dump_json(by_alias=True,
                                                            exclude_none=True))
     else:
         raise ValueError(f"Unsupported response format: {response_format.type}")
+
+    if guided_decoding_params is None or reasoning_parser is None:
+        return guided_decoding_params
+
+    if guided_decoding_params.structural_tag is not None:
+        return guided_decoding_params
+
+    # Adapt guided_decoding_params for reasoning parser
+    if guided_decoding_params.json is not None:
+        content = {
+            "type": "json_schema",
+            "json_schema": guided_decoding_params.json
+        }
+    elif guided_decoding_params.json_object:
+        content = {"type": "json_schema", "json_schema": {"type": "object"}}
+    elif guided_decoding_params.regex is not None:
+        content = {"type": "regex", "pattern": guided_decoding_params.regex}
+    elif guided_decoding_params.grammar is not None:
+        content = {"type": "grammar", "grammar": guided_decoding_params.grammar}
+
+    if reasoning_parser == "gpt_oss":
+        # Trigger user constraint by final channel
+        stag_format = {
+            "type":
+            "triggered_tags",
+            "triggers": ["<|start|>assistant<|channel|>final<|message|>"],
+            "tags": [
+                {
+                    "begin": "<|start|>assistant<|channel|>final<|message|>",
+                    "content": content,
+                    "end": "",
+                },
+            ],
+            "stop_after_first":
+            True,
+        }
+    else:
+        # Force thinking and then trigger user constraint
+        parser = ReasoningParserFactory.create_reasoning_parser(
+            reasoning_parser)
+        stag_format = {
+            "type":
+            "sequence",
+            "elements": [
+                {
+                    "type": "tag",
+                    "begin": parser.reasoning_start,
+                    "content": {
+                        "type": "any_text"
+                    },
+                    "end": parser.reasoning_end,
+                },
+                content,
+            ],
+        }
+
+    stag_format = ResponseFormat(type="structural_tag", format=stag_format)
+    return GuidedDecodingParams(structural_tag=stag_format.model_dump_json(
+        by_alias=True, exclude_none=True))
+
+
+def _response_format_text_config_to_guided_decoding_params(
+    text_format: Optional[ResponseFormatTextConfig],
+    reasoning_parser: Optional[str] = None,
+) -> Optional[GuidedDecodingParams]:
+    if text_format is None:
+        return None
+
+    resp_format = ResponseFormat(type=text_format.type,
+                                 json_schema=getattr(text_format, "schema_",
+                                                     None))
+    return _response_format_to_guided_decoding_params(
+        resp_format, reasoning_parser=reasoning_parser)
 
 
 class CompletionRequest(OpenAIBaseModel):
@@ -278,7 +376,10 @@ class CompletionRequest(OpenAIBaseModel):
 
     # doc: end-completion-extra-params
 
-    def to_sampling_params(self, vocab_size: int = 32000) -> SamplingParams:
+    def to_sampling_params(self,
+                           vocab_size: int = 32000,
+                           gather_generation_logits: bool = False,
+                           backend: Optional[str] = None) -> SamplingParams:
         sampling_params = SamplingParams(
             best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
@@ -318,17 +419,26 @@ class CompletionRequest(OpenAIBaseModel):
 
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
-
-            # TODO: migrate to use logprobs and prompt_logprobs
-            _return_log_probs=bool(self.logprobs),
         )
+        if self.logprobs:
+            if backend == "pytorch":
+                sampling_params.logprobs = self.logprobs
+            else:
+                if gather_generation_logits:
+                    sampling_params.logprobs = self.logprobs
+                elif self.logprobs > 1:
+                    raise ValueError(
+                        "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
+                    )
+                else:
+                    sampling_params._return_log_probs = True
         return sampling_params
 
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if data.get("logprobs"):
-            raise ValueError("logprobs is not supported")
+        if (logprobs := data.get("logprobs")) is not None and logprobs < 0:
+            raise ValueError("logprobs must be positive or zero")
         return data
 
     @model_validator(mode="before")
@@ -366,7 +476,7 @@ class ToolCall(OpenAIBaseModel):
 
 class DeltaToolCall(OpenAIBaseModel):
     id: Optional[str] = None
-    type: Optional[Literal["function"]] = None
+    type: Literal["function"] = "function"
     index: int
     function: Optional[DeltaFunctionCall] = None
 
@@ -627,6 +737,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def to_sampling_params(self,
                            vocab_size: int = 32000,
                            gather_generation_logits: bool = False,
+                           reasoning_parser: Optional[str] = None,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
@@ -657,7 +768,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             guided_decoding=_response_format_to_guided_decoding_params(
-                self.response_format),
+                self.response_format, reasoning_parser=reasoning_parser),
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -786,13 +897,12 @@ class ResponsesRequest(OpenAIBaseModel):
 
     def to_sampling_params(
         self,
-        default_max_tokens: int,
         default_sampling_params: Optional[dict] = None,
+        reasoning_parser: Optional[str] = None,
     ) -> SamplingParams:
-        if self.max_output_tokens is None:
-            max_tokens = default_max_tokens
-        else:
-            max_tokens = min(self.max_output_tokens, default_max_tokens)
+        max_tokens = None
+        if self.max_output_tokens is not None:
+            max_tokens = self.max_output_tokens
 
         default_sampling_params = default_sampling_params or {}
         if (temperature := self.temperature) is None:
@@ -801,17 +911,13 @@ class ResponsesRequest(OpenAIBaseModel):
         if (top_p := self.top_p) is None:
             top_p = default_sampling_params.get(
                 "top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
-        stop_token_ids = default_sampling_params.get("stop_token_ids")
+        stop_token_ids = default_sampling_params.get("stop_token_ids", None)
 
         # Structured output
         guided_decoding = None
         if self.text is not None and self.text.format is not None:
-            response_format = self.text.format
-            if response_format.type == "json_schema":
-                guided_decoding = GuidedDecodingParams(
-                    json=response_format.schema_)
-            elif response_format.type == "json_object":
-                raise NotImplementedError("json_object is not supported")
+            guided_decoding = _response_format_text_config_to_guided_decoding_params(
+                self.text.format, reasoning_parser=reasoning_parser)
 
         return SamplingParams(
             temperature=temperature,
@@ -855,6 +961,27 @@ class ResponseUsage(OpenAIBaseModel):
     total_tokens: int
 
 
+StreamingResponsesResponse: TypeAlias = Union[
+    ResponseCreatedEvent,
+    ResponseInProgressEvent,
+    ResponseCompletedEvent,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent,
+    ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent,
+    ResponseCodeInterpreterCallInProgressEvent,
+    ResponseCodeInterpreterCallCodeDeltaEvent,
+    ResponseWebSearchCallInProgressEvent,
+    ResponseWebSearchCallSearchingEvent,
+    ResponseWebSearchCallCompletedEvent,
+    ResponseCodeInterpreterCallCodeDoneEvent,
+    ResponseCodeInterpreterCallInterpretingEvent,
+    ResponseCodeInterpreterCallCompletedEvent,
+]
+
+
 class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{str(uuid.uuid4().hex)}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
@@ -871,7 +998,7 @@ class ResponsesResponse(OpenAIBaseModel):
     tools: list[Tool]
     top_p: float
     background: bool
-    max_output_tokens: int
+    max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
     previous_response_id: Optional[str] = None
     prompt: Optional[ResponsePrompt] = None
@@ -931,6 +1058,16 @@ class ResponsesStreamResponse(OpenAIBaseModel):
                   "response.incomplete"]
 
 
+class MemoryUpdateRequest(OpenAIBaseModel):
+    tags: List[str] = Field(default=["model", "kv_cache"])
+
+
+class UpdateWeightsRequest(OpenAIBaseModel):
+    weights: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Weight handles dict, or None to finalize update")
+
+
 def encode_opaque_state(opaque_state: Optional[bytes]) -> Optional[str]:
     if opaque_state is None:
         return None
@@ -953,7 +1090,8 @@ def to_disaggregated_params(
         ctx_request_id=tllm_disagg_params.ctx_request_id,
         encoded_opaque_state=encode_opaque_state(
             tllm_disagg_params.opaque_state),
-        draft_tokens=tllm_disagg_params.draft_tokens)
+        draft_tokens=tllm_disagg_params.draft_tokens,
+        disagg_request_id=tllm_disagg_params.disagg_request_id)
 
 
 def to_llm_disaggregated_params(
@@ -966,4 +1104,9 @@ def to_llm_disaggregated_params(
         ctx_request_id=disaggregated_params.ctx_request_id,
         opaque_state=decode_opaque_state(
             disaggregated_params.encoded_opaque_state),
-        draft_tokens=disaggregated_params.draft_tokens)
+        draft_tokens=disaggregated_params.draft_tokens,
+        disagg_request_id=disaggregated_params.disagg_request_id)
+
+
+UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
+UCompletionResponse = Union[CompletionResponse, ChatCompletionResponse]

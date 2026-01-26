@@ -1,11 +1,16 @@
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Any, List, Literal, Optional, Tuple, Union
+
+from tensorrt_llm.serve.responses_utils import ResponsesStreamingProcessor
+from tensorrt_llm.serve.responses_utils import \
+    create_response_non_store as responses_api_create_response_non_store
 
 from .._utils import nvtx_range_debug
 from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
                         GenerationResultBase)
 from ..executor.postproc_worker import PostprocArgs
 from ..executor.result import Logprob, TokenLogprobs
+from ..llmapi import SamplingParams
 from ..llmapi.reasoning_parser import (BaseReasoningParser,
                                        ReasoningParserFactory)
 from ..llmapi.tokenizer import TransformersTokenizer
@@ -21,12 +26,13 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               ChatCompletionResponseStreamChoice,
                               ChatCompletionStreamResponse,
                               ChatCompletionToolsParam, ChatMessage,
-                              CompletionRequest, CompletionResponse,
-                              CompletionResponseChoice,
+                              CompletionLogProbs, CompletionRequest,
+                              CompletionResponse, CompletionResponseChoice,
                               CompletionResponseStreamChoice,
                               CompletionStreamResponse, DeltaFunctionCall,
                               DeltaMessage, DeltaToolCall, FunctionCall,
-                              PromptTokensDetails, StreamOptions, ToolCall,
+                              PromptTokensDetails, ResponsesRequest,
+                              ResponsesResponse, StreamOptions, ToolCall,
                               UsageInfo, to_disaggregated_params)
 from .tool_parser.base_tool_parser import BaseToolParser
 from .tool_parser.core_types import ToolCallItem
@@ -54,6 +60,8 @@ class ChatPostprocArgs(PostprocArgs):
         default_factory=dict)
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
     has_tool_call: dict[int, bool] = field(default_factory=dict)
+    tool_call_id_type: str = "random"
+    chat_template_kwargs: Optional[dict[str, Any]] = None
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -68,6 +76,7 @@ class ChatPostprocArgs(PostprocArgs):
             stream_options=request.stream_options,
             return_logprobs=bool(request.logprobs),
             top_logprobs=bool(request.top_logprobs),
+            chat_template_kwargs=request.chat_template_kwargs,
         )
 
 
@@ -107,9 +116,10 @@ def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
     reasoning_parser = None
     if args.reasoning_parser is not None:
         if output_index not in args.reasoning_parser_dict:
+            chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
             args.reasoning_parser_dict[
                 output_index] = ReasoningParserFactory.create_reasoning_parser(
-                    args.reasoning_parser)
+                    args.reasoning_parser, chat_template_kwargs)
         reasoning_parser = args.reasoning_parser_dict[output_index]
 
     if reasoning_parser is not None:
@@ -223,7 +233,10 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 # Tool call ID should be generated only once per tool call
                 if call_item.name:
                     # First chunk: include ID and function name
-                    tool_call_id = make_tool_call_id()
+                    tool_call_id = make_tool_call_id(
+                        id_type=args.tool_call_id_type,
+                        func_name=call_item.name,
+                        idx=call_item.tool_index)
                     function_name = call_item.name
                 else:
                     # Subsequent chunks: null ID and name for argument deltas
@@ -381,6 +394,7 @@ class CompletionPostprocArgs(PostprocArgs):
     prompt_idx: int = 0
     detokenize: bool = True
     prompt: Optional[str] = None
+    return_logprobs: bool = False
     stream_options: Optional[StreamOptions] = None
 
     @classmethod
@@ -391,7 +405,41 @@ class CompletionPostprocArgs(PostprocArgs):
             num_choices=request.n if request.n else 1,
             stream_options=request.stream_options,
             detokenize=request.detokenize,
+            return_logprobs=bool(request.logprobs),
         )
+
+
+def create_completion_logprobs(token_ids: List[int],
+                               tokenizer: TransformersTokenizer,
+                               logprobs: List[float] | TokenLogprobs,
+                               initial_offset: int = 0) -> CompletionLogProbs:
+    assert len(token_ids) == len(logprobs), \
+            "token_ids and logprobs have different lengths"
+    text_offset = []
+    token_logprobs = []
+    top_logprobs_list = []
+    tokens = []
+    for token_id, logprob in zip(token_ids, logprobs):
+        if isinstance(logprob, dict):
+            token_logprobs.append(max(logprob[token_id].logprob, -9999.0))
+            top_logprobs_list.append({
+                tokenizer.decode(tid):
+                max(lp.logprob, -9999.0)
+                for tid, lp in logprob.items()
+            })
+        else:
+            token_logprobs.append(max(logprob, -9999.0))
+
+        token = tokenizer.decode(token_id)
+        if len(text_offset) == 0:
+            text_offset.append(initial_offset)
+        else:
+            text_offset.append(text_offset[-1] + len(token))
+        tokens.append(token)
+    return CompletionLogProbs(text_offset=text_offset,
+                              token_logprobs=token_logprobs,
+                              tokens=tokens,
+                              top_logprobs=top_logprobs_list)
 
 
 @nvtx_range_debug("completion_stream_post_processor")
@@ -420,6 +468,12 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
         )
+        if args.return_logprobs:
+            logprobs = output.logprobs_diff
+            token_ids = output.token_ids_diff
+            choice.logprobs = create_completion_logprobs(
+                token_ids, args.tokenizer, logprobs, output._last_text_len)
+
         chunk = CompletionStreamResponse(model=args.model, choices=[choice])
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
@@ -475,6 +529,11 @@ def completion_response_post_processor(
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
         )
+        if args.return_logprobs:
+            logprobs = output.logprobs
+            token_ids = output.token_ids
+            choice.logprobs = create_completion_logprobs(
+                token_ids, args.tokenizer, logprobs)
 
         completion_tokens += output.length
         choices.append(choice)
@@ -497,6 +556,7 @@ class ChatCompletionPostprocArgs(PostprocArgs):
     tool_choice: Optional[Union[Literal["none", "auto"],
                                 ChatCompletionNamedToolChoiceParam]]
     request_id: Optional[int] = None
+    chat_template_kwargs: Optional[dict[str, Any]] = None
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -504,6 +564,7 @@ class ChatCompletionPostprocArgs(PostprocArgs):
             model=request.model,
             tools=request.tools,
             tool_choice=request.tool_choice,
+            chat_template_kwargs=request.chat_template_kwargs,
         )
 
 
@@ -534,3 +595,42 @@ def chat_harmony_streaming_post_processor(
         num_prompt_tokens=args.num_prompt_tokens,
     )
     return response
+
+
+@dataclass(kw_only=True)
+class ResponsesAPIPostprocArgs(PostprocArgs):
+    model: str
+    request: ResponsesRequest
+    sampling_params: SamplingParams
+    use_harmony: bool
+    reasoning_parser: Optional[str] = None
+    tool_parser: Optional[str] = None
+    streaming_processor: Optional[ResponsesStreamingProcessor] = None
+
+
+@nvtx_range_debug("responses_api_post_processor")
+def responses_api_post_processor(
+        rsp: GenerationResult,
+        args: ResponsesAPIPostprocArgs) -> ResponsesResponse:
+    return responses_api_create_response_non_store(
+        generation_result=rsp,
+        request=args.request,
+        sampling_params=args.sampling_params,
+        model_name=args.model,
+        use_harmony=args.use_harmony,
+        reasoning_parser=args.reasoning_parser,
+        tool_parser=args.tool_parser,
+    )
+
+
+@nvtx_range_debug("responses_api_streaming_post_processor")
+def responses_api_streaming_post_processor(
+        rsp: GenerationResult, args: ResponsesAPIPostprocArgs) -> List[str]:
+    if args.streaming_processor is None:
+        raise ValueError(
+            "streaming_processor is required for streaming post-processing")
+    outputs = args.streaming_processor.process_single_output(rsp)
+    if rsp._done:
+        outputs.append(
+            args.streaming_processor.get_final_response_non_store(rsp))
+    return outputs

@@ -1,3 +1,4 @@
+import json
 import random
 import time
 from contextlib import contextmanager, nullcontext
@@ -7,7 +8,7 @@ import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
-from tensorrt_llm.executor import GenerationExecutorWorker
+from tensorrt_llm.executor import GenerationExecutorWorker, RequestError
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig, PeftCacheConfig
@@ -19,7 +20,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 from .lora_test_utils import (
     check_llama_7b_multi_lora_from_request_test_harness,
     check_llama_7b_multi_unique_lora_adapters_from_request,
-    create_mock_nemo_lora_checkpoint)
+    create_mock_nemo_lora_checkpoint, compare_cuda_graph_lora_params_filler,
+    CUDAGraphLoRATestParams, test_lora_with_and_without_cuda_graph)
 from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
@@ -41,12 +43,14 @@ import torch
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from dataclasses import replace
 
 # isort: on
 
 
 @force_ampere
 @pytest.mark.parametrize("enable_chunked_prefill,", [False, True])
+@pytest.mark.part2
 def test_tinyllama_logits_processor(enable_chunked_prefill):
     tinyllama_logits_processor_test_harness(
         backend="pytorch", enable_chunked_prefill=enable_chunked_prefill)
@@ -61,6 +65,7 @@ def test_tinyllama_logits_processor(enable_chunked_prefill):
         (False, True, False, True),
         (False, True, True, True),
     ])
+@pytest.mark.part0
 def test_llm_get_stats(return_context_logits, use_overlap,
                        enable_chunked_prefill, enable_iter_req_stats):
     llm_get_stats_test_harness(tp_size=1,
@@ -81,6 +86,7 @@ def test_llm_get_stats(return_context_logits, use_overlap,
         (False, True, False, True),
         (False, True, True, True),
     ])
+@pytest.mark.part1
 def test_llm_get_stats_async(return_context_logits, use_overlap,
                              enable_chunked_prefill, enable_iter_req_stats):
     llm_get_stats_async_test_harness(
@@ -93,6 +99,7 @@ def test_llm_get_stats_async(return_context_logits, use_overlap,
         enable_iter_req_stats=enable_iter_req_stats)
 
 
+@pytest.mark.part1
 def test_llm_capture_request_error():
     _test_llm_capture_request_error(pytorch_backend=True, tp_size=1)
 
@@ -104,6 +111,7 @@ def test_llm_capture_request_error():
     [
         SamplingParams()  # pytorch only supports n=1
     ])
+@pytest.mark.part0
 def test_llm_abort_request(sampling_params):
     llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
@@ -117,6 +125,7 @@ def _validate_invalid_token_error_scope():
 
 
 @force_ampere
+@pytest.mark.part1
 def test_llm_invalid_input_token():
     llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
     prompts = [
@@ -135,6 +144,7 @@ def test_llm_invalid_input_token():
 
 
 @force_ampere
+@pytest.mark.part0
 def test_llm_invalid_input_token_async():
     llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
     # NB: exc_info in _validate_invalid_token_error_scope creates a reference
@@ -166,6 +176,7 @@ def test_llm_invalid_input_token_async():
                         futures[collect_idx].result()
 
 
+@pytest.mark.part2
 def test_llm_reward_model():
     rm_model_path = get_model_path("Qwen2.5-Math-PRM-7B")
     tokenizer = TransformersTokenizer.from_pretrained(rm_model_path)
@@ -187,6 +198,7 @@ def test_llm_reward_model():
 
 
 @skip_ray
+@pytest.mark.part3
 def test_llm_perf_metrics():
     with LLM(model=llama_model_path,
              kv_cache_config=global_kvcache_config) as llm:
@@ -215,6 +227,7 @@ def test_llm_perf_metrics():
 
 
 @skip_ray
+@pytest.mark.part3
 def test_llm_prometheus():
     test_prompts = [
         "Hello, my name is",
@@ -238,6 +251,7 @@ def test_llm_prometheus():
 
 @skip_ray
 @pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.part3
 def test_llm_with_postprocess_parallel_and_result_handler(streaming):
     run_llm_with_postprocess_parallel_and_result_handler(streaming,
                                                          "pytorch",
@@ -271,19 +285,76 @@ def test_embedding_bias_with_torch_sampler_strategies():
     )
 
 
+def test_lora_cuda_graph_params_filling_kernel_special_cases():
+    torch.cuda.set_device(0)
+
+    # test all requests have the same LoRA id case
+    test_params = CUDAGraphLoRATestParams(
+        batch_slot_ids=[0] * 10,
+        input_hidden_size=4096,
+        slot_ranks=[64] * 10,
+        max_lora_rank=64,
+        output_hidden_sizes=[123],
+        layer_module_mask=None,
+        dtype=torch.bfloat16,
+        seed=42,
+    )
+    compare_cuda_graph_lora_params_filler(test_params)
+
+    # test no LoRA in a batch case
+    test_params2 = replace(test_params,
+                           batch_slot_ids=[len(test_params.slot_ranks)] * 10)
+    compare_cuda_graph_lora_params_filler(test_params2)
+
+    # test all having three modules case
+    test_params3 = replace(test_params, output_hidden_sizes=[123, 456, 789])
+    compare_cuda_graph_lora_params_filler(test_params3)
+
+    # test some layer module have invalid weight pointers case
+    mask = torch.full((test_params3.module_count, test_params3.slot_count),
+                      True,
+                      dtype=torch.bool)
+    mask[0, 0] = False
+    mask[1, 7] = False
+    mask[2, 3] = False
+    test_params4 = replace(test_params3, layer_module_mask=mask)
+    compare_cuda_graph_lora_params_filler(test_params4)
+
+    # test mixed slot ids case
+    test_params5 = CUDAGraphLoRATestParams(
+        batch_slot_ids=[6, 2, 0, 1, 1, 1, 5, 6],
+        input_hidden_size=512,
+        slot_ranks=[8, 12, 4] * 2,
+        max_lora_rank=15,
+        output_hidden_sizes=[123, 456, 789],
+        layer_module_mask=None,
+        dtype=torch.bfloat16,
+        seed=42,
+    )
+    compare_cuda_graph_lora_params_filler(test_params5)
+
+    # test mixed slot with invalid weight pointers
+    mask = torch.full((test_params5.module_count, test_params5.slot_count),
+                      True,
+                      dtype=torch.bool)
+    mask[1, 3] = False
+    mask[2, 5] = False
+    mask[-1, -4] = False
+    test_params6 = replace(test_params5, layer_module_mask=mask)
+    compare_cuda_graph_lora_params_filler(test_params6)
+
+
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
     lora_config = LoraConfig(
         lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
         max_lora_rank=8,
         max_loras=2,
         max_cpu_loras=2)
-    llm = LLM(
-        model=f"{llm_models_root()}/llama-models/llama-7b-hf",
-        lora_config=lora_config,
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None,
-        **llm_kwargs)
+    if "cuda_graph_config" not in llm_kwargs:
+        llm_kwargs["cuda_graph_config"] = None
+    llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
+              lora_config=lora_config,
+              **llm_kwargs)
     try:
         prompts = [
             "美国的首都在哪里? \n答案:",
@@ -305,22 +376,22 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_lora():
-    llama_7b_lora_from_dir_test_harness()
+@pytest.mark.part0
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_lora(cuda_graph_config):
+    llama_7b_lora_from_dir_test_harness(cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_lora_default_modules() -> None:
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_lora_default_modules(cuda_graph_config) -> None:
     lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
 
-    llm = LLM(
-        model=hf_model_dir,
-        lora_config=lora_config,
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None)
+    llm = LLM(model=hf_model_dir,
+              lora_config=lora_config,
+              cuda_graph_config=cuda_graph_config)
 
     hf_lora_dir = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
     try:
@@ -346,7 +417,8 @@ def test_llama_7b_lora_default_modules() -> None:
 
 def _check_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
-        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
+        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int,
+        **llm_kwargs):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
     # (1) specify lora_target_modules, or
     # (2) provide a lora_dir to infer the lora_target_modules.
@@ -360,14 +432,14 @@ def _check_llama_7b_multi_lora_evict_load_new_adapters(
         repeats_per_call,
         LLM,
         lora_config=lora_config,
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None)
+        **llm_kwargs)
 
 
 @skip_gpu_memory_less_than_40gb
 @skip_ray  # https://nvbugs/5682551
-def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
+@pytest.mark.part3
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache(cuda_graph_config):
     """Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
     llm.generate call, that's repeated twice.
     """  # noqa: D205
@@ -376,11 +448,15 @@ def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
         max_loras=1,
         max_cpu_loras=2,
         repeat_calls=2,
-        repeats_per_call=3)
+        repeats_per_call=3,
+        cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache():
+@pytest.mark.part1
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache(
+        cuda_graph_config):
     """Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
     cache size < LoRA CPU cache size.
     """  # noqa: D205
@@ -389,23 +465,29 @@ def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache():
         max_loras=1,
         max_cpu_loras=3,
         repeat_calls=1,
-        repeats_per_call=1)
+        repeats_per_call=1,
+        cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_read_from_cache_after_insert():
+@pytest.mark.part0
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_multi_lora_read_from_cache_after_insert(cuda_graph_config):
     """Test that loading and then using the same adapters loaded in cache works."""
     _check_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call=[3],
         max_loras=3,
         max_cpu_loras=3,
         repeat_calls=2,
-        repeats_per_call=1)
+        repeats_per_call=1,
+        cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
+@pytest.mark.part3
+@test_lora_with_and_without_cuda_graph
 def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_cache(
-):
+        cuda_graph_config):
     """Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU
     cache over multiple llm.generate call repeated twice (two calls with the same requests):
     At the end of the 1st llm.generate call:
@@ -422,11 +504,14 @@ def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_ca
         max_loras=2,
         max_cpu_loras=2,
         repeat_calls=2,
-        repeats_per_call=1)
+        repeats_per_call=1,
+        cuda_graph_config=cuda_graph_config)
 
 
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_peft_cache_config_affects_peft_cache_size():
+@pytest.mark.part2
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_peft_cache_config_affects_peft_cache_size(cuda_graph_config):
     """Tests that LLM arg of peft_cache_config affects the peft cache sizes.
 
     NOTE: The caller can't get the actual LoRA cache sizes, so we instead we
@@ -446,9 +531,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             lora_config=lora_config_no_cache_size_values,
             peft_cache_config=PeftCacheConfig(
                 host_cache_size=1),  # size in bytes
-            # Disable CUDA graph
-            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=None)
+            cuda_graph_config=cuda_graph_config)
 
     # Test that too small PeftCacheConfig.device_cache_percent causes failure
     with pytest.raises(RuntimeError):
@@ -456,14 +539,14 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             LLM,
             lora_config=lora_config_no_cache_size_values,
             peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001),
-            # Disable CUDA graph
-            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=None)
+            cuda_graph_config=cuda_graph_config)
 
 
 @skip_ray  # https://nvbugs/5682551
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_lora_config_overrides_peft_cache_config():
+@pytest.mark.part1
+@test_lora_with_and_without_cuda_graph
+def test_llama_7b_lora_config_overrides_peft_cache_config(cuda_graph_config):
     """Tests that cache size args in lora_config LLM arg override the cache size
     parameters in peft_cache_config LLM arg.
     """    # noqa: D205
@@ -477,16 +560,16 @@ def test_llama_7b_lora_config_overrides_peft_cache_config():
         peft_cache_config=PeftCacheConfig(
             host_cache_size=1,  # size in bytes
             device_cache_percent=0.0000001),
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None)
+        cuda_graph_config=cuda_graph_config)
 
 
 # TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high
 # https://jirasw.nvidia.com/browse/TRTLLM-5045
 @pytest.mark.skip(reason="https://nvbugs/5448464")
 @skip_gpu_memory_less_than_138gb
-def test_nemotron_nas_lora() -> None:
+@pytest.mark.part1
+@test_lora_with_and_without_cuda_graph
+def test_nemotron_nas_lora(cuda_graph_config) -> None:
     lora_config = LoraConfig(lora_dir=[
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
     ],
@@ -498,7 +581,7 @@ def test_nemotron_nas_lora() -> None:
         model=
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
         lora_config=lora_config,
-    )
+        cuda_graph_config=cuda_graph_config)
 
     prompts = [
         "Hello, how are you?",
@@ -518,7 +601,9 @@ def test_nemotron_nas_lora() -> None:
 
 
 @skip_gpu_memory_less_than_80gb
-def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
+@pytest.mark.part0
+@test_lora_with_and_without_cuda_graph
+def test_llama_3_1_8b_fp8_with_bf16_lora(cuda_graph_config) -> None:
     skip_fp8_pre_ada(use_fp8=True)
     model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
     lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
@@ -531,12 +616,9 @@ def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
                              max_cpu_loras=2)
     lora_req = LoRARequest("lora-chinese", 0, lora_dir)
 
-    llm = LLM(
-        model_dir,
-        lora_config=lora_config,
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None)
+    llm = LLM(model_dir,
+              lora_config=lora_config,
+              cuda_graph_config=cuda_graph_config)
 
     try:
         output = llm.generate(prompt,
@@ -548,7 +630,9 @@ def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
 
 
 @skip_gpu_memory_less_than_80gb
-def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
+@pytest.mark.part2
+@test_lora_with_and_without_cuda_graph
+def test_bielik_11b_v2_2_instruct_multi_lora(cuda_graph_config) -> None:
     model_dir = f"{llm_models_root()}/Bielik-11B-v2.2-Instruct"
 
     target_modules = ['attn_q', 'attn_k', 'attn_v']
@@ -578,12 +662,9 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
                                         max_lora_rank=8,
                                         max_loras=2,
                                         max_cpu_loras=2)
-        llm = LLM(
-            model_dir,
-            lora_config=trtllm_lora_config,
-            # Disable CUDA graph
-            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=None)
+        llm = LLM(model_dir,
+                  lora_config=trtllm_lora_config,
+                  cuda_graph_config=cuda_graph_config)
 
         prompts = [
             "Kim był Mikołaj Kopernik i z czego zasłynął?",
@@ -601,7 +682,9 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
         assert len(outputs) == 2
 
 
-def test_gemma3_1b_instruct_multi_lora() -> None:
+@pytest.mark.part2
+@test_lora_with_and_without_cuda_graph
+def test_gemma3_1b_instruct_multi_lora(cuda_graph_config) -> None:
     model_dir = f"{llm_models_root()}/gemma/gemma-3-1b-it"
 
     target_modules = ['attn_q', 'attn_k', 'attn_v']
@@ -639,7 +722,8 @@ def test_gemma3_1b_instruct_multi_lora() -> None:
         )
         llm = LLM(model_dir,
                   lora_config=trtllm_lora_config,
-                  kv_cache_config=kv_cache_config)
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config)
 
         prompts = [
             "Is it ok to fill diesel in a petrol car?",
@@ -665,6 +749,7 @@ def test_gemma3_1b_instruct_multi_lora() -> None:
         (16, 16, "rank_16"),
         (4, 8, "rank_4_max_8"),
     ])
+@pytest.mark.part3
 def test_load_torch_nemo_lora_function(tmp_path, lora_rank, max_lora_rank,
                                        description):
     """Test load_torch_nemo_lora function with different LoRA rank configurations."""
@@ -694,6 +779,7 @@ def test_load_torch_nemo_lora_function(tmp_path, lora_rank, max_lora_rank,
     }, f"Expected correct module mapping for {description}"
 
 
+@pytest.mark.part0
 def test_nemo_lora_unsupported_modules_validation(tmp_path):
     """Test validation of unsupported modules in NeMo LoRA."""
     from tensorrt_llm.lora_manager import load_torch_nemo_lora
@@ -719,7 +805,9 @@ def test_nemo_lora_unsupported_modules_validation(tmp_path):
 
 
 @force_ampere
-def test_gqa_nemo_lora(tmp_path):
+@pytest.mark.part1
+@test_lora_with_and_without_cuda_graph
+def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
     """
     Test NeMo-format LoRA checkpoint loading and GQA support in TinyLlama.
 
@@ -764,6 +852,7 @@ def test_gqa_nemo_lora(tmp_path):
         model=model_path,
         lora_config=lora_config,
         kv_cache_config=global_kvcache_config,
+        cuda_graph_config=cuda_graph_config,
     )
 
     try:
@@ -797,16 +886,20 @@ def test_gqa_nemo_lora(tmp_path):
 
 class TestLlmError:
 
+    @pytest.mark.part3
     def test_max_num_token_check(self):
         """ LLM should raise error when got prompt length exceed the valid range. """
         llm = LLM(llama_model_path,
                   kv_cache_config=global_kvcache_config,
                   max_num_tokens=100)
 
-        with pytest.raises(ValueError,
-                           match="should not exceed max_num_tokens"):
-            ids = [random.randint(10, 100) for _ in range(101)]
-            llm.generate([ids])
+        try:
+            with pytest.raises(RequestError,
+                               match="should not exceed max_num_tokens"):
+                ids = [random.randint(10, 100) for _ in range(101)]
+                llm.generate([ids])
+        finally:
+            llm.shutdown()
 
 
 class FailingExecutorWorker(GenerationExecutorWorker):
@@ -827,6 +920,7 @@ FailingExecutor = type(
 
 
 @skip_ray
+@pytest.mark.part2
 def test_llm_with_proxy_error():
     """Test that LLM properly handles GenerationExecutorWorker constructor failures.
 
@@ -927,16 +1021,20 @@ def test_llm_return_logprobs_streaming(prompt_logprobs, logprobs,
 
 class TestLlmError:
 
+    @pytest.mark.part3
     def test_max_num_token_check(self):
         """ LLM should raise error when got prompt length exceed the valid range. """
         llm = LLM(llama_model_path,
                   kv_cache_config=global_kvcache_config,
                   max_num_tokens=100)
 
-        with pytest.raises(ValueError,
-                           match="should not exceed max_num_tokens"):
-            ids = [random.randint(10, 100) for _ in range(101)]
-            llm.generate([ids])
+        try:
+            with pytest.raises(RequestError,
+                               match="should not exceed max_num_tokens"):
+                ids = [random.randint(10, 100) for _ in range(101)]
+                llm.generate([ids])
+        finally:
+            llm.shutdown()
 
 
 @skip_ray
@@ -974,6 +1072,62 @@ async def test_llm_rpc_streaming():
             outputs.append(output.outputs[0].text)
         "".join(outputs)
         print(f"get result: {outputs}")
+
+
+@skip_ray
+def test_llm_rpc_get_stats():
+    """Test that get_stats works with RPC orchestrator."""
+
+    with LLM(model=llama_model_path,
+             kv_cache_config=global_kvcache_config,
+             enable_iter_perf_stats=True,
+             orchestrator_type="rpc") as llm:
+        assert isinstance(llm._executor, GenerationExecutorRpcProxy)
+
+        # Generate some output to produce stats
+        for output in llm.generate(
+                prompts, sampling_params=SamplingParams(max_tokens=5)):
+            print(output)
+
+        stats = llm.get_stats(timeout=5)
+
+        assert len(stats) > 0, "Should have at least one stats entry"
+        # Stats should be JSON strings that can be parsed
+        parsed = json.loads(stats[0]) if isinstance(stats[0], str) else stats[0]
+        assert "iter" in parsed, "Stats should contain 'iter' field"
+        assert "cpuMemUsage" in parsed, "Stats should contain 'cpuMemUsage' field"
+
+
+@skip_ray
+@pytest.mark.asyncio
+async def test_llm_rpc_get_stats_async():
+    """Test that get_stats_async works with RPC orchestrator."""
+    import json
+
+    with LLM(model=llama_model_path,
+             kv_cache_config=global_kvcache_config,
+             enable_iter_perf_stats=True,
+             orchestrator_type="rpc") as llm:
+        assert isinstance(llm._executor, GenerationExecutorRpcProxy)
+
+        # Generate some output to produce stats
+        async for output in llm.generate_async(
+            prompts[0], sampling_params=SamplingParams(max_tokens=5)):
+            print(output)
+
+        # Get stats via async API
+        stats_result = llm.get_stats_async(timeout=2)
+
+        # Should be able to iterate over results
+        stats_count = 0
+        async for stat in stats_result:
+            parsed = json.loads(stat) if isinstance(stat, str) else stat
+            assert "iter" in parsed, "Stats should contain 'iter' field"
+            stats_count += 1
+            if stats_count >= 1:
+                break  # Just verify we can get at least one
+
+        assert stats_count > 0, "Should have received at least one stat"
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -1052,8 +1206,9 @@ def test_llm_context_only_timed_out():
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.parametrize("sender_future_timeout_ms", [100, 1000])
-def test_llm_context_only_timed_out_kv_cache_exhausted(
-        sender_future_timeout_ms):
+@pytest.mark.parametrize("backend", ["NIXL", "UCX"])
+def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
+                                                       backend):
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1073,7 +1228,7 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(
         kv_cache_config=kv_cache_config,
         tensor_parallel_size=tp_size,
         cache_transceiver_config=CacheTransceiverConfig(
-            backend="UCX",
+            backend=backend,
             kv_transfer_timeout_ms=1000,
             kv_transfer_sender_future_timeout_ms=sender_future_timeout_ms),
         **llm_args_extra)

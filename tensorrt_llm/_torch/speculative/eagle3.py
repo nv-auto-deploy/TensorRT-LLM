@@ -7,12 +7,11 @@ from torch import nn
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, get_force_num_accepted_tokens
+from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPSampler
 from .spec_tree_manager import SpecTreeManager
 
@@ -134,7 +133,7 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.layers_to_capture = (self.num_layers - 1, )
         elif self.layers_to_capture is None:
             if self.num_layers == 1 or self.is_mtp_eagle:
-                self.layers_to_capture = (self.num_layers - 1, )
+                self.layers_to_capture = (-1, )
             else:
                 if self.num_layers <= 5:
                     raise ValueError(
@@ -357,15 +356,16 @@ class Eagle3OneModelSampler(MTPSampler):
         super().__init__(args, nextn=args.max_draft_len)
 
 
-class Eagle3OneModelWorker(nn.Module):
+class Eagle3OneModelWorker(SpecWorkerBase):
 
     def __init__(self, spec_config: "EagleDecodingConfig", mapping: Mapping):
         super().__init__()
         self.spec_config = spec_config
-        self.max_draft_len = self.spec_config.max_draft_len
         self.mapping = mapping
-        self.guided_decoder: Optional[CapturableGuidedDecoder] = None
-        self.force_num_accepted_tokens = get_force_num_accepted_tokens()
+
+    @property
+    def max_draft_len(self) -> int:
+        return self.spec_config.max_draft_len
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
@@ -377,15 +377,14 @@ class Eagle3OneModelWorker(nn.Module):
 
         raw_logits = logits
 
-        if self.guided_decoder is not None:
-            self.guided_decoder.execute(logits)
+        self._execute_guided_decoder_if_present(logits)
 
         # Sample and accept tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, attn_metadata, spec_metadata)
 
         # Save the old attn_metadata and spec_metadata
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
         # Prepare inputs for the 1st draft model forward
         position_ids = position_ids.squeeze(0)
@@ -400,6 +399,7 @@ class Eagle3OneModelWorker(nn.Module):
 
         # Predict draft tokens
         next_draft_tokens = []
+        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         for i in range(self.max_draft_len):
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
@@ -419,6 +419,13 @@ class Eagle3OneModelWorker(nn.Module):
                 self.guided_decoder.add_draft_batch(new_tokens,
                                                     num_accepted_tokens,
                                                     draft_step=i)
+
+            # Update attn_metadata.all_rank_num_tokens for attention DP
+            if original_all_rank_num_tokens is not None:
+                if i == 0:
+                    attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+                elif spec_metadata.all_rank_num_seqs is not None:
+                    attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
 
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
 
@@ -461,8 +468,6 @@ class Eagle3OneModelWorker(nn.Module):
             elif hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
             # support attention dp
-            if spec_metadata.all_rank_num_tokens is not None:
-                spec_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
             inputs = {
                 "input_ids": new_draft_token,
                 "position_ids": position_ids,
@@ -473,15 +478,15 @@ class Eagle3OneModelWorker(nn.Module):
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # restore attn_metadata to support cuda graph
-        attn_metadata.restore_from_spec_dec()
-        attn_metadata.on_update()
+        self._restore_attn_metadata_from_spec_dec(attn_metadata)
+        # restore all_rank_num_tokens for attention DP
+        if original_all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         # prepare next new tokens to support overlap scheduler
-        next_new_tokens = accepted_tokens[
-            spec_metadata.batch_indices_cuda[:batch_size],
-            num_accepted_tokens - 1].unsqueeze(1)
-        next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
-                                       dim=1)
+        next_new_tokens = self._prepare_next_new_tokens(
+            accepted_tokens, next_draft_tokens,
+            spec_metadata.batch_indices_cuda, batch_size, num_accepted_tokens)
 
         attn_metadata.use_spec_decoding = True
 
@@ -503,37 +508,13 @@ class Eagle3OneModelWorker(nn.Module):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        if logits.dim() == 1:
-            logits = logits.unsqueeze(0)
-
-        # The return buffer
-        accepted_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
-                                      dtype=torch.int,
-                                      device=logits.device)
-        num_accepted_tokens = torch.ones(batch_size,
-                                         dtype=torch.int,
-                                         device=logits.device)
-
-        # Do greedy sampling for the input logits
-        target_tokens = torch.argmax(logits, dim=-1)
-        # context
-        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
-
-        # generation
-        gen_target_tokens = target_tokens[num_contexts:].reshape(
-            num_gens, self.max_draft_len + 1)
-        accepted_tokens[num_contexts:, :] = gen_target_tokens
+        # Reshape draft tokens for base implementation
         draft_tokens = spec_metadata.draft_tokens.reshape(
             num_gens, self.max_draft_len)
-        num_accepted_tokens[num_contexts:] += torch.cumprod(
-            (draft_tokens == gen_target_tokens[:, :self.max_draft_len]).int(),
-            dim=-1).sum(1)
-        # Check for environment variable override
-        if self.force_num_accepted_tokens != 0:
-            force_num_accepted_tokens = min(self.force_num_accepted_tokens,
-                                            self.max_draft_len + 1)
-            num_accepted_tokens[num_contexts:] = force_num_accepted_tokens
-        return accepted_tokens, num_accepted_tokens
+
+        # Use base implementation for strict acceptance
+        return self._sample_and_accept_draft_tokens_base(
+            logits, draft_tokens, num_contexts, batch_size, spec_metadata)
 
     def draft_decoder(
         self,
@@ -541,7 +522,7 @@ class Eagle3OneModelWorker(nn.Module):
         draft_model: nn.Module,
     ):
         '''
-        Sampling draft tokens.
+        Sampling draft tokens with support for non-greedy sampling.
 
         Args:
             logits: torch.Tensor
@@ -556,15 +537,11 @@ class Eagle3OneModelWorker(nn.Module):
                 Draft token ids. Flattened.
         '''
 
-        draft_tokens = torch.argmax(logits, dim=-1)
-
-        # Apply d2t (offsets between draft model dictionary and main model dictionary).
-        if (d2t := getattr(draft_model.model, "d2t", None)) is not None:
-            draft_tokens = d2t[draft_tokens] + draft_tokens
-
-        draft_tokens = draft_tokens.type(torch.int32)
-
-        return draft_tokens
+        # Note: using greedy for draft tokens is a bit easier to implement and
+        # faster. It doesn't affect the final output and seems to have a negligible
+        # impact on AR.
+        d2t = getattr(draft_model.model, "d2t", None)
+        return self._draft_sampler_greedy(logits, d2t)
 
     def prepare_1st_drafter_inputs(
         self,
@@ -587,14 +564,9 @@ class Eagle3OneModelWorker(nn.Module):
         hidden_states = draft_model.apply_eagle3_fc(hidden_states)
 
         # context
-        input_ctx_ids = input_ids[:attn_metadata.num_ctx_tokens]
-        input_ids_ctx = torch.empty_like(input_ctx_ids,
-                                         dtype=torch.int32,
-                                         device="cuda")
-        input_ids_ctx[:-1].copy_(input_ctx_ids[1:])
-        input_ids_ctx[
-            spec_metadata.
-            gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+        input_ids_ctx = self._prepare_context_input_ids(
+            input_ids, attn_metadata.num_ctx_tokens, spec_metadata.gather_ids,
+            accepted_tokens, num_contexts)
 
         # generation
         input_ids_gen = accepted_tokens[num_contexts:, :].flatten()
@@ -609,8 +581,3 @@ class Eagle3OneModelWorker(nn.Module):
             "attn_metadata": attn_metadata,
             "spec_metadata": spec_metadata,
         }
-
-    def set_guided_decoder(self,
-                           guided_decoder: CapturableGuidedDecoder) -> bool:
-        self.guided_decoder = guided_decoder
-        return True

@@ -1,3 +1,4 @@
+import os
 import weakref
 from abc import abstractmethod
 from enum import Enum, IntEnum
@@ -200,11 +201,19 @@ class MoE(nn.Module):
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
         self.all_reduce = None
+        # Debug function for eliminating imbalance during performance analysis.
+        self.enable_dummy_allreduce = os.environ.get(
+            "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
         if not self.use_dp and self.mapping.tp_size > 1:
             self.all_reduce = AllReduce(
                 mapping=self.mapping,
                 strategy=model_config.allreduce_strategy,
                 dtype=self.dtype)
+        elif self.enable_dummy_allreduce:
+            from tensorrt_llm.functional import AllReduceStrategy
+            self.all_reduce = AllReduce(mapping=self.mapping,
+                                        strategy=AllReduceStrategy.NCCL,
+                                        dtype=self.dtype)
 
         # Initialize load balancer related attributes
         if init_load_balancer:
@@ -512,11 +521,43 @@ class MoE(nn.Module):
         raise NotImplementedError
 
     @abstractmethod
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
+        """
+        Args:
+            weights: List of weight dictionaries to load.
+            allow_partial_loading: Whether to enable partial loading for module parameters.
+                When True, weights are loaded without applying quantization transformations.
+                When False (default), weights are loaded and quantized together.
+        """
         raise NotImplementedError
 
     def post_load_weights(self):
         pass
+
+    def process_weights_after_loading(self):
+        """
+        Apply quantization processing to loaded weights.
+
+        When allow_partial_loading=True is used in load_weights(), this method
+        must be called separately to complete the loading setup.
+        """
+        if hasattr(self.quant_method, 'process_weights_after_loading'):
+            self.quant_method.process_weights_after_loading(self)
+
+    def pre_reload_weights(self):
+        """
+        Prepare tensors for weight reloading by reverting them to their original creation shape.
+        """
+        assert hasattr(
+            self.quant_method, 'pre_reload_weights'
+        ), "pre_reload_weights is not supported for this quant method"
+        if self._using_load_balancer():
+            raise NotImplementedError(
+                "Weight reloading is not compatible with Expert Parallel Load Balancer (EPLB). "
+            )
+        self.quant_method.pre_reload_weights(self)
 
     @abstractmethod
     def quantize_input(
@@ -719,6 +760,15 @@ class MoE(nn.Module):
         """
         return False
 
+    @property
+    def expand_intermediate_size_per_partition(self):
+        return self.intermediate_size_per_partition * self.intermediate_size_expand_ratio
+
+    def supports_moe_output_in_alltoall_workspace(self):
+        """ Supports moe_output in alltoall workspace
+        """
+        return False
+
     def reducescatter_or_allreduce(
         self,
         inputs,
@@ -739,3 +789,14 @@ class MoE(nn.Module):
             elif self.reduce_results:
                 outputs = self.all_reduce(inputs)
         return outputs
+
+    def dummy_allreduce(self):
+        assert self.enable_dummy_allreduce and self.all_reduce is not None, "Dummy allreduce is not enabled"
+        """
+        Debug function for eliminating imbalance during performance analysis.
+        Creates a small dummy tensor and performs allreduce to synchronize processes
+        and eliminate timing imbalances for more accurate profiling measurements.
+        """
+        dummy_tensor = torch.zeros(4, dtype=torch.float32, device="cuda")
+        dummy_tensor = self.all_reduce(dummy_tensor)
+        return dummy_tensor

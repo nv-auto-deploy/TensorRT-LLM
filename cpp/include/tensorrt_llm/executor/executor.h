@@ -47,6 +47,12 @@ class BaseKVCacheManager;
 namespace tensorrt_llm::executor
 {
 
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
+// Mmkey is used in KVCacheBlock when multimodal data presents in a block.
+// Type alias for hash array + start offset at per-block granularity.
+// This differs from the per-request level multimodal hash in MultimodalInput.
+using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
+
 /// @brief Version of TRT-LLM
 char const* version() noexcept;
 
@@ -678,6 +684,7 @@ public:
     /// finish reason. The request may exceed this time slightly, but at most by 1 forward pass (in pipeline parallelism
     /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
     /// @param cacheSaltID Salt ID for KV cache blocks to limit the kv cache reuse to the requests with the same string.
+    /// @param disaggRequestId Disaggregated request ID.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -705,7 +712,8 @@ public:
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt);
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
+        std::optional<IdType> disaggRequestId = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -755,6 +763,7 @@ public:
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
     [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
+    [[nodiscard]] std::optional<IdType> getDisaggRequestId() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -790,6 +799,7 @@ public:
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
     void setCacheSaltID(CacheSaltIDType cacheSaltID);
+    void setDisaggRequestId(IdType disaggRequestId);
 
 private:
     friend class Serialization;
@@ -1462,7 +1472,8 @@ public:
         DEFAULT = 0,
         MPI = 1,
         UCX = 2,
-        NIXL = 3
+        NIXL = 3,
+        MOONCAKE = 4
     };
     explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
         std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
@@ -1691,12 +1702,14 @@ struct KVCacheStoredBlockData
 {
 
     KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens tokens,
-        std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority)
+        std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority,
+        std::vector<MmKey> mmKeys = {})
         : blockHash{blockHash}
         , tokens{std::move(tokens)}
         , loraId{loraId}
         , cacheLevel{cacheLevel}
         , priority{priority}
+        , mmKeys{std::move(mmKeys)}
     {
     }
 
@@ -1710,6 +1723,8 @@ struct KVCacheStoredBlockData
     SizeType32 cacheLevel;
     /// @brief The priority of the block
     SizeType32 priority;
+    /// @brief The multimodal keys of the block
+    std::vector<MmKey> mmKeys;
 };
 
 struct KVCacheStoredData

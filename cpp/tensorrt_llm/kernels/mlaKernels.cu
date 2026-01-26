@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -31,8 +32,8 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -368,7 +369,6 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets,
     bool const* helix_is_inactive_rank)
 {
-
     // Constants.
     using VecT = typename VecType<T>::Type;
     using GPTJEltT = typename VecType<T>::GPTJEltType;
@@ -388,7 +388,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     // Block/Head idx.
     size_t const head_idx = blockIdx.y;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
 #endif
 
     if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
@@ -475,23 +475,27 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
             if (valid_token)
             {
-                if (head_idx == head_num && (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]))
+                if (head_idx == head_num)
                 {
-                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
-
+                    // If helix parallelism is being used, only write to KV cache if current rank is active.
+                    if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
                     {
-                        auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
-                        auto inBlockIdx = kv_cache.getKVLocalIdx(
-                            token_kv_idx, 0, TOTAL_VEC_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
-                        if (cache_type == KvCacheDataType::FP8)
-                        {
+                        auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
 
-                            quantCopy<T, ELTS_PER_VEC>(
-                                reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
-                                reinterpret_cast<T const*>(&data), quant_scale_kv_val);
+                        {
+                            auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
+                            auto inBlockIdx = kv_cache.getKVLocalIdx(
+                                token_kv_idx, 0, TOTAL_VEC_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
+                            if (cache_type == KvCacheDataType::FP8)
+                            {
+
+                                quantCopy<T, ELTS_PER_VEC>(
+                                    reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
+                                    reinterpret_cast<T const*>(&data), quant_scale_kv_val);
+                            }
+                            else
+                                reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
                         }
-                        else
-                            reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
                     }
                 }
                 else
@@ -529,28 +533,33 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             auto local_token_idx = global_token_idx % seq_len;
             bool valid_token = global_token_idx < total_s_len;
 
-            if (valid_token && (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]))
+            if (valid_token)
             {
                 if (head_dim_vec_idx == 0)
                 {
                     seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
                 }
 
-                auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
-                auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
-
+                // If helix parallelism is being used, only write to KV cache if current rank is active.
+                if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
                 {
-                    auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
-                    auto inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, TOTAL_VEC_PER_HEAD, head_dim_vec_idx);
+                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+                    auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
 
-                    if (cache_type == KvCacheDataType::FP8)
                     {
-                        quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
-                            fuse_buf + src_kv_global_offset + head_dim_idx, quant_scale_kv_val);
+                        auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
+                        auto inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, TOTAL_VEC_PER_HEAD, head_dim_vec_idx);
+
+                        if (cache_type == KvCacheDataType::FP8)
+                        {
+                            quantCopy<T, ELTS_PER_VEC>(
+                                reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
+                                fuse_buf + src_kv_global_offset + head_dim_idx, quant_scale_kv_val);
+                        }
+                        else
+                            reinterpret_cast<VecT*>(kDst)[inBlockIdx]
+                                = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
                     }
-                    else
-                        reinterpret_cast<VecT*>(kDst)[inBlockIdx]
-                            = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
                 }
             }
         }
@@ -587,7 +596,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
     // The implementation of the parallel scan in the thread block (see CUB for details).
@@ -1131,4 +1140,4 @@ INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_fp8_e4m3);
 
 } // namespace kernels
 
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

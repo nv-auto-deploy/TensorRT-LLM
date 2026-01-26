@@ -8,6 +8,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
+from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
 '''
@@ -262,6 +263,8 @@ class PyResult:
             chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
         self._mm_embeddings = None
+        self._mrope_position_ids = None
+        self._mrope_position_deltas = None
         self._additional_context_outputs = {
             name: []
             for name in additional_outputs
@@ -292,6 +295,16 @@ class PyResult:
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
         self._mm_embeddings = SharedTensorContainer.from_tensor(
             mm_embeddings).dump_to_dict()
+
+    def set_mrope_position(
+        self,
+        mrope_position_ids: torch.Tensor,
+        mrope_position_deltas: torch.Tensor,
+    ):
+        self._mrope_position_ids = (SharedTensorContainer.from_tensor(
+            mrope_position_ids).dump_to_dict())
+        self._mrope_position_deltas = (SharedTensorContainer.from_tensor(
+            mrope_position_deltas).dump_to_dict())
 
     def transfer_remaining_device_logits(self):
         """Finalize any remaining generation logits transfers (for chunked mode)"""
@@ -353,6 +366,18 @@ class PyResult:
         return self._mm_embeddings
 
     @property
+    def mrope_position_ids_handle(self) -> Dict[str, Any] | None:
+        # NOTE: when populated, the returned `dict` contains the information necessary to rebuild
+        # the `SharedTensorContainer` using the `from_dict` class method.
+        return self._mrope_position_ids
+
+    @property
+    def mrope_position_deltas_handle(self) -> Dict[str, Any] | None:
+        # NOTE: when populated, the returned `dict` contains the information necessary to rebuild
+        # the `SharedTensorContainer` using the `from_dict` class method.
+        return self._mrope_position_deltas
+
+    @property
     def additional_context_outputs(self) -> Dict[str, torch.Tensor] | None:
         if self._additional_context_outputs is None:
             return None
@@ -382,7 +407,8 @@ class LlmResult:
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
          'mm_embedding_handle', 'additional_context_outputs',
-         'additional_generation_outputs'))
+         'additional_generation_outputs', 'mrope_position_ids_handle',
+         'mrope_position_deltas_handle'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
@@ -460,6 +486,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             is_first_draft: bool = False,
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
+            logprobs_mode: LogprobMode = LogprobMode.RAW,
             **kwargs):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
@@ -488,6 +515,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_orig_prompt_len = self.orig_prompt_len
         self.py_max_new_tokens = self.max_new_tokens
         self.py_min_length = self.sampling_config.min_length
+        # `seqlen_this_rank_cp`, `total_input_len_cp`, and `py_helix_is_inactive_rank` are relevant to helix parallelism.
+        self.seqlen_this_rank_cp = self.prompt_len
+        self.total_input_len_cp = self.prompt_len
         self.py_helix_is_inactive_rank = False
         self.py_batch_idx = None
         self.py_draft_pages_allocated = 0
@@ -503,9 +533,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
-        self.py_lora_task_layer_module_configs: list[
-            tensorrt_llm.bindings.internal.runtime.
-            TaskLayerModuleConfig] | None = None
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
 
@@ -537,6 +564,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
         self.py_stop_words_list = stop_words_list
+
+        self.py_logprobs_mode = LogprobMode(
+            logprobs_mode)  # handle passed a raw string
 
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
@@ -623,7 +653,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         return LlmResponse(
             request_id=self.py_request_id
-            if self.is_child else self.parent_request_id,
+            if not self.is_child else self.parent_request_id,
             result=LlmResult(result, py_result, is_final),
             client_id=self.py_client_id) if len(result) > 0 else None
 
@@ -797,7 +827,10 @@ def executor_request_to_llm_request(
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
-        kv_cache_retention_config=executor_request.kv_cache_retention_config)
+        kv_cache_retention_config=executor_request.kv_cache_retention_config,
+        logprobs_mode=getattr(executor_request, "py_logprobs_mode",
+                              LogprobMode.RAW),
+    )
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

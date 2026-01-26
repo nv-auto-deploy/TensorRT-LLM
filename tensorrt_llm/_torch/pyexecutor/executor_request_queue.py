@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import heapq
+import os
 import queue
 import threading
 import time
@@ -11,9 +12,11 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import mpi_disabled, nvtx_range
+from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
+from .hang_detector import HangDetector
 from .llm_request import (ExecutorRequest, LlmRequest,
                           executor_request_to_llm_request)
 
@@ -47,10 +50,17 @@ class RequestQueueItem:
 class ExecutorRequestQueue:
     """Handles fetching and processing of new requests from the request queue."""
 
-    def __init__(self, dist: Distributed, enable_attention_dp: bool,
-                 max_batch_size: int, max_beam_width: int,
-                 max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 batch_wait_timeout_ms: float):
+    def __init__(
+        self,
+        dist: Distributed,
+        enable_attention_dp: bool,
+        max_batch_size: int,
+        max_beam_width: int,
+        max_num_active_requests: int,
+        enable_iter_perf_stats: bool,
+        batch_wait_timeout_ms: float,
+        hang_detector: Optional[HangDetector] = None,
+    ):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
@@ -66,6 +76,7 @@ class ExecutorRequestQueue:
         self.active = True
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
         self.send_requests_handler = None
+        self.hang_detector = hang_detector or HangDetector()
 
         # State tracking
         self.num_fetch_requests = 0
@@ -197,10 +208,15 @@ class ExecutorRequestQueue:
 
         return False
 
-    def _get_request_id(self):
-        # (next_request_id + 1) % UINT64_MAX
+    def _get_request_id(self, request: Optional[ExecutorRequest] = None):
+        # if request has a disagg_request_id, use it as request id so that
+        # corresponding context and generation requests have the same request id
+        if request and request.disagg_request_id and isinstance(
+                request.disagg_request_id, int):
+            return request.disagg_request_id
+
         current_id = self.next_request_id
-        self.next_request_id = (self.next_request_id + 1) & ((1 << 64) - 1)
+        self.next_request_id = get_local_request_id(current_id)
         return current_id
 
     def _generate_child_request_ids(
@@ -227,7 +243,7 @@ class ExecutorRequestQueue:
             assert self.active, "PyExecutor has already been shutdown."
             start_time = time.time()
             for request, query in requests_and_queries:
-                req_id = self._get_request_id()
+                req_id = self._get_request_id(request)
                 if self.enable_iter_perf_stats:
                     self.start_times[req_id] = start_time
                 child_req_ids = self._generate_child_request_ids(request)
@@ -303,7 +319,8 @@ class ExecutorRequestQueue:
                 self.request_accumulated.clear()
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
-            new_requests.extend(self._get_from_request_queue(timeout))
+            with self.hang_detector.pause():
+                new_requests.extend(self._get_from_request_queue(timeout))
 
         # Broadcast requests and handle Python objects
         new_requests, py_request_objects = self._handle_request_broadcasting(
@@ -477,8 +494,9 @@ class ExecutorRequestQueue:
             # Preserve original `new_requests` on rank 0
             _ = self._broadcast_new_requests(new_requests, py_request_objects)
         else:
-            new_requests, py_request_objects = self._broadcast_new_requests(
-                new_requests, py_request_objects)
+            with self.hang_detector.pause():
+                new_requests, py_request_objects = self._broadcast_new_requests(
+                    new_requests, py_request_objects)
 
         return new_requests, py_request_objects
 
@@ -587,9 +605,10 @@ class ExecutorRequestQueue:
         if not self.dist.has_pp:
             return self.dist.broadcast(payloads, root=0)
 
-        # Broadcast within first tp group before send/recv chain to other tp groups
-        if self.dist.tp_size > 1 and self.dist.is_first_pp_rank:
-            payloads = self.dist.tp_broadcast(payloads, root=0)
+        # Broadcast within first PP stage before send/recv chain to other PP stages.
+        # This needs to cover both TP and CP ranks within the first PP stage.
+        if self.dist.is_first_pp_rank:
+            payloads = self.dist.tp_cp_broadcast(payloads, root=0)
 
         # Tag for communication
         tag = self.dist.pp_size  # Use pp_size as tag to avoid conflicts
@@ -599,12 +618,20 @@ class ExecutorRequestQueue:
             with nvtx_range("recv_requests_from_prev_pp"):
                 payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
 
+        # isend new requests may cause deadlock, when CUDA_LAUNCH_BLOCKING=1 or PP microbatches can't overlap,
+        # the deadlock will happen deterministicly:
+        # 1. rank1 will wait on nccl.send(rank2), without invoking mpi.wait(isend-handle)
+        # 2. rank2 will wait on mpi.recv(rank1) but never receive the new requests.
+        # 3. rank1 will hang on nccl.send because rank2 will never reach nccl.recv(rank1).
+        pp_send_func = self.dist.isend_object if os.environ.get(
+            "TRTLLM_PP_REQ_SEND_ASYNC", "0") == "1" else self.dist.send_object
+
         if not self.dist.is_last_pp_rank:
             if self.send_requests_handler is not None:
                 with nvtx_range("wait_prev_send_requests_handler"):
                     self.send_requests_handler.wait()
             with nvtx_range("send_requests_to_next_pp"):
-                self.send_requests_handler = self.dist.isend_object(
+                self.send_requests_handler = pp_send_func(
                     payloads, self.dist.next_pp_rank, tag)
 
         return payloads
@@ -694,6 +721,7 @@ class ExecutorRequestQueue:
                 position_ids=position_ids_this_rank,
             )
             req.total_input_len_cp = input_len
+            req.seqlen_this_rank_cp = len(input_ids_this_rank)
             req_with_children.append(req)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)

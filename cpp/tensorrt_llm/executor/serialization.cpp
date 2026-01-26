@@ -732,6 +732,7 @@ Request Serialization::deserializeRequest(std::istream& is)
         ? std::optional<std::chrono::milliseconds>(std::chrono::milliseconds(*allottedTimeInt))
         : std::nullopt;
     auto cacheSaltID = su::deserialize<std::optional<CacheSaltIDType>>(is);
+    auto disaggRequestId = su::deserialize<std::optional<IdType>>(is);
 
     return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId, padId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
@@ -741,7 +742,7 @@ Request Serialization::deserializeRequest(std::istream& is)
         std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         std::move(crossAttentionMask), numReturnSequences, std::move(eagleConfig), std::move(skipCrossAttnBlocks),
-        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, cacheSaltID);
+        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, cacheSaltID, disaggRequestId);
 }
 
 void Serialization::serialize(Request const& request, std::ostream& os)
@@ -2333,6 +2334,7 @@ size_t Serialization::serializedSize(KVCacheStoredBlockData const& data)
     totalSize += su::serializedSize(data.loraId);
     totalSize += su::serializedSize(data.cacheLevel);
     totalSize += su::serializedSize(data.priority);
+    totalSize += su::serializedSize(data.mmKeys);
     return totalSize;
 }
 
@@ -2343,6 +2345,7 @@ void Serialization::serialize(KVCacheStoredBlockData const& data, std::ostream& 
     su::serialize(data.loraId, os);
     su::serialize(data.cacheLevel, os);
     su::serialize(data.priority, os);
+    su::serialize(data.mmKeys, os);
 }
 
 KVCacheStoredBlockData Serialization::deserializeKVCacheStoredBlockData(std::istream& is)
@@ -2352,8 +2355,9 @@ KVCacheStoredBlockData Serialization::deserializeKVCacheStoredBlockData(std::ist
     auto loraId = su::deserialize<std::optional<tensorrt_llm::runtime::LoraTaskIdType>>(is);
     auto cacheLevel = su::deserialize<SizeType32>(is);
     auto priority = su::deserialize<SizeType32>(is);
+    auto mmKeys = su::deserialize<std::vector<tensorrt_llm::batch_manager::kv_cache_manager::MmKey>>(is);
 
-    return KVCacheStoredBlockData{blockHash, tokens, loraId, cacheLevel, priority};
+    return KVCacheStoredBlockData{blockHash, tokens, loraId, cacheLevel, priority, mmKeys};
 }
 
 // KVcacheRemovedData

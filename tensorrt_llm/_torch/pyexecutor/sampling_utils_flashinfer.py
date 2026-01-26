@@ -33,6 +33,8 @@ else:
 from ..flashinfer_utils import get_env_enable_pdl
 from .sampling_utils import (
     GREEDY,
+    BeamSearch,
+    BeamSearchMetadata,
     GroupedStrategySampler,
     Strategy,
     StrategyMetadata,
@@ -40,6 +42,7 @@ from .sampling_utils import (
     TopK,
     TopKTopP,
     TopP,
+    beam_search_sampling_batch,
     greedy_search_sampling_batch,
 )
 
@@ -65,6 +68,7 @@ class _StrategyImpls:
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
+            group_metadata: StrategyMetadata | None = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             pass
 
@@ -137,8 +141,9 @@ class _StrategyImpls:
             *,
             group_logit_indices: Optional[torch.Tensor],
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            probs = self._prepare_probs_with_temperature(logits, group_logit_indices, None)
-            new_tokens, _ = greedy_search_sampling_batch(probs, return_probs=False)
+            if group_logit_indices is not None:
+                logits = torch.index_select(logits, 0, group_logit_indices)  # ensures copy
+            new_tokens, probs = greedy_search_sampling_batch(logits, return_probs=True)
             return new_tokens, probs
 
         @classmethod
@@ -169,6 +174,66 @@ class _StrategyImpls:
             new_tokens = cls._sample_from_probs(probs, generator=generator)
             return new_tokens, probs
 
+    class BeamSearchMixin(StrategyImpl):
+        def __init__(
+            self,
+            beam_width_in: torch.Tensor,
+            beam_width_out: torch.Tensor,
+            temperature: torch.Tensor,
+        ):
+            self._beam_width_in = beam_width_in
+            self._beam_width_out = beam_width_out
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Strategy], cuda_device: torch.device
+        ) -> "_StrategyImpls.BeamSearchMixin":
+            assert all(strat[0] == "beam_search" for strat in strategies)
+            narrowed_strats = cast(list[BeamSearch], strategies)
+            beam_width_in = cls._make_tensor(
+                [strat[1] for strat in narrowed_strats], torch.int32, cuda_device
+            )
+            beam_width_out = cls._make_tensor(
+                [strat[2] for strat in narrowed_strats], torch.int32, cuda_device
+            )
+            temperature = cls._make_tensor(
+                [strat[3] or 1.0 for strat in narrowed_strats], torch.float32, cuda_device
+            )
+            return cls(beam_width_in, beam_width_out, temperature)
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: StrategyMetadata | None = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
+                "BeamSearchMetadata is required for beam_search_sampling_batch"
+            )
+            assert torch.unique(self._beam_width_in).numel() == 1, (
+                "beam_width_in must be the same for all strategies"
+            )
+            assert torch.unique(self._beam_width_out).numel() == 1, (
+                "beam_width_out must be the same for all strategies"
+            )
+            logits = self._prepare_logits_with_temperature(
+                logits, group_logit_indices, self._temperature
+            )
+            return beam_search_sampling_batch(
+                logits,
+                beam_width_in=self._beam_width_in[0],
+                beam_width_out=self._beam_width_out[0],
+                beam_search_args=group_metadata,
+                temperature=None,
+                generator=generator,
+                return_probs=self.computes_probs(),
+            )
+
     class StrategyImplWithProbs(StrategyImpl):
         @override
         @classmethod
@@ -176,6 +241,9 @@ class _StrategyImpls:
             return True
 
     class GreedyWithProbs(StrategyImplWithProbs):
+        def __init__(self):
+            self._temperature = None
+
         @override
         @classmethod
         def from_strategies(
@@ -191,6 +259,7 @@ class _StrategyImpls:
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
+            group_metadata: StrategyMetadata | None = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             return self._sample_greedy_with_probs(logits, group_logit_indices=group_logit_indices)
 
@@ -225,6 +294,7 @@ class _StrategyImpls:
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
+            group_metadata: StrategyMetadata | None = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             new_tokens, probs = self._sample_with_probs(
                 logits,
@@ -263,6 +333,7 @@ class _StrategyImpls:
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
+            group_metadata: StrategyMetadata | None = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             new_tokens, probs = self._sample_with_probs(
                 logits,
@@ -301,6 +372,7 @@ class _StrategyImpls:
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
+            group_metadata: StrategyMetadata | None = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             new_tokens, probs = self._sample_with_probs(
                 logits,
@@ -335,6 +407,7 @@ class _StrategyImpls:
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
+            group_metadata: StrategyMetadata | None = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             new_tokens, probs = self._sample_with_probs(
                 logits,
@@ -346,6 +419,9 @@ class _StrategyImpls:
             )
             return new_tokens, probs
 
+    class BeamSearchWithProbs(BeamSearchMixin, StrategyImplWithProbs):
+        pass
+
     class StrategyImplSampleOnly(StrategyImpl):
         @override
         @classmethod
@@ -353,6 +429,9 @@ class _StrategyImpls:
             return False
 
     class GreedySampleOnly(StrategyImplSampleOnly):
+        def __init__(self):
+            self._temperature = None
+
         @override
         @classmethod
         def from_strategies(
@@ -368,6 +447,7 @@ class _StrategyImpls:
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
+            group_metadata: StrategyMetadata | None = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             if group_logit_indices is not None:
                 logits = logits[group_logit_indices]
@@ -404,6 +484,7 @@ class _StrategyImpls:
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
+            group_metadata: StrategyMetadata | None = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             logits = self._prepare_logits_with_temperature(
                 logits, group_logit_indices, self._temperature
@@ -450,6 +531,7 @@ class _StrategyImpls:
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
+            group_metadata: StrategyMetadata | None = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             probs = self._prepare_probs_with_temperature(
                 logits, group_logit_indices, self._temperature
@@ -494,6 +576,7 @@ class _StrategyImpls:
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
+            group_metadata: StrategyMetadata | None = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             probs = self._prepare_probs_with_temperature(
                 logits, group_logit_indices, self._temperature
@@ -534,6 +617,7 @@ class _StrategyImpls:
             *,
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
+            group_metadata: StrategyMetadata | None = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             logits = self._prepare_logits_with_temperature(
                 logits, group_logit_indices, self._temperature
@@ -550,6 +634,37 @@ class _StrategyImpls:
                 check_nan=self._flashinfer_check_nans(logits),
             )
             return new_tokens, None
+
+    class BeamSearchSampleOnly(BeamSearchMixin, StrategyImplSampleOnly):
+        pass
+
+
+def _create_beam_search_specialized_cls(
+    beam_width_in: torch.Tensor,
+    beam_width_out: torch.Tensor,
+    return_probs: bool,
+) -> Type[_StrategyImpls.BeamSearchMixin]:
+    """Create a class that implements BeamSearchMixin with static parameters for grouping."""
+
+    class BeamSearchSpecialized(
+        _StrategyImpls.BeamSearchWithProbs if return_probs else _StrategyImpls.BeamSearchSampleOnly
+    ):
+        static_beam_width_in = beam_width_in
+        static_beam_width_out = beam_width_out
+
+        @override
+        def __hash__(self) -> int:
+            return hash((super(), self.static_beam_width_in, self.static_beam_width_out))
+
+        @override
+        def __eq__(self, other: object) -> bool:
+            return (
+                super().__eq__(other)
+                and self.static_beam_width_in == other.static_beam_width_in
+                and self.static_beam_width_out == other.static_beam_width_out
+            )
+
+    return BeamSearchSpecialized
 
 
 class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpls.StrategyImpl]]):
@@ -576,6 +691,8 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpl
                     return _StrategyImpls.TemperatureOnlyWithProbs
                 case ("greedy", None):
                     return _StrategyImpls.GreedyWithProbs
+                case ("beam_search", beam_width_in, beam_width_out, _):
+                    return _create_beam_search_specialized_cls(beam_width_in, beam_width_out, True)
         else:
             match strategy:
                 case ("top_p", _, _):
@@ -588,6 +705,18 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpl
                     return _StrategyImpls.TemperatureOnlySampleOnly
                 case ("greedy", None):
                     return _StrategyImpls.GreedySampleOnly
+                case ("beam_search", beam_width_in, beam_width_out, _):
+                    return _create_beam_search_specialized_cls(beam_width_in, beam_width_out, False)
+
+    @override
+    @staticmethod
+    def get_metadata_type_for_group(
+        strategy_key: STRATEGY_KEY_TYPE,
+    ) -> Type[StrategyMetadata] | None:
+        if issubclass(strategy_key, _StrategyImpls.BeamSearchMixin):
+            return BeamSearchMetadata
+        else:
+            return None
 
     @override
     @staticmethod
@@ -600,17 +729,29 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpl
         generator: Optional[torch.Generator] = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if group_logit_indices is None:
-            assert logits.size(0) == len(strategies)
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if hasattr(group_key, "static_beam_width_in"):
+            beam_width_in = group_key.static_beam_width_in
         else:
-            assert group_logit_indices.size(0) == len(strategies)
+            beam_width_in = 1
+        if group_logit_indices is None:
+            assert logits.size(0) == beam_width_in * len(strategies)
+        else:
+            assert group_logit_indices.size(0) == beam_width_in * len(strategies)
 
         assert return_probs == group_key.computes_probs()
 
         strategy_impl_cls = group_key
-        return strategy_impl_cls.from_strategies(strategies, cuda_device=logits.device).sample(
+        sampling_object = strategy_impl_cls.from_strategies(strategies, cuda_device=logits.device)
+        next_tokens, softmax = sampling_object.sample(
             logits,
             group_logit_indices=group_logit_indices,
             generator=generator,
+            group_metadata=group_metadata,
         )
+        temperature = (
+            sampling_object._temperature.unsqueeze(-1)
+            if sampling_object._temperature is not None
+            else None
+        )
+        return next_tokens, softmax, temperature

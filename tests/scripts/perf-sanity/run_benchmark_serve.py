@@ -4,12 +4,11 @@ import ast
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Dict, List, NamedTuple
 
-import requests
 import yaml
+from test_common.http_utils import wait_for_endpoint_ready
 
 
 def get_node_name() -> str:
@@ -167,7 +166,7 @@ HF_MODEL_PATH = {
 }
 
 LLM_MODELS_ROOT = os.environ.get('LLM_MODELS_ROOT',
-                                 '/home/scratch.trt_llm_data/llm-models')
+                                 '/home/scratch.trt_llm_data_ci/llm-models')
 
 
 # Model path mapping
@@ -219,7 +218,7 @@ SERVER_CONFIG_METRICS = {
 SPECULATIVE_CONFIG_METRICS = {
     "decoding_type": (True, str),
     "max_draft_len": (True, int),
-    "speculative_model_dir": (True, str),
+    "speculative_model": (True, str),
     "eagle3_one_model": (True, str_to_bool),
 }
 
@@ -260,7 +259,7 @@ class ServerConfig:
         enable_padding: bool = True,
         decoding_type: str = "",
         max_draft_len: int = 0,
-        speculative_model_dir: str = "",
+        speculative_model: str = "",
         eagle3_one_model: bool = False,
     ):
         self.name = name
@@ -286,7 +285,7 @@ class ServerConfig:
         self.enable_padding = enable_padding
         self.decoding_type = decoding_type
         self.max_draft_len = max_draft_len
-        self.speculative_model_dir = speculative_model_dir
+        self.speculative_model = speculative_model
         self.eagle3_one_model = eagle3_one_model
 
         model_dir = get_model_dir(self.model_name)
@@ -346,9 +345,9 @@ class ServerConfig:
             config_lines.append(f"  decoding_type: {self.decoding_type}")
             if self.max_draft_len > 0:
                 config_lines.append(f"  max_draft_len: {self.max_draft_len}")
-            if self.speculative_model_dir:
+            if self.speculative_model:
                 config_lines.append(
-                    f"  speculative_model_dir: {self.speculative_model_dir}")
+                    f"  speculative_model: {self.speculative_model}")
             if self.eagle3_one_model:
                 config_lines.append(
                     f"  eagle3_one_model: {str(self.eagle3_one_model).lower()}")
@@ -501,8 +500,8 @@ def parse_config_file(config_file_path: str, select_pattern: str = None):
                                                  {}).get('decoding_type', ''),
             max_draft_len=server_config_data.get('speculative_config',
                                                  {}).get('max_draft_len', 0),
-            speculative_model_dir=server_config_data.get(
-                'speculative_config', {}).get('speculative_model_dir', ''),
+            speculative_model=server_config_data.get(
+                'speculative_config', {}).get('speculative_model', ''),
             eagle3_one_model=server_config_data.get(
                 'speculative_config', {}).get('eagle3_one_model', False))
 
@@ -568,19 +567,6 @@ class PerfServerBenchmarkCmds(NamedTuple):
     names: List[str]
     working_dir: str
 
-    def wait_for_endpoint_ready(self, url: str, timeout: int = 5400):
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            try:
-                time.sleep(10)
-                if requests.get(url, timeout=5).status_code == 200:
-                    print(f"endpoint {url} is ready")
-                    return
-            except Exception as err:
-                print(f"endpoint {url} is not ready, with exception: {err}")
-        print_error(
-            f"Endpoint {url} did not become ready within {timeout} seconds")
-
     def run_cmd(self,
                 cmd_idx: int,
                 node_name: str,
@@ -601,8 +587,8 @@ class PerfServerBenchmarkCmds(NamedTuple):
                                                stderr=subprocess.STDOUT)
 
             # Wait for server to be ready
-            self.wait_for_endpoint_ready("http://localhost:8000/v1/models",
-                                         timeout=max_timeout)
+            wait_for_endpoint_ready("http://localhost:8000/v1/models",
+                                    timeout=max_timeout)
 
             # Save node name, gpu info, server config, client config output to server file path
             with open(client_file_path, 'w') as client_ctx:

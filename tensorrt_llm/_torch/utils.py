@@ -21,6 +21,7 @@ aux_stream_name_list = [
     'MoeShared',
     'MoeChunkingOverlap',
     'MoeBalancer',
+    'MoeOutputMemset',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -291,6 +292,15 @@ def fp4_scale_infer_shape(input_shapes: List[List[int]]):
     return scale_shape * 2
 
 
+def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp4 scale tensor.
+    """
+    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
+                                                     sf_vec_size=16,
+                                                     is_swizzled_layout=False)
+    return scale_shape * 2
+
+
 _enable_piecewise_cuda_graph = True
 
 
@@ -394,3 +404,25 @@ def split(x: torch.Tensor,
 
 def relu2(x: torch.Tensor) -> torch.Tensor:
     return torch.square(F.relu(x))
+
+
+@maybe_compile
+def maybe_compiled_copy_(dst, src):
+    dst.copy_(src)
+
+
+@maybe_compile
+def maybe_compiled_cat(tensors, dim):
+    return torch.cat(tensors, dim)
+
+
+def replace_parameter_and_save_metadata(module: torch.nn.Module,
+                                        param_name: str,
+                                        new_param: torch.nn.Parameter,
+                                        metadata_dict: Dict):
+    """
+    Replace a parameter in a module and save the metadata of the original parameter.
+    """
+    if param_name not in metadata_dict:
+        metadata_dict[param_name] = getattr(module, param_name).to("meta")
+    module.register_parameter(param_name, new_param)

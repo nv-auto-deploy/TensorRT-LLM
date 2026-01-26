@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/quantization.h"
@@ -36,7 +37,9 @@
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
 
-namespace tensorrt_llm::common::op
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common::op
 {
 
 class AttentionOp
@@ -124,7 +127,6 @@ public:
     public:
         // Attention packed mask input (used by context FMHA).
         uint32_t const* attention_packed_mask = nullptr;
-        kernels::KVBlockArray::DataType* host_block_offsets = nullptr;
         int32_t batch_size = 0;
         float2 const* mrope_rotary_cos_sin = nullptr;
 
@@ -179,7 +181,6 @@ public:
             ss << "context_buf_sf: " << this->context_buf_sf << std::endl;
             ss << "key_value_cache: " << (half*) this->key_value_cache << std::endl;
             ss << "block_offsets: " << this->block_offsets << std::endl;
-            ss << "host_block_offsets: " << this->host_block_offsets << std::endl;
             ss << "host_primary_pool_pointer: " << this->host_primary_pool_pointer << std::endl;
             ss << "host_secondary_pool_pointer: " << this->host_secondary_pool_pointer << std::endl;
             ss << "batch_size: " << this->batch_size << std::endl;
@@ -491,6 +492,14 @@ public:
     // See [Chunked Attention] in _torch/modules/attention.py
     std::optional<int64_t> mAttentionChunkSize = std::nullopt;
 
+    // Skip softmax threshold scale factor.
+    float mSkipSoftmaxThresholdScaleFactorPrefill = 0;
+    float mSkipSoftmaxThresholdScaleFactorDecode = 0;
+#ifdef SKIP_SOFTMAX_STAT
+    uint32_t* mSkipSoftmaxTotalBlocks;
+    uint32_t* mSkipSoftmaxSkippedBlocks;
+#endif
+
     [[nodiscard]] auto data() const
     {
         return std::make_tuple(mLayerIdx, mNumHeads, mVisionStart, mVisionLength, mNumKVHeads, mHeadSize,
@@ -507,7 +516,8 @@ public:
             mMLAParams.data(), mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin,
             mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA,
             mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
-            mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1));
+            mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
+            mSkipSoftmaxThresholdScaleFactorDecode);
     };
 
 private:
@@ -543,4 +553,6 @@ private:
     UniqPtrWNullCopy<int32_t[], Deleter> mMultiBlockSemaphores = {};
 };
 
-} // namespace tensorrt_llm::common::op
+} // namespace common::op
+
+TRTLLM_NAMESPACE_END

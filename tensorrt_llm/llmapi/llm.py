@@ -8,7 +8,7 @@ import time
 import weakref
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Sequence, Union
+from typing import Any, List, Literal, Optional, Sequence, Union, cast
 
 import transformers
 from tqdm import tqdm
@@ -17,7 +17,8 @@ from transformers import PreTrainedTokenizerBase
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
-from tensorrt_llm.inputs.registry import DefaultInputProcessor
+from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+                                          DefaultInputProcessor)
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
 
@@ -30,7 +31,7 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
-from ..executor.utils import (create_mpi_comm_session,
+from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, create_input_processor,
                       create_input_processor_with_hash, get_cache_salt_id,
@@ -88,8 +89,12 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
 
     def _repr_fields(self):
         return [
-            "request_id", "prompt", "prompt_token_ids", "outputs", "finished",
-            "mm_embedding_handle"
+            "request_id",
+            "prompt",
+            "prompt_token_ids",
+            "outputs",
+            "finished",
+            "mm_embedding_handle",
         ]
 
 
@@ -192,7 +197,7 @@ class BaseLLM:
         self.mpi_session = self.args.mpi_session
 
         if self.args.parallel_config.is_multi_gpu:
-            if get_device_count(
+            if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(
                     f"Only {get_device_count()} GPUs are available, but {self.args.parallel_config.world_size} are required."
@@ -228,7 +233,6 @@ class BaseLLM:
 
             self.runtime_context: Optional[_ModelRuntimeContext] = None
             self.llm_build_stats = LlmBuildStats()
-
             self._build_model()
 
         except Exception:
@@ -419,7 +423,7 @@ class BaseLLM:
         multimodal_params = None
 
         if is_mm_disagg:
-            if not self.input_processor.support_mm_disagg:
+            if not getattr(self.input_processor, "support_mm_disagg", False):
                 raise ValueError(
                     "Multimodal disaggregated inference is not supported for this model"
                 )
@@ -436,14 +440,42 @@ class BaseLLM:
                 mm_hashes = disaggregated_params.multimodal_hashes
                 multimodal_input = MultimodalInput.from_components(
                     mm_hashes, mm_token_positions, mm_token_length)
+                multimodal_data = {"multimodal_embedding": mm_handles}
+                if disaggregated_params.mrope_position_ids_handle is not None:
+                    # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
+                    assert disaggregated_params.mrope_position_deltas_handle is not None
+                    mrope_config = {}
+                    mrope_config[
+                        "mrope_position_ids"] = disaggregated_params.mrope_position_ids_handle
+                    mrope_config[
+                        "mrope_position_deltas"] = disaggregated_params.mrope_position_deltas_handle
+                    multimodal_data["mrope_config"] = mrope_config
                 multimodal_params = MultimodalParams(
                     multimodal_input=multimodal_input,
-                    multimodal_data={"multimodal_embedding": mm_handles})
+                    multimodal_data=multimodal_data,
+                )
 
         elif "prompt_token_ids" in inputs:
             prompt_token_ids = inputs['prompt_token_ids']
             prompt = None
             query_token_ids = inputs.get("query_token_ids", None)
+            multimodal_data = {}
+            # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
+            if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
+                # It looks like `PyTorchModelEngine` assumes both are present when using mrope?
+                if disaggregated_params.mrope_position_deltas_handle is None:
+                    raise RuntimeError(
+                        "`mrope_position_ids_handle` and `mrope_position_deltas_handle` must both "
+                        "be provided, or both `None`.")
+                mrope_config = {}
+                mrope_config[
+                    "mrope_position_ids"] = disaggregated_params.mrope_position_ids_handle
+                mrope_config[
+                    "mrope_position_deltas"] = disaggregated_params.mrope_position_deltas_handle
+                multimodal_data["mrope_config"] = mrope_config
+            if multimodal_data:
+                multimodal_params = MultimodalParams(
+                    multimodal_data=multimodal_data)
         elif "prompt" in inputs:
             if 'multi_modal_data' in inputs:
                 # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
@@ -458,8 +490,10 @@ class BaseLLM:
                         inputs, sampling_params)
             elif 'multi_modal_embeddings' in inputs:
                 mm_embedding_info = inputs['multi_modal_embeddings']
-                prompt_token_ids, extra_processed_inputs = self.input_processor.attach_multimodal_embeddings(
-                    inputs, mm_embedding_info, sampling_params)
+                prompt_token_ids, extra_processed_inputs = cast(
+                    BaseMultimodalInputProcessor,
+                    self.input_processor).attach_multimodal_embeddings(
+                        inputs, mm_embedding_info, sampling_params)
             else:
                 with nvtx_range_debug("input_processor"):
                     prompt_token_ids, extra_processed_inputs = self.input_processor(
@@ -632,7 +666,7 @@ class BaseLLM:
             if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
                 sampling_params.return_context_logits = True
                 sampling_params._context_logits_auto_enabled = True
-            if sampling_params.logprobs and not sampling_params.return_generation_logits:
+            if sampling_params.logprobs is not None and not sampling_params.return_generation_logits:
                 sampling_params.return_generation_logits = True
                 sampling_params._generation_logits_auto_enabled = True
 
@@ -652,7 +686,7 @@ class BaseLLM:
             if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
                 max_num_tokens = self.args.max_num_tokens
                 if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
-                    raise ValueError(
+                    raise RequestError(
                         f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) should not exceed "
                         f"max_num_tokens ({max_num_tokens})")
             return
@@ -703,7 +737,7 @@ class BaseLLM:
                 f"Example: LLM(..., build_config=BuildConfig(gather_context_logits=True))."
             )
 
-        if sampling_params.logprobs and not self.args.gather_generation_logits:
+        if sampling_params.logprobs is not None and not self.args.gather_generation_logits:
             raise ValueError(
                 f"`sampling_params.logprobs={sampling_params.logprobs}` requires `gather_generation_logits=True` "
                 f"to be passed explicitly to the `LLM()` constructor.")
@@ -787,6 +821,17 @@ class BaseLLM:
         if hasattr(self, 'mpi_session') and self.mpi_session is not None:
             self.mpi_session.shutdown()
             self.mpi_session = None
+
+    def _check_health(self) -> bool:
+        """Check if the LLM is healthy.
+
+        Returns:
+            bool: True if the executor is running and not shutdown, False otherwise.
+        """
+        if hasattr(self, "_executor") and self._executor is not None:
+            return not self._executor.is_shutdown()
+
+        return False
 
     @staticmethod
     def _shutdown_wrapper(self_ref):
