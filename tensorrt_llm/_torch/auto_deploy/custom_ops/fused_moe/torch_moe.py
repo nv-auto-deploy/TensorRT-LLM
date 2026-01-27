@@ -5,22 +5,6 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.utils import ActivationType
 
-# MoE Mapping Configuration Indices
-# These indices define the layout of the mapping_config list parameter
-# that encodes sharding information for MoE operators when enable_alltoall=True.
-# Note: mapping_config is only used in all-to-all mode.
-MOE_MAPPING_WORLD_SIZE = 0
-MOE_MAPPING_TP_SIZE = 1
-MOE_MAPPING_TP_RANK = 2
-MOE_MAPPING_EP_SIZE = 3
-MOE_MAPPING_EP_RANK = 4
-MOE_MAPPING_CLUSTER_SIZE = 5
-MOE_MAPPING_CLUSTER_RANK = 6
-MOE_MAPPING_MAX_NUM_TOKENS = 7  # Max tokens for workspace allocation
-# Future indices can be added here without breaking compatibility
-# e.g., MOE_MAPPING_PP_SIZE, MOE_MAPPING_CP_SIZE, etc.
-MOE_MAPPING_LENGTH = 8  # Current length of mapping_config
-
 
 def _resolve_torch_fn(act_fn: ActivationType) -> Callable[[torch.Tensor], torch.Tensor]:
     """
@@ -114,7 +98,7 @@ def torch_moe(
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
     enable_alltoall: bool = False,
-    # Sharding configuration (only used when enable_alltoall=True) - see MOE_MAPPING_* constants for layout
+    # Sharding configuration (only used when enable_alltoall=True) - see MappingSerializer
     mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """
@@ -269,7 +253,7 @@ def torch_quant_fp8_moe(
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
     enable_alltoall: bool = False,
-    # Sharding configuration (only used when enable_alltoall=True) - see MOE_MAPPING_* constants for layout
+    # Sharding configuration (only used when enable_alltoall=True) - see MappingSerializer
     mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """
@@ -407,7 +391,7 @@ def torch_quant_nvfp4_moe(
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
     enable_alltoall: bool = False,
-    # Sharding configuration (only used when enable_alltoall=True) - see MOE_MAPPING_* constants for layout
+    # Sharding configuration (only used when enable_alltoall=True) - see MappingSerializer
     mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """

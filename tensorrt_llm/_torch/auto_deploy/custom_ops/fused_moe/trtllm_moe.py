@@ -13,25 +13,74 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.torch_moe import (
-    MOE_MAPPING_CLUSTER_RANK,
-    MOE_MAPPING_CLUSTER_SIZE,
-    MOE_MAPPING_EP_RANK,
-    MOE_MAPPING_EP_SIZE,
-    MOE_MAPPING_MAX_NUM_TOKENS,
-    MOE_MAPPING_TP_RANK,
-    MOE_MAPPING_TP_SIZE,
-    MOE_MAPPING_WORLD_SIZE,
-)
 from tensorrt_llm._torch.auto_deploy.custom_ops.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import MappingSerializer
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import mpi_allgather
-from tensorrt_llm.mapping import Mapping
+
+# =============================================================================
+# MoE TP Process Group Cache
+# =============================================================================
+# When using 2D MoE parallelism (moe_tp_size > 1 AND moe_ep_size > 1) with all-to-all,
+# we need to perform all-reduce within the MoE TP group after the all-to-all combine.
+# The all-to-all handles EP communication, but TP-partial results still need to be summed.
+#
+# This cache stores the MoE TP process groups to avoid recreating them on every call.
+# Key: (world_size, moe_tp_size, moe_ep_size, moe_tp_rank)
+# Value: ProcessGroup for the MoE TP group containing this rank
+# =============================================================================
+_MOE_TP_GROUP_CACHE: Dict[Tuple[int, int, int, int], Optional[dist.ProcessGroup]] = {}
+
+
+def _get_moe_tp_group(mapping) -> Optional[dist.ProcessGroup]:
+    """Get or create the MoE TP process group for all-reduce after all-to-all combine.
+
+    When using 2D MoE parallelism with all-to-all, the fused_moe kernel computes
+    TP-partial results (each rank processes its portion of TP-sharded weights).
+    After all-to-all combine gathers EP results, we need all-reduce within the
+    MoE TP group to sum the TP-partial results.
+
+    Args:
+        mapping: Mapping object with distributed configuration
+
+    Returns:
+        ProcessGroup for MoE TP all-reduce, or None if moe_tp_size == 1
+    """
+    if mapping.moe_tp_size <= 1:
+        return None
+
+    if not dist.is_initialized():
+        return None
+
+    cache_key = (mapping.world_size, mapping.moe_tp_size, mapping.moe_ep_size, mapping.moe_tp_rank)
+
+    if cache_key not in _MOE_TP_GROUP_CACHE:
+        # Create process groups for all MoE TP groups
+        # Each MoE TP group contains ranks with the same moe_ep_rank but different moe_tp_rank
+        # We need to create groups for ALL ranks, not just ours, because new_group is collective
+
+        # Calculate all MoE TP groups based on the Mapping's calculation
+        # moe_tp_rank = tp_rank // (moe_ep_size * moe_cluster_size)
+        # For simplicity, we'll create the group based on moe_tp_group property from Mapping
+        try:
+            moe_tp_group_ranks = mapping.moe_tp_group
+            if len(moe_tp_group_ranks) > 1:
+                group = dist.new_group(ranks=moe_tp_group_ranks)
+                _MOE_TP_GROUP_CACHE[cache_key] = group
+            else:
+                _MOE_TP_GROUP_CACHE[cache_key] = None
+        except (NotImplementedError, AttributeError):
+            # moe_tp_group may not be available in all Mapping implementations
+            # Fall back to None (no TP reduction)
+            _MOE_TP_GROUP_CACHE[cache_key] = None
+
+    return _MOE_TP_GROUP_CACHE[cache_key]
 
 
 @torch.library.custom_op("auto_deploy::trtllm_moe_fused", mutates_args=())
@@ -45,7 +94,7 @@ def trtllm_moe_fused(
     act_fn: int = int(ActivationType.Silu),
     apply_routing_on_input: bool = False,
     enable_alltoall: bool = False,
-    # Sharding configuration (only used when enable_alltoall=True) - see MOE_MAPPING_* constants for layout
+    # Sharding configuration (only used when enable_alltoall=True) - see MappingSerializer
     mapping_config: Optional[List[int]] = None,
 ) -> torch.Tensor:
     x_shape = x.shape
@@ -75,19 +124,9 @@ def trtllm_moe_fused(
                 f"Unsupported activation '{ActivationType(act_fn).name}' for mlp. Use 'relu2'."
             )
 
-    # Extract sharding configuration with safe defaults
+    # Deserialize Mapping from config (or use defaults if None)
     # Note: mapping_config is only populated when enable_alltoall=True
-    def _get_config(idx: int, default: int = 1) -> int:
-        return mapping_config[idx] if mapping_config and len(mapping_config) > idx else default
-
-    _world_size = _get_config(MOE_MAPPING_WORLD_SIZE, 1)  # noqa: F841 - kept for debugging
-    moe_tp_size = _get_config(MOE_MAPPING_TP_SIZE, 1)
-    moe_tp_rank = _get_config(MOE_MAPPING_TP_RANK, 0)
-    moe_ep_size = _get_config(MOE_MAPPING_EP_SIZE, 1)
-    moe_ep_rank = _get_config(MOE_MAPPING_EP_RANK, 0)
-    moe_cluster_size = _get_config(MOE_MAPPING_CLUSTER_SIZE, 1)
-    moe_cluster_rank = _get_config(MOE_MAPPING_CLUSTER_RANK, 0)
-    max_num_tokens_config = _get_config(MOE_MAPPING_MAX_NUM_TOKENS, 0)
+    mapping = MappingSerializer.deserialize(mapping_config)
 
     # =================================================================================
     # MoE ALL-TO-ALL PATH
@@ -120,24 +159,14 @@ def trtllm_moe_fused(
 
         # Expert weights are sharded - shape[0] gives LOCAL expert count
         local_num_experts = w3_w1_stacked_weight.shape[0]
-        global_num_experts = local_num_experts * moe_ep_size
+        global_num_experts = local_num_experts * mapping.moe_ep_size
 
         # Use configured max_num_tokens for workspace allocation
-        # This should be set to max_batch_size * max_seq_len * moe_ep_size in sharding.py
-        # Fallback to runtime calculation if not configured
-        if max_num_tokens_config > 0:
-            max_num_tokens = max_num_tokens_config
-        else:
-            local_tokens = int(x.shape[0])
-            all_rank_tokens = mpi_allgather(local_tokens)
-            if isinstance(all_rank_tokens, list):
-                runtime_max_tokens_per_rank = max(all_rank_tokens)
-            else:
-                runtime_max_tokens_per_rank = local_tokens
-            max_num_tokens = runtime_max_tokens_per_rank * moe_ep_size
+        # This should be set to max_batch_size * max_seq_len * moe_ep_size
+        max_num_tokens = MappingSerializer.get_max_num_tokens(mapping_config)
 
         workspace_size = MoeAlltoAll.calculate_required_workspace_size(
-            moe_ep_size, top_k, max_num_tokens, hidden_size, x_dtype
+            mapping.moe_ep_size, top_k, max_num_tokens, hidden_size, x_dtype
         )
 
         # Get runtime tokens per rank for actual dispatch/combine
@@ -148,16 +177,7 @@ def trtllm_moe_fused(
         else:
             runtime_max_tokens_per_rank = local_tokens
 
-        # Build Mapping object for MoeAlltoAll
-        # Note: rank is set to moe_ep_rank (position within EP group)
-        mapping = Mapping(
-            world_size=moe_ep_size,
-            rank=moe_ep_rank,
-            tp_size=moe_ep_size,
-            moe_tp_size=1,
-            moe_ep_size=moe_ep_size,
-            moe_cluster_size=1,
-        )
+        # Build MoeAlltoAll using the deserialized Mapping object
         moe_a2a = MoeAlltoAll(
             mapping=mapping,
             max_num_tokens=max_num_tokens,
@@ -205,12 +225,12 @@ def trtllm_moe_fused(
             fc2_expert_biases=None,
             output_dtype=x.dtype,
             quant_scales=quant_scales,
-            tp_size=moe_tp_size,
-            tp_rank=moe_tp_rank,
-            ep_size=moe_ep_size,
-            ep_rank=moe_ep_rank,
-            cluster_size=moe_cluster_size,
-            cluster_rank=moe_cluster_rank,
+            tp_size=mapping.moe_tp_size,
+            tp_rank=mapping.moe_tp_rank,
+            ep_size=mapping.moe_ep_size,
+            ep_rank=mapping.moe_ep_rank,
+            cluster_size=mapping.moe_cluster_size,
+            cluster_rank=mapping.moe_cluster_rank,
             enable_alltoall=True,
             tuner_num_tokens=max_num_tokens,
             tuner_top_k=top_k,
@@ -223,9 +243,22 @@ def trtllm_moe_fused(
             use_fused_finalize=True,
         )[0]
 
-        # COMBINE: Gather results back to original GPUs
-        moe_out = moe_out.view(moe_ep_size, runtime_max_tokens_per_rank, hidden_size)
+        # TP REDUCTION (BEFORE COMBINE): Sum partial results when using 2D MoE parallelism
+        # With moe_tp_size > 1, all TP ranks within the same EP group receive the SAME tokens
+        # (via dispatch) and compute partial results using their TP-sharded portion of weights.
+        # We must all-reduce these partial results BEFORE combine, because:
+        # 1. All TP peers in the same EP group have the same tokens right now
+        # 2. After combine, tokens scatter back to original GPUs - TP peers no longer share tokens
+        if mapping.moe_tp_size > 1:
+            moe_tp_group = _get_moe_tp_group(mapping)
+            if moe_tp_group is not None:
+                moe_out = moe_out.contiguous()
+                dist.all_reduce(moe_out, op=dist.ReduceOp.SUM, group=moe_tp_group)
+
+        # COMBINE: Gather full results back to original GPUs
+        moe_out = moe_out.view(mapping.moe_ep_size, runtime_max_tokens_per_rank, hidden_size)
         combined = moe_a2a.combine(moe_out, runtime_max_tokens_per_rank)
+
         return combined.view(x_shape)
 
     else:
