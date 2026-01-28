@@ -18,7 +18,14 @@ def deepseek_v3_attention(
     use_cache: bool = False,
     **kwargs,
 ):
-    """DeepSeekV3Attention forward function rewritten to wrap MultiheadLatentAttention as a custom op."""
+    """DeepSeekV3Attention forward function rewritten to wrap MLA as a custom op.
+
+    This version separates RoPE from attention and uses FlashInfer naming:
+    - ckv: compressed key/value (from kv_b_proj)
+    - kpe: key positional encoding (after RoPE)
+
+    The torch_mla op expects inputs in BSND layout with RoPE already applied.
+    """
     if "padding_mask" in kwargs:
         warnings.warn(
             "Passing `padding_mask` is deprecated and will be removed in v4.37. "
@@ -26,104 +33,80 @@ def deepseek_v3_attention(
         )
     bsz, q_len, _ = hidden_states.size()
 
-    # If else paths are determined by config.json
+    # =========================================================================
+    # Query projection
+    # =========================================================================
     if self.q_lora_rank is None:
         q = self.q_proj(hidden_states)
     else:
         q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-    q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+
+    # Shape: [B, S, N, q_head_dim] (BSND layout)
+    q = q.view(bsz, q_len, self.num_heads, self.q_head_dim)
     q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
+    # =========================================================================
+    # KV projection
+    # =========================================================================
     compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
     compressed_kv, k_pe = torch.split(
         compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
     )
-    k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
-    kv = (
-        self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-        .view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        .transpose(1, 2)
+    # k_pe: [B, S, 1, qk_rope_head_dim] (BSND layout, shared across heads)
+    k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
+
+    # ckv: KV after kv_b_proj projection
+    # Shape: [B, S, N, qk_nope_head_dim + v_head_dim] (per-head, BSND layout)
+    # Note: In the full FlashInfer MLA implementation, this would be compressed,
+    # but for compatibility with existing model weights, we keep per-head expansion
+    ckv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv)).view(
+        bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
     )
-    _, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-    kv_seq_len = value_states.shape[-2]
+
+    kv_seq_len = q_len
     if past_key_value is not None:
         raise ValueError("past_key_value is not supported")
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
-    # Use custom op to capture mla. This does not handle KV cache
-    # as passing transformers Cache into a custom op is throwing an error.
-    # Would not be an issue, cause we intend to replace mla op with our implementation further along the pipeline
-    attn_output = torch.ops.auto_deploy.torch_attention_deepseek_fused_mla(
-        q_nope,
+    # =========================================================================
+    # Apply RoPE BEFORE the MLA call (separation of concerns)
+    # =========================================================================
+    cos, sin = self.rotary_emb(hidden_states, seq_len=kv_seq_len)
+    cos = cos[position_ids]  # [B, S, head_dim]
+    sin = sin[position_ids]  # [B, S, head_dim]
+
+    # Apply RoPE to q_pe and k_pe using existing custom op
+    # Input layout for torch_rope_with_qk_interleaving: [B, S, N, D] with unsqueeze_dim=2
+    q_pe_rotated, kpe = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
         q_pe,
-        kv,
         k_pe,
         cos,
         sin,
-        position_ids,
-        attention_mask,
-        self.softmax_scale,
+        2,  # unsqueeze_dim=2 for BSND layout
     )
 
-    attn_output = attn_output.transpose(1, 2).contiguous()
+    # =========================================================================
+    # Call MLA WITHOUT fused RoPE (using FlashInfer naming)
+    # =========================================================================
+    # torch_mla expects BSND layout:
+    # - q_nope: [B, S, N, qk_nope_head_dim]
+    # - q_pe: [B, S, N, qk_rope_head_dim] (RoPE already applied)
+    # - ckv: [B, S, 1, head_dim_ckv] (compressed key/value)
+    # - kpe: [B, S, 1, head_dim_kpe] (RoPE already applied)
+    attn_output = torch.ops.auto_deploy.torch_mla(
+        q_nope,  # query non-positional [B, S, N, qk_nope_head_dim]
+        q_pe_rotated,  # query positional with RoPE [B, S, N, qk_rope_head_dim]
+        ckv,  # compressed key/value [B, S, 1, head_dim_ckv]
+        kpe,  # key positional with RoPE [B, S, 1, head_dim_kpe]
+        True,  # is_causal
+        self.softmax_scale,
+        "bsnd",  # layout
+    )
+
+    # Output shape: [B, S, N, v_head_dim] -> [B, S, N * v_head_dim]
     attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
     attn_output = self.o_proj(attn_output)
 
     return attn_output, None, past_key_value
-
-
-# This patched module matches exactly with HF generate
-@torch.inference_mode()
-def deepseek_v3_moe_exact(self, hidden_states):
-    """DeepSeekV3MoE forward function rewritten to enable torch export.
-
-    This custom implementation matches exactly with the deepseek implementation. There are
-    some errors in the output tensors when the index_add based implementation is used, leading
-    to some mismatch in the outputs for some prompts. This ensures exact match between HF output
-    without custom patch and with custom patch.
-    """
-    identity = hidden_states
-    batch_size, sequence_length, hidden_dim = hidden_states.shape
-
-    selected_experts, routing_weights, *_ = self.gate(hidden_states)
-
-    hidden_states = hidden_states.view(-1, hidden_dim)
-    idxs = torch.argsort(selected_experts.view(-1), stable=True)
-
-    expert_mask = torch.nn.functional.one_hot(
-        selected_experts, num_classes=self.experts_per_rank
-    ).permute(2, 1, 0)
-    outputs = []
-    for expert_idx in range(len(self.experts)):
-        expert_layer = self.experts[expert_idx]
-        _, top_x = torch.where(expert_mask[expert_idx])
-        # Sort the top_xs and idx
-        sorted, _ = torch.sort(top_x)
-        tokens_for_this_expert = hidden_states[None, sorted].reshape(-1, hidden_dim)
-        expert_out = expert_layer(tokens_for_this_expert)
-        outputs.append(expert_out)
-
-    outs = torch.cat(outputs, dim=0)
-    # Wrap torch.zeros() in a custom op to fix meta device issue during inference.
-    new_x = torch.zeros(
-        (*selected_experts.view(-1).shape, hidden_dim),
-        device=selected_experts.device,
-        dtype=outs.dtype,
-    )
-    new_x[idxs] = outs
-    final_hidden_states = (
-        new_x.view(*selected_experts.shape, -1)
-        .type(routing_weights.dtype)
-        .mul_(routing_weights.unsqueeze(-1))
-        .sum(dim=1)
-        .type(new_x.dtype)
-    )
-    final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-
-    if self.config.n_shared_experts is not None:
-        final_hidden_states = final_hidden_states + self.shared_experts(identity)
-
-    return final_hidden_states.to(hidden_states.dtype)
 
 
 @torch.inference_mode()
