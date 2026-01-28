@@ -1560,16 +1560,8 @@ def _insert_sharded_moe(
         args[1] = selected_experts_local
         args[2] = final_scales_local
 
-    # =====================================================================================
-    # Update node arguments with sharded weights and enable_alltoall/mapping_config
-    # =====================================================================================
-    # Use kwargs for optional parameters to avoid positional/keyword argument conflicts.
-    # The node may already have kwargs from pattern matching (e.g., is_gated_mlp, act_fn).
-    # We preserve existing kwargs and add/update enable_alltoall and mapping_config.
-
-    # Truncate positional args to only include required parameters (up to scales)
-    # Optional parameters (is_gated_mlp, act_fn, apply_routing_on_input, enable_alltoall, mapping_config)
-    # should be passed as kwargs only.
+    # Update node with sharded weights + enable_alltoall/mapping_config kwargs
+    # Truncate args to required params; optional params use kwargs to avoid conflicts
 
     num_scale_args = len(scale_names) * 3
     params_start_idx = 6 + num_scale_args  # Position after base args and scales
