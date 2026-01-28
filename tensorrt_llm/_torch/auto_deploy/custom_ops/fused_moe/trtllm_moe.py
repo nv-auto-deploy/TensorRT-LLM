@@ -178,12 +178,15 @@ def trtllm_moe_fused(
             runtime_max_tokens_per_rank = local_tokens
 
         # Build MoeAlltoAll using the deserialized Mapping object
+        # num_slots: Total number of routing slots (for EPLB, can be > num_experts with replicas)
+        # For auto_deploy without EPLB: num_slots == num_experts
         moe_a2a = MoeAlltoAll(
             mapping=mapping,
             max_num_tokens=max_num_tokens,
             top_k=top_k,
-            num_experts=global_num_experts,  # Use GLOBAL expert count for dispatch
+            num_slots=global_num_experts,  # No EPLB: num_slots == num_experts
             workspace_size_per_rank=workspace_size,
+            num_experts=None,  # None = EPLB disabled
         )
 
         # Validate and clamp expert IDs (using GLOBAL range)
@@ -249,16 +252,16 @@ def trtllm_moe_fused(
         # We must all-reduce these partial results BEFORE combine, because:
         # 1. All TP peers in the same EP group have the same tokens right now
         # 2. After combine, tokens scatter back to original GPUs - TP peers no longer share tokens
-        if mapping.moe_tp_size > 1:
-            moe_tp_group = _get_moe_tp_group(mapping)
-            if moe_tp_group is not None:
-                moe_out = moe_out.contiguous()
-                dist.all_reduce(moe_out, op=dist.ReduceOp.SUM, group=moe_tp_group)
+        # if mapping.moe_tp_size > 1:
 
         # COMBINE: Gather full results back to original GPUs
         moe_out = moe_out.view(mapping.moe_ep_size, runtime_max_tokens_per_rank, hidden_size)
         combined = moe_a2a.combine(moe_out, runtime_max_tokens_per_rank)
 
+        moe_tp_group = _get_moe_tp_group(mapping)
+        if moe_tp_group is not None:
+            combined = combined.contiguous()
+            dist.all_reduce(combined, op=dist.ReduceOp.SUM, group=moe_tp_group)
         return combined.view(x_shape)
 
     else:

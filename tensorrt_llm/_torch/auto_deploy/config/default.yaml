@@ -88,6 +88,7 @@ transforms:
     sharding_dims: ['TP','EP']
     enable_attention_dp: true
     shard_all_unprocessed: true
+    dp_tp_only: true
     allreduce_strategy: 'NCCL'
     dist_backend: auto
     requires_shape_prop: true

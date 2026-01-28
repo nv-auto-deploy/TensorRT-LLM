@@ -200,6 +200,12 @@ class MappingSerializer:
         ad_config.transforms['detect_sharding']['dist_mapping'] and creates
         a proper Mapping object.
 
+        When enable_attention_dp=True, enforces 1D MoE parallelism:
+        - dp_tp_only=False (default): EP-only (moe_ep_size=world_size, moe_tp_size=1)
+        - dp_tp_only=True: TP-only (moe_tp_size=world_size, moe_ep_size=1)
+
+        2D MoE parallelism (EP+TP) is NOT supported with attention-DP.
+
         Args:
             ad_config: LlmArgs configuration object containing transform configs
             world_size: Total number of processes in the distributed setup
@@ -212,13 +218,34 @@ class MappingSerializer:
             >>> mapping = MappingSerializer.from_config(ad_config, world_size=8, rank=0)
             >>> print(mapping.moe_ep_size)  # Access MoE expert parallelism size
         """
-        # Extract dist_mapping from config if present
-        dist_mapping_config = {}
-        if (
-            "detect_sharding" in ad_config.transforms
-            and "dist_mapping" in ad_config.transforms["detect_sharding"]
-        ):
-            dist_mapping_config = ad_config.transforms["detect_sharding"]["dist_mapping"]
+        # Extract config from transforms
+        sharding_config = ad_config.transforms.get("detect_sharding", {})
+        dist_mapping_config = sharding_config.get("dist_mapping", {})
+        enable_attention_dp = sharding_config.get("enable_attention_dp", False)
+        dp_tp_only = sharding_config.get("dp_tp_only", False)
+
+        # Determine MoE parallelism dimensions
+        if enable_attention_dp:
+            # EP + TP 2D parallelism is currently NOT supported with attention-DP.
+            # Enforce 1D parallelism to avoid broken 2D case.
+            if dp_tp_only:
+                # TP-only: all experts on all GPUs, use allgather + reducescatter
+                moe_tp_size = world_size
+                moe_ep_size = 1
+                ad_logger.info(
+                    f"Attention-DP with TP-only MoE: moe_tp_size={moe_tp_size}, moe_ep_size={moe_ep_size}"
+                )
+            else:
+                # EP-only: experts sharded across GPUs, use all-to-all dispatch/combine
+                moe_ep_size = world_size
+                moe_tp_size = 1
+                ad_logger.info(
+                    f"Attention-DP with EP-only MoE: moe_ep_size={moe_ep_size}, moe_tp_size={moe_tp_size}"
+                )
+        else:
+            # No attention-DP: use dist_mapping config or defaults
+            moe_tp_size = dist_mapping_config.get("moe_tp", 1)
+            moe_ep_size = dist_mapping_config.get("moe_ep", world_size)
 
         # Create Mapping with proper distributed configuration
         try:
@@ -226,9 +253,10 @@ class MappingSerializer:
                 world_size=world_size,
                 rank=rank,
                 tp_size=dist_mapping_config.get("tp", world_size),
-                moe_tp_size=dist_mapping_config.get("moe_tp", 1),
-                moe_ep_size=dist_mapping_config.get("moe_ep", world_size),
+                moe_tp_size=moe_tp_size,
+                moe_ep_size=moe_ep_size,
                 moe_cluster_size=dist_mapping_config.get("moe_cluster", 1),
+                enable_attention_dp=enable_attention_dp,
             )
         except ValueError as e:
             ad_logger.warning(f"Invalid parallel grid config: {e}")

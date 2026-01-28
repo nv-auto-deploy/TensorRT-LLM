@@ -1032,11 +1032,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     rank = mpi_rank()
 
     # Initialize Mapping from config
-    # Configuration flow:
-    # 1. YAML config (default.yaml) has transforms['detect_sharding']['dist_mapping']
-    # 2. MappingSerializer.from_config() extracts it and builds a proper Mapping object
-    # 3. This Mapping is passed to InferenceOptimizer -> SharedConfig -> all transforms
-    # 4. ShardingTransform uses SharedConfig.mapping instead of creating its own
     dist_mapping = MappingSerializer.from_config(ad_config, world_size, rank)
 
     dist = Distributed.get(dist_mapping)

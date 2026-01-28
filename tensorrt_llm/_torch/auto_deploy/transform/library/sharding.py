@@ -126,6 +126,20 @@ class DistBackend(Enum):
     TORCH = "torch"
 
 
+class DistOps(BaseModel):
+    """Container for distributed operations (backend-aware).
+
+    Holds references to all_gather, all_reduce, and reduce_scatter operations
+    for the selected backend (torch.distributed or TRT-LLM).
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    all_gather: Any = Field(description="All-gather operation for the selected backend")
+    all_reduce: Any = Field(description="All-reduce operation for the selected backend")
+    reduce_scatter: Any = Field(description="Reduce-scatter operation for the selected backend")
+
+
 ########################################################
 #  Sharding classes
 ########################################################
@@ -165,20 +179,77 @@ class ShardingTransformConfig(TransformConfig):
         description="When True, skip TP sharding as attention data parallelism is enabled.",
     )
 
+    dp_tp_only: bool = Field(
+        default=False,
+        description="When enable_attention_dp=True, use TP-only MoE (allgather+reducescatter) "
+        "instead of EP-only (all-to-all). TP-only has better load balance but higher memory. "
+        "2D MoE parallelism (EP+TP) is NOT supported with attention-DP.",
+    )
+
     dist_mapping: dict[str, int] = Field(default_factory=dict)
 
     mapping: Mapping = Field(default_factory=Mapping)
-
-    enable_attention_dp: bool = Field(
-        default=False,
-        description="When True, skip TP sharding as attention data parallelism is enabled.",
-    )
 
     max_num_tokens: int = Field(
         default=0,
         description="Maximum number of tokens (max_batch_size * max_seq_len) extracted from "
         "SequenceInfo during transform. Used for MoE all-to-all workspace allocation.",
     )
+
+    dist_backend: DistBackend = Field(
+        default=DistBackend.AUTO,
+        description="Distributed backend to use. Options: AUTO (automatic selection), "
+        "TRTLLM (force TRT-LLM ops), TORCH (force PyTorch distributed ops)",
+    )
+
+    dist_ops: DistOps = Field(
+        default=None,
+        description="Distributed operations for the selected backend (all_gather, all_reduce, reduce_scatter). "
+        "Initialized automatically in _init_dist_ops() based on dist_backend.",
+    )
+
+    def _init_dist_ops(self):
+        """Initialize distributed operations based on backend availability.
+
+        This method selects the appropriate distributed ops (all_gather, all_reduce, reduce_scatter)
+        based on the configured backend and runtime availability.
+        """
+        backend = self.dist_backend
+
+        # Handle DistBackend enum or string
+        if hasattr(backend, "value"):
+            backend = backend.value
+
+        if backend == "trtllm":
+            # Force TRT-LLM ops
+            self.dist_ops = DistOps(
+                all_gather=torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+                all_reduce=torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
+                reduce_scatter=torch.ops.auto_deploy.trtllm_dist_reduce_scatter.default,
+            )
+        elif backend == "torch":
+            # Force PyTorch distributed ops
+            self.dist_ops = DistOps(
+                all_gather=torch.ops.auto_deploy.torch_dist_all_gather.default,
+                all_reduce=torch.ops.auto_deploy.torch_dist_all_reduce.default,
+                reduce_scatter=torch.ops.auto_deploy.torch_dist_reduce_scatter.default,
+            )
+        else:  # auto
+            # Automatically select based on availability
+            if is_trtllm_op_available():
+                # Use TRT-LLM optimized ops in MPI mode
+                self.dist_ops = DistOps(
+                    all_gather=torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+                    all_reduce=torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
+                    reduce_scatter=torch.ops.auto_deploy.trtllm_dist_reduce_scatter.default,
+                )
+            else:
+                # Use PyTorch distributed ops in demollm mode
+                self.dist_ops = DistOps(
+                    all_gather=torch.ops.auto_deploy.torch_dist_all_gather.default,
+                    all_reduce=torch.ops.auto_deploy.torch_dist_all_reduce.default,
+                    reduce_scatter=torch.ops.auto_deploy.torch_dist_reduce_scatter.default,
+                )
 
     def _init_mapping(self):
         """Initialize Mapping from dist_mapping config.
@@ -826,6 +897,9 @@ class Sharding(BaseTransform):
             # Fallback to creating mapping from dist_mapping config if not provided
             config._init_mapping()
 
+        # Initialize distributed operations based on backend availability
+        config._init_dist_ops()
+
         config.validate_config()
 
         # Extract max_num_tokens from sequence info for MoE all-to-all workspace allocation
@@ -852,7 +926,7 @@ class Sharding(BaseTransform):
 
         info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
         ad_logger.info(MappingSerializer.print_grid(config.mapping))
-        if config.enable_attention_dp:
+        if config.mapping.enable_attention_dp:
             # only MoE all-to-all sharding is supported in attention DP mode
             # we already enforced 1D sharding (TP=1, EP=world_size) in init_mapping
             ad_logger.info(
@@ -1072,47 +1146,6 @@ def validate_allreduce_strategy(v):
     if isinstance(v, int):
         return AllReduceStrategy(v)
     return v  # Let Pydantic handle other types
-
-
-def _get_dist_ops(backend: str):
-    """Get the appropriate distributed ops based on backend availability.
-
-    Args:
-        backend: The distributed backend to use. Can be 'auto', 'trtllm', or 'torch'.
-                 'auto' will automatically select based on availability.
-
-    Returns tuple of (all_gather_op, all_reduce_op) for the current backend.
-    """
-    # Handle DistBackend enum or string
-    if hasattr(backend, "value"):
-        backend = backend.value
-
-    if backend == "trtllm":
-        # Force TRT-LLM ops
-        return (
-            torch.ops.auto_deploy.trtllm_dist_all_gather.default,
-            torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
-        )
-    elif backend == "torch":
-        # Force PyTorch distributed ops
-        return (
-            torch.ops.auto_deploy.torch_dist_all_gather.default,
-            torch.ops.auto_deploy.torch_dist_all_reduce.default,
-        )
-    else:  # auto
-        # Automatically select based on availability
-        if is_trtllm_op_available():
-            # Use TRT-LLM optimized ops in MPI mode
-            return (
-                torch.ops.auto_deploy.trtllm_dist_all_gather.default,
-                torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
-            )
-        else:
-            # Use PyTorch distributed ops in demollm mode
-            return (
-                torch.ops.auto_deploy.torch_dist_all_gather.default,
-                torch.ops.auto_deploy.torch_dist_all_reduce.default,
-            )
 
 
 def _validate_sharded_shapes(
@@ -1367,10 +1400,9 @@ def _shard_parameter_node(
         return
 
     # figure out the right dist op (backend-aware)
-    all_gather_op, all_reduce_op = _get_dist_ops(config.dist_backend)
     dist_lookup = {
-        0: (all_gather_op, -1),
-        1: (all_reduce_op, allreduce_strategy),
+        0: (config.dist_ops.all_gather, -1),
+        1: (config.dist_ops.all_reduce, allreduce_strategy),
     }
     fn_dist, *dist_args = dist_lookup[dim]
 
@@ -1407,13 +1439,17 @@ def _insert_sharded_moe(
     NOTE: allreduce_strategy is MANDATORY.
     """
     # =====================================================================================
-    # CONFIGURATION
+    # DISTRIBUTED GRID CONFIGURATION
     # =====================================================================================
     ep_size = config.mapping.moe_ep_size
     ep_rank = config.mapping.moe_ep_rank
     tp_size = config.mapping.moe_tp_size
     tp_rank = config.mapping.moe_tp_rank
-    enable_alltoall = config.enable_attention_dp  # All-to-all when attention uses data parallelism
+    # All-to-all is used when:
+    # 1. Attention uses data parallelism (tokens distributed across ranks)
+    # 2. AND we have EP > 1 (experts distributed across ranks)
+    # When dp_tp_only=True, ep_size=1, so enable_alltoall=False (use allgather+reducescatter instead)
+    enable_alltoall = config.enable_attention_dp and ep_size > 1
 
     allreduce_strategy = config.allreduce_strategy.name
     if allreduce_strategy is None:
@@ -1562,17 +1598,77 @@ def _insert_sharded_moe(
     node.kwargs = new_kwargs
 
     ad_logger.debug(
-        f"Sharded MoE node {node.name}: enable_alltoall={enable_alltoall}, ep_size={ep_size}"
+        f"Sharded MoE node {node.name}: enable_alltoall={enable_alltoall}, ep_size={ep_size}, "
+        f"tp_size={tp_size}, enable_attention_dp={config.enable_attention_dp}"
     )
 
     if not enable_alltoall:
-        # Add all_reduce for non-all-to-all paradigm
-        with gm.graph.inserting_after(node):
-            dist_node = gm.graph.call_function(
-                torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node, allreduce_strategy)
-            )
-            node.replace_all_uses_with(dist_node)
-            dist_node.replace_input_with(dist_node, node)
+        # =====================================================================================
+        # Non-all-to-all paradigm: add collective ops for TP reduction
+        # =====================================================================================
+        if config.enable_attention_dp:
+            # TP-only with attention-DP (dp_tp_only=True):
+            # Tokens are DP-distributed, but experts are NOT EP-sharded (ep_size=1).
+            # We need to:
+            # 1. allgather tokens from all ranks BEFORE MoE (so each rank sees all tokens)
+            # 2. reducescatter AFTER MoE (reduce TP partials AND scatter back to original ranks)
+            #
+            # This replaces all-to-all dispatch/combine with static allgather/reducescatter.
+            # Benefits: perfect load balance, static NCCL patterns, no dynamic buffers.
+
+            # Get the input node (hidden states)
+            input_node = args[0]
+            selected_experts_node = args[1]
+            routing_weights_node = args[2]
+
+            # Insert allgather for all token-dimension tensors BEFORE the MoE node
+            # TODO: Consider fusing these three allgathers into one batched collective
+            with gm.graph.inserting_before(node):
+                # Allgather hidden states
+                allgather_input = gm.graph.call_function(
+                    config.dist_ops.all_gather,
+                    args=(input_node,),
+                    kwargs={"dim": 0},  # Gather along token dimension
+                )
+                # Allgather selected_experts
+                allgather_experts = gm.graph.call_function(
+                    config.dist_ops.all_gather,
+                    args=(selected_experts_node,),
+                    kwargs={"dim": 0},  # Gather along token dimension
+                )
+                # Allgather routing_weights
+                allgather_weights = gm.graph.call_function(
+                    config.dist_ops.all_gather,
+                    args=(routing_weights_node,),
+                    kwargs={"dim": 0},  # Gather along token dimension
+                )
+
+            # Update MoE node to use allgathered inputs
+            args[0] = allgather_input
+            args[1] = allgather_experts
+            args[2] = allgather_weights
+            node.args = tuple(args)
+
+            # Insert reducescatter AFTER the MoE node
+            with gm.graph.inserting_after(node):
+                reducescatter_node = gm.graph.call_function(
+                    config.dist_ops.reduce_scatter,
+                    args=(node,),
+                    kwargs={"dim": 0},  # Scatter along token dimension
+                )
+                node.replace_all_uses_with(reducescatter_node)
+                reducescatter_node.replace_input_with(reducescatter_node, node)
+        else:
+            # Standard TP with all_reduce:
+            # No attention-DP, so tokens are NOT distributed across ranks.
+            # Just add all_reduce after MoE to sum TP partial results.
+            with gm.graph.inserting_after(node):
+                dist_node = gm.graph.call_function(
+                    config.dist_ops.all_reduce,
+                    args=(node, allreduce_strategy),
+                )
+                node.replace_all_uses_with(dist_node)
+                dist_node.replace_input_with(dist_node, node)
 
     # =====================================================================================
     # Cleanup unused expert weights and scales
