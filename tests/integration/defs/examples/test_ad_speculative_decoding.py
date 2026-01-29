@@ -499,6 +499,8 @@ def test_autodeploy_eagle3_one_model(batch_size: int):
     acceptance_stats = check_acceptance(llm, min_acceptance_rate=0.10, verbose=True)
     print(f"\n{acceptance_stats}")
 
+    llm.shutdown()
+
     print("\n" + "=" * 80)
     print("SUCCESS! Eagle3 one model generation and acceptance rate test completed")
     print("=" * 80)
