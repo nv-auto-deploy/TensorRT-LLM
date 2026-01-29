@@ -77,6 +77,13 @@ from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
 
+@dataclass
+class ReportingInfo:
+    print_log: bool = False
+    enable_iter_perf_stats: bool = False
+    enable_iter_req_stats: bool = False
+
+
 def get_extra_seq_len_for_kv_cache(ad_config: LlmArgs) -> int:
     """Compute extra sequence length needed for KV cache sizing.
 
@@ -91,10 +98,9 @@ def get_extra_seq_len_for_kv_cache(ad_config: LlmArgs) -> int:
     extra_seq_len = 0
     spec_config = ad_config.speculative_config
 
-    # Overlap scheduler requires +1 token per sequence for bookkeeping lag
+    # Overlap scheduler requires extra tokens for bookkeeping lag
     if not ad_config.disable_overlap_scheduler:
         extra_seq_len += 1
-        # With overlap + spec decoding, draft tokens are pre-allocated
         if spec_config is not None:
             extra_seq_len += spec_config.max_total_draft_tokens
 
@@ -105,13 +111,6 @@ def get_extra_seq_len_for_kv_cache(ad_config: LlmArgs) -> int:
         extra_seq_len += get_num_extra_kv_tokens(spec_config)
 
     return extra_seq_len
-
-
-@dataclass
-class ReportingInfo:
-    print_log: bool = False
-    enable_iter_perf_stats: bool = False
-    enable_iter_req_stats: bool = False
 
 
 def construct_draft_llm_args(
@@ -194,8 +193,8 @@ def create_draft_kv_cache_manager_maybe(
     # Get the appropriate KV cache manager class
     kv_cache_manager_cls = get_kv_cache_manager_cls(draft_model_engine.model.model_config)
 
-    # TODO: Verify if this sizing adjustment is actually necessary for AutoDeploy, or if
-    # the layerwise pools handle this independently.
+    # Similar to logic in py_executor_creator.py, we allocate extra tokens for speculative decoding
+    # and overlap scheduling.
     max_seq_len_for_kv_cache = ad_config.max_seq_len + get_extra_seq_len_for_kv_cache(ad_config)
 
     return _create_kv_cache_manager(
@@ -368,18 +367,6 @@ class ADEngine(ModelEngine):
     def _device(self) -> DeviceLikeType:
         return self.cache_seq_interface.device
 
-    @property
-    def without_logits(self) -> bool:
-        """Check if this engine uses one-model speculative decoding.
-
-        When True, the model performs sampling internally and returns tokens
-        instead of logits. The sampler should not sample from logits but
-        instead use the pre-computed tokens from the model output.
-        """
-        if self.spec_config is None:
-            return False
-        return self.spec_config.spec_dec_mode.is_eagle3_one_model()
-
     @classmethod
     def build_from_config(
         cls,
@@ -407,6 +394,7 @@ class ADEngine(ModelEngine):
             max_num_tokens=ad_config.max_num_tokens,
             vocab_size_padded=factory.vocab_size_padded,
             extra_seq_len_for_kv_cache=get_extra_seq_len_for_kv_cache(ad_config),
+            spec_config=ad_config.speculative_config,
         )
 
         reporting_info = ReportingInfo(
@@ -755,7 +743,6 @@ class ADEngine(ModelEngine):
 
         self.cache_seq_interface.info.run_host_prepare_for_attention_forward()
 
-        # Use internal resource manager (from EagleWrapper) if external one is not available
         spec_resource_manager = spec_resource_manager or self.get_internal_resource_manager()
 
         if spec_resource_manager is not None and isinstance(
@@ -770,8 +757,8 @@ class ADEngine(ModelEngine):
         # TODO: handle extend requests and draft requests for specdec
         self.iter_states["num_generation_tokens"] = num_generation_tokens
 
-    @nvtx_range("ad_compute_forward")
-    def _compute_forward(self) -> Dict[str, torch.Tensor]:
+    @nvtx_range("ad_compute_model_outputs")
+    def _compute_model_outputs(self) -> Dict[str, torch.Tensor]:
         """Run model forward and return outputs in dict format.
 
         For regular models, returns {"logits": tensor}.
@@ -780,14 +767,11 @@ class ADEngine(ModelEngine):
         """
         # Print model.forward() arguments at the beginning of each iteration
         print(f"\n{'=' * 60}")
-        print(f"[ADEngine._compute_forward] Iteration {self.iter_counter}")
+        print(f"[ADEngine._compute_model_outputs] Iteration {self.iter_counter}")
         print(f"{'=' * 60}")
         print("model.forward() arguments:")
-        # Skip large cache tensors that aren't useful for debugging
-        skip_prefixes = ("k_cache", "v_cache")
+
         for name, tensor in self.cache_seq_interface.named_args.items():
-            if name.startswith(skip_prefixes):
-                continue
             if isinstance(tensor, torch.Tensor):
                 print(
                     f"  {name}: shape={tensor.shape}, dtype={tensor.dtype}, device={tensor.device}"
@@ -818,33 +802,17 @@ class ADEngine(ModelEngine):
         # TRTLLMSampler expects float32 logits. PyTorchModelEngine always casts to float32 regardless.
         return {"logits": logits.float()}
 
-    @nvtx_range("ad_compute_logits")
-    def _compute_logits(self) -> torch.Tensor:
-        """Backward compatible method that returns just logits."""
-        outputs = self._compute_forward()
-        return outputs["logits"]
-
     def get_max_num_sequences(self) -> int:
         """Maximum number of sequences supported by the engine."""
         return self.cache_seq_interface.info.max_batch_size
 
     def get_internal_resource_manager(self):
-        """Get the internal resource manager if the model has one.
+        """Get internal resource manager if the model has one.
 
-        For one-model speculative decoding (EagleWrapper), the resource manager
-        is stored inside the EagleWrapper model itself rather than in the
-        external ResourceManager. This method retrieves it.
-
-        Note: After torch.compile, the model may be wrapped in OptimizedModule,
-        so we check for the resource_manager attribute instead of using isinstance.
-
-        Returns:
-            The ADHiddenStateManager from EagleWrapper, or None if the model
-            doesn't have an internal resource manager.
+        For one-model speculative decoding, the resource manager is stored inside the model itself
+        instead of externally.
         """
-        if hasattr(self.model, "resource_manager"):
-            return self.model.resource_manager
-        return None
+        return getattr(self.model, "resource_manager", None)
 
     @torch.inference_mode()
     @maybe_pad_for_cuda_graph
@@ -865,10 +833,10 @@ class ADEngine(ModelEngine):
         )
         self.iter_counter += 1
 
-        # Run model forward - _compute_forward handles both regular and EagleWrapperOutput
-        outputs = self._compute_forward()
+        outputs = self._compute_model_outputs()
 
-        # save hidden states after running model.forward() in _compute_forward()
+        # If we have an external spec resource manager (two-model spec dec),
+        # save hidden states after running model.forward() in _compute_model_outputs()
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER
         )
@@ -879,10 +847,9 @@ class ADEngine(ModelEngine):
 
         # For one-model spec dec (without_logits=True), pass through all outputs
         # The sampler will use new_tokens, etc. instead of sampling from logits
-        if self.without_logits:
+        if self.spec_config is not None and self.spec_config.spec_dec_mode.without_logits():
             return outputs
 
-        # For regular mode, only pass logits and apply post-processors
         if self.mapping is not None:
             self._execute_logit_post_processors(scheduled_requests, outputs)
 

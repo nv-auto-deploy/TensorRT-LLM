@@ -253,6 +253,8 @@ def create_py_executor(
         max_batch_size,
     ) = llm_args.get_runtime_sizes()
 
+    print(f"[create_py_executor] max_seq_len (initial): {max_seq_len}")
+
     tokens_per_block = kv_cache_config.tokens_per_block
     if llm_args.attn_backend == "VANILLA":
         tokens_per_block = max_num_tokens
@@ -425,14 +427,30 @@ def create_py_executor(
     # PyTorchModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
+    print(f"[PyExec] Base model_engine.max_seq_len: {model_engine.max_seq_len}")
+    print(f"[PyExec] spec_config: {spec_config}")
+    print(
+        f"[PyExec] disable_overlap_scheduler: {llm_args.disable_overlap_scheduler}"
+    )
     if not llm_args.disable_overlap_scheduler:
         model_engine_max_seq_len = model_engine.max_seq_len + 1
+        print(f"[PyExec] +1 for overlap scheduler")
         if spec_config is not None:
             model_engine_max_seq_len += spec_config.max_total_draft_tokens
+            print(
+                f"[PyExec] +{spec_config.max_total_draft_tokens} for overlap+spec"
+            )
 
     if spec_config is not None:
-        model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
+        num_extra = get_num_extra_kv_tokens(spec_config)
+        model_engine_max_seq_len += num_extra
+        print(
+            f"[PyExec] +{num_extra} for one-model extra (get_num_extra_kv_tokens)"
+        )
         model_engine_max_seq_len += spec_config.max_total_draft_tokens
+        print(
+            f"[PyExec] +{spec_config.max_total_draft_tokens} for spec dec draft tokens"
+        )
 
     if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
         logger.warning(
@@ -440,6 +458,14 @@ def create_py_executor(
         )
 
     max_seq_len = model_engine_max_seq_len
+
+    print(
+        f"[create_py_executor] max_seq_len (after overlap scheduler + spec dec update): {max_seq_len}"
+    )
+    print(
+        f"[create_py_executor] model_engine_max_seq_len: {model_engine_max_seq_len}"
+    )
+    print(f"[create_py_executor] net_max_seq_len: {net_max_seq_len}")
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
 

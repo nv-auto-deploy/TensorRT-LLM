@@ -14,7 +14,7 @@ from ...llmapi.llm_args import (
     _ParallelConfig,
 )
 from .models import ModelFactory, ModelFactoryRegistry
-from .models.eagle_one_model import EagleOneModelFactory
+from .models.eagle import EagleOneModelFactory
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
 

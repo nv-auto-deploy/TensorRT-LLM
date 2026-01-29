@@ -522,32 +522,14 @@ class EagleWrapper(nn.Module):
         submodule_name: str,
         cache_prefixes: tuple[str, ...] = ("k_cache", "v_cache", "hidden_states_cache"),
     ) -> dict:
-        """Filter kwargs to only include entries relevant to the specified submodule.
-
-        When the combined model receives kwargs with caches for both target and draft models
-        (e.g., k_cache_target_model_0, k_cache_draft_model_0), each submodule only needs
-        its own caches. This method filters to only include caches for the specified submodule.
-
-        Args:
-            kwargs: The full kwargs dict containing caches for all submodules.
-            submodule_name: The submodule to filter for ("target_model" or "draft_model").
-            cache_prefixes: Prefixes that identify cache-related kwargs.
-
-        Returns:
-            A filtered kwargs dict with only the relevant entries.
-        """
         filtered = {}
         for key, value in kwargs.items():
-            # Check if this is a cache-related kwarg
             is_cache_kwarg = any(key.startswith(prefix) for prefix in cache_prefixes)
 
             if is_cache_kwarg:
-                # For cache kwargs, only keep if it belongs to this submodule
                 if submodule_name in key:
                     filtered[key] = value
-                # Otherwise skip it (belongs to another submodule)
             else:
-                # Pass through non-cache entries unchanged
                 filtered[key] = value
 
         return filtered
@@ -556,8 +538,6 @@ class EagleWrapper(nn.Module):
         self,
         kwargs: dict,
         position_ids: torch.Tensor,
-        num_sequences: int,
-        device: torch.device,
         decode_batch_info_host: torch.Tensor,
         decode_cu_seqlen: torch.Tensor,
         decode_cu_seqlen_host: torch.Tensor,
@@ -568,19 +548,12 @@ class EagleWrapper(nn.Module):
         This utility takes the current kwargs (already filtered for a submodule) and
         returns updated kwargs with all position metadata adjusted by the given increment,
         suitable for moving forward or backward in the sequence.
-
-        Args:
-            kwargs: Current kwargs dict (already filtered for the submodule).
-            position_ids: Current position_ids tensor of shape [batch, 1].
-            num_sequences: Number of sequences in the batch.
-            device: Device to create tensors on.
-            decode_batch_info_host: Pre-computed decode-mode batch info [0, 0, num_sequences].
-            decode_cu_seqlen: Pre-computed decode-mode cu_seqlen [0, 1, 2, ..., num_sequences].
-            decode_cu_seqlen_host: Pre-computed decode-mode cu_seqlen on CPU.
             increment: Integer value to adjust positions by (positive = forward, negative = backward).
 
         Returns:
             Tuple of (new_position_ids, new_kwargs) with all metadata adjusted by increment.
+
+        TODO: Need to handle the case where the increment wraps around a page boundary.
         """
         # Get page_size from k_cache shape: [num_pages, page_size, num_kv_heads, head_dim]
         page_size = None
@@ -613,10 +586,8 @@ class EagleWrapper(nn.Module):
                 # For now, we leave cu_num_pages unchanged and assume sufficient pre-allocation.
                 new_kwargs[key] = val
             elif key == "seq_len_with_cache":
-                # Adjust each sequence's length by increment
                 new_kwargs[key] = val + increment
             elif key == "seq_len_with_cache_host":
-                # Adjust each sequence's length by increment (CPU tensor)
                 new_kwargs[key] = val + increment
             elif key == "last_page_len":
                 # Adjust by increment, wrapping at page boundaries
@@ -1637,8 +1608,6 @@ class EagleWrapper(nn.Module):
                 padded_position_ids_decode, draft_kwargs = self._increment_position_metadata(
                     current_decode_kwargs,
                     current_decode_position_ids,
-                    num_sequences,
-                    device,
                     decode_batch_info_host,
                     decode_cu_seqlen,
                     decode_cu_seqlen_host,
@@ -2026,21 +1995,13 @@ class EagleWrapper(nn.Module):
             new_tokens_lens=num_newly_accepted_tokens,
         )
 
-    @classmethod
-    def build_from_models(cls, config, target_model, draft_model, resource_manager):
-        return cls(
-            config,
-            target_model=target_model,
-            draft_model=draft_model,
-            resource_manager=resource_manager,
-        )
-
 
 class ADHiddenStateManager(Eagle3ResourceManager):
     """AutoDeploy-specific hidden state manager for Eagle3 speculative decoding.
 
-    This class extends Eagle3ResourceManager with functionality specific to
-    AutoDeploy's cached sequence interface for managing hidden states.
+    Stores hidden states for use by the draft model in EagleWrapper.forward().
+    This class extends Eagle3ResourceManager with functionality tailored to
+    how AutoDeploy captures hidden states.
     """
 
     def __init__(
@@ -2066,11 +2027,6 @@ class ADHiddenStateManager(Eagle3ResourceManager):
         config: EagleDecodingConfig,
         max_num_requests: int,
     ) -> "ADHiddenStateManager":
-        print(f"[ADHiddenStateManager.build_from_target_engine] engine: {engine}")
-        print(f"[ADHiddenStateManager.build_from_target_engine] config: {config}")
-        print(
-            f"[ADHiddenStateManager.build_from_target_engine] cache_seq_interface: {engine.cache_seq_interface}"
-        )
         hidden_state_buffer = cls._get_hidden_state_buffers(engine.cache_seq_interface)[0]
         dtype = hidden_state_buffer.dtype
         hidden_size = hidden_state_buffer.shape[1]
@@ -2101,8 +2057,6 @@ class ADHiddenStateManager(Eagle3ResourceManager):
 
         dtype = target_factory.dtype
         assert dtype is not None, "dtype must be available in target factory."
-
-        print(f"Building ADHiddenStateManager with dtype: {dtype}")
 
         return cls(
             config=config,
@@ -2176,7 +2130,6 @@ class ADHiddenStateManager(Eagle3ResourceManager):
         if not hidden_state_buffers:
             return
 
-        # Slice to num_tokens and concatenate along hidden dimension
         hidden_states = [buffer[:num_tokens] for buffer in hidden_state_buffers]
         hidden_states = torch.cat(hidden_states, dim=1)
         hidden_states = hidden_states.to(dtype=self.dtype)
@@ -2186,10 +2139,6 @@ class ADHiddenStateManager(Eagle3ResourceManager):
         self.hidden_states[:, : hidden_states.shape[1]].index_copy_(0, token_idx, hidden_states)
 
     def capture_hidden_states(self, cache_seq_interface) -> None:
-        """Capture configured hidden states that have been written by the model,
-        in a format that can be used by the draft model.
-
-        """
         full_hidden_states = self._get_hidden_state_buffers(cache_seq_interface)
         if not full_hidden_states:
             return

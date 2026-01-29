@@ -36,8 +36,7 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     EagleWrapper,
     EagleWrapperConfig,
 )
-from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
-from tensorrt_llm._torch.auto_deploy.models.eagle_one_model import EagleOneModelFactory
+from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory, EagleOneModelFactory
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig, KvCacheConfig
 
 prompts = [

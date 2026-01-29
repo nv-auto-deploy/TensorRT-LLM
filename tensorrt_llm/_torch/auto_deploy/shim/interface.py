@@ -13,6 +13,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ...pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ...pyexecutor.resource_manager import KVCacheManager
+from ...speculative.utils import get_num_extra_kv_tokens
 from ..custom_ops.attention_interface import (
     PagedResourceHandler,
     ResourceHandler,
@@ -58,6 +59,7 @@ class CachedSequenceInterface:
         max_num_tokens: Optional[int] = None,
         vocab_size_padded: Optional[int] = None,
         extra_seq_len_for_kv_cache: int = 0,
+        spec_config=None,
     ) -> None:
         """Initialize the CachedSequenceInterface.
 
@@ -69,8 +71,8 @@ class CachedSequenceInterface:
             max_num_tokens: Maximum total tokens across all sequences. If None, computed from
                 max_seq_len and max_batch_size.
             vocab_size_padded: Padded vocabulary size of the model.
-            extra_seq_len_for_kv_cache: Extra sequence length for KV cache sizing (for speculative
-                decoding and overlap scheduler). Defaults to 0.
+            spec_config: Speculative decoding configuration. Passed to KVCacheManager for
+                runtime use (num_extra_kv_tokens, max_draft_len, etc.). Defaults to None.
         """
         # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired
         # device and not the actual device unlike, e.g., in SequenceInfo. We rely on the attribute
@@ -101,11 +103,7 @@ class CachedSequenceInterface:
         self._state_resource_order: ResourceHandlerDict = {}  # State resources (ssm states)
         self._current_submodule_name: str = ""
         self._extra_seq_len_for_kv_cache: int = extra_seq_len_for_kv_cache
-
-    @property
-    def max_seq_len_for_kv_cache(self) -> int:
-        """Return the max sequence length to use for KV cache allocation."""
-        return self.info.max_seq_len + self._extra_seq_len_for_kv_cache
+        self._spec_config = spec_config
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -135,6 +133,21 @@ class CachedSequenceInterface:
     def add_resource(self, name: str, resource_handler: ResourceHandler) -> None:
         """Add a resource handler to the cache interface."""
         self._resource_lookup[name] = resource_handler
+
+    def _update_kv_cache_manager_for_spec_dec(self) -> None:
+        """Update KVCacheManager spec-related attributes for speculative decoding.
+
+        We need these values to be properly set to get good KV cache allocation.
+        However, we cannot pass spec_config directly to the KVCacheManager constructor
+        because it would add an extra speculative layer that we have already handled.
+        """
+        self._kv_cache_manager.num_extra_kv_tokens = get_num_extra_kv_tokens(self._spec_config)
+        self._kv_cache_manager.max_draft_len = (
+            self._spec_config.max_draft_len if self._spec_config is not None else 0
+        )
+        self._kv_cache_manager.max_total_draft_tokens = (
+            self._spec_config.max_total_draft_tokens if self._spec_config is not None else 0
+        )
 
     def _create_kv_cache_manager(self, max_tokens: Optional[int] = None) -> int:
         """Create KVCacheManager or MambaHybridCacheManager with multi-layer byte-level params.
@@ -214,7 +227,7 @@ class CachedSequenceInterface:
             "num_kv_heads": num_kv_heads_per_layer,  # per-layer bytes_per_token
             "head_dim": 1,  # all bytes in num_kv_heads
             "tokens_per_block": kv_cache_config.tokens_per_block,
-            "max_seq_len": self.max_seq_len_for_kv_cache,
+            "max_seq_len": self.info.max_seq_len + self._extra_seq_len_for_kv_cache,
             "max_batch_size": self.info.max_batch_size,
             "mapping": Mapping(),
             # NOTE (lucaslie): this is the only 1-byte dtype currently supported by the
@@ -261,6 +274,8 @@ class CachedSequenceInterface:
         else:
             # No state resources - use pure KVCacheManager
             self._kv_cache_manager = KVCacheManager(**kv_cache_kwargs)
+
+        self._update_kv_cache_manager_for_spec_dec()
 
         # store the tuned kv_cache_config
         self._kv_cache_config_tuned = kv_cache_config
