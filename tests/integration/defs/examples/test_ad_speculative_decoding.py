@@ -37,12 +37,31 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     EagleWrapperConfig,
 )
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
+from tensorrt_llm._torch.auto_deploy.models.eagle_one_model import EagleOneModelFactory
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig, KvCacheConfig
 
 prompts = [
     "What is the capital of France?",
     "Please explain the concept of gravity in simple words and a single sentence.",
 ]
+
+
+@dataclass
+class AcceptanceStats:
+    """Statistics from speculative decoding acceptance rate check."""
+
+    acceptance_rate: float
+    total_drafted: int
+    total_accepted: int
+    num_decode_iters: int
+
+    def __repr__(self) -> str:
+        return (
+            f"AcceptanceStats(rate={self.acceptance_rate:.2%}, "
+            f"drafted={self.total_drafted}, accepted={self.total_accepted}, "
+            f"decode_iters={self.num_decode_iters})"
+        )
+
 
 EAGLE_MODEL_SUBPATH = "EAGLE3-LLaMA3.1-Instruct-8B"
 LLAMA_BASE_SUBPATH = "llama-3.1-model/Llama-3.1-8B-Instruct"
@@ -109,7 +128,7 @@ def run_with_autodeploy(model, speculative_config, batch_size):
         "world_size": 1,
         "kv_cache_config": kv_cache_config,
         "disable_overlap_scheduler": True,
-        "max_num_tokens": 64,
+        "max_num_tokens": 128,
     }
 
     # Configure experiment with prompts
@@ -127,7 +146,7 @@ def run_with_autodeploy(model, speculative_config, batch_size):
 
     # Add sampling parameters (deterministic with temperature=0.0 and fixed seed)
     cfg.prompt.sp_kwargs = {
-        "max_tokens": 50,
+        "max_tokens": 128,
         "top_k": None,
         "temperature": 0.0,
         "seed": 42,
@@ -139,6 +158,84 @@ def run_with_autodeploy(model, speculative_config, batch_size):
     # Extract and return prompts_and_outputs
     assert "prompts_and_outputs" in result, "Result should contain 'prompts_and_outputs'"
     return result["prompts_and_outputs"]
+
+
+def generate_and_check_acceptance(
+    model,
+    speculative_config,
+    batch_size,
+    min_acceptance_rate: float = 0.10,
+    verbose: bool = True,
+):
+    """Generate with AutoDeploy LLM and check acceptance rate.
+
+    Creates an LLM instance, runs batched generation on prompts,
+    and verifies acceptance rate is above a minimum threshold.
+
+    Args:
+        model: Path to the base model
+        speculative_config: Speculative decoding config
+        batch_size: Number of prompts to process
+        min_acceptance_rate: Minimum acceptance rate threshold (default 0.10 = 10%).
+        verbose: If True, print verbose output
+
+    Returns:
+        Tuple of (prompts_and_outputs, acceptance_stats) where acceptance_stats is
+        an AcceptanceStats object.
+    """
+    # Select prompts based on batch size
+    selected_prompts = prompts[:batch_size]
+
+    # Configure KV cache
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=0.01,
+    )
+
+    # Create AutoDeploy LLM with iter perf stats enabled
+    llm = LLM(
+        model=model,
+        skip_loading_weights=False,
+        speculative_config=speculative_config,
+        runtime="trtllm",
+        world_size=1,
+        kv_cache_config=kv_cache_config,
+        disable_overlap_scheduler=True,
+        max_num_tokens=128,
+        enable_iter_perf_stats=True,
+    )
+
+    # Configure sampling parameters
+    sampling_params = SamplingParams(
+        max_tokens=128,
+        top_k=None,
+        temperature=0.0,
+        seed=42,
+    )
+
+    # Run batched generation with prompts directly
+    outputs = llm.generate(selected_prompts, sampling_params)
+
+    # Handle both single and batched outputs
+    if not isinstance(outputs, list):
+        outputs = [outputs]
+
+    # Build prompts_and_outputs list
+    prompts_and_outputs = []
+    for prompt, output in zip(selected_prompts, outputs):
+        output_text = output.outputs[0].text
+        prompts_and_outputs.append((prompt, output_text))
+        if verbose:
+            print(f"Prompt: {prompt}")
+            print(f"Output: {output_text}\n")
+
+    # Check acceptance rate
+    acceptance_stats = check_acceptance(
+        llm, min_acceptance_rate=min_acceptance_rate, verbose=verbose
+    )
+
+    llm.shutdown()
+
+    return prompts_and_outputs, acceptance_stats
 
 
 # Note: This test tests exact equality of outputs between speculative and baseline modes.
@@ -210,14 +307,74 @@ def test_autodeploy_spec_dec_output(spec_dec_mode):
     print("=" * 80)
 
 
+def check_acceptance(
+    llm,
+    min_acceptance_rate: float = 0.10,
+    verbose: bool = True,
+) -> AcceptanceStats:
+    """Check acceptance rate using get_stats() API after generation.
+
+    Collects iteration stats and computes the aggregate acceptance rate
+    for speculative decoding. Must be called after generation.
+
+    Args:
+        llm: The LLM instance with enable_iter_perf_stats=True.
+        min_acceptance_rate: Minimum acceptance rate threshold (default 0.10 = 10%).
+                            Set to 0.0 to skip assertion.
+        verbose: If True, print per-iteration stats.
+
+    Returns:
+        AcceptanceStats with acceptance_rate, total_drafted, total_accepted, num_decode_iters
+
+    Raises:
+        AssertionError: If acceptance rate is below min_acceptance_rate (when > 0).
+    """
+    # Get iteration stats after generation
+    stats = llm.get_stats(timeout=2)
+    if verbose:
+        print(f"\nCollected {len(stats)} iteration stats")
+
+    # Extract speculative decoding stats from each iteration
+    total_drafted = 0
+    total_accepted = 0
+    num_decode_iters = 0
+
+    for i, stat in enumerate(stats):
+        spec_stats = stat.get("specDecodingStats", {})
+        num_draft = spec_stats.get("numDraftTokens", 0)
+        num_accepted_iter = spec_stats.get("numAcceptedTokens", 0)
+
+        if num_draft > 0:
+            total_drafted += num_draft
+            total_accepted += num_accepted_iter
+            num_decode_iters += 1
+            if verbose:
+                print(f"  Iter {i}: drafted={num_draft}, accepted={num_accepted_iter}")
+
+    accept_rate = total_accepted / total_drafted if total_drafted > 0 else 0.0
+
+    # Verify acceptance rate is above minimum threshold
+    if min_acceptance_rate > 0:
+        assert accept_rate > min_acceptance_rate, (
+            f"Acceptance rate {accept_rate:.2%} is below minimum threshold {min_acceptance_rate:.0%}"
+        )
+
+    return AcceptanceStats(
+        acceptance_rate=accept_rate,
+        total_drafted=total_drafted,
+        total_accepted=total_accepted,
+        num_decode_iters=num_decode_iters,
+    )
+
+
 def test_autodeploy_eagle3_acceptance_rate():
     """Test Eagle3 acceptance rate with AutoDeploy engine.
 
-    Runs Eagle3 speculative decoding with streaming and verifies
-    that the acceptance rate is above a minimum threshold.
+    Runs Eagle3 speculative decoding and verifies that the acceptance rate
+    is above a minimum threshold using the get_stats() API.
     """
     print("\n" + "=" * 80)
-    print("Testing AutoDeploy Eagle3 Acceptance Rate")
+    print("Testing AutoDeploy Eagle3 Acceptance Rate (Two-Model)")
     print("=" * 80)
 
     base_model, _, eagle_model = get_model_paths()
@@ -227,7 +384,7 @@ def test_autodeploy_eagle3_acceptance_rate():
 
     max_draft_len = EAGLE_MAX_DRAFT_LEN
 
-    # Configure Eagle3 speculative decoding
+    # Configure Eagle3 speculative decoding (two-model mode)
     speculative_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
@@ -235,15 +392,62 @@ def test_autodeploy_eagle3_acceptance_rate():
         eagle3_layers_to_capture=None,
     )
 
+    print("\nRunning Eagle3 two-model speculative decoding...")
+
+    # Run generation and check acceptance rate
+    _, acceptance_stats = generate_and_check_acceptance(
+        model=base_model,
+        speculative_config=speculative_config,
+        batch_size=2,
+        min_acceptance_rate=0.10,
+        verbose=False,
+    )
+
+    print(f"\n{acceptance_stats}")
+    print("\n" + "=" * 80)
+    print("SUCCESS! Acceptance rate test passed")
+    print("=" * 80)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_autodeploy_eagle3_one_model(batch_size: int):
+    """Test Eagle3 one model mode with AutoDeploy engine.
+
+    Builds an AutoDeploy LLM with eagle3_one_model=True, which loads
+    the Eagle3 weights into the base model instead of using a separate
+    speculative model. Then generates a small number of tokens to verify
+    the end-to-end flow works.
+
+    Args:
+        batch_size: Number of prompts to process in parallel.
+    """
+    print("\n" + "=" * 80)
+    print(f"Testing AutoDeploy Eagle3 One Model (batch_size={batch_size})")
+    print("=" * 80)
+
+    base_model, _, eagle_model = get_model_paths()
+
+    print(f"\nBase Model: {base_model}")
+    print(f"Eagle3 Model: {eagle_model}")
+
+    max_draft_len = EAGLE_MAX_DRAFT_LEN
+
+    # Configure Eagle3 speculative decoding with one model mode
+    speculative_config = Eagle3DecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model=eagle_model,
+        eagle3_one_model=True,
+        eagle3_layers_to_capture={1, 15, 28},
+    )
+
     # Configure KV cache
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=0.01,
     )
 
-    # Create AutoDeploy LLM with Eagle3 speculative decoding
-    # We directly instantiate the LLM class instead of using the main() function
-    # so that we can stream the outputs to see acceptance rates without needing to
-    # collect them in the executor.
+    # Create AutoDeploy LLM with Eagle3 one model mode and export transforms
+    # Note: skip_loading_weights=False to actually load weights for generation
+    # Note: enable_iter_perf_stats=True to collect speculative decoding stats
     llm = LLM(
         model=base_model,
         skip_loading_weights=False,
@@ -252,43 +456,52 @@ def test_autodeploy_eagle3_acceptance_rate():
         kv_cache_config=kv_cache_config,
         speculative_config=speculative_config,
         disable_overlap_scheduler=True,
-        max_num_tokens=64,
+        max_num_tokens=128,
+        enable_iter_perf_stats=True,
     )
 
-    # Tokenize 2 prompts to test multiple sequential requests
-    batch_tok_ids = [llm.tokenizer.encode(p) for p in prompts[:2]]
+    # Verify EagleOneModelFactory was created
+    print(f"\nFactory type: {type(llm.factory).__name__}")
 
-    sampling_params = SamplingParams(max_tokens=128, temperature=0, seed=42)
-
-    print("\nRunning Eagle3 speculative decoding with streaming...")
-
-    # Process each request sequentially and verify acceptance rate
-    for i in range(len(batch_tok_ids)):
-        num_tokens = 0
-        num_drafted = 0
-        num_accepted = 0
-
-        for output in llm.generate_async(batch_tok_ids[i], sampling_params, streaming=True):
-            new_tokens = output.outputs[0].token_ids
-            num_drafted += max_draft_len
-            num_accepted += len(new_tokens) - num_tokens - 1
-            num_tokens = len(new_tokens)
-
-        accept_rate = num_accepted / num_drafted
-
-        print(f"\nRequest {i + 1} Acceptance Rate Statistics:")
-        print(f"  Total tokens drafted: {num_drafted}")
-        print(f"  Total tokens accepted: {num_accepted}")
-        print(f"  Acceptance rate: {accept_rate:.2%}")
-
-        # Verify acceptance rate is above minimum threshold (10%)
-        min_acceptance_rate = 0.10
-        assert accept_rate > min_acceptance_rate, (
-            f"Request {i + 1}: Acceptance rate {accept_rate:.2%} is below minimum threshold {min_acceptance_rate:.0%}"
+    if speculative_config is not None:
+        assert isinstance(llm.factory, EagleOneModelFactory), (
+            f"Expected EagleOneModelFactory, got {type(llm.factory).__name__}"
         )
+        print(f"Target factory: {type(llm.factory.target_factory).__name__}")
+        print(f"Draft factory: {type(llm.factory.draft_factory).__name__}")
+
+    # Test generation and acceptance rate
+    print("\n" + "-" * 80)
+    print("Testing Eagle3 one model generation and acceptance rate")
+    print("-" * 80)
+
+    # Select prompts based on batch_size
+    selected_prompts = prompts[:batch_size]
+    print(f"\nPrompts: {selected_prompts}")
+    print(f"Batch size: {batch_size}")
+    print(f"Draft length: {max_draft_len}")
+
+    # Configure sampling parameters for deterministic generation
+    sampling_params = SamplingParams(
+        max_tokens=128,
+        temperature=0,
+        seed=42,
+    )
+
+    # Run batched generation
+    outputs = llm.generate(selected_prompts, sampling_params)
+    if not isinstance(outputs, list):
+        outputs = [outputs]
+
+    for i, output in enumerate(outputs):
+        print(f"Request {i + 1} output: {output.outputs[0].text}")
+
+    # Check acceptance rate
+    acceptance_stats = check_acceptance(llm, min_acceptance_rate=0.10, verbose=True)
+    print(f"\n{acceptance_stats}")
 
     print("\n" + "=" * 80)
-    print("SUCCESS! All requests passed acceptance rate threshold")
+    print("SUCCESS! Eagle3 one model generation and acceptance rate test completed")
     print("=" * 80)
 
 
