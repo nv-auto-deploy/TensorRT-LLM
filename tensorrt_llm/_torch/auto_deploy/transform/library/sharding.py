@@ -152,7 +152,7 @@ class ShardingTransformConfig(TransformConfig):
     manual_config: Dict[str, Any] = Field(default_factory=dict)
     simple_shard_only: bool = Field(default=False)
     support_partial_config: bool = Field(default=True)
-    sharding_source: List[ShardingSource] = Field(
+    TP_sharding_source: List[ShardingSource] = Field(
         default_factory=lambda: [
             ShardingSource.MANUAL,
             ShardingSource.FACTORY,
@@ -946,7 +946,7 @@ class Sharding(BaseTransform):
             # === TP sharding ===
             # for TP sharding, we may have three different sharding sources:
             # manual, factory, and/or heuristics.
-            for source in config.sharding_source:
+            for source in config.TP_sharding_source:
                 if source == ShardingSource.FACTORY:
                     if len(config.factory_config) == 0:
                         ad_logger.debug(
@@ -1646,14 +1646,88 @@ def _insert_sharded_moe(
             node.args = tuple(args)
 
             # Insert reducescatter AFTER the MoE node
-            with gm.graph.inserting_after(node):
-                reducescatter_node = gm.graph.call_function(
-                    config.dist_ops.reduce_scatter,
-                    args=(node,),
-                    kwargs={"dim": 0},  # Scatter along token dimension
+            # with gm.graph.inserting_after(node):
+            #     reducescatter_node = gm.graph.call_function(
+            #         config.dist_ops.reduce_scatter,
+            #         args=(node,),
+            #         kwargs={"dim": 0},  # Scatter along token dimension
+            #     )
+            #     node.replace_all_uses_with(reducescatter_node)
+            #     reducescatter_node.replace_input_with(reducescatter_node, node)
+
+            # TP-only + attention-DP: all-reduce + local mask
+            # 1. All-reduce to sum TP partials across all ranks
+            # with gm.graph.inserting_after(node):
+            #     dist_node = gm.graph.call_function(
+            #         config.dist_ops.all_reduce,
+            #         args=(node, allreduce_strategy),
+            #     )
+
+            # 2. Mask to restore DP-sharded distribution (each rank keeps its tokens)
+            dist_node = node
+            with gm.graph.inserting_after(dist_node):
+                # Get batch size from all-reduce output
+                batch_size_node = gm.graph.call_method("size", args=(dist_node, 0))
+
+                # pad the all-reduce output to make it divisible by world_size
+            with gm.graph.inserting_after(batch_size_node):
+                # Calculate padding needed to make batch divisible by world_size
+                remainder_node = gm.graph.call_function(
+                    operator.mod, args=(batch_size_node, config.mapping.world_size)
                 )
-                node.replace_all_uses_with(reducescatter_node)
-                reducescatter_node.replace_input_with(reducescatter_node, node)
+            with gm.graph.inserting_after(remainder_node):
+                pad_size_node = gm.graph.call_function(
+                    operator.sub, args=(config.mapping.world_size, remainder_node)
+                )
+            with gm.graph.inserting_after(pad_size_node):
+                pad_size_node = gm.graph.call_function(
+                    operator.mod, args=(pad_size_node, config.mapping.world_size)
+                )
+
+                # Get other dimensions
+            with gm.graph.inserting_after(pad_size_node):
+                dim1_node = gm.graph.call_method("size", args=(dist_node, 1))
+            # with gm.graph.inserting_after(dim1_node):
+            #     dim2_node = gm.graph.call_method("size", args=(dist_node, 2))
+            with gm.graph.inserting_after(dim1_node):
+                # Pad if needed
+                pad_tensor_node = gm.graph.call_method(
+                    "new_zeros", args=(dist_node, (pad_size_node, dim1_node))
+                )
+            with gm.graph.inserting_after(pad_tensor_node):
+                padded_node = gm.graph.call_function(
+                    torch.ops.aten.cat.default, args=((dist_node, pad_tensor_node), 0)
+                )
+            with gm.graph.inserting_after(padded_node):
+                # Calculate this rank's slice indices
+                padded_batch_size_node = gm.graph.call_function(
+                    operator.add, args=(batch_size_node, pad_size_node)
+                )
+            with gm.graph.inserting_after(padded_batch_size_node):
+                local_batch_size_node = gm.graph.call_function(
+                    operator.floordiv, args=(padded_batch_size_node, config.mapping.world_size)
+                )
+            with gm.graph.inserting_after(local_batch_size_node):
+                local_batch_start_node = gm.graph.call_function(
+                    operator.mul, args=(local_batch_size_node, config.mapping.rank)
+                )
+            with gm.graph.inserting_after(local_batch_start_node):
+                local_batch_end_node = gm.graph.call_function(
+                    operator.add, args=(local_batch_start_node, local_batch_size_node)
+                )
+
+            with gm.graph.inserting_after(local_batch_end_node):
+                # Slice to get this rank's portion
+                mask_node = gm.graph.call_function(
+                    torch.ops.aten.slice.Tensor,
+                    args=(padded_node, 0, local_batch_start_node, local_batch_end_node, 1),
+                )
+
+            # Replace uses of the original MoE node with the masked output
+            node.replace_all_uses_with(mask_node)
+            # # Fix dist_node to use node (not mask_node) as input
+            batch_size_node.replace_input_with(mask_node, dist_node)
+            padded_node.replace_input_with(mask_node, dist_node)
         else:
             # Standard TP with all_reduce:
             # No attention-DP, so tokens are NOT distributed across ranks.
