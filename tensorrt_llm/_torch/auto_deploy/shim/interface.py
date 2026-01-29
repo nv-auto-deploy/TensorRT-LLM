@@ -57,6 +57,7 @@ class CachedSequenceInterface:
         kv_cache_config: Optional[KvCacheConfig] = None,
         max_num_tokens: Optional[int] = None,
         vocab_size_padded: Optional[int] = None,
+        extra_seq_len_for_kv_cache: int = 0,
     ) -> None:
         """Initialize the CachedSequenceInterface.
 
@@ -68,6 +69,8 @@ class CachedSequenceInterface:
             max_num_tokens: Maximum total tokens across all sequences. If None, computed from
                 max_seq_len and max_batch_size.
             vocab_size_padded: Padded vocabulary size of the model.
+            extra_seq_len_for_kv_cache: Extra sequence length for KV cache sizing (for speculative
+                decoding and overlap scheduler). Defaults to 0.
         """
         # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired
         # device and not the actual device unlike, e.g., in SequenceInfo. We rely on the attribute
@@ -96,8 +99,13 @@ class CachedSequenceInterface:
         # Ordered dicts tracking resource handlers by type
         self._paged_cache_order: ResourceHandlerDict = {}  # Paged resources (kv caches)
         self._state_resource_order: ResourceHandlerDict = {}  # State resources (ssm states)
-        # Current submodule name being processed (used for cache name suffixing)
         self._current_submodule_name: str = ""
+        self._extra_seq_len_for_kv_cache: int = extra_seq_len_for_kv_cache
+
+    @property
+    def max_seq_len_for_kv_cache(self) -> int:
+        """Return the max sequence length to use for KV cache allocation."""
+        return self.info.max_seq_len + self._extra_seq_len_for_kv_cache
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -206,7 +214,7 @@ class CachedSequenceInterface:
             "num_kv_heads": num_kv_heads_per_layer,  # per-layer bytes_per_token
             "head_dim": 1,  # all bytes in num_kv_heads
             "tokens_per_block": kv_cache_config.tokens_per_block,
-            "max_seq_len": self.info.max_seq_len,
+            "max_seq_len": self.max_seq_len_for_kv_cache,
             "max_batch_size": self.info.max_batch_size,
             "mapping": Mapping(),
             # NOTE (lucaslie): this is the only 1-byte dtype currently supported by the

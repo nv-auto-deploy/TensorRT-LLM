@@ -29,7 +29,6 @@ from torch._prims_common import DeviceLikeType
 from torch.export import Dim
 from torch.fx import GraphModule
 
-from ..custom_ops.attention_interface import CacheConfig
 from .custom.modeling_eagle import ADHiddenStateManager, EagleWrapper, EagleWrapperConfig
 from .factory import DynamicShape, ModelFactory, ModelFactoryRegistry, SubModuleExportInfo
 from .hf import AutoModelForCausalLMFactory
@@ -378,9 +377,9 @@ class EagleOneModelFactory(ModelFactory):
         # Use target model's sharding config as the primary config
         return self.target_factory.get_sharding_config()
 
-    def get_cache_config(self) -> CacheConfig:
-        """Return the cache configuration from the target model factory."""
-        return self.target_factory.get_cache_config()
+    def get_cache_config_updates(self) -> Dict[str, Any]:
+        """Return the cache configuration updates from the target model factory."""
+        return self.target_factory.get_cache_config_updates()
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer from the target model factory."""

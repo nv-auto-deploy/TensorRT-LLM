@@ -77,11 +77,42 @@ from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
 
+def get_extra_seq_len_for_kv_cache(ad_config: LlmArgs) -> int:
+    """Compute extra sequence length needed for KV cache sizing.
+
+    This accounts for:
+    - Overlap scheduler bookkeeping (+1 token)
+    - Speculative decoding draft tokens
+    - One-model spec dec extra tokens
+
+    Returns:
+        The additional sequence length to add to max_seq_len for KV cache.
+    """
+    extra_seq_len = 0
+    spec_config = ad_config.speculative_config
+
+    # Overlap scheduler requires +1 token per sequence for bookkeeping lag
+    if not ad_config.disable_overlap_scheduler:
+        extra_seq_len += 1
+        # With overlap + spec decoding, draft tokens are pre-allocated
+        if spec_config is not None:
+            extra_seq_len += spec_config.max_total_draft_tokens
+
+    # Speculative decoding requires extra tokens for draft allocation
+    if spec_config is not None:
+        extra_seq_len += spec_config.max_total_draft_tokens
+        # One-model spec decoding modes need additional tokens
+        extra_seq_len += get_num_extra_kv_tokens(spec_config)
+
+    return extra_seq_len
+
+
 @dataclass
 class ReportingInfo:
     print_log: bool = False
     enable_iter_perf_stats: bool = False
     enable_iter_req_stats: bool = False
+
 
 def construct_draft_llm_args(
     ad_config: LlmArgs,
@@ -150,27 +181,6 @@ def construct_draft_llm_args(
 
     return draft_llm_args
 
-def get_max_seq_len_for_kv_cache(ad_config: LlmArgs) -> int:
-    # TODO: Verify if this sizing adjustment is actually necessary for AutoDeploy, or if
-    # the layerwise pools handle this independently.
-    max_seq_len_for_kv_cache = ad_config.max_seq_len
-    spec_config = ad_config.speculative_config
-
-    # Overlap scheduler requires +1 token per sequence for bookkeeping lag
-    if not ad_config.disable_overlap_scheduler:
-        max_seq_len_for_kv_cache += 1
-        # With overlap + spec decoding, draft tokens are pre-allocated
-        if spec_config is not None:
-            max_seq_len_for_kv_cache += spec_config.max_total_draft_tokens
-
-    # Speculative decoding requires extra tokens for draft allocation
-    if spec_config is not None:
-        max_seq_len_for_kv_cache += spec_config.max_total_draft_tokens
-        # One-model spec decoding modes need additional tokens
-        max_seq_len_for_kv_cache += get_num_extra_kv_tokens(spec_config)
-
-    return max_seq_len_for_kv_cache
-
 
 def create_draft_kv_cache_manager_maybe(
     draft_model_engine: Optional[PyTorchModelEngine],
@@ -186,7 +196,7 @@ def create_draft_kv_cache_manager_maybe(
 
     # TODO: Verify if this sizing adjustment is actually necessary for AutoDeploy, or if
     # the layerwise pools handle this independently.
-    max_seq_len_for_kv_cache = get_max_seq_len_for_kv_cache(ad_config)
+    max_seq_len_for_kv_cache = ad_config.max_seq_len + get_extra_seq_len_for_kv_cache(ad_config)
 
     return _create_kv_cache_manager(
         model_engine=draft_model_engine,
@@ -396,6 +406,7 @@ class ADEngine(ModelEngine):
             kv_cache_config=ad_config.kv_cache_config,
             max_num_tokens=ad_config.max_num_tokens,
             vocab_size_padded=factory.vocab_size_padded,
+            extra_seq_len_for_kv_cache=get_extra_seq_len_for_kv_cache(ad_config),
         )
 
         reporting_info = ReportingInfo(
@@ -1145,10 +1156,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # resource managers
     # KVCacheManager is now created and managed by CachedSequenceInterface during the
     # initialize_cache/resize_kv_cache transform pipeline. Get it from the interface.
-
-    # TODO: We should probably increase the max_seq_len for the KV cache manager if speculative decoding
-    # and/or overlap scheduler are enabled. Especially for one-model spec dec, the max_seq_len needs to grow a lot;
-    # roughly 2 * max_draft_len to account for the target model verification and the drafting loop.
     kv_cache_manager = engine.cache_seq_interface.kv_cache_manager
     kv_cache_config_tuned = engine.cache_seq_interface.kv_cache_config_tuned
     seq_slot_manager = SeqSlotManager(max_num_sequences=max_num_sequences)
