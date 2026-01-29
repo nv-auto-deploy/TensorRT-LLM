@@ -13,7 +13,6 @@ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     EPShardingInfo,
     FP8EPShardingInfo,
-    MLPType,
     NVFP4EPShardingInfo,
     ShardingTransformConfig,
 )
@@ -99,7 +98,6 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                     EPShardingInfo(
                         target_node=node.name,
                         config=config,
-                        mlp_type=MLPType.GATED_MLP,
                     )
                 )
             elif is_op(node, torch.ops.auto_deploy.torch_quant_fp8_moe):
@@ -107,7 +105,6 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                     FP8EPShardingInfo(
                         target_node=node.name,
                         config=config,
-                        mlp_type=MLPType.GATED_MLP,
                     )
                 )
             elif is_op(node, torch.ops.auto_deploy.torch_quant_nvfp4_moe):
@@ -115,7 +112,6 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                     NVFP4EPShardingInfo(
                         target_node=node.name,
                         config=config,
-                        mlp_type=MLPType.GATED_MLP,
                     )
                 )
 
