@@ -208,6 +208,10 @@ class ShardingTransformConfig(TransformConfig):
         "Initialized automatically in _init_dist_ops() based on dist_backend.",
     )
 
+    def __init__(self, **data):
+        super().__init__(**data)
+        self._init_dist_ops()
+
     def _init_dist_ops(self):
         """Initialize distributed operations based on backend availability.
 
