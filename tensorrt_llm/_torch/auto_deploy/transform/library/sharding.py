@@ -2457,6 +2457,7 @@ def detect_column_row_shard(
         return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
     layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
+    min_local_shape = 1
 
     num_shards = 0
     num_simple_shards = 0
