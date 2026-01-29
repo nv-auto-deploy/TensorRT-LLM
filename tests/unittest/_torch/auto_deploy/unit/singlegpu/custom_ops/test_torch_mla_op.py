@@ -1,7 +1,13 @@
 """Comprehensive test suite for torch MLA backend operations.
 
-Tests the new torch_mla source op and torch_backend_mla_with_cache cached op
-with unified FlashInfer cache layout.
+Tests the torch_mla source op and torch_backend_mla_with_cache cached op
+with FlashInfer-compatible compressed cache layout.
+
+Key features:
+- 5 tensor arguments: q_nope, q_pe, compressed_kv, kpe, kv_b_proj_weight
+- Compressed cache: [max_batch, max_seq, kv_lora_rank + qk_rope_head_dim]
+- Prefill: Expand compressed_kv, compute normal attention
+- Generate: Weight absorption for efficiency
 """
 
 import math
@@ -13,21 +19,25 @@ import torch
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
 
 
-def numpy_mla_reference(
+def numpy_mla_reference_with_expansion(
     q_nope: np.ndarray,
     q_pe: np.ndarray,
-    ckv: np.ndarray,
+    compressed_kv: np.ndarray,
     kpe: np.ndarray,
+    kv_b_proj_weight: np.ndarray,
     mla_cache: np.ndarray,
     seq_len: np.ndarray,
     input_pos: np.ndarray,
     cache_loc: np.ndarray,
     seq_start: np.ndarray,
     scale: float = None,
-    head_dim_ckv: int = None,
+    kv_lora_rank: int = None,
     is_generate: bool = False,
 ):
-    """Numpy reference implementation of MLA attention with FlashInfer cache layout."""
+    """Numpy reference implementation of MLA attention with FlashInfer cache layout.
+
+    This expands compressed_kv using kv_b_proj_weight for attention computation.
+    """
     # Get dimensions
     if is_generate:
         batch_size = q_nope.shape[0]
@@ -35,21 +45,21 @@ def numpy_mla_reference(
         qk_nope_head_dim = q_nope.shape[3]
         qk_rope_head_dim = q_pe.shape[3]
     else:
-        # Context phase: flattened [1, total_tokens, ...]
         batch_size = len(seq_len)
         num_heads = q_nope.shape[2]
         qk_nope_head_dim = q_nope.shape[3]
         qk_rope_head_dim = q_pe.shape[3]
 
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
-    # head_dim_kpe = kpe.shape[-1]
 
-    if head_dim_ckv is None:
-        head_dim_ckv = ckv.shape[-1]
+    if kv_lora_rank is None:
+        kv_lora_rank = compressed_kv.shape[-1]
 
-    v_head_dim = head_dim_ckv - qk_nope_head_dim
+    # Infer v_head_dim from kv_b_proj_weight
+    out_features = kv_b_proj_weight.shape[0]
+    kv_head_dim = out_features // num_heads
+    v_head_dim = kv_head_dim - qk_nope_head_dim
 
-    # Set default scale
     if scale is None:
         scale = 1.0 / math.sqrt(qk_head_dim)
 
@@ -58,20 +68,17 @@ def numpy_mla_reference(
         for i in range(batch_size):
             cache_idx = cache_loc[i]
             pos = input_pos[i]
-            # Update ckv portion
-            mla_cache[cache_idx, pos, :head_dim_ckv] = ckv[i, 0, 0]
-            # Update kpe portion
-            mla_cache[cache_idx, pos, head_dim_ckv:] = kpe[i, 0, 0]
+            mla_cache[cache_idx, pos, :kv_lora_rank] = compressed_kv[i, 0]
+            mla_cache[cache_idx, pos, kv_lora_rank:] = kpe[i, 0, 0]
     else:
         for i in range(batch_size):
             cache_idx = cache_loc[i]
             pos = input_pos[i]
             seq_len_i = seq_len[i]
             seq_start_i = seq_start[i]
-
             for j in range(seq_len_i):
-                mla_cache[cache_idx, pos + j, :head_dim_ckv] = ckv[seq_start_i + j, 0]
-                mla_cache[cache_idx, pos + j, head_dim_ckv:] = kpe[seq_start_i + j, 0]
+                mla_cache[cache_idx, pos + j, :kv_lora_rank] = compressed_kv[seq_start_i + j]
+                mla_cache[cache_idx, pos + j, kv_lora_rank:] = kpe[seq_start_i + j, 0]
 
     # Compute attention for each sequence
     outputs = []
@@ -90,53 +97,42 @@ def numpy_mla_reference(
             q_nope_seq = q_nope[i, 0]  # [N, qk_nope_head_dim]
             q_pe_seq = q_pe[i, 0]  # [N, qk_rope_head_dim]
         else:
-            q_nope_seq = q_nope[
-                seq_start_i : seq_start_i + seq_len_i
-            ]  # [seq_len_i, N, qk_nope_head_dim]
-            q_pe_seq = q_pe[
-                seq_start_i : seq_start_i + seq_len_i
-            ]  # [seq_len_i, N, qk_rope_head_dim]
+            q_nope_seq = q_nope[seq_start_i : seq_start_i + seq_len_i]
+            q_pe_seq = q_pe[seq_start_i : seq_start_i + seq_len_i]
 
-        # Get cached ckv and kpe
+        # Get cached compressed_kv and kpe
         kv_seq_len = pos + seq_len_i
-        cached_data = mla_cache[cache_idx, :kv_seq_len]  # [kv_seq_len, head_dim_ckv + head_dim_kpe]
-        ckv_cached = cached_data[:, :head_dim_ckv]  # [kv_seq_len, head_dim_ckv]
-        kpe_cached = cached_data[:, head_dim_ckv:]  # [kv_seq_len, head_dim_kpe]
+        cached_data = mla_cache[cache_idx, :kv_seq_len]
+        compressed_kv_cached = cached_data[:, :kv_lora_rank]
+        kpe_cached = cached_data[:, kv_lora_rank:]
 
-        # Split ckv into k_nope and value
-        k_nope_cached = ckv_cached[:, :qk_nope_head_dim]  # [kv_seq_len, qk_nope_head_dim]
-        v_cached = ckv_cached[:, qk_nope_head_dim:]  # [kv_seq_len, v_head_dim]
+        # Expand compressed_kv using kv_b_proj_weight
+        # compressed_kv_cached: [kv_seq_len, kv_lora_rank]
+        # kv_b_proj_weight: [N * kv_head_dim, kv_lora_rank]
+        kv_expanded = np.matmul(compressed_kv_cached, kv_b_proj_weight.T)
+        kv_expanded = kv_expanded.reshape(kv_seq_len, num_heads, kv_head_dim)
 
-        # Construct full query
-        if is_generate:
-            query_full = np.concatenate([q_nope_seq, q_pe_seq], axis=-1)  # [N, qk_head_dim]
-        else:
-            query_full = np.concatenate(
-                [q_nope_seq, q_pe_seq], axis=-1
-            )  # [seq_len_i, N, qk_head_dim]
+        k_nope = kv_expanded[:, :, :qk_nope_head_dim]
+        v = kv_expanded[:, :, qk_nope_head_dim:]
 
-        # Construct full key (expand to num_heads)
-        k_nope_expanded = np.broadcast_to(
-            k_nope_cached[:, None, :], (kv_seq_len, num_heads, qk_nope_head_dim)
-        )
+        # Expand kpe to all heads
         kpe_expanded = np.broadcast_to(
             kpe_cached[:, None, :], (kv_seq_len, num_heads, qk_rope_head_dim)
         )
-        key_full = np.concatenate(
-            [k_nope_expanded, kpe_expanded], axis=-1
-        )  # [kv_seq_len, N, qk_head_dim]
+
+        # Construct full query and key
+        if is_generate:
+            query_full = np.concatenate([q_nope_seq, q_pe_seq], axis=-1)
+        else:
+            query_full = np.concatenate([q_nope_seq, q_pe_seq], axis=-1)
+
+        key_full = np.concatenate([k_nope, kpe_expanded], axis=-1)
 
         # Compute attention scores
         if is_generate:
-            # query_full: [N, qk_head_dim], key_full: [kv_seq_len, N, qk_head_dim]
-            attn_scores = np.einsum("nh,knh->nk", query_full, key_full) * scale  # [N, kv_seq_len]
+            attn_scores = np.einsum("nh,knh->nk", query_full, key_full) * scale
         else:
-            # query_full: [seq_len_i, N, qk_head_dim], key_full: [kv_seq_len, N, qk_head_dim]
-            attn_scores = (
-                np.einsum("snh,knh->snk", query_full, key_full) * scale
-            )  # [seq_len_i, N, kv_seq_len]
-
-            # Apply causal mask
+            attn_scores = np.einsum("snh,knh->snk", query_full, key_full) * scale
             causal_mask = np.triu(np.ones((seq_len_i, kv_seq_len)), k=kv_seq_len - seq_len_i + 1)
             attn_scores = np.where(causal_mask[:, None, :], -np.inf, attn_scores)
 
@@ -146,18 +142,10 @@ def numpy_mla_reference(
         attn_weights = attn_scores_exp / np.sum(attn_scores_exp, axis=-1, keepdims=True)
 
         # Compute output
-        v_expanded = np.broadcast_to(
-            v_cached[:, None, :], (kv_seq_len, num_heads, v_head_dim)
-        )  # [kv_seq_len, N, v_head_dim]
-
         if is_generate:
-            # attn_weights: [N, kv_seq_len], v_expanded: [kv_seq_len, N, v_head_dim]
-            attn_out = np.einsum("nk,knh->nh", attn_weights, v_expanded)  # [N, v_head_dim]
+            attn_out = np.einsum("nk,knh->nh", attn_weights, v)
         else:
-            # attn_weights: [seq_len_i, N, kv_seq_len], v_expanded: [kv_seq_len, N, v_head_dim]
-            attn_out = np.einsum(
-                "snk,knh->snh", attn_weights, v_expanded
-            )  # [seq_len_i, N, v_head_dim]
+            attn_out = np.einsum("snk,knh->snh", attn_weights, v)
 
         outputs.append(attn_out)
 
@@ -165,13 +153,11 @@ def numpy_mla_reference(
     if len(outputs) == 0:
         return np.zeros((1, 0, num_heads, v_head_dim), dtype=np.float32)
     elif is_generate:
-        # Generate phase: outputs is a list of [N, v_head_dim] tensors
-        result = np.stack(outputs, axis=0)  # [batch_size, N, v_head_dim]
-        return result[:, None, :, :]  # [batch_size, 1, N, v_head_dim]
+        result = np.stack(outputs, axis=0)
+        return result[:, None, :, :]
     else:
-        # Context phase: outputs is a list of [seq_len_i, N, v_head_dim] tensors
-        result = np.concatenate(outputs, axis=0)  # [total_seq, N, v_head_dim]
-        return result[None, :, :, :]  # [1, total_seq, N, v_head_dim]
+        result = np.concatenate(outputs, axis=0)
+        return result[None, :, :, :]
 
 
 class TestTorchMLASourceOp:
@@ -196,11 +182,12 @@ class TestTorchMLASourceOp:
         num_heads: int,
         qk_nope_head_dim: int,
         qk_rope_head_dim: int,
-        head_dim_ckv: int,
+        kv_lora_rank: int,
+        v_head_dim: int,
         layout: str = "bsnd",
     ):
-        """Create test data for MLA source op."""
-        head_dim_kpe = qk_rope_head_dim
+        """Create test data for MLA source op with compressed_kv."""
+        kv_head_dim = qk_nope_head_dim + v_head_dim
 
         if layout == "bsnd":
             q_nope = torch.randn(
@@ -219,11 +206,11 @@ class TestTorchMLASourceOp:
                 dtype=self.dtype,
                 device=self.device,
             )
-            ckv = torch.randn(
-                batch_size, seq_len, 1, head_dim_ckv, dtype=self.dtype, device=self.device
+            compressed_kv = torch.randn(
+                batch_size, seq_len, kv_lora_rank, dtype=self.dtype, device=self.device
             )
             kpe = torch.randn(
-                batch_size, seq_len, 1, head_dim_kpe, dtype=self.dtype, device=self.device
+                batch_size, seq_len, 1, qk_rope_head_dim, dtype=self.dtype, device=self.device
             )
         else:  # bnsd
             q_nope = torch.randn(
@@ -242,42 +229,55 @@ class TestTorchMLASourceOp:
                 dtype=self.dtype,
                 device=self.device,
             )
-            ckv = torch.randn(
-                batch_size, 1, seq_len, head_dim_ckv, dtype=self.dtype, device=self.device
+            compressed_kv = torch.randn(
+                batch_size, seq_len, kv_lora_rank, dtype=self.dtype, device=self.device
             )
             kpe = torch.randn(
-                batch_size, 1, seq_len, head_dim_kpe, dtype=self.dtype, device=self.device
+                batch_size, 1, seq_len, qk_rope_head_dim, dtype=self.dtype, device=self.device
             )
+
+        # kv_b_proj_weight: [num_heads * kv_head_dim, kv_lora_rank]
+        kv_b_proj_weight = torch.randn(
+            num_heads * kv_head_dim, kv_lora_rank, dtype=self.dtype, device=self.device
+        )
 
         return {
             "q_nope": q_nope,
             "q_pe": q_pe,
-            "ckv": ckv,
+            "compressed_kv": compressed_kv,
             "kpe": kpe,
+            "kv_b_proj_weight": kv_b_proj_weight,
         }
 
     def test_basic_functionality(self):
         """Test basic MLA source op functionality."""
         batch_size, seq_len, num_heads = 2, 4, 8
         qk_nope_head_dim, qk_rope_head_dim = 128, 64
-        head_dim_ckv = qk_nope_head_dim + 128  # v_head_dim = 128
+        kv_lora_rank = 512
+        v_head_dim = 128
 
         data = self._create_mla_data(
-            batch_size, seq_len, num_heads, qk_nope_head_dim, qk_rope_head_dim, head_dim_ckv
+            batch_size,
+            seq_len,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            v_head_dim,
         )
 
         output = torch.ops.auto_deploy.torch_mla(
             data["q_nope"],
             data["q_pe"],
-            data["ckv"],
+            data["compressed_kv"],
             data["kpe"],
+            data["kv_b_proj_weight"],
             True,  # is_causal
             None,  # scale
             "bsnd",  # layout
         )
 
         # Verify output shape: [B, S, N, v_head_dim]
-        v_head_dim = head_dim_ckv - qk_nope_head_dim
         expected_shape = (batch_size, seq_len, num_heads, v_head_dim)
         assert output.shape == expected_shape, f"Expected {expected_shape}, got {output.shape}"
 
@@ -288,7 +288,8 @@ class TestTorchMLASourceOp:
         """Test MLA source op with both bsnd and bnsd layouts."""
         batch_size, seq_len, num_heads = 2, 4, 8
         qk_nope_head_dim, qk_rope_head_dim = 64, 32
-        head_dim_ckv = qk_nope_head_dim + 64  # v_head_dim = 64
+        kv_lora_rank = 256
+        v_head_dim = 64
 
         for layout in ["bsnd", "bnsd"]:
             data = self._create_mla_data(
@@ -297,21 +298,22 @@ class TestTorchMLASourceOp:
                 num_heads,
                 qk_nope_head_dim,
                 qk_rope_head_dim,
-                head_dim_ckv,
+                kv_lora_rank,
+                v_head_dim,
                 layout,
             )
 
             output = torch.ops.auto_deploy.torch_mla(
                 data["q_nope"],
                 data["q_pe"],
-                data["ckv"],
+                data["compressed_kv"],
                 data["kpe"],
+                data["kv_b_proj_weight"],
                 True,
                 None,
                 layout,
             )
 
-            v_head_dim = head_dim_ckv - qk_nope_head_dim
             if layout == "bsnd":
                 expected_shape = (batch_size, seq_len, num_heads, v_head_dim)
             else:
@@ -325,21 +327,42 @@ class TestTorchMLASourceOp:
         """Test MLA source op with custom scale."""
         batch_size, seq_len, num_heads = 1, 2, 4
         qk_nope_head_dim, qk_rope_head_dim = 32, 16
-        head_dim_ckv = qk_nope_head_dim + 32
+        kv_lora_rank = 128
+        v_head_dim = 32
 
         data = self._create_mla_data(
-            batch_size, seq_len, num_heads, qk_nope_head_dim, qk_rope_head_dim, head_dim_ckv
+            batch_size,
+            seq_len,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            v_head_dim,
         )
 
         # Test with default scale
         output_default = torch.ops.auto_deploy.torch_mla(
-            data["q_nope"], data["q_pe"], data["ckv"], data["kpe"], True, None, "bsnd"
+            data["q_nope"],
+            data["q_pe"],
+            data["compressed_kv"],
+            data["kpe"],
+            data["kv_b_proj_weight"],
+            True,
+            None,
+            "bsnd",
         )
 
         # Test with custom scale
         custom_scale = 0.5
         output_custom = torch.ops.auto_deploy.torch_mla(
-            data["q_nope"], data["q_pe"], data["ckv"], data["kpe"], True, custom_scale, "bsnd"
+            data["q_nope"],
+            data["q_pe"],
+            data["compressed_kv"],
+            data["kpe"],
+            data["kv_b_proj_weight"],
+            True,
+            custom_scale,
+            "bsnd",
         )
 
         # Outputs should be different
@@ -370,12 +393,13 @@ class TestTorchBackendMLAWithCache:
         num_heads: int,
         qk_nope_head_dim: int,
         qk_rope_head_dim: int,
-        head_dim_ckv: int,
+        kv_lora_rank: int,
+        v_head_dim: int,
         max_seq_len: int,
         cache_offset: int = 0,
     ):
         """Create test data for cached MLA op with FlashInfer layout."""
-        head_dim_kpe = qk_rope_head_dim
+        kv_head_dim = qk_nope_head_dim + v_head_dim
 
         # Create input tensors (BSND layout)
         q_nope = torch.randn(
@@ -384,19 +408,23 @@ class TestTorchBackendMLAWithCache:
         q_pe = torch.randn(
             batch_size, seq_len, num_heads, qk_rope_head_dim, dtype=self.dtype, device=self.device
         )
-        ckv = torch.randn(
-            batch_size, seq_len, 1, head_dim_ckv, dtype=self.dtype, device=self.device
+        compressed_kv = torch.randn(
+            batch_size, seq_len, kv_lora_rank, dtype=self.dtype, device=self.device
         )
         kpe = torch.randn(
-            batch_size, seq_len, 1, head_dim_kpe, dtype=self.dtype, device=self.device
+            batch_size, seq_len, 1, qk_rope_head_dim, dtype=self.dtype, device=self.device
         )
 
-        # Create unified MLA cache (FlashInfer layout)
-        # Shape: [max_batch, max_seq, head_dim_ckv + head_dim_kpe]
+        # kv_b_proj_weight: [num_heads * kv_head_dim, kv_lora_rank]
+        kv_b_proj_weight = torch.randn(
+            num_heads * kv_head_dim, kv_lora_rank, dtype=self.dtype, device=self.device
+        )
+
+        # Create FlashInfer MLA cache: [max_batch, max_seq, kv_lora_rank + qk_rope_head_dim]
         mla_cache = torch.zeros(
             batch_size,
             max_seq_len,
-            head_dim_ckv + head_dim_kpe,
+            kv_lora_rank + qk_rope_head_dim,
             dtype=self.dtype,
             device=self.device,
         )
@@ -406,7 +434,7 @@ class TestTorchBackendMLAWithCache:
             mla_cache[:, :cache_offset, :] = torch.randn(
                 batch_size,
                 cache_offset,
-                head_dim_ckv + head_dim_kpe,
+                kv_lora_rank + qk_rope_head_dim,
                 dtype=self.dtype,
                 device=self.device,
             )
@@ -433,21 +461,22 @@ class TestTorchBackendMLAWithCache:
             # Flatten inputs for context phase
             q_nope = q_nope.view(1, batch_size * seq_len, num_heads, qk_nope_head_dim)
             q_pe = q_pe.view(1, batch_size * seq_len, num_heads, qk_rope_head_dim)
-            ckv = ckv.view(1, batch_size * seq_len, 1, head_dim_ckv)
-            kpe = kpe.view(1, batch_size * seq_len, 1, head_dim_kpe)
+            compressed_kv = compressed_kv.view(1, batch_size * seq_len, kv_lora_rank)
+            kpe = kpe.view(1, batch_size * seq_len, 1, qk_rope_head_dim)
 
         return {
             "q_nope": q_nope,
             "q_pe": q_pe,
-            "ckv": ckv,
+            "compressed_kv": compressed_kv,
             "kpe": kpe,
+            "kv_b_proj_weight": kv_b_proj_weight,
             "batch_info_host": batch_info_host,
             "seq_len": seq_len_tensor,
             "input_pos": input_pos,
             "cache_loc": cache_loc,
             "cu_seqlen": cu_seqlen,
             "mla_cache": mla_cache,
-            "head_dim_ckv": head_dim_ckv,
+            "kv_lora_rank": kv_lora_rank,
         }
 
     def _run_cached_mla(self, data, scale=None):
@@ -455,8 +484,9 @@ class TestTorchBackendMLAWithCache:
         return torch.ops.auto_deploy.torch_cached_mla_with_cache(
             data["q_nope"],
             data["q_pe"],
-            data["ckv"],
+            data["compressed_kv"],
             data["kpe"],
+            data["kv_b_proj_weight"],
             data["batch_info_host"],
             data["seq_len"],
             data["input_pos"],
@@ -464,14 +494,15 @@ class TestTorchBackendMLAWithCache:
             data["cu_seqlen"],
             data["mla_cache"],
             scale,
-            data["head_dim_ckv"],
+            data["kv_lora_rank"],
         )
 
     def test_generate_phase_basic(self):
         """Test generate phase (single token) basic functionality."""
         batch_size, seq_len, num_heads = 2, 1, 8
         qk_nope_head_dim, qk_rope_head_dim = 64, 32
-        head_dim_ckv = qk_nope_head_dim + 64
+        kv_lora_rank = 256
+        v_head_dim = 64
         max_seq_len = 128
         cache_offset = 5
 
@@ -481,7 +512,8 @@ class TestTorchBackendMLAWithCache:
             num_heads,
             qk_nope_head_dim,
             qk_rope_head_dim,
-            head_dim_ckv,
+            kv_lora_rank,
+            v_head_dim,
             max_seq_len,
             cache_offset,
         )
@@ -489,7 +521,6 @@ class TestTorchBackendMLAWithCache:
         output = self._run_cached_mla(data)
 
         # Verify output shape
-        v_head_dim = head_dim_ckv - qk_nope_head_dim
         expected_shape = (batch_size, seq_len, num_heads, v_head_dim)
         assert output.shape == expected_shape, f"Expected {expected_shape}, got {output.shape}"
 
@@ -500,7 +531,8 @@ class TestTorchBackendMLAWithCache:
         """Test context phase (multi-token) basic functionality."""
         batch_size, seq_len, num_heads = 2, 4, 8
         qk_nope_head_dim, qk_rope_head_dim = 64, 32
-        head_dim_ckv = qk_nope_head_dim + 64
+        kv_lora_rank = 256
+        v_head_dim = 64
         max_seq_len = 128
 
         data = self._create_cached_mla_data(
@@ -509,14 +541,14 @@ class TestTorchBackendMLAWithCache:
             num_heads,
             qk_nope_head_dim,
             qk_rope_head_dim,
-            head_dim_ckv,
+            kv_lora_rank,
+            v_head_dim,
             max_seq_len,
         )
 
         output = self._run_cached_mla(data)
 
         # Verify output shape
-        v_head_dim = head_dim_ckv - qk_nope_head_dim
         expected_shape = (1, batch_size * seq_len, num_heads, v_head_dim)
         assert output.shape == expected_shape, f"Expected {expected_shape}, got {output.shape}"
 
@@ -527,8 +559,8 @@ class TestTorchBackendMLAWithCache:
         """Test that cache is updated correctly during forward pass."""
         batch_size, seq_len, num_heads = 1, 1, 4
         qk_nope_head_dim, qk_rope_head_dim = 32, 16
-        head_dim_ckv = qk_nope_head_dim + 32
-        # head_dim_kpe = qk_rope_head_dim
+        kv_lora_rank = 128
+        v_head_dim = 32
         max_seq_len = 32
         cache_offset = 5
 
@@ -538,7 +570,8 @@ class TestTorchBackendMLAWithCache:
             num_heads,
             qk_nope_head_dim,
             qk_rope_head_dim,
-            head_dim_ckv,
+            kv_lora_rank,
+            v_head_dim,
             max_seq_len,
             cache_offset,
         )
@@ -552,18 +585,17 @@ class TestTorchBackendMLAWithCache:
         # Check cache was updated at the correct position
         updated_cache_at_pos = data["mla_cache"][0, cache_offset]
 
-        # The cache should have been updated (values should be different from zeros/original)
-        # since we're writing ckv and kpe to that position
+        # The cache should have been updated
         assert not torch.allclose(original_cache_at_pos, updated_cache_at_pos, atol=1e-6), (
             "Cache should have been updated at the target position"
         )
 
     def test_cache_layout_flashinfer_compatible(self):
-        """Test that cache layout matches FlashInfer spec."""
+        """Test that cache layout matches FlashInfer spec (no num_heads dimension)."""
         batch_size, seq_len, num_heads = 2, 1, 4
         qk_nope_head_dim, qk_rope_head_dim = 64, 32
-        head_dim_ckv = 512  # DeepSeek-style kv_lora_rank
-        head_dim_kpe = qk_rope_head_dim
+        kv_lora_rank = 512  # DeepSeek-style
+        v_head_dim = 128
         max_seq_len = 64
 
         data = self._create_cached_mla_data(
@@ -572,31 +604,35 @@ class TestTorchBackendMLAWithCache:
             num_heads,
             qk_nope_head_dim,
             qk_rope_head_dim,
-            head_dim_ckv,
+            kv_lora_rank,
+            v_head_dim,
             max_seq_len,
         )
 
-        # Verify cache shape matches FlashInfer layout
-        expected_cache_shape = (batch_size, max_seq_len, head_dim_ckv + head_dim_kpe)
+        # Verify cache shape matches FlashInfer layout: [batch, seq, kv_lora_rank + rope_dim]
+        expected_cache_shape = (batch_size, max_seq_len, kv_lora_rank + qk_rope_head_dim)
         assert data["mla_cache"].shape == expected_cache_shape, (
             f"Cache shape {data['mla_cache'].shape} doesn't match FlashInfer layout {expected_cache_shape}"
         )
 
         # Verify zero-copy slicing works
-        ckv_slice = data["mla_cache"][:, :, :head_dim_ckv]
-        kpe_slice = data["mla_cache"][:, :, head_dim_ckv:]
+        compressed_kv_slice = data["mla_cache"][:, :, :kv_lora_rank]
+        kpe_slice = data["mla_cache"][:, :, kv_lora_rank:]
 
-        assert ckv_slice.shape == (batch_size, max_seq_len, head_dim_ckv)
-        assert kpe_slice.shape == (batch_size, max_seq_len, head_dim_kpe)
+        assert compressed_kv_slice.shape == (batch_size, max_seq_len, kv_lora_rank)
+        assert kpe_slice.shape == (batch_size, max_seq_len, qk_rope_head_dim)
 
         # Verify slices share memory (zero-copy)
-        assert ckv_slice.data_ptr() == data["mla_cache"].data_ptr(), "ckv slice should be zero-copy"
+        assert compressed_kv_slice.data_ptr() == data["mla_cache"].data_ptr(), (
+            "compressed_kv slice should be zero-copy"
+        )
 
     def test_generate_with_reference(self):
         """Test generate phase against numpy reference."""
         batch_size, seq_len, num_heads = 2, 1, 4
         qk_nope_head_dim, qk_rope_head_dim = 32, 16
-        head_dim_ckv = qk_nope_head_dim + 32
+        kv_lora_rank = 64
+        v_head_dim = 32
         max_seq_len = 64
         cache_offset = 3
 
@@ -606,7 +642,8 @@ class TestTorchBackendMLAWithCache:
             num_heads,
             qk_nope_head_dim,
             qk_rope_head_dim,
-            head_dim_ckv,
+            kv_lora_rank,
+            v_head_dim,
             max_seq_len,
             cache_offset,
         )
@@ -614,32 +651,35 @@ class TestTorchBackendMLAWithCache:
         # Run backend
         output = self._run_cached_mla(data)
 
-        # Run numpy reference (convert to float32 first since numpy doesn't support bfloat16)
-        reference = numpy_mla_reference(
+        # Run numpy reference
+        reference = numpy_mla_reference_with_expansion(
             data["q_nope"].cpu().float().numpy(),
             data["q_pe"].cpu().float().numpy(),
-            data["ckv"].cpu().float().numpy(),
+            data["compressed_kv"].cpu().float().numpy(),
             data["kpe"].cpu().float().numpy(),
+            data["kv_b_proj_weight"].cpu().float().numpy(),
             data["mla_cache"].cpu().float().numpy(),
             data["seq_len"].cpu().numpy(),
             data["input_pos"].cpu().numpy(),
             data["cache_loc"].cpu().numpy(),
             data["cu_seqlen"].cpu().numpy(),
             None,
-            head_dim_ckv,
+            kv_lora_rank,
             is_generate=True,
         )
 
         reference_torch = torch.from_numpy(reference).to(output.device, output.dtype)
         assert torch.allclose(output, reference_torch, atol=self.atol, rtol=self.rtol), (
-            f"Generate phase output doesn't match reference. Max diff: {(output - reference_torch).abs().max():.6f}"
+            f"Generate phase output doesn't match reference. "
+            f"Max diff: {(output - reference_torch).abs().max():.6f}"
         )
 
     def test_dtype_preservation(self):
         """Test that output dtype matches input dtype."""
         batch_size, seq_len, num_heads = 1, 1, 4
         qk_nope_head_dim, qk_rope_head_dim = 32, 16
-        head_dim_ckv = qk_nope_head_dim + 32
+        kv_lora_rank = 64
+        v_head_dim = 32
         max_seq_len = 32
 
         for dtype in [torch.float16, torch.bfloat16]:
@@ -650,63 +690,91 @@ class TestTorchBackendMLAWithCache:
                 num_heads,
                 qk_nope_head_dim,
                 qk_rope_head_dim,
-                head_dim_ckv,
+                kv_lora_rank,
+                v_head_dim,
                 max_seq_len,
             )
 
             output = self._run_cached_mla(data)
             assert output.dtype == dtype, f"Expected dtype {dtype}, got {output.dtype}"
 
+    def test_memory_efficiency(self):
+        """Test that cache uses compressed dimensions (no num_heads)."""
+        batch_size = 1
+        max_seq_len = 1024
+        kv_lora_rank = 512
+        qk_rope_head_dim = 64
+        num_heads = 128  # DeepSeek V3
+
+        # FlashInfer compressed cache size
+        compressed_cache_size = batch_size * max_seq_len * (kv_lora_rank + qk_rope_head_dim)
+
+        # Expanded per-head cache size (what we avoid)
+        qk_nope_head_dim = 128
+        v_head_dim = 128
+        expanded_cache_size = (
+            batch_size
+            * max_seq_len
+            * num_heads
+            * (qk_nope_head_dim + v_head_dim + qk_rope_head_dim)
+        )
+
+        # Verify compression ratio
+        compression_ratio = expanded_cache_size / compressed_cache_size
+        assert compression_ratio > 50, f"Expected >50x compression, got {compression_ratio:.1f}x"
+
 
 class TestMLADescriptor:
     """Test MultiHeadLatentAttention descriptor configuration."""
+
+    def _get_mla_descriptor(self):
+        """Get MLA descriptor from registry."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionRegistry
+
+        return AttentionRegistry.get("torch_mla")
 
     def test_descriptor_registration(self):
         """Test that MLA descriptor is properly registered."""
         from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionRegistry
 
-        assert AttentionRegistry.has("MultiHeadLatentAttention"), (
-            "MultiHeadLatentAttention should be registered"
-        )
+        assert AttentionRegistry.has("torch_mla"), "torch_mla should be registered"
 
     def test_descriptor_layout(self):
         """Test that MLA descriptor uses correct layout."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.mla import MultiHeadLatentAttention
+        mla_descriptor = self._get_mla_descriptor()
 
-        assert MultiHeadLatentAttention.get_attention_layout() == "bsnd", (
-            "MLA should use bsnd layout"
-        )
+        assert mla_descriptor.get_attention_layout() == "bsnd", "MLA should use bsnd layout"
 
     def test_descriptor_num_qkv_args(self):
-        """Test that MLA descriptor expects 4 qkv args."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.mla import MultiHeadLatentAttention
+        """Test that MLA descriptor expects 5 tensor args."""
+        mla_descriptor = self._get_mla_descriptor()
 
-        assert MultiHeadLatentAttention.get_num_qkv_args() == 4, (
-            "MLA should expect 4 qkv args (q_nope, q_pe, ckv, kpe)"
+        assert mla_descriptor.get_num_qkv_args() == 5, (
+            "MLA should expect 5 tensor args (q_nope, q_pe, compressed_kv, kpe, kv_b_proj_weight)"
         )
 
     def test_descriptor_source_op(self):
         """Test that MLA descriptor points to correct source op."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.mla import MultiHeadLatentAttention
+        mla_descriptor = self._get_mla_descriptor()
 
-        source_op = MultiHeadLatentAttention.get_source_attention_op()
+        source_op = mla_descriptor.get_source_attention_op()
         assert source_op == torch.ops.auto_deploy.torch_mla, "MLA should use torch_mla as source op"
 
     def test_descriptor_cached_op(self):
         """Test that MLA descriptor points to correct cached op."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.mla import MultiHeadLatentAttention
+        mla_descriptor = self._get_mla_descriptor()
 
-        cached_op = MultiHeadLatentAttention.get_cached_attention_op()
+        cached_op = mla_descriptor.get_cached_attention_op()
         assert cached_op == torch.ops.auto_deploy.torch_cached_mla_with_cache.default, (
             "MLA should use torch_cached_mla_with_cache as cached op"
         )
 
     def test_descriptor_standard_metadata(self):
         """Test that MLA descriptor uses standard metadata args."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.mla import MultiHeadLatentAttention
+        mla_descriptor = self._get_mla_descriptor()
 
         expected_args = ["batch_info_host", "seq_len", "input_pos", "cache_loc", "cu_seqlen"]
-        actual_args = MultiHeadLatentAttention.get_standard_metadata_args()
+        actual_args = mla_descriptor.get_standard_metadata_args()
         assert actual_args == expected_args, (
             f"Expected standard metadata {expected_args}, got {actual_args}"
         )

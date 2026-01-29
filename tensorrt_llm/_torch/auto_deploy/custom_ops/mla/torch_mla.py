@@ -1,4 +1,10 @@
-"""Torch reference implementations for attention."""
+"""Torch reference implementation for Multi-head Latent Attention (MLA).
+
+This module provides the source op for MLA that:
+- Accepts compressed_kv (before kv_b_proj) for FlashInfer-compatible caching
+- Expands compressed_kv using kv_b_proj_weight for attention computation
+- Computes standard attention with the expanded K, V
+"""
 
 import math
 from typing import Optional
@@ -8,94 +14,92 @@ import torch
 
 @torch.library.custom_op("auto_deploy::torch_mla", mutates_args=())
 def torch_mla(
-    q_nope: torch.Tensor,  # [B, S, N, qk_nope_head_dim] or [B, N, S, ...] - query non-positional
-    q_pe: torch.Tensor,  # [B, S, N, qk_rope_head_dim] or [B, N, S, ...] - query positional (RoPE applied)
-    ckv: torch.Tensor,  # [B, S, 1, head_dim_ckv] or [B, 1, S, ...] - compressed key/value
-    kpe: torch.Tensor,  # [B, S, 1, head_dim_kpe] or [B, 1, S, ...] - key positional (RoPE applied)
+    q_nope: torch.Tensor,  # [B, S, N, qk_nope_head_dim]
+    q_pe: torch.Tensor,  # [B, S, N, qk_rope_head_dim] (RoPE applied)
+    compressed_kv: torch.Tensor,  # [B, S, kv_lora_rank] - BEFORE kv_b_proj
+    kpe: torch.Tensor,  # [B, S, 1, qk_rope_head_dim] (RoPE applied)
+    kv_b_proj_weight: torch.Tensor,  # [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
     is_causal: bool = True,
     scale: Optional[float] = None,
-    layout: str = "bsnd",  # "bsnd" or "bnsd"
+    layout: str = "bsnd",
 ) -> torch.Tensor:
-    """Multi-head Latent Attention (MLA) without fused RoPE.
+    """Multi-head Latent Attention (MLA) with FlashInfer-compatible compressed KV.
 
-    This op follows the torch_attention signature style and uses FlashInfer naming:
-    - ckv: compressed key/value (what DeepSeek calls kv after kv_b_proj)
-    - kpe: key positional encoding (k_pe after RoPE is applied)
-
-    The attention computation follows the MLA paper:
-    - Query = concat(q_nope, q_pe) expanded to all heads
-    - Key = concat(k_nope, kpe) where k_nope is derived from ckv
-    - Value is derived from ckv
+    This op expands compressed_kv using kv_b_proj_weight and computes attention.
+    For prefill, this is the standard formulation. For the cached version,
+    weight absorption is used for efficiency.
 
     Args:
         q_nope: Query non-positional component [B, S, N, qk_nope_head_dim] (bsnd)
-        q_pe: Query positional component with RoPE already applied [B, S, N, qk_rope_head_dim] (bsnd)
-        ckv: Compressed key/value from kv_b_proj [B, S, 1, head_dim_ckv] (bsnd)
-        kpe: Key positional encoding with RoPE already applied [B, S, 1, head_dim_kpe] (bsnd)
+        q_pe: Query positional component with RoPE applied [B, S, N, qk_rope_head_dim] (bsnd)
+        compressed_kv: Compressed KV latent [B, S, kv_lora_rank] (before kv_b_proj)
+        kpe: Key positional encoding with RoPE applied [B, S, 1, qk_rope_head_dim] (bsnd)
+        kv_b_proj_weight: Projection weights [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
         is_causal: Whether to apply causal masking (default: True)
         scale: Softmax scale factor (default: 1/sqrt(qk_head_dim))
         layout: Input/output layout, either "bsnd" or "bnsd" (default: "bsnd")
 
     Returns:
-        Attention output with shape [B, S, N, v_head_dim] (bsnd) or [B, N, S, v_head_dim] (bnsd)
+        Attention output with shape [B, S, N, v_head_dim] (bsnd)
     """
     if layout not in ("bnsd", "bsnd"):
         raise ValueError(f"layout must be 'bnsd' or 'bsnd', got {layout!r}")
 
-    # Convert to bnsd format for computation
-    if layout == "bsnd":
-        q_nope = q_nope.transpose(1, 2).contiguous()  # [B, N, S, qk_nope_head_dim]
-        q_pe = q_pe.transpose(1, 2).contiguous()  # [B, N, S, qk_rope_head_dim]
-        ckv = ckv.transpose(1, 2).contiguous()  # [B, 1, S, head_dim_ckv]
-        kpe = kpe.transpose(1, 2).contiguous()  # [B, 1, S, head_dim_kpe]
-
     # Get dimensions
-    bs, num_heads, s_q, qk_nope_head_dim = q_nope.shape
-    qk_rope_head_dim = q_pe.shape[-1]
-    head_dim_ckv = ckv.shape[-1]
-    head_dim_kpe = kpe.shape[-1]
-    s_k = ckv.shape[2]
+    if layout == "bsnd":
+        bs, s_q, num_heads, qk_nope_head_dim = q_nope.shape
+        qk_rope_head_dim = q_pe.shape[-1]
+    else:
+        bs, num_heads, s_q, qk_nope_head_dim = q_nope.shape
+        qk_rope_head_dim = q_pe.shape[-1]
 
-    # MLA uses compressed KV: ckv contains both k_nope and value_states
-    # Typically: head_dim_ckv = qk_nope_head_dim + v_head_dim
-    # For DeepSeek: ckv is [B, 1, S, kv_lora_rank] where kv_lora_rank includes both
-    v_head_dim = head_dim_ckv - qk_nope_head_dim
-    if v_head_dim <= 0:
-        # If ckv doesn't contain separate k_nope and v, treat entire ckv as the compressed representation
-        # This handles the absorb case where the latent representation is used directly
-        v_head_dim = head_dim_ckv
+    s_k = compressed_kv.shape[1]
+
+    # Infer dimensions from kv_b_proj_weight
+    # kv_b_proj_weight: [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
+    out_features = kv_b_proj_weight.shape[0]
+    kv_head_dim = out_features // num_heads  # qk_nope_head_dim + v_head_dim
+    v_head_dim = kv_head_dim - qk_nope_head_dim
 
     # Set scale
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
     if scale is None:
         scale = 1.0 / math.sqrt(qk_head_dim)
 
-    # Split ckv into k_nope and value_states
-    if head_dim_ckv > qk_nope_head_dim:
-        k_nope, value_states = torch.split(
-            ckv, [qk_nope_head_dim, head_dim_ckv - qk_nope_head_dim], dim=-1
-        )
-    else:
-        # Absorb case: use ckv directly
-        k_nope = ckv
-        value_states = ckv
+    # =========================================================================
+    # Expand compressed_kv using kv_b_proj_weight (this is the prefill path)
+    # =========================================================================
+    # compressed_kv: [B, S, kv_lora_rank]
+    # kv_b_proj_weight: [num_heads * kv_head_dim, kv_lora_rank]
+    # kv = compressed_kv @ kv_b_proj_weight.T -> [B, S, num_heads * kv_head_dim]
+    kv = torch.matmul(compressed_kv, kv_b_proj_weight.t())
 
-    # Expand kpe to match num_heads (kpe is shared across heads)
-    # kpe shape: [B, 1, S, head_dim_kpe] -> [B, N, S, head_dim_kpe]
-    kpe_expanded = kpe.expand(bs, num_heads, s_k, head_dim_kpe)
+    # Reshape to [B, S, N, kv_head_dim]
+    kv = kv.view(bs, s_k, num_heads, kv_head_dim)
 
-    # Expand k_nope to match num_heads (k_nope is shared across heads)
-    # k_nope shape: [B, 1, S, qk_nope_head_dim] -> [B, N, S, qk_nope_head_dim]
-    k_nope_expanded = k_nope.expand(bs, num_heads, s_k, qk_nope_head_dim)
+    # Split into k_nope and value_states
+    k_nope, value_states = torch.split(kv, [qk_nope_head_dim, v_head_dim], dim=-1)
 
-    # Expand value_states to match num_heads
-    value_expanded = value_states.expand(bs, num_heads, s_k, -1)
+    # k_nope and value_states are always [B, S, N, D] from the kv reshape above.
+    # We need them in [B, N, S, D] for attention computation.
+    k_nope = k_nope.transpose(1, 2).contiguous()
+    value_states = value_states.transpose(1, 2).contiguous()
+
+    # Convert inputs to computation layout [B, N, S, D] if they come in bsnd format
+    if layout == "bsnd":
+        # [B, S, N, D] -> [B, N, S, D]
+        q_nope = q_nope.transpose(1, 2).contiguous()
+        q_pe = q_pe.transpose(1, 2).contiguous()
+        kpe = kpe.transpose(1, 2).contiguous()
+
+    # kpe is [B, 1, S, qk_rope_head_dim], expand to num_heads
+    kpe_expanded = kpe.expand(bs, num_heads, s_k, qk_rope_head_dim)
 
     # Construct full query and key states
     # query_states: [B, N, S, qk_head_dim]
     query_states = torch.cat([q_nope, q_pe], dim=-1)
     # key_states: [B, N, S, qk_head_dim]
-    key_states = torch.cat([k_nope_expanded, kpe_expanded], dim=-1)
+    key_states = torch.cat([k_nope, kpe_expanded], dim=-1)
 
     # Compute attention scores: Q @ K^T
     attn_scores = (
@@ -112,7 +116,7 @@ def torch_mla(
 
     # Compute attention weights and output
     attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q_nope.dtype)
-    attn_out = torch.matmul(attn_weights, value_expanded)  # [B, N, s_q, v_head_dim]
+    attn_out = torch.matmul(attn_weights, value_states)  # [B, N, s_q, v_head_dim]
 
     # Convert back to requested layout
     if layout == "bsnd":
@@ -125,19 +129,20 @@ def torch_mla(
 def torch_mla_fake(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
-    ckv: torch.Tensor,
+    compressed_kv: torch.Tensor,
     kpe: torch.Tensor,
+    kv_b_proj_weight: torch.Tensor,
     is_causal: bool = True,
     scale: Optional[float] = None,
     layout: str = "bsnd",
 ) -> torch.Tensor:
     """Fake implementation for torch_mla."""
-    # Compute v_head_dim from ckv
+    # Infer v_head_dim from kv_b_proj_weight
     qk_nope_head_dim = q_nope.shape[-1]
-    head_dim_ckv = ckv.shape[-1]
-    v_head_dim = (
-        head_dim_ckv - qk_nope_head_dim if head_dim_ckv > qk_nope_head_dim else head_dim_ckv
-    )
+    num_heads = q_nope.shape[2] if layout == "bsnd" else q_nope.shape[1]
+    out_features = kv_b_proj_weight.shape[0]
+    kv_head_dim = out_features // num_heads
+    v_head_dim = kv_head_dim - qk_nope_head_dim
 
     # Output shape depends on layout
     if layout == "bsnd":

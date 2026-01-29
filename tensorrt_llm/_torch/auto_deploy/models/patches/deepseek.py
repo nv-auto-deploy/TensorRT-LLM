@@ -20,11 +20,14 @@ def deepseek_v3_attention(
 ):
     """DeepSeekV3Attention forward function rewritten to wrap MLA as a custom op.
 
-    This version separates RoPE from attention and uses FlashInfer naming:
-    - ckv: compressed key/value (from kv_b_proj)
-    - kpe: key positional encoding (after RoPE)
+    This version uses FlashInfer-compatible compressed KV cache:
+    - compressed_kv: latent before kv_b_proj [B, S, kv_lora_rank]
+    - kpe: key positional encoding (after RoPE) [B, S, 1, qk_rope_head_dim]
+    - kv_b_proj_weight: projection weights passed to attention op
 
-    The torch_mla op expects inputs in BSND layout with RoPE already applied.
+    The torch_mla op handles kv_b_proj expansion internally:
+    - Prefill: expand compressed_kv -> full K, V for attention
+    - Generate: use weight absorption for efficiency
     """
     if "padding_mask" in kwargs:
         warnings.warn(
@@ -46,22 +49,19 @@ def deepseek_v3_attention(
     q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
     # =========================================================================
-    # KV projection
+    # KV projection - keep compressed form for FlashInfer cache
     # =========================================================================
-    compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+    kv_a_output = self.kv_a_proj_with_mqa(hidden_states)
     compressed_kv, k_pe = torch.split(
-        compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        kv_a_output, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
     )
+
+    # Apply layernorm to compressed_kv (this is what we store in cache)
+    # Shape: [B, S, kv_lora_rank]
+    compressed_kv = self.kv_a_layernorm(compressed_kv)
+
     # k_pe: [B, S, 1, qk_rope_head_dim] (BSND layout, shared across heads)
     k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
-
-    # ckv: KV after kv_b_proj projection
-    # Shape: [B, S, N, qk_nope_head_dim + v_head_dim] (per-head, BSND layout)
-    # Note: In the full FlashInfer MLA implementation, this would be compressed,
-    # but for compatibility with existing model weights, we keep per-head expansion
-    ckv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv)).view(
-        bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-    )
 
     kv_seq_len = q_len
     if past_key_value is not None:
@@ -85,18 +85,20 @@ def deepseek_v3_attention(
     )
 
     # =========================================================================
-    # Call MLA WITHOUT fused RoPE (using FlashInfer naming)
+    # Call MLA with compressed KV (FlashInfer-compatible)
     # =========================================================================
-    # torch_mla expects BSND layout:
+    # torch_mla signature (5 tensor args):
     # - q_nope: [B, S, N, qk_nope_head_dim]
     # - q_pe: [B, S, N, qk_rope_head_dim] (RoPE already applied)
-    # - ckv: [B, S, 1, head_dim_ckv] (compressed key/value)
-    # - kpe: [B, S, 1, head_dim_kpe] (RoPE already applied)
+    # - compressed_kv: [B, S, kv_lora_rank] (BEFORE kv_b_proj)
+    # - kpe: [B, S, 1, qk_rope_head_dim] (RoPE already applied)
+    # - kv_b_proj_weight: [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
     attn_output = torch.ops.auto_deploy.torch_mla(
-        q_nope,  # query non-positional [B, S, N, qk_nope_head_dim]
-        q_pe_rotated,  # query positional with RoPE [B, S, N, qk_rope_head_dim]
-        ckv,  # compressed key/value [B, S, 1, head_dim_ckv]
-        kpe,  # key positional with RoPE [B, S, 1, head_dim_kpe]
+        q_nope,  # [B, S, N, qk_nope_head_dim]
+        q_pe_rotated,  # [B, S, N, qk_rope_head_dim]
+        compressed_kv,  # [B, S, kv_lora_rank] - compressed latent
+        kpe,  # [B, S, 1, qk_rope_head_dim]
+        self.kv_b_proj.weight,  # [out_features, in_features] = [N*(qk_nope+v), kv_lora_rank]
         True,  # is_causal
         self.softmax_scale,
         "bsnd",  # layout
@@ -151,6 +153,7 @@ CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
     "DeepseekV3YarnRotaryEmbedding": deepseek_v3_rope,
     "DeepseekV2RotaryEmbedding": deepseek_v3_rope,
     "DeepseekV2YarnRotaryEmbedding": deepseek_v3_rope,
+    "DeepseekV3Attention": deepseek_v3_attention,
 }
 
 

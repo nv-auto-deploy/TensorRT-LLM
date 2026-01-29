@@ -517,13 +517,27 @@ class TestMLAOpRegistration:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.bfloat16
 
-        q_nope = torch.randn(1, 2, 4, 64, dtype=dtype, device=device)
-        q_pe = torch.randn(1, 2, 4, 32, dtype=dtype, device=device)
-        ckv = torch.randn(1, 2, 1, 128, dtype=dtype, device=device)
-        kpe = torch.randn(1, 2, 1, 32, dtype=dtype, device=device)
+        batch_size, seq_len, num_heads = 1, 2, 4
+        qk_nope_head_dim, qk_rope_head_dim = 64, 32
+        kv_lora_rank = 128
+        v_head_dim = 64
+
+        q_nope = torch.randn(
+            batch_size, seq_len, num_heads, qk_nope_head_dim, dtype=dtype, device=device
+        )
+        q_pe = torch.randn(
+            batch_size, seq_len, num_heads, qk_rope_head_dim, dtype=dtype, device=device
+        )
+        compressed_kv = torch.randn(batch_size, seq_len, kv_lora_rank, dtype=dtype, device=device)
+        kpe = torch.randn(batch_size, seq_len, 1, qk_rope_head_dim, dtype=dtype, device=device)
+        kv_b_proj_weight = torch.randn(
+            num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank, dtype=dtype, device=device
+        )
 
         # Should not raise
-        output = torch.ops.auto_deploy.torch_mla(q_nope, q_pe, ckv, kpe, True, None, "bsnd")
+        output = torch.ops.auto_deploy.torch_mla(
+            q_nope, q_pe, compressed_kv, kpe, kv_b_proj_weight, True, None, "bsnd"
+        )
         assert output is not None
 
     def test_torch_cached_mla_callable(self):
@@ -533,7 +547,8 @@ class TestMLAOpRegistration:
 
         batch_size, seq_len, num_heads = 1, 1, 4
         qk_nope_head_dim, qk_rope_head_dim = 32, 16
-        head_dim_ckv = 64
+        kv_lora_rank = 64
+        v_head_dim = 32
         max_seq_len = 32
 
         q_nope = torch.randn(
@@ -542,8 +557,11 @@ class TestMLAOpRegistration:
         q_pe = torch.randn(
             batch_size, seq_len, num_heads, qk_rope_head_dim, dtype=dtype, device=device
         )
-        ckv = torch.randn(batch_size, seq_len, 1, head_dim_ckv, dtype=dtype, device=device)
+        compressed_kv = torch.randn(batch_size, seq_len, kv_lora_rank, dtype=dtype, device=device)
         kpe = torch.randn(batch_size, seq_len, 1, qk_rope_head_dim, dtype=dtype, device=device)
+        kv_b_proj_weight = torch.randn(
+            num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank, dtype=dtype, device=device
+        )
 
         batch_info_host = torch.tensor([0, 0, batch_size], dtype=torch.int32, device=device)
         seq_len_tensor = torch.tensor([seq_len], dtype=torch.int32, device=device)
@@ -552,15 +570,16 @@ class TestMLAOpRegistration:
         cu_seqlen = torch.tensor([0], dtype=torch.int32, device=device)
 
         mla_cache = torch.zeros(
-            batch_size, max_seq_len, head_dim_ckv + qk_rope_head_dim, dtype=dtype, device=device
+            batch_size, max_seq_len, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
         )
 
         # Should not raise
         output = torch.ops.auto_deploy.torch_cached_mla_with_cache(
             q_nope,
             q_pe,
-            ckv,
+            compressed_kv,
             kpe,
+            kv_b_proj_weight,
             batch_info_host,
             seq_len_tensor,
             input_pos,
@@ -568,6 +587,6 @@ class TestMLAOpRegistration:
             cu_seqlen,
             mla_cache,
             None,
-            head_dim_ckv,
+            kv_lora_rank,
         )
         assert output is not None
