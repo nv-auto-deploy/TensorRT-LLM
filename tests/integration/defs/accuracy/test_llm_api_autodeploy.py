@@ -185,7 +185,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             "transforms": {
                 "detect_sharding": {
                     "sharding_source": ['factory', 'heuristic'],
-                    "sharding_dims": ['ep', 'bmm'],
+                    "sharding_dims": ['EP'],
                 },
                 "multi_stream_moe": {
                     "stage": "compile",
@@ -285,7 +285,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             "transforms": {
                 "detect_sharding": {
                     "sharding_source": ['factory', 'heuristic'],
-                    "sharding_dims": ['ep', 'bmm'],
+                    "sharding_dims": ['EP'],
                 },
             }
         }
