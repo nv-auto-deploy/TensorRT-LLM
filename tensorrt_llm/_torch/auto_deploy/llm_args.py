@@ -14,6 +14,7 @@ from ...llmapi.llm_args import (
     _ParallelConfig,
 )
 from .models import ModelFactory, ModelFactoryRegistry
+from .models.eagle import EagleOneModelFactory
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
 
@@ -316,7 +317,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         """Create a model factory from the arguments."""
 
         # TODO (lucaslie): consider supporting Path objects in the model factory
-        return ModelFactoryRegistry.get(self.model_factory)(
+        target_factory = ModelFactoryRegistry.get(self.model_factory)(
             model=str(self.model),
             model_kwargs=self.model_kwargs,
             tokenizer=None if self.tokenizer is None else str(self.tokenizer),
@@ -324,6 +325,28 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             skip_loading_weights=self.skip_loading_weights,
             max_seq_len=self.max_seq_len,
         )
+
+        # Check if we need to wrap with EagleOneModelFactory for one-model Eagle
+        is_eagle_one_model = (
+            self.speculative_config is not None
+            and isinstance(self.speculative_config, EagleDecodingConfig)
+            and self.speculative_config.eagle3_one_model
+        )
+        if is_eagle_one_model:
+            # Compute max_num_tokens if not set, then adjust for draft tokens
+            max_num_tokens = self.max_num_tokens or self.max_batch_size * self.max_seq_len
+            max_num_tokens = (
+                min(max_num_tokens, self.max_batch_size * self.max_seq_len)
+                + (self.speculative_config.max_total_draft_tokens + 1) * self.max_batch_size
+            )
+            target_factory = EagleOneModelFactory.build_from_target(
+                target_factory=target_factory,
+                speculative_config=self.speculative_config,
+                max_batch_size=self.max_batch_size,
+                max_num_tokens=max_num_tokens,
+            )
+
+        return target_factory
 
     def is_cuda_graph_enabled(self) -> bool:
         return self.compile_backend in ["torch-cudagraph", "torch-opt"]

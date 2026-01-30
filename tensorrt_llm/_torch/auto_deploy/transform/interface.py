@@ -491,12 +491,16 @@ class BaseTransform(ABC):
         # just run it on first graph module we are encountering for now...
         info = None
         for k, graph_sub in named_graphmodules(mod):
+            # Set the current submodule name for cache prefixing
+            cm.set_current_submodule(k)
             graph_sub, info_apply = self._apply(graph_sub, cm, factory, shared_config)
             if k == "":
                 mod = graph_sub
             else:
                 mod.set_submodule(k, graph_sub)
             info = info & info_apply if info is not None else info_apply
+        # Reset submodule name after processing
+        cm.set_current_submodule("")
         return mod, info
 
     @final

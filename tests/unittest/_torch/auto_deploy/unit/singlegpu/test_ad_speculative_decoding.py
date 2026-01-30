@@ -18,7 +18,8 @@ from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 from test_common.llm_data import with_mocked_hf_download
 
-from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
+from tensorrt_llm._torch.auto_deploy.llm import DemoLLM
+from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig, KvCacheConfig
 
 
 @pytest.mark.parametrize("use_hf_speculative_model", [False])
@@ -81,3 +82,97 @@ def test_ad_speculative_decoding_smoke(use_hf_speculative_model: bool):
     assert len(generated_text) > 0, "Generated text should not be empty"
 
     print("Speculative decoding smoke test passed!")
+
+
+# Maybe this test would be better checking a variety of settings of spec config and overlap scheduler
+# and being a test for the KV cache manager creation.
+def test_kv_cache_manager_spec_dec():
+    """Tests that KV cache manager is created correctly with spec decoding related parameters."""
+    print("\n" + "=" * 80)
+    print("Testing Au")
+    print("=" * 80)
+
+    base_model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+    eagle_model_id = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
+
+    base_model_config = get_small_model_config(base_model_id)
+    eagle_model_config = get_small_model_config(eagle_model_id)
+
+    print(f"\nBase Model Config: {base_model_config}")
+    print(f"Eagle Model Config: {eagle_model_config}")
+
+    max_draft_len = 3
+    use_one_model_spec_dec = True
+
+    speculative_config = Eagle3DecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model=eagle_model_config["args"]["model"],
+        eagle3_one_model=use_one_model_spec_dec,
+        eagle3_layers_to_capture={1, 15, 28},
+    )
+
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=0.001,
+    )
+
+    llm = DemoLLM(
+        model=base_model_config["args"]["model"],
+        skip_loading_weights=True,
+        world_size=0,
+        kv_cache_config=kv_cache_config,
+        speculative_config=speculative_config,
+        disable_overlap_scheduler=True,
+        max_num_tokens=128,
+    )
+
+    engine = llm._executor.engine_executor
+    cache_interface = engine.cache_seq_interface
+    kv_cache_manager = cache_interface._kv_cache_manager
+
+    kv_num_extra_kv_tokens = getattr(kv_cache_manager, "num_extra_kv_tokens", None)
+    kv_max_draft_len = getattr(kv_cache_manager, "max_draft_len", None)
+    kv_max_total_draft_tokens = getattr(kv_cache_manager, "max_total_draft_tokens", None)
+
+    csi_extra_seq_len_for_kv_cache = getattr(cache_interface, "_extra_seq_len_for_kv_cache", None)
+    csi_spec_config = getattr(cache_interface, "_spec_config", None)
+
+    print("\n" + "=" * 60)
+    print("KVCacheManager Parameters:")
+    print("=" * 60)
+    print(f"  kv_num_extra_kv_tokens:     {kv_num_extra_kv_tokens}")
+    print(f"  kv_max_draft_len:           {kv_max_draft_len}")
+    print(f"  kv_max_total_draft_tokens:  {kv_max_total_draft_tokens}")
+    print("=" * 60)
+    print("\nCachedSequenceInterface Parameters:")
+    print("=" * 60)
+    print(f"  csi_extra_seq_len_for_kv_cache: {csi_extra_seq_len_for_kv_cache}")
+    print(f"  csi_spec_config:                {csi_spec_config}")
+    print("=" * 60)
+
+    assert kv_max_draft_len == max_draft_len, (
+        f"Expected kv_max_draft_len={max_draft_len}, got {kv_max_draft_len}"
+    )
+    assert kv_max_total_draft_tokens == max_draft_len, (
+        f"Expected kv_max_total_draft_tokens={max_draft_len}, got {kv_max_total_draft_tokens}"
+    )
+
+    expected_num_extra_kv_tokens = max_draft_len - 1 if use_one_model_spec_dec else 0
+    assert kv_num_extra_kv_tokens == expected_num_extra_kv_tokens, (
+        f"Expected kv_num_extra_kv_tokens={expected_num_extra_kv_tokens}, "
+        f"got {kv_num_extra_kv_tokens}"
+    )
+
+    # csi_extra_seq_len_for_kv_cache = max_total_draft_tokens + num_extra_kv_tokens
+    # (no overlap scheduler contribution since disable_overlap_scheduler=True)
+    expected_extra_seq_len = max_draft_len + expected_num_extra_kv_tokens  # 3 + 2 = 5
+    assert csi_extra_seq_len_for_kv_cache == expected_extra_seq_len, (
+        f"Expected csi_extra_seq_len_for_kv_cache={expected_extra_seq_len}, "
+        f"got {csi_extra_seq_len_for_kv_cache}"
+    )
+
+    print("\n" + "=" * 80)
+    print("SUCCESS! All KV cache spec-related assertions passed!")
+    print("=" * 80)
+
+    # Shutdown the LLM (no generation was performed)
+    llm.shutdown()
