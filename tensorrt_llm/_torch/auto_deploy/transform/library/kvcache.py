@@ -316,7 +316,6 @@ class InitializeCache(BaseTransform):
         # Initialize with estimation mode
         # This allows resize_kv_cache to recreate with correct capacity after measuring memory
         num_caches = cm.initialize_resources()
-        self._log_info(f"Initialized {num_caches} caches for cached attention")
 
         info = TransformInfo(
             skipped=False, num_matches=num_caches, is_clean=True, has_valid_shapes=True
