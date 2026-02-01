@@ -1,4 +1,5 @@
 import sys
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -337,6 +338,10 @@ class MTPSampler(Sampler[SampleStateMTP]):
         next_new_tokens = self.store.next_new_tokens
         new_tokens_lens = self.store.new_tokens_lens
         next_draft_tokens = self.store.next_draft_tokens
+
+        # Zero out store tensors before scatter to prevent stale/garbage values
+        # from previous iterations from being accidentally read.
+        new_tokens_lens.zero_()
 
         new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
         next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)

@@ -173,7 +173,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.7
             },
-            "disable_overlap_scheduler": True,  # Required for one-model mode
+            "disable_overlap_scheduler": False,
             "enable_iter_perf_stats": True,  # Enable stats for acceptance rate
         }
 
@@ -229,9 +229,11 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
                 **kwargs,
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs={'dataset_path': None})
 
-            self.check_acceptance_rate(llm, min_acceptance_rate=0.07)
+            self.check_acceptance_rate(llm, min_acceptance_rate=0.25)
 
 
 class TestNemotronH(LlmapiAccuracyTestHarness):
