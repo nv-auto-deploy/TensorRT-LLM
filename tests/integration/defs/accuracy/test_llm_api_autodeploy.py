@@ -22,7 +22,7 @@ from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..conftest import get_device_count, llm_models_root
+from ..conftest import get_device_count, get_device_memory, llm_models_root
 from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 
@@ -391,12 +391,13 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip("Skipping FP4 test until it is supported")
     @pytest.mark.skip_less_device_memory(180000)
-    @pytest.mark.parametrize("world_size", [4, 8])
+    @pytest.mark.parametrize("world_size", [1, 4, 8])
     def test_fp4(self, world_size):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
+        if get_device_memory() < 100000 and world_size == 1:
+            pytest.skip("Not enough memory for this world size, skipping test")
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_FP4,
@@ -405,7 +406,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                            **kwargs) as llm:
             # Manually set quant_config for FP4 model to get the accuracy threshold
             llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
-            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP8
 
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)

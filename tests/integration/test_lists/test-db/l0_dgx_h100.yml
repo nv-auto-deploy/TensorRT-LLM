@@ -339,4 +339,7 @@ l0_dgx_h100:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_bf16
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_fp8[4]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_fp8[8]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_nvfp4[1]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_nvfp4[4]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_nvfp4[8]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_attention_dp[4]
