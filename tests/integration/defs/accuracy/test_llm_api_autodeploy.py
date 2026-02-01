@@ -393,7 +393,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [1, 4, 8])
-    def test_fp4(self, world_size):
+    def test_nvfp4(self, world_size):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         if get_device_memory() < 100000 and world_size == 1:
