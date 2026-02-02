@@ -22,8 +22,7 @@ import torch
 import tensorrt_llm.bindings
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.interface import \
-        AttentionMetadata
+    from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -318,6 +317,57 @@ class PythonMambaCacheManager(BaseResourceManager):
         # Store max_batch_size for resource management
         self._max_batch_size = max_batch_size
 
+    def ensure_speculative_intermediate_buffers(
+            self, speculative_num_draft_tokens: int) -> None:
+        """Lazily allocate speculative intermediate buffers after manager construction.
+
+        TODO: Move this allocation back to MambaHybridCacheManager constructor once AutoDeploy's
+        speculative-layer handling is reconciled with KVCacheManager construction.
+        """
+        if speculative_num_draft_tokens < 0:
+            raise ValueError(
+                f"speculative_num_draft_tokens must be non-negative, got {speculative_num_draft_tokens}"
+            )
+
+        if (isinstance(self.mamba_cache, self.SpeculativeState)
+                and self.speculative_num_draft_tokens
+                == speculative_num_draft_tokens):
+            return
+
+        conv_states = self.mamba_cache.conv
+        ssm_states = self.mamba_cache.temporal
+        num_local_layers = conv_states.shape[0]
+        conv_state_shape = tuple(conv_states.shape[2:])
+        ssm_state_shape = tuple(ssm_states.shape[2:])
+
+        intermediate_ssm_states = torch.zeros(
+            size=(
+                num_local_layers,
+                self.spec_state_size,
+                speculative_num_draft_tokens + 1,
+            ) + ssm_state_shape,
+            dtype=ssm_states.dtype,
+            device=ssm_states.device,
+        )
+
+        intermediate_conv_window_cache = torch.zeros(
+            size=(
+                num_local_layers,
+                self.spec_state_size,
+                speculative_num_draft_tokens + 1,
+            ) + conv_state_shape,
+            dtype=conv_states.dtype,
+            device=conv_states.device,
+        )
+
+        self.mamba_cache = self.SpeculativeState(
+            conv=conv_states,
+            temporal=ssm_states,
+            intermediate_ssm=intermediate_ssm_states,
+            intermediate_conv_window=intermediate_conv_window_cache,
+        )
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
+
     def get_max_resource_count(self) -> int:
         """Return the maximum number of sequences that can be cached."""
         return self._max_batch_size
@@ -455,12 +505,8 @@ class PythonMambaCacheManager(BaseResourceManager):
 
         torch.cuda.empty_cache()
 
-    @torch.compile(options={"max-autotune": True})
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor):
-        batch_size = attn_metadata.num_seqs
-        num_contexts = attn_metadata.num_contexts
-        num_gens = batch_size - num_contexts
+    def _update_mamba_states(self, num_contexts: int, num_gens: int,
+                             num_accepted_tokens: torch.Tensor):
         num_accepted_draft_tokens = num_accepted_tokens[
             num_contexts:num_contexts + num_gens] - 1
         state_indices_d = self.state_indices[num_contexts:num_contexts +
@@ -482,6 +528,11 @@ class PythonMambaCacheManager(BaseResourceManager):
                                                              src_state_indices,
                                                              num_accepted_draft_tokens]
         conv_states[:, state_indices_d, :] = accepted_conv_state
+
+    @torch.compile(options={"max-autotune": True})
+    def update_mamba_states(self, num_contexts: int, num_gens: int,
+                            num_accepted_tokens: torch.Tensor):
+        self._update_mamba_states(num_contexts, num_gens, num_accepted_tokens)
 
 
 class MambaCacheManager(BaseResourceManager):
@@ -611,10 +662,11 @@ class MambaCacheManager(BaseResourceManager):
     def shutdown(self):
         self._impl.shutdown()
 
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
+    def update_mamba_states(self, num_contexts: int, num_gens: int,
                             num_accepted_tokens: torch.Tensor):
         assert not self._use_cpp, "update_mamba_states is not supported in CppMambaCacheManager"
-        self._impl.update_mamba_states(attn_metadata, num_accepted_tokens)
+        self._impl.update_mamba_states(num_contexts, num_gens,
+                                       num_accepted_tokens)
 
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
@@ -717,7 +769,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         KVCacheManager.update_resources(self, scheduled_batch, attn_metadata,
                                         kv_cache_dtype_byte_size)
 
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
+    def update_mamba_states(self, num_contexts: int, num_gens: int,
                             num_accepted_tokens: torch.Tensor):
-        MambaCacheManager.update_mamba_states(self, attn_metadata,
+        MambaCacheManager.update_mamba_states(self, num_contexts, num_gens,
                                               num_accepted_tokens)

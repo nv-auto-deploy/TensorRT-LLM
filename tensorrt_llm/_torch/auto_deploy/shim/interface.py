@@ -147,6 +147,12 @@ class CachedSequenceInterface:
         return full_name
 
     @staticmethod
+    def _resource_suffix(cache_name: str) -> str:
+        """Strip the ``r{idx}_`` prefix added by add_resource()."""
+        _, sep, suffix = cache_name.partition("_")
+        return suffix if sep else cache_name
+
+    @staticmethod
     def _check_n_groups_constraint(
         ssm: SSMResourceHandler, conv: CausalConvResourceHandler
     ) -> bool:
@@ -478,7 +484,52 @@ class CachedSequenceInterface:
                 )
                 self._caches[conv_managed[layer_idx][0]] = conv_view
 
+        self._bind_intermediate_state_views(manager, num_managed_mamba_layers)
+
         return manager, num_managed_mamba_layers
+
+    def _bind_intermediate_state_views(
+        self,
+        manager: MambaHybridCacheManager,
+        num_managed_mamba_layers: int,
+    ) -> None:
+        """Bind optional intermediate state cache args to manager-backed views."""
+        next_ssm_layer_idx = 0
+        next_conv_layer_idx = 0
+        supports_intermediate_ssm = True
+        supports_intermediate_conv = True
+
+        for cache_name in self._resource_lookup.keys():
+            suffix = self._resource_suffix(cache_name)
+
+            if suffix.startswith("intermediate_ssm_state_cache"):
+                if not supports_intermediate_ssm or next_ssm_layer_idx >= num_managed_mamba_layers:
+                    continue
+                try:
+                    view = manager.get_intermediate_ssm_states(next_ssm_layer_idx)
+                except AssertionError:
+                    supports_intermediate_ssm = False
+                    continue
+                next_ssm_layer_idx += 1
+                if view is not None:
+                    assert view.is_contiguous(), f"Non-contiguous state {cache_name}"
+                    self._caches[cache_name] = view
+
+            elif suffix.startswith("intermediate_conv_state_cache"):
+                if (
+                    not supports_intermediate_conv
+                    or next_conv_layer_idx >= num_managed_mamba_layers
+                ):
+                    continue
+                try:
+                    view = manager.get_intermediate_conv_states(next_conv_layer_idx)
+                except AssertionError:
+                    supports_intermediate_conv = False
+                    continue
+                next_conv_layer_idx += 1
+                if view is not None:
+                    assert view.is_contiguous(), f"Non-contiguous state {cache_name}"
+                    self._caches[cache_name] = view
 
     def _assign_kv_cache_views(self, kv_managed: Dict[str, KVPagedResourceHandler]) -> int:
         """Retrieve and assign buffer views for managed KV paged resources.

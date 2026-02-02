@@ -10,7 +10,9 @@ from tensorrt_llm.mapping import Mapping
 
 from ...llmapi.llm_args import (
     BuildConfig,
+    Eagle3DecodingConfig,
     EagleDecodingConfig,
+    MTPDecodingConfig,
     SamplerType,
     TorchLlmArgs,
     _ParallelConfig,
@@ -115,9 +117,29 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     @model_validator(mode="after")
     def setup_hidden_state_capture(self):
-        if self.speculative_config is None or not isinstance(
-            self.speculative_config, EagleDecodingConfig
-        ):
+        if self.speculative_config is None:
+            return self
+
+        if isinstance(self.speculative_config, MTPDecodingConfig):
+            mtp_cfg = self.speculative_config
+            if mtp_cfg.mtp_eagle_one_model:
+                if mtp_cfg.use_mtp_vanilla:
+                    raise ValueError(
+                        "mtp_eagle_one_model and use_mtp_vanilla cannot both be enabled"
+                    )
+                speculative_model = (
+                    mtp_cfg.speculative_model
+                    if mtp_cfg.speculative_model is not None
+                    else str(self.model)
+                )
+                self.speculative_config = Eagle3DecodingConfig(
+                    max_draft_len=mtp_cfg.num_nextn_predict_layers,
+                    speculative_model=speculative_model,
+                    eagle3_one_model=True,
+                    eagle3_layers_to_capture={-1},
+                )
+
+        if not isinstance(self.speculative_config, EagleDecodingConfig):
             return self
 
         self.transforms["detect_hidden_states_for_capture"]["enabled"] = True
