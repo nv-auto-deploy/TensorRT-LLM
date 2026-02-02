@@ -346,7 +346,7 @@ def test_eagle_model_with_weights():
     builds the Eagle drafter model based on the checkpoint's model_type:
 
     1. Factory creates config via AutoConfig.from_pretrained
-    2. Factory selects Eagle3DrafterForCausalLM based on model_type="llama"
+    2. Factory selects EagleDrafterForCausalLM based on model_type="llama"
     3. Factory creates model via _from_config
     4. Factory loads weights via load_or_random_init -> _load_checkpoint
 
@@ -383,8 +383,8 @@ def test_eagle_model_with_weights():
     # Factory flow:
     #   build_model() -> prefetch_checkpoint() -> _build_model()
     #   _build_model() -> _get_model_config() (gets base LlamaConfig)
-    #   _build_model() -> selects Eagle3DrafterForCausalLM for model_type="llama"
-    #   _build_model() -> Eagle3DrafterForCausalLM._from_config(config)
+    #   _build_model() -> selects EagleDrafterForCausalLM for model_type="llama"
+    #   _build_model() -> EagleDrafterForCausalLM._from_config(config)
     print("Building model via factory.build_model('meta')...")
     model = factory.build_model("meta")
     print(f"Model type: {type(model).__name__}")
