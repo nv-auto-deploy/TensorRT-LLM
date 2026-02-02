@@ -872,3 +872,53 @@ class NemotronHMTPForCausalLM(NemotronHPreTrainedModel):
 
 AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
 AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHMTPConfig", NemotronHMTPForCausalLM)
+
+
+# =============================================================================
+# Eagle Layer Builder for NemotronH (Stub)
+# =============================================================================
+
+
+def build_nemotron_eagle_layers(config) -> nn.ModuleList:
+    """Build NemotronH MTP layers for Eagle drafter.
+
+    This function is called by get_eagle_layers() in modeling_eagle.py when
+    model_type is "nemotron_h".
+
+    NemotronH Eagle layers differ from Llama Eagle layers in:
+    - Do NOT use RoPE (hybrid Mamba model)
+    - Use pattern-based construction ("*E" = Attention + MoE)
+    - First layer has start projections (enorm, hnorm, eh_proj)
+    - Last layer has final_layernorm
+    - Layers should ignore position_ids parameter
+
+    Expected forward signature (unified interface):
+        forward(hidden_states, inputs_embeds, position_ids) -> Tensor
+
+    Args:
+        config: Model configuration with NemotronH-specific parameters
+                (mtp_hybrid_override_pattern, n_routed_experts, etc.)
+
+    Returns:
+        nn.ModuleList of NemotronH Eagle layers
+
+    Raises:
+        NotImplementedError: This is a stub - full implementation pending.
+    """
+    raise NotImplementedError(
+        "NemotronH Eagle layers not yet implemented. "
+        "Expected interface: forward(hidden_states, inputs_embeds, position_ids) -> Tensor. "
+        "See NemotronHMTPSublayer for reference implementation."
+    )
+    # Future implementation:
+    # pattern = getattr(config, "mtp_hybrid_override_pattern", "*E")
+    # return nn.ModuleList([
+    #     NemotronHEagleLayer(
+    #         config,
+    #         layer_idx=i,
+    #         layer_type=char,
+    #         has_start_proj=(i == 0),
+    #         has_end_norm=(i == len(pattern) - 1),
+    #     )
+    #     for i, char in enumerate(pattern)
+    # ])
