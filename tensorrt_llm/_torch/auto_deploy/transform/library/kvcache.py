@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -142,11 +142,12 @@ class _InsertCachedOperator(BaseTransform):
         meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
         constants: List[Constant],
+        spec_config=None,
     ):
         """Insert a cached attention node into the graph."""
         with gm.graph.inserting_before(attn_node):
             cached_attn_node = gm.graph.call_function(
-                self.attn_descriptor.get_cached_attention_op(),
+                self.attn_descriptor.get_cached_attention_op(spec_config=spec_config),
                 args=(
                     *qkv_nodes,
                     *meta_nodes_std,
@@ -196,7 +197,11 @@ class _InsertCachedOperator(BaseTransform):
             qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
 
             # setup + store cache resource handlers and caches as input nodes
-            resources_dict = attn_descriptor.get_cache_initializers(attn_node, cm.kv_cache_config)
+            resources_dict = attn_descriptor.get_cache_initializers(
+                attn_node,
+                cm.kv_cache_config,
+                spec_config=cm._spec_config,
+            )
             cache_in_nodes = [
                 self._process_cache_node(gm, cm.add_resource(k, resource_handler))
                 for k, resource_handler in resources_dict.items()
@@ -217,6 +222,7 @@ class _InsertCachedOperator(BaseTransform):
                 meta_nodes_extra,
                 cache_in_nodes,
                 constants,
+                spec_config=cm._spec_config,
             )
 
             num_cached_attn_replacements += 1

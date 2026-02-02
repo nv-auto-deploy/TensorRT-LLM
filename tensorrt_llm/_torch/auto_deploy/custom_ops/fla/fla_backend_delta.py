@@ -181,7 +181,7 @@ class FlaDeltaBackend(AttentionDescriptor):
         return torch.ops.auto_deploy.fla_delta_rule
 
     @classmethod
-    def get_cached_attention_op(cls) -> MHACallable:
+    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
         return torch.ops.auto_deploy.fla_cached_delta_rule.default
 
     @classmethod
@@ -196,7 +196,7 @@ class FlaDeltaBackend(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig
+        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
     ) -> ResourceHandlerDict:
         key_node = source_attn_node.args[1]
         value_node = source_attn_node.args[2]

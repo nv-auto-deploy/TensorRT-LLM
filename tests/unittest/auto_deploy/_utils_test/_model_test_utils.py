@@ -552,6 +552,11 @@ _SMALL_MODEL_CONFIGS = {
             "num_hidden_layers": 8,
         },
     },
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": {
+        "model_kwargs": {
+            "layers_block_type": ["mamba"],
+        },
+    },
     "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": {
         "model_kwargs": {
             "hidden_size": 64,

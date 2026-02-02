@@ -1652,6 +1652,21 @@ class SSMResourceHandler(StateResourceHandler):
         """Return the SSM state shape: (num_heads, head_dim, d_state)."""
         return (self.num_heads, self.head_dim, self.d_state)
 
+    def has_compatible_dims(self, other: Optional["SSMResourceHandler"]) -> bool:
+        """Return whether this handler can share Mamba state dimensions with ``other``.
+
+        Spec handlers prepend ``cache_steps`` to the state shape, so compatibility needs to be
+        checked from the base SSM dimensions instead of relying on ``__eq__``.
+        """
+        if other is None:
+            return False
+        return (
+            self.num_heads == other.num_heads
+            and self.head_dim == other.head_dim
+            and self.d_state == other.d_state
+            and self.dtype == other.dtype
+        )
+
 
 class CausalConvResourceHandler(StateResourceHandler):
     """Handler for causal conv state resources that maps to MambaCacheManager's conv_states buffer.
@@ -1684,6 +1699,61 @@ class CausalConvResourceHandler(StateResourceHandler):
     def state_shape(self) -> Tuple[int, int]:
         """Return the conv state shape: (conv_dim, d_conv - 1)."""
         return (self.conv_dim, self.d_conv - 1)
+
+    def has_compatible_dims(self, other: Optional["CausalConvResourceHandler"]) -> bool:
+        """Return whether this handler can share Mamba state dimensions with ``other``."""
+        if other is None:
+            return False
+        return (
+            self.conv_dim == other.conv_dim
+            and self.d_conv == other.d_conv
+            and self.dtype == other.dtype
+        )
+
+
+class SpecSSMResourceHandler(SSMResourceHandler):
+    """Intermediate SSM state cache for speculative decoding.
+
+    Shape: [max_batch_size, cache_steps, num_heads, head_dim, d_state]
+    (prepends cache_steps to the base SSM state shape).
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        d_state: int,
+        dtype: torch.dtype,
+        cache_steps: int,
+    ) -> None:
+        self.cache_steps = cache_steps
+        super().__init__(num_heads=num_heads, head_dim=head_dim, d_state=d_state, dtype=dtype)
+
+    @property
+    def state_shape(self) -> Tuple[int, int, int, int]:
+        return (self.cache_steps, self.num_heads, self.head_dim, self.d_state)
+
+
+class SpecCausalConvResourceHandler(CausalConvResourceHandler):
+    """Intermediate conv state cache for speculative decoding.
+
+    Shape: [max_batch_size, cache_steps, conv_dim, d_conv - 1]
+    (prepends cache_steps to the base conv state shape).
+    """
+
+    def __init__(
+        self,
+        conv_dim: int,
+        d_conv: int,
+        dtype: torch.dtype,
+        cache_steps: int,
+    ) -> None:
+        self.cache_steps = cache_steps
+        super().__init__(conv_dim=conv_dim, d_conv=d_conv, dtype=dtype)
+
+    @property
+    def state_shape(self) -> Tuple[int, int, int]:
+        return (self.cache_steps, self.conv_dim, self.d_conv - 1)
 
 
 class UnpagedResourceHandler(ResourceHandler):
@@ -1757,7 +1827,7 @@ class AttentionDescriptor(ABC):
 
     @classmethod
     @abstractmethod
-    def get_cached_attention_op(cls) -> MHACallable:
+    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
         """Get the cached attention op .
 
         The attention_op should follow the below signature:
@@ -1823,7 +1893,7 @@ class AttentionDescriptor(ABC):
     @classmethod
     @abstractmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig
+        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
     ) -> ResourceHandlerDict:
         """Provide a dictionary of resource handlers that can be used to initialize the resources.
 
@@ -1836,7 +1906,8 @@ class AttentionDescriptor(ABC):
         global CacheManager and passed back to the model during the forward pass.
 
         If the cache initializer requires information about the attention op, it can retrieve
-        the necessary information from the source attention node and cache config.
+        the necessary information from the source attention node, cache config, and optional
+        speculative decoding config.
         """
 
     @classmethod

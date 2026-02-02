@@ -321,7 +321,7 @@ class TorchBackendSSM(AttentionDescriptor):
         return torch.ops.auto_deploy.torch_ssm
 
     @classmethod
-    def get_cached_attention_op(cls) -> MHACallable:
+    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
         return torch.ops.auto_deploy.torch_cached_ssm.default
 
     @classmethod
@@ -330,7 +330,7 @@ class TorchBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig
+        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
     ) -> ResourceHandlerDict:
         # Shapes from fake tensors
         hs_fake: torch.Tensor = source_attn_node.args[0].meta["val"]

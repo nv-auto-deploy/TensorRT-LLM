@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -694,6 +694,15 @@ class ADEngine(ModelEngine):
         num_decode_tokens = num_decode
         num_extend = len(extend_requests)
         num_extend_tokens = len(input_ids) - num_prefill_tokens - num_decode_tokens
+        if num_extend > 1:
+            extend_lens = [
+                cu_seqlen[num_prefill + i + 1] - cu_seqlen[num_prefill + i]
+                for i in range(num_extend)
+            ]
+            if len(set(extend_lens)) > 1:
+                raise ValueError(
+                    "Non-uniform extend lengths are not currently supported in AutoDeploy."
+                )
         batch_info = [num_prefill, num_prefill_tokens]
         batch_info.extend([num_extend, num_extend_tokens])
         batch_info.extend([num_decode, num_decode_tokens])
@@ -931,7 +940,10 @@ def instantiate_sampler(
     spec_config = ad_config.speculative_config
 
     # One-model spec dec: model performs sampling internally, returns pre-computed tokens
-    if spec_config is not None and spec_config.spec_dec_mode.is_eagle3_one_model():
+    if spec_config is not None and (
+        spec_config.spec_dec_mode.is_eagle3_one_model()
+        or spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    ):
         sampler_args = TorchSampler.Args(
             max_seq_len=ad_config.max_seq_len,
             max_draft_len=max_draft_len,
@@ -1023,10 +1035,11 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         spec_config.spec_dec_mode.is_draft_target()
         or spec_config.spec_dec_mode.is_eagle3()
         or spec_config.spec_dec_mode.is_eagle3_one_model()
+        or spec_config.spec_dec_mode.is_mtp_eagle_one_model()
     ):
         raise ValueError(
             "Currently, AutoDeploy only supports speculative decoding in "
-            "draft_target, eagle3, or eagle3_one_model mode."
+            "draft_target, eagle3, eagle3_one_model, or mtp_eagle_one_model mode."
         )
 
     if spec_config is not None and ad_config.guided_decoding_backend is not None:
@@ -1039,6 +1052,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     if (
         spec_config is not None
         and not spec_config.spec_dec_mode.is_eagle3_one_model()
+        and not spec_config.spec_dec_mode.is_mtp_eagle_one_model()
         and (spec_config.spec_dec_mode.is_draft_target() or spec_config.spec_dec_mode.is_eagle3())
     ):
         draft_model_engine = create_draft_model_engine_maybe(

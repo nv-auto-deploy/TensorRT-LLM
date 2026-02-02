@@ -64,7 +64,7 @@ class BaseCausalConvDescriptor(AttentionDescriptor):
 
     @classmethod
     @abstractmethod
-    def get_cached_attention_op(cls) -> MHACallable:
+    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
         """Return the cached attention op for this backend.
 
         Must be implemented by subclasses.
@@ -77,7 +77,7 @@ class BaseCausalConvDescriptor(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig
+        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
     ) -> ResourceHandlerDict:
         inp_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
         w_fake: torch.Tensor = source_attn_node.args[1].meta["val"]

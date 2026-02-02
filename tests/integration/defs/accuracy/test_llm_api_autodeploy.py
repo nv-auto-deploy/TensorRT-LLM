@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -90,6 +90,32 @@ def print_memory_usage(label: str):
     print(f"{'=' * 60}\n")
 
 
+def _check_acceptance_rate_stats(stats, min_acceptance_rate: float) -> None:
+    total_drafted = 0
+    total_accepted = 0
+    num_spec_iterations = 0
+
+    for stat in stats:
+        spec_stats = stat.get("specDecodingStats", {})
+        num_draft = spec_stats.get("numDraftTokens", 0)
+        num_accepted = spec_stats.get("numAcceptedTokens", 0)
+        if num_draft <= 0:
+            continue
+
+        num_spec_iterations += 1
+        total_drafted += num_draft
+        total_accepted += num_accepted
+
+    accept_rate = total_accepted / total_drafted if total_drafted > 0 else 0.0
+    print("Spec dec acceptance rate: "
+          f"{accept_rate:.2%} ({total_accepted}/{total_drafted} tokens across "
+          f"{num_spec_iterations} speculative iterations)")
+
+    assert accept_rate >= min_acceptance_rate, (
+        f"Acceptance rate {accept_rate:.2%} below threshold {min_acceptance_rate:.0%}"
+    )
+
+
 def low_memory_overrides(config,
                          max_batch_size=32,
                          free_gpu_memory_fraction=0.4,
@@ -177,6 +203,10 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
+    def check_acceptance_rate(self, llm, min_acceptance_rate: float):
+        """Check speculative decoding acceptance rate for the current run."""
+        _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
+
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 2, 4])
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
@@ -257,24 +287,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
             llm: The LLM instance with enable_iter_perf_stats=True.
             min_acceptance_rate: Minimum acceptance rate threshold (default 7%).
         """
-        stats = llm.get_stats(timeout=2)
-        total_drafted = 0
-        total_accepted = 0
-
-        for stat in stats:
-            spec_stats = stat.get("specDecodingStats", {})
-            num_draft = spec_stats.get("numDraftTokens", 0)
-            num_accepted = spec_stats.get("numAcceptedTokens", 0)
-            if num_draft > 0:
-                total_drafted += num_draft
-                total_accepted += num_accepted
-
-        accept_rate = total_accepted / total_drafted if total_drafted > 0 else 0.0
-        print(f"Spec dec acceptance rate: {accept_rate:.2%} "
-              f"({total_accepted}/{total_drafted} tokens)")
-        assert accept_rate >= min_acceptance_rate, (
-            f"Acceptance rate {accept_rate:.2%} below threshold {min_acceptance_rate:.0%}"
-        )
+        _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
 
     @pytest.mark.skip_less_device_memory(32000)
     def test_eagle3_one_model(self):
@@ -504,6 +517,10 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
+    def check_acceptance_rate(self, llm, min_acceptance_rate: float):
+        """Check speculative decoding acceptance rate for the current run."""
+        _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
+
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     @pytest.mark.parametrize("enable_attention_dp", [False, True],
@@ -546,6 +563,58 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
         print_memory_usage("after evaluation")
+
+    # TODO: Reconcile these parameters with accuracy test above.
+    # Currently tests only bf16 model
+    @pytest.mark.skip_less_device_memory(180000)
+    @pytest.mark.parametrize("world_size", [4, 8])
+    def test_mtp(self, world_size):
+        from tensorrt_llm import llmapi
+
+        MTP_MODEL_NAME = "nvidia/Nemotron-Super-V3"
+        MTP_MODEL_PATH_BF16 = hf_id_to_local_model_dir(
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16")
+        MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
+                          GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+
+        speculative_config = llmapi.MTPDecodingConfig(
+            num_nextn_predict_layers=6,
+            mtp_eagle_one_model=True,
+            speculative_model=MTP_MODEL_PATH_BF16,
+        )
+
+        kwargs = {
+            "skip_loading_weights": False,
+            "trust_remote_code": True,
+            "runtime": "trtllm",
+            "world_size": world_size,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.4
+            },
+            "enable_iter_perf_stats": True,
+            "speculative_config": speculative_config,
+            "transforms": {
+                "insert_cached_causal_conv": {
+                    "backend": "triton_causal_conv"
+                },
+                "insert_cached_ssm_attention": {
+                    "backend": "triton_ssm"
+                },
+            },
+            "compile_backend": "torch-simple",
+            "max_batch_size": 128,
+            "max_num_tokens": MAX_SEQ_LEN,
+            "attn_backend": "flashinfer",
+            "max_seq_len": MAX_SEQ_LEN,
+        }
+        with AutoDeployLLM(
+                model=MTP_MODEL_PATH_BF16,
+                tokenizer=MTP_MODEL_PATH_BF16,
+                **kwargs,
+        ) as llm:
+            task = GSM8K(MTP_MODEL_NAME)
+            task.evaluate(llm)
+            self.check_acceptance_rate(llm, min_acceptance_rate=0.45)
 
 
 class TestGLM4Flash(LlmapiAccuracyTestHarness):

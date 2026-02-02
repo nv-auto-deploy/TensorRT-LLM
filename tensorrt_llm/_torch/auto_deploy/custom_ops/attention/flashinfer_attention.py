@@ -517,7 +517,7 @@ class FlashInferAttention(AttentionDescriptor):
         return torch.ops.auto_deploy.torch_attention
 
     @classmethod
-    def get_cached_attention_op(cls) -> MHACallable:
+    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
         return torch.ops.auto_deploy.flashinfer_attention_mha_with_cache.default
 
     @classmethod
@@ -541,7 +541,7 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig
+        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
     ) -> ResourceHandlerDict:
         # source op is [bsnd] layout already
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
