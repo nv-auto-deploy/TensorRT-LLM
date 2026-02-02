@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -30,14 +31,19 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.llama.modeling_llama import LlamaModel
 from transformers.utils.generic import ModelOutput
 
-from tensorrt_llm import SamplingParams
+from tensorrt_llm import SamplingParams, llmapi
 from tensorrt_llm._torch.auto_deploy.llm import LLM
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     EagleWrapper,
     EagleWrapperConfig,
 )
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
-from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig, KvCacheConfig
+from tensorrt_llm.llmapi import (
+    DraftTargetDecodingConfig,
+    Eagle3DecodingConfig,
+    KvCacheConfig,
+    MTPDecodingConfig,
+)
 
 prompts = [
     "What is the capital of France?",
@@ -48,6 +54,14 @@ prompts = [
 
 EAGLE_MODEL_SUBPATH = "EAGLE3-LLaMA3.1-Instruct-8B"
 LLAMA_BASE_SUBPATH = "llama-3.1-model/Llama-3.1-8B-Instruct"
+LLAMA_BASE_HF_SNAPSHOT_PATH = (
+    "$HF_HOME/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/"
+    "0e9e39f249a16976918f6564b8830bc894c89659"
+)
+EAGLE_HF_SNAPSHOT_PATH = (
+    "$HF_HOME/hub/models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B/snapshots/"
+    "61aa096484ad9752292507b0cc9973bb423abb35"
+)
 DRAFT_TARGET_MAX_DRAFT_LEN = 3
 EAGLE_MAX_DRAFT_LEN = 3
 
@@ -244,7 +258,14 @@ def test_autodeploy_eagle3_acceptance_rate():
     print("Testing AutoDeploy Eagle3 Acceptance Rate")
     print("=" * 80)
 
-    base_model, _, eagle_model = get_model_paths()
+    # Temporary env-local override for debugging in this workspace.
+    base_model = os.path.expandvars(LLAMA_BASE_HF_SNAPSHOT_PATH)
+    eagle_model = os.path.expandvars(EAGLE_HF_SNAPSHOT_PATH)
+
+    if "$HF_HOME" in base_model or not Path(base_model).is_dir():
+        pytest.skip(f"Configured base model path does not exist: {base_model}")
+    if "$HF_HOME" in eagle_model or not Path(eagle_model).is_dir():
+        pytest.skip(f"Configured Eagle model path does not exist: {eagle_model}")
 
     print(f"\nBase Model: {base_model}")
     print(f"Eagle3 Model: {eagle_model}")
@@ -297,7 +318,14 @@ def test_autodeploy_eagle3_one_model_acceptance_rate(disable_overlap_scheduler: 
     )
     print("=" * 80)
 
-    base_model, _, eagle_model = get_model_paths()
+    # Temporary env-local override for debugging in this workspace.
+    base_model = os.path.expandvars(LLAMA_BASE_HF_SNAPSHOT_PATH)
+    eagle_model = os.path.expandvars(EAGLE_HF_SNAPSHOT_PATH)
+
+    if "$HF_HOME" in base_model or not Path(base_model).is_dir():
+        pytest.skip(f"Configured base model path does not exist: {base_model}")
+    if "$HF_HOME" in eagle_model or not Path(eagle_model).is_dir():
+        pytest.skip(f"Configured Eagle model path does not exist: {eagle_model}")
 
     print(f"\nBase Model: {base_model}")
     print(f"Eagle3 Model: {eagle_model}")
@@ -427,7 +455,7 @@ def test_eagle_model_with_weights():
     builds the Eagle drafter model based on the checkpoint's model_type:
 
     1. Factory creates config via AutoConfig.from_pretrained
-    2. Factory selects Eagle3DrafterForCausalLM based on model_type="llama"
+    2. Factory selects EagleDrafterForCausalLM based on model_type="llama"
     3. Factory creates model via _from_config
     4. Factory loads weights via load_or_random_init -> _load_checkpoint
 
@@ -464,8 +492,8 @@ def test_eagle_model_with_weights():
     # Factory flow:
     #   build_model() -> prefetch_checkpoint() -> _build_model()
     #   _build_model() -> _get_model_config() (gets base LlamaConfig)
-    #   _build_model() -> selects Eagle3DrafterForCausalLM for model_type="llama"
-    #   _build_model() -> Eagle3DrafterForCausalLM._from_config(config)
+    #   _build_model() -> selects EagleDrafterForCausalLM for model_type="llama"
+    #   _build_model() -> EagleDrafterForCausalLM._from_config(config)
     print("Building model via factory.build_model('meta')...")
     model = factory.build_model("meta")
     print(f"Model type: {type(model).__name__}")
@@ -1308,3 +1336,474 @@ def test_eagle_wrapper_forward(batch_size: int):
             f"  Eagle:  {eagle_generated.tolist()}"
         )
     print(f"✓ First {num_tokens_to_check} generated tokens match for all batches!")
+
+
+# =============================================================================
+# Nemotron SuperV3 Smoke Test (No MTP)
+# =============================================================================
+
+
+@pytest.mark.skip_less_device_memory(180000)
+@pytest.mark.parametrize("use_mtp", [False, True], ids=["no_mtp", "mtp_eagle"])
+def test_nemotron_superv3_autodeploy_smoke(use_mtp: bool):
+    """Smoke test SuperV3 checkpoint with and without MTP Eagle one-model config."""
+    print("\n" + "=" * 80)
+    print(
+        f"Test: Nemotron SuperV3 AutoDeploy smoke ({'MTP Eagle one-model' if use_mtp else 'no MTP'})"
+    )
+    print("=" * 80)
+
+    superv3_model_path = os.path.expandvars(MTP_MODEL_HF_SNAPSHOT_PATH)
+    if "$" in superv3_model_path or not Path(superv3_model_path).exists():
+        pytest.skip(f"Configured HF snapshot path does not exist: {superv3_model_path}")
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.00)
+    if use_mtp:
+        speculative_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+            speculative_model=superv3_model_path,
+        )
+    else:
+        speculative_config = None
+
+    transforms_override = {
+        "insert_cached_causal_conv": {"backend": "triton_causal_conv"},
+        "insert_cached_ssm_attention": {"backend": "triton_ssm"},
+    }
+    print(f"Transforms override: {transforms_override}")
+
+    with LLM(
+        model=superv3_model_path,
+        tokenizer=superv3_model_path,
+        skip_loading_weights=False,
+        trust_remote_code=True,
+        runtime="trtllm",
+        world_size=1,
+        kv_cache_config=kv_cache_config,
+        speculative_config=speculative_config,
+        disable_overlap_scheduler=True,
+        transforms=transforms_override,
+        compile_backend="torch-simple",
+        max_batch_size=16,
+        max_num_tokens=256,
+    ) as llm:
+        sampling_params = SamplingParams(max_tokens=64, temperature=0.0, seed=42)
+        outputs = list(llm.generate(prompts, sampling_params))
+
+        assert len(outputs) == len(prompts)
+        for output in outputs:
+            assert len(output.outputs) == 1
+            assert output.outputs[0].token_ids, "Expected at least one generated token"
+            assert output.outputs[0].text, "Expected at least one generated text"
+            print(f"Prompt: {output.prompt}, Generated text: {output.outputs[0].text}")
+
+
+# =============================================================================
+
+
+@pytest.mark.skip_less_device_memory(180000)
+def test_nemotron_superv3_pytorch_smoke_mtp_eagle():
+    """Smoke test SuperV3 checkpoint with PyTorch backend + MTP Eagle one-model."""
+    print("\n" + "=" * 80)
+    print("Test: Nemotron SuperV3 PyTorch smoke (MTP Eagle one-model)")
+    print("=" * 80)
+
+    superv3_model_path = os.path.expandvars(MTP_MODEL_HF_SNAPSHOT_PATH)
+    if "$" in superv3_model_path or not Path(superv3_model_path).exists():
+        pytest.skip(f"Configured HF snapshot path does not exist: {superv3_model_path}")
+
+    speculative_config = MTPDecodingConfig(
+        num_nextn_predict_layers=3,
+        mtp_eagle_one_model=True,
+        speculative_model=superv3_model_path,
+    )
+
+    # 0.00 gives an error in trtllm
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.01)
+    prompt = prompts[0]
+
+    with llmapi.LLM(
+        model=superv3_model_path,
+        tokenizer=superv3_model_path,
+        trust_remote_code=True,
+        cuda_graph_config=None,
+        kv_cache_config=kv_cache_config,
+        speculative_config=speculative_config,
+        disable_overlap_scheduler=True,
+        max_batch_size=2,
+        max_num_tokens=256,
+    ) as llm:
+        sampling_params = SamplingParams(max_tokens=64, temperature=0.0, seed=42)
+        outputs = list(llm.generate([prompt], sampling_params))
+
+        assert len(outputs) == 1
+        assert len(outputs[0].outputs) == 1
+        generated_token_ids = outputs[0].outputs[0].token_ids
+        assert generated_token_ids, "Expected at least one generated token"
+
+        generated_text = outputs[0].outputs[0].text
+        if not generated_text:
+            generated_text = llm.tokenizer.decode(generated_token_ids)
+
+        print("Prompt:", prompt)
+        print("Generated token ids:", generated_token_ids)
+        print("Generated text:", generated_text)
+
+
+# =============================================================================
+
+
+@pytest.mark.skip_less_device_memory(180000)
+@pytest.mark.parametrize("use_mtp", [False, True], ids=["no_mtp", "mtp_eagle"])
+def test_nemotron_superv3_autodeploy_smoke_small_target(use_mtp: bool):
+    """Smoke test SuperV3 small-target path with optional MTP."""
+    print("\n" + "=" * 80)
+    print(
+        f"Test: Nemotron SuperV3 AutoDeploy smoke (small target, {'MTP' if use_mtp else 'no MTP'})"
+    )
+    print("=" * 80)
+
+    superv3_model_path = os.path.expandvars(MTP_MODEL_HF_SNAPSHOT_PATH)
+    if "$" in superv3_model_path or not Path(superv3_model_path).exists():
+        pytest.skip(f"Configured HF snapshot path does not exist: {superv3_model_path}")
+
+    # TODO: fix resize IMA later...
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.00)
+    prompt = prompts[0]
+
+    if use_mtp:
+        print("\n--- Run with MTP ---")
+        speculative_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+            speculative_model=superv3_model_path,
+        )
+    else:
+        print("\n--- Run without MTP ---")
+        speculative_config = None
+
+    transforms_override = {
+        "insert_cached_causal_conv": {"backend": "triton_causal_conv"},
+        "insert_cached_ssm_attention": {"backend": "triton_ssm"},
+    }
+    print(f"Transforms override: {transforms_override}")
+
+    with LLM(
+        model=superv3_model_path,
+        tokenizer=superv3_model_path,
+        model_kwargs={"num_hidden_layers": 8},
+        skip_loading_weights=False,
+        trust_remote_code=True,
+        runtime="trtllm",
+        world_size=1,
+        kv_cache_config=kv_cache_config,
+        speculative_config=speculative_config,
+        disable_overlap_scheduler=True,
+        compile_backend="torch-simple",
+        max_batch_size=2,
+        max_num_tokens=256,
+        transforms=transforms_override,
+    ) as llm:
+        sampling_params = SamplingParams(max_tokens=64, temperature=0.0, seed=42)
+        outputs = list(llm.generate([prompt], sampling_params))
+
+        print(f"Outputs: {outputs}")
+        assert len(outputs) == 1
+        assert len(outputs[0].outputs) == 1
+        generated_token_ids = outputs[0].outputs[0].token_ids
+        assert generated_token_ids, "Expected at least one generated token"
+        generated_text = outputs[0].outputs[0].text
+        if not generated_text:
+            generated_text = llm.tokenizer.decode(generated_token_ids)
+
+        print("Prompt:", prompt)
+        print("Generated token ids:", generated_token_ids)
+        print("Generated text:", generated_text)
+
+
+# =============================================================================
+# Nemotron Super / NemotronH MTP Tests
+# =============================================================================
+
+MTP_MODEL_HF_SNAPSHOT_PATH = (
+    "$HF_HOME/hub/models--nvidia--NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726/snapshots/"
+    "39ac5ebfc5759bb007b2e8a77e22a13a83610324/"
+)
+MTP_MODEL_BF16_HF_SNAPSHOT_PATH = (
+    "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/autodeploy_data/hf_home/hub/"
+    "models--nvidia--NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-010726/snapshots/"
+    "346db1b26ea89ac6c3eea06dbec37cc22f508f44"
+)
+# Original BF16 path on another cluster:
+# MTP_MODEL_SUBPATH = "NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726"
+MTP_MODEL_SUBPATH = "Nemotron-Super-3-120B-A12B-dev"
+
+
+@pytest.mark.skip_less_device_memory(180000)
+@pytest.mark.parametrize("use_mtp", [False, True], ids=["no_mtp", "mtp_eagle"])
+def test_nemotron_super_bf16_sharding(use_mtp: bool):
+    """Smoke test Super BF16 checkpoint with TP sharding, with and without MTP Eagle."""
+    print("\n" + "=" * 80)
+    print(
+        "Test: Nemotron Super BF16 AutoDeploy smoke "
+        f"({'MTP Eagle one-model' if use_mtp else 'no MTP'} + sharding)"
+    )
+    print("=" * 80)
+
+    super_model_path = os.path.expandvars(MTP_MODEL_BF16_HF_SNAPSHOT_PATH)
+    if "$" in super_model_path or not Path(super_model_path).exists():
+        pytest.skip(f"Configured BF16 HF snapshot path does not exist: {super_model_path}")
+
+    if use_mtp:
+        speculative_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+            speculative_model=super_model_path,
+        )
+    else:
+        speculative_config = None
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.00)
+    transforms_override = {
+        "insert_cached_causal_conv": {"backend": "triton_causal_conv"},
+        "insert_cached_ssm_attention": {"backend": "triton_ssm"},
+        # "detect_sharding": {
+        # "sharding_dims": ["tp"],
+        # "sharding_source": ["heuristic"],
+        # }
+    }
+
+    prompt = prompts[0]
+    with LLM(
+        model=super_model_path,
+        tokenizer=super_model_path,
+        skip_loading_weights=False,
+        trust_remote_code=True,
+        runtime="trtllm",
+        world_size=4,
+        kv_cache_config=kv_cache_config,
+        speculative_config=speculative_config,
+        disable_overlap_scheduler=True,
+        compile_backend="torch-simple",
+        max_batch_size=2,
+        max_num_tokens=256,
+        transforms=transforms_override,
+    ) as llm:
+        print("SUCCESS: LLM initialization finished and weights were loaded. Exiting early.")
+        return
+        sampling_params = SamplingParams(max_tokens=64, temperature=0.0, seed=42)
+        outputs = list(llm.generate([prompt], sampling_params))
+
+        assert len(outputs) == 1
+        assert len(outputs[0].outputs) == 1
+        generated_token_ids = outputs[0].outputs[0].token_ids
+        assert generated_token_ids, "Expected at least one generated token"
+
+        generated_text = outputs[0].outputs[0].text
+        if not generated_text:
+            generated_text = llm.tokenizer.decode(generated_token_ids)
+
+        print("Prompt:", prompt)
+        print("Generated token ids:", generated_token_ids)
+        print("Generated text:", generated_text)
+
+
+def _load_valid_safetensors_index(index_path: Path):
+    """Load a safetensors index JSON, skipping invalid and Git-LFS pointer files."""
+    if not index_path.exists():
+        return None
+
+    try:
+        index_text = index_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    if index_text.lstrip().startswith("version https://git-lfs.github.com/spec/v1"):
+        return None
+
+    try:
+        index = json.loads(index_text)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(index, dict):
+        return None
+
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        return None
+
+    return index
+
+
+def _analyze_mtp_weight_loading(model_path: Path, model):
+    """Analyze weight loading for MTP models with safetensors index.
+
+    MTP checkpoints use multiple safetensors files with an index. This function
+    loads the checkpoint keys from the index and applies the model's
+    _checkpoint_conversion_mapping to determine which keys will be loaded.
+
+    Args:
+        model_path: Path to the MTP model directory
+        model: The instantiated model
+
+    Returns:
+        Tuple of (loaded_keys, missing_keys, unexpected_keys)
+    """
+    import re
+
+    # Load checkpoint keys from safetensors index
+    index_path = model_path / "model.safetensors.index.json"
+    index = _load_valid_safetensors_index(index_path)
+    if index is None:
+        raise ValueError(
+            "Expected a valid safetensors index JSON. "
+            f"Path was missing, malformed, or a Git-LFS pointer: {index_path}"
+        )
+
+    # Get MTP-specific checkpoint keys (those starting with "mtp.")
+    checkpoint_keys_original = [k for k in index["weight_map"].keys() if k.startswith("mtp.")]
+    if not checkpoint_keys_original:
+        raise ValueError(f"No mtp.* keys found in safetensors index: {index_path}")
+
+    # Apply _checkpoint_conversion_mapping (same logic as hf.py _remap_param_names_load_hook)
+    conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+    checkpoint_keys_remapped = []
+
+    for key in checkpoint_keys_original:
+        new_key = key
+        if conversion_mapping:
+            for pattern, replacement in conversion_mapping.items():
+                new_key = re.sub(pattern, replacement, new_key)
+        checkpoint_keys_remapped.append(new_key)
+
+    # Get model's expected keys
+    model_keys = set(model.state_dict().keys())
+    checkpoint_keys = set(checkpoint_keys_remapped)
+
+    # Calculate differences
+    loaded_keys = checkpoint_keys & model_keys
+    missing_in_checkpoint = model_keys - checkpoint_keys
+    unexpected_in_checkpoint = checkpoint_keys - model_keys
+
+    return loaded_keys, missing_in_checkpoint, unexpected_in_checkpoint
+
+
+def test_nemotron_mtp_model_with_weights():
+    """Test NemotronH MTP model weight loading using EagleDrafterFactory.
+
+    This test verifies that:
+    1. EagleDrafterFactory can create EagleDrafterForCausalLM with NemotronH layers
+    2. Weights are correctly loaded with the mtp.* -> model.* key mapping
+    3. All expected model parameters are loaded from the MTP checkpoint
+
+    The MTP model uses a checkpoint that contains both backbone.* and mtp.* keys.
+    Only mtp.* keys are loaded. Shared parameters (embed_tokens, lm_head) are NOT
+    created in the model (load_embedding_from_target=True, load_lm_head_from_target=True),
+    so they don't appear as missing keys. They are shared from the target model at runtime.
+    """
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import EagleDrafterForCausalLM
+
+    print("\n" + "=" * 80)
+    print("Test: NemotronH MTP model weight loading (via EagleDrafterFactory)")
+    print("=" * 80)
+
+    # Use a fixed local HF snapshot path for this run.
+    mtp_model_path = os.path.expandvars(MTP_MODEL_HF_SNAPSHOT_PATH)
+    mtp_path = Path(mtp_model_path)
+    if not mtp_path.exists():
+        pytest.skip(f"Configured HF snapshot path does not exist: {mtp_model_path}")
+    index_path = mtp_path / "model.safetensors.index.json"
+
+    # Check for a valid index JSON and verify it has mtp.* keys.
+    index = _load_valid_safetensors_index(index_path)
+    if index is None:
+        pytest.skip(
+            "Safetensors index is missing/invalid or a Git-LFS pointer at configured snapshot path: "
+            f"{index_path}"
+        )
+    mtp_source_keys = {k for k in index["weight_map"].keys() if k.startswith("mtp.")}
+    assert mtp_source_keys, f"Expected at least one mtp.* key in {index_path}"
+
+    # Setup device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Create factory - use EagleDrafterFactory for NemotronH MTP
+    print("Creating EagleDrafterFactory...")
+    factory = EagleDrafterFactory(
+        model=mtp_model_path,
+        skip_loading_weights=False,
+    )
+
+    # Build model using factory
+    print("Building model via factory.build_model('meta')...")
+    model = factory.build_model("meta")
+    print(f"Model type: {type(model).__name__}")
+    print(f"Model config type: {type(model.config).__name__}")
+
+    # Verify model type is EagleDrafterForCausalLM
+    assert isinstance(model, EagleDrafterForCausalLM), (
+        f"Expected EagleDrafterForCausalLM, got {type(model).__name__}"
+    )
+
+    # Analyze weight loading
+    print("\n--- Weight Loading Analysis ---")
+    loaded_keys, missing_keys, unexpected_keys = _analyze_mtp_weight_loading(mtp_path, model)
+
+    print(f"Total model parameters: {len(loaded_keys) + len(missing_keys)}")
+    print(f"Total MTP checkpoint keys: {len(loaded_keys) + len(unexpected_keys)}")
+    print(f"✅ Weights to be loaded: {len(loaded_keys)}")
+    print(f"⚠️  Missing in checkpoint (should be 0): {len(missing_keys)}")
+    print(f"⚠️  Unexpected in checkpoint (should be 0): {len(unexpected_keys)}")
+
+    if missing_keys:
+        print("\nMissing keys (expected - shared from target model):")
+        for key in sorted(missing_keys):
+            if "embed_tokens" in key:
+                print(f"  - {key} (shared embedding from target)")
+            elif "lm_head" in key:
+                print(f"  - {key} (shared lm_head from target)")
+            else:
+                print(f"  - {key}")
+
+    if unexpected_keys:
+        print("\nUnexpected keys (should not happen):")
+        for key in sorted(unexpected_keys):
+            print(f"  - {key}")
+
+    print("--- End Weight Analysis ---\n")
+
+    # Verify expected missing and unexpected keys
+    # MTP checkpoint does NOT contain embed_tokens or lm_head, but that's OK because:
+    # - embed_tokens: shared from target model (load_embedding_from_target=True → model doesn't create it)
+    # - lm_head: shared from target model (load_lm_head_from_target=True → model doesn't create it)
+    # Since neither parameter is created in the model, they don't appear as missing keys.
+    # Note: For NemotronH, layers_handle_final_norm=True, so the wrapper doesn't create self.norm.
+    # The final norm is inside the layers (final_layernorm), which IS in the checkpoint.
+    expected_missing_keys = set()  # All model params are loaded; shared params aren't created
+    expected_unexpected_keys = set()  # All checkpoint keys should be used
+
+    assert missing_keys == expected_missing_keys, (
+        f"Unexpected missing keys.\n"
+        f"Expected: {expected_missing_keys}\n"
+        f"Got: {missing_keys}\n"
+        f"Extra missing: {missing_keys - expected_missing_keys}\n"
+        f"Not missing (but expected): {expected_missing_keys - missing_keys}"
+    )
+
+    assert unexpected_keys == expected_unexpected_keys, (
+        f"Unexpected keys in checkpoint.\n"
+        f"Expected: {expected_unexpected_keys}\n"
+        f"Got: {unexpected_keys}\n"
+        f"Extra unexpected: {unexpected_keys - expected_unexpected_keys}"
+    )
+
+    print("✅ Weight loading analysis matches expected missing/unexpected keys!")
+
+    # Load weights using factory
+    print("Loading weights via factory.load_or_random_init()...")
+    factory.load_or_random_init(model, device, disable_preload=True)
+    print("Weights loaded successfully via factory interface!")
+
+    model.eval()
+    print("✅ NemotronH MTP model created and weights loaded successfully!")
