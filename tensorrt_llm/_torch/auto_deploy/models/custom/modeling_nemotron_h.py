@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
+from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
@@ -634,4 +635,240 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         return NemotronHCausalLMOutput(logits)
 
 
+# =============================================================================
+# MTP (Multi-Token Prediction) Model for Speculative Decoding
+# =============================================================================
+#
+# The MTP model is a draft model that uses hidden states from the target model
+# to predict next tokens. It follows the pattern "*E" (Attention + MoE).
+#
+# Checkpoint structure:
+#   mtp.layers.0.*  - Attention layer with start projections (enorm, hnorm, eh_proj)
+#   mtp.layers.1.*  - MoE layer with final_layernorm
+# =============================================================================
+
+
+class NemotronHMTPConfig(PretrainedConfig):
+    """Config for NemotronH MTP (Multi-Token Prediction) head.
+
+    This config is used to identify MTP models and load them with the
+    correct architecture via AutoDeploy's custom model mechanism.
+    """
+
+    model_type = "NemotronHMTPForCausalLM"
+
+
+class NemotronHMTPSublayer(nn.Module):
+    """Single MTP sublayer - either Attention (*) or MoE (E).
+
+    Matches checkpoint structure:
+    - layers.0: Attention with start projections (enorm, hnorm, eh_proj)
+    - layers.1: MoE with final_layernorm
+
+    The start projections fuse the embedded input tokens with hidden states
+    from the target model: eh_proj(cat(enorm(embeds), hnorm(hidden_states))).
+    """
+
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        layer_type: str,
+        has_start_projections: bool,
+        has_end_norm: bool,
+    ):
+        super().__init__()
+        eps = getattr(config, "layer_norm_epsilon", getattr(config, "norm_eps", 1e-5))
+        self.has_start_projections = has_start_projections
+        self.has_end_norm = has_end_norm
+
+        # Start projections (only on first layer)
+        if has_start_projections:
+            self.enorm = NemotronHRMSNorm(config.hidden_size, eps=eps)
+            self.hnorm = NemotronHRMSNorm(config.hidden_size, eps=eps)
+            self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+
+        # Pre-layer norm
+        self.norm = NemotronHRMSNorm(config.hidden_size, eps=eps)
+
+        # Mixer based on layer type
+        if layer_type == "*":
+            self.mixer = NemotronHAttention(config, layer_idx=layer_idx)
+        elif layer_type == "E":
+            self.mixer = NemotronHMOE(config, layer_idx=layer_idx)
+        else:
+            raise ValueError(f"Unknown MTP layer type: {layer_type}")
+
+        # Final norm (only on last layer)
+        if has_end_norm:
+            self.final_layernorm = NemotronHRMSNorm(config.hidden_size, eps=eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Forward pass for MTP sublayer.
+
+        Args:
+            hidden_states: Hidden states from previous layer or target model.
+            inputs_embeds: Input embeddings (only used in first layer with start projections).
+
+        Returns:
+            Updated hidden states.
+        """
+        # Fuse embeddings and hidden states (first layer only)
+        if self.has_start_projections and inputs_embeds is not None:
+            e_normed = self.enorm(inputs_embeds)
+            h_normed = self.hnorm(hidden_states)
+            hidden_states = self.eh_proj(torch.cat([e_normed, h_normed], dim=-1))
+
+        # Standard pre-norm residual block
+        residual = hidden_states
+        hidden_states = self.norm(hidden_states)
+        hidden_states = self.mixer(hidden_states)
+        hidden_states = residual + hidden_states
+
+        # Final layer norm (last layer only)
+        if self.has_end_norm:
+            hidden_states = self.final_layernorm(hidden_states)
+
+        return hidden_states
+
+
+class NemotronHMTPModel(nn.Module):
+    """MTP model for SuperV3 - matches checkpoint layers.{0,1}.* structure.
+
+    The model processes hidden states from the target model along with input
+    token embeddings to predict next token logits for speculative decoding.
+
+    Architecture (pattern "*E"):
+        Layer 0: Attention with start projections (fuses embeds + hidden_states)
+        Layer 1: MoE with final_layernorm
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+
+        # Build layers based on pattern (default "*E")
+        pattern = getattr(config, "mtp_hybrid_override_pattern", "*E")
+        self.layers = nn.ModuleList()
+        for i, char in enumerate(pattern):
+            self.layers.append(
+                NemotronHMTPSublayer(
+                    config,
+                    layer_idx=i,
+                    layer_type=char,
+                    has_start_projections=(i == 0),
+                    has_end_norm=(i == len(pattern) - 1),
+                )
+            )
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass for MTP model.
+
+        Args:
+            input_ids: Input token IDs [batch, seq_len].
+            hidden_states: Hidden states from target model [batch, seq_len, hidden_size].
+
+        Returns:
+            Output hidden states [batch, seq_len, hidden_size].
+        """
+        inputs_embeds = self.embed_tokens(input_ids)
+
+        for i, layer in enumerate(self.layers):
+            # Only pass embeds to first layer
+            hidden_states = layer(
+                hidden_states,
+                inputs_embeds=inputs_embeds if i == 0 else None,
+            )
+
+        return hidden_states
+
+
+@dataclass
+class NemotronHMTPOutput(ModelOutput):
+    """Output for NemotronH MTP model.
+
+    Args:
+        logits: Prediction scores for next tokens [batch, seq_len, vocab_size].
+        last_hidden_state: Hidden states from the last layer [batch, seq_len, hidden_size].
+    """
+
+    logits: Optional[torch.FloatTensor] = None
+    last_hidden_state: Optional[torch.FloatTensor] = None
+
+
+class NemotronHMTPForCausalLM(NemotronHPreTrainedModel):
+    """HuggingFace-compatible wrapper for NemotronH MTP drafter model.
+
+    This wrapper makes the MTP model compatible with AutoDeploy's model loading
+    and inference pipeline for speculative decoding.
+
+    Checkpoint key mapping:
+        mtp.layers.* -> model.layers.*  (handled by _checkpoint_conversion_mapping)
+    """
+
+    config_class = NemotronHMTPConfig
+    base_model_prefix = "model"
+    _no_split_modules = ["NemotronHMTPSublayer"]
+
+    # Checkpoint conversion: mtp.* -> model.*
+    # The checkpoint has keys like "mtp.layers.0.norm.weight"
+    # but the model expects "model.layers.0.norm.weight"
+    _checkpoint_conversion_mapping = {
+        r"^mtp\.": "model.",
+    }
+
+    def __init__(self, config):
+        super().__init__(config)
+        eps = getattr(config, "layer_norm_epsilon", getattr(config, "norm_eps", 1e-5))
+
+        self.model = NemotronHMTPModel(config)
+        self.norm = NemotronHRMSNorm(config.hidden_size, eps=eps)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        position_ids: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> NemotronHMTPOutput:
+        """Forward pass compatible with HuggingFace/AutoDeploy interface.
+
+        Args:
+            input_ids: Input token IDs [batch, seq_len].
+            position_ids: Position IDs (unused, for interface compatibility).
+            **kwargs: Must contain 'hidden_states' from the target model.
+
+        Returns:
+            NemotronHMTPOutput with logits and last_hidden_state.
+
+        Raises:
+            ValueError: If hidden_states is not provided.
+        """
+        hidden_states = kwargs.get("hidden_states")
+        if hidden_states is None:
+            raise ValueError("hidden_states must be provided for MTP model.")
+
+        hidden_states = self.model(input_ids, hidden_states)
+        norm_hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(norm_hidden_states)
+
+        return NemotronHMTPOutput(
+            logits=logits,
+            last_hidden_state=hidden_states,
+        )
+
+
 AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
+AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHMTPConfig", NemotronHMTPForCausalLM)

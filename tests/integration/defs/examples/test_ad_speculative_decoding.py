@@ -36,7 +36,9 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     EagleWrapper,
     EagleWrapperConfig,
 )
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHMTPConfig
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
+from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig, KvCacheConfig
 
 prompts = [
@@ -1217,3 +1219,192 @@ def test_eagle_wrapper_forward(batch_size: int):
             f"  Eagle:  {eagle_generated.tolist()}"
         )
     print(f"✓ First {num_tokens_to_check} generated tokens match for all batches!")
+
+
+# =============================================================================
+# NemotronH MTP Tests
+# =============================================================================
+
+MTP_MODEL_SUBPATH = "MTP-Nemotron-Super"
+
+
+def _analyze_mtp_weight_loading(model_path: Path, model):
+    """Analyze weight loading for MTP models with safetensors index.
+
+    MTP checkpoints use multiple safetensors files with an index. This function
+    loads the checkpoint keys from the index and applies the model's
+    _checkpoint_conversion_mapping to determine which keys will be loaded.
+
+    Args:
+        model_path: Path to the MTP model directory
+        model: The instantiated model
+
+    Returns:
+        Tuple of (loaded_keys, missing_keys, unexpected_keys)
+    """
+    import json
+    import re
+
+    # Load checkpoint keys from safetensors index
+    index_path = model_path / "model.safetensors.index.json"
+    if not index_path.exists():
+        raise FileNotFoundError(f"Safetensors index not found at {index_path}")
+
+    with open(index_path) as f:
+        index = json.load(f)
+
+    # Get MTP-specific checkpoint keys (those starting with "mtp.")
+    checkpoint_keys_original = [k for k in index["weight_map"].keys() if k.startswith("mtp.")]
+
+    # Apply _checkpoint_conversion_mapping (same logic as hf.py _remap_param_names_load_hook)
+    conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+    checkpoint_keys_remapped = []
+
+    for key in checkpoint_keys_original:
+        new_key = key
+        if conversion_mapping:
+            for pattern, replacement in conversion_mapping.items():
+                new_key = re.sub(pattern, replacement, new_key)
+        checkpoint_keys_remapped.append(new_key)
+
+    # Get model's expected keys
+    model_keys = set(model.state_dict().keys())
+    checkpoint_keys = set(checkpoint_keys_remapped)
+
+    # Calculate differences
+    loaded_keys = checkpoint_keys & model_keys
+    missing_in_checkpoint = model_keys - checkpoint_keys
+    unexpected_in_checkpoint = checkpoint_keys - model_keys
+
+    return loaded_keys, missing_in_checkpoint, unexpected_in_checkpoint
+
+
+@pytest.fixture
+def register_nemotron_mtp_config():
+    """Temporarily register NemotronHMTPConfig with AutoConfig for the test.
+
+    This fixture registers the config before the test runs and cleans up after,
+    ensuring no global state leaks between tests.
+    """
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    AutoConfig.register(NemotronHMTPConfig.model_type, NemotronHMTPConfig)
+    yield
+    # Cleanup: remove the registration
+    CONFIG_MAPPING._extra_content.pop(NemotronHMTPConfig.model_type, None)
+
+
+def test_nemotron_mtp_model_with_weights(register_nemotron_mtp_config):
+    """Test NemotronH MTP model weight loading using the factory interface.
+
+    This test verifies that:
+    1. Factory can create NemotronHMTPForCausalLM from the MTP checkpoint
+    2. Weights are correctly loaded with the mtp.* -> model.* key mapping
+    3. All expected model parameters are loaded (except embed_tokens, norm, lm_head)
+
+    The MTP model uses a separate checkpoint that contains only the MTP layers.
+    Shared parameters (embed_tokens, norm, lm_head) are expected to come from
+    the target model at runtime.
+    """
+    print("\n" + "=" * 80)
+    print("Test: NemotronH MTP model weight loading (via factory interface)")
+    print("=" * 80)
+
+    # Get MTP model path
+    models_root = llm_models_root()
+    mtp_model_path = os.path.join(models_root, MTP_MODEL_SUBPATH)
+    mtp_path = Path(mtp_model_path)
+
+    if not mtp_path.exists():
+        pytest.skip(f"MTP model not found at {mtp_model_path}")
+
+    # Check for weights index
+    index_path = mtp_path / "model.safetensors.index.json"
+    if not index_path.exists():
+        pytest.skip(f"Safetensors index not found at {mtp_model_path}")
+
+    # Setup device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Create factory
+    print("Creating AutoModelForCausalLMFactory...")
+    factory = AutoModelForCausalLMFactory(
+        model=mtp_model_path,
+        skip_loading_weights=False,
+        model_kwargs={
+            "model_type": "NemotronHMTPForCausalLM",
+        },
+    )
+
+    # Build model using factory
+    print("Building model via factory.build_model('meta')...")
+    model = factory.build_model("meta")
+    print(f"Model type: {type(model).__name__}")
+    print(f"Model config type: {type(model.config).__name__}")
+
+    # Analyze weight loading
+    print("\n--- Weight Loading Analysis ---")
+    loaded_keys, missing_keys, unexpected_keys = _analyze_mtp_weight_loading(mtp_path, model)
+
+    print(f"Total model parameters: {len(loaded_keys) + len(missing_keys)}")
+    print(f"Total MTP checkpoint keys: {len(loaded_keys) + len(unexpected_keys)}")
+    print(f"✅ Weights to be loaded: {len(loaded_keys)}")
+    print(f"⚠️  Missing in checkpoint (expected, shared from target): {len(missing_keys)}")
+    print(f"⚠️  Unexpected in checkpoint (should be 0): {len(unexpected_keys)}")
+
+    if missing_keys:
+        print("\nMissing keys (expected - shared from target model):")
+        for key in sorted(missing_keys):
+            if "embed_tokens" in key:
+                print(f"  - {key} (shared embedding from target)")
+            elif key == "norm.weight":
+                print(f"  - {key} (shared pre-lm_head norm from target)")
+            elif "lm_head" in key:
+                print(f"  - {key} (shared lm_head from target)")
+            else:
+                print(f"  - {key}")
+
+    if unexpected_keys:
+        print("\nUnexpected keys (should not happen):")
+        for key in sorted(unexpected_keys):
+            print(f"  - {key}")
+
+    print("--- End Weight Analysis ---\n")
+
+    # Verify expected missing and unexpected keys
+    # MTP checkpoint does NOT contain:
+    # - embed_tokens: shared from target model
+    # - norm: shared from target model (pre-lm_head norm)
+    # - lm_head: shared from target model
+    expected_missing_keys = {
+        "model.embed_tokens.weight",
+        "norm.weight",
+        "lm_head.weight",
+    }
+    expected_unexpected_keys = set()  # All checkpoint keys should be used
+
+    assert missing_keys == expected_missing_keys, (
+        f"Unexpected missing keys.\n"
+        f"Expected: {expected_missing_keys}\n"
+        f"Got: {missing_keys}\n"
+        f"Extra missing: {missing_keys - expected_missing_keys}\n"
+        f"Not missing (but expected): {expected_missing_keys - missing_keys}"
+    )
+
+    assert unexpected_keys == expected_unexpected_keys, (
+        f"Unexpected keys in checkpoint.\n"
+        f"Expected: {expected_unexpected_keys}\n"
+        f"Got: {unexpected_keys}\n"
+        f"Extra unexpected: {unexpected_keys - expected_unexpected_keys}"
+    )
+
+    print("✅ Weight loading analysis matches expected missing/unexpected keys!")
+
+    # Load weights using factory
+    print("Loading weights via factory.load_or_random_init()...")
+    factory.load_or_random_init(model, device)
+    print("Weights loaded successfully via factory interface!")
+
+    model.eval()
+    print("✅ NemotronH MTP model created and weights loaded successfully!")
