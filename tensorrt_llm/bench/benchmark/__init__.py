@@ -68,6 +68,11 @@ class GeneralExecSettings(BaseModel):
 
     @property
     def model_type(self) -> str:
+        # If using autodeploy backend, import custom models to register them with HF AutoConfig.
+        # These custom models are AutoDeploy-specific and register
+        # themselves with transformers.AutoConfig when imported.
+        if self.backend == "_autodeploy":
+            import tensorrt_llm._torch.auto_deploy.models.custom  # noqa: F401
         return get_model_config(self.model, self.checkpoint_path).model_type
 
     @property
