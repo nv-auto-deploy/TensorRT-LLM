@@ -125,16 +125,62 @@ def _flashinfer_cached_ssm(
         import flashinfer
 
         slot_idx_decode_i32 = slot_idx_decode.to(torch.int32)
+
+        # FlashInfer's selective_state_update has VERY SPECIFIC stride requirements:
+        # - x: [batch, nheads, dim] contiguous (stride(1)=dim, stride(2)=1)
+        # - dt: [batch, nheads, dim] BROADCASTED (stride(1)=1, stride(2)=0)
+        # - dt_bias: [nheads, dim] BROADCASTED (stride(0)=1, stride(1)=0)
+        # - A: [nheads, dim, dstate] BROADCASTED (stride(1)=0, stride(2)=0)
+        # - D: [nheads, dim] BROADCASTED (stride(0)=1, stride(1)=0)
+        # - B, C: [batch, ngroups, dstate] contiguous
+        #
+        # The _prepare_ssm_decode_inputs creates expanded views with expand(), which have
+        # the correct stride=0 pattern. However, we need to cast dtypes, and .to(dtype)
+        # on an expanded tensor creates a contiguous copy, breaking the stride pattern.
+        #
+        # Solution: Extract base tensors, cast to correct dtype, then re-expand.
+
+        # x, B, C are contiguous - just cast to bfloat16
+        x_decode_bf16 = x_decode.to(torch.bfloat16)
+        B_decode_bf16 = B_decode.to(torch.bfloat16)
+        C_decode_bf16 = C_decode.to(torch.bfloat16)
+
+        # dt: extract base [nd, nheads], cast, then re-expand with stride(2)=0
+        # dt_hp has shape [nd, num_heads, head_dim] from expand with stride pattern [nheads, 1, 0]
+        dt_base = dt_hp[:, :, 0]  # [nd, num_heads] - extract base (all values same along dim 2)
+        dt_base_bf16 = dt_base.to(torch.bfloat16)
+        dt_bf16 = dt_base_bf16.unsqueeze(-1).expand(
+            -1, -1, head_dim
+        )  # [nd, nheads, head_dim] stride(2)=0
+
+        # dt_bias: extract base [nheads], cast, then re-expand with stride(1)=0
+        dt_bias_base = dt_bias_hp[:, 0]  # [num_heads]
+        dt_bias_base_bf16 = dt_bias_base.to(torch.bfloat16)
+        dt_bias_bf16 = dt_bias_base_bf16.unsqueeze(-1).expand(
+            -1, head_dim
+        )  # [nheads, head_dim] stride(1)=0
+
+        # A: extract base [nheads], cast to float32, then re-expand with stride(1)=0, stride(2)=0
+        # A_full has shape [nheads, head_dim, ssm_state_size] from expand
+        A_base = A_full[:, 0, 0]  # [num_heads]
+        A_base_fp32 = A_base.to(torch.float32)
+        A_fp32 = A_base_fp32.unsqueeze(-1).unsqueeze(-1).expand(-1, head_dim, ssm_state_size)
+
+        # D: extract base [nheads], cast, then re-expand with stride(1)=0
+        D_base = D_full[:, 0]  # [num_heads]
+        D_base_bf16 = D_base.to(torch.bfloat16)
+        D_bf16 = D_base_bf16.unsqueeze(-1).expand(-1, head_dim)  # [nheads, head_dim] stride(1)=0
+
         y_decode = flashinfer.mamba.selective_state_update(
             ssm_state_cache,
-            x_decode,
-            dt_hp,
-            A_full,
-            B_decode,
-            C_decode,
-            D=D_full,
+            x_decode_bf16,
+            dt_bf16,
+            A_fp32,
+            B_decode_bf16,
+            C_decode_bf16,
+            D=D_bf16,
             z=None,
-            dt_bias=dt_bias_hp,
+            dt_bias=dt_bias_bf16,
             dt_softplus=True,
             state_batch_indices=slot_idx_decode_i32,
         )
@@ -191,6 +237,9 @@ class FlashinferBackendSSM(BaseBackendSSM):
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.auto_deploy.flashinfer_cached_ssm.default
+
+    # flashinfer's selective_state_update only supports these state dtypes
+    FLASHINFER_SUPPORTED_STATE_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
 
     @classmethod
     def get_cache_initializers(
