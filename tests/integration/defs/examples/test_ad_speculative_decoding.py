@@ -36,9 +36,7 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     EagleWrapper,
     EagleWrapperConfig,
 )
-from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHMTPConfig
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig, KvCacheConfig
 
 prompts = [
@@ -1279,36 +1277,22 @@ def _analyze_mtp_weight_loading(model_path: Path, model):
     return loaded_keys, missing_in_checkpoint, unexpected_in_checkpoint
 
 
-@pytest.fixture
-def register_nemotron_mtp_config():
-    """Temporarily register NemotronHMTPConfig with AutoConfig for the test.
-
-    This fixture registers the config before the test runs and cleans up after,
-    ensuring no global state leaks between tests.
-    """
-    from transformers import AutoConfig
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-
-    AutoConfig.register(NemotronHMTPConfig.model_type, NemotronHMTPConfig)
-    yield
-    # Cleanup: remove the registration
-    CONFIG_MAPPING._extra_content.pop(NemotronHMTPConfig.model_type, None)
-
-
-def test_nemotron_mtp_model_with_weights(register_nemotron_mtp_config):
-    """Test NemotronH MTP model weight loading using the factory interface.
+def test_nemotron_mtp_model_with_weights():
+    """Test NemotronH MTP model weight loading using EagleDrafterFactory.
 
     This test verifies that:
-    1. Factory can create NemotronHMTPForCausalLM from the MTP checkpoint
+    1. EagleDrafterFactory can create EagleDrafterForCausalLM with NemotronH layers
     2. Weights are correctly loaded with the mtp.* -> model.* key mapping
     3. All expected model parameters are loaded (except embed_tokens, norm, lm_head)
 
-    The MTP model uses a separate checkpoint that contains only the MTP layers.
-    Shared parameters (embed_tokens, norm, lm_head) are expected to come from
-    the target model at runtime.
+    The MTP model uses a checkpoint that contains both backbone.* and mtp.* keys.
+    Only mtp.* keys are loaded. Shared parameters (embed_tokens, norm, lm_head)
+    are expected to come from the target model at runtime.
     """
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import EagleDrafterForCausalLM
+
     print("\n" + "=" * 80)
-    print("Test: NemotronH MTP model weight loading (via factory interface)")
+    print("Test: NemotronH MTP model weight loading (via EagleDrafterFactory)")
     print("=" * 80)
 
     # Get MTP model path
@@ -1327,14 +1311,11 @@ def test_nemotron_mtp_model_with_weights(register_nemotron_mtp_config):
     # Setup device
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Create factory
-    print("Creating AutoModelForCausalLMFactory...")
-    factory = AutoModelForCausalLMFactory(
+    # Create factory - use EagleDrafterFactory for NemotronH MTP
+    print("Creating EagleDrafterFactory...")
+    factory = EagleDrafterFactory(
         model=mtp_model_path,
         skip_loading_weights=False,
-        model_kwargs={
-            "model_type": "NemotronHMTPForCausalLM",
-        },
     )
 
     # Build model using factory
@@ -1342,6 +1323,11 @@ def test_nemotron_mtp_model_with_weights(register_nemotron_mtp_config):
     model = factory.build_model("meta")
     print(f"Model type: {type(model).__name__}")
     print(f"Model config type: {type(model.config).__name__}")
+
+    # Verify model type is EagleDrafterForCausalLM
+    assert isinstance(model, EagleDrafterForCausalLM), (
+        f"Expected EagleDrafterForCausalLM, got {type(model).__name__}"
+    )
 
     # Analyze weight loading
     print("\n--- Weight Loading Analysis ---")
@@ -1358,8 +1344,6 @@ def test_nemotron_mtp_model_with_weights(register_nemotron_mtp_config):
         for key in sorted(missing_keys):
             if "embed_tokens" in key:
                 print(f"  - {key} (shared embedding from target)")
-            elif key == "norm.weight":
-                print(f"  - {key} (shared pre-lm_head norm from target)")
             elif "lm_head" in key:
                 print(f"  - {key} (shared lm_head from target)")
             else:
@@ -1374,12 +1358,11 @@ def test_nemotron_mtp_model_with_weights(register_nemotron_mtp_config):
 
     # Verify expected missing and unexpected keys
     # MTP checkpoint does NOT contain:
-    # - embed_tokens: shared from target model
-    # - norm: shared from target model (pre-lm_head norm)
-    # - lm_head: shared from target model
+    # - embed_tokens: shared from target model (load_embedding_from_target=True)
+    # - lm_head: shared from target model (load_lm_head_from_target=False, but not in checkpoint)
+    # Note: For NemotronH, layers_handle_final_norm=True, so the wrapper doesn't create self.norm.
+    # The final norm is inside the layers (final_layernorm), which IS in the checkpoint.
     expected_missing_keys = {
-        "model.embed_tokens.weight",
-        "norm.weight",
         "lm_head.weight",
     }
     expected_unexpected_keys = set()  # All checkpoint keys should be used

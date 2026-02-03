@@ -110,15 +110,37 @@ class EagleConfig(PretrainedConfig):
 
     Args:
         config: Base config for the draft model from its config.json.
-        model_type: The base model type (e.g., "llama") used to look up defaults.
+        model_type: The base model type (e.g., "llama", "nemotron_h") used to look up defaults.
     """
 
     # Map model_type -> default Eagle config values
+    # Includes _checkpoint_conversion_mapping for model-specific weight key transformations
     _drafter_defaults: Dict[str, Dict[str, Any]] = {
         "llama": {
             "load_embedding_from_target": True,
             "load_lm_head_from_target": False,
             "num_capture_layers": 3,
+            # Whether the final norm (pre-lm_head) is handled inside the layers.
+            # If False, the wrapper applies self.norm after the layers.
+            # If True, layers have their own final_layernorm and wrapper skips self.norm.
+            "layers_handle_final_norm": False,
+            # Llama Eagle checkpoint: fc.*, midlayer.* -> model.fc.*, model.layers.*
+            "_checkpoint_conversion_mapping": {
+                "^(?!lm_head|norm)": "model.",
+                "midlayer": "layers",
+            },
+        },
+        "nemotron_h": {
+            "load_embedding_from_target": True,
+            "load_lm_head_from_target": False,
+            "num_capture_layers": 1,
+            # NemotronH MTP layers have final_layernorm on the last layer,
+            # so the wrapper should NOT apply an additional norm.
+            "layers_handle_final_norm": True,
+            # NemotronH MTP checkpoint: mtp.* -> model.*
+            "_checkpoint_conversion_mapping": {
+                r"^mtp\.": "model.",
+            },
         },
     }
 
@@ -528,9 +550,10 @@ class EagleModel(nn.Module):
         )
 
         # Vocab mapping for draft -> target token conversion
-        if config.draft_vocab_size is not None and config.draft_vocab_size != config.vocab_size:
+        draft_vocab_size = getattr(config, "draft_vocab_size", None) or config.vocab_size
+        if draft_vocab_size != config.vocab_size:
             self.d2t = nn.Parameter(
-                torch.empty((config.draft_vocab_size,), dtype=torch.int32),
+                torch.empty((draft_vocab_size,), dtype=torch.int32),
                 requires_grad=False,
             )
 
@@ -607,43 +630,55 @@ class EagleDrafterForCausalLM(PreTrainedModel):
     model-specific layer implementations.
 
     Args:
-        config: Model configuration
-        layers: nn.ModuleList of layers to use in EagleModel. If None, falls back
-                to building Llama layers for backward compatibility.
+        config: Model configuration (should be EagleConfig with model-type specific defaults)
+        layers: nn.ModuleList of layers to use in EagleModel. If None, builds based on model_type.
     """
 
     base_model_prefix = "model"
     supports_gradient_checkpointing = False
-    _no_split_modules = ["Eagle3DecoderLayer", "LlamaEagleLayer"]
+    _no_split_modules = ["Eagle3DecoderLayer", "LlamaEagleLayer", "NemotronHEagleLayer"]
 
-    # Checkpoint conversion mapping: Eagle checkpoints have keys like "fc.weight"
-    # but the wrapper model expects "model.fc.weight" (due to self.model = EagleModel).
-    # This mapping tells the factory to add "model." prefix when loading weights.
-    # Also renames "midlayer" -> "layers" for backward compatibility with old checkpoints.
+    # NOTE: _checkpoint_conversion_mapping is now set per-instance from config,
+    # not as a class attribute. This allows different mappings for different model types.
     # Used by AutoModelForCausalLMFactory._remap_param_names_load_hook()
-
-    _checkpoint_conversion_mapping = {
-        "^(?!lm_head|norm)": "model.",  # Prepend "model." to all keys EXCEPT lm_head and norm
-        "midlayer": "layers",  # Rename midlayer to layers (backward compat with old checkpoints)
-    }
 
     def __init__(self, config, layers: nn.ModuleList = None):
         super().__init__(config)
 
+        # Read checkpoint conversion mapping from config (set by EagleConfig based on model_type)
+        # This allows different mappings for Llama vs NemotronH checkpoints
+        self._checkpoint_conversion_mapping = getattr(
+            config, "_checkpoint_conversion_mapping", None
+        )
+
         self.load_embedding_from_target = getattr(config, "load_embedding_from_target", False)
         self.load_lm_head_from_target = getattr(config, "load_lm_head_from_target", False)
+        # Whether layers handle the final norm (pre-lm_head) internally.
+        # If True, layers have their own final_layernorm and we skip self.norm in forward.
+        # If False (default), we apply self.norm after the layers.
+        self._layers_handle_final_norm = getattr(config, "layers_handle_final_norm", False)
 
         # If layers not provided, build based on model_type
         if layers is None:
             layers = get_eagle_layers(config, config.model_type)
 
         self.model = EagleModel(config, layers)
-        self.norm = EagleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Only create norm if layers don't handle final normalization internally.
+        # For Llama: layers don't normalize, so we need self.norm here.
+        # For NemotronH: layers have final_layernorm, so we don't need self.norm.
+        if not self._layers_handle_final_norm:
+            # Use fallback chain for eps: rms_norm_eps (Llama) -> layer_norm_epsilon (NemotronH) -> default
+            norm_eps = getattr(config, "rms_norm_eps", getattr(config, "layer_norm_epsilon", 1e-6))
+            self.norm = EagleRMSNorm(config.hidden_size, eps=norm_eps)
+        else:
+            self.norm = None
+        # draft_vocab_size defaults to vocab_size if not specified
+        draft_vocab_size = getattr(config, "draft_vocab_size", None) or config.vocab_size
         self.lm_head = (
             None
             if self.load_lm_head_from_target
             else nn.Linear(
-                config.hidden_size, config.draft_vocab_size, bias=False, dtype=config.torch_dtype
+                config.hidden_size, draft_vocab_size, bias=False, dtype=config.torch_dtype
             )
         )
 
@@ -679,7 +714,13 @@ class EagleDrafterForCausalLM(PreTrainedModel):
             inputs_embeds=inputs_embeds, position_ids=position_ids, hidden_states=hidden_states
         )
 
-        norm_hidden_state = self.norm(hidden_states)
+        # Apply final norm only if layers don't handle it internally.
+        # For Llama: layers don't normalize, so we apply self.norm here.
+        # For NemotronH: layers have final_layernorm, so hidden_states are already normalized.
+        if self.norm is not None:
+            norm_hidden_state = self.norm(hidden_states)
+        else:
+            norm_hidden_state = hidden_states  # already normalized by layer
 
         last_hidden_state = norm_hidden_state if self._return_hidden_post_norm else hidden_states
 

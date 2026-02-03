@@ -26,7 +26,6 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
-from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
@@ -635,38 +634,41 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         return NemotronHCausalLMOutput(logits)
 
 
+AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
+
+
 # =============================================================================
-# MTP (Multi-Token Prediction) Model for Speculative Decoding
+# Eagle Layer Builder for NemotronH MTP (Multi-Token Prediction)
 # =============================================================================
 #
-# The MTP model is a draft model that uses hidden states from the target model
-# to predict next tokens. It follows the pattern "*E" (Attention + MoE).
+# The MTP drafter is built using EagleDrafterForCausalLM with NemotronH-specific
+# Eagle layers. This approach:
+# - Uses the unified EagleDrafterForCausalLM wrapper from modeling_eagle.py
+# - Builds NemotronHEagleLayer instances via build_nemotron_eagle_layers()
+# - Handles NemotronH-specific architecture: pattern-based layers ("*E"),
+#   no RoPE, start projections (enorm, hnorm, eh_proj), and final_layernorm
 #
-# Checkpoint structure:
-#   mtp.layers.0.*  - Attention layer with start projections (enorm, hnorm, eh_proj)
+# Checkpoint structure (mtp.* keys are remapped to model.* by EagleConfig):
+#   mtp.layers.0.*  - Attention layer with start projections
 #   mtp.layers.1.*  - MoE layer with final_layernorm
 # =============================================================================
 
 
-class NemotronHMTPConfig(PretrainedConfig):
-    """Config for NemotronH MTP (Multi-Token Prediction) head.
+class NemotronHEagleLayer(nn.Module):
+    """Eagle layer for NemotronH models.
 
-    This config is used to identify MTP models and load them with the
-    correct architecture via AutoDeploy's custom model mechanism.
-    """
+    This layer follows the unified Eagle interface:
+        forward(hidden_states, inputs_embeds, position_ids) -> Tensor
 
-    model_type = "NemotronHMTPForCausalLM"
+    NemotronH does not use RoPE, so position_ids is accepted but ignored.
+    The layer implements the MTP (Multi-Token Prediction) architecture:
+    - First layer fuses embeds + hidden_states via start projections (enorm, hnorm, eh_proj)
+    - All layers have pre-norm residual block with mixer (Attention or MoE)
+    - Last layer applies final_layernorm
 
-
-class NemotronHMTPSublayer(nn.Module):
-    """Single MTP sublayer - either Attention (*) or MoE (E).
-
-    Matches checkpoint structure:
-    - layers.0: Attention with start projections (enorm, hnorm, eh_proj)
-    - layers.1: MoE with final_layernorm
-
-    The start projections fuse the embedded input tokens with hidden states
-    from the target model: eh_proj(cat(enorm(embeds), hnorm(hidden_states))).
+    Architecture for pattern "*E":
+        Layer 0 (*): Attention with start projections
+        Layer 1 (E): MoE with final_layernorm
     """
 
     def __init__(
@@ -683,6 +685,7 @@ class NemotronHMTPSublayer(nn.Module):
         self.has_end_norm = has_end_norm
 
         # Start projections (only on first layer)
+        # These fuse embeds + hidden_states: eh_proj(cat(enorm(embeds), hnorm(hidden)))
         if has_start_projections:
             self.enorm = NemotronHRMSNorm(config.hidden_size, eps=eps)
             self.hnorm = NemotronHRMSNorm(config.hidden_size, eps=eps)
@@ -706,19 +709,23 @@ class NemotronHMTPSublayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.LongTensor,
     ) -> torch.Tensor:
-        """Forward pass for MTP sublayer.
+        """Forward pass with unified Eagle interface.
 
         Args:
-            hidden_states: Hidden states from previous layer or target model.
-            inputs_embeds: Input embeddings (only used in first layer with start projections).
+            hidden_states: Hidden states from target model [batch, seq, hidden_size]
+            inputs_embeds: Token embeddings [batch, seq, hidden_size]
+            position_ids: Position IDs (ignored - NemotronH doesn't use RoPE)
 
         Returns:
-            Updated hidden states.
+            Updated hidden states [batch, seq, hidden_size]
         """
+        # Note: position_ids is ignored - NemotronH doesn't use RoPE
+
         # Fuse embeddings and hidden states (first layer only)
-        if self.has_start_projections and inputs_embeds is not None:
+        if self.has_start_projections:
             e_normed = self.enorm(inputs_embeds)
             h_normed = self.hnorm(hidden_states)
             hidden_states = self.eh_proj(torch.cat([e_normed, h_normed], dim=-1))
@@ -736,150 +743,7 @@ class NemotronHMTPSublayer(nn.Module):
         return hidden_states
 
 
-class NemotronHMTPModel(nn.Module):
-    """MTP model for SuperV3 - matches checkpoint layers.{0,1}.* structure.
-
-    The model processes hidden states from the target model along with input
-    token embeddings to predict next token logits for speculative decoding.
-
-    Architecture (pattern "*E"):
-        Layer 0: Attention with start projections (fuses embeds + hidden_states)
-        Layer 1: MoE with final_layernorm
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-
-        # Build layers based on pattern (default "*E")
-        pattern = getattr(config, "mtp_hybrid_override_pattern", "*E")
-        self.layers = nn.ModuleList()
-        for i, char in enumerate(pattern):
-            self.layers.append(
-                NemotronHMTPSublayer(
-                    config,
-                    layer_idx=i,
-                    layer_type=char,
-                    has_start_projections=(i == 0),
-                    has_end_norm=(i == len(pattern) - 1),
-                )
-            )
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        """Forward pass for MTP model.
-
-        Args:
-            input_ids: Input token IDs [batch, seq_len].
-            hidden_states: Hidden states from target model [batch, seq_len, hidden_size].
-
-        Returns:
-            Output hidden states [batch, seq_len, hidden_size].
-        """
-        inputs_embeds = self.embed_tokens(input_ids)
-
-        for i, layer in enumerate(self.layers):
-            # Only pass embeds to first layer
-            hidden_states = layer(
-                hidden_states,
-                inputs_embeds=inputs_embeds if i == 0 else None,
-            )
-
-        return hidden_states
-
-
-@dataclass
-class NemotronHMTPOutput(ModelOutput):
-    """Output for NemotronH MTP model.
-
-    Args:
-        logits: Prediction scores for next tokens [batch, seq_len, vocab_size].
-        last_hidden_state: Hidden states from the last layer [batch, seq_len, hidden_size].
-    """
-
-    logits: Optional[torch.FloatTensor] = None
-    last_hidden_state: Optional[torch.FloatTensor] = None
-
-
-class NemotronHMTPForCausalLM(NemotronHPreTrainedModel):
-    """HuggingFace-compatible wrapper for NemotronH MTP drafter model.
-
-    This wrapper makes the MTP model compatible with AutoDeploy's model loading
-    and inference pipeline for speculative decoding.
-
-    Checkpoint key mapping:
-        mtp.layers.* -> model.layers.*  (handled by _checkpoint_conversion_mapping)
-    """
-
-    config_class = NemotronHMTPConfig
-    base_model_prefix = "model"
-    _no_split_modules = ["NemotronHMTPSublayer"]
-
-    # Checkpoint conversion: mtp.* -> model.*
-    # The checkpoint has keys like "mtp.layers.0.norm.weight"
-    # but the model expects "model.layers.0.norm.weight"
-    _checkpoint_conversion_mapping = {
-        r"^mtp\.": "model.",
-    }
-
-    def __init__(self, config):
-        super().__init__(config)
-        eps = getattr(config, "layer_norm_epsilon", getattr(config, "norm_eps", 1e-5))
-
-        self.model = NemotronHMTPModel(config)
-        self.norm = NemotronHRMSNorm(config.hidden_size, eps=eps)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> NemotronHMTPOutput:
-        """Forward pass compatible with HuggingFace/AutoDeploy interface.
-
-        Args:
-            input_ids: Input token IDs [batch, seq_len].
-            position_ids: Position IDs (unused, for interface compatibility).
-            **kwargs: Must contain 'hidden_states' from the target model.
-
-        Returns:
-            NemotronHMTPOutput with logits and last_hidden_state.
-
-        Raises:
-            ValueError: If hidden_states is not provided.
-        """
-        hidden_states = kwargs.get("hidden_states")
-        if hidden_states is None:
-            raise ValueError("hidden_states must be provided for MTP model.")
-
-        hidden_states = self.model(input_ids, hidden_states)
-        norm_hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(norm_hidden_states)
-
-        return NemotronHMTPOutput(
-            logits=logits,
-            last_hidden_state=hidden_states,
-        )
-
-
-AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
-AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHMTPConfig", NemotronHMTPForCausalLM)
-
-
-# =============================================================================
-# Eagle Layer Builder for NemotronH (Stub)
-# =============================================================================
-
-
-def build_nemotron_eagle_layers(config) -> nn.ModuleList:
+def build_nemotron_eagle_layers(config) -> Union[nn.ModuleList, nn.Module]:
     """Build NemotronH MTP layers for Eagle drafter.
 
     This function is called by get_eagle_layers() in modeling_eagle.py when
@@ -890,35 +754,44 @@ def build_nemotron_eagle_layers(config) -> nn.ModuleList:
     - Use pattern-based construction ("*E" = Attention + MoE)
     - First layer has start projections (enorm, hnorm, eh_proj)
     - Last layer has final_layernorm
-    - Layers should ignore position_ids parameter
 
-    Expected forward signature (unified interface):
+    Forward signature (unified interface):
         forward(hidden_states, inputs_embeds, position_ids) -> Tensor
+
+    For backward compatibility with checkpoints:
+    - Single layer: returns NemotronHEagleLayer directly (not wrapped in ModuleList)
+    - Multiple layers: returns nn.ModuleList of NemotronHEagleLayer instances
+
+    This matches the Llama Eagle layer builder behavior for checkpoint weight loading.
 
     Args:
         config: Model configuration with NemotronH-specific parameters
                 (mtp_hybrid_override_pattern, n_routed_experts, etc.)
 
     Returns:
-        nn.ModuleList of NemotronH Eagle layers
-
-    Raises:
-        NotImplementedError: This is a stub - full implementation pending.
+        nn.ModuleList of NemotronHEagleLayer instances, or single NemotronHEagleLayer
     """
-    raise NotImplementedError(
-        "NemotronH Eagle layers not yet implemented. "
-        "Expected interface: forward(hidden_states, inputs_embeds, position_ids) -> Tensor. "
-        "See NemotronHMTPSublayer for reference implementation."
-    )
-    # Future implementation:
-    # pattern = getattr(config, "mtp_hybrid_override_pattern", "*E")
-    # return nn.ModuleList([
-    #     NemotronHEagleLayer(
-    #         config,
-    #         layer_idx=i,
-    #         layer_type=char,
-    #         has_start_proj=(i == 0),
-    #         has_end_norm=(i == len(pattern) - 1),
-    #     )
-    #     for i, char in enumerate(pattern)
-    # ])
+    pattern = getattr(config, "mtp_hybrid_override_pattern", "*E")
+
+    if len(pattern) > 1:
+        return nn.ModuleList(
+            [
+                NemotronHEagleLayer(
+                    config,
+                    layer_idx=i,
+                    layer_type=char,
+                    has_start_projections=(i == 0),
+                    has_end_norm=(i == len(pattern) - 1),
+                )
+                for i, char in enumerate(pattern)
+            ]
+        )
+    else:
+        # Single layer case - return layer directly (not wrapped in ModuleList)
+        return NemotronHEagleLayer(
+            config,
+            layer_idx=0,
+            layer_type=pattern[0],
+            has_start_projections=True,
+            has_end_norm=True,
+        )
