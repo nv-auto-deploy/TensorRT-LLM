@@ -1,4 +1,6 @@
-model: zai-org/GLM-4.7-Flash
+model: DeepInfra/GLM-4.7-Flash-NVFP4
+# model: Tengyunw/GLM-4.7-NVFP4
+# model: zai-org/GLM-4.7-Flash
 args:
   mode: graph
   # world_size: 8
@@ -20,7 +22,7 @@ args:
     tokens_per_block: 64
   model_kwargs:
     torch_dtype: bfloat16
-    # num_hidden_layers: 2
+    num_hidden_layers: 2
 benchmark:
   enabled: false
 prompt:
