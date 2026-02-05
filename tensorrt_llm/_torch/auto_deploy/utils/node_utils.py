@@ -216,6 +216,18 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
             ],
             biases=[],
         )
+    elif is_weight_node(node):
+        return WeightNodes(
+            weights=[
+                WeightNode(
+                    node=node,
+                    node_key=node.target,
+                    tensor=get_param_or_buffer(node.target, gm),
+                    submod=gm.get_submodule(node.target.rpartition(".")[0]),
+                )
+            ],
+            biases=[],
+        )
     # for other parametrized nodes, we need to find the weight node
     else:
         all_weight_nodes = [
