@@ -232,9 +232,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
                 **kwargs,
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm,
-                          sampling_params=sampling_params,
-                          extra_evaluator_kwargs={'dataset_path': None})
+            task.evaluate(llm, sampling_params=sampling_params)
 
             self.check_acceptance_rate(llm, min_acceptance_rate=0.07)
 
