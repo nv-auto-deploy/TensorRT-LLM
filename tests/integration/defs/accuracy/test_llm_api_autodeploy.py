@@ -156,9 +156,6 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
 
     Tests that Eagle3 one-model spec dec maintains accuracy on GSM8K
     (math reasoning benchmark with 256 max output tokens).
-
-    To run locally with HuggingFace caching:
-        HF_HOME=/path/to/hf_home pytest tests/integration/defs/accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model_gsm8k -v -s
     """
 
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
@@ -213,7 +210,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         )
 
     @pytest.mark.skip_less_device_memory(32000)
-    def test_eagle3_one_model_gsm8k(self):
+    def test_eagle3_one_model(self):
         """Test Eagle3 one-model speculative decoding accuracy on GSM8K."""
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
