@@ -1678,24 +1678,46 @@ def _stack_nvfp4_moe_weights(gm: GraphModule) -> int:
         if is_gated_mlp:
             # For gated MLP, concatenate w1 and w3 as [w3, w1]
             fc1_expert_weights = torch.cat([w3_stacked, w1_stacked], dim=1).contiguous()
-            # Use a single global scale for fc1 activation quantization.
-            # Use min() because scales are in kernel format (2688/amax): smaller scale = larger amax.
-            fc1_act_scale = torch.minimum(
-                w1_input_scale_stacked.min(), w3_input_scale_stacked.min()
-            )
-            # Recompute alpha using global input scale instead of per-expert input scale.
-            # Formula: new_alpha = old_alpha * per_expert_input_scale / global_input_scale
-            # This ensures alpha is consistent with the global fc1_act_scale used by the kernel.
-            fc1_alpha_stacked = w1_alpha_stacked * w1_input_scale_stacked / fc1_act_scale
             fc1_weight_blockscale_fp8_stacked = torch.cat(
                 [w3_weight_blockscale_fp8_stacked, w1_weight_blockscale_fp8_stacked], dim=1
             ).contiguous()
+
+            # Check if all w1 and w3 input scales are identical across experts
+            all_scales_equal = (
+                torch.all(w1_input_scale_stacked == w1_input_scale_stacked[0])
+                and torch.all(w3_input_scale_stacked == w3_input_scale_stacked[0])
+                and torch.all(w1_input_scale_stacked == w3_input_scale_stacked)
+            )
+
+            if all_scales_equal:
+                # All scales are identical, no need for min() or alpha recomputation
+                fc1_act_scale = w1_input_scale_stacked[0]
+                fc1_alpha_stacked = w1_alpha_stacked
+            else:
+                # Scales differ across experts - use global min scale and recompute alpha
+                # Use min() because scales are in kernel format (2688/amax): smaller scale = larger amax.
+                fc1_act_scale = torch.minimum(
+                    w1_input_scale_stacked.min(), w3_input_scale_stacked.min()
+                )
+                # Recompute alpha using global input scale instead of per-expert input scale.
+                # Formula: new_alpha = old_alpha * per_expert_input_scale / global_input_scale
+                # This ensures alpha is consistent with the global fc1_act_scale used by the kernel.
+                fc1_alpha_stacked = w1_alpha_stacked * w1_input_scale_stacked / fc1_act_scale
         else:
             fc1_expert_weights = w1_stacked
-            fc1_act_scale = w1_input_scale_stacked.min()
-            # Recompute alpha using global input scale
-            fc1_alpha_stacked = w1_alpha_stacked * w1_input_scale_stacked / fc1_act_scale
             fc1_weight_blockscale_fp8_stacked = w1_weight_blockscale_fp8_stacked
+
+            # Check if all w1 input scales are identical across experts
+            all_scales_equal = torch.all(w1_input_scale_stacked == w1_input_scale_stacked[0])
+
+            if all_scales_equal:
+                # All scales are identical, no need for min() or alpha recomputation
+                fc1_act_scale = w1_input_scale_stacked[0]
+                fc1_alpha_stacked = w1_alpha_stacked
+            else:
+                # Scales differ across experts - use global min scale and recompute alpha
+                fc1_act_scale = w1_input_scale_stacked.min()
+                fc1_alpha_stacked = w1_alpha_stacked * w1_input_scale_stacked / fc1_act_scale
 
         fc2_expert_weights = w2_stacked
         # Keep fc2_act_scale per-expert (no global scale aggregation for fc2)
