@@ -133,6 +133,7 @@ transforms:
   fuse_nvfp4_moe:
     stage: post_load_fusion
     expect_mem_change: true
+    enabled: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   fuse_rmsnorm:
