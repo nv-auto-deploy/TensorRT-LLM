@@ -401,6 +401,15 @@ def is_any_attention_op(node: Node) -> bool:
     )
 
 
+def is_any_mla_op(node: Node) -> bool:
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_mla,
+        ],
+    )
+
+
 def is_linear_op(node: Node) -> bool:
     """Check if the node is a linear op.
 
@@ -938,33 +947,53 @@ def get_layer_after_linear_node(
     ]
     ssm_nodes = list(filtered_nodes(interior_nodes, is_any_ssm_op))
     attention_nodes = list(filtered_nodes(interior_nodes, is_any_attention_op))
+    mla_nodes = list(filtered_nodes(interior_nodes, is_any_mla_op))
     intermediate_lin_nodes = list(filtered_nodes(interior_nodes, is_any_lin_op))
+    ####################################################
+    ########## LAYER TYPE CLASSIFICATION ###############
+    ####################################################
 
-    layer_type = LayerType.MLP
-    min_local_shape = 1
-    if len(ssm_nodes) > 0:
-        assert len(ssm_nodes) == 1, "SSM layer must have exactly one SSM node"
-        layer_type = LayerType.SSM
-        # determine head size
-        min_local_shape = shape(ssm_nodes[0])[-1]
-    if len(attention_nodes) > 0:
-        assert len(attention_nodes) == 1, "Attention layer must have exactly one attention node"
-        layer_type = LayerType.ATTENTION
-        # determine head size
-        min_local_shape = shape(attention_nodes[0])[-1]
-    if len(intermediate_lin_nodes) > 0:
-        assert len(intermediate_lin_nodes) == 2, (
-            "MLA layer must have exactly two intermediate linear nodes"
-        )
-        assert len(attention_nodes) == 1, "MLA layer must have exactly one attention node"
-        layer_type = LayerType.MLA
+    def classify_layer_type() -> [LayerType, int]:
+        if len(ssm_nodes) + len(attention_nodes) + len(mla_nodes) > 1:
+            # ambiguous layer type
+            return LayerType.UNKNOWN, 1
 
+        if len(attention_nodes) == 1:
+            head_size = shape(attention_nodes[0])[-1]
+            if len(intermediate_lin_nodes) > 0:
+                return LayerType.UNKNOWN, 1
+            return LayerType.ATTENTION, head_size
+
+        if len(ssm_nodes) == 1:
+            head_size = shape(ssm_nodes[0])[-1]
+            # Mamba layers should not have any intermediate linear nodes.
+            if len(intermediate_lin_nodes) > 0:
+                return LayerType.UNKNOWN, 1
+            return LayerType.SSM, head_size
+
+        if len(mla_nodes) == 1:
+            head_size = shape(mla_nodes[0])[-1]
+            # MLA should have two intermediate linear nodes:
+            # kv_b_proj and q_b_proj, but:
+            # - kv_b_proj may be absorbed by the MLA op
+            # - q_b_proj is skipped if q_lora_rank is None
+            if len(intermediate_lin_nodes) > 2:
+                return LayerType.UNKNOWN, 1
+            return LayerType.MLA, head_size
+
+        # if we reach here, it means the layer is a MLP.
+        # MLP should not have any intermediate linear or weight nodes.
+        if len(intermediate_lin_nodes) > 0:
+            return LayerType.UNKNOWN, 1
+        return LayerType.MLP, 1
+
+    layer_type, head_size = classify_layer_type()
     layer_subgraph = LayerSubgraph(
         opening_nodes=opening_linear_nodes,
         subgraph_nodes=interior_nodes,
         terminating_node=terminating_linear_node,
         layer_type=layer_type,
-        min_local_shape=min_local_shape,
+        min_local_shape=head_size,
     )
     assert linear_nodes[start_lin_index] in opening_linear_nodes, (
         f"Linear node not found in opening linear nodes - "
