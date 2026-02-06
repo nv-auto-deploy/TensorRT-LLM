@@ -23,7 +23,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     WeightShardingInfo,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op, is_weight_node
 from tensorrt_llm.functional import AllReduceStrategy
 
 base_model_tp_plan = {
@@ -638,6 +638,16 @@ def _run_pattern_detection_job(
                             layer_type=LayerType.MLA,
                         )
                     )
+                if is_weight_node(node):
+                    if "kv_b_proj_weight" in node.name:
+                        expected_transformations.append(
+                            WeightShardingInfo(
+                                target_node=node.name,
+                                split_dim=SplitDimension.COLUMN,
+                                config=config,
+                                layer_type=LayerType.MLA,
+                            )
+                        )
 
     # get detected transformations
     optimizer = InferenceOptimizer(
