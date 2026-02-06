@@ -760,8 +760,8 @@ class ADEngine(ModelEngine):
         # TODO: handle extend requests and draft requests for specdec
         self.iter_states["num_generation_tokens"] = num_generation_tokens
 
-    @nvtx_range("ad_compute_model_outputs")
-    def _compute_model_outputs(self) -> Dict[str, torch.Tensor]:
+    @nvtx_range("ad_compute_logits")
+    def _compute_logits(self) -> Dict[str, torch.Tensor]:
         """Run model forward and return outputs in dict format.
 
         For regular models, returns {"logits": tensor}.
@@ -818,10 +818,10 @@ class ADEngine(ModelEngine):
         )
         self.iter_counter += 1
 
-        outputs = self._compute_model_outputs()
+        outputs = self._compute_logits()
 
         # If we have an external spec resource manager (two-model spec dec),
-        # save hidden states after running model.forward() in _compute_model_outputs()
+        # save hidden states after running model.forward() in _compute_logits()
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER
         )
