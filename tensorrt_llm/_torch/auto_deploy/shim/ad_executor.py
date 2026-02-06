@@ -761,12 +761,12 @@ class ADEngine(ModelEngine):
         self.iter_states["num_generation_tokens"] = num_generation_tokens
 
     @nvtx_range("ad_compute_logits")
-    def _compute_logits(self) -> Dict[str, torch.Tensor]:
-        """Run model forward and return outputs in dict format.
+    def _compute_logits(self):
+        """Run model forward and return outputs.
 
-        For regular models, returns {"logits": tensor}.
-        For one-model spec dec (EagleWrapper), returns the full output dict
-        with new_tokens, new_tokens_lens, next_draft_tokens, next_new_tokens.
+        For regular models, returns raw logits tensor (same as upstream).
+        For one-model spec dec (EagleWrapper), returns a dict with logits,
+        new_tokens, new_tokens_lens, next_draft_tokens, next_new_tokens.
         """
         # run the model
         model_output = self.model(**self.cache_seq_interface.named_args)
@@ -785,7 +785,8 @@ class ADEngine(ModelEngine):
         logits = self.cache_seq_interface.info.maybe_gather_and_squeeze_logits(logits)
 
         # TRTLLMSampler expects float32 logits. PyTorchModelEngine always casts to float32 regardless.
-        return {"logits": logits.float()}
+        # Return raw tensor for compatibility with demollm and unit tests (same as upstream).
+        return logits.float()
 
     def get_max_num_sequences(self) -> int:
         """Maximum number of sequences supported by the engine."""
@@ -820,6 +821,11 @@ class ADEngine(ModelEngine):
 
         outputs = self._compute_logits()
 
+        # For one-model spec dec (without_logits=True), pass through all outputs
+        # The sampler will use new_tokens, etc. instead of sampling from logits
+        if self.spec_config is not None and self.spec_config.spec_dec_mode.without_logits():
+            return outputs
+
         # If we have an external spec resource manager (two-model spec dec),
         # save hidden states after running model.forward() in _compute_logits()
         spec_resource_manager = resource_manager.get_resource_manager(
@@ -830,10 +836,7 @@ class ADEngine(ModelEngine):
         ):
             spec_resource_manager.capture_hidden_states(self.cache_seq_interface)
 
-        # For one-model spec dec (without_logits=True), pass through all outputs
-        # The sampler will use new_tokens, etc. instead of sampling from logits
-        if self.spec_config is not None and self.spec_config.spec_dec_mode.without_logits():
-            return outputs
+        outputs = {"logits": outputs}
 
         if self.mapping is not None:
             self._execute_logit_post_processors(scheduled_requests, outputs)
