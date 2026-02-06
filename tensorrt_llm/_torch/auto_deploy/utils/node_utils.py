@@ -224,6 +224,18 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
             ],
             biases=[],
         )
+    elif is_weight_node(node):
+        return WeightNodes(
+            weights=[
+                WeightNode(
+                    node=node,
+                    node_key=node.target,
+                    tensor=get_param_or_buffer(node.target, gm),
+                    submod=gm.get_submodule(node.target.rpartition(".")[0]),
+                )
+            ],
+            biases=[],
+        )
     # for other parametrized nodes, we need to find the weight node
     else:
         all_weight_nodes = [
@@ -515,6 +527,13 @@ def precompute_weight_node_mapping(gm: GraphModule) -> None:
             continue
 
         is_bias = node.target.endswith("bias")
+        # This is reflective - weight node "belongs" to itself.
+        if is_bias:
+            node.meta["bias_nodes"] = []
+            node.meta["bias_nodes"].append(node)
+        else:
+            node.meta["weight_nodes"] = []
+            node.meta["weight_nodes"].append(node)
 
         # Find the consumer compute node by traversing through auxiliary ops
         current = node
