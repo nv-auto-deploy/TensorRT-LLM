@@ -1021,38 +1021,6 @@ class SequenceInfo:
             ungathered_input_ids, gather_ids_device, mask_scatter_indices_device, input_ids_device
         )
 
-    @nvtx_range("ad_scatter_to_slot_positions")
-    def scatter_to_slot_positions(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Scatter a tensor from batch position order to slot_idx position order.
-
-        Args:
-            tensor: Tensor indexed by batch position [0, 1, 2, ..., num_sequences-1].
-
-        Returns:
-            Tensor of shape [max_batch_size] indexed by slot_idx. The value at position
-            slot_idx[i] contains the original tensor[i].
-
-        This is used to convert tensors like new_tokens_lens from batch iteration order
-        (how EagleWrapper outputs them) to slot-indexed order (for stable cross-iteration
-        access, matching PyTorch backend's convention).
-        """
-        slot_idx = self._get_arg("slot_idx")
-        batch_info = self._get_arg("batch_info")
-
-        # Get num_sequences from batch_info (num_prefill + num_decode)
-        num_sequences = batch_info[0].item() + batch_info[2].item()
-
-        if num_sequences == 0:
-            return tensor
-
-        # Create output tensor indexed by slot_idx
-        scattered = torch.zeros(self.max_batch_size, dtype=tensor.dtype, device=tensor.device)
-        # slot_idx[i] is the slot for batch position i
-        # Scatter: scattered[slot_idx[i]] = tensor[i]
-        scattered[slot_idx[:num_sequences]] = tensor[:num_sequences]
-
-        return scattered
-
     # TODO: remove once https://github.com/NVIDIA/TensorRT-LLM/issues/9878 is fixed and
     # logits gather is enabled by default (only keep squeeze_logits)
     @nvtx_range("ad_maybe_gather_logits")

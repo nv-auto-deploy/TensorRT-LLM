@@ -1187,7 +1187,6 @@ class EagleWrapper(nn.Module):
         else:
             return self._forward_with_kv_cache(input_ids, position_ids, **kwargs)
 
-    @torch.compiler.disable  # Disable dynamo to allow debug prints
     def _forward_with_kv_cache(self, input_ids, position_ids, **kwargs):
         """Forward pass with KV cache support (for generation with cached attention).
 

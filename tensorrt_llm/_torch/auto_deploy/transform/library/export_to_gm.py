@@ -168,21 +168,6 @@ class ExportToGM(BaseTransform):
                 for k, v in captured_kwargs.items()
             }
 
-            # DEBUG: Print captured kwargs shapes and dynamic shapes
-            print(f"\n[DEBUG export_to_gm] Exporting submodule: {e_info.submodule_name}")
-            print(
-                f"[DEBUG export_to_gm] dynamic_shape_lookup keys: {list(e_info.dynamic_shape_lookup.keys())}"
-            )
-            for k, v in captured_kwargs.items():
-                if isinstance(v, torch.Tensor):
-                    print(
-                        f"[DEBUG export_to_gm]   {k}: shape={v.shape}, dynamic_shapes={dynamic_shapes.get(k)}"
-                    )
-                else:
-                    print(
-                        f"[DEBUG export_to_gm]   {k}: type={type(v).__name__}, dynamic_shapes={dynamic_shapes.get(k)}"
-                    )
-
             # export the model to a graph module. We temporarily overwrite the signature of the
             # forward function to exactly match the kwargs we pass in. This is to ensure that
             # torch.export's graph capture can correctly handle all inputs. Specifically,
