@@ -1836,6 +1836,7 @@ def _process_mla_sharding(
     - q_a_proj: # gather (simple shard, output is replicated)
     - q_b_proj: # column-sharding  (output is head-distributed)
     - kv_a_proj # gather (simple shard, output is replicated)
+    # This one is actually absorbed by the MLA kernel.
     - kv_b_proj # column-sharding (output is head-distributed)
     - o_proj # row-sharding + all-reduce
 
