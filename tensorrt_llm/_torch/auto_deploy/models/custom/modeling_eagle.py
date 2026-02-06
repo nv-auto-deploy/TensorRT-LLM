@@ -615,9 +615,8 @@ class EagleWrapper(nn.Module):
         kwargs: dict,
         position_ids: torch.Tensor,
         num_sequences: int,
-        page_size: int,
-    ) -> tuple[dict, torch.Tensor]:
-        """Build decode-like kwargs: only set decode shape (cu_seqlen, batch_info_host).
+    ) -> dict:
+        """Build decode-like kwargs: decode shape (cu_seqlen, batch_info_host) and position_ids.
 
         Does NOT overwrite seq_len_with_cache, last_page_len, pages_per_seq, cu_num_pages,
         or any cache-related fields. Those are preserved from kwargs so that metadata
@@ -628,11 +627,10 @@ class EagleWrapper(nn.Module):
                 metadata is preserved from this dict.
             position_ids: [1, num_sequences] - position IDs (e.g. last position we just ran).
             num_sequences: Number of sequences.
-            page_size: Unused; kept for API compatibility.
 
         Returns:
-            Tuple of (new_kwargs, position_ids). new_kwargs has decode layout but
-            unchanged seq_len_with_cache, last_page_len, pages_per_seq, cu_num_pages.
+            new_kwargs with decode layout, position_ids set, and unchanged seq_len_with_cache,
+            last_page_len, pages_per_seq, cu_num_pages.
         """
         device = position_ids.device
 
@@ -649,11 +647,12 @@ class EagleWrapper(nn.Module):
         new_kwargs["cu_seqlen"] = cu_seqlen
         new_kwargs["cu_seqlen_host"] = cu_seqlen_host
         new_kwargs["batch_info_host"] = batch_info_host
+        new_kwargs["position_ids"] = position_ids
 
         # Explicitly do NOT overwrite: seq_len_with_cache, last_page_len, pages_per_seq,
         # cu_num_pages, cache_loc, full_cache_loc, cu_allocated_pages (preserved from kwargs).
 
-        return new_kwargs, position_ids
+        return new_kwargs
 
     def _prepare_next_draft_metadata(
         self,
@@ -708,13 +707,8 @@ class EagleWrapper(nn.Module):
             0
         )  # [1, num_sequences]
 
-        # Build base kwargs: decode shape only; seq_len_with_cache, last_page_len, pages_per_seq, cu_num_pages preserved
-        base_kwargs, _ = self._build_decode_kwargs(
-            kwargs, position_ids_last, num_sequences, page_size
-        )
-        base_kwargs["position_ids"] = (
-            position_ids_last  # increment_position_ids expects this in the dict
-        )
+        # Build base kwargs: decode shape + position_ids; cache/length/page metadata preserved
+        base_kwargs = self._build_decode_kwargs(kwargs, position_ids_last, num_sequences)
 
         # Step B: Increment is iteration-dependent
         if draft_idx == 0:
@@ -1577,14 +1571,13 @@ class ADHiddenStateManager(Eagle3ResourceManager):
         # Call parent to initialize most fields
         super().__init__(config, dtype, hidden_size, max_num_requests, max_seq_len, max_num_tokens)
 
-        # Re-allocate hidden_states with full max_num_tokens for AutoDeploy.
-        # The parent class caps allocation at min(max_num_tokens, max_num_requests * max_seq_len),
-        # but AutoDeploy's warmup pass (resize_kv_cache) sends a batch with exactly max_num_tokens
-        # to measure memory usage. We need to allocate enough to handle this warmup batch.
-        # NOTE: This may allocate more memory than strictly necessary for inference, but ensures
-        # compatibility with AutoDeploy's memory estimation. Future optimization could reduce this
-        # by making warmup respect the max_seq_len cap.
-        ad_max_num_tokens = max_num_tokens + (config.max_total_draft_tokens + 1) * max_num_requests
+        # Re-allocate hidden_states for AutoDeploy using max() instead of the parent's min().
+        # The parent caps at min(max_num_tokens, max_num_requests * max_seq_len); we use max()
+        # so we cover both AutoDeploy's warmup (which may send max_num_tokens) and inference.
+        ad_max_num_tokens = (
+            max(max_num_tokens, max_num_requests * max_seq_len)
+            + (config.max_total_draft_tokens + 1) * max_num_requests
+        )
         self.hidden_states = torch.empty(
             (ad_max_num_tokens, hidden_size * config.num_capture_layers),
             dtype=dtype,
