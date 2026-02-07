@@ -114,9 +114,10 @@ def test_kv_cache_manager_spec_dec():
         eagle3_layers_to_capture={1, 15, 28},
     )
 
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.001,
-    )
+    # Use free_gpu_memory_fraction=0.0 so ResizeKVCache skips the forward pass (needs_resize()
+    # is False). This test only asserts KV cache manager creation and spec-dec fields; we don't need
+    # to run a forward pass.
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.0)
 
     llm = DemoLLM(
         model=base_model_config["args"]["model"],
@@ -136,8 +137,10 @@ def test_kv_cache_manager_spec_dec():
     kv_max_draft_len = getattr(kv_cache_manager, "max_draft_len", None)
     kv_max_total_draft_tokens = getattr(kv_cache_manager, "max_total_draft_tokens", None)
 
-    csi_extra_seq_len_for_kv_cache = getattr(cache_interface, "_extra_seq_len_for_kv_cache", None)
-    csi_spec_config = getattr(cache_interface, "_spec_config", None)
+    actual_extra_seq_len_for_kv_cache = getattr(
+        cache_interface, "_extra_seq_len_for_kv_cache", None
+    )
+    actual_spec_config = getattr(cache_interface, "_spec_config", None)
 
     print("\n" + "=" * 60)
     print("KVCacheManager Parameters:")
@@ -148,8 +151,8 @@ def test_kv_cache_manager_spec_dec():
     print("=" * 60)
     print("\nCachedSequenceInterface Parameters:")
     print("=" * 60)
-    print(f"  csi_extra_seq_len_for_kv_cache: {csi_extra_seq_len_for_kv_cache}")
-    print(f"  csi_spec_config:                {csi_spec_config}")
+    print(f"  actual_extra_seq_len_for_kv_cache: {actual_extra_seq_len_for_kv_cache}")
+    print(f"  actual_spec_config:                {actual_spec_config}")
     print("=" * 60)
 
     assert kv_max_draft_len == max_draft_len, (
@@ -165,12 +168,12 @@ def test_kv_cache_manager_spec_dec():
         f"got {kv_num_extra_kv_tokens}"
     )
 
-    # csi_extra_seq_len_for_kv_cache = max_total_draft_tokens + num_extra_kv_tokens
+    # actual_extra_seq_len_for_kv_cache = max_total_draft_tokens + num_extra_kv_tokens
     # (no overlap scheduler contribution since disable_overlap_scheduler=True)
     expected_extra_seq_len = max_draft_len + expected_num_extra_kv_tokens  # 3 + 2 = 5
-    assert csi_extra_seq_len_for_kv_cache == expected_extra_seq_len, (
-        f"Expected csi_extra_seq_len_for_kv_cache={expected_extra_seq_len}, "
-        f"got {csi_extra_seq_len_for_kv_cache}"
+    assert actual_extra_seq_len_for_kv_cache == expected_extra_seq_len, (
+        f"Expected actual_extra_seq_len_for_kv_cache={expected_extra_seq_len}, "
+        f"got {actual_extra_seq_len_for_kv_cache}"
     )
 
     print("\n" + "=" * 80)
