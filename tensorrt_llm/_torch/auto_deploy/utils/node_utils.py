@@ -10,6 +10,8 @@ from pydantic import BaseModel, ConfigDict
 from torch import nn
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import GraphModule, Node
+from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
+from torch.fx.passes.operator_support import OperatorSupportBase
 
 from .logger import ad_logger
 
@@ -49,6 +51,27 @@ class LayerSubgraph(BaseModel):
     terminating_node: Union[Node, None]
     layer_type: LayerType
     min_local_shape: int = 1
+
+
+class LayerInteriorSupport(OperatorSupportBase):
+    """OperatorSupportBase that marks residual boundary nodes as unsupported.
+
+    Used by CapabilityBasedPartitioner to split the graph into layer-sized partitions.
+    Everything that is NOT a residual boundary (and not a placeholder/output) is "supported"
+    and will be grouped into partitions. The partitioner's cycle detection prevents
+    merging across residual add boundaries.
+    """
+
+    def __init__(self, boundary_nodes: set):
+        super().__init__()
+        self.boundary_nodes = boundary_nodes
+
+    def is_node_supported(self, submodules, node: Node) -> bool:
+        if node in self.boundary_nodes:
+            return False
+        if node.op in ("placeholder", "output"):
+            return False
+        return True
 
 
 class WeightNode(BaseModel):
@@ -682,11 +705,14 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     boundary_nodes.append(n_user)
 
     # find residual nodes from here on
-    # NOTE: for now, we assume that the residual nodes do not go through point-wise operations like
-    # activations. We are just looking for a "straight" path to the output.
-    for node in gm.graph.nodes:
-        if is_op(node, torch.ops.aten.add) and any(n == node for n in boundary_nodes[-1].users):
-            boundary_nodes.append(node)
+    while True:
+        next_res_add, _ = bfs(
+            boundary_nodes[-1], lambda n: is_op(n, torch.ops.aten.add), include_root=False
+        )
+        if next_res_add is None:
+            break
+        else:
+            boundary_nodes.append(next_res_add)
 
     # sanity check: we expect at most two users for any residual node
     res_nodes_more_users = [n for n in boundary_nodes[2:] if len(n.users) > 2]
@@ -699,40 +725,177 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     return boundary_nodes
 
 
-def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[Node]]:
+def _classify_partition(
+    partition_nodes: set,
+    embd: int,
+) -> Optional[LayerSubgraph]:
+    """Classify a partition of nodes into a LayerSubgraph.
+
+    Examines the anchor ops and linear structure within a partition (produced by
+    CapabilityBasedPartitioner) to determine the layer type and identify opening/closing
+    linear nodes.
+
+    Args:
+        partition_nodes: Set of FX Nodes belonging to this partition.
+        embd: Embedding size for distinguishing opening vs closing linear nodes.
+
+    Returns:
+        A LayerSubgraph if the partition contains at least one linear node with
+        embedding-dimension shapes, or None if the partition is not a recognized layer
+        (e.g., embedding region, final norm, or lm_head without proper structure).
     """
-    Get subgraphs for all consecutive layers (attention, MLP, SSM, MoE) in the graph.
+    linears = [n for n in partition_nodes if is_any_lin_op(n)]
+    if not linears:
+        return None
 
-    Pre-computes weight mappings and caches weight shapes for all linear nodes.
-    Each layer is contained between opening linear layers and a single closing linear layer.
+    attention_ops = list(filtered_nodes(partition_nodes, is_any_attention_op))
+    ssm_ops = list(filtered_nodes(partition_nodes, is_any_ssm_op))
+    moe_ops = list(filtered_nodes(partition_nodes, is_any_moe_op))
 
-    Assumptions:
-        1. each layer (each subgraph) is contained between a list of opening
-        linear layers (e.g., q/k/v_proj, gate/up_proj, in_proj, etc.) and a single closing linear layer
-        (e.g., out_proj, down_proj, etc.)
-        2. all layers are connected in sequence, there are no "parallel" layers.
+    # Identify closing (terminating) linear: a linear whose
+    #   1. weight shape[0] == embd (projects TO embedding space), AND
+    #   2. its output exits the partition (feeds into a boundary node / output)
+    # This topological check disambiguates square matrices (e.g., o_proj with [embd, embd])
+    # that match both opening and closing shape criteria.
+    closing_candidates = [
+        n
+        for n in linears
+        if "lin_node_shape" in n.meta
+        and n.meta["lin_node_shape"][0] == embd
+        and any(u not in partition_nodes for u in n.users)
+    ]
 
-    Consequence:
-        1. We can linearize both all linear nodes in the graph and the layers itself, having a single
-        linear history and define layers by the indices of corresponding opening and closing linear nodes,
-        with no overlap between layers.
-        E.g., if layer i is defined between linear nodes start_i and end_i, then all linear nodes between
-        start_i and end_i necessarily belong to layer i.
-        2. It does not mean that every linear node in the graph belongs to a layer, that is. Then, if:
-            end_i < start_{{i+1}}, then all linear nodes in[end_i + 1, start_{{i+1}} - 1] do not belong
-            to any layer, and are marked as "unprocessed".
+    # Determine the unique closing (terminating) linear node.
+    terminating_node = None
+    if len(closing_candidates) == 1:
+        terminating_node = closing_candidates[0]
+    elif len(closing_candidates) > 1:
+        # Multiple closing candidates: pick the last one in topological order
+        # (the one furthest from the partition entry)
+        terminating_node = closing_candidates[-1]
+
+    # Opening linears: weight shape[-1] == embd (project FROM embedding space),
+    # excluding the closing linear.
+    closing_set_for_filter = {terminating_node} if terminating_node else set()
+    opening = [
+        n
+        for n in linears
+        if n not in closing_set_for_filter
+        and "lin_node_shape" in n.meta
+        and n.meta["lin_node_shape"][-1] == embd
+    ]
+
+    if not opening or terminating_node is None:
+        # A valid layer requires both opening linears (projecting FROM embedding space)
+        # and a closing linear (projecting TO embedding space). Without both, this is
+        # not a proper layer -- the linears will remain in unprocessed_linear_nodes.
+        return None
+
+    # Interior = everything except opening and closing nodes
+    interior_nodes = [
+        n for n in partition_nodes if n not in set(opening) and n not in closing_set_for_filter
+    ]
+
+    # Gather interior analysis data
+    intermediate_lin_nodes = list(filtered_nodes(interior_nodes, is_any_lin_op))
+    intermediate_weight_nodes = list(
+        filtered_nodes(
+            interior_nodes,
+            lambda n: is_weight_node(n)
+            and (not list(n.users) or not is_any_lin_op(list(n.users)[0])),
+        )
+    )
+
+    ####################################################
+    ########## LAYER TYPE CLASSIFICATION ###############
+    ####################################################
+
+    def classify_layer_type() -> Tuple[LayerType, int]:
+        if len(ssm_ops) + len(attention_ops) > 1:
+            return LayerType.UNKNOWN, 1
+
+        if len(attention_ops) == 1:
+            head_size = shape(attention_ops[0])[-1]
+            # check if this is MLA:
+            # these two intermediate linear nodes are the latent q and kv projections.
+            if len(intermediate_lin_nodes) == 2:
+                # MLA has a RMS norm inside, so it should have one (or two, counting bias)
+                # intermediate weight nodes
+                if len(intermediate_weight_nodes) not in [1, 2]:
+                    return LayerType.UNKNOWN, 1
+                return LayerType.MLA, head_size
+            else:
+                if len(intermediate_lin_nodes) != 0:
+                    return LayerType.UNKNOWN, 1
+                return LayerType.ATTENTION, head_size
+
+        if len(ssm_ops) == 1:
+            head_size = shape(ssm_ops[0])[-1]
+            # Mamba layers should not have any intermediate linear nodes.
+            if len(intermediate_lin_nodes) > 0:
+                return LayerType.UNKNOWN, 1
+            # Mamba layer should have 3 to 6 intermediate weight nodes:
+            # - conv1d weight
+            # - A (A_log)
+            # - D
+            # - conv1d bias [optional]
+            # - dt_bias [optional]
+            # - RMS norm [optional]
+            if len(intermediate_weight_nodes) not in list(range(3, 7)):
+                return LayerType.UNKNOWN, 1
+            return LayerType.SSM, head_size
+
+        if len(moe_ops) > 0:
+            return LayerType.MOE, 1
+
+        # if we reach here, it means the layer is a MLP.
+        # MLP should not have any intermediate linear or weight nodes.
+        if len(intermediate_lin_nodes) > 0 or len(intermediate_weight_nodes) > 0:
+            return LayerType.UNKNOWN, 1
+        return LayerType.MLP, 1
+
+    layer_type, head_size = classify_layer_type()
+
+    return LayerSubgraph(
+        opening_nodes=opening,
+        subgraph_nodes=interior_nodes,
+        terminating_node=terminating_node,
+        layer_type=layer_type,
+        min_local_shape=head_size,
+    )
+
+
+def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[Node]]:
+    """Get subgraphs for all consecutive layers (attention, MLP, SSM, MoE) in the graph.
+
+    Uses CapabilityBasedPartitioner to split the graph into layer-sized partitions
+    based on residual add boundaries, then classifies each partition.
+
+    The approach is two-stage:
+        Stage 1: identify_regions_between_residuals() finds residual boundary nodes
+                 (input, embedding, residual adds, output). CapabilityBasedPartitioner
+                 treats these as "unsupported" so they break the graph into partitions.
+                 The partitioner's cycle detection prevents merging across boundaries.
+        Stage 2: Each partition is classified by examining its anchor ops (attention,
+                 SSM, MoE) and linear structure (opening/closing linear nodes matched
+                 by embedding dimension).
+
+    Returns:
+        Tuple of (layer_subgraphs, unprocessed_linear_nodes) where:
+        - layer_subgraphs: List of LayerSubgraph for each recognized layer
+        - unprocessed_linear_nodes: Set of linear nodes not belonging to any layer.
+          These can be "simple sharded".
+
     Note:
-        The interesting case is MoE with shared experts. In this case, there are two parallel paths:
-        1. Routed experts
-        2. Shared experts
-        In this case, "shared experts" path will be marked as an MLP layer, and "routed experts" path will
-        be "unprocessed". This is desired, since routed experts should not be sharded by the TP transform,
-        but a corresponding EP/BMM transforms.
+        The interesting case is MoE with shared experts. In this case, there are two
+        parallel paths (routed experts and shared experts) within the same partition.
+        The shared experts path will be identified as part of the layer, and the routed
+        experts should be handled by EP/BMM transforms.
     """
 
     assert gm.graph.nodes, "Graph is empty"
-    layer_subgraphs = []
     linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+    assert len(linear_nodes) > 0, "Could not find any linear nodes in the graph"
 
     # Pre-compute weight-to-consumer mapping for O(1) weight node lookup
     precompute_weight_node_mapping(gm)
@@ -740,35 +903,50 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
     # Cache weight shapes for all linear nodes
     for lin_node in linear_nodes:
         if "lin_node_shape" not in lin_node.meta:
-            shape = get_weight_shape(lin_node)
-            if shape is not None:
-                lin_node.meta["lin_node_shape"] = shape
+            w_shape = get_weight_shape(lin_node)
+            if w_shape is not None:
+                lin_node.meta["lin_node_shape"] = w_shape
 
     # Find the embedding size from the first linear node
     embd = get_weight_shape(linear_nodes[0], dim=-1)
     if embd is None:
         raise ValueError("Failed to extract embedding size from first linear node")
 
-    unprocessed_linear_nodes = set(linear_nodes)
-    assert len(linear_nodes) > 0, "Could not find any linear nodes in the graph"
+    # Stage 1: Partition the graph using residual boundary nodes
+    boundary_nodes = identify_regions_between_residuals(gm)
+    boundary_set = set(boundary_nodes)
 
-    terminating_indices = [-1]
-    last_lin_index = terminating_indices[-1] + 1
+    partitioner = CapabilityBasedPartitioner(
+        gm,
+        LayerInteriorSupport(boundary_set),
+        allows_single_node_partition=True,
+    )
+    partitions = partitioner.propose_partitions()
 
-    # For each linear node, find its layer subgraph defined as regions between consecutive linear nodes.
-    while last_lin_index < len(linear_nodes):
-        layer_subgraph = get_layer_after_linear_node(linear_nodes, terminating_indices, embd=embd)
+    # Stage 2: Classify each partition and build LayerSubgraphs
+    layer_subgraphs = []
+    processed_linear_nodes = set()
 
-        if layer_subgraph.opening_nodes is not None and len(layer_subgraph.opening_nodes) > 0:
-            unprocessed_linear_nodes -= (
-                set(layer_subgraph.opening_nodes)
-                | set([layer_subgraph.terminating_node])
-                | set(layer_subgraph.subgraph_nodes)
-            )
+    for partition in partitions:
+        partition_nodes = set(partition.nodes.keys())
+        layer_subgraph = _classify_partition(partition_nodes, embd)
+
+        if layer_subgraph is not None and len(layer_subgraph.opening_nodes) > 0:
             layer_subgraphs.append(layer_subgraph)
-        last_lin_index = terminating_indices[-1] + 1
+            processed_linear_nodes.update(layer_subgraph.opening_nodes)
+            if layer_subgraph.terminating_node is not None:
+                processed_linear_nodes.add(layer_subgraph.terminating_node)
+            processed_linear_nodes.update(
+                n for n in layer_subgraph.subgraph_nodes if is_any_lin_op(n)
+            )
 
-    # Unprocessed linear nodes can be "simple sharded".
+    unprocessed_linear_nodes = set(linear_nodes) - processed_linear_nodes
+
+    ad_logger.debug(
+        f"Partitioner found {len(layer_subgraphs)} layer subgraphs, "
+        f"{len(unprocessed_linear_nodes)} unprocessed linear nodes"
+    )
+
     return layer_subgraphs, unprocessed_linear_nodes
 
 
@@ -1023,224 +1201,6 @@ def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[in
         return s
     else:
         return s[dim]
-
-
-def get_layer_after_linear_node(
-    linear_nodes: List[Node],
-    terminating_indices: List[int],
-    embd: int,
-    match_on_shapes: bool = True,
-    enforce_strict_linear_history: bool = True,
-) -> LayerSubgraph:
-    """
-    Get the next model layer.
-    The previous layer was closed by the terminating linear node with index terminating_indices[-1].
-
-    Since we assume a layer is always terminated by a single linear node, we iteratively query subgraph
-    and check for the condition len(lin_nodes_in_subgraph) == 1. If a given linear node
-    linear_nodes[start_lin_index] does not have a corresponding single sink linear node, it will
-    be classified as "unprocessed", and the next linear node is picked as a candidate to open
-    a new layer.
-
-    match_on_shapes explanation: We assume that the opening linear weights have shape [hidden, embedding],
-       where, while hidden may vary from layer to layer (e.g., MLP, MoE, latent projections) may have
-       different hidden sizes, the embedding size is the property of the model across all layers.
-       Similarly, the unique closing linear weight should have shape [embedding, hidden], to map back
-       from the hidden space to the embedding space.
-       If match_on_shapes is True, we require that the opening_layer.shape[-1] == closing_layer.shape[0]
-       If match_on_shapes is False, we only require the topological connectivity and uniqueness of
-       closing_layer being the only sink.
-    Why it matters: For MLA, activation X goes through the latent space projection, following:
-        Q = norm(X @ W_q_a) @ W_q_b   # <- two linear projections
-        KV = norm(X @ W_kv_a) @ W_kv_b  # <- two linear projections
-        Without match_on_shapes, we would treat norm(X @ W_q_a) @ W_q_b as entire MLP layer and apply
-        column-row sharding to it. That would result with Q not being sharded, but replicated (after MLP all-reduce),
-        and the entire attention computation being replicated.
-        With match_on_shapes, the entire MLA will be treated as a single layer, with the o_proj as the
-        unique closing linear node.
-
-    Args:
-        linear_nodes: List of linear nodes in the graph.
-        terminating_indices: List of indices of terminating linear nodes.
-        embd: Embedding size for shape matching.
-        match_on_shapes: If True, match layers on embedding shapes.
-        enforce_strict_linear_history: If True, enforce strict ordering constraints.
-
-    Returns:
-        LayerSubgraph containing opening nodes, subgraph nodes, and terminating node.
-    """
-
-    def boundary_condition(node: Node, dim: int) -> bool:
-        if match_on_shapes:
-            if is_any_lin_op(node):
-                return node.meta["lin_node_shape"][dim] == embd
-            return (
-                is_any_moe_op(node)
-                or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
-                or is_residual_add(node)
-            )
-        else:
-            return (
-                is_any_lin_op(node)
-                or is_any_moe_op(node)
-                or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
-                or is_residual_add(node)
-            )
-
-    def filter_condition(node: Node, dim: int) -> bool:
-        if match_on_shapes:
-            if is_any_lin_op(node):
-                return node.meta["lin_node_shape"][dim] == embd
-            return False
-        else:
-            return is_any_lin_op(node)
-
-    lin_nodes_in_subgraph = []
-    start_lin_index = terminating_indices[-1] + 1
-
-    while len(lin_nodes_in_subgraph) != 1:
-        if start_lin_index >= len(linear_nodes):
-            terminating_indices.append(len(linear_nodes))
-            return LayerSubgraph(
-                opening_nodes=[],
-                subgraph_nodes=[],
-                terminating_node=None,
-                layer_type=LayerType.UNKNOWN,
-            )
-
-        forward_subgraph = subgraph(
-            sources=[linear_nodes[start_lin_index]],
-            boundary_condition=lambda n: boundary_condition(n, dim=0),
-        )
-        lin_nodes_in_subgraph = list(
-            filtered_nodes(forward_subgraph, lambda n: filter_condition(n, dim=0))
-        )
-        if len(lin_nodes_in_subgraph) > 1:
-            # it means that probably we went over the boundary of the layer.
-            # It may happen e.g., with MoLE (latent MoE), with the closing latent fc2 projection,
-            # when the subgraph spanned over fc2 "spills" over consecutive layers.
-            # Then, wrap this single linear node in  LayerType.UNKNOWN and return.
-            terminating_indices.append(start_lin_index)
-            return LayerSubgraph(
-                opening_nodes=[linear_nodes[start_lin_index]],
-                subgraph_nodes=[],
-                terminating_node=linear_nodes[start_lin_index],
-                layer_type=LayerType.UNKNOWN,
-            )
-        start_lin_index += 1
-    start_lin_index -= 1
-    terminating_linear_node = lin_nodes_in_subgraph[0]
-
-    # For backward pass, match embedding on dim=-1
-    backward_subgraph = subgraph(
-        sinks=[terminating_linear_node], boundary_condition=lambda n: boundary_condition(n, dim=-1)
-    )
-
-    # Get all opening linear nodes
-    opening_linear_nodes = list(
-        filtered_nodes(backward_subgraph, lambda n: filter_condition(n, dim=-1))
-    )
-
-    if enforce_strict_linear_history:
-        # opening nodes must succeed last terminating node
-        last_terminating_index = terminating_indices[-1]
-        opening_linear_nodes = [
-            n for n in opening_linear_nodes if linear_nodes.index(n) > last_terminating_index
-        ]
-
-    # subgraph_nodes should not include opening nodes.
-    # the entire layer =  opening_nodes + subgraph_nodes + terminating_node,
-    # with these three sets being disjoint.
-    interior_nodes = [
-        n
-        for n in set(backward_subgraph).union(forward_subgraph)
-        if n not in set(opening_linear_nodes).union([terminating_linear_node])
-    ]
-    ssm_nodes = list(filtered_nodes(interior_nodes, is_any_ssm_op))
-    attention_nodes = list(filtered_nodes(interior_nodes, is_any_attention_op))
-    intermediate_lin_nodes = list(filtered_nodes(interior_nodes, is_any_lin_op))
-    intermediate_weight_nodes = list(
-        filtered_nodes(
-            interior_nodes, lambda n: is_weight_node(n) and not is_any_lin_op(list(n.users)[0])
-        )
-    )
-
-    ####################################################
-    ########## LAYER TYPE CLASSIFICATION ###############
-    ####################################################
-
-    def classify_layer_type() -> [LayerType, int]:
-        if len(ssm_nodes) + len(attention_nodes) > 1:
-            return LayerType.UNKNOWN, 1
-
-        if len(attention_nodes) == 1:
-            head_size = shape(attention_nodes[0])[-1]
-            # check if this is MLA:
-            # these two intermediate linear nodes are the latent q and kv projections.
-            if len(intermediate_lin_nodes) == 2:
-                # MLA has a RMS norm inside, so it should have one (or two, couning biaas)
-                # intermediate weight nodes
-                if len(intermediate_weight_nodes) not in [1, 2]:
-                    return LayerType.UNKNOWN, 1
-                return LayerType.MLA, head_size
-            else:
-                if len(intermediate_lin_nodes) != 0:
-                    return LayerType.UNKNOWN, 1
-                return LayerType.ATTENTION, head_size
-
-        if len(ssm_nodes) == 1:
-            head_size = shape(ssm_nodes[0])[-1]
-            # Mamba layers should not have any intermediate linear nodes.
-            if len(intermediate_lin_nodes) > 0:
-                return LayerType.UNKNOWN, 1
-            # Mamba layer should have 3 to 6 intermediate weight nodes:
-            # - conv1d weight
-            # - A (A_log)
-            # - D
-            # - conv1d bias [optional]
-            # - dt_bias [optional]
-            # - RMS norm [optional]
-            if len(intermediate_weight_nodes) not in list(range(3, 7)):
-                return LayerType.UNKNOWN, 1
-            return LayerType.SSM, head_size
-
-        # if we reach here, it means the layer is a MLP.
-        # MLP should not have any intermediate linear or weight nodes.
-        if len(intermediate_lin_nodes) > 0 or len(intermediate_weight_nodes) > 0:
-            return LayerType.UNKNOWN, 1
-        return LayerType.MLP, 1
-
-    layer_type, head_size = classify_layer_type()
-
-    layer_subgraph = LayerSubgraph(
-        opening_nodes=opening_linear_nodes,
-        subgraph_nodes=interior_nodes,
-        terminating_node=terminating_linear_node,
-        layer_type=layer_type,
-        min_local_shape=head_size,
-    )
-    assert linear_nodes[start_lin_index] in opening_linear_nodes, (
-        f"Linear node not found in opening linear nodes - "
-        f"terminating_linear_node:{terminating_linear_node.name}, "
-        f"opening_linear_nodes: {[n.name for n in opening_linear_nodes]}"
-    )
-
-    # return the index of the terminating linear node
-    if terminating_linear_node == linear_nodes[-1]:
-        terminating_index = len(linear_nodes)
-    else:
-        terminating_index = (
-            start_lin_index + len(opening_linear_nodes) + len(intermediate_lin_nodes)
-        )
-
-    if enforce_strict_linear_history:
-        if terminating_index < len(linear_nodes):
-            assert linear_nodes[terminating_index] == terminating_linear_node, (
-                "ill-formed layer subgraph"
-            )
-        terminating_indices.append(terminating_index)
-
-    return layer_subgraph
 
 
 def has_shape(node: Node) -> bool:
