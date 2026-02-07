@@ -37,6 +37,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 from ...._utils import nvtx_range, str_dtype_to_torch
 from ..utils.logger import ad_logger
+from ..utils.sequence_metadata_utils import increment_position_ids
 
 Constant = Union[int, float, str, None]
 
@@ -358,6 +359,11 @@ class SequenceInfo:
       Gather indices used by the overlap scheduler to reorder input tokens.
     - _mask_scatter_indices: [m_0, m_1, ..., m_{s_total-1}]
       Mask scatter indices used by the overlap scheduler to scatter results back.
+    - full_cache_loc: Flat tensor of all allocated page IDs (concatenated per sequence). When
+      set together with cu_allocated_pages, increment_position_ids can rebuild cache_loc when
+      pages grow (e.g. speculative decoding). Stored via nest_sequences(..., full_cache_loc=...).
+    - cu_allocated_pages: Cumulative allocated pages [0, a0, a0+a1, ...], length batch_size+1.
+      Used with full_cache_loc for cache_loc rebuild in increment_position_ids.
 
     NOTE: all tensors are also accessible as host tensors with the suffix "_host". For example,
     the tensor "batch_info" is accessible as "batch_info_host" on the host.
@@ -835,6 +841,8 @@ class SequenceInfo:
         logits_gather_info: Optional[Sequence[int]] = None,
         _gather_idx: Optional[Sequence[int]] = None,
         _mask_scatter_indices: Optional[Sequence[int]] = None,
+        full_cache_loc: Optional[Union[torch.Tensor, Sequence[int]]] = None,
+        cu_allocated_pages: Optional[Union[torch.Tensor, Sequence[int]]] = None,
         **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
     ) -> None:
         """Create and store sequence information for the next forward pass.
@@ -867,6 +875,11 @@ class SequenceInfo:
             logits_gather_info: Info list containing [num_tokens_to_gather, gather_required].
             _gather_idx: Gather indices for the overlap scheduler to reorder input tokens.
             _mask_scatter_indices: Mask scatter indices for the overlap scheduler.
+            full_cache_loc: Flat tensor of all allocated page IDs (per sequence). When set,
+                increment_position_ids can rebuild cache_loc when pages grow (e.g. speculative
+                decoding). Used with cu_allocated_pages to get allocated pages for each sequence.
+            cu_allocated_pages: Cumulative allocated pages [0, a0, a0+a1, ...], length
+                batch_size+1. cu_allocated_pages[i] >= cu_num_pages[i] for all i.
             extra_args: Extra arguments to be stored in the interface.
 
         This i/f will ensure that all sequence info args are updated accordingly. Reset values are
@@ -969,6 +982,13 @@ class SequenceInfo:
 
         ### UPDATE EXTRA INPUTS ####################################################################
         self._extra_args = {}
+        # Full allocation for cache_loc rebuild (e.g. speculative decoding). Stored first
+        # since they are explicit params (not from extra_args); increment_position_ids
+        # uses them when extra_pages > 0.
+        if full_cache_loc is not None:
+            self._store_extra_arg("full_cache_loc", full_cache_loc)
+        if cu_allocated_pages is not None:
+            self._store_extra_arg("cu_allocated_pages", cu_allocated_pages)
         for key, value in extra_args.items():
             self._store_extra_arg(key, value)
 
@@ -1029,6 +1049,53 @@ class SequenceInfo:
     def run_host_prepare_for_attention_forward(self) -> None:
         for host_function, args in self._host_prepare_functions:
             host_function(**{arg: self._get_arg(arg) for arg in args})
+
+    def increment_position_ids(self, increment: torch.Tensor, page_size: int) -> None:
+        """Increment position_ids and update related sequence metadata consistently.
+
+        Uses the standalone increment_position_ids() function and writes the results
+        back to both device and host buffers. Updates position_ids and related metadata
+        (seq_len_with_cache, last_page_len, pages_per_seq, cu_num_pages).
+
+        Args:
+            increment: 1D tensor of shape [batch_size] with increment values.
+                       Expected to be 0 for context requests and (accepted_tokens - 1)
+                       for generation requests.
+            page_size: Page size for computing last_page_len and page counts.
+        """
+        result = increment_position_ids(self.named_args, increment, page_size)
+
+        # Keys modified by increment_position_ids (both device and host versions)
+        # cache_loc is included so it gets written back when rebuilt from full_cache_loc
+        modified_base_keys = {
+            "position_ids",
+            "seq_len_with_cache",
+            "last_page_len",
+            "pages_per_seq",
+            "cu_num_pages",
+            "cache_loc",
+        }
+
+        # Only write back the keys that were actually modified (both device and host versions)
+        for base_name in modified_base_keys:
+            for name in [base_name, f"{base_name}_host"]:
+                if name not in result:
+                    continue
+                tensor = result[name]
+                # Flatten the tensor for buffer copy (buffers store flat data)
+                flat_tensor = tensor.view(-1)
+                length = flat_tensor.numel()
+
+                if name.endswith("_host"):
+                    # Update host buffer only
+                    self._input_buffer.get_host_view(base_name)[:length].copy_(flat_tensor)
+                else:
+                    # Update device buffer
+                    self._input_buffer.get_view(base_name)[:length].copy_(flat_tensor)
+
+                # Update _args_list (use base_name since _args_list doesn't have _host keys)
+                if not name.endswith("_host"):
+                    self._args_list[base_name][:length] = flat_tensor.tolist()
 
 
 class ResourceHandler(ABC):

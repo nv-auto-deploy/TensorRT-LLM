@@ -27,6 +27,7 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     EagleWrapperOutput,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import get_input_embeddings, get_lm_head_weights
+from tensorrt_llm._torch.auto_deploy.utils.sequence_metadata_utils import build_cache_loc_from_full
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -477,12 +478,6 @@ class ADEngine(ModelEngine):
         else:
             self.max_total_draft_tokens = 0
 
-        # TODO(govind): Enable overlap scheduler for speculation.
-        assert self.spec_config is None or self._disable_overlap_scheduler, (
-            "Overlap scheduler is not supported \
-            for speculative decoding in AutoDeploy."
-        )
-
         # For compatibility with PyTorchModelEngine utilities
         self.batch_size = cache_seq_interface.info.max_batch_size
 
@@ -491,6 +486,7 @@ class ADEngine(ModelEngine):
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
+
         # start fresh with fixed seed
         torch.manual_seed(42)
 
@@ -519,6 +515,7 @@ class ADEngine(ModelEngine):
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
         new_tokens: Optional[torch.Tensor] = None,
+        new_tokens_lens: Optional[torch.Tensor] = None,
         gather_context_logits: bool = False,
     ) -> None:
         """Prepare inputs for AD Model from scheduled requests."""
@@ -541,6 +538,8 @@ class ADEngine(ModelEngine):
         ]
         gen_requests = extend_requests + generation_requests
         ordered_requests = context_requests + gen_requests
+        num_sequences = len(ordered_requests)
+
         # info to be extracted
         input_ids: List[List[int]] = []
         position_ids: List[List[int]] = []
@@ -548,6 +547,7 @@ class ADEngine(ModelEngine):
         seq_len: List[int] = []
         cu_seqlen: List[int] = [0]
         cache_loc: List[int] = []
+        full_cache_indices_list: List[List[int]] = []
         pages_per_seq: List[int] = []
         cu_num_pages: List[int] = [0]
         seq_len_with_cache: List[int] = []
@@ -603,6 +603,7 @@ class ADEngine(ModelEngine):
             cache_indices = kv_cache_manager.get_cache_indices(request)
             num_active_blocks = kv_cache_manager.get_num_kv_blocks(end_compute)
             cache_loc.extend(cache_indices[:num_active_blocks])
+            full_cache_indices_list.append(cache_indices)
             pages_per_seq.append(num_active_blocks)
             cu_num_pages.append(cu_num_pages[-1] + pages_per_seq[-1])
             seq_len_with_cache.append(input_pos[-1] + seq_len[-1])
@@ -629,22 +630,20 @@ class ADEngine(ModelEngine):
             )
 
         def _compute_num_tokens_seen(request) -> int:
-            """Compute num_tokens_seen based on request. Note that we treat extend requests
-            (corresponding to running target model in speculative decoding) differently from
-            normal generation requests.
-            """
-            is_extend = get_draft_token_length(request) > 0
+            """Compute num_tokens_seen based on request.
 
-            if is_extend:
-                return request.max_beam_num_tokens - 1
+            With overlap scheduler enabled, the newly sampled token hasn't been committed to
+            max_beam_num_tokens yet, so we use max_beam_num_tokens directly (no -1).
+            Without overlap scheduler, the token has been committed, so we subtract 1.
+            """
+            use_overlap = _use_overlap_scheduler(request)
+
+            if use_overlap:
+                # Overlap scheduler: token not yet committed to max_beam_num_tokens
+                return request.max_beam_num_tokens
             else:
-                # When overlap scheduler is disabled, or when new_tokens is not available,
-                # we use the previous token count
-                use_overlap = _use_overlap_scheduler(request)
-                if use_overlap:
-                    return request.max_beam_num_tokens
-                else:
-                    return request.max_beam_num_tokens - 1
+                # No overlap scheduler: token already committed, subtract 1
+                return request.max_beam_num_tokens - 1
 
         def _build_input_ids(request) -> Tuple[List[int], List[int], bool]:
             """Build input_ids and gather indices for a request.
@@ -680,7 +679,12 @@ class ADEngine(ModelEngine):
 
             return input_ids, gather_indices, use_overlap
 
-        for request in gen_requests:
+        # Collect old py_batch_idx values BEFORE they get overwritten with seq_slot.
+        # These are the batch positions from the PREVIOUS iteration, which is what we need
+        # to index into new_tokens and new_tokens_lens (which were produced in the previous iteration).
+        old_py_batch_idx_for_gen = [req.py_batch_idx for req in gen_requests]
+
+        for gen_idx, request in enumerate(gen_requests):
             num_tokens_seen = _compute_num_tokens_seen(request)
             input_ids_for_request, gather_indices_to_append, use_overlap = _build_input_ids(request)
 
@@ -703,14 +707,40 @@ class ADEngine(ModelEngine):
             if use_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
-            # get cache indices
+            # get cache indices (full allocation); use only pages_needed for metadata
             cache_indices = kv_cache_manager.get_cache_indices(request)
-            cache_loc.extend(cache_indices)
-            pages_per_seq.append(len(cache_indices))
+            swc = input_pos[-1] + seq_len[-1]
+            pages_needed = (swc + page_size - 1) // page_size
+            assert len(cache_indices) >= pages_needed, (
+                f"req_id={request.py_request_id}: need {pages_needed} pages, "
+                f"got {len(cache_indices)} allocated"
+            )
+            full_cache_indices_list.append(cache_indices)
+            pages_per_seq.append(pages_needed)
             cu_num_pages.append(cu_num_pages[-1] + pages_per_seq[-1])
-            seq_len_with_cache.append(input_pos[-1] + seq_len[-1])
-            last_page_len.append((seq_len_with_cache[-1] - 1) % page_size + 1)
+            seq_len_with_cache.append(swc)
+            last_page_len.append((swc - 1) % page_size + 1)
             position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
+
+        # Build compact cache_loc from full allocation so FlashInfer sees used pages only.
+        # Store full_cache_loc and cu_allocated_pages for increment_position_ids to rebuild when pages grow.
+        num_sequences = len(pages_per_seq)
+        allocated_pages_per_seq = [len(block) for block in full_cache_indices_list]
+        cu_allocated_pages: List[int] = [0]
+        for n in allocated_pages_per_seq:
+            cu_allocated_pages.append(cu_allocated_pages[-1] + n)
+        full_cache_loc_flat: List[int] = []
+        for block in full_cache_indices_list:
+            full_cache_loc_flat.extend(block)
+        cache_loc_tensor = build_cache_loc_from_full(
+            full_cache_loc_flat,
+            cu_allocated_pages,
+            pages_per_seq,
+            num_sequences,
+        )
+        cache_loc = cache_loc_tensor.tolist()
+        full_cache_loc_tensor = torch.tensor(full_cache_loc_flat, dtype=torch.int)
+        cu_allocated_pages_tensor = torch.tensor(cu_allocated_pages, dtype=torch.int)
 
         # check for logits_gather_info
         # we only need to gather in the following situation:
@@ -720,6 +750,9 @@ class ADEngine(ModelEngine):
         gather_required = len(context_requests) > 0 and not gather_context_logits
         logits_gather_info = [len(logits_gather_indices), int(gather_required)]
 
+        # Only store full_cache_loc / cu_allocated_pages for cache_loc rebuild when doing speculative decoding
+        full_cache_loc_arg = full_cache_loc_tensor if self.spec_config is not None else None
+        cu_allocated_pages_arg = cu_allocated_pages_tensor if self.spec_config is not None else None
         # update the sequence info object now
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
@@ -738,6 +771,8 @@ class ADEngine(ModelEngine):
             logits_gather_info=logits_gather_info,
             _gather_idx=None if new_tokens is None else flat_gather_indices,
             _mask_scatter_indices=None if new_tokens is None else mask_scatter_indices,
+            full_cache_loc=full_cache_loc_arg,
+            cu_allocated_pages=cu_allocated_pages_arg,
             **extra_args,
         )
         # scatter the new tokens into the input_ids tensor if provided
@@ -745,6 +780,44 @@ class ADEngine(ModelEngine):
             self.cache_seq_interface.info.rescatter_input_ids(new_tokens.flatten())
 
         self.cache_seq_interface.info.run_host_prepare_for_attention_forward()
+
+        if not self._disable_overlap_scheduler and new_tokens_lens is not None:
+            # Build increment tensor with proper indexing.
+            # new_tokens_lens is indexed by batch position from the PREVIOUS iteration.
+            # Context requests (new requests joining via IFB) don't have prior acceptance counts.
+            device = new_tokens_lens.device
+            increment = torch.zeros(num_sequences, dtype=torch.int32, device=device)
+
+            # Context requests (new) stay at 0 - they don't have prior acceptance counts
+            # Generation requests need to read from new_tokens_lens using their OLD batch position
+            # (which we saved before the loop overwrote py_batch_idx with seq_slot)
+            if len(gen_requests) > 0:
+                old_batch_positions = torch.tensor(
+                    old_py_batch_idx_for_gen,
+                    dtype=torch.long,
+                    device=device,
+                )
+                # Read new_tokens_lens at the OLD batch positions and subtract 1
+                gen_increments = new_tokens_lens[old_batch_positions] - 1
+
+                # Assert new_tokens_lens values are valid (>= 1) for generation requests.
+                # For speculative decoding, at least 1 token is always accepted per iteration.
+                # Any value < 1 indicates uninitialized memory, wrong indexing, or a scatter bug.
+                assert (new_tokens_lens[old_batch_positions] >= 1).all(), (
+                    f"Invalid new_tokens_lens for gen requests: expected >= 1, "
+                    f"got {new_tokens_lens[old_batch_positions].tolist()} at positions {old_batch_positions.tolist()}"
+                )
+
+                increment[num_ctx_requests:] = gen_increments.to(torch.int32)
+
+            # Increment position_ids for overlap scheduler (also updates related metadata).
+            # NOTE: We must update both GPU and host tensors because FlashInfer's plan() API
+            # for prefill kernels requires host-side tensors. To enable GPU-only updates,
+            # kernel changes would be needed to call prefill kernels with only GPU-side tensors.
+            self.cache_seq_interface.info.increment_position_ids(
+                increment=increment,
+                page_size=page_size,
+            )
 
         spec_resource_manager = spec_resource_manager or self.get_internal_resource_manager()
 
@@ -757,8 +830,8 @@ class ADEngine(ModelEngine):
 
         self.iter_states["num_ctx_requests"] = num_ctx_requests
         self.iter_states["num_ctx_tokens"] = num_ctx_tokens
-        # TODO: handle extend requests and draft requests for specdec
         self.iter_states["num_generation_tokens"] = num_generation_tokens
+        self.iter_states["ordered_requests"] = ordered_requests
 
     @nvtx_range("ad_compute_logits")
     def _compute_logits(self):
@@ -773,6 +846,9 @@ class ADEngine(ModelEngine):
 
         # Handle EagleWrapperOutput (one-model spec dec)
         if isinstance(model_output, EagleWrapperOutput):
+            # EagleWrapper outputs are indexed by batch position (0 to num_sequences-1).
+            # MTPSampler.sample_async() will scatter these to seq_slot positions.
+            # We just pass through the tensors unchanged here.
             return {
                 "logits": model_output.logits,  # not used for sampling, just compatibility
                 "new_tokens": model_output.new_tokens,
@@ -814,8 +890,9 @@ class ADEngine(ModelEngine):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
         new_tokens = getattr(new_tensors_device, "new_tokens", None)
+        new_tokens_lens = getattr(new_tensors_device, "new_tokens_lens", None)
         self._prepare_inputs(
-            scheduled_requests, resource_manager, new_tokens, gather_context_logits
+            scheduled_requests, resource_manager, new_tokens, new_tokens_lens, gather_context_logits
         )
         self.iter_counter += 1
 

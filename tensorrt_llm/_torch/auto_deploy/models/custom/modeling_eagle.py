@@ -35,6 +35,7 @@ from tensorrt_llm.llmapi.llm_args import EagleDecodingConfig
 
 from ...utils._config import deep_merge_dicts
 from ...utils.logger import ad_logger
+from ...utils.sequence_metadata_utils import increment_position_ids
 
 
 class EagleConfig(PretrainedConfig):
@@ -596,108 +597,60 @@ class EagleWrapper(nn.Module):
         expected_names = {node.name for node in submodule.graph.nodes if node.op == "placeholder"}
         return {k: v for k, v in kwargs.items() if k in expected_names}
 
-    def _recompute_metadata_from_position_ids(
-        self,
-        kwargs: dict,
-        packed_position_ids: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ) -> dict:
-        """Recompute all position-related metadata from packed position_ids and seq_lens.
+    def _get_page_size(self, kwargs: dict) -> int:
+        """Get page_size from kv_cache tensor in kwargs.
 
-        This is the shared helper used by _prepare_next_draft_metadata to derive
-        all metadata from position_ids.
-
-        Args:
-            kwargs: Current kwargs dict (already filtered for submodule). Used to get
-                page_size from k_cache and to copy non-metadata keys.
-            packed_position_ids: Position IDs in packed format [1, total_tokens].
-            seq_lens: Number of tokens per sequence [num_seq]. Can be a tensor or list.
-
-        Returns:
-            New kwargs dict with all metadata recomputed from position_ids.
+        HND layout (default): [..., num_kv_heads, page_size, head_dim]
+        page_size is always at index -2 (second to last).
         """
-        device = packed_position_ids.device
-
-        # Convert seq_lens to tensor if needed
-        if not isinstance(seq_lens, torch.Tensor):
-            seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-        else:
-            seq_lens_tensor = seq_lens.int().to(device)
-
-        num_seq = len(seq_lens_tensor)
-
-        # Get page_size from kv_cache shape
-        # HND layout (default): [..., num_kv_heads, page_size, head_dim]
-        # page_size is always at index -2 (second to last)
-        page_size = None
         for key, val in kwargs.items():
             if key.startswith("kv_cache") and isinstance(val, torch.Tensor):
-                page_size = val.shape[-2]
-                break
-
-        if page_size is None:
-            raise ValueError(
-                f"Could not determine page_size from kv_cache in kwargs. Keys: {list(kwargs.keys())}"
-            )
-
-        # Compute cu_seqlen: cumulative sequence lengths [0, seq_len[0], seq_len[0]+seq_len[1], ...]
-        cu_seqlen = torch.zeros(num_seq + 1, dtype=torch.int32, device=device)
-        cu_seqlen[1:] = torch.cumsum(seq_lens_tensor, dim=0)
-        cu_seqlen_host = cu_seqlen.cpu()
-
-        # Compute batch_info: [num_prefill, num_prefill_tokens, num_decode]
-        # seq_len > 1 is "prefill" (multi-token), seq_len == 1 is "decode"
-        num_prefill = (seq_lens_tensor > 1).sum().item()
-        num_prefill_tokens = seq_lens_tensor[seq_lens_tensor > 1].sum().item()
-        num_decode = (seq_lens_tensor <= 1).sum().item()
-        batch_info_host = torch.tensor(
-            [num_prefill, num_prefill_tokens, num_decode], dtype=torch.int32, device="cpu"
+                return val.shape[-2]
+        raise ValueError(
+            f"Could not determine page_size from kv_cache in kwargs. Keys: {list(kwargs.keys())}"
         )
 
-        # Compute seq_len_with_cache for each sequence
-        # seq_len_with_cache = last_position + 1 = position_ids[last_token_of_seq] + 1
-        # Last token of sequence i is at packed index cu_seqlen[i+1] - 1
-        last_token_indices = cu_seqlen[1:] - 1  # [num_seq]
-        last_positions = packed_position_ids[0, last_token_indices]  # [num_seq]
-        seq_len_with_cache = (last_positions + 1).int()
-        seq_len_with_cache_host = seq_len_with_cache.cpu()
+    def _build_decode_kwargs(
+        self,
+        kwargs: dict,
+        position_ids: torch.Tensor,
+        num_sequences: int,
+    ) -> dict:
+        """Build decode-like kwargs: decode shape (cu_seqlen, batch_info_host) and position_ids.
 
-        # Compute last_page_len: (seq_len_with_cache - 1) % page_size + 1
-        last_page_len = ((seq_len_with_cache - 1) % page_size + 1).int()
-        last_page_len_host = last_page_len.cpu()
+        Does NOT overwrite seq_len_with_cache, last_page_len, pages_per_seq, cu_num_pages,
+        or any cache-related fields. Those are preserved from kwargs so that metadata
+        updates are delegated to increment_position_ids().
 
-        # Compute pages_per_seq: ceil(seq_len_with_cache / page_size) for each sequence
-        # Using integer math: (x + page_size - 1) // page_size = ceil(x / page_size)
-        pages_per_seq = ((seq_len_with_cache + page_size - 1) // page_size).int()
-        pages_per_seq_host = pages_per_seq.cpu()
+        Args:
+            kwargs: Current kwargs dict. Decode-shape keys are updated; cache/length/page
+                metadata is preserved from this dict.
+            position_ids: [1, num_sequences] - position IDs (e.g. last position we just ran).
+            num_sequences: Number of sequences.
 
-        # Compute cu_num_pages: cumulative sum [0, p0, p0+p1, p0+p1+p2, ...]
-        cu_num_pages = torch.zeros(num_seq + 1, dtype=torch.int32, device=device)
-        cu_num_pages[1:] = torch.cumsum(pages_per_seq, dim=0)
-        cu_num_pages_host = cu_num_pages.cpu()
+        Returns:
+            new_kwargs with decode layout, position_ids set, and unchanged seq_len_with_cache,
+            last_page_len, pages_per_seq, cu_num_pages.
+        """
+        device = position_ids.device
 
-        # Build new kwargs with recomputed metadata
-        metadata_updates = {
-            "batch_info_host": batch_info_host,
-            "cu_seqlen_host": cu_seqlen_host,
-            "cu_seqlen": cu_seqlen,
-            "seq_len_with_cache": seq_len_with_cache,
-            "seq_len_with_cache_host": seq_len_with_cache_host,
-            "last_page_len": last_page_len,
-            "last_page_len_host": last_page_len_host,
-            "pages_per_seq": pages_per_seq,
-            "pages_per_seq_host": pages_per_seq_host,
-            "cu_num_pages": cu_num_pages,
-            "cu_num_pages_host": cu_num_pages_host,
-        }
+        # Decode-like cu_seqlen: [0, 1, 2, ..., num_sequences] (1 token per sequence)
+        cu_seqlen = torch.arange(num_sequences + 1, dtype=torch.int32, device=device)
+        cu_seqlen_host = cu_seqlen.cpu()
 
-        new_kwargs = {}
-        for key, val in kwargs.items():
-            if key in metadata_updates:
-                new_kwargs[key] = metadata_updates[key]
-            else:
-                # Pass through unchanged (caches, cache_loc, etc.)
-                new_kwargs[key] = val
+        # All-decode batch_info: [num_prefill=0, num_prefill_tokens=0, num_decode=num_sequences]
+        batch_info_host = torch.tensor([0, 0, num_sequences], dtype=torch.int32, device="cpu")
+
+        # Only update decode-shape keys; seq_len_with_cache, last_page_len, pages_per_seq,
+        # cu_num_pages, cache_loc, etc. are preserved from kwargs.
+        new_kwargs = dict(kwargs)
+        new_kwargs["cu_seqlen"] = cu_seqlen
+        new_kwargs["cu_seqlen_host"] = cu_seqlen_host
+        new_kwargs["batch_info_host"] = batch_info_host
+        new_kwargs["position_ids"] = position_ids
+
+        # Explicitly do NOT overwrite: seq_len_with_cache, last_page_len, pages_per_seq,
+        # cu_num_pages, cache_loc, full_cache_loc, cu_allocated_pages (preserved from kwargs).
 
         return new_kwargs
 
@@ -708,41 +661,86 @@ class EagleWrapper(nn.Module):
         curr_cu_seq_len: torch.Tensor,
         num_sequences: int,
         num_accepted: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict]:
+        draft_idx: int,
+        max_draft_len: int,
+        num_context: int = 0,
+        full_cache_loc: Optional[torch.Tensor] = None,
+        cu_allocated_pages: Optional[torch.Tensor] = None,
+    ) -> dict:
         """Prepare position_ids and metadata for the next draft iteration.
 
-        Extracts positions from each sequence at the last accepted token and increments
-        by 1, then recomputes all metadata including cu_num_pages for page boundary handling.
+        Uses last position from curr_position_ids (no num_accepted in extraction).
+        Builds decode-shaped base kwargs (metadata preserved), then calls
+        increment_position_ids() with iteration-dependent increment.
+
+        For iter 0: context sequences (first num_context) only ran prefill; we must not
+        rewind — use increment=1. Spec_dec sequences ran verification (1 + max_draft_len);
+        use increment = num_accepted - max_draft_len.
+
+        full_cache_loc and cu_allocated_pages are patched into base_kwargs only for
+        increment_position_ids (so it can rebuild cache_loc when extra_pages > 0);
+        they are popped from the returned dict so draft_kwargs never contains them.
 
         Args:
-            kwargs: Current kwargs dict
+            kwargs: Current draft_kwargs
             curr_position_ids: [1, total_tokens] - current position IDs
-            curr_cu_seq_len: [num_seq + 1] - cumulative sequence lengths (may be pre-allocated)
-            num_sequences: Actual number of sequences to process
-            num_accepted: [num_seq] - number of accepted tokens per sequence.
-                Extracts at cu_seqlen[i] + num_accepted[i] - 1 for each sequence.
+            curr_cu_seq_len: [num_seq + 1] - cumulative sequence lengths
+            num_sequences: Actual number of sequences
+            num_accepted: [num_seq] - for context: prefill length; for spec_dec: accepted this round
+            draft_idx: 0 = verification step (run length 1 + max_draft_len), 1+ = decode (1 token)
+            max_draft_len: Used for iter 0 spec_dec increment = num_accepted - max_draft_len
+            num_context: Number of context (prefill) sequences; they get increment=1 in iter 0.
+            full_cache_loc: Optional; patched in for increment_position_ids only (not returned).
+            cu_allocated_pages: Optional; patched in for increment_position_ids only (not returned).
 
         Returns:
-            Tuple of:
-            - new_position_ids: [1, num_seq] - next position for each sequence
-            - new_kwargs: dict with recomputed metadata
+            new_kwargs: dict including "position_ids" (and updated metadata). Does not
+            include full_cache_loc/cu_allocated_pages. Caller should extract position_ids
+            from this dict just before calling the draft model.
         """
-        # Compute extraction indices: cu_seqlen[i] + num_accepted[i] - 1
-        extraction_indices = (curr_cu_seq_len[:num_sequences] + num_accepted - 1).long()
+        page_size = self._get_page_size(kwargs)
+        device = curr_position_ids.device
 
-        # Get positions at extraction indices and increment by 1
-        extracted_positions = curr_position_ids[0, extraction_indices]
-        new_position_ids = (extracted_positions + 1).unsqueeze(0)  # [1, num_sequences]
+        # Step A: Last position we just ran (end of each sequence in packed layout). No num_accepted.
+        extraction_indices = (curr_cu_seq_len[1 : num_sequences + 1] - 1).long()
+        position_ids_last = curr_position_ids[0, extraction_indices].unsqueeze(
+            0
+        )  # [1, num_sequences]
 
-        # Each draft iteration is a standard decode step (1 token per sequence)
-        seq_lens = torch.ones(
-            new_position_ids.shape[1], dtype=torch.int32, device=curr_position_ids.device
-        )
+        # Build base kwargs: decode shape + position_ids; cache/length/page metadata preserved
+        base_kwargs = self._build_decode_kwargs(kwargs, position_ids_last, num_sequences)
 
-        # Recompute all metadata from the new packed position_ids
-        new_kwargs = self._recompute_metadata_from_position_ids(kwargs, new_position_ids, seq_lens)
+        # Step B: Increment is iteration-dependent
+        if draft_idx == 0:
+            # Context sequences: we only ran prefill; do not rewind — increment by 1.
+            # Spec_dec sequences: ran verification (1 + max_draft_len); increment = num_accepted - max_draft_len.
+            # Sanity check: when all tokens are accepted, increments by 1.
+            increment = torch.empty(num_sequences, dtype=torch.int32, device=device)
+            if num_context > 0:
+                increment[:num_context] = 1
+            if num_context < num_sequences:
+                increment[num_context:] = (num_accepted[num_context:] - max_draft_len).to(
+                    device=device, dtype=torch.int32
+                )
+        else:
+            # Decode step: we ran 1 token; want next at position_ids_last + 1
+            increment = torch.ones(num_sequences, dtype=torch.int32, device=device)
 
-        return new_position_ids, new_kwargs
+        # Patch in full_cache_loc / cu_allocated_pages only for increment_position_ids (they
+        # do not change; needed for cache_loc rebuild when extra_pages > 0).
+        if full_cache_loc is not None:
+            base_kwargs["full_cache_loc"] = full_cache_loc
+        if cu_allocated_pages is not None:
+            base_kwargs["cu_allocated_pages"] = cu_allocated_pages
+
+        # Step C: Delegate all position and metadata updates to increment_position_ids
+        new_kwargs = increment_position_ids(base_kwargs, increment, page_size)
+
+        # Remove allocation keys so draft_kwargs never contains them (draft model does not expect them).
+        new_kwargs.pop("full_cache_loc", None)
+        new_kwargs.pop("cu_allocated_pages", None)
+
+        return new_kwargs
 
     def _extract_draft_iteration_outputs(
         self,
@@ -803,7 +801,7 @@ class EagleWrapper(nn.Module):
         ret = torch.argmax(logits, dim=-1)
         return ret
 
-    def prepare_draft_context(
+    def prepare_drafts_for_context_seqs(
         self,
         packed_input_ids: torch.Tensor,
         packed_logits: torch.Tensor,
@@ -1226,6 +1224,7 @@ class EagleWrapper(nn.Module):
 
         # Capture and store hidden states from target model forward pass
         num_tokens = self._store_target_hidden_states(kwargs, cu_seqlen, num_sequences)
+
         hidden_states = self.resource_manager.hidden_states[:num_tokens, :]
         hidden_states = self.apply_eagle3_fc(hidden_states)
 
@@ -1237,7 +1236,7 @@ class EagleWrapper(nn.Module):
         # Process context and spec_dec sequences (methods return None if count is 0)
         packed_output_chunks = []
 
-        ctx_output, ctx_accepted = self.prepare_draft_context(
+        ctx_output, ctx_accepted = self.prepare_drafts_for_context_seqs(
             input_ids, target_logits, cu_seqlen, num_context
         )
         if ctx_output is not None:
@@ -1272,6 +1271,7 @@ class EagleWrapper(nn.Module):
 
         for draft_idx in range(self.max_draft_len):
             inputs_embeds = self.apply_draft_embedding(draft_input_ids)
+
             draft_output = self.draft_model(
                 inputs_embeds=inputs_embeds,
                 position_ids=draft_position_ids,
@@ -1308,13 +1308,20 @@ class EagleWrapper(nn.Module):
                 num_accepted = (
                     num_accepted_tokens if draft_idx == 0 else torch.ones_like(num_accepted_tokens)
                 )
-                draft_position_ids, draft_kwargs = self._prepare_next_draft_metadata(
+                draft_kwargs = self._prepare_next_draft_metadata(
                     draft_kwargs,
                     curr_position_ids=draft_position_ids,
                     curr_cu_seq_len=draft_kwargs["cu_seqlen"],
                     num_sequences=num_sequences,
                     num_accepted=num_accepted,
+                    draft_idx=draft_idx,
+                    max_draft_len=self.max_draft_len,
+                    num_context=num_context,
+                    full_cache_loc=kwargs.get("full_cache_loc"),
+                    cu_allocated_pages=kwargs.get("cu_allocated_pages"),
                 )
+                # Extract position_ids for next iteration; pop so we don't pass it twice to the model.
+                draft_position_ids = draft_kwargs.pop("position_ids")
 
                 # Prepare tensor inputs for next iteration
                 # last_draft_token: [num_sequences] -> [1, num_sequences]
@@ -1561,10 +1568,24 @@ class ADHiddenStateManager(Eagle3ResourceManager):
         max_seq_len: int,
         max_num_tokens: int,
     ):
+        # Call parent to initialize most fields
         super().__init__(config, dtype, hidden_size, max_num_requests, max_seq_len, max_num_tokens)
 
+        # Re-allocate hidden_states for AutoDeploy using max() instead of the parent's min().
+        # The parent caps at min(max_num_tokens, max_num_requests * max_seq_len); we use max()
+        # so we cover both AutoDeploy's warmup (which may send max_num_tokens) and inference.
+        ad_max_num_tokens = (
+            max(max_num_tokens, max_num_requests * max_seq_len)
+            + (config.max_total_draft_tokens + 1) * max_num_requests
+        )
+        self.hidden_states = torch.empty(
+            (ad_max_num_tokens, hidden_size * config.num_capture_layers),
+            dtype=dtype,
+            device="cuda",
+        )
+
         self.hidden_state_write_indices: torch.Tensor = torch.empty(
-            max_num_tokens, dtype=torch.long, device="cuda"
+            ad_max_num_tokens, dtype=torch.long, device="cuda"
         )
 
     @classmethod
@@ -1631,27 +1652,16 @@ class ADHiddenStateManager(Eagle3ResourceManager):
         return hidden_state_buffers
 
     def prepare_hidden_states_capture(self, ordered_requests, cache_seq_interface) -> None:
-        """Prepare the hidden states for capture by establishing indices that the hidden states will be written to."""
+        """Prepare the hidden states for capture by establishing indices.
+
+        For one-model speculative decoding, hidden states are written and read sequentially,
+        so we simply use range(num_tokens) as the write indices.
+        """
         seq_lens = cache_seq_interface.info.seq_len
         num_tokens = sum(seq_lens)
 
-        start_idx = 0
-        hidden_states_write_indices = []
-        for request, seq_len in zip(ordered_requests, seq_lens):
-            request_id = request.request_id
-            slot_id = self.slot_manager.get_slot(request_id)
-            self.start_indices[slot_id] = start_idx
-            hidden_states_write_indices.extend(range(start_idx, start_idx + seq_len))
-            start_idx += max(seq_len, self.max_total_draft_tokens + 1)
-            assert start_idx < self.hidden_states.shape[0], (
-                f"start_idx {start_idx} exceeds hidden_states capacity {self.hidden_states.shape[0]}"
-            )
-
-        if len(hidden_states_write_indices) != num_tokens:
-            raise ValueError(
-                f"len(hidden_state_write_indices) ({len(hidden_states_write_indices)}) != num_tokens \
-                ({num_tokens}). Check whether ordered_requests matches up with seq_lens."
-            )
+        # Hidden states are written sequentially for one-model speculative decoding
+        hidden_states_write_indices = list(range(num_tokens))
 
         hidden_state_write_indices_host = torch.tensor(
             hidden_states_write_indices, dtype=torch.long
@@ -1678,12 +1688,22 @@ class ADHiddenStateManager(Eagle3ResourceManager):
         if not hidden_state_buffers:
             return
 
+        # During warmup/initialization, write indices may not be set up yet
+        if self.hidden_state_write_indices is None:
+            return
+
         hidden_states = [buffer[:num_tokens] for buffer in hidden_state_buffers]
         hidden_states = torch.cat(hidden_states, dim=1)
         hidden_states = hidden_states.to(dtype=self.dtype)
 
         # Use write indices to copy to the correct locations in self.hidden_states
         token_idx = self.hidden_state_write_indices[:num_tokens]
+
+        # Guard against shape mismatch during warmup - if shapes don't match,
+        # skip storage (this can happen during resize_kv_cache warmup pass)
+        if token_idx.shape[0] != hidden_states.shape[0]:
+            return
+
         self.hidden_states[:, : hidden_states.shape[1]].index_copy_(0, token_idx, hidden_states)
 
     def capture_hidden_states(self, cache_seq_interface) -> None:
