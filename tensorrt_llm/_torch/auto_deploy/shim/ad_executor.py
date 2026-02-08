@@ -584,9 +584,9 @@ class ADEngine(ModelEngine):
         ]
         gen_requests = extend_requests + generation_requests
         ordered_requests = context_requests + gen_requests
-        # info to be extracted
-        input_ids: List[List[int]] = []
-        position_ids: List[List[int]] = []
+        # info to be extracted — build flat input_ids/position_ids directly to skip _flatten
+        flat_input_ids: List[int] = []
+        flat_position_ids: List[int] = []
         input_pos: List[int] = []
         seq_len: List[int] = []
         cu_seqlen: List[int] = [0]
@@ -627,13 +627,14 @@ class ADEngine(ModelEngine):
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
-            num_ctx_tokens += len(prompt_tokens)
+            sl = len(prompt_tokens)
+            num_ctx_tokens += sl
 
-            input_ids.append(prompt_tokens)
+            flat_input_ids.extend(prompt_tokens)
             input_pos.append(begin_compute)
 
-            seq_len.append(len(input_ids[-1]))
-            cu_seqlen.append(cu_seqlen[-1] + seq_len[-1])
+            seq_len.append(sl)
+            cu_seqlen.append(cu_seqlen[-1] + sl)
 
             request.py_batch_idx = request.seq_slot
 
@@ -651,7 +652,7 @@ class ADEngine(ModelEngine):
             seq_len_with_cache.append(input_pos[-1] + seq_len[-1])
             last_page_len.append((seq_len_with_cache[-1] - 1) % page_size + 1)
 
-            position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
+            flat_position_ids.extend(range(input_pos[-1], seq_len_with_cache[-1]))
 
             # store seq slot idx (use mamba_cache_index if available)
             slot_idx.append(_get_slot_idx(request))
@@ -727,7 +728,7 @@ class ADEngine(ModelEngine):
             num_tokens_seen = _compute_num_tokens_seen(request)
             input_ids_for_request, gather_indices_to_append, use_overlap = _build_input_ids(request)
 
-            input_ids.append(input_ids_for_request)
+            flat_input_ids.extend(input_ids_for_request)
             input_pos.append(num_tokens_seen)
             flat_gather_indices.extend(gather_indices_to_append)
 
@@ -737,14 +738,15 @@ class ADEngine(ModelEngine):
             slot_idx.append(_get_slot_idx(request))
             use_initial_states.append(input_pos[-1] > 0)
 
-            seq_len.append(len(input_ids[-1]))
-            cu_seqlen.append(cu_seqlen[-1] + seq_len[-1])
+            sl = len(input_ids_for_request)
+            seq_len.append(sl)
+            cu_seqlen.append(cu_seqlen[-1] + sl)
 
             # for generate requests, we always keep all logits (target logits + draft logits)
             logits_gather_indices.extend(range(cu_seqlen[-2], cu_seqlen[-1]))
 
             if use_overlap:
-                mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
+                mask_scatter_indices.extend(range(cu_seqlen[-2], cu_seqlen[-1]))
 
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
@@ -754,7 +756,7 @@ class ADEngine(ModelEngine):
             seq_len_with_cache.append(input_pos[-1] + seq_len[-1])
             last_page_len.append((seq_len_with_cache[-1] - 1) % page_size + 1)
 
-            position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
+            flat_position_ids.extend(range(input_pos[-1], seq_len_with_cache[-1]))
 
         # check for logits_gather_info
         # we only need to gather in the following situation:
@@ -764,31 +766,49 @@ class ADEngine(ModelEngine):
         gather_required = len(context_requests) > 0 and not gather_context_logits
         logits_gather_info = [len(logits_gather_indices), int(gather_required)]
 
-        # update the sequence info object now
-        self.cache_seq_interface.info.nest_sequences(
-            input_ids,
-            position_ids=position_ids,
-            seq_len=seq_len,
-            input_pos=input_pos,
-            cu_seqlen=cu_seqlen,
-            cache_loc=cache_loc,
-            pages_per_seq=pages_per_seq,
-            cu_num_pages=cu_num_pages,
-            seq_len_with_cache=seq_len_with_cache,
-            last_page_len=last_page_len,
-            slot_idx=slot_idx,
-            use_initial_states=use_initial_states,
-            logits_gather_indices=logits_gather_indices,
-            logits_gather_info=logits_gather_info,
-            _gather_idx=None if new_tokens is None else flat_gather_indices,
-            _mask_scatter_indices=None if new_tokens is None else mask_scatter_indices,
-            **extra_args,
+        # Compute batch_info: [num_prefill, num_prefill_tokens, num_decode]
+        num_prefill = sum(s > 1 for s in seq_len)
+        num_prefill_tokens = sum(s for s in seq_len if s > 1)
+        num_decode = len(seq_len) - num_prefill
+        batch_info = [num_prefill, num_prefill_tokens, num_decode]
+
+        # Build args dict for bulk store — bypasses 17 individual _store_arg calls
+        # (eliminates per-field NVTX markers, function call overhead, dict lookups)
+        args_data = {
+            "seq_len": seq_len,
+            "input_pos": input_pos,
+            "input_ids": flat_input_ids,
+            "position_ids": flat_position_ids,
+            "batch_info": batch_info,
+            "cu_seqlen": cu_seqlen,
+            "cache_loc": cache_loc,
+            "pages_per_seq": pages_per_seq,
+            "cu_num_pages": cu_num_pages,
+            "seq_len_with_cache": seq_len_with_cache,
+            "last_page_len": last_page_len,
+            "slot_idx": slot_idx,
+            "use_initial_states": use_initial_states,
+            "logits_gather_indices": logits_gather_indices,
+            "logits_gather_info": logits_gather_info,
+        }
+        force_copy_names = {"logits_gather_indices", "logits_gather_info"}
+        if new_tokens is not None:
+            args_data["_gather_idx"] = flat_gather_indices
+            args_data["_mask_scatter_indices"] = mask_scatter_indices
+            force_copy_names.update({"_gather_idx", "_mask_scatter_indices"})
+
+        info = self.cache_seq_interface.info
+        info.bulk_store_args(
+            args_data,
+            force_copy_names=force_copy_names,
+            extra_args=extra_args if extra_args else None,
         )
+
         # scatter the new tokens into the input_ids tensor if provided
         if new_tokens is not None:
-            self.cache_seq_interface.info.rescatter_input_ids(new_tokens.flatten())
+            info.rescatter_input_ids(new_tokens.flatten())
 
-        self.cache_seq_interface.info.run_host_prepare_for_attention_forward()
+        info.run_host_prepare_for_attention_forward()
 
         if spec_resource_manager is not None and isinstance(
             spec_resource_manager, ADHiddenStateManager

@@ -73,11 +73,11 @@ def _torch_cached_ssm_decode(
     dA = torch.exp(dt[..., None] * A)
 
     # Discretize B
-    # [bsz, n_groups * state_size] -> [bsz, n_groups, 1, state_size] ->
-    # -> [bsz, n_groups, group to head repetition factor, state_size] -> [bsz, num_heads, state_size]
-    B = B.reshape(batch_size, n_groups, -1)[..., None, :]
-    B = B.expand(batch_size, n_groups, num_heads // n_groups, B.shape[-1]).contiguous()
-    B = B.reshape(batch_size, -1, B.shape[-1])
+    # [bsz, n_groups * state_size] -> [bsz, n_groups, state_size] -> [bsz, num_heads, state_size]
+    # Use repeat_interleave instead of expand+contiguous+reshape to avoid materializing
+    # a non-contiguous expanded view (saves one D2D copy per decode step per layer).
+    B = B.reshape(batch_size, n_groups, -1)
+    B = B.repeat_interleave(num_heads // n_groups, dim=1)
     # [bsz, num_heads, head_dim, state_size]
     dB = dt[..., None] * B[..., None, :]
 
@@ -90,10 +90,9 @@ def _torch_cached_ssm_decode(
     updated_ssm_state = ssm_state_cache * dA + dBx
 
     # Subsequent output
-    # [bsz, n_groups * state_size] -> [bsz, num_heads, state_size]
-    C = C.reshape(batch_size, n_groups, -1)[..., None, :]
-    C = C.expand(batch_size, n_groups, num_heads // n_groups, C.shape[-1]).contiguous()
-    C = C.reshape(batch_size, -1, C.shape[-1])
+    # [bsz, n_groups * state_size] -> [bsz, n_groups, state_size] -> [bsz, num_heads, state_size]
+    C = C.reshape(batch_size, n_groups, -1)
+    C = C.repeat_interleave(num_heads // n_groups, dim=1)
     # [bsz, num_heads, head_dim]
 
     ssm_states = updated_ssm_state.to(dtype=C.dtype)  # Shape: [b, h, d, n]

@@ -26,6 +26,7 @@ and operates on a purely functional paradigm that is compatible with the torch c
 
 import math
 from abc import ABC, abstractmethod
+from itertools import accumulate, chain
 from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
 import torch
@@ -213,12 +214,14 @@ class InputBuffer:
         if fill_value is not None:
             host_view.fill_(fill_value)
 
-        # Convert list to tensor and copy to host buffer
+        # Write data directly into pinned host buffer via numpy view.
+        # This avoids allocating a temporary torch.tensor from a Python list on every call.
         length = len(data)
         assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
 
-        temp_tensor = torch.tensor(data, dtype=dtype)
-        host_view[:length].copy_(temp_tensor)
+        if length > 0:
+            np_view = host_view[:length].numpy()
+            np_view[:] = data
 
         self._current_lengths[name] = length
         return length
@@ -757,11 +760,15 @@ class SequenceInfo:
 
     @staticmethod
     def _flatten(nested_seqs: Sequence[Sequence[int]]) -> List[int]:
-        return [
-            val
-            for lst in nested_seqs
-            for val in (lst.detach().tolist() if isinstance(lst, torch.Tensor) else lst)
-        ]
+        # Use itertools.chain for C-level iteration instead of nested Python comprehension.
+        # Fall back to the old path only if any element is a torch.Tensor.
+        if any(isinstance(lst, torch.Tensor) for lst in nested_seqs):
+            return [
+                val
+                for lst in nested_seqs
+                for val in (lst.detach().tolist() if isinstance(lst, torch.Tensor) else lst)
+            ]
+        return list(chain.from_iterable(nested_seqs))
 
     def _store_arg(
         self,
@@ -782,8 +789,10 @@ class SequenceInfo:
             force_copy: Whether to force immediate copy to device (for use outside nest_sequences).
         """
         with nvtx_range(f"ad_store_on_host_seq_info_arg_{name}"):
-            # Always store list object for Python access
-            self._args_list[name] = tnsr_like.copy()
+            # Store list object for Python access. We store the reference directly
+            # (no defensive copy) since callers build fresh lists each iteration.
+            # Read-side properties already return copies for safety.
+            self._args_list[name] = tnsr_like
 
             # Only store to buffer when the argument is active or force_copy is True
             if not (name in self._active_args or f"{name}_host" in self._active_args or force_copy):
@@ -805,6 +814,51 @@ class SequenceInfo:
                 self._extra_args[name] = tnsr_like.to(self.device, non_blocking=True)
             else:
                 self._extra_args[name] = None
+
+    def bulk_store_args(
+        self,
+        args_data: Dict[str, list],
+        force_copy_names: Optional[Set[str]] = None,
+        extra_args: Optional[Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]]] = None,
+    ) -> None:
+        """Store all arguments in a single pass, bypassing per-field _store_arg overhead.
+
+        This is the fast path for _prepare_inputs where all arguments are pre-computed.
+        It replaces 17 individual _store_arg calls (each with NVTX markers, dict lookups,
+        function call overhead) with a single tight loop + one H2D copy.
+
+        Args:
+            args_data: Dict mapping argument name to its pre-computed list data.
+                       input_ids and position_ids should already be flattened.
+            force_copy_names: Set of argument names that must be copied to device even
+                            if not in _active_args (e.g., logits_gather_indices).
+            extra_args: Optional dict of extra tensor arguments (e.g., multimodal data).
+        """
+        force_copy_names = force_copy_names or set()
+
+        for name, data in args_data.items():
+            # Update _args_list for Python property access
+            self._args_list[name] = data
+
+            # Only write to InputBuffer if the arg is active or force_copy
+            is_active = name in self._active_args or f"{name}_host" in self._active_args
+            if not (is_active or name in force_copy_names):
+                continue
+
+            # Write directly to pinned host memory — no intermediate tensor allocation
+            length = len(data)
+            if length > 0:
+                self._input_buffer.get_host_view(name)[:length].numpy()[:] = data
+            self._input_buffer._current_lengths[name] = length
+
+        # Handle extra args (e.g., multimodal data)
+        self._extra_args = {}
+        if extra_args:
+            for key, value in extra_args.items():
+                self._store_extra_arg(key, value)
+
+        # Single async H2D copy for all device tensors
+        self._input_buffer.copy_to_device()
 
     @nvtx_range("ad_get_unique_value")
     def _get_unique_value(self, occupied: Set[int], max_val: int) -> int:
@@ -907,9 +961,8 @@ class SequenceInfo:
         self._store_arg("batch_info", batch_info)
 
         if cu_seqlen is None:
-            cu_seqlen = torch.zeros(len(seq_len) + 1, dtype=torch.int)
-            cu_seqlen[1:] = torch.cumsum(torch.tensor(seq_len), dim=0)
-            cu_seqlen = cu_seqlen.tolist()
+            # Use itertools.accumulate instead of torch.tensor -> cumsum -> tolist round-trip
+            cu_seqlen = [0] + list(accumulate(seq_len))
         self._store_arg("cu_seqlen", cu_seqlen)
 
         # check for updated page_assignments
@@ -923,9 +976,8 @@ class SequenceInfo:
         # update cumulative number of pages
         if cu_num_pages is None:
             pages_per_seq = self.pages_per_seq
-            cu_num_pages = torch.zeros(len(pages_per_seq) + 1, dtype=torch.int)
-            cu_num_pages[1:] = torch.cumsum(torch.tensor(pages_per_seq), dim=0)
-            cu_num_pages = cu_num_pages.tolist()
+            # Use itertools.accumulate instead of torch.tensor -> cumsum -> tolist round-trip
+            cu_num_pages = [0] + list(accumulate(pages_per_seq))
         self._store_arg("cu_num_pages", cu_num_pages)
 
         # update sequence length with cache
