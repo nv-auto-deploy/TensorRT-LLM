@@ -397,3 +397,6 @@ nvidia/NVIDIA-Nemotron-3-Super-120B-012726:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 86.12
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 77.56
