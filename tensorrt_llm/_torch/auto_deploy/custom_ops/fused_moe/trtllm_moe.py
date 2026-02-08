@@ -407,12 +407,15 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     local_expert_offset = 0
 
     # Routing parameters - use DeepSeekV3 routing with n_group=1 for external routing
-    # This is required for top_k > 10 (Nemotron Super v3 uses top_k=22)
+    # This is the ONLY routing method that supports top_k > 10 (Nemotron Super v3 uses top_k=22)
     # When n_group=1, topk_group=1, it behaves like standard routing but supports higher top_k
+    # Note: Nemotron uses routed_scaling_factor=5.0 in its router (noaux_tc_op)
+    # The routing weights should already have this scaling applied, but we pass it anyway
+    # for consistency with the model's configuration
     routing_method_type = int(RoutingMethodType.DeepSeekV3)  # = 2
     n_group = 1
     topk_group = 1
-    routed_scaling_factor = 1.0
+    routed_scaling_factor = 5.0  # Nemotron Super v3 uses routed_scaling_factor=5.0
 
     # Prepare topk tensors for external routing
     topk_ids = selected_experts.to(torch.int32)

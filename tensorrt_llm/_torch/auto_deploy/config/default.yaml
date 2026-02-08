@@ -134,6 +134,9 @@ transforms:
     stage: post_load_fusion
     expect_mem_change: true
     backend: trtllm
+  fuse_nvfp4_trtllm_gen_moe:
+    stage: post_load_fusion
+    expect_mem_change: true
   fuse_nvfp4_moe:
     stage: post_load_fusion
     expect_mem_change: true
@@ -141,7 +144,7 @@ transforms:
     stage: post_load_fusion
   fuse_rmsnorm:
     stage: post_load_fusion
-    rmsnorm_backend: flashinfer
+    rmsnorm_backend: torch
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
   fuse_l2norm:

@@ -406,7 +406,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                            **kwargs) as llm:
             # Manually set quant_config for FP4 model to get the accuracy threshold
             llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
-            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP8
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
 
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
