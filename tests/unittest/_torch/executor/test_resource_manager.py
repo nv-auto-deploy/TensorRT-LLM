@@ -456,7 +456,7 @@ class TestResourceManager(unittest.TestCase):
 
         model_config.num_hidden_layers = len(total_layers)
         model_config.num_attention_layers = len(total_layers)
-        model_config.layer_types = [LayerType.ATTENTION
+        model_config.layer_types = [LayerType.MHA
                                     ] * model_config.num_attention_layers
 
         kv_factor = 2
@@ -593,7 +593,7 @@ class TestResourceManager(unittest.TestCase):
         num_kv_heads = 8
 
         model_config = ModelConfigCpp(**model_config_params)
-        model_config.layer_types = [LayerType.ATTENTION
+        model_config.layer_types = [LayerType.MHA
                                     ] * model_config.num_attention_layers()
         model_config.set_num_kv_heads(num_kv_heads)
 

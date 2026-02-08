@@ -36,7 +36,7 @@ OperatorLike = Union[OpOrOverload, Callable]
 class LayerType(Enum):
     """Enum for layer type."""
 
-    ATTENTION = "attention"
+    MHA = "mha"
     SSM = "ssm"
     MLP = "mlp"
     MOE = "moe"
@@ -46,10 +46,10 @@ class LayerType(Enum):
 
 class LayerSubgraph(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    opening_nodes: List[Node]
-    subgraph_nodes: List[Node]
-    terminating_node: Union[Node, None]
     layer_type: LayerType
+    opening_nodes: List[Node]
+    terminating_nodes: Union[List[Node], None]
+    subgraph_nodes: List[Node]
     min_local_shape: int = 1
 
 
@@ -665,7 +665,7 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
 
 
 def _classify_partition(
-    partition_nodes: set,
+    partition_nodes: list[Node],
     embd: int,
 ) -> Optional[LayerSubgraph]:
     """Classify a partition of nodes into a LayerSubgraph.
@@ -683,7 +683,7 @@ def _classify_partition(
         embedding-dimension shapes, or None if the partition is not a recognized layer
         (e.g., embedding region, final norm, or lm_head without proper structure).
     """
-    linears = [n for n in partition_nodes if is_any_lin_op(n)]
+    linears = list(filtered_nodes(partition_nodes, is_any_lin_op))
     if not linears:
         return None
 
@@ -691,48 +691,44 @@ def _classify_partition(
     ssm_ops = list(filtered_nodes(partition_nodes, is_any_ssm_op))
     moe_ops = list(filtered_nodes(partition_nodes, is_any_moe_op))
 
-    # Identify closing (terminating) linear: a linear whose
-    #   1. weight shape[0] == embd (projects TO embedding space), AND
-    #   2. its output exits the partition (feeds into a boundary node / output)
-    # This topological check disambiguates square matrices (e.g., o_proj with [embd, embd])
-    # that match both opening and closing shape criteria.
-    closing_candidates = [
-        n
-        for n in linears
-        if "lin_node_shape" in n.meta
-        and n.meta["lin_node_shape"][0] == embd
-        and any(u not in partition_nodes for u in n.users)
-    ]
+    opening_linears = [linears[0]]
+    for linear in linears[1:]:
+        # linears are sorted topologically. Iteratively add nodes
+        # to the opening_linears set if node is not proceed by any other linear node.
+        linear_predecessors = subgraph(
+            sinks=[linear], include=is_any_lin_op, boundary_condition=is_any_lin_op
+        )
+        if any(n in linear_predecessors for n in opening_linears):
+            continue
+        opening_linears.append(linear)
 
-    # Determine the unique closing (terminating) linear node.
-    terminating_node = None
-    if len(closing_candidates) == 1:
-        terminating_node = closing_candidates[0]
-    elif len(closing_candidates) > 1:
-        # Multiple closing candidates: pick the last one in topological order
-        # (the one furthest from the partition entry)
-        terminating_node = closing_candidates[-1]
+    # verify if every opening linear has the same embedding dimension
+    for linear in opening_linears:
+        if linear.meta["lin_node_shape"][-1] != embd:
+            # malformed layer -- the linears will remain in unprocessed_linear_nodes.
+            return None
 
-    # Opening linears: weight shape[-1] == embd (project FROM embedding space),
-    # excluding the closing linear.
-    closing_set_for_filter = {terminating_node} if terminating_node else set()
-    opening = [
-        n
-        for n in linears
-        if n not in closing_set_for_filter
-        and "lin_node_shape" in n.meta
-        and n.meta["lin_node_shape"][-1] == embd
-    ]
+    # terminating linear node should be the topologically last linear node in the partition
+    terminating_linears = [linears[-1]]
+    for linear in reversed(linears[:-1]):
+        # linears are sorted topologically. Iteratively add nodes
+        # to the terminating_linears set if node is not followed by any other linear node.
+        linear_successors = subgraph(
+            sources=[linear], include=is_any_lin_op, boundary_condition=is_any_lin_op
+        )
+        if any(n in linear_successors for n in terminating_linears):
+            continue
+        terminating_linears.append(linear)
 
-    if not opening or terminating_node is None:
-        # A valid layer requires both opening linears (projecting FROM embedding space)
-        # and a closing linear (projecting TO embedding space). Without both, this is
-        # not a proper layer -- the linears will remain in unprocessed_linear_nodes.
-        return None
+    # verify if every terminating linear has the same embedding dimension
+    for linear in terminating_linears:
+        if linear.meta["lin_node_shape"][0] != embd:
+            # malformed layer -- the linears will remain in unprocessed_linear_nodes.
+            return None
 
     # Interior = everything except opening and closing nodes
     interior_nodes = [
-        n for n in partition_nodes if n not in set(opening) and n not in closing_set_for_filter
+        n for n in partition_nodes if n not in (opening_linears + terminating_linears)
     ]
 
     # Gather interior analysis data
@@ -753,8 +749,16 @@ def _classify_partition(
         if len(ssm_ops) + len(attention_ops) > 1:
             return LayerType.UNKNOWN, 1
 
+        # opening and terminating lin nodes must be disjoint
+        if set(opening_linears) & set(terminating_linears):
+            return LayerType.UNKNOWN, 1
+
         if len(attention_ops) == 1:
             head_size = shape(attention_ops[0])[-1]
+
+            # attention should have only one terminating node
+            if len(terminating_linears) != 1:
+                return LayerType.UNKNOWN, 1
             # check if this is MLA:
             # these two intermediate linear nodes are the latent q and kv projections.
             if len(intermediate_lin_nodes) == 2:
@@ -766,21 +770,26 @@ def _classify_partition(
             else:
                 if len(intermediate_lin_nodes) != 0:
                     return LayerType.UNKNOWN, 1
-                return LayerType.ATTENTION, head_size
+                return LayerType.MHA, head_size
 
         if len(ssm_ops) == 1:
             head_size = shape(ssm_ops[0])[-1]
-            # Mamba layers should not have any intermediate linear nodes.
-            if len(intermediate_lin_nodes) > 0:
+            # Mamba layers should have only 2 linear nodes: opening and terminating.
+            if (
+                len(intermediate_lin_nodes) > 0
+                or len(opening_linears) != 1
+                or len(terminating_linears) != 1
+            ):
                 return LayerType.UNKNOWN, 1
-            # Mamba layer should have 3 to 6 intermediate weight nodes:
+            # Mamba layer should have 3 to 7 intermediate weight nodes:
             # - conv1d weight
             # - A (A_log)
             # - D
             # - conv1d bias [optional]
             # - dt_bias [optional]
             # - RMS norm [optional]
-            if len(intermediate_weight_nodes) not in list(range(3, 7)):
+            # - input RMS norm [optional]
+            if len(intermediate_weight_nodes) not in list(range(3, 8)):
                 return LayerType.UNKNOWN, 1
             return LayerType.SSM, head_size
 
@@ -789,16 +798,20 @@ def _classify_partition(
 
         # if we reach here, it means the layer is a MLP.
         # MLP should not have any intermediate linear or weight nodes.
-        if len(intermediate_lin_nodes) > 0 or len(intermediate_weight_nodes) > 0:
+        if (
+            len(intermediate_lin_nodes) > 0
+            or len(intermediate_weight_nodes) > 0
+            or len(terminating_linears) != 1
+        ):
             return LayerType.UNKNOWN, 1
         return LayerType.MLP, 1
 
     layer_type, head_size = classify_layer_type()
 
     return LayerSubgraph(
-        opening_nodes=opening,
+        opening_nodes=opening_linears,
         subgraph_nodes=interior_nodes,
-        terminating_node=terminating_node,
+        terminating_nodes=terminating_linears,
         layer_type=layer_type,
         min_local_shape=head_size,
     )
@@ -863,18 +876,23 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
     layer_subgraphs = []
     processed_linear_nodes = set()
 
-    for partition in partitions:
-        partition_nodes = set(partition.nodes.keys())
+    # Parttitions are MOST LIKELY sorted in the reverse topological order.
+    # There are no guarantees, but also, it is not required for the validity
+    # of the sharding. Sorting is mostly for debugging and clarity.
+    for partition in reversed(partitions):
+        # nodes inside the partition are guaranteed to be topologically sorted.
+        partition_nodes = list(partition.nodes.keys())
         layer_subgraph = _classify_partition(partition_nodes, embd)
 
         if layer_subgraph is not None and len(layer_subgraph.opening_nodes) > 0:
             layer_subgraphs.append(layer_subgraph)
-            processed_linear_nodes.update(layer_subgraph.opening_nodes)
-            if layer_subgraph.terminating_node is not None:
-                processed_linear_nodes.add(layer_subgraph.terminating_node)
-            processed_linear_nodes.update(
-                n for n in layer_subgraph.subgraph_nodes if is_any_lin_op(n)
+            # gather all linear nodes that belong to the layer
+            lin_nodes_in_layer = (
+                layer_subgraph.opening_nodes
+                + layer_subgraph.terminating_nodes
+                + list(filtered_nodes(layer_subgraph.subgraph_nodes, is_any_lin_op))
             )
+            processed_linear_nodes.update(lin_nodes_in_layer)
 
     unprocessed_linear_nodes = set(linear_nodes) - processed_linear_nodes
 
