@@ -1,12 +1,12 @@
 runtime: trtllm
 compile_backend: torch-cudagraph
-max_batch_size: 384
-max_seq_len: 65536 # tunable
+max_batch_size: 64
+max_seq_len: 2100 # tunable
 enable_chunked_prefill: true
 attn_backend: flashinfer
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
-cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]
+cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64]
 kv_cache_config:
   # tunable mamba cache dtype
   # --> use float32 for accuracy and default (auto) for speed
