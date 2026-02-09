@@ -25,7 +25,10 @@ except ImportError:
 
 
 def _clean_up_device_info(gm: fx.GraphModule) -> None:
-    """Correct device information in the graph."""
+    """Correct device information in the graph.
+
+    NOTE: Does not call canonicalize_graph() -- caller is responsible for that.
+    """
     devices = {t.device for _, t in gm.named_parameters()}
     if len(devices) == 0:
         return
@@ -44,8 +47,6 @@ def _clean_up_device_info(gm: fx.GraphModule) -> None:
             new_kwargs = {k: v if v != meta_device else device for k, v in new_kwargs.items()}
             node.kwargs = new_kwargs
 
-    canonicalize_graph(gm)
-
 
 def _load_hook_for_deduplication(
     state_dict, prefix, *args, param_key_remaining: str, param_key_removed: str
@@ -59,7 +60,10 @@ def _load_hook_for_deduplication(
 
 
 def _deduplicate_params_and_buffers(gm: fx.GraphModule) -> None:
-    """This will de-duplicate params and buffers that share the same tensor."""
+    """This will de-duplicate params and buffers that share the same tensor.
+
+    NOTE: Does not call canonicalize_graph() -- caller is responsible for that.
+    """
     # get all get_attr nodes
     get_attr_nodes = [n for n in gm.graph.nodes if n.op == "get_attr"]
 
@@ -90,8 +94,6 @@ def _deduplicate_params_and_buffers(gm: fx.GraphModule) -> None:
             )
 
             ad_logger.debug(f"Deduplicated: {n.target} --> {node_kept.target}")
-
-    canonicalize_graph(gm)
 
 
 def _add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> None:
@@ -189,7 +191,10 @@ def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> N
 
 
 def _clean_up_assertions_and_guards(gm: fx.GraphModule):
-    """This transformations removes shape checks and assertions from the graph."""
+    """This transformations removes shape checks and assertions from the graph.
+
+    NOTE: Does not call canonicalize_graph() -- caller is responsible for that.
+    """
     check_ops = {
         torch.ops.aten._assert_scalar,
         torch.ops.aten.sym_constrain_range,
@@ -199,12 +204,10 @@ def _clean_up_assertions_and_guards(gm: fx.GraphModule):
         # torch.ops.aten._functional_sym_constrain_range_for_size
     }
     graph: fx.Graph = gm.graph
-    removed = False
     for node in reversed(graph.nodes):
         if len(node.users) > 0 or not is_op(node, check_ops):
             continue
         graph.erase_node(node)
-        removed = True
     for node in reversed(graph.nodes):
         if node.op == "call_module" and (
             str(node.target) == "_guards_fn" or str(node.target).startswith("_guards")
@@ -213,12 +216,9 @@ def _clean_up_assertions_and_guards(gm: fx.GraphModule):
             if len(node.users) > 0 and len(node.args) >= 1:
                 node.replace_all_uses_with(node.args[0])
             graph.erase_node(node)
-            removed = True
 
-    if removed and hasattr(gm, "_guards_fn"):
+    if hasattr(gm, "_guards_fn"):
         delattr(gm, "_guards_fn")
-    if removed:
-        canonicalize_graph(gm)
 
 
 def run_forward_for_capture(
@@ -313,7 +313,8 @@ def torch_export_to_gm(
 
     def _capture_fn(model, args, kwargs):
         ep = te.export(model, args, kwargs, dynamic_shapes=dynamic_shapes, strict=strict)
-        egm = ep.module()
+        # Skip guards generation since _clean_up_assertions_and_guards removes them anyway.
+        egm = ep.module(check_guards=False)
         assert isinstance(egm, fx.GraphModule)
         return egm
 
@@ -340,6 +341,10 @@ def torch_export_to_gm(
 
     # clean up checks --> generally the sanity checks are overly conservative and we can remove them
     _clean_up_assertions_and_guards(egm)
+
+    # Single canonicalize_graph call for all post-export cleanups above.
+    # Previously each cleanup function called canonicalize_graph() individually.
+    canonicalize_graph(egm)
 
     # show exported graph
     ad_logger.debug("exported graph: " + str(egm))
