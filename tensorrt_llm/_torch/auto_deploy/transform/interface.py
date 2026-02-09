@@ -418,6 +418,9 @@ class BaseTransform(ABC):
             )
             elapsed_time_pre_cleanup += time.time()
 
+            # save graph state after pre-cleanup (before apply)
+            info_pre = info
+
             # run the transform in a error-handling wrapper if desired
             elapsed_time_apply = -time.time()
             with self._apply_logging_context():
@@ -441,6 +444,17 @@ class BaseTransform(ABC):
             # we cannot say it's clean if the previous wasn't clean even if this one is
             # create new info object with updated cleanup status
             info = info & info_apply
+
+            # When the transform didn't modify the graph (skipped or 0 matches), the
+            # graph state is unchanged from pre-cleanup. Restore the pre-cleanup
+            # is_clean/has_valid_shapes flags to avoid expensive redundant post-cleanup.
+            if info_apply.skipped or info_apply.num_matches == 0:
+                info = TransformInfo(
+                    skipped=info.skipped,
+                    num_matches=info.num_matches,
+                    is_clean=info_pre.is_clean,
+                    has_valid_shapes=info_pre.has_valid_shapes,
+                )
 
             # run graph post-cleanup
             elapsed_time_post_cleanup = -time.time()
