@@ -214,14 +214,13 @@ class InputBuffer:
         if fill_value is not None:
             host_view.fill_(fill_value)
 
-        # Write data directly into pinned host buffer via numpy view.
-        # This avoids allocating a temporary torch.tensor from a Python list on every call.
+        # Convert list to tensor and copy to host buffer
         length = len(data)
         assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
 
         if length > 0:
-            np_view = host_view[:length].numpy()
-            np_view[:] = data
+            temp_tensor = torch.tensor(data, dtype=dtype)
+            host_view[:length].copy_(temp_tensor)
 
         self._current_lengths[name] = length
         return length
@@ -847,6 +846,8 @@ class SequenceInfo:
 
             # Write directly to pinned host memory — no intermediate tensor allocation
             length = len(data)
+            numel = self._input_buffer._tensor_specs[name][0]
+            assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
             if length > 0:
                 self._input_buffer.get_host_view(name)[:length].numpy()[:] = data
             self._input_buffer._current_lengths[name] = length
