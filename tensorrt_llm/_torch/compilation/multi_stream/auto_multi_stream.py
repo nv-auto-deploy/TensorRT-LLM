@@ -39,7 +39,6 @@ def estimate_time(node: Node) -> int:
     moe_ops = {
         torch.ops.trtllm.fp4_block_scale_moe_runner.default,
         torch.ops.trtllm.fused_moe.default,
-        torch.ops.trtllm.moe_custom_op.default,
     }
 
     gemm_ops = {
