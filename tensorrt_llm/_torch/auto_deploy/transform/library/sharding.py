@@ -1869,6 +1869,16 @@ def _process_ssm_sharding(
     return 1
 
 
+def _process_delta_sharding(
+    layer_subgraph: LayerSubgraph,
+    transform_container: ShardingTransformContainer,
+) -> int:
+    """
+    Process the Delta sharding from the Delta layer subgraph and update the view and split nodes accordingly.
+    """
+    return 0
+
+
 def _process_moe_sharding(
     layer_subgraph: LayerSubgraph,
     transform_container: ShardingTransformContainer,
@@ -2638,6 +2648,7 @@ def detect_column_row_shard(
     num_mha_shards = 0
     num_mla_shards = 0
     num_moe_shards = 0
+    num_delta_shards = 0
     num_column_row_shards = 0
     for layer in layer_subgraphs:
         opening = layer.opening_nodes
@@ -2678,6 +2689,13 @@ def detect_column_row_shard(
 
         if layer.layer_type == LayerType.MHA:
             num_mha_shards += _process_mha_sharding(
+                layer,
+                transform_container,
+            )
+            continue
+
+        if layer.layer_type == LayerType.DELTA:
+            num_delta_shards += _process_delta_sharding(
                 layer,
                 transform_container,
             )

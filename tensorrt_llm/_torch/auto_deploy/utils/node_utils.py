@@ -41,6 +41,7 @@ class LayerType(Enum):
     MLP = "mlp"
     MOE = "moe"
     MLA = "mla"
+    DELTA = "delta"
     UNKNOWN = "unknown"
 
 
@@ -512,6 +513,15 @@ def is_any_moe_op(node: Node) -> bool:
     )
 
 
+def is_any_delta_op(node: Node) -> bool:
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_gated_delta_rule,
+        ],
+    )
+
+
 def is_residual_add(node: Node) -> bool:
     if is_op(node, torch.ops.aten.add):
         if len(list(filtered_nodes(node.args, is_any_lin_op))) == 1:
@@ -690,6 +700,7 @@ def _classify_partition(
     attention_ops = list(filtered_nodes(partition_nodes, is_any_attention_op))
     ssm_ops = list(filtered_nodes(partition_nodes, is_any_ssm_op))
     moe_ops = list(filtered_nodes(partition_nodes, is_any_moe_op))
+    delta_ops = list(filtered_nodes(partition_nodes, is_any_delta_op))
 
     opening_linears = [linears[0]]
     for linear in linears[1:]:
@@ -746,12 +757,33 @@ def _classify_partition(
     ####################################################
 
     def classify_layer_type() -> Tuple[LayerType, int]:
-        if len(ssm_ops) + len(attention_ops) > 1:
+        if len(ssm_ops) + len(attention_ops) + len(delta_ops) > 1:
             return LayerType.UNKNOWN, 1
 
         # opening and terminating lin nodes must be disjoint
         if set(opening_linears) & set(terminating_linears):
             return LayerType.UNKNOWN, 1
+
+        if len(delta_ops) == 1:
+            head_size = shape(delta_ops[0])[-1]
+            # Gated DeltaNet layers should have 2 opening linear nodes and one terminating.
+            if (
+                len(intermediate_lin_nodes) > 0
+                or len(opening_linears) != 2
+                or len(terminating_linears) != 1
+            ):
+                return LayerType.UNKNOWN, 1
+            # Gated DeltaNet layer should have 4 to 6 intermediate weight nodes:
+            # - conv1d weight
+            # - attn_A (attn_a_log))
+            # - attn_norm_weight
+            # - layernorm_weight
+            # - attn_dt_bias [optional]
+            # - conv1d bias [optional]
+
+            if len(intermediate_weight_nodes) not in list(range(4, 7)):
+                return LayerType.UNKNOWN, 1
+            return LayerType.DELTA, head_size
 
         if len(attention_ops) == 1:
             head_size = shape(attention_ops[0])[-1]
