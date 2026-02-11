@@ -56,8 +56,8 @@ def apply_rope_with_input_pos_flashinfer(
     position_ids = position_ids.view(-1).to(q.device).int()  # flashinfer requires int
     num_nnz = position_ids.shape[0]
 
-    q_flat = q.view(num_nnz, -1)
-    k_flat = k.view(num_nnz, -1)
+    q_flat = q.reshape(num_nnz, -1)
+    k_flat = k.reshape(num_nnz, -1)
 
     query_rotated_flash, key_rotated_flash = flashinfer.rope.apply_rope_with_cos_sin_cache(
         position_ids, q_flat, k_flat, head_dim, cos_sin_cache, is_neox=is_neox
