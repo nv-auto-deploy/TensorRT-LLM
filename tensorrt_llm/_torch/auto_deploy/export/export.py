@@ -25,6 +25,228 @@ except ImportError:
     torch_export_context = nullcontext
 
 
+# =====================================================================
+# MOE export optimization: reduce experts for faster tracing, then
+# expand the graph back to include all experts after export.
+# =====================================================================
+
+
+def _infer_target_pattern(target_0: str, target_1: str) -> Tuple[str, str]:
+    """Infer ``(prefix, suffix)`` from two consecutive expert-weight targets.
+
+    Compares two ``get_attr`` targets that differ only in the expert index and
+    returns ``(prefix, suffix)`` such that ``target == prefix + str(idx) + suffix``.
+
+    Example::
+
+        >>> _infer_target_pattern('experts.0.gate.weight', 'experts.1.gate.weight')
+        ('experts.', '.gate.weight')
+    """
+    parts_0 = target_0.split(".")
+    parts_1 = target_1.split(".")
+    if len(parts_0) != len(parts_1):
+        raise ValueError(f"Target structure mismatch: {target_0} vs {target_1}")
+
+    diff_positions = [i for i, (a, b) in enumerate(zip(parts_0, parts_1)) if a != b]
+    if len(diff_positions) != 1:
+        raise ValueError(
+            f"Expected exactly one differing part, found {len(diff_positions)}: "
+            f"{target_0} vs {target_1}"
+        )
+
+    idx = diff_positions[0]
+    prefix = ".".join(parts_0[:idx]) + "." if idx > 0 else ""
+    suffix = "." + ".".join(parts_0[idx + 1 :]) if idx < len(parts_0) - 1 else ""
+    return prefix, suffix
+
+
+def _infer_single_target_pattern(target: str, expert_prefix: str) -> Tuple[str, str]:
+    """Infer ``(prefix, suffix)`` when only one expert target is available.
+
+    Uses the known *expert_prefix* to locate the expert index position.
+
+    Example::
+
+        >>> _infer_single_target_pattern('layer.0.experts.0.w.weight', 'layer.0.experts')
+        ('layer.0.experts.', '.w.weight')
+    """
+    full_prefix = expert_prefix + "."
+    if not target.startswith(full_prefix):
+        raise ValueError(f"Target '{target}' does not start with '{full_prefix}'")
+    remainder = target[len(full_prefix) :]  # e.g. '0.w.weight'
+    _idx_str, _, after_idx = remainder.partition(".")
+    suffix = "." + after_idx if after_idx else ""
+    return full_prefix, suffix
+
+
+def _register_nested_parameter(gm: fx.GraphModule, dotted_name: str, param: nn.Parameter) -> None:
+    """Register a parameter at a nested dotted path, creating intermediate modules as needed."""
+    parts = dotted_name.split(".")
+    current: nn.Module = gm
+    for part in parts[:-1]:
+        if hasattr(current, part):
+            current = getattr(current, part)
+        else:
+            new_mod = nn.Module()
+            current.add_module(part, new_mod)
+            current = new_mod
+    current.register_parameter(parts[-1], param)
+
+
+def _reduce_moe_experts(model: nn.Module, min_num_experts: int) -> List[Dict[str, Any]]:
+    """Reduce MOE expert ``nn.ModuleList``s for faster export tracing.
+
+    Finds every ``nn.ModuleList`` attribute called ``experts`` with more than
+    *min_num_experts* entries and truncates it, keeping only the first
+    *min_num_experts* entries.  The returned list of dicts carries the metadata
+    needed by :func:`_restore_moe_experts` and :func:`_expand_moe_experts_in_graph`.
+    """
+    if min_num_experts < 1:
+        raise ValueError(f"min_num_experts must be >= 1, got {min_num_experts}")
+
+    reductions: List[Dict[str, Any]] = []
+    for name, module in model.named_modules():
+        if not (hasattr(module, "experts") and isinstance(module.experts, nn.ModuleList)):
+            continue
+        orig_count = len(module.experts)
+        if orig_count <= min_num_experts:
+            continue
+
+        expert_prefix = f"{name}.experts" if name else "experts"
+        reductions.append(
+            {
+                "module": module,
+                "original_list": module.experts,
+                "original_count": orig_count,
+                "expert_prefix": expert_prefix,
+            }
+        )
+        module.experts = nn.ModuleList(list(module.experts[:min_num_experts]))
+        ad_logger.info(
+            f"Reduced MOE experts in '{name or '<root>'}' from {orig_count} to "
+            f"{min_num_experts} for faster export"
+        )
+    return reductions
+
+
+def _restore_moe_experts(reductions: List[Dict[str, Any]]) -> None:
+    """Restore MOE expert ``nn.ModuleList``s to their original state."""
+    for info in reductions:
+        info["module"].experts = info["original_list"]
+
+
+def _find_original_num_experts(target: str, reductions: List[Dict[str, Any]]) -> Optional[int]:
+    """Return the original expert count for a ``get_attr`` *target*, or ``None``."""
+    for info in reductions:
+        if target.startswith(info["expert_prefix"] + "."):
+            return info["original_count"]
+    return None
+
+
+def _find_expert_prefix(target: str, reductions: List[Dict[str, Any]]) -> Optional[str]:
+    """Return the ``expert_prefix`` that matches *target*, or ``None``."""
+    for info in reductions:
+        if target.startswith(info["expert_prefix"] + "."):
+            return info["expert_prefix"]
+    return None
+
+
+def _expand_moe_experts_in_graph(
+    gm: fx.GraphModule,
+    model: nn.Module,
+    reductions: List[Dict[str, Any]],
+) -> None:
+    """Expand MOE expert weights in *gm* to match the full *model*.
+
+    After exporting with a reduced number of experts this function:
+
+    1. Finds every ``torch_moe``-family node whose weight-list arguments are
+       shorter than the original expert count.
+    2. Registers the missing expert parameters on *gm* (copied from the
+       already-restored *model*).
+    3. Creates the corresponding ``get_attr`` nodes and extends the weight
+       lists in the call node so the graph is equivalent to a full export.
+    """
+    if not reductions:
+        return
+
+    # MOE ops whose arguments include per-expert weight lists (from index 3 onward)
+    moe_ops = {
+        torch.ops.auto_deploy.torch_moe,
+        torch.ops.auto_deploy.torch_quant_fp8_moe,
+        torch.ops.auto_deploy.torch_quant_nvfp4_moe,
+    }
+
+    graph = gm.graph
+    num_expanded = 0
+
+    for node in list(graph.nodes):
+        if not is_op(node, moe_ops):
+            continue
+
+        # Collect indices of list-of-node arguments (expert weight/scale lists)
+        list_arg_indices = [
+            i
+            for i in range(3, len(node.args))
+            if isinstance(node.args[i], (list, tuple)) and len(node.args[i]) > 0
+        ]
+        if not list_arg_indices:
+            continue
+
+        first_list = node.args[list_arg_indices[0]]
+        current_num = len(first_list)
+        first_target = first_list[0].target
+        original_num = _find_original_num_experts(first_target, reductions)
+
+        if original_num is None or original_num <= current_num:
+            continue
+
+        ad_logger.debug(
+            f"Expanding MOE node '{node.name}': {current_num} -> {original_num} experts"
+        )
+
+        # Insert new get_attr nodes at the very beginning of the graph
+        first_graph_node = next(iter(graph.nodes))
+
+        new_args = list(node.args)
+        for li in list_arg_indices:
+            weight_list = list(node.args[li])
+
+            # Determine the naming pattern: prefix + <expert_idx> + suffix
+            if len(weight_list) >= 2:
+                prefix, suffix = _infer_target_pattern(weight_list[0].target, weight_list[1].target)
+            else:
+                ep = _find_expert_prefix(weight_list[0].target, reductions)
+                assert ep is not None, (
+                    f"Could not find expert prefix for target '{weight_list[0].target}'"
+                )
+                prefix, suffix = _infer_single_target_pattern(weight_list[0].target, ep)
+
+            # Add the missing expert weights
+            for expert_idx in range(current_num, original_num):
+                new_target = f"{prefix}{expert_idx}{suffix}"
+
+                # Copy the parameter from the restored model
+                orig_param = model.get_parameter(new_target)
+                _register_nested_parameter(gm, new_target, nn.Parameter(orig_param.data))
+
+                # Create a get_attr node
+                with graph.inserting_before(first_graph_node):
+                    new_node = graph.get_attr(new_target)
+                    new_node.meta["val"] = gm.get_parameter(new_target)
+
+                weight_list.append(new_node)
+
+            new_args[li] = weight_list
+
+        node.args = tuple(new_args)
+        num_expanded += 1
+
+    if num_expanded:
+        canonicalize_graph(gm)
+        ad_logger.info(f"Expanded {num_expanded} MOE node(s) in the exported graph")
+
+
 def _clean_up_device_info(gm: fx.GraphModule) -> None:
     """Correct device information in the graph."""
     devices = {t.device for _, t in gm.named_parameters()}
@@ -330,6 +552,7 @@ def torch_export_to_gm(
     strict: bool = False,
     patch_configs: Optional[Dict[str, Union[dict, Any]]] = None,
     patch_list: Optional[List[str]] = None,
+    num_moe_experts_for_export: Optional[int] = None,
 ) -> fx.GraphModule:
     """torch's export with wrapping into GraphModule + useful additions to the resulting module.
 
@@ -341,6 +564,8 @@ def torch_export_to_gm(
         4. Retain load hooks for state_dict loading from the original module.
         5. Manage parameter aliasing in the model.
         6. Remove assertions from the graph.
+        7. Optionally speed up export for MOE models by tracing with fewer experts
+           and expanding the graph afterward.
 
     Args:
         model: The model to export
@@ -353,6 +578,10 @@ def torch_export_to_gm(
                       will be applied with default settings.
         patch_list: Optional list of patch names to apply with default settings.
                    Cannot be used together with patch_configs.
+        num_moe_experts_for_export: If set, only this many experts are traced during
+            ``torch.export`` (the graph is expanded to include all experts afterward).
+            This can dramatically speed up export for large MOE models.
+            Recommended value: 2.
     """
 
     def _capture_fn(model, args, kwargs):
@@ -361,10 +590,22 @@ def torch_export_to_gm(
         assert isinstance(egm, fx.GraphModule)
         return egm
 
+    # Optionally reduce MOE experts for faster export tracing
+    moe_reductions: List[Dict[str, Any]] = []
+    if num_moe_experts_for_export is not None:
+        moe_reductions = _reduce_moe_experts(model, num_moe_experts_for_export)
+
     # run capture with export
     egm = run_forward_for_capture(
         model, _capture_fn, args, kwargs, clone, patch_list=patch_list, patch_configs=patch_configs
     )
+
+    # Restore full expert lists on the source model and expand the graph to include
+    # all expert weights.  This must happen before the load-hook / deduplication
+    # post-processing so that those steps see the complete set of parameters.
+    if moe_reductions:
+        _restore_moe_experts(moe_reductions)
+        _expand_moe_experts_in_graph(egm, model, moe_reductions)
 
     # Export strips away all methods not traced during forward. The model could have
     # load hooks that contain logic for correct state_dict loading. We need to add those
