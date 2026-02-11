@@ -431,45 +431,100 @@ def _optimize_explicit(
     head_dim = cos_node.meta["val"].shape[-1]
     half_head_dim = head_dim // 2
 
-    cache_key = (cos_node, sin_node)
-    if cache_key in cache:
-        fused_cos_sin_to = cache[cache_key]
+    # Try trace-back to find full cos/sin tables and real position_ids.
+    # When cos/sin are produced by aten.index.Tensor(table, [position_ids]),
+    # we can build the fused cache from the full table once and pass the real
+    # position_ids to flashinfer, eliminating per-forward index/slice/cat ops.
+    cos_traced = _trace_back_index(cos_node)
+    sin_traced = _trace_back_index(sin_node)
+
+    use_full_table = False
+    if cos_traced is not None and sin_traced is not None:
+        cos_table_node, cos_pos_ids = cos_traced
+        sin_table_node, sin_pos_ids = sin_traced
+        if cos_pos_ids is sin_pos_ids:
+            use_full_table = True
+
+    if use_full_table:
+        # Full-table path: build fused cache from the original 2-D tables
+        # (shared across all layers that index the same table).
+        cache_key = (cos_table_node, sin_table_node)
+        if cache_key in cache:
+            fused_cos_sin_to = cache[cache_key]
+        else:
+            with graph.inserting_after(cos_table_node):
+                cos_prefix = graph.call_function(
+                    torch.ops.aten.slice, args=(cos_table_node, -1, 0, half_head_dim)
+                )
+            with graph.inserting_after(sin_table_node):
+                sin_prefix = graph.call_function(
+                    torch.ops.aten.slice, args=(sin_table_node, -1, 0, half_head_dim)
+                )
+            with graph.inserting_after(_get_last_node([cos_prefix, sin_prefix])):
+                fused_cos_sin = graph.call_function(
+                    torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
+                )
+            with graph.inserting_after(fused_cos_sin):
+                fused_cos_sin_to = graph.call_function(
+                    torch.ops.aten.to, args=(fused_cos_sin, torch.float32)
+                )
+            cache[cache_key] = fused_cos_sin_to
+
+        # Flatten real position_ids from [B, S] to [B*S] and ensure float32.
+        if "full_table_position_ids" in pos_cache:
+            position_ids = pos_cache["full_table_position_ids"]
+        else:
+            with graph.inserting_before(node):
+                flat_pos_ids = graph.call_function(
+                    torch.ops.aten.reshape, args=(cos_pos_ids, (-1,))
+                )
+                position_ids = graph.call_function(
+                    torch.ops.aten.to, args=(flat_pos_ids, torch.float32)
+                )
+            pos_cache["full_table_position_ids"] = position_ids
     else:
-        with graph.inserting_after(cos_node):
-            cos_prefix = graph.call_function(
-                torch.ops.aten.slice, args=(cos_node, -1, 0, half_head_dim)
+        # Fallback: build fused cache from already-indexed cos/sin values.
+        cache_key = (cos_node, sin_node)
+        if cache_key in cache:
+            fused_cos_sin_to = cache[cache_key]
+        else:
+            with graph.inserting_after(cos_node):
+                cos_prefix = graph.call_function(
+                    torch.ops.aten.slice, args=(cos_node, -1, 0, half_head_dim)
+                )
+            with graph.inserting_after(sin_node):
+                sin_prefix = graph.call_function(
+                    torch.ops.aten.slice, args=(sin_node, -1, 0, half_head_dim)
+                )
+            with graph.inserting_after(sin_prefix):
+                fused_cos_sin = graph.call_function(
+                    torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
+                )
+            with graph.inserting_after(q_node):
+                sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 0))
+                sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 1))
+            with graph.inserting_after(_get_last_node([sym_batch, sym_seq])):
+                bs_seq = graph.call_function(operator.mul, args=(sym_batch, sym_seq))
+            with graph.inserting_after(_get_last_node([bs_seq, fused_cos_sin])):
+                fused_cos_sin_flat = graph.call_function(
+                    torch.ops.aten.view, args=(fused_cos_sin, (bs_seq, -1))
+                )
+            with graph.inserting_after(fused_cos_sin_flat):
+                fused_cos_sin_to = graph.call_function(
+                    torch.ops.aten.to, args=(fused_cos_sin_flat, torch.float32)
+                )
+            cache[cache_key] = fused_cos_sin_to
+
+        with graph.inserting_before(node):
+            position_ids = _get_position_ids(
+                graph,
+                q_node,
+                batch_dim=0,
+                seq_dim=1,
+                rope_position_ids_cache=pos_cache,
             )
-        with graph.inserting_after(sin_node):
-            sin_prefix = graph.call_function(
-                torch.ops.aten.slice, args=(sin_node, -1, 0, half_head_dim)
-            )
-        with graph.inserting_after(sin_prefix):
-            fused_cos_sin = graph.call_function(
-                torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
-            )
-        with graph.inserting_after(q_node):
-            sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 0))
-            sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 1))
-        with graph.inserting_after(_get_last_node([sym_batch, sym_seq])):
-            bs_seq = graph.call_function(operator.mul, args=(sym_batch, sym_seq))
-        with graph.inserting_after(_get_last_node([bs_seq, fused_cos_sin])):
-            fused_cos_sin_flat = graph.call_function(
-                torch.ops.aten.view, args=(fused_cos_sin, (bs_seq, -1))
-            )
-        with graph.inserting_after(fused_cos_sin_flat):
-            fused_cos_sin_to = graph.call_function(
-                torch.ops.aten.to, args=(fused_cos_sin_flat, torch.float32)
-            )
-        cache[cache_key] = fused_cos_sin_to
 
     with graph.inserting_before(node):
-        position_ids = _get_position_ids(
-            graph,
-            q_node,
-            batch_dim=0,
-            seq_dim=1,
-            rope_position_ids_cache=pos_cache,
-        )
         flash_node = graph.call_function(
             torch.ops.auto_deploy.flashinfer_rope,
             args=(q_node, k_node, position_ids, fused_cos_sin_to, True),
