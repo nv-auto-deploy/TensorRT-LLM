@@ -420,6 +420,7 @@ def is_any_conv_op(node: Node) -> bool:
         node,
         ops=[
             torch.ops.auto_deploy.torch_causal_conv1d,
+            torch.ops.aten.conv1d,  # Support regular conv1d for tests
         ],
     )
 
