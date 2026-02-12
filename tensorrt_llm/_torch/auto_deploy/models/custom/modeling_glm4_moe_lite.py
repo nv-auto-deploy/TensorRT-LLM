@@ -247,17 +247,27 @@ class Glm4MoeLiteRotaryEmbedding(nn.Module):
         t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos() * self.attention_scaling
+        sin = emb.sin() * self.attention_scaling
         # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
-        self.register_buffer("_ad_cos_cached", emb.cos() * self.attention_scaling, persistent=False)
-        self.register_buffer("_ad_sin_cached", emb.sin() * self.attention_scaling, persistent=False)
+        self.register_buffer("_ad_cos_cached", cos, persistent=False)
+        self.register_buffer("_ad_sin_cached", sin, persistent=False)
+
+        # Pre-fused cache for FlashInfer: [max_seq_len, head_dim] in float32
+        # Format: [cos_0..cos_{d/2-1}, sin_0..sin_{d/2-1}]
+        half = cos.shape[-1] // 2
+        fused = torch.cat([cos[:, :half], sin[:, :half]], dim=-1).to(torch.float32)
+        self.register_buffer("_ad_rope_cos_sin_cache", fused, persistent=False)
 
     def forward(
         self, x: torch.Tensor, seq_len: Optional[int] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Return full cached cos/sin (not sliced) for export compatibility
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Return full cached cos/sin (not sliced) for export compatibility,
+        # plus pre-fused cache for FlashInfer RoPE optimization
         return (
             self._ad_cos_cached.to(dtype=x.dtype, device=x.device),
             self._ad_sin_cached.to(dtype=x.dtype, device=x.device),
+            self._ad_rope_cos_sin_cache,
         )
 
 
@@ -314,10 +324,18 @@ class Glm4MoeLiteYarnRotaryEmbedding(Glm4MoeLiteRotaryEmbedding):
         )
 
         emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos() * _mscale
+        sin = emb.sin() * _mscale
         # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
         # Note: attention_scaling is already incorporated in _mscale for YaRN
-        self.register_buffer("_ad_cos_cached", (emb.cos() * _mscale), persistent=False)
-        self.register_buffer("_ad_sin_cached", (emb.sin() * _mscale), persistent=False)
+        self.register_buffer("_ad_cos_cached", cos, persistent=False)
+        self.register_buffer("_ad_sin_cached", sin, persistent=False)
+
+        # Pre-fused cache for FlashInfer: [max_seq_len, head_dim] in float32
+        # Format: [cos_0..cos_{d/2-1}, sin_0..sin_{d/2-1}]
+        half = cos.shape[-1] // 2
+        fused = torch.cat([cos[:, :half], sin[:, :half]], dim=-1).to(torch.float32)
+        self.register_buffer("_ad_rope_cos_sin_cache", fused, persistent=False)
 
     @staticmethod
     def _yarn_find_correction_dim(
@@ -601,7 +619,8 @@ class Glm4MoeLiteAttention(nn.Module):
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
 
         # Get cos/sin from position_embeddings (full cached from shared rotary embedding)
-        cos, sin = position_embeddings  # Full table: [max_seq_len, head_dim]
+        cos = position_embeddings[0]  # Full table: [max_seq_len, head_dim]
+        sin = position_embeddings[1]  # Full table: [max_seq_len, head_dim]
         cos = cos[position_ids]  # [B, S, head_dim]
         sin = sin[position_ids]  # [B, S, head_dim]
 

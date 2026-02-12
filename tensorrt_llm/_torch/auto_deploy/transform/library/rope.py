@@ -406,6 +406,94 @@ class OptimizeRope(BaseTransform):
         return gm, info
 
 
+def _trace_to_buffer_source(node: Node) -> Optional[Node]:
+    """Trace back through unary call_function nodes to find the source get_attr/placeholder."""
+    visited = set()
+    current = node
+    while id(current) not in visited:
+        visited.add(id(current))
+        if current.op in ("get_attr", "placeholder"):
+            return current
+        if (
+            current.op == "call_function"
+            and len(current.args) > 0
+            and isinstance(current.args[0], Node)
+        ):
+            current = current.args[0]
+        else:
+            return None
+    return None
+
+
+def _get_nested_attr(module: torch.nn.Module, target: str) -> torch.Tensor:
+    """Access a nested module attribute via dotted path (e.g. 'model.rotary_emb._ad_cos_cached')."""
+    parts = target.split(".")
+    obj = module
+    for p in parts:
+        obj = getattr(obj, p)
+    return obj
+
+
+def _try_prefuse_cos_sin_cache(
+    graph: torch.fx.Graph,
+    cos_table_node: Node,
+    sin_table_node: Node,
+    half_head_dim: int,
+) -> Optional[Node]:
+    """Try to precompute the fused cos_sin cache as a graph constant.
+
+    Traces back from cos/sin table nodes to find the source get_attr buffers,
+    computes the fused cache from actual tensor values, and registers it as
+    a new attribute on the GraphModule.
+
+    Returns a get_attr Node for the fused cache, or None if precomputation
+    is not possible (caller should fall back to runtime slice+concat).
+    """
+    gm = graph.owning_module
+    if gm is None:
+        return None
+
+    cos_source = _trace_to_buffer_source(cos_table_node)
+    sin_source = _trace_to_buffer_source(sin_table_node)
+
+    if cos_source is None or sin_source is None:
+        return None
+
+    if cos_source.op != "get_attr" or sin_source.op != "get_attr":
+        return None
+
+    try:
+        cos_tensor = _get_nested_attr(gm, cos_source.target)
+        sin_tensor = _get_nested_attr(gm, sin_source.target)
+    except AttributeError:
+        return None
+
+    if cos_tensor.is_meta or sin_tensor.is_meta:
+        return None
+
+    # Compute fused cache: [max_seq_len, head_dim] in float32
+    # Format: [cos_0..cos_{d/2-1}, sin_0..sin_{d/2-1}]
+    fused = torch.cat([cos_tensor[:, :half_head_dim], sin_tensor[:, :half_head_dim]], dim=-1).to(
+        torch.float32
+    )
+
+    # Register as a new buffer on the GraphModule with a unique name
+    attr_name = "_prefused_rope_cache"
+    counter = 0
+    while hasattr(gm, attr_name):
+        counter += 1
+        attr_name = f"_prefused_rope_cache_{counter}"
+
+    gm.register_buffer(attr_name, fused, persistent=False)
+
+    # Create get_attr node
+    with graph.inserting_after(_get_last_node([cos_source, sin_source])):
+        fused_node = graph.create_node("get_attr", attr_name)
+    fused_node.meta["val"] = torch.empty_like(fused, device="meta")
+
+    return fused_node
+
+
 def _optimize_explicit(
     graph: GraphModule, node: Node, cache: Dict[Any, Node], pos_cache: Dict[str, Node]
 ) -> None:
@@ -452,22 +540,30 @@ def _optimize_explicit(
         if cache_key in cache:
             fused_cos_sin_to = cache[cache_key]
         else:
-            with graph.inserting_after(cos_table_node):
-                cos_prefix = graph.call_function(
-                    torch.ops.aten.slice, args=(cos_table_node, -1, 0, half_head_dim)
-                )
-            with graph.inserting_after(sin_table_node):
-                sin_prefix = graph.call_function(
-                    torch.ops.aten.slice, args=(sin_table_node, -1, 0, half_head_dim)
-                )
-            with graph.inserting_after(_get_last_node([cos_prefix, sin_prefix])):
-                fused_cos_sin = graph.call_function(
-                    torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
-                )
-            with graph.inserting_after(fused_cos_sin):
-                fused_cos_sin_to = graph.call_function(
-                    torch.ops.aten.to, args=(fused_cos_sin, torch.float32)
-                )
+            # Try to precompute the fused cache as a graph constant
+            prefused_node = _try_prefuse_cos_sin_cache(
+                graph, cos_table_node, sin_table_node, half_head_dim
+            )
+            if prefused_node is not None:
+                fused_cos_sin_to = prefused_node
+            else:
+                # Fallback: build fused cache at runtime (slice + concat)
+                with graph.inserting_after(cos_table_node):
+                    cos_prefix = graph.call_function(
+                        torch.ops.aten.slice, args=(cos_table_node, -1, 0, half_head_dim)
+                    )
+                with graph.inserting_after(sin_table_node):
+                    sin_prefix = graph.call_function(
+                        torch.ops.aten.slice, args=(sin_table_node, -1, 0, half_head_dim)
+                    )
+                with graph.inserting_after(_get_last_node([cos_prefix, sin_prefix])):
+                    fused_cos_sin = graph.call_function(
+                        torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
+                    )
+                with graph.inserting_after(fused_cos_sin):
+                    fused_cos_sin_to = graph.call_function(
+                        torch.ops.aten.to, args=(fused_cos_sin, torch.float32)
+                    )
             cache[cache_key] = fused_cos_sin_to
 
         # Flatten real position_ids from [B, S] to [B*S] and ensure float32.
