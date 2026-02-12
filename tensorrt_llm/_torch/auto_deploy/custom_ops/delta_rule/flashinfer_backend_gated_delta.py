@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cached attention op for the gated delta rule using fla kernels.
+"""Cached attention op for the gated delta rule using FlashInfer CuTe DSL decode kernel.
 
-Gated Delta Rule is based on this paper: https://arxiv.org/abs/2412.06464
+Uses the CuTe DSL GDN decode kernel (gdn_decode.py) for decode and the FLA Triton
+chunked kernel for prefill. Requires SM90+ (Hopper) GPU architecture.
 
-Kernels are based on this repo: https://github.com/fla-org/flash-linear-attention
+Gated Delta Rule reference: https://arxiv.org/abs/2412.06464
+CuTe DSL kernel from FlashInfer PR #2370.
 """
 
 from typing import List
@@ -28,7 +30,6 @@ from torch.fx import Node
 
 from .....llmapi.llm_args import KvCacheConfig
 from ....modules.fla.chunk import chunk_gated_delta_rule
-from ....modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update_fwd
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
@@ -39,16 +40,21 @@ from ..attention_interface import (
     ResourceHandlerDict,
     StateResourceHandler,
 )
+from .torch_gated_delta_rule import compute_g_beta
 
 
-@torch.library.custom_op("auto_deploy::fla_cached_gated_delta_rule", mutates_args=("delta_cache",))
-def fla_cached_gated_delta_rule(
+@torch.library.custom_op(
+    "auto_deploy::flashinfer_cached_gated_delta_rule", mutates_args=("delta_cache",)
+)
+def flashinfer_cached_gated_delta_rule(
     # INPUTS (dense but may be flattened across sequences)
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
     # STANDARD METADATA
     batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
@@ -61,18 +67,21 @@ def fla_cached_gated_delta_rule(
     # CONSTANTS
     scale: float,
 ) -> torch.Tensor:
-    b, s, num_heads, _ = q.shape
+    b_size, s, num_heads, _ = q.shape
+
+    # Derive g and beta from raw parameters
+    g, beta = compute_g_beta(a, b, A_log, dt_bias)
 
     # flatten batch and sequence dims
-    q_flat = q.view(b * s, num_heads, -1)
-    k_flat = k.view(b * s, num_heads, -1)
-    v_flat = v.view(b * s, num_heads, -1)
-    g_flat = g.view(b * s, num_heads)
-    beta_flat = beta.view(b * s, num_heads)
+    q_flat = q.view(b_size * s, num_heads, -1)
+    k_flat = k.view(b_size * s, num_heads, -1)
+    v_flat = v.view(b_size * s, num_heads, -1)
+    g_flat = g.view(b_size * s, num_heads)
+    beta_flat = beta.view(b_size * s, num_heads)
 
     # pre-allocate output
     y = torch.empty_like(v, memory_format=torch.contiguous_format)
-    y_flat = y.view(b * s, num_heads, -1)
+    y_flat = y.view(b_size * s, num_heads, -1)
 
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
@@ -109,48 +118,52 @@ def fla_cached_gated_delta_rule(
         del y_prefill, initial_states, final_state
 
     if num_decode > 0:
-        # WORKAROUND: Process decode sequences one at a time.
-        # The fused_recurrent Triton kernel produces wrong results for batch
-        # elements with i_n > 0 when B > 1, regardless of whether indirect or
-        # identity indices are used. Processing each token individually with
-        # B=1 avoids this kernel bug.
-        for i in range(num_decode):
-            seq_idx = num_prefill + i
-            slot = slot_idx[seq_idx]
-            token_idx = num_prefill_tokens + i
+        from .gdn_decode import gated_delta_rule_decode_pooled
 
-            q_tok = q_flat[token_idx, :, :].unsqueeze(0).unsqueeze(0)  # [1, 1, H, K]
-            k_tok = k_flat[token_idx, :, :].unsqueeze(0).unsqueeze(0)
-            v_tok = v_flat[token_idx, :, :].unsqueeze(0).unsqueeze(0)
-            g_tok = g_flat[token_idx, :].unsqueeze(0).unsqueeze(0)
-            beta_tok = beta_flat[token_idx, :].unsqueeze(0).unsqueeze(0)
+        decode_start = num_prefill_tokens
+        decode_end = num_prefill_tokens + num_decode
+        decode_slots = slot_idx[num_prefill:num_seq]
 
-            y_tok = fused_recurrent_gated_delta_rule_update_fwd(
-                q=q_tok,
-                k=k_tok,
-                v=v_tok,
-                g=g_tok,
-                beta=beta_tok,
-                scale=scale,
-                initial_state_source=delta_cache,
-                initial_state_indices=torch.tensor([slot], device=q.device, dtype=torch.long),
-            )
+        q_decode = q_flat[decode_start:decode_end].unsqueeze(1)  # [D, 1, H, K]
+        k_decode = k_flat[decode_start:decode_end].unsqueeze(1)  # [D, 1, H, K]
+        v_decode = v_flat[decode_start:decode_end].unsqueeze(1)  # [D, 1, H, V]
+        a_decode = a.view(b_size * s, num_heads)[decode_start:decode_end].unsqueeze(1)
+        b_decode = b.view(b_size * s, num_heads)[decode_start:decode_end].unsqueeze(1)
 
-            y_flat[token_idx, :, :] = y_tok[0, 0, :, :]
+        # Pool-indexed decode: pass delta_cache + slot indices directly.
+        # The kernel reads/writes state in-place at indexed positions.
+        # No gather, no scatter, no .contiguous(), no state.copy_().
+        y_decode = gated_delta_rule_decode_pooled(
+            q=q_decode,
+            k=k_decode,
+            v=v_decode,
+            state_pool=delta_cache,
+            state_indices=decode_slots.to(torch.int32),
+            A_log=A_log.detach().float(),
+            a=a_decode,
+            dt_bias=dt_bias.detach(),
+            b=b_decode,
+            scale=scale,
+            use_qk_l2norm=False,
+        )
 
-            del y_tok
+        y_flat[decode_start:decode_end] = y_decode.squeeze(1).to(y_flat.dtype)
+
+        del y_decode
 
     return y
 
 
-@fla_cached_gated_delta_rule.register_fake
-def fla_cached_gated_delta_rule_fake(
+@flashinfer_cached_gated_delta_rule.register_fake
+def flashinfer_cached_gated_delta_rule_fake(
     # INPUTS (dense but may be flattened across sequences)
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
     # STANDARD METADATA
     batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
@@ -166,16 +179,16 @@ def fla_cached_gated_delta_rule_fake(
     return torch.empty_like(v)
 
 
-@AttentionRegistry.register("fla_gated_delta")
-class FlaGatedDeltaBackend(AttentionDescriptor):
+@AttentionRegistry.register("flashinfer_gated_delta")
+class FlashinferGatedDeltaBackend(AttentionDescriptor):
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
         return "bsnd"
 
     @classmethod
     def get_num_qkv_args(cls) -> int:
-        # q, k, v, g, beta
-        return 5
+        # q, k, v, a, b, A_log, dt_bias
+        return 7
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
@@ -183,7 +196,7 @@ class FlaGatedDeltaBackend(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.fla_cached_gated_delta_rule.default
+        return torch.ops.auto_deploy.flashinfer_cached_gated_delta_rule.default
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:

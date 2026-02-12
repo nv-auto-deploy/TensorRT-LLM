@@ -131,30 +131,62 @@ def _torch_chunk_gated_delta_rule_impl(
     return core_attn_out.to(initial_dtype)
 
 
+def compute_g_beta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+) -> tuple:
+    """Compute gating (g) and update gate (beta) from raw parameters.
+
+    Args:
+        a:      [B, S, HV] or [B, S, H] - input-dependent decay
+        b:      [B, S, HV] or [B, S, H] - update gate input
+        A_log:  [HV] or [H]             - log decay parameter (model weight)
+        dt_bias: [HV] or [H]            - decay bias (model weight)
+
+    Returns:
+        g:    same shape as a - gating/decay values (negative, log-space)
+        beta: same shape as b - beta scaling values in (0, 1)
+    """
+    beta = b.sigmoid()
+    g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
+    return g, beta
+
+
 @torch.library.custom_op("auto_deploy::torch_gated_delta_rule", mutates_args=())
 def torch_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
     scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Gated Delta Rule custom op for linear attention (torch reference implementation).
 
     All inputs use the autodeploy [B, S, H, D] (bsnd) layout convention.
+    Accepts raw parameters and computes gating internally so any backend can
+    dispatch from the same source op.
 
     Args:
-        q:    [B, S, H, K] - query states (should be l2-normalized before calling)
-        k:    [B, S, H, K] - key states (should be l2-normalized before calling)
-        v:    [B, S, H, V] - value states
-        g:    [B, S, H]    - gating/decay values
-        beta: [B, S, H]    - beta scaling values
+        q:      [B, S, H, K] - query states (should be l2-normalized before calling)
+        k:      [B, S, H, K] - key states (should be l2-normalized before calling)
+        v:      [B, S, H, V] - value states
+        a:      [B, S, HV]   - input-dependent decay (raw, pre-softplus)
+        b:      [B, S, HV]   - update gate input (raw, pre-sigmoid)
+        A_log:  [HV]         - log decay parameter (model weight)
+        dt_bias: [HV]        - decay bias (model weight)
         scale: optional query scaling factor (defaults to K^-0.5)
 
     Returns:
         output: [B, S, H, V]
     """
+    # Compute gating from raw parameters
+    g, beta = compute_g_beta(a, b, A_log, dt_bias)
+
     # Transpose from bsnd -> bhsd for internal computation
     q_t = q.transpose(1, 2)
     k_t = k.transpose(1, 2)
@@ -173,8 +205,10 @@ def torch_gated_delta_rule_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
     scale: Optional[float] = None,
 ) -> torch.Tensor:
     return torch.empty_like(v)

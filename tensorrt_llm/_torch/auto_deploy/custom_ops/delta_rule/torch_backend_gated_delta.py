@@ -45,6 +45,7 @@ from ..attention_interface import (
     ResourceHandlerDict,
     StateResourceHandler,
 )
+from .torch_gated_delta_rule import compute_g_beta
 
 # ---------------------------------------------------------------------------
 # Core recurrence helpers
@@ -159,8 +160,10 @@ def torch_cached_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
     # STANDARD METADATA
     batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
@@ -176,11 +179,13 @@ def torch_cached_gated_delta_rule(
     Handles mixed prefill + decode batches. Inputs use the autodeploy bsnd layout.
 
     Args:
-        q:    [B, S, H, K]
-        k:    [B, S, H, K]
-        v:    [B, S, H, V]
-        g:    [B, S, H]
-        beta: [B, S, H]
+        q:       [B, S, H, K]
+        k:       [B, S, H, K]
+        v:       [B, S, H, V]
+        a:       [B, S, HV]   - input-dependent decay (raw, pre-softplus)
+        b:       [B, S, HV]   - update gate input (raw, pre-sigmoid)
+        A_log:   [HV]         - log decay parameter (model weight)
+        dt_bias: [HV]         - decay bias (model weight)
         batch_info_host: [num_prefill, num_prefill_tokens, num_decode] on host
         cu_seqlen:       cumulative sequence lengths for prefill sequences
         slot_idx:        per-sequence slot indices into delta_cache
@@ -191,7 +196,10 @@ def torch_cached_gated_delta_rule(
     Returns:
         output: [B, S, H, V]
     """
-    b, s, num_heads, _ = q.shape
+    b_size, s, num_heads, _ = q.shape
+
+    # Derive g and beta from raw parameters
+    g, beta = compute_g_beta(a, b, A_log, dt_bias)
 
     # Pre-allocate output
     y = torch.empty_like(v, memory_format=torch.contiguous_format)
@@ -205,12 +213,12 @@ def torch_cached_gated_delta_rule(
     use_initial_states = use_initial_states[:num_seq]
 
     # Flatten for indexing: [B*S, H, D]
-    q_flat = q.reshape(b * s, num_heads, -1)
-    k_flat = k.reshape(b * s, num_heads, -1)
-    v_flat = v.reshape(b * s, num_heads, -1)
-    g_flat = g.reshape(b * s, num_heads)
-    beta_flat = beta.reshape(b * s, num_heads)
-    y_flat = y.reshape(b * s, num_heads, -1)
+    q_flat = q.reshape(b_size * s, num_heads, -1)
+    k_flat = k.reshape(b_size * s, num_heads, -1)
+    v_flat = v.reshape(b_size * s, num_heads, -1)
+    g_flat = g.reshape(b_size * s, num_heads)
+    beta_flat = beta.reshape(b_size * s, num_heads)
+    y_flat = y.reshape(b_size * s, num_heads, -1)
 
     key_dim = q.shape[-1]
     value_dim = v.shape[-1]
@@ -299,8 +307,10 @@ def torch_cached_gated_delta_rule_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
     batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
@@ -329,8 +339,8 @@ class TorchGatedDeltaBackend(AttentionDescriptor):
 
     @classmethod
     def get_num_qkv_args(cls) -> int:
-        # q, k, v, g, beta
-        return 5
+        # q, k, v, a, b, A_log, dt_bias
+        return 7
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:

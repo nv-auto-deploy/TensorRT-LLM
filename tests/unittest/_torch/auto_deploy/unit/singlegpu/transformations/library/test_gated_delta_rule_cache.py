@@ -93,9 +93,13 @@ class GatedDeltaRuleModel(nn.Module):
         self.q_proj = nn.Linear(hidden_size, num_heads * key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, num_heads * key_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, num_heads * value_dim, bias=False)
-        self.g_proj = nn.Linear(hidden_size, num_heads, bias=False)
-        self.beta_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        self.a_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
         self.o_proj = nn.Linear(num_heads * value_dim, hidden_size, bias=False)
+
+        # Model weights for gating: A_log and dt_bias (per-head)
+        self.A_log = nn.Parameter(torch.randn(num_heads))
+        self.dt_bias = nn.Parameter(torch.randn(num_heads))
 
     @torch.no_grad()
     def forward(
@@ -112,11 +116,13 @@ class GatedDeltaRuleModel(nn.Module):
         q = torch.nn.functional.normalize(q, dim=-1)
         k = torch.nn.functional.normalize(k, dim=-1)
 
-        # g should be negative (decay), beta should be in (0, 1)
-        g = -torch.nn.functional.softplus(self.g_proj(x))  # [B, S, H]
-        beta = torch.sigmoid(self.beta_proj(x))  # [B, S, H]
+        # Raw parameters for gated delta rule (backend computes g/beta internally)
+        a = self.a_proj(x)  # [B, S, H]
+        b_val = self.b_proj(x)  # [B, S, H]
 
-        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(q, k, v, g, beta)
+        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+            q, k, v, a, b_val, self.A_log, self.dt_bias
+        )
         # attn_out: [B, S, H, V]
 
         attn_out = attn_out.reshape(b, s, -1)

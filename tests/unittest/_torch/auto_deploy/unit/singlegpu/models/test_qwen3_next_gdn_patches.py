@@ -21,6 +21,9 @@ from transformers.models.qwen3_next.modeling_qwen3_next import (
 
 # Register all auto_deploy custom ops (torch_gated_delta_rule, torch_causal_conv1d, torch_l2norm)
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.delta_rule.torch_gated_delta_rule import (
+    compute_g_beta,
+)
 from tensorrt_llm._torch.auto_deploy.models.patches.qwen3_next import _patched_gdn_forward
 
 
@@ -30,6 +33,7 @@ def test_torch_gated_delta_rule_op():
 
     Both operate on pure-torch math (no FLA kernels). We compare with
     `use_qk_l2norm_in_kernel=False` so L2 norm is excluded from both paths.
+    The custom op accepts raw (a, b, A_log, dt_bias) and computes g/beta internally.
     """
     torch.manual_seed(42)
 
@@ -43,8 +47,13 @@ def test_torch_gated_delta_rule_op():
     q = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32)
     k = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32)
     v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.float32)
-    g = -torch.rand(batch_size, seq_len, num_heads, dtype=torch.float32)  # negative (decay)
-    beta = torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32))
+    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32)
+    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32)
+    A_log = torch.randn(num_heads, dtype=torch.float32)
+    dt_bias = torch.randn(num_heads, dtype=torch.float32)
+
+    # Derive g, beta for the HF reference
+    g, beta = compute_g_beta(a, b, A_log, dt_bias)
 
     # L2 normalize Q and K (as our patched forward does externally)
     q = torch.nn.functional.normalize(q, dim=-1)
@@ -56,9 +65,9 @@ def test_torch_gated_delta_rule_op():
             q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=False
         )
 
-    # Test: our custom op
+    # Test: our custom op (takes raw a, b, A_log, dt_bias)
     with torch.no_grad():
-        test_output = torch.ops.auto_deploy.torch_gated_delta_rule(q, k, v, g, beta)
+        test_output = torch.ops.auto_deploy.torch_gated_delta_rule(q, k, v, a, b, A_log, dt_bias)
 
     torch.testing.assert_close(
         ref_output,
@@ -82,8 +91,13 @@ def test_torch_gated_delta_rule_op_bfloat16():
     q = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16)
     k = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16)
     v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.bfloat16)
-    g = -torch.rand(batch_size, seq_len, num_heads, dtype=torch.bfloat16)
-    beta = torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16))
+    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16)
+    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16)
+    A_log = torch.randn(num_heads, dtype=torch.float32)
+    dt_bias = torch.randn(num_heads, dtype=torch.bfloat16)
+
+    # Derive g, beta for the HF reference
+    g, beta = compute_g_beta(a, b, A_log, dt_bias)
 
     q = torch.nn.functional.normalize(q, dim=-1)
     k = torch.nn.functional.normalize(k, dim=-1)
@@ -94,7 +108,7 @@ def test_torch_gated_delta_rule_op_bfloat16():
         )
 
     with torch.no_grad():
-        test_output = torch.ops.auto_deploy.torch_gated_delta_rule(q, k, v, g, beta)
+        test_output = torch.ops.auto_deploy.torch_gated_delta_rule(q, k, v, a, b, A_log, dt_bias)
 
     torch.testing.assert_close(
         ref_output,

@@ -1,11 +1,21 @@
-"""Transform unit test for insert_cached_gated_delta_rule with the torch_gated_delta backend.
+"""Transform unit test for insert_cached_gated_delta_rule with the flashinfer_gated_delta backend.
+
+Requires SM90+ (Hopper) GPU for the CuTe DSL GDN decode kernel.
 
 Verifies the full pipeline:
   1. Build a mock model that calls ``torch_gated_delta_rule`` internally.
   2. Export to GraphModule.
   3. Apply the ``insert_cached_gated_delta_rule`` transform.
   4. Test full-sequence prefill matches uncached model output.
-  5. Test token-by-token autoregressive matches uncached model output.
+  5. Test token-by-token autoregressive decode output matches the cached model's
+     own full-sequence prefill output.
+
+Note: the autoregressive test compares against the cached model's prefill output
+(y_prefill) rather than the uncached reference (y_model) because the FlashInfer
+CuTe DSL decode kernel and the pure-torch ``torch_gated_delta_rule`` produce
+slightly different floating-point results.  Comparing cached prefill vs cached
+autoregressive verifies that "autoregressive caching reproduces the same result
+as full-sequence processing through the same kernel path."
 
 The stale-cache fix zeroes delta_cache tensors between phases because
 ``cm.info.reset()`` only clears sequence metadata, not physical cache data.
@@ -13,6 +23,7 @@ The stale-cache fix zeroes delta_cache tensors between phases because
 
 from typing import List, Optional
 
+import pytest
 import torch
 import torch.nn as nn
 from _torch_test_utils import all_close
@@ -27,6 +38,10 @@ from tensorrt_llm._torch.auto_deploy.models.factory import (
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+# CuTe DSL kernel requires SM90+ (Hopper)
+_sm90_available = torch.cuda.is_available() and torch.cuda.get_device_capability(0) >= (9, 0)
+_skip_reason = "CuTe DSL GDN decode kernel requires SM90+ (Hopper) GPU"
 
 # ---------------------------------------------------------------------------
 # Dummy factory (same pattern as test_kv_cache.py)
@@ -63,6 +78,8 @@ class DummyFactory(ModelFactory):
 
 class GatedDeltaRuleModel(nn.Module):
     """Minimal model that projects embeddings through torch_gated_delta_rule.
+
+    Uses K=128, V=128 to satisfy CuTe DSL kernel requirements (K >= 128, V >= 128).
 
     Architecture:
       input_ids -> embedding -> linear projections -> torch_gated_delta_rule -> output proj
@@ -126,21 +143,27 @@ class GatedDeltaRuleModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not _sm90_available, reason=_skip_reason)
 @torch.inference_mode()
-def test_torch_gated_delta_rule_cache():
-    """Test the insert_cached_gated_delta_rule transform with torch_gated_delta backend."""
+def test_flashinfer_gated_delta_rule_with_cache():
+    """Test the insert_cached_gated_delta_rule transform with flashinfer_gated_delta backend."""
     # Configuration
-    dtype = torch.float32
-    atol = 1e-3
-    rtol = 1e-3
-    batch_size = 4
-    seq_len = 16
+    dtype = torch.bfloat16
+    # Wider tolerances: FlashInfer CuTe DSL decode kernel vs pure-torch source op
+    atol_prefill = 5e-2
+    rtol_prefill = 5e-2
+    # Autoregressive vs prefill through the same cached kernel path
+    atol_ar = 5e-2
+    rtol_ar = 5e-2
+    batch_size = 2
+    seq_len = 8
     vocab_size = 100
-    hidden_size = 32
+    hidden_size = 256
     num_heads = 2
-    key_dim = 8
-    value_dim = 8
-    max_position_embeddings = 64
+    # CuTe DSL kernel requires K >= 128 and V >= 128 (V % 32 == 0)
+    key_dim = 128
+    value_dim = 128
+    max_position_embeddings = 32
 
     # Create CachedSequenceInterface
     kv_cache_config = KvCacheConfig(
@@ -167,7 +190,7 @@ def test_torch_gated_delta_rule_cache():
     # Create input data
     input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device="cuda")
 
-    # Get uncached reference output
+    # Get uncached reference output (pure-torch torch_gated_delta_rule)
     y_model = model(input_ids)  # [B, S, hidden]
 
     # Apply the transformation pipeline
@@ -194,7 +217,7 @@ def test_torch_gated_delta_rule_cache():
             },
             "insert_cached_gated_delta_rule": {
                 "stage": "cache_init",
-                "backend": "torch_gated_delta",
+                "backend": "flashinfer_gated_delta",
             },
         },
     )  # type: ignore
@@ -216,28 +239,31 @@ def test_torch_gated_delta_rule_cache():
     for cache in cm._caches.values():
         if cache is not None:
             cache.zero_()
-    y_no_cache = _call_and_unnest(input_ids, 0)
-    assert all_close(y_model, y_no_cache, atol=atol, rtol=rtol), (
+    y_prefill = _call_and_unnest(input_ids, 0)
+    assert all_close(y_model, y_prefill, atol=atol_prefill, rtol=rtol_prefill), (
         "Prefill output does not match uncached model output"
     )
 
     # ---- Test 2: Token-by-token autoregressive ----
+    # Compare against the cached model's full-sequence prefill output (y_prefill)
+    # rather than the uncached reference (y_model) because the FlashInfer CuTe DSL
+    # decode kernel and the pure-torch torch_gated_delta_rule produce slightly
+    # different floating-point results.  Comparing cached prefill vs cached
+    # autoregressive verifies that "autoregressive caching reproduces the same
+    # result as full-sequence processing through the same kernel path."
     cm.info.reset()
     # CRITICAL: Zero the delta_cache tensors between test phases.
     # cm.info.reset() only clears sequence metadata, NOT the physical cache.
-    # For recurrent state caches, the decode path unconditionally loads state
-    # from delta_cache when num_decode > 0, so stale data from the prior
-    # prefill test would corrupt the first autoregressive token.
     for cache in cm._caches.values():
         if cache is not None:
             cache.zero_()
 
-    y_with_cache = torch.empty_like(y_model)
+    y_autoregressive = torch.empty_like(y_model)
     for i_p in range(seq_len):
-        y_with_cache[:, i_p : i_p + 1] = _call_and_unnest(
+        y_autoregressive[:, i_p : i_p + 1] = _call_and_unnest(
             input_ids[:, i_p : i_p + 1],
             i_p,
         )
-    assert all_close(y_model, y_with_cache, atol=atol, rtol=rtol), (
-        "Autoregressive output does not match uncached model output"
+    assert all_close(y_prefill, y_autoregressive, atol=atol_ar, rtol=rtol_ar), (
+        "Autoregressive output does not match cached prefill output"
     )

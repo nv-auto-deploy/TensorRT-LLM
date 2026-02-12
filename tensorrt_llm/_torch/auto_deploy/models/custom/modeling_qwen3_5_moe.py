@@ -370,19 +370,17 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         query = torch.ops.auto_deploy.torch_l2norm(query)
         key = torch.ops.auto_deploy.torch_l2norm(key)
 
-        # 4. Compute beta and gating
-        beta = b.sigmoid()  # [B, S, num_v_heads]
-        # If the model is loaded in fp16, without the .float() here, A might be -inf
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)  # [B, S, num_v_heads]
-
-        # Repeat-interleave Q, K if num_v_heads > num_k_heads (GQA for linear attention)
+        # 4. Repeat-interleave Q, K if num_v_heads > num_k_heads (GQA for linear attention)
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         # 5. Gated Delta Rule via autodeploy custom op
+        # Pass raw a, b, A_log, dt_bias so any backend can compute g/beta as needed.
         # Op expects [B, S, H, D] layout (bsnd convention)
-        core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(query, key, value, g, beta)
+        core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+            query, key, value, a, b, self.A_log, self.dt_bias
+        )
 
         # 6. Gated RMSNorm
         z_shape_og = z.shape

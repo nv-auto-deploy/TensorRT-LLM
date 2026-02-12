@@ -16,6 +16,9 @@ import torch
 
 # Register all auto_deploy custom ops
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.delta_rule.torch_gated_delta_rule import (
+    compute_g_beta,
+)
 from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_fwd
 
@@ -31,17 +34,22 @@ def gdr_env():
 
 
 def _random_inputs(device, dtype, batch, seq, num_heads, key_dim, value_dim):
-    """Generate random gated delta rule inputs."""
+    """Generate random gated delta rule inputs (raw parameters).
+
+    Returns q, k, v, a, b (per-token), A_log, dt_bias (per-head model weights).
+    """
     q = torch.randn(batch, seq, num_heads, key_dim, device=device, dtype=dtype)
     k = torch.randn(batch, seq, num_heads, key_dim, device=device, dtype=dtype)
     v = torch.randn(batch, seq, num_heads, value_dim, device=device, dtype=dtype)
-    g = -torch.rand(batch, seq, num_heads, device=device, dtype=dtype)  # negative (decay)
-    beta = torch.sigmoid(torch.randn(batch, seq, num_heads, device=device, dtype=dtype))
+    a = torch.randn(batch, seq, num_heads, device=device, dtype=dtype)
+    b = torch.randn(batch, seq, num_heads, device=device, dtype=dtype)
+    A_log = torch.randn(num_heads, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(num_heads, device=device, dtype=dtype)
 
     # L2 normalize Q and K as the patched forward does
     q = torch.nn.functional.normalize(q, dim=-1)
     k = torch.nn.functional.normalize(k, dim=-1)
-    return q, k, v, g, beta
+    return q, k, v, a, b, A_log, dt_bias
 
 
 def test_decode_only(gdr_env):
@@ -63,7 +71,12 @@ def test_decode_only(gdr_env):
     max_batch_size = 6
     scale = key_dim**-0.5
 
-    q, k, v, g, beta = _random_inputs(device, dtype, batch, seq, num_heads, key_dim, value_dim)
+    q, k, v, a, b, A_log, dt_bias = _random_inputs(
+        device, dtype, batch, seq, num_heads, key_dim, value_dim
+    )
+
+    # Derive g, beta for reference kernels
+    g, beta = compute_g_beta(a, b, A_log, dt_bias)
 
     # Slot mapping with arbitrary order
     slot_idx = torch.tensor([4, 1, 3], device=device, dtype=torch.int32)
@@ -91,8 +104,10 @@ def test_decode_only(gdr_env):
         q,
         k,
         v,
-        g,
-        beta,
+        a,
+        b,
+        A_log,
+        dt_bias,
         batch_info_host,
         cu_seqlen,
         slot_idx,
@@ -158,7 +173,7 @@ def test_prefill_only(gdr_env):
     scale = key_dim**-0.5
 
     # Create flattened inputs: [1, total_tokens, H, D]
-    q, k, v, g, beta = _random_inputs(
+    q, k, v, a, b, A_log, dt_bias = _random_inputs(
         device,
         dtype,
         1,
@@ -167,6 +182,9 @@ def test_prefill_only(gdr_env):
         key_dim,
         value_dim,
     )
+
+    # Derive g, beta for reference kernels
+    g, beta = compute_g_beta(a, b, A_log, dt_bias)
 
     slot_idx = torch.tensor([2, 0], device=device, dtype=torch.int32)
     delta_cache = torch.zeros(
@@ -193,8 +211,10 @@ def test_prefill_only(gdr_env):
         q,
         k,
         v,
-        g,
-        beta,
+        a,
+        b,
+        A_log,
+        dt_bias,
         batch_info_host,
         cu_seqlen,
         slot_idx,
@@ -256,7 +276,12 @@ def test_prefill_with_initial_state(gdr_env):
     max_batch_size = 2
     scale = key_dim**-0.5
 
-    q, k, v, g, beta = _random_inputs(device, dtype, 1, seq_len, num_heads, key_dim, value_dim)
+    q, k, v, a, b, A_log, dt_bias = _random_inputs(
+        device, dtype, 1, seq_len, num_heads, key_dim, value_dim
+    )
+
+    # Derive g, beta for reference kernels
+    g, beta = compute_g_beta(a, b, A_log, dt_bias)
 
     slot_idx = torch.tensor([1], device=device, dtype=torch.int32)
 
@@ -281,8 +306,10 @@ def test_prefill_with_initial_state(gdr_env):
         q,
         k,
         v,
-        g,
-        beta,
+        a,
+        b,
+        A_log,
+        dt_bias,
         batch_info_host,
         cu_seqlen,
         slot_idx,
@@ -319,8 +346,10 @@ def test_prefill_with_initial_state(gdr_env):
         q,
         k,
         v,
-        g,
-        beta,
+        a,
+        b,
+        A_log,
+        dt_bias,
         batch_info_host,
         cu_seqlen,
         slot_idx,
