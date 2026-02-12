@@ -736,6 +736,16 @@ class ADEngine(ModelEngine):
             **extra_args,
         )
 
+        # Set padded_num_tokens for piecewise CG bucket alignment (prefill/mixed only).
+        # This makes _shape_for_forward return tensors sized to the bucket, while
+        # batch_info_host and other metadata stay unchanged for correct dynamic op behavior.
+        seq_info = self.cache_seq_interface.info
+        if not seq_info.is_generate and seq_info.piecewise_bucket_sizes:
+            total_tokens = seq_info.total_num_tokens
+            bucket = seq_info.find_nearest_piecewise_bucket(total_tokens)
+            if bucket is not None and bucket > total_tokens:
+                seq_info.padded_num_tokens = bucket
+
         if spec_resource_manager is not None and isinstance(
             spec_resource_manager, ADHiddenStateManager
         ):
