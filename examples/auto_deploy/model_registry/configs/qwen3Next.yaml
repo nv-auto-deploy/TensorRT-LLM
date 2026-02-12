@@ -14,7 +14,7 @@ kv_cache_config:
   tokens_per_block: 64
 model_kwargs:
   torch_dtype: bfloat16
-  # num_hidden_layers: 6
+  # num_hidden_layers: 1
 transforms:
   export_to_gm:
     num_moe_experts_for_export: 2

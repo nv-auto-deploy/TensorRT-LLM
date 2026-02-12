@@ -109,20 +109,36 @@ def fla_cached_gated_delta_rule(
         del y_prefill, initial_states, final_state
 
     if num_decode > 0:
-        y_decode = fused_recurrent_gated_delta_rule_update_fwd(
-            q=q_flat[num_prefill_tokens:, None],
-            k=k_flat[num_prefill_tokens:, None],
-            v=v_flat[num_prefill_tokens:, None],
-            g=g_flat[num_prefill_tokens:, None],
-            beta=beta_flat[num_prefill_tokens:, None],
-            scale=scale,
-            initial_state_source=delta_cache,
-            initial_state_indices=slot_idx[num_prefill:],
-        )
+        # WORKAROUND: Process decode sequences one at a time.
+        # The fused_recurrent Triton kernel produces wrong results for batch
+        # elements with i_n > 0 when B > 1, regardless of whether indirect or
+        # identity indices are used. Processing each token individually with
+        # B=1 avoids this kernel bug.
+        for i in range(num_decode):
+            seq_idx = num_prefill + i
+            slot = slot_idx[seq_idx]
+            token_idx = num_prefill_tokens + i
 
-        y_flat[num_prefill_tokens:, None] = y_decode.to(y_flat.dtype)
+            q_tok = q_flat[token_idx, :, :].unsqueeze(0).unsqueeze(0)  # [1, 1, H, K]
+            k_tok = k_flat[token_idx, :, :].unsqueeze(0).unsqueeze(0)
+            v_tok = v_flat[token_idx, :, :].unsqueeze(0).unsqueeze(0)
+            g_tok = g_flat[token_idx, :].unsqueeze(0).unsqueeze(0)
+            beta_tok = beta_flat[token_idx, :].unsqueeze(0).unsqueeze(0)
 
-        del y_decode
+            y_tok = fused_recurrent_gated_delta_rule_update_fwd(
+                q=q_tok,
+                k=k_tok,
+                v=v_tok,
+                g=g_tok,
+                beta=beta_tok,
+                scale=scale,
+                initial_state_source=delta_cache,
+                initial_state_indices=torch.tensor([slot], device=q.device, dtype=torch.long),
+            )
+
+            y_flat[token_idx, :, :] = y_tok[0, 0, :, :]
+
+            del y_tok
 
     return y
 
