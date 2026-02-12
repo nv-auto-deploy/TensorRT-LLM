@@ -61,24 +61,52 @@ def _get_fp8_linear_args(node: Node):
     return input_arg, weight_arg, bias_arg, in_scale, w_scale
 
 
-def _same_scale_source(a: Node, b: Node) -> bool:
+def _resolve_get_attr(gm: GraphModule, node: Node) -> "torch.Tensor | None":
+    """Resolve a get_attr node to its actual tensor value."""
+    if node.op != "get_attr":
+        return None
+    try:
+        atoms = node.target.split(".")
+        mod = gm
+        for atom in atoms:
+            mod = getattr(mod, atom)
+        return mod if isinstance(mod, torch.Tensor) else None
+    except (AttributeError, TypeError):
+        return None
+
+
+def _same_scale_source(a: Node, b: Node, gm: "GraphModule | None" = None) -> bool:
     """Check if two FX nodes reference the same underlying scale value.
 
     FX tracing may create separate get_attr nodes for the same parameter
     (e.g., self.in_scale accessed 3 times yields in_scale, in_scale_1,
     in_scale_2). These are different Node objects but point to the same
     parameter via their `target` attribute.
+
+    In real models, Q/K/V projections in the same layer each have their own
+    input_scale attribute (e.g., q_proj.input_scale, k_proj.input_scale)
+    but the actual tensor values are typically identical since they were
+    calibrated on the same input distribution.  When a GraphModule is
+    provided, we fall back to comparing actual tensor values.
     """
     if a is b:
         return True
     # Both are get_attr referencing the same module attribute
-    if a.op == "get_attr" and b.op == "get_attr" and a.target == b.target:
-        return True
+    if a.op == "get_attr" and b.op == "get_attr":
+        if a.target == b.target:
+            return True
+        # Different attributes -- compare actual tensor values if gm available
+        if gm is not None:
+            val_a = _resolve_get_attr(gm, a)
+            val_b = _resolve_get_attr(gm, b)
+            if val_a is not None and val_b is not None:
+                return torch.equal(val_a, val_b)
     return False
 
 
 def _find_fp8_linear_consumers(
     norm_node: Node,
+    gm: "GraphModule | None" = None,
 ) -> Tuple[List[Node], "Node | None"]:
     """Find trtllm_quant_fp8_linear consumers of a norm node.
 
@@ -94,7 +122,7 @@ def _find_fp8_linear_consumers(
             _, _, _, in_scale, _ = _get_fp8_linear_args(user)
             if shared_scale is None:
                 shared_scale = in_scale
-            elif not _same_scale_source(in_scale, shared_scale):
+            elif not _same_scale_source(in_scale, shared_scale, gm):
                 # Different input_scales -- cannot share a single FP8 output
                 return [], None
             fp8_linear_users.append(user)
@@ -148,13 +176,8 @@ class FuseRMSNormQuantFP8(BaseTransform):
             if not is_op(node, torch.ops.auto_deploy.flashinfer_rms_norm):
                 continue
 
-            print(f"GAGAM fuse_rmsnorm_quant_fp8: found flashinfer_rms_norm node: {node.name}")
-            for user in node.users:
-                print(f"GAGAM   direct user: op={user.op}, name={user.name}, target={user.target}")
-
-            fp8_linear_users, shared_scale = _find_fp8_linear_consumers(node)
+            fp8_linear_users, shared_scale = _find_fp8_linear_consumers(node, gm)
             if not fp8_linear_users:
-                print(f"GAGAM   -> no fp8_linear consumers found (count={len(fp8_linear_users)})")
                 continue
 
             # Determine output dtype from the norm node metadata
@@ -164,15 +187,21 @@ class FuseRMSNormQuantFP8(BaseTransform):
             # triton_rms_norm_quant_fp8(input, weight, eps, scale)
             #   -> (bf16_out, fp8_out)
             #
-            # Insert right before the first fp8_linear consumer to ensure
-            # all argument nodes (including shared_scale, which may be a
-            # get_attr defined after the norm node) are available.
+            # Insert right before the *topologically earliest* fp8_linear
+            # consumer.  node.users iteration order is arbitrary, so we
+            # scan graph.nodes to find the first one in our set.
+            # We also use the input_scale from that earliest user (not
+            # shared_scale, which may come from a later user whose get_attr
+            # isn't defined yet at this insertion point).  All scales were
+            # verified value-equal by _find_fp8_linear_consumers.
             norm_args = node.args  # (input, weight, eps)
-            first_fp8_user = fp8_linear_users[0]
-            with graph.inserting_before(first_fp8_user):
+            fp8_user_set = set(fp8_linear_users)
+            earliest_fp8_user = next(n for n in graph.nodes if n in fp8_user_set)
+            _, _, _, earliest_scale, _ = _get_fp8_linear_args(earliest_fp8_user)
+            with graph.inserting_before(earliest_fp8_user):
                 fused_node = graph.call_function(
                     torch.ops.auto_deploy.triton_rms_norm_quant_fp8.default,
-                    args=(*norm_args, shared_scale),
+                    args=(*norm_args, earliest_scale),
                 )
                 bf16_node = graph.call_function(operator.getitem, args=(fused_node, 0))
                 fp8_node = graph.call_function(operator.getitem, args=(fused_node, 1))
