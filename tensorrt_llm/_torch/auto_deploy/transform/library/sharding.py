@@ -44,7 +44,7 @@ from ...utils.node_utils import (
     get_all_layer_subgraphs,
     get_all_weight_infos,
     get_all_weights_in_subgraph,
-    is_any_attention_op,
+    is_any_delta_op,
     is_any_lin_op,
     is_any_moe_op,
     is_any_ssm_op,
@@ -137,7 +137,7 @@ class ShardingTransformConfig(TransformConfig):
         default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
     shard_all_unprocessed: bool = Field(
-        default=True,
+        default=False,
         description="When True, apply simple shard (column split + all_gather) to "
         "'leftover' linear nodes that are not part of any layer subgraph.",
     )
@@ -1833,6 +1833,184 @@ def _process_ssm_sharding(
     return 1
 
 
+def _process_delta_sharding(
+    layer_subgraph: LayerSubgraph,
+    transform_container: ShardingTransformContainer,
+) -> int:
+    """
+    Process the Delta sharding from the Delta layer subgraph and update the view and split nodes accordingly.
+    See modeling_qwen3_next.py:Qwen3NextGatedDeltaNet for the details.
+
+    Weight sharding actions:
+    in_proj_qkvz, in_proj_ba: nn.Linear  -> column sharding
+    out_proj: nn.Linear -> row sharding
+    conv1d: nn.Conv1d -> column sharding
+    A_log, dt_bias, norm weights: nn.Parameter -> column sharding
+    """
+    config = transform_container.config
+    world_size = config.world_size
+    # check if we have exactly 2 opening linear nodes (in_proj_qkvz and in_proj_ba)
+    assert len(layer_subgraph.opening_nodes) == 2, (
+        "Expecting exactly two opening nodes for Delta layer"
+    )
+    # extract in_proj_qkvz, in_proj_ba, and out_proj nodes
+    in_proj_qkvz, in_proj_ba = layer_subgraph.opening_nodes
+    out_proj = layer_subgraph.terminating_node
+
+    # Get subgraph between entry nodes and out_proj node
+    subgraph_nodes = layer_subgraph.subgraph_nodes
+    gm = in_proj_qkvz.graph.owning_module
+
+    ##############################################################
+    ########## identify conv1d and split node after it ##########
+    ##############################################################
+    # The split after conv1d splits concatenated (q,k,v) with sizes [key_dim, key_dim, value_dim]
+    # where key_dim = num_k_heads * head_k_dim, value_dim = num_v_heads * head_v_dim
+    # These DO depend on num_heads and need to be updated
+    conv1d_nodes = [
+        n for n in subgraph_nodes if is_op(n, [torch.ops.auto_deploy.torch_causal_conv1d])
+    ]
+    assert len(conv1d_nodes) == 1, "Expecting exactly one conv1d node"
+    conv1d_node = conv1d_nodes[0]
+
+    # Find the split node after conv1d by searching forward in dataflow
+    # Pattern: conv1d -> transpose -> split([key_dim, key_dim, value_dim])
+    split_node_after_conv, depth = bfs(
+        conv1d_node,
+        lambda n: is_op(n, [torch.ops.aten.split_with_sizes, torch.ops.aten.split])
+        and len(list(n.users)) >= 3,  # Should produce 3 outputs (q, k, v)
+    )
+
+    # ##############################################################
+    # ####### shard the opening nodes (in_proj_qkvz, in_proj_ba) ###
+    # ##############################################################
+    # Column-shard WITHOUT fused_weight_dims because the splits on dim=3
+    # in fix_query_key_value_ordering are NOT sharding across heads
+    if not transform_container.add(
+        WeightShardingInfo.from_node(
+            in_proj_qkvz,
+            split_dim=SplitDimension.COLUMN,
+            config=config,
+            dist_op=None,
+            min_local_shape=1,
+            layer_type=LayerType.DELTA,
+        )
+    ):
+        # the layer was already sharded. Skipping.
+        return 0
+
+    transform_container.add(
+        WeightShardingInfo.from_node(
+            in_proj_ba,
+            split_dim=SplitDimension.COLUMN,
+            config=config,
+            dist_op=None,
+            min_local_shape=1,
+            layer_type=LayerType.DELTA,
+        )
+    )
+
+    # ##############################################################
+    # ############## update split node after conv1d ################
+    # ##############################################################
+    # The split after conv1d uses [key_dim, key_dim, value_dim] where:
+    # key_dim = num_k_heads * head_k_dim, value_dim = num_v_heads * head_v_dim
+    # These need to be divided by world_size
+    if split_node_after_conv is not None and depth > 0:
+        split_args_after_conv = list(split_node_after_conv.args)
+        # Check if it's split_with_sizes (has list of sizes) or regular split
+        if len(split_args_after_conv) > 1 and isinstance(split_args_after_conv[1], (list, tuple)):
+            split_args_after_conv[1] = [s // world_size for s in split_args_after_conv[1]]
+            transform_container.add(
+                ParameterUpdateInfo(
+                    config=config,
+                    target_node=split_node_after_conv.name,
+                    args=tuple(split_args_after_conv),
+                )
+            )
+
+    # ##############################################################
+    # ############# update conv1d num output channels ##############
+    # ##############################################################
+    # conv1d operates on concatenated (q,k,v) which has total size:
+    # key_dim * 2 + value_dim = (num_k_heads * head_k_dim) * 2 + (num_v_heads * head_v_dim)
+    # After sharding, this becomes (num_k_heads // world_size) * head_k_dim * 2 + ...
+    conv_args = list(conv1d_node.args)
+    conv_args[-1] = conv1d_node.args[-1] // world_size
+    transform_container.add(
+        ParameterUpdateInfo(config=config, target_node=conv1d_node.name, args=tuple(conv_args))
+    )
+
+    # ##############################################################
+    # ############## shard the remaining weights ###################
+    # ##############################################################
+    # conv1d weight, at_bias, a_log
+
+    delta_node = list(filtered_nodes(subgraph_nodes, is_any_delta_op))[0]
+    weight_nodes = [
+        n for n in get_all_weights_in_subgraph([in_proj_qkvz, in_proj_ba], [delta_node])
+    ]
+    for weight_node in weight_nodes:
+        weight_key = weight_node.target
+        # Get the weight parameter
+        try:
+            gm.get_parameter(weight_key)
+        except AttributeError:
+            ad_logger.debug(f"Could not get parameter for {weight_key}, skipping")
+            continue
+
+        # Shard the weight tensor (no fused dims needed)
+        transform_container.add(
+            WeightShardingInfo.from_node(
+                weight_node,
+                split_dim=SplitDimension.COLUMN,
+                config=config,
+                dist_op=None,
+                min_local_shape=1,
+                layer_type=LayerType.DELTA,
+            )
+        )
+
+    # ##############################################################
+    # ############## update the view and reshape nodes #############
+    # ##############################################################
+    # Update view/reshape operations that explicitly reference num_k_heads or num_v_heads
+    # Pattern: view(..., num_k_heads, ...) or reshape(..., num_v_heads)
+    nodes_to_validate = [
+        n for n in subgraph_nodes if is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape])
+    ]
+    for view_node in nodes_to_validate:
+        if len(view_node.args) < 2:
+            continue
+        view_shape = list(view_node.args[1])
+        if not isinstance(view_shape, list) and not isinstance(view_shape, tuple):
+            continue
+        view_shape = list(view_shape)
+        # Check if dimension 2 (head dimension) has a concrete value to shard
+        if len(view_shape) >= 3 and isinstance(view_shape[2], int) and view_shape[2] != -1:
+            args = list(view_node.args)
+            view_shape[2] = view_shape[2] // world_size
+            args[1] = tuple(view_shape)
+            transform_container.add(
+                ParameterUpdateInfo(config=config, target_node=view_node.name, args=tuple(args))
+            )
+            ad_logger.debug(f"\nUpdated view node {view_node} arguments to {view_shape}")
+
+    ##############################################################
+    ############## shard the out_proj node #######################
+    ##############################################################
+    transform_container.add(
+        WeightShardingInfo.from_node(
+            out_proj,
+            split_dim=SplitDimension.ROW,
+            config=config,
+            dist_op="all_reduce",
+            layer_type=LayerType.DELTA,
+        )
+    )
+    return 1
+
+
 def _process_mla_sharding(
     layer_subgraph: LayerSubgraph,
     transform_container: ShardingTransformContainer,
@@ -2516,15 +2694,14 @@ def detect_column_row_shard(
     num_ssm_shards = 0
     num_mha_shards = 0
     num_mla_shards = 0
+    num_delta_shards = 0
     num_column_row_shards = 0
     for layer in layer_subgraphs:
         opening = layer.opening_nodes
         closing = layer.terminating_node
         layer_subgraph = layer.subgraph_nodes
-        nodes_linear = opening + [closing]
-
-        attention_nodes = list(filtered_nodes(layer_subgraph, is_any_attention_op))
-        min_local_shape = 1
+        min_local_shape = layer.min_local_shape
+        nodes_linear = opening + [closing] + list(filtered_nodes(layer_subgraph, is_any_lin_op))
 
         if config.simple_shard_only or layer.layer_type == LayerType.UNKNOWN:
             ad_logger.debug(
@@ -2550,11 +2727,14 @@ def detect_column_row_shard(
             )
             continue
 
+        if layer.layer_type == LayerType.DELTA:
+            num_delta_shards += _process_delta_sharding(
+                layer,
+                transform_container,
+            )
+            continue
+
         if layer.layer_type == LayerType.ATTENTION:
-            ad_logger.debug(f"Found attention nodes in layer subgraph: {attention_nodes}")
-            # Extract head dimension. We cannot shard below the head_dim size.
-            # Assume that head_dim is the last (innermost) dimension of the tensor
-            min_local_shape = shape(attention_nodes[0])[-1]
             # if the QKV projection is fused, check if num_kv_heads is divisible by world_size
             if len(opening) == 1:
                 qkv_proj_node = opening[0]
@@ -2607,7 +2787,7 @@ def detect_column_row_shard(
     ad_logger.info(
         f"Heuristics found {num_shards} TP shards. Simple: {num_simple_shards}, "
         f"row-col: {num_column_row_shards} (including: ssm: {num_ssm_shards}, "
-        f"mha: {num_mha_shards}, mla: {num_mla_shards})"
+        f"mha: {num_mha_shards}, mla: {num_mla_shards}, delta: {num_delta_shards})"
     )
     return TransformInfo(
         skipped=False, num_matches=num_shards, is_clean=False, has_valid_shapes=False
