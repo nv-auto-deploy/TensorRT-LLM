@@ -87,6 +87,31 @@ def _rope_deinterleave_load_hook(
             state_dict[kv_bias_key] = torch.cat([b_kv, b_pe])
 
 
+def build_cos_sin_caches(freqs: torch.Tensor, scale: float = 1.0):
+    """Build cos/sin caches in the formats needed by both kernels.
+
+    Args:
+        freqs: Frequency tensor of shape [max_seq_len, D/2] from torch.outer(t, inv_freq).
+        scale: Optional scaling factor (e.g. attention_scaling or mscale).
+
+    Returns:
+        cos_full: Triton format [max_seq_len, D] (duplicated halves).
+        sin_full: Triton format [max_seq_len, D] (duplicated halves).
+        cos_sin_cache: FlashInfer format [max_seq_len, D] fused float32.
+    """
+    cos_half = freqs.cos() * scale  # [max_seq_len, D/2]
+    sin_half = freqs.sin() * scale  # [max_seq_len, D/2]
+
+    # Triton format: separate cos/sin of shape [max_seq_len, D] (duplicated halves)
+    cos_full = torch.cat([cos_half, cos_half], dim=-1)  # [max_seq_len, D]
+    sin_full = torch.cat([sin_half, sin_half], dim=-1)  # [max_seq_len, D]
+
+    # FlashInfer format: fused [cos_half || sin_half] of shape [max_seq_len, D], float32
+    cos_sin_cache = torch.cat([cos_half, sin_half], dim=-1).float()  # [max_seq_len, D]
+
+    return cos_full, sin_full, cos_sin_cache
+
+
 class DeepSeekV3RMSNorm(nn.Module):
     """RMS Normalization for DeepSeekV3."""
 
@@ -123,18 +148,24 @@ class DeepSeekV3RotaryEmbedding(nn.Module):
     def _set_cos_sin_cache(self, seq_len: int):
         self.max_seq_len_cached = seq_len
         t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        freqs = torch.outer(t, self.inv_freq)  # [max_seq_len, D/2]
+
+        cos_full, sin_full, cos_sin_cache = build_cos_sin_caches(freqs)
+
+        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
+        self.register_buffer("_ad_cos_cached", cos_full, persistent=False)
+        self.register_buffer("_ad_sin_cached", sin_full, persistent=False)
+        self.register_buffer("_ad_rope_cos_sin_cache", cos_sin_cache, persistent=False)
 
     def forward(
         self, x: torch.Tensor, seq_len: Optional[int] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Return full cached cos/sin (not sliced) for export compatibility
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Return full cached cos/sin (not sliced) for export compatibility,
+        # plus pre-fused cache for FlashInfer RoPE optimization
         return (
-            self.cos_cached.to(dtype=x.dtype, device=x.device),
-            self.sin_cached.to(dtype=x.dtype, device=x.device),
+            self._ad_cos_cached.to(dtype=x.dtype, device=x.device),
+            self._ad_sin_cached.to(dtype=x.dtype, device=x.device),
+            self._ad_rope_cos_sin_cache,
         )
 
 
@@ -189,9 +220,12 @@ class DeepSeekV3YarnRotaryEmbedding(DeepSeekV3RotaryEmbedding):
             / self._yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
         )
 
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", (emb.cos() * _mscale), persistent=False)
-        self.register_buffer("sin_cached", (emb.sin() * _mscale), persistent=False)
+        cos_full, sin_full, cos_sin_cache = build_cos_sin_caches(freqs, scale=_mscale)
+
+        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
+        self.register_buffer("_ad_cos_cached", cos_full, persistent=False)
+        self.register_buffer("_ad_sin_cached", sin_full, persistent=False)
+        self.register_buffer("_ad_rope_cos_sin_cache", cos_sin_cache, persistent=False)
 
     @staticmethod
     def _yarn_find_correction_dim(
@@ -486,8 +520,8 @@ class DeepSeekV3Attention(nn.Module):
 
         kv_seq_len = q_len
 
-        # Get cos/sin for RoPE
-        cos, sin = self.rotary_emb(hidden_states, seq_len=kv_seq_len)
+        # Get cos/sin for RoPE (third element is pre-fused cache, unused here)
+        cos, sin, _ = self.rotary_emb(hidden_states, seq_len=kv_seq_len)
         cos = cos[position_ids]  # [B, S, head_dim]
         sin = sin[position_ids]  # [B, S, head_dim]
 

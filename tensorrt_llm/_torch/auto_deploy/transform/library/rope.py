@@ -442,9 +442,10 @@ def _try_prefuse_cos_sin_cache(
 ) -> Optional[Node]:
     """Try to precompute the fused cos_sin cache as a graph constant.
 
-    Traces back from cos/sin table nodes to find the source get_attr buffers,
-    computes the fused cache from actual tensor values, and registers it as
-    a new attribute on the GraphModule.
+    First checks if a pre-fused cache (_ad_rope_cos_sin_cache) already exists
+    as a sibling buffer of the cos/sin tables (built by build_cos_sin_caches).
+    If found, reuses it directly. Otherwise, computes the fused cache from the
+    cos/sin table tensor values.
 
     Returns a get_attr Node for the fused cache, or None if precomputation
     is not possible (caller should fall back to runtime slice+concat).
@@ -471,7 +472,25 @@ def _try_prefuse_cos_sin_cache(
     if cos_tensor.is_meta or sin_tensor.is_meta:
         return None
 
-    # Compute fused cache: [max_seq_len, head_dim] in float32
+    # Try to reuse an existing pre-fused cache (_ad_rope_cos_sin_cache) built
+    # by build_cos_sin_caches, which lives as a sibling buffer of cos/sin tables.
+    cos_target = cos_source.target
+    parent_path = cos_target.rsplit(".", 1)[0] if "." in cos_target else ""
+    prefused_path = (
+        f"{parent_path}._ad_rope_cos_sin_cache" if parent_path else "_ad_rope_cos_sin_cache"
+    )
+    try:
+        prefused_tensor = _get_nested_attr(gm, prefused_path)
+        if not prefused_tensor.is_meta:
+            # Reuse the existing buffer directly
+            with graph.inserting_after(_get_last_node([cos_source, sin_source])):
+                fused_node = graph.create_node("get_attr", prefused_path)
+            fused_node.meta["val"] = torch.empty_like(prefused_tensor, device="meta")
+            return fused_node
+    except AttributeError:
+        pass
+
+    # Fallback: compute fused cache from cos/sin tables
     # Format: [cos_0..cos_{d/2-1}, sin_0..sin_{d/2-1}]
     fused = torch.cat([cos_tensor[:, :half_head_dim], sin_tensor[:, :half_head_dim]], dim=-1).to(
         torch.float32

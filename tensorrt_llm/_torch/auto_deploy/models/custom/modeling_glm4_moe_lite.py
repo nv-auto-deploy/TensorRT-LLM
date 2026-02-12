@@ -194,6 +194,31 @@ def _rope_deinterleave_load_hook(
             state_dict[kv_bias_key] = torch.cat([b_kv, b_pe])
 
 
+def build_cos_sin_caches(freqs: torch.Tensor, scale: float = 1.0):
+    """Build cos/sin caches in the formats needed by both kernels.
+
+    Args:
+        freqs: Frequency tensor of shape [max_seq_len, D/2] from torch.outer(t, inv_freq).
+        scale: Optional scaling factor (e.g. attention_scaling or mscale).
+
+    Returns:
+        cos_full: Triton format [max_seq_len, D] (duplicated halves).
+        sin_full: Triton format [max_seq_len, D] (duplicated halves).
+        cos_sin_cache: FlashInfer format [max_seq_len, D] fused float32.
+    """
+    cos_half = freqs.cos() * scale  # [max_seq_len, D/2]
+    sin_half = freqs.sin() * scale  # [max_seq_len, D/2]
+
+    # Triton format: separate cos/sin of shape [max_seq_len, D] (duplicated halves)
+    cos_full = torch.cat([cos_half, cos_half], dim=-1)  # [max_seq_len, D]
+    sin_full = torch.cat([sin_half, sin_half], dim=-1)  # [max_seq_len, D]
+
+    # FlashInfer format: fused [cos_half || sin_half] of shape [max_seq_len, D], float32
+    cos_sin_cache = torch.cat([cos_half, sin_half], dim=-1).float()  # [max_seq_len, D]
+
+    return cos_full, sin_full, cos_sin_cache
+
+
 class Glm4MoeLiteRMSNorm(nn.Module):
     """RMS Normalization for GLM4 MoE Lite.
 
@@ -245,19 +270,16 @@ class Glm4MoeLiteRotaryEmbedding(nn.Module):
     def _set_cos_sin_cache(self, seq_len: int):
         self.max_seq_len_cached = seq_len
         t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos() * self.attention_scaling
-        sin = emb.sin() * self.attention_scaling
-        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
-        self.register_buffer("_ad_cos_cached", cos, persistent=False)
-        self.register_buffer("_ad_sin_cached", sin, persistent=False)
+        freqs = torch.outer(t, self.inv_freq)  # [max_seq_len, D/2]
 
-        # Pre-fused cache for FlashInfer: [max_seq_len, head_dim] in float32
-        # Format: [cos_0..cos_{d/2-1}, sin_0..sin_{d/2-1}]
-        half = cos.shape[-1] // 2
-        fused = torch.cat([cos[:, :half], sin[:, :half]], dim=-1).to(torch.float32)
-        self.register_buffer("_ad_rope_cos_sin_cache", fused, persistent=False)
+        cos_full, sin_full, cos_sin_cache = build_cos_sin_caches(
+            freqs, scale=self.attention_scaling
+        )
+
+        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
+        self.register_buffer("_ad_cos_cached", cos_full, persistent=False)
+        self.register_buffer("_ad_sin_cached", sin_full, persistent=False)
+        self.register_buffer("_ad_rope_cos_sin_cache", cos_sin_cache, persistent=False)
 
     def forward(
         self, x: torch.Tensor, seq_len: Optional[int] = None
@@ -323,19 +345,12 @@ class Glm4MoeLiteYarnRotaryEmbedding(Glm4MoeLiteRotaryEmbedding):
             / self._yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
         )
 
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos() * _mscale
-        sin = emb.sin() * _mscale
-        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
-        # Note: attention_scaling is already incorporated in _mscale for YaRN
-        self.register_buffer("_ad_cos_cached", cos, persistent=False)
-        self.register_buffer("_ad_sin_cached", sin, persistent=False)
+        cos_full, sin_full, cos_sin_cache = build_cos_sin_caches(freqs, scale=_mscale)
 
-        # Pre-fused cache for FlashInfer: [max_seq_len, head_dim] in float32
-        # Format: [cos_0..cos_{d/2-1}, sin_0..sin_{d/2-1}]
-        half = cos.shape[-1] // 2
-        fused = torch.cat([cos[:, :half], sin[:, :half]], dim=-1).to(torch.float32)
-        self.register_buffer("_ad_rope_cos_sin_cache", fused, persistent=False)
+        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
+        self.register_buffer("_ad_cos_cached", cos_full, persistent=False)
+        self.register_buffer("_ad_sin_cached", sin_full, persistent=False)
+        self.register_buffer("_ad_rope_cos_sin_cache", cos_sin_cache, persistent=False)
 
     @staticmethod
     def _yarn_find_correction_dim(
