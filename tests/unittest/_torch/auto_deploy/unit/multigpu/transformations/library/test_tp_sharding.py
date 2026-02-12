@@ -763,6 +763,7 @@ def _run_pattern_detection_job(
             "detect_sharding": {
                 "stage": "sharding",
                 "use_sharding_from_factory": from_config,
+                "shard_all_unprocessed": True,
             },
         },
     )
