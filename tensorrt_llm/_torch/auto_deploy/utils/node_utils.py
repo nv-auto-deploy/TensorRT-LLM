@@ -39,6 +39,7 @@ class LayerType(Enum):
     MLP = "mlp"
     MOE = "moe"
     MLA = "mla"
+    DELTA = "delta"
     UNKNOWN = "unknown"
 
 
@@ -389,6 +390,15 @@ def is_any_moe_op(node: Node) -> bool:
     )
 
 
+def is_any_delta_op(node: Node) -> bool:
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_gated_delta_rule,
+        ],
+    )
+
+
 def is_residual_add(node: Node) -> bool:
     if is_op(node, torch.ops.aten.add):
         if len(list(filtered_nodes(node.args, is_any_lin_op))) == 1:
@@ -410,6 +420,7 @@ def is_any_conv_op(node: Node) -> bool:
         node,
         ops=[
             torch.ops.auto_deploy.torch_causal_conv1d,
+            torch.ops.aten.conv1d,  # Support regular conv1d for tests
         ],
     )
 
@@ -497,7 +508,7 @@ def precompute_weight_node_mapping(gm: GraphModule) -> None:
       - Each weight node mapped to exactly one consumer
     """
     # Early return if already computed
-    if "_weight_mapping_computed" in gm.meta:
+    if "_weight_mapping_computed" in gm.meta and gm.meta["_weight_mapping_computed"]:
         return
     gm.meta["_weight_mapping_computed"] = True
 
@@ -506,6 +517,9 @@ def precompute_weight_node_mapping(gm: GraphModule) -> None:
             continue
 
         is_bias = node.target.endswith("bias")
+
+        # the weight to user mapping is reflective - the weight node "owns" itself
+        node.meta["weight_nodes"] = [node]
 
         # Find the consumer compute node by traversing through auxiliary ops
         current = node
@@ -517,8 +531,6 @@ def precompute_weight_node_mapping(gm: GraphModule) -> None:
             if not users:
                 break
 
-            # Check if any user is a compute node (not an auxiliary op)
-            consumer_found = None
             aux_node = None
 
             for user in users:
@@ -541,15 +553,8 @@ def precompute_weight_node_mapping(gm: GraphModule) -> None:
                 if user.target in _WEIGHT_AUX_OPS:
                     # This is an auxiliary op, continue traversing
                     aux_node = user
-                else:
-                    # This is a potential consumer compute node
-                    consumer_found = user
-                    break
 
-            if consumer_found is not None:
-                # Found the consumer, return
-                break
-            elif aux_node is not None and aux_node not in visited:
+            if aux_node is not None and aux_node not in visited:
                 # Continue through auxiliary op
                 current = aux_node
                 visited.add(current)
@@ -648,7 +653,7 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     Right now, we split the regions according to the following structure:
         1. Input node
         2. Embedding node
-        3. Residual nodes from the embedding node onwards (no other nodes in-between0)
+        3. Residual nodes from the embedding node onwards (no other nodes in-between)
         4. Output node
 
     The list will contain the boundary nodes between the regions.
@@ -682,11 +687,14 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     boundary_nodes.append(n_user)
 
     # find residual nodes from here on
-    # NOTE: for now, we assume that the residual nodes do not go through point-wise operations like
-    # activations. We are just looking for a "straight" path to the output.
-    for node in gm.graph.nodes:
-        if is_op(node, torch.ops.aten.add) and any(n == node for n in boundary_nodes[-1].users):
-            boundary_nodes.append(node)
+    while True:
+        next_res_add, _ = bfs(
+            boundary_nodes[-1], lambda n: is_op(n, torch.ops.aten.add), include_root=False
+        )
+        if next_res_add is None:
+            break
+        else:
+            boundary_nodes.append(next_res_add)
 
     # sanity check: we expect at most two users for any residual node
     res_nodes_more_users = [n for n in boundary_nodes[2:] if len(n.users) > 2]
@@ -734,6 +742,9 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
     layer_subgraphs = []
     linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
 
+    # get residual add nodes to correctly identify layer boundaries
+    residuals = identify_regions_between_residuals(gm)
+
     # Pre-compute weight-to-consumer mapping for O(1) weight node lookup
     precompute_weight_node_mapping(gm)
 
@@ -757,7 +768,9 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
 
     # For each linear node, find its layer subgraph defined as regions between consecutive linear nodes.
     while last_lin_index < len(linear_nodes):
-        layer_subgraph = get_layer_after_linear_node(linear_nodes, terminating_indices, embd=embd)
+        layer_subgraph = get_layer_after_linear_node(
+            linear_nodes, terminating_indices, embd=embd, residuals=residuals
+        )
 
         if layer_subgraph.opening_nodes is not None and len(layer_subgraph.opening_nodes) > 0:
             unprocessed_linear_nodes -= (
@@ -1029,6 +1042,7 @@ def get_layer_after_linear_node(
     linear_nodes: List[Node],
     terminating_indices: List[int],
     embd: int,
+    residuals: List[Node],
     match_on_shapes: bool = True,
     enforce_strict_linear_history: bool = True,
 ) -> LayerSubgraph:
@@ -1077,14 +1091,14 @@ def get_layer_after_linear_node(
             return (
                 is_any_moe_op(node)
                 or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
-                or is_residual_add(node)
+                or node in residuals
             )
         else:
             return (
                 is_any_lin_op(node)
                 or is_any_moe_op(node)
                 or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
-                or is_residual_add(node)
+                or node in residuals
             )
 
     def filter_condition(node: Node, dim: int) -> bool:
@@ -1157,6 +1171,7 @@ def get_layer_after_linear_node(
         if n not in set(opening_linear_nodes).union([terminating_linear_node])
     ]
     ssm_nodes = list(filtered_nodes(interior_nodes, is_any_ssm_op))
+    delta_nodes = list(filtered_nodes(interior_nodes, is_any_delta_op))
     attention_nodes = list(filtered_nodes(interior_nodes, is_any_attention_op))
     intermediate_lin_nodes = list(filtered_nodes(interior_nodes, is_any_lin_op))
     intermediate_weight_nodes = list(
@@ -1169,9 +1184,26 @@ def get_layer_after_linear_node(
     ########## LAYER TYPE CLASSIFICATION ###############
     ####################################################
 
-    def classify_layer_type() -> [LayerType, int]:
-        if len(ssm_nodes) + len(attention_nodes) > 1:
+    def classify_layer_type() -> Tuple[LayerType, int]:
+        if len(attention_nodes) + len(ssm_nodes) + len(delta_nodes) > 1:
             return LayerType.UNKNOWN, 1
+
+        if len(delta_nodes) == 1:
+            head_size = shape(delta_nodes[0])[-1]
+            # Gated DeltaNet layers should have 2 opening linear nodes and one terminating.
+            if len(intermediate_lin_nodes) > 0 or len(opening_linear_nodes) != 2:
+                return LayerType.UNKNOWN, 1
+            # Gated DeltaNet layer should have 4 to 6 intermediate weight nodes:
+            # - conv1d weight
+            # - attn_A (attn_a_log))
+            # - attn_norm_weight
+            # - layernorm_weight
+            # - attn_dt_bias [optional]
+            # - conv1d bias [optional]
+
+            if len(intermediate_weight_nodes) not in list(range(4, 7)):
+                return LayerType.UNKNOWN, 1
+            return LayerType.DELTA, head_size
 
         if len(attention_nodes) == 1:
             head_size = shape(attention_nodes[0])[-1]
