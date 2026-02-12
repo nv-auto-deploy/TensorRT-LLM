@@ -67,6 +67,7 @@ def _to_fp8(x, scale):
 
 
 @torch.library.custom_op("auto_deploy::trtllm_quant_fp8_linear", mutates_args=())
+@torch.compile(dynamic=True)
 def trtllm_quant_fp8_linear(
     input: torch.Tensor,
     weight_fp8: torch.Tensor,
@@ -74,12 +75,17 @@ def trtllm_quant_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """FP8 linear op similar to torch.nn.linear using TensorRT-LLM FP8 operations.
+    """FP8 linear op using compilable quantization + tuned cuBLAS GEMM.
+
+    Quantization uses PyTorch-level _to_fp8 (div + clamp + cast) which
+    torch.compile fuses into a single Triton kernel. The GEMM dispatches
+    to TRT-LLM's tuned cuBLAS (with nvjet algo LUTs) or CUDA-core kernels.
 
     Args:
-        input: unquantized input tensor
+        input: unquantized input tensor (BF16/FP16)
         weight_fp8: pre-quantized weight tensor, with dtype torch.float8_e4m3fn
-        input_scale: (Optional) pre-computed scalar tensor for static quantization.
+        bias: optional bias tensor
+        input_scale: pre-computed scalar tensor for static per-tensor quantization.
         weight_scale: scalar tensor for weight dequantization.
 
     Returns:
@@ -114,20 +120,19 @@ def trtllm_quant_fp8_linear(
             weight_fp8, (0, 0, 0, n_pad), mode="constant", value=0
         ).contiguous()
 
-    # Use TensorRT-LLM FP8 per-tensor quantization
+    # Compilable FP8 quantization: torch.compile fuses div + clamp + cast into
+    # a single Triton kernel, replacing the standalone scaleMatrix CUDA kernel.
     assert input_scale is not None
-    input_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(input, input_scale)
+    input_fp8 = _to_fp8(input, input_scale)
 
     enable_cuda_core = False
     if torch.cuda.is_available():
         capability = torch.cuda.get_device_capability(0)
         enable_cuda_core = capability == (8, 9) or capability == (12, 0)
-    # Use TensorRT-LLM FP8 scaled matrix multiply
-    # Choose between CUDA core (for small M) and cuBLAS (for large M) implementations
-    if (
-        input_fp8.shape[0] <= 8 and enable_cuda_core
-    ):  # NOTE: this kernel work with n % 2 == 0 as well??
-        # Use CUDA core for small M dimension (better for small batch sizes)
+    # Tuned cuBLAS GEMM with nvjet algo LUTs (or CUDA-core for small M).
+    # These custom ops are opaque to torch.compile (graph breaks), which is
+    # correct -- we want the hand-tuned cuBLAS kernels, not generic compiled GEMM.
+    if input_fp8.shape[0] <= 8 and enable_cuda_core:
         output = torch.ops.trtllm.cuda_scaled_mm(
             input_fp8,
             weight_fp8.t(),
@@ -137,7 +142,6 @@ def trtllm_quant_fp8_linear(
             out_dtype=input_dtype,
         )
     else:
-        # Use cuBLAS for large M dimension
         output = torch.ops.trtllm.cublas_scaled_mm(
             input_fp8,
             weight_fp8.t(),
