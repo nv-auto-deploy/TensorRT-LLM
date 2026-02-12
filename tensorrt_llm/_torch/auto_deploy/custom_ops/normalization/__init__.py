@@ -25,6 +25,7 @@ This module provides various normalization implementations:
 __all__ = [
     "rms_norm",
     "triton_rms_norm",
+    "triton_rms_norm_quant_fp8",
     "l2norm",
     "flashinfer_fused_add_rms_norm",
 ]
