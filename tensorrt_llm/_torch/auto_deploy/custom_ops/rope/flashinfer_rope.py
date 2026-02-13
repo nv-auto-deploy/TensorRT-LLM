@@ -52,7 +52,7 @@ def apply_rope_with_input_pos_flashinfer(
     q_shape = q.shape
     k_shape = k.shape
 
-    position_ids = position_ids.view(-1).to(q.device).int()  # flashinfer requires int
+    position_ids = position_ids.view(-1).to(device=q.device, dtype=torch.int32)
 
     # Flatten batch and seq dims only (contiguous), keep (num_heads, head_dim) as-is.
     # This avoids forcing .contiguous() on non-contiguous split_with_sizes outputs.

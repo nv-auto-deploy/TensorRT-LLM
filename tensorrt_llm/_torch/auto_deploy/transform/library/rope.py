@@ -585,7 +585,9 @@ def _optimize_explicit(
                     )
             cache[cache_key] = fused_cos_sin_to
 
-        # Flatten real position_ids from [B, S] to [B*S] and ensure float32.
+        # Flatten real position_ids from [B, S] to [B*S] and ensure int32
+        # (FlashInfer requires int; converting once here avoids a per-layer
+        # dtype cast inside the opaque custom op).
         if "full_table_position_ids" in pos_cache:
             position_ids = pos_cache["full_table_position_ids"]
         else:
@@ -594,7 +596,7 @@ def _optimize_explicit(
                     torch.ops.aten.reshape, args=(cos_pos_ids, (-1,))
                 )
                 position_ids = graph.call_function(
-                    torch.ops.aten.to, args=(flat_pos_ids, torch.float32)
+                    torch.ops.aten.to, args=(flat_pos_ids, torch.int32)
                 )
             pos_cache["full_table_position_ids"] = position_ids
     else:
@@ -934,7 +936,7 @@ def _get_position_ids(
     position_ids = graph.call_function(
         torch.ops.aten.arange,
         args=(bs_seq,),
-        kwargs={"dtype": torch.float32, "device": device, "pin_memory": False},
+        kwargs={"dtype": torch.int32, "device": device, "pin_memory": False},
     )
     rope_position_ids_cache["position_ids"] = position_ids
     return position_ids
