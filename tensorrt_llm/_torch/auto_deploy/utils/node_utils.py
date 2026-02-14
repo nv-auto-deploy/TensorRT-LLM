@@ -933,6 +933,12 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
         f"{len(unprocessed_linear_nodes)} unprocessed linear nodes"
     )
 
+    ad_logger.info("Drawing layered graph for rank")
+    from .debug_utils import draw_layered_graph
+
+    residuals = identify_regions_between_residuals(gm)
+    draw_layered_graph(gm, layer_subgraphs, unprocessed_linear_nodes, residuals, "qwen3Next")
+    exit()
     return layer_subgraphs, unprocessed_linear_nodes
 
 
