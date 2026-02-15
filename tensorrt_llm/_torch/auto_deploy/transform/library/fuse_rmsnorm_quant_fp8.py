@@ -139,6 +139,30 @@ def _get_out_dtype_str(norm_node: Node) -> str:
     return "bfloat16"
 
 
+def _find_last_input_node(graph, input_nodes: List[Node]) -> Node:
+    """Find the topologically last node among the given input nodes.
+
+    This determines the earliest safe insertion point where all inputs
+    are guaranteed to be defined.
+    """
+    input_set = set(input_nodes)
+    last_input = None
+    for n in graph.nodes:
+        if n in input_set:
+            last_input = n
+    return last_input
+
+
+def _node_comes_before(node_a: Node, node_b: Node, graph) -> bool:
+    """Check if node_a comes before node_b in topological order."""
+    for n in graph.nodes:
+        if n is node_a:
+            return True
+        if n is node_b:
+            return False
+    return False
+
+
 @TransformRegistry.register("fuse_rmsnorm_quant_fp8")
 class FuseRMSNormQuantFP8(BaseTransform):
     """Fuse RMSNorm + FP8 quantization into a single Triton kernel.
@@ -187,17 +211,30 @@ class FuseRMSNormQuantFP8(BaseTransform):
             # triton_rms_norm_quant_fp8(input, weight, eps, scale)
             #   -> (bf16_out, fp8_out)
             #
-            # Insert right before the *topologically earliest* fp8_linear
-            # consumer.  node.users iteration order is arbitrary, so we
-            # scan graph.nodes to find the first one in our set.
-            # We also use the input_scale from that earliest user (not
-            # shared_scale, which may come from a later user whose get_attr
-            # isn't defined yet at this insertion point).  All scales were
-            # verified value-equal by _find_fp8_linear_consumers.
+            # Insertion constraints:
+            #   1. AFTER all inputs (norm inputs + scale) so they're defined
+            #   2. BEFORE all fp8_linear users so gemm replacements can use fp8_node
+            #
+            # We insert right BEFORE the earliest fp8_linear user. This satisfies
+            # constraint 2. Constraint 1 is satisfied because each fp8_linear uses
+            # the scale, so the scale must be defined before it.
+            #
+            # IMPORTANT: We must use the scale from the EARLIEST fp8_linear user,
+            # not shared_scale (which comes from arbitrary iteration order).
+            # Different fp8_linear users may have their scales defined at different
+            # positions, and only the earliest user's scale is guaranteed to be
+            # defined before the insertion point.
             norm_args = node.args  # (input, weight, eps)
+
+            # Find the topologically earliest fp8_linear user and its scale
             fp8_user_set = set(fp8_linear_users)
-            earliest_fp8_user = next(n for n in graph.nodes if n in fp8_user_set)
+            earliest_fp8_user = None
+            for n in graph.nodes:
+                if n in fp8_user_set:
+                    earliest_fp8_user = n
+                    break
             _, _, _, earliest_scale, _ = _get_fp8_linear_args(earliest_fp8_user)
+
             with graph.inserting_before(earliest_fp8_user):
                 fused_node = graph.call_function(
                     torch.ops.auto_deploy.triton_rms_norm_quant_fp8.default,
@@ -225,9 +262,18 @@ class FuseRMSNormQuantFP8(BaseTransform):
                 cnt += 1
 
             # --- Rewire remaining consumers of the original norm node ---
-            # At this point, only non-fp8-linear consumers remain
-            node.replace_all_uses_with(bf16_node)
-            graph.erase_node(node)
+            # Only rewire consumers that come AFTER bf16_node in the graph.
+            # Consumers before bf16_node must keep using the original norm.
+            remaining_users = list(node.users.keys())
+            users_to_rewire = [
+                u for u in remaining_users if _node_comes_before(bf16_node, u, graph)
+            ]
+            for user in users_to_rewire:
+                user.replace_input_with(node, bf16_node)
+
+            # Only erase the original norm if it has no remaining users
+            if len(node.users) == 0:
+                graph.erase_node(node)
 
         gm.recompile()
 
