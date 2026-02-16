@@ -186,7 +186,7 @@ def worker_main(
         # The cached env snapshot is used to spawn workers.
         # Any env overrides to the main process after tensorrt_llm import
         # may not get reflected in the spawned worker process, no matter how early,
-        # unless we update it explicitly here.
+        # unless we update it explicitly here.e
         os.environ.update(llm_args.env_overrides)
 
     if llm_args is not None and llm_args.trust_remote_code:
