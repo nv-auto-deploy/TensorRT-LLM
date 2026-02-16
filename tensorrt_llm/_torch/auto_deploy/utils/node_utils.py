@@ -491,6 +491,10 @@ def is_any_lin_op(node: Node) -> bool:
     return is_linear_op(node) or is_fake_quantized_linear_op(node)
 
 
+def is_contraction_op(node: Node) -> bool:
+    return is_any_lin_op(node) or is_any_moe_op(node) or is_bmm_op(node)
+
+
 def is_fp4_op(node: Node) -> bool:
     return is_op(
         node,
@@ -511,6 +515,16 @@ def is_any_moe_op(node: Node) -> bool:
             torch.ops.auto_deploy.triton_mxfp4_moe,
         ],
     )
+
+
+def is_any_mla_op(node: Node) -> bool:
+    return False
+    # return is_op(
+    #     node,
+    #     ops=[
+    #         torch.ops.auto_deploy.torch_mla,
+    #     ],
+    # )
 
 
 def is_any_delta_op(node: Node) -> bool:
@@ -701,17 +715,22 @@ def _classify_partition(
     ssm_ops = list(filtered_nodes(partition_nodes, is_any_ssm_op))
     moe_ops = list(filtered_nodes(partition_nodes, is_any_moe_op))
     delta_ops = list(filtered_nodes(partition_nodes, is_any_delta_op))
+    mla_ops = list(filtered_nodes(partition_nodes, is_any_mla_op))
 
-    opening_linears = [linears[0]]
-    for linear in linears[1:]:
-        # linears are sorted topologically. Iteratively add nodes
-        # to the opening_linears set if node is not proceed by any other linear node.
-        linear_predecessors = subgraph(
-            sinks=[linear], include=is_any_lin_op, boundary_condition=is_any_lin_op
+    # opening linears are the linears that are not preceded by any other contraction node in the partition
+    opening_linears = list(
+        filtered_nodes(
+            linears,
+            target=lambda n: len(
+                subgraph(
+                    sinks=[n],
+                    include=is_contraction_op,
+                    boundary_condition=lambda n: n not in set(partition_nodes),
+                )
+            )
+            == 0,
         )
-        if any(n in linear_predecessors for n in opening_linears):
-            continue
-        opening_linears.append(linear)
+    )
 
     # verify if every opening linear has the same embedding dimension
     for linear in opening_linears:
@@ -719,21 +738,27 @@ def _classify_partition(
             # malformed layer -- the linears will remain in unprocessed_linear_nodes.
             return None
 
-    # terminating linear node should be the topologically last linear node in the partition
-    terminating_linears = [linears[-1]]
-    for linear in reversed(linears[:-1]):
-        # linears are sorted topologically. Iteratively add nodes
-        # to the terminating_linears set if node is not followed by any other linear node.
-        linear_successors = subgraph(
-            sources=[linear], include=is_any_lin_op, boundary_condition=is_any_lin_op
+    # terminating linear nodes are the linears that are not followed by any other linear node in the partition
+    terminating_linears = list(
+        filtered_nodes(
+            linears,
+            target=lambda n: len(
+                subgraph(
+                    sources=[n],
+                    include=is_contraction_op,
+                    boundary_condition=lambda n: n not in set(partition_nodes),
+                )
+            )
+            == 0
+            and shape(n)[-1] > 1,
         )
-        if any(n in linear_successors for n in terminating_linears):
-            continue
-        terminating_linears.append(linear)
+    )
 
     # verify if every terminating linear has the same embedding dimension
     for linear in terminating_linears:
-        if linear.meta["lin_node_shape"][0] != embd:
+        # linear.meta["lin_node_shape"][0] == 1 indicates e.g., a gating function in gated shared
+        # expert weight
+        if linear.meta["lin_node_shape"][0] > 1 and linear.meta["lin_node_shape"][0] != embd:
             # malformed layer -- the linears will remain in unprocessed_linear_nodes.
             return None
 
@@ -757,7 +782,7 @@ def _classify_partition(
     ####################################################
 
     def classify_layer_type() -> Tuple[LayerType, int]:
-        if len(ssm_ops) + len(attention_ops) + len(delta_ops) > 1:
+        if len(ssm_ops) + len(attention_ops) + len(delta_ops) + len(mla_ops) + len(moe_ops) > 1:
             return LayerType.UNKNOWN, 1
 
         # opening and terminating lin nodes must be disjoint
@@ -784,6 +809,10 @@ def _classify_partition(
             if len(intermediate_weight_nodes) not in list(range(4, 7)):
                 return LayerType.UNKNOWN, 1
             return LayerType.DELTA, head_size
+
+        if len(mla_ops) == 1:
+            head_size = shape(mla_ops[0])[-1]
+            return LayerType.MLA, head_size
 
         if len(attention_ops) == 1:
             head_size = shape(attention_ops[0])[-1]
@@ -937,7 +966,7 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
     from .debug_utils import draw_layered_graph
 
     residuals = identify_regions_between_residuals(gm)
-    draw_layered_graph(gm, layer_subgraphs, unprocessed_linear_nodes, residuals, "qwen3Next")
+    draw_layered_graph(gm, layer_subgraphs, unprocessed_linear_nodes, residuals, "nemotron-super")
     exit()
     return layer_subgraphs, unprocessed_linear_nodes
 

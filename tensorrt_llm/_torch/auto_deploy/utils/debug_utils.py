@@ -9,20 +9,23 @@ Two-pass approach:
      node positions, and insert semi-transparent layer rectangles + labels.
 """
 
+import inspect
 import re
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from torch.fx import GraphModule, Node
 
 from .node_utils import (
     LayerSubgraph,
+    has_shape,
     is_any_attention_op,
     is_any_delta_op,
     is_any_lin_op,
     is_any_moe_op,
     is_any_ssm_op,
     is_weight_node,
+    shape,
 )
 
 # ── Colour palettes ──────────────────────────────────────────────────────────
@@ -73,6 +76,126 @@ def _classify_node(node: Node, residuals_set: Set[Node]) -> str:
     if node in residuals_set:
         return "residual"
     return "default"
+
+
+def _short_target_sig(node: Node) -> str:
+    """Build a concise ``name(param, param, ...)`` string for *call_function* nodes.
+
+    For ``OpOverload`` targets the ``_schema`` is parsed to extract parameter
+    names and optional/default markers.  For regular callables
+    ``inspect.signature`` is used as a fallback.  Non-``call_function`` nodes
+    get a plain short target name.
+    """
+    target = node.target
+    if node.op != "call_function":
+        if isinstance(target, str):
+            return target
+        name = getattr(target, "__name__", None)
+        return name if name else str(target)
+
+    # Determine the function name (stripped of namespace).
+    name = getattr(target, "__name__", None) or str(target)
+    for prefix in ("torch.ops.auto_deploy.", "torch.ops.aten.", "torch.ops."):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+
+    # remove ".default" from the name
+    name = name.replace(".default", "")
+
+    # Try _schema first (torch OpOverload).
+    if hasattr(target, "_schema"):
+        schema = str(target._schema)
+        # Schema looks like: "ns::name(Type param, Type param=default, ...) -> RetType"
+        m = re.search(r"\(([^)]*)\)", schema)
+        if m:
+            raw_params = m.group(1)
+            params: list = []
+            for p in raw_params.split(","):
+                p = p.strip()
+                if not p:
+                    continue
+                # "Type name" or "Type name=default" or "*, ..."
+                parts = p.split()
+                if len(parts) >= 2:
+                    pname = parts[-1]
+                    if "=" in pname:
+                        pname = pname.split("=")[0] + "[opt]"
+                    params.append(pname)
+                elif parts:
+                    params.append(parts[0])
+
+            # add "non-node" args
+            nonparametric_args = [p for p in node.args if p not in node.all_input_nodes]
+            for i, p in enumerate(nonparametric_args):
+                if isinstance(p, Iterable):
+                    nonparametric_args[i] = [pp if not isinstance(pp, Node) else "p" for pp in p]
+            nonparametric_args = [str(p) for p in nonparametric_args]
+            return f"{name}({', '.join(params)}, {', '.join(nonparametric_args)})"
+
+    # Fallback: inspect.signature.
+    try:
+        sig = inspect.signature(target)
+        params = []
+        for pname, param in sig.parameters.items():
+            if param.default is not inspect.Parameter.empty:
+                params.append(f"{pname}[opt]")
+            elif param.annotation is not inspect.Parameter.empty:
+                ann = getattr(param.annotation, "__name__", str(param.annotation))
+                if "Optional" in ann:
+                    params.append(f"{pname}[opt]")
+                else:
+                    params.append(pname)
+            else:
+                params.append(pname)
+        return f"{name}({', '.join(params)})"
+    except (ValueError, TypeError):
+        return name
+
+
+def _node_shape_str(node: Node) -> str:
+    """Return a compact shape string like ``[2, 1024, 4096]``."""
+    if has_shape(node):
+        s = shape(node)
+        if s is not None:
+            return str(list(s))
+    return ""
+
+
+def _node_dtype_str(node: Node) -> str:
+    """Return the dtype string (without ``torch.`` prefix)."""
+    val = getattr(node, "meta", {}).get("val", None)
+    if val is not None and hasattr(val, "dtype"):
+        return str(val.dtype).replace("torch.", "")
+    return ""
+
+
+def _record_escape(text: str) -> str:
+    """Escape characters special in graphviz record labels."""
+    return (
+        text.replace("{", r"\{")
+        .replace("}", r"\}")
+        .replace("|", r"\|")
+        .replace("<", r"\<")
+        .replace(">", r"\>")
+    )
+
+
+def _custom_label(node: Node) -> str:
+    """Build a graphviz record label showing name, target sig, shape, dtype."""
+    display_name = node.name
+    if display_name.startswith("model_"):
+        display_name = display_name[len("model_") :]
+    parts = [f"name={_record_escape(display_name)}"]
+    target_sig = _record_escape(_short_target_sig(node))
+    if target_sig:
+        parts.append(f"target={target_sig}")
+    shape_s = _record_escape(_node_shape_str(node))
+    if shape_s:
+        parts.append(f"shape={shape_s}")
+    dtype_s = _record_escape(_node_dtype_str(node))
+    if dtype_s:
+        parts.append(f"dtype={dtype_s}")
+    return "{" + "|".join(parts) + "}"
 
 
 def _extract_bbox(
@@ -129,12 +252,14 @@ def draw_layered_graph(
     unprocessed_linear_nodes: Set[Node],
     residuals: List[Node],
     filename: str,
+    skip_aux_nodes: bool = True,
 ) -> None:
     """Draw a layered graph of the ``GraphModule`` and save it as SVG.
 
     **Step 1** — Render the full graph using :class:`FxGraphDrawer` (pydot /
     graphviz ``dot``).  Before rendering, node fill-colours are overridden
     based on their semantic role (linear → blue, attention → orange, …).
+    Auxiliary nodes (e.g., ``sym_size``) are optionally removed for clarity.
 
     **Step 2** — Parse the SVG, look up each node's position, compute a
     bounding box per :class:`LayerSubgraph`, and insert coloured rectangles
@@ -146,6 +271,8 @@ def draw_layered_graph(
         unprocessed_linear_nodes: Linear nodes not in any layer.
         residuals: Residual-add nodes (rendered in pink).
         filename: Stem — ``<filename>.svg`` is written.
+        skip_aux_nodes: If ``True``, removes auxiliary nodes (e.g., ``sym_size``)
+            from the graph for a cleaner diagram.
     """
     from torch.fx.passes.graph_drawer import FxGraphDrawer
 
@@ -156,11 +283,44 @@ def draw_layered_graph(
     drawer = FxGraphDrawer(gm, filename)
     dot_graph = drawer.get_dot_graph()
 
+    # Remove auxiliary nodes if requested.
+    aux_node_names: Set[str] = set()
+    if skip_aux_nodes:
+        # Identify nodes to delete
+        nodes_to_delete = []
+        for dot_node in dot_graph.get_nodes():
+            name = dot_node.get_name().strip('"')
+            if "sym_size" in name:
+                aux_node_names.add(name)
+                nodes_to_delete.append(dot_node)
+
+        # Delete edges connected to these nodes (both incoming and outgoing)
+        edges_to_delete = []
+        for edge in dot_graph.get_edges():
+            src = edge.get_source().strip('"')
+            dst = edge.get_destination().strip('"')
+            if src in aux_node_names or dst in aux_node_names:
+                edges_to_delete.append(edge)
+
+        for edge in edges_to_delete:
+            dot_graph.del_edge(edge)
+            dot_graph.del_edge(edge.get_source(), edge.get_destination())
+
+        # Now delete the nodes themselves
+        for dot_node in nodes_to_delete:
+            dot_graph.del_node(dot_node)
+
     for dot_node in dot_graph.get_nodes():
         name = dot_node.get_name().strip('"')
-        if name not in fx_nodes:
+        if name not in fx_nodes or name in aux_node_names:
             continue
-        cat = _classify_node(fx_nodes[name], residuals_set)
+        fx_node = fx_nodes[name]
+
+        # Override label: name, target(params), shape, dtype.
+        dot_node.set_label(_custom_label(fx_node))
+
+        # Override colours by node category.
+        cat = _classify_node(fx_node, residuals_set)
         border, fill = _NODE_COLORS[cat]
         if fill is not None:
             dot_node.set_fillcolor(fill)
@@ -217,10 +377,10 @@ def draw_layered_graph(
     # valid when inserting at the same position).
     for i, ls in enumerate(layer_subgraphs):
         all_layer_nodes = list(ls.opening_nodes) + list(ls.subgraph_nodes)
-        # remove nodes that do not contain "model_layers" in their name
-        all_layer_nodes = [n for n in all_layer_nodes if "model_layers" in n.name]
-        if ls.terminating_node is not None:
-            all_layer_nodes.append(ls.terminating_node)
+        # remove nodes that do not contain "_layers" in their name
+        all_layer_nodes = [n for n in all_layer_nodes if "_layers" in n.name]
+        if ls.terminating_nodes is not None:
+            all_layer_nodes.extend(ls.terminating_nodes)
 
         boxes = [node_bboxes[n.name] for n in all_layer_nodes if n.name in node_bboxes]
         # if not boxes:
