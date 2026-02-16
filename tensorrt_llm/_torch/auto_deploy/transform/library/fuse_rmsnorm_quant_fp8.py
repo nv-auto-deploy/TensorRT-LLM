@@ -178,6 +178,9 @@ class FuseRMSNormQuantFP8(BaseTransform):
 
     Handles multi-consumer case: when norm_out feeds multiple fp8_linear ops
     (e.g., Q, K, V projections), all share the fused FP8 output.
+
+    Skips norms that have any consumer before the earliest fp8_linear user (e.g.
+    MoE gate/view). Fusing those would leave two norms (bf16 + fp8); we skip instead.
     """
 
     config: TransformConfig
@@ -234,6 +237,17 @@ class FuseRMSNormQuantFP8(BaseTransform):
                     earliest_fp8_user = n
                     break
             _, _, _, earliest_scale, _ = _get_fp8_linear_args(earliest_fp8_user)
+
+            # Skip if any norm consumer other than fp8_linear appears before the
+            # earliest fp8_linear user (e.g. MoE gate/view). Then we would keep the
+            # original norm for those and add a fused norm for fp8 (two norms).
+            # Only fuse when we can replace the norm entirely (e.g. M: single consumer).
+            has_other_consumer_before_fp8 = any(
+                u not in fp8_user_set and _node_comes_before(u, earliest_fp8_user, graph)
+                for u in node.users
+            )
+            if has_other_consumer_before_fp8:
+                continue
 
             with graph.inserting_before(earliest_fp8_user):
                 fused_node = graph.call_function(
