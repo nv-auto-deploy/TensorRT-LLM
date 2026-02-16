@@ -518,13 +518,12 @@ def is_any_moe_op(node: Node) -> bool:
 
 
 def is_any_mla_op(node: Node) -> bool:
-    return False
-    # return is_op(
-    #     node,
-    #     ops=[
-    #         torch.ops.auto_deploy.torch_mla,
-    #     ],
-    # )
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_mla,
+        ],
+    )
 
 
 def is_any_delta_op(node: Node) -> bool:
@@ -822,16 +821,9 @@ def _classify_partition(
                 return LayerType.UNKNOWN, 1
             # check if this is MLA:
             # these two intermediate linear nodes are the latent q and kv projections.
-            if len(intermediate_lin_nodes) == 2:
-                # MLA has a RMS norm inside, so it should have one (or two, counting bias)
-                # intermediate weight nodes
-                if len(intermediate_weight_nodes) not in [1, 2]:
-                    return LayerType.UNKNOWN, 1
-                return LayerType.MLA, head_size
-            else:
-                if len(intermediate_lin_nodes) != 0:
-                    return LayerType.UNKNOWN, 1
-                return LayerType.MHA, head_size
+            if len(intermediate_lin_nodes) > 0:
+                return LayerType.UNKNOWN, 1
+            return LayerType.MHA, head_size
 
         if len(ssm_ops) == 1:
             head_size = shape(ssm_ops[0])[-1]
@@ -861,7 +853,7 @@ def _classify_partition(
         # MLP should not have any intermediate linear or weight nodes.
         if (
             len(intermediate_lin_nodes) > 0
-            or len(intermediate_weight_nodes) > 0
+            # or len(intermediate_weight_nodes) > 0
             or len(terminating_linears) != 1
         ):
             return LayerType.UNKNOWN, 1

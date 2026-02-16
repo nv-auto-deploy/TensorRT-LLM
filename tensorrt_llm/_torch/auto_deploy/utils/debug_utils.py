@@ -379,6 +379,10 @@ def draw_layered_graph(
         all_layer_nodes = list(ls.opening_nodes) + list(ls.subgraph_nodes)
         # remove nodes that do not contain "_layers" in their name
         all_layer_nodes = [n for n in all_layer_nodes if "_layers" in n.name]
+        # remove nodes from rotary embedding cache
+        all_layer_nodes = [n for n in all_layer_nodes if "rotary_emb" not in n.name]
+        all_layer_nodes = [n for n in all_layer_nodes if "attn_index" not in n.name]
+
         if ls.terminating_nodes is not None:
             all_layer_nodes.extend(ls.terminating_nodes)
 
