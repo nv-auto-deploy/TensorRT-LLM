@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/fusedLayernormKernels/fused_add_rms_norm_fp8.h"
 #include "tensorrt_llm/kernels/fusedLayernormKernels/layernorm_param.h"
 #include "tensorrt_llm/kernels/fusedLayernormKernels/ws_layernorm.h"
 #include "tensorrt_llm/kernels/quantization.h"
@@ -26,6 +27,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <cstdint>
 #include <optional>
@@ -37,24 +39,25 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-// Fused Add + RMSNorm + FP4 Quantization kernel
+// Fused Add + RMSNorm + Quantization (NVFP4 or FP8 per-tensor).
 // input: [M, N] - input tensor (fp16/bf16)
 // residual: [M, N] - residual tensor (fp16/bf16)
 // gamma: [N] - RMSNorm weight (fp16/bf16)
-// sf_scale: [1] - optional scale factor for FP4 quantization (float)
-// use_rms_norm: bool - if true use RMSNorm, else use LayerNorm
+// sf_scale: [1] - optional scale; for NVFP4: scale for FP4 quant; for FP8: required per-tensor FP8 scale
+// use_rms_norm: bool - if true use RMSNorm, else use LayerNorm (NVFP4 path only)
+// eps: float - layernorm epsilon
 // output_hp_norm: bool - if true, also output high precision normalized values (same dtype as input) for MoE gate.
+// use_fp8_quant: bool - if true use FP8 per-tensor quant (normed_output [M,N] FP8, sf_out [1] float); else NVFP4.
 // Returns:
-//   normed_output: [M, N/8] - FP4 quantized normalized output (uint32_t, packed)
+//   normed_output: NVFP4: [M, N/8] packed uint32_t; FP8: [M, N] Float8_e4m3fn
 //   output: [M, N] - pre-norm output (input + residual), same dtype as input
-//   sf_out: scale factors for FP4 (uint8_t), swizzled layout
-//   high_precision_normed_output: [M, N] - normalized output before quant (only if output_hp_norm=true, else empty)
+//   sf_out: NVFP4: scale factors (swizzled); FP8: [1] float32 scale
+//   high_precision_normed_output: [M, N] - only if output_hp_norm=true, else empty
 //
-// NOTE: This kernel requires SM90 (Hopper) or SM100 (Blackwell) GPU architecture.
-// NOTE: Hidden dimension N must be >= 2048 and <= 16384.
+// NOTE: NVFP4 path requires SM90+ and N in [2048, 16384], N % 16 == 0. FP8 path requires N % 8 == 0.
 std::tuple<at::Tensor, at::Tensor, at::Tensor, std::optional<at::Tensor>> fused_add_rms_norm_quant(
     at::Tensor const& input, at::Tensor const& residual, at::Tensor const& gamma,
-    std::optional<at::Tensor> const& sf_scale, bool use_rms_norm, double eps, bool output_hp_norm)
+    std::optional<at::Tensor> const& sf_scale, bool use_rms_norm, double eps, bool output_hp_norm, bool use_fp8_quant)
 {
     CHECK_TH_CUDA(input);
     CHECK_CONTIGUOUS(input);
@@ -85,9 +88,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, std::optional<at::Tensor>> fused_
     int64_t const m_padded = (m + 31) / 32 * 32;
 
     TORCH_CHECK(gamma.sizes()[0] == n, "gamma size must match hidden dimension N.");
-    TORCH_CHECK(n >= 2048, "Hidden dimension N must be >= 2048 (kernel constraint).");
-    TORCH_CHECK(n <= 16384, "Hidden dimension N must be <= 16384.");
-    TORCH_CHECK(n % 16 == 0, "Hidden dimension N must be divisible by 16 for FP4 quantization.");
+
+    if (use_fp8_quant)
+    {
+        TORCH_CHECK(n % 8 == 0, "Hidden dimension N must be divisible by 8 for FP8 quantization.");
+        TORCH_CHECK(sf_scale.has_value() && sf_scale->numel() >= 1,
+            "fused_add_rms_norm_quant with use_fp8_quant=True requires sf_scale (per-tensor FP8 scale).");
+    }
+    else
+    {
+        TORCH_CHECK(n >= 2048, "Hidden dimension N must be >= 2048 (kernel constraint).");
+        TORCH_CHECK(n <= 16384, "Hidden dimension N must be <= 16384.");
+        TORCH_CHECK(n % 16 == 0, "Hidden dimension N must be divisible by 16 for FP4 quantization.");
+    }
 
     // Validate sf_scale if provided
     float* sfScalePtr = nullptr;
@@ -97,6 +110,81 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, std::optional<at::Tensor>> fused_
         sfScalePtr = sf_scale.value().data_ptr<float>();
     }
 
+    at::Tensor normed_output;
+    at::Tensor output;
+    at::Tensor sf_out;
+    std::optional<at::Tensor> high_precision_normed_output = std::nullopt;
+
+    if (use_fp8_quant)
+    {
+        // --- FP8 path: normed_output [M, N] FP8, sf_out [1] float ---
+        normed_output = at::detail::empty_cuda({m, n}, torch::kFloat8_e4m3fn, input.device(), std::nullopt);
+        output = at::detail::empty_cuda({m, n}, input.scalar_type(), input.device(), std::nullopt);
+        sf_out = at::detail::empty_cuda({1}, torch::kFloat32, input.device(), std::nullopt);
+        if (output_hp_norm)
+        {
+            high_precision_normed_output
+                = at::detail::empty_cuda({m, n}, input.scalar_type(), input.device(), std::nullopt);
+        }
+        {
+            if (input.scalar_type() == at::ScalarType::Half)
+            {
+                tensorrt_llm::kernels::GeneralFP8AddBiasResidualPreLayerNormParam<half> param;
+                param.normed_output = reinterpret_cast<__nv_fp8_e4m3*>(normed_output.data_ptr());
+                param.output = reinterpret_cast<half*>(output.data_ptr());
+                param.input = reinterpret_cast<half const*>(input.data_ptr());
+                param.residual = reinterpret_cast<half const*>(residual.data_ptr());
+                param.gamma = reinterpret_cast<half const*>(gamma.data_ptr());
+                param.scale = sfScalePtr;
+                param.high_precision_normed_output = output_hp_norm
+                    ? reinterpret_cast<half*>(high_precision_normed_output.value().data_ptr())
+                    : nullptr;
+                param.m = static_cast<int>(m);
+                param.n = static_cast<int>(n);
+                param.layernorm_eps = static_cast<float>(eps);
+                param.stream = at::cuda::getCurrentCUDAStream(device);
+                tensorrt_llm::kernels::invokeFusedAddRMSNormFP8(param);
+            }
+            else if (input.scalar_type() == at::ScalarType::BFloat16)
+            {
+#ifdef ENABLE_BF16
+                tensorrt_llm::kernels::GeneralFP8AddBiasResidualPreLayerNormParam<__nv_bfloat16> param;
+                param.normed_output = reinterpret_cast<__nv_fp8_e4m3*>(normed_output.data_ptr());
+                param.output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr());
+                param.input = reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr());
+                param.residual = reinterpret_cast<__nv_bfloat16 const*>(residual.data_ptr());
+                param.gamma = reinterpret_cast<__nv_bfloat16 const*>(gamma.data_ptr());
+                param.scale = sfScalePtr;
+                param.high_precision_normed_output = output_hp_norm
+                    ? reinterpret_cast<__nv_bfloat16*>(high_precision_normed_output.value().data_ptr())
+                    : nullptr;
+                param.m = static_cast<int>(m);
+                param.n = static_cast<int>(n);
+                param.layernorm_eps = static_cast<float>(eps);
+                param.stream = at::cuda::getCurrentCUDAStream(device);
+                tensorrt_llm::kernels::invokeFusedAddRMSNormFP8(param);
+#else
+                C10_THROW_ERROR(
+                    NotImplementedError, "BFloat16 must be enabled for fused_add_rms_norm_quant with bf16 input.");
+#endif
+            }
+            else
+            {
+                C10_THROW_ERROR(
+                    NotImplementedError, "fused_add_rms_norm_quant only supports input tensor with dtypes fp16/bf16.");
+            }
+        }
+        // Copy scale to sf_out for API consistency (callers may expect scale tensor)
+        if (sfScalePtr != nullptr)
+        {
+            at::Tensor scale_dev
+                = at::tensor({*sfScalePtr}, torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
+            sf_out.copy_(scale_dev);
+        }
+        return std::make_tuple(normed_output, output, sf_out, high_precision_normed_output);
+    }
+
+    // --- NVFP4 path (existing) ---
     // Allocate output tensors
     // normed_output: FP4 packed output [M, N/8] as uint32_t (8 FP4 values packed per uint32)
     // NOTE: allocate [M_padded, ...] to avoid OOB writes; return a view of [M, ...] to keep API stable.
@@ -203,8 +291,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fused_add_rms_norm_quant(Tensor input, Tensor residual, Tensor gamma, "
-        "Tensor? sf_scale, bool use_rms_norm=True, float eps=1e-6, bool output_hp_norm=False) -> (Tensor, Tensor, "
-        "Tensor, Tensor?)");
+        "Tensor? sf_scale, bool use_rms_norm=True, float eps=1e-6, bool output_hp_norm=False, bool "
+        "use_fp8_quant=False) "
+        "-> (Tensor, Tensor, Tensor, Tensor?)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

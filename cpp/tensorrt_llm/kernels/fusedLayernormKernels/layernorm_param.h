@@ -18,6 +18,9 @@
 
 #include "tensorrt_llm/common/config.h"
 #include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -37,6 +40,25 @@ struct GeneralFP4AddBiasResidualPreLayerNormParam
     T const* bias = nullptr;
     T const* gamma = nullptr;
     T const* beta = nullptr;
+    T* high_precision_normed_output = nullptr;
+
+    int m;
+    int n;
+    float layernorm_eps;
+    cudaStream_t stream;
+};
+
+// Fused Add + RMSNorm + FP8 per-tensor quantization (E4M3).
+// normed_output: [M, N] FP8; output: [M, N] pre-norm (input + residual); scale: input scale for quant.
+template <typename T>
+struct GeneralFP8AddBiasResidualPreLayerNormParam
+{
+    __nv_fp8_e4m3* normed_output;
+    T* output;
+    T const* input;
+    T const* residual;
+    T const* gamma;
+    float const* scale; // per-tensor FP8 quantization scale
     T* high_precision_normed_output = nullptr;
 
     int m;
