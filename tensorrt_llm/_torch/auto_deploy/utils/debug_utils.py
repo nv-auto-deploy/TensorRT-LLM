@@ -46,7 +46,7 @@ _NODE_COLORS: Dict[str, Tuple[str, str]] = {
 _LAYER_COLORS: Dict[str, Tuple[str, str]] = {
     "attention": ("#E65100", "#FFF3E0"),
     "ssm": ("#2E7D32", "#E8F5E9"),
-    "mlp": ("#1565C0", "#E3F2FD"),
+    "mlp": ("#C62828", "#FFEBEE"),
     "moe": ("#6A1B9A", "#F3E5F5"),
     "mla": ("#00838F", "#E0F7FA"),
     "delta": ("#C62828", "#FFEBEE"),
@@ -287,10 +287,11 @@ def draw_layered_graph(
     aux_node_names: Set[str] = set()
     if skip_aux_nodes:
         # Identify nodes to delete
+        kwords = ["sym_size", "_scale", "attn_index", "rotary_emb"]
         nodes_to_delete = []
         for dot_node in dot_graph.get_nodes():
             name = dot_node.get_name().strip('"')
-            if "sym_size" in name:
+            if any(kw in name for kw in kwords):
                 aux_node_names.add(name)
                 nodes_to_delete.append(dot_node)
 
