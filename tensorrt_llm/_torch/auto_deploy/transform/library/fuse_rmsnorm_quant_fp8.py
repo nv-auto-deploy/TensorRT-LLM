@@ -19,17 +19,23 @@ Matches patterns where flashinfer_rms_norm feeds into trtllm_quant_fp8_linear,
 and replaces them with a fused Triton kernel (RMSNorm + FP8 quant) followed by
 a GEMM-only op that takes pre-quantized FP8 input.
 
+Also handles the case where fuse_add_rms_norm has already run, converting
+flashinfer_rms_norm nodes to flashinfer_fused_add_rms_norm. In this case,
+we match getitem(flashinfer_fused_add_rms_norm, 0) and replace with a fully
+fused add+norm+quant kernel (triton_fused_add_rms_norm_quant_fp8).
+
 This eliminates the DRAM round-trip between the normalization and quantization
 steps by producing both BF16 (for residual / other consumers) and FP8 (for GEMM)
 outputs in a single pass.
 """
 
 import operator
-from typing import List, Tuple, Type
+from typing import List, Optional, Tuple, Type
 
 import torch
 from torch.fx import GraphModule, Node
 
+from ...custom_ops.normalization.flashinfer_fused_add_rms_norm import flashinfer_fused_add_rms_norm
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
@@ -163,16 +169,81 @@ def _node_comes_before(node_a: Node, node_b: Node, graph) -> bool:
     return False
 
 
+def _get_norm_source_info(
+    node: Node,
+) -> Tuple[bool, str, Tuple, Optional[Node], Optional[Node]]:
+    """Check if node represents a norm output and extract source info.
+
+    Returns:
+        (is_norm_output, source_type, norm_args, fused_node, add_out_node)
+        - source_type: "direct" for flashinfer_rms_norm,
+                       "fused" for getitem(flashinfer_fused_add_rms_norm, 0)
+        - norm_args: (input, weight, eps) - the args needed for triton_rms_norm_quant_fp8
+        - fused_node: the flashinfer_fused_add_rms_norm node (only for "fused" type)
+        - add_out_node: the getitem node for add output (only for "fused" type)
+    """
+    # Case 1: Direct flashinfer_rms_norm
+    if is_op(node, torch.ops.auto_deploy.flashinfer_rms_norm):
+        return True, "direct", node.args, None, None
+
+    # Case 2: getitem(flashinfer_fused_add_rms_norm, 0)
+    # Note: flashinfer_fused_add_rms_norm is a Python function wrapper (not a custom op),
+    # so we check against the function object directly.
+    if node.op == "call_function" and node.target == operator.getitem:
+        source_node = node.args[0]
+        idx = node.args[1]
+        if idx == 0 and isinstance(source_node, Node):
+            # Check if source is flashinfer_fused_add_rms_norm (Python function)
+            if (
+                source_node.op == "call_function"
+                and source_node.target is flashinfer_fused_add_rms_norm
+            ):
+                # source_node.args = (add_rhs, add_lhs, weight, eps)
+                add_rhs, add_lhs, weight, eps = source_node.args
+                # Find the add_out node (getitem with index 1)
+                add_out_node = None
+                for user in source_node.users:
+                    if (
+                        user.op == "call_function"
+                        and user.target == operator.getitem
+                        and user.args[1] == 1
+                    ):
+                        add_out_node = user
+                        break
+                # The norm input is the add result, which we'll compute as add(add_lhs, add_rhs)
+                # For triton_rms_norm_quant_fp8, we need (input, weight, eps)
+                # We'll create the add node later; for now return the add operands
+                return True, "fused", (add_lhs, add_rhs, weight, eps), source_node, add_out_node
+
+    return False, "", (), None, None
+
+
 @TransformRegistry.register("fuse_rmsnorm_quant_fp8")
 class FuseRMSNormQuantFP8(BaseTransform):
     """Fuse RMSNorm + FP8 quantization into a single Triton kernel.
 
-    Matches:
+    Matches two patterns:
+
+    1. Direct flashinfer_rms_norm:
         norm_out = flashinfer_rms_norm(x, weight, eps)
         linear_out = trtllm_quant_fp8_linear(norm_out, w_fp8, bias, in_scale, w_scale)
 
+    2. Fused add+norm (after fuse_add_rms_norm has run):
+        fused = flashinfer_fused_add_rms_norm(x, residual, weight, eps)
+        norm_out = getitem(fused, 0)
+        add_out = getitem(fused, 1)
+        linear_out = trtllm_quant_fp8_linear(norm_out, w_fp8, ...)
+
     Replaces with:
+        # For direct case:
         bf16_out, fp8_out = triton_rms_norm_quant_fp8(x, weight, eps, in_scale)
+
+        # For fused case (fully fused add+norm+quant):
+        bf16_out, fp8_out, add_out = triton_fused_add_rms_norm_quant_fp8(
+            x, residual, weight, eps, in_scale
+        )
+
+        # Both cases:
         linear_out = trtllm_fp8_gemm(fp8_out, w_fp8, bias, in_scale, w_scale, dtype)
         (other consumers of norm_out use bf16_out)
 
@@ -199,8 +270,18 @@ class FuseRMSNormQuantFP8(BaseTransform):
         graph = gm.graph
         cnt = 0
 
+        # Track nodes we've already processed (for fused case, multiple getitems
+        # reference the same fused node)
+        processed_fused_nodes = set()
+
         for node in list(graph.nodes):
-            if not is_op(node, torch.ops.auto_deploy.flashinfer_rms_norm):
+            # Check if this node represents a norm output
+            is_norm, source_type, norm_info, fused_node, add_out_node = _get_norm_source_info(node)
+            if not is_norm:
+                continue
+
+            # Skip if we've already processed this fused node
+            if fused_node is not None and id(fused_node) in processed_fused_nodes:
                 continue
 
             fp8_linear_users, shared_scale = _find_fp8_linear_consumers(node, gm)
@@ -209,25 +290,6 @@ class FuseRMSNormQuantFP8(BaseTransform):
 
             # Determine output dtype from the norm node metadata
             out_dtype_str = _get_out_dtype_str(node)
-
-            # --- Insert fused RMSNorm + FP8 quant ---
-            # triton_rms_norm_quant_fp8(input, weight, eps, scale)
-            #   -> (bf16_out, fp8_out)
-            #
-            # Insertion constraints:
-            #   1. AFTER all inputs (norm inputs + scale) so they're defined
-            #   2. BEFORE all fp8_linear users so gemm replacements can use fp8_node
-            #
-            # We insert right BEFORE the earliest fp8_linear user. This satisfies
-            # constraint 2. Constraint 1 is satisfied because each fp8_linear uses
-            # the scale, so the scale must be defined before it.
-            #
-            # IMPORTANT: We must use the scale from the EARLIEST fp8_linear user,
-            # not shared_scale (which comes from arbitrary iteration order).
-            # Different fp8_linear users may have their scales defined at different
-            # positions, and only the earliest user's scale is guaranteed to be
-            # defined before the insertion point.
-            norm_args = node.args  # (input, weight, eps)
 
             # Find the topologically earliest fp8_linear user and its scale
             fp8_user_set = set(fp8_linear_users)
@@ -241,7 +303,7 @@ class FuseRMSNormQuantFP8(BaseTransform):
             # Skip if any norm consumer other than fp8_linear appears before the
             # earliest fp8_linear user (e.g. MoE gate/view). Then we would keep the
             # original norm for those and add a fused norm for fp8 (two norms).
-            # Only fuse when we can replace the norm entirely (e.g. M: single consumer).
+            # Only fuse when we can replace the norm entirely.
             has_other_consumer_before_fp8 = any(
                 u not in fp8_user_set and _node_comes_before(u, earliest_fp8_user, graph)
                 for u in node.users
@@ -249,13 +311,74 @@ class FuseRMSNormQuantFP8(BaseTransform):
             if has_other_consumer_before_fp8:
                 continue
 
-            with graph.inserting_before(earliest_fp8_user):
-                fused_node = graph.call_function(
-                    torch.ops.auto_deploy.triton_rms_norm_quant_fp8.default,
-                    args=(*norm_args, earliest_scale),
-                )
-                bf16_node = graph.call_function(operator.getitem, args=(fused_node, 0))
-                fp8_node = graph.call_function(operator.getitem, args=(fused_node, 1))
+            # --- Handle based on source type ---
+            if source_type == "direct":
+                # Direct flashinfer_rms_norm case
+                norm_args = norm_info  # (input, weight, eps)
+
+                with graph.inserting_before(earliest_fp8_user):
+                    fused_quant_node = graph.call_function(
+                        torch.ops.auto_deploy.triton_rms_norm_quant_fp8.default,
+                        args=(*norm_args, earliest_scale),
+                    )
+                    bf16_node = graph.call_function(operator.getitem, args=(fused_quant_node, 0))
+                    fp8_node = graph.call_function(operator.getitem, args=(fused_quant_node, 1))
+
+                # Rewire remaining consumers of the original norm node
+                remaining_users = list(node.users.keys())
+                users_to_rewire = [
+                    u for u in remaining_users if _node_comes_before(bf16_node, u, graph)
+                ]
+                for user in users_to_rewire:
+                    user.replace_input_with(node, bf16_node)
+
+                # Only erase the original norm if it has no remaining users
+                if len(node.users) == 0:
+                    graph.erase_node(node)
+
+            else:
+                # Fused add+norm case: getitem(flashinfer_fused_add_rms_norm, 0)
+                # Use the fully fused add+norm+quant kernel
+                add_lhs, add_rhs, weight, eps = norm_info
+                processed_fused_nodes.add(id(fused_node))
+
+                with graph.inserting_before(earliest_fp8_user):
+                    # Create fused add+norm+quant node
+                    # triton_fused_add_rms_norm_quant_fp8(x, residual, weight, eps, scale)
+                    #   -> (bf16_norm, fp8_norm, add_out)
+                    # Note: add_rhs is x, add_lhs is residual in the original fused op
+                    fused_all_node = graph.call_function(
+                        torch.ops.auto_deploy.triton_fused_add_rms_norm_quant_fp8.default,
+                        args=(add_rhs, add_lhs, weight, eps, earliest_scale),
+                    )
+                    bf16_node = graph.call_function(operator.getitem, args=(fused_all_node, 0))
+                    fp8_node = graph.call_function(operator.getitem, args=(fused_all_node, 1))
+                    add_node = graph.call_function(operator.getitem, args=(fused_all_node, 2))
+
+                # Rewire consumers of the original norm_out (getitem 0) to bf16_node
+                remaining_users = list(node.users.keys())
+                users_to_rewire = [
+                    u for u in remaining_users if _node_comes_before(bf16_node, u, graph)
+                ]
+                for user in users_to_rewire:
+                    user.replace_input_with(node, bf16_node)
+
+                # Rewire consumers of add_out (getitem 1) to the new add_node
+                if add_out_node is not None:
+                    add_out_users = list(add_out_node.users.keys())
+                    add_users_to_rewire = [
+                        u for u in add_out_users if _node_comes_before(add_node, u, graph)
+                    ]
+                    for user in add_users_to_rewire:
+                        user.replace_input_with(add_out_node, add_node)
+
+                # Erase old nodes if they have no remaining users
+                if len(node.users) == 0:
+                    graph.erase_node(node)
+                if add_out_node is not None and len(add_out_node.users) == 0:
+                    graph.erase_node(add_out_node)
+                if fused_node is not None and len(fused_node.users) == 0:
+                    graph.erase_node(fused_node)
 
             # --- Replace each fp8_linear consumer with fp8_gemm ---
             for fp8_user in fp8_linear_users:
@@ -274,20 +397,6 @@ class FuseRMSNormQuantFP8(BaseTransform):
                     fp8_user.replace_all_uses_with(gemm_node)
                 graph.erase_node(fp8_user)
                 cnt += 1
-
-            # --- Rewire remaining consumers of the original norm node ---
-            # Only rewire consumers that come AFTER bf16_node in the graph.
-            # Consumers before bf16_node must keep using the original norm.
-            remaining_users = list(node.users.keys())
-            users_to_rewire = [
-                u for u in remaining_users if _node_comes_before(bf16_node, u, graph)
-            ]
-            for user in users_to_rewire:
-                user.replace_input_with(node, bf16_node)
-
-            # Only erase the original norm if it has no remaining users
-            if len(node.users) == 0:
-                graph.erase_node(node)
 
         gm.recompile()
 
