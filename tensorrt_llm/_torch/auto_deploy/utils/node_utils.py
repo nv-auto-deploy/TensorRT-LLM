@@ -976,6 +976,18 @@ def extract_output_tuple(node: Node, count: int = 2):
     return results
 
 
+def _get_op_schema(node: Node):
+    """Return the op schema for a call_function node."""
+    if node.op != "call_function":
+        raise ValueError(f"_get_op_schema only supports call_function nodes, got {node.op}")
+    op = node.target
+    if hasattr(op, "_schemas"):
+        return next(iter(op._schemas.values()))
+    elif hasattr(op, "_schema"):
+        return op._schema
+    raise RuntimeError(f"No schema found on op {op}")
+
+
 def extract_op_args(node: Node, *arg_names):
     """
     Given a call_function node for torch custom op,
@@ -984,16 +996,7 @@ def extract_op_args(node: Node, *arg_names):
     2. node.args[position_in_schema]
     3. the schema default
     """
-    if node.op != "call_function":
-        raise ValueError(f"extract_op_args only supports call_function nodes, got {node.op}")
-
-    op = node.target
-    if hasattr(op, "_schemas"):
-        schema = next(iter(op._schemas.values()))
-    elif hasattr(op, "_schema"):
-        schema = op._schema
-    else:
-        raise RuntimeError(f"No schema found on op {op}")
+    schema = _get_op_schema(node)
     args_meta = schema.arguments
 
     # name→index in signature, and name→default_value
@@ -1011,9 +1014,27 @@ def extract_op_args(node: Node, *arg_names):
             return args[i]
         if name in defs:
             return defs[name]
-        raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
+        raise RuntimeError(f"Could not find a value for '{name}' on op {node.target}")
 
     return [_get(n) for n in arg_names]
+
+
+def set_op_arg(node: Node, name: str, value) -> tuple:
+    """Return an updated copy of node.args with the named argument replaced.
+
+    Uses the op schema to find the positional index of the argument by name,
+    making this robust to trailing default arguments being stripped by torch.export.
+    """
+    schema = _get_op_schema(node)
+    idx = next(
+        (i for i, a in enumerate(schema.arguments) if a.name == name),
+        None,
+    )
+    if idx is None:
+        raise RuntimeError(f"Argument '{name}' not found in schema for op {node.target}")
+    args = list(node.args)
+    args[idx] = value
+    return tuple(args)
 
 
 def predecessors(
