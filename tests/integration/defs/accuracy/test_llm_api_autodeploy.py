@@ -505,6 +505,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+
 class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for Qwen3-Next Instruct via AutoDeploy.
 
@@ -580,10 +581,10 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
             "trust_remote_code": True,
             "enable_chunked_prefill": True,
             "compile_backend": "torch-cudagraph",
-            "max_batch_size": 64,
+            "max_batch_size": 128,
             "max_seq_len": self.MAX_SEQ_LEN,
             "max_num_tokens": self.MAX_SEQ_LEN,
-            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64],
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.5,
@@ -591,12 +592,6 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
             },
             "model_kwargs": {
                 "torch_dtype": "bfloat16",
-            },
-            "transforms": {
-                "detect_sharding": {
-                    "sharding_source": ['factory', 'heuristic'],
-                    "sharding_dims": ['ep', 'bmm'],
-                },
             },
         }
 
