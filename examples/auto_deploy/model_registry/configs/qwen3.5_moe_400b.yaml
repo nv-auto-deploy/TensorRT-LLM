@@ -5,10 +5,20 @@ max_num_tokens: 2048
 max_batch_size: 512
 world_size: 8
 enable_chunked_prefill: true
+cuda_graph_batch_sizes: [512, 256, 128, 64, 32]
 model_factory: AutoModelForCausalLM
+skip_loading_weights: true
 kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.95
   tokens_per_block: 64
 model_kwargs:
   torch_dtype: bfloat16
+transforms:
+  match_swiglu_pattern:
+    enabled: true
+  fuse_swiglu:
+    enabled: true
+  multi_stream_moe:
+    stage: compile
+    enabled: true
