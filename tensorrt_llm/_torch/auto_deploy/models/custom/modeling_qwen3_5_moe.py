@@ -633,6 +633,11 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         # Router
         routing_weights, selected_experts = self.gate(hidden_states_flat)
 
+        shared_expert_output = self.shared_expert(hidden_states_flat)
+        shared_expert_output = (
+            F.sigmoid(self.shared_expert_gate(hidden_states_flat)) * shared_expert_output
+        )
+
         # Routed experts via fused MoE (weights already in TRT-LLM format from load hook)
         expert_output = torch.ops.auto_deploy.torch_moe_fused(
             hidden_states_flat,
@@ -642,11 +647,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             self.experts.down_proj,  # [E, H, I]
         )
 
-        # Shared expert with sigmoid gating
-        shared_expert_output = self.shared_expert(hidden_states_flat)
-        shared_expert_output = (
-            F.sigmoid(self.shared_expert_gate(hidden_states_flat)) * shared_expert_output
-        )
         expert_output = expert_output + shared_expert_output
 
         expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
