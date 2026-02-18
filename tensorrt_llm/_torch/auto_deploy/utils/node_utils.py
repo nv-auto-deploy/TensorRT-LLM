@@ -954,12 +954,12 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
         f"{len(unprocessed_linear_nodes)} unprocessed linear nodes"
     )
 
-    ad_logger.info("Drawing layered graph for rank")
-    from .debug_utils import draw_layered_graph
+    # ad_logger.info("Drawing layered graph for rank")
+    # from .debug_utils import draw_layered_graph
 
-    residuals = identify_regions_between_residuals(gm)
-    draw_layered_graph(gm, layer_subgraphs, unprocessed_linear_nodes, residuals, "deepseek")
-    exit()
+    # residuals = identify_regions_between_residuals(gm)
+    # draw_layered_graph(gm, layer_subgraphs, unprocessed_linear_nodes, residuals, "deepseek")
+    # exit()
     return layer_subgraphs, unprocessed_linear_nodes
 
 
@@ -1029,11 +1029,11 @@ def get_all_layer_subgraphs_old(gm: GraphModule) -> tuple[List[LayerSubgraph], s
             layer_subgraphs.append(layer_subgraph)
         last_lin_index = terminating_indices[-1] + 1
 
-    from .debug_utils import draw_layered_graph
+    # from .debug_utils import draw_layered_graph
 
-    residuals = identify_regions_between_residuals(gm)
-    draw_layered_graph(gm, layer_subgraphs, unprocessed_linear_nodes, residuals, "deepseek_old")
-    exit()
+    # residuals = identify_regions_between_residuals(gm)
+    # draw_layered_graph(gm, layer_subgraphs, unprocessed_linear_nodes, residuals, "deepseek_old")
+    # exit()
     # Unprocessed linear nodes can be "simple sharded".
     return layer_subgraphs, unprocessed_linear_nodes
 
