@@ -290,7 +290,7 @@ class ResizeKVCache(BaseTransform):
         *_, mem_reserved_for_forward = get_mem_info(empty_cache=False, unit="B")
 
         # Resize - KVCacheManager will compute optimal capacity based on free memory
-        cm.resize_kv_cache_manager(mem_reserved_for_forward)
+        cm.resize_kv_cache_manager(mem_reserved_for_forward * 1.3)
 
         info = TransformInfo(
             skipped=False,

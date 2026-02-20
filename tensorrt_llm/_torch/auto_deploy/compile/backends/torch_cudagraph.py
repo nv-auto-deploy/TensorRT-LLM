@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from torch.cuda import CUDAGraph
-from torch.fx import GraphModule
+from torch.fx import GraphModule, Interpreter
 from torch.fx._pytree import tree_flatten_spec
 from torch.utils._pytree import PyTree, TreeSpec, tree_flatten
 
@@ -27,6 +27,82 @@ from ...utils.logger import ad_logger
 from ..compiler import CompileBackendRegistry, CompilerBackend, GetArgsKwargsForBatchSize
 from ..piecewise_runner import ADPiecewiseRunner
 from ..piecewise_utils import SplitInfo, split_graph_at_dynamic_ops
+
+
+def _log_cuda_mem(label: str) -> None:
+    """Log current CUDA memory state without side effects (no empty_cache)."""
+    free, total = torch.cuda.mem_get_info()
+    alloc = torch.cuda.memory_allocated()
+    resv = torch.cuda.memory_reserved()
+    peak_alloc = torch.cuda.max_memory_allocated()
+    frag = resv - alloc
+    ad_logger.info(
+        f"[CUDA MEM] {label} | "
+        f"alloc: {alloc / (1 << 30):.2f}GB | "
+        f"resv: {resv / (1 << 30):.2f}GB | "
+        f"free: {free / (1 << 30):.2f}GB | "
+        f"frag: {frag / (1 << 30):.2f}GB | "
+        f"peak_alloc: {peak_alloc / (1 << 30):.2f}GB"
+    )
+
+
+class IntraBucketFinalizeInterpreter(Interpreter):
+    """FX Interpreter that finalizes static runners as soon as their outputs
+    are fully consumed during the capture pass.
+
+    Combines Phase A (garbage_collect_values=True for FX env refs) with
+    Phase B (finalize_entry for runner-held refs + registry refs).
+
+    The finalize schedule is computed from the FX graph topology by
+    :meth:`ADPiecewiseRunner.compute_finalize_schedule` — each runner is
+    finalized only after its LAST consumer node has executed, which is safe
+    even when skip connections exist in the graph.
+    """
+
+    def __init__(
+        self,
+        split_gm: GraphModule,
+        finalize_schedule: Dict[str, List[str]],
+        registry_prune_schedule: Dict[str, List[str]],
+        num_tokens: int,
+    ):
+        super().__init__(split_gm, garbage_collect_values=True)
+        self.finalize_schedule = finalize_schedule
+        self.registry_prune_schedule = registry_prune_schedule
+        self.num_tokens = num_tokens
+
+    def run_node(self, n):
+        result = super().run_node(n)
+
+        # Drop runner-held refs as soon as execution liveness allows, but keep
+        # registry entries until downstream runner captures have completed.
+        runners_to_finalize = self.finalize_schedule.get(n.name, [])
+        for runner_name in runners_to_finalize:
+            runner = getattr(self.module, runner_name, None)
+            if isinstance(runner, ADPiecewiseRunner):
+                runner.finalize_entry(
+                    self.num_tokens,
+                    prune_registry=False,
+                    drop_static_inputs=True,
+                )
+                ad_logger.debug(
+                    f"IntraBucketFinalizeInterpreter: finalized {runner_name} "
+                    f"for num_tokens={self.num_tokens} (trigger: {n.name})"
+                )
+
+        # Prune registry entries only when no downstream static runner capture
+        # should need lookup for the producer anymore.
+        runners_to_prune = self.registry_prune_schedule.get(n.name, [])
+        for runner_name in runners_to_prune:
+            runner = getattr(self.module, runner_name, None)
+            if isinstance(runner, ADPiecewiseRunner):
+                runner.prune_registry_for_entry(self.num_tokens)
+                ad_logger.debug(
+                    f"IntraBucketFinalizeInterpreter: pruned registry for {runner_name} "
+                    f"num_tokens={self.num_tokens} (trigger: {n.name})"
+                )
+
+        return result
 
 
 # Trivial FX ops that are metadata-only or typically no-ops — used to identify
@@ -273,6 +349,10 @@ class PiecewiseCapturedGraph(nn.Module):
         # Capturing these as CUDA graphs produces empty graphs and triggers PyTorch warnings.
         # Create a shared pool upfront so all runners share memory allocations.
         graph_pool = torch.cuda.graph_pool_handle()
+        # Graph-level parameter/buffer pointers are used by runners to avoid
+        # misclassifying forwarded weight tensors as dynamic inputs.
+        global_weight_ptrs = {p.data_ptr() for p in self.split_gm.parameters()}
+        global_weight_ptrs.update(b.data_ptr() for b in self.split_gm.buffers())
         num_wrapped = 0
         num_skipped = 0
         for idx in self.split_info.static_submod_indices:
@@ -292,6 +372,7 @@ class PiecewiseCapturedGraph(nn.Module):
                     submodule=original_submod,
                     piecewise_num_tokens=self.piecewise_num_tokens,
                     graph_pool=graph_pool,
+                    global_weight_ptrs=global_weight_ptrs,
                 )
                 setattr(self.split_gm, submod_name, runner)
                 num_wrapped += 1
@@ -305,6 +386,10 @@ class PiecewiseCapturedGraph(nn.Module):
             f"piecewise_num_tokens={self.piecewise_num_tokens}"
         )
 
+    def _get_placeholder_names(self) -> List[str]:
+        """Return placeholder node names in graph order (for Interpreter.run)."""
+        return [n.target for n in self.split_gm.graph.nodes if n.op == "placeholder"]
+
     def warmup_and_capture(
         self,
         get_args_kwargs: Callable[[int], Any],
@@ -314,6 +399,12 @@ class PiecewiseCapturedGraph(nn.Module):
 
         Follows the same pattern as monolithic CapturedGraph._capture_one_graph:
         the orchestrator controls the warmup → capture transition explicitly.
+
+        The capture phase uses an IntraBucketFinalizeInterpreter that:
+          - Eagerly frees FX intermediate values (garbage_collect_values=True)
+          - Finalizes each static runner after its last consumer node executes
+        This dramatically reduces peak graph-pool usage during capture of large
+        buckets by releasing cross-submodule activation tensors as they become dead.
 
         Args:
             get_args_kwargs: Callable that takes num_tokens and returns (args, kwargs).
@@ -326,11 +417,38 @@ class PiecewiseCapturedGraph(nn.Module):
         if self.split_gm is None:
             return
 
+        runners: List[ADPiecewiseRunner] = [
+            m for m in self.split_gm.modules() if isinstance(m, ADPiecewiseRunner)
+        ]
+
+        # Compute the intra-bucket finalize schedule once from the graph topology.
+        # This maps each FX node name → list of runner submodule names that become
+        # safe to finalize after that node executes.
+        finalize_schedule = ADPiecewiseRunner.compute_finalize_schedule(self.split_gm)
+        registry_prune_schedule = ADPiecewiseRunner.compute_registry_prune_schedule(self.split_gm)
+        ad_logger.info(
+            f"PiecewiseCapturedGraph: computed intra-bucket finalize schedule "
+            f"({sum(len(v) for v in finalize_schedule.values())} runners across "
+            f"{len(finalize_schedule)} trigger nodes)"
+        )
+        ad_logger.info(
+            f"PiecewiseCapturedGraph: computed registry-prune schedule "
+            f"({sum(len(v) for v in registry_prune_schedule.values())} runners across "
+            f"{len(registry_prune_schedule)} trigger nodes)"
+        )
+
+        # Placeholder names for converting kwargs → positional args for Interpreter.run()
+        placeholder_names = self._get_placeholder_names()
+
         # Sort num_tokens in descending order (largest first for memory allocation)
         num_tokens_list = sorted(self.piecewise_num_tokens, reverse=True)
-        for nt in num_tokens_list:
+        for idx, nt in enumerate(num_tokens_list):
             ad_logger.info(f"PiecewiseCapturedGraph: warming up for num_tokens={nt}")
             args, kwargs = get_args_kwargs(nt)
+            # Warm up only the largest bucket to avoid repeated eager-pass peak
+            # allocations (e.g., large to_dtype temporaries) on smaller buckets.
+            # Smaller buckets are captured directly using the same split graph.
+            warmup_iters_nt = warmup_iters if idx == 0 else 0
 
             # Set the num_tokens context so ALL ADPiecewiseRunners use the correct value.
             # This is critical: in piecewise-split models, some submodules receive
@@ -338,20 +456,142 @@ class PiecewiseCapturedGraph(nn.Module):
             # so inferring from arg shapes is unreliable.
             ADPiecewiseRunner.set_current_num_tokens(nt)
 
+            # Reset peak stats so we can measure per-phase peaks
+            torch.cuda.reset_peak_memory_stats()
+            _log_cuda_mem(f"nt={nt} before_warmup")
+
             with CudaGraphWarmUpPhase():
                 ADPiecewiseRunner.set_current_phase("warmup")
-                for _ in range(warmup_iters):
+                for _ in range(warmup_iters_nt):
                     self.split_gm(*args, **kwargs)
 
-                # Capture phase: capture CUDA graphs for all static segments
-                ADPiecewiseRunner.set_current_phase("capture")
-                self.split_gm(*args, **kwargs)
+                _log_cuda_mem(f"nt={nt} after_warmup")
 
+                # Free warmup activation blocks before capture so the graph pool
+                # can use the reclaimed CUDA memory instead of competing with it.
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+                _log_cuda_mem(f"nt={nt} after_warmup_empty_cache")
+                # Reset peak stats again so capture peak is measured cleanly
+                torch.cuda.reset_peak_memory_stats()
+
+                # Capture phase: use IntraBucketFinalizeInterpreter to capture
+                # CUDA graphs while aggressively freeing intermediate tensors.
+                ADPiecewiseRunner.set_current_phase("capture")
+                ADPiecewiseRunner.reset_registry_prune_hits(nt)
+
+                # Convert kwargs → positional args matching placeholder order
+                interp_args = []
+                for name in placeholder_names:
+                    if name in kwargs:
+                        interp_args.append(kwargs[name])
+
+                interp = IntraBucketFinalizeInterpreter(
+                    self.split_gm,
+                    finalize_schedule,
+                    registry_prune_schedule,
+                    nt,
+                )
+                interp.run(*interp_args)
+
+            _log_cuda_mem(f"nt={nt} after_capture")
+            # Debug telemetry: how many dynamic inputs are currently eligible for
+            # reconstruction (registry-backed) vs pinned, and how many registry
+            # entries were actually pruned during capture.
+            total_dyn_inputs = 0
+            total_reconstructable_inputs = 0
+            total_dyn_input_bytes = 0
+            total_reconstructable_input_bytes = 0
+            total_pinned_input_bytes = 0
+            unique_dyn_input_bytes = 0
+            unique_reconstructable_input_bytes = 0
+            unique_pinned_input_bytes = 0
+            seen_dyn_ptrs = set()
+            seen_reconstructable_ptrs = set()
+            seen_pinned_ptrs = set()
+            total_output_tensors = 0
+            total_finalized_runners = 0
+            for runner in runners:
+                entry = runner.entries.get(nt)
+                if entry is None:
+                    continue
+                if entry.dynamic_indices is not None:
+                    total_dyn_inputs += len(entry.dynamic_indices)
+                    reconstructable_set = entry._reconstructable_input_indices or set()
+                    for idx in entry.dynamic_indices:
+                        if entry.static_inputs is None or idx >= len(entry.static_inputs):
+                            continue
+                        inp = entry.static_inputs[idx]
+                        if not isinstance(inp, torch.Tensor):
+                            continue
+                        nbytes = inp.untyped_storage().nbytes()
+                        ptr = inp.untyped_storage().data_ptr()
+                        total_dyn_input_bytes += nbytes
+                        if ptr not in seen_dyn_ptrs:
+                            unique_dyn_input_bytes += nbytes
+                            seen_dyn_ptrs.add(ptr)
+
+                        if idx in reconstructable_set:
+                            total_reconstructable_input_bytes += nbytes
+                            if ptr not in seen_reconstructable_ptrs:
+                                unique_reconstructable_input_bytes += nbytes
+                                seen_reconstructable_ptrs.add(ptr)
+                        else:
+                            total_pinned_input_bytes += nbytes
+                            if ptr not in seen_pinned_ptrs:
+                                unique_pinned_input_bytes += nbytes
+                                seen_pinned_ptrs.add(ptr)
+                total_reconstructable_inputs += len(entry._reconstructable_input_indices or set())
+                if entry._finalized is not None:
+                    total_finalized_runners += 1
+                    total_output_tensors += sum(
+                        1 for meta in entry._finalized.output_metadata if meta is not None
+                    )
+                elif entry.static_output is not None:
+                    flat_output, _ = tree_flatten(entry.static_output)
+                    total_output_tensors += sum(
+                        1 for out_tensor in flat_output if isinstance(out_tensor, torch.Tensor)
+                    )
+            ad_logger.info(
+                f"PiecewiseCapturedGraph: nt={nt} capture_stats | "
+                f"dynamic_inputs={total_dyn_inputs} | "
+                f"reconstructable_inputs={total_reconstructable_inputs} | "
+                f"pinned_inputs={max(total_dyn_inputs - total_reconstructable_inputs, 0)} | "
+                f"dynamic_input_bytes={total_dyn_input_bytes / (1 << 30):.2f}GB | "
+                f"reconstructable_input_bytes={total_reconstructable_input_bytes / (1 << 30):.2f}GB | "
+                f"pinned_input_bytes={total_pinned_input_bytes / (1 << 30):.2f}GB | "
+                f"dynamic_input_bytes_unique={unique_dyn_input_bytes / (1 << 30):.2f}GB | "
+                f"reconstructable_input_bytes_unique={unique_reconstructable_input_bytes / (1 << 30):.2f}GB | "
+                f"pinned_input_bytes_unique={unique_pinned_input_bytes / (1 << 30):.2f}GB | "
+                f"output_tensors={total_output_tensors} | "
+                f"finalized_runners={total_finalized_runners}/{len(runners)} | "
+                f"registry_prune_hits={ADPiecewiseRunner.get_registry_prune_hits(nt)}"
+            )
             ad_logger.info(f"PiecewiseCapturedGraph: captured graphs for num_tokens={nt}")
+
+            # Keep entries in finalized form during multi-bucket capture to
+            # minimize live graph-pool references and maximize reuse. We defer
+            # materialization for all buckets until after the capture loop.
+            _log_cuda_mem(f"nt={nt} after_finalize")
+
+            # Cross-bucket cleanup: clear registry + empty_cache so the
+            # caching allocator can reuse freed blocks for the next bucket.
+            if idx < len(num_tokens_list) - 1:
+                ADPiecewiseRunner.clear_static_output_registry()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                _log_cuda_mem(f"nt={nt} after_cross_bucket_cleanup")
+
+        # Reconstruct finalized entries after all buckets are captured.
+        for nt in num_tokens_list:
+            for runner in runners:
+                runner.materialize_entry(nt)
 
         # Clear contexts after warmup/capture phase
         ADPiecewiseRunner.set_current_num_tokens(None)
         ADPiecewiseRunner.set_current_phase("replay")
+        ADPiecewiseRunner.clear_static_output_registry()
 
     def forward(self, *args, num_tokens: Optional[int] = None, **kwargs) -> Any:
         """Forward pass through the piecewise graph.
