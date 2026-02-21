@@ -56,7 +56,10 @@ def _forward_moe(self: Qwen3NextSparseMoeBlock, hidden_states: torch.Tensor):
 
     # Shared expert path (unique to Qwen3Next vs Qwen3MoE)
     shared_expert_output = self.shared_expert(hidden_states)
-    shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+    gate_logits = self.shared_expert_gate(hidden_states)
+    shared_expert_output = torch.ops.auto_deploy.fused_sigmoid_mul(
+        gate_logits, shared_expert_output
+    )
     final_hidden_states = final_hidden_states + shared_expert_output
 
     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
@@ -147,10 +150,8 @@ def _patched_gdn_forward(
     query = torch.ops.auto_deploy.torch_l2norm(query)
     key = torch.ops.auto_deploy.torch_l2norm(key)
 
-    # 4. Compute beta and gating
-    beta = b.sigmoid()  # [B, S, num_v_heads]
-    # If the model is loaded in fp16, without the .float() here, A might be -inf
-    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)  # [B, S, num_v_heads]
+    # 4. Compute beta and gating (fused into single Triton kernel)
+    g, beta = torch.ops.auto_deploy.fused_gdn_gating(self.A_log, a, self.dt_bias, b)
 
     # Repeat-interleave Q, K if num_v_heads > num_k_heads (GQA for linear attention)
     if self.num_v_heads // self.num_k_heads > 1:

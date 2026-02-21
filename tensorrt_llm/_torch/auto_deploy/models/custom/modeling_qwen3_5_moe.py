@@ -371,10 +371,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         query = torch.ops.auto_deploy.torch_l2norm(query)
         key = torch.ops.auto_deploy.torch_l2norm(key)
 
-        # 4. Compute beta and gating
-        beta = b.sigmoid()  # [B, S, num_v_heads]
-        # If the model is loaded in fp16, without the .float() here, A might be -inf
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)  # [B, S, num_v_heads]
+        # 4. Compute beta and gating (fused into single Triton kernel)
+        g, beta = torch.ops.auto_deploy.fused_gdn_gating(self.A_log, a, self.dt_bias, b)
 
         # Repeat-interleave Q, K if num_v_heads > num_k_heads (GQA for linear attention)
         if self.num_v_heads // self.num_k_heads > 1:
@@ -490,8 +488,8 @@ class Qwen3_5MoeAttention(nn.Module):
         )
         attn_output = attn_output.view(bsz, q_len, -1)  # (B, S, N*D)
 
-        # Gated output
-        attn_output = attn_output * torch.sigmoid(gate)
+        # Gated output (fused sigmoid × mul)
+        attn_output = torch.ops.auto_deploy.fused_sigmoid_mul(gate, attn_output)
 
         # Output projection
         attn_output = self.o_proj(attn_output)
@@ -619,10 +617,11 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         w2_weights = [self.experts[i].down_proj.weight for i in range(len(self.experts))]
         w3_weights = [self.experts[i].up_proj.weight for i in range(len(self.experts))]
 
-        # Shared expert with sigmoid gating
+        # Shared expert with sigmoid gating (fused sigmoid × mul)
         shared_expert_output = self.shared_expert(hidden_states_flat)
-        shared_expert_output = (
-            F.sigmoid(self.shared_expert_gate(hidden_states_flat)) * shared_expert_output
+        gate_logits = self.shared_expert_gate(hidden_states_flat)
+        shared_expert_output = torch.ops.auto_deploy.fused_sigmoid_mul(
+            gate_logits, shared_expert_output
         )
 
         expert_output = torch.ops.auto_deploy.torch_moe(
