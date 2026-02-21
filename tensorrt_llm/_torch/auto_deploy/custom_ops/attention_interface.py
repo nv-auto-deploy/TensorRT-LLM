@@ -534,6 +534,7 @@ class SequenceInfo:
             ("pages_per_seq", self.max_batch_size, torch.int),
             ("seq_len_with_cache", self.max_batch_size, torch.int),
             ("use_initial_states", self.max_batch_size, torch.bool),
+            ("any_prefill_use_initial_states", 1, torch.bool),
             ### OTHER ARGUMENTS USED BY THE RUNTIME ################################################
             ("extra_page_per_seq", self.max_batch_size, torch.int),
             ("token_gather_indices", self.max_num_tokens, torch.long),
@@ -1036,6 +1037,14 @@ class SequenceInfo:
         if self._is_required("use_initial_states"):
             use_initial_states = ip_host > 0
             self._stage_arg("use_initial_states", use_initial_states)
+
+        # precompute any(use_initial_states[:num_prefill]) on the host to avoid
+        # per-layer GPU->CPU sync from torch.any() inside cached ops
+        if self._is_required("any_prefill_use_initial_states"):
+            uis_host = self.get_arg("use_initial_states_host", truncate=True)
+            num_prefill = self.get_arg("batch_info_host")[0]
+            any_pfx_uis = uis_host[:num_prefill].any().unsqueeze(0)
+            self._stage_arg("any_prefill_use_initial_states", any_pfx_uis)
 
         ### UPDATE LOGITS GATHERING METADATA using heuristic if not provided #######################
         # default is to gather all logits
