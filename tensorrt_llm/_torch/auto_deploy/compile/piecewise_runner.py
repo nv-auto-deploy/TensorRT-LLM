@@ -80,7 +80,8 @@ class ADPiecewiseRunner(nn.Module):
 
     # Class-level contexts: the orchestrator sets these before each split_gm forward pass
     # so ALL runners in the graph use the same correct num_tokens and phase.
-    _current_num_tokens: Optional[int] = None
+    _current_num_tokens: Optional[int] = None  # bucket size (for entry lookup / CG replay)
+    _real_num_tokens: Optional[int] = None  # actual token count (for DynamicPaddingWrapper)
     _current_phase: str = "replay"  # "warmup", "capture", or "replay"
 
     # Class-level registry of output tensors produced during CUDA graph capture.
@@ -95,11 +96,21 @@ class ADPiecewiseRunner(nn.Module):
 
     @classmethod
     def set_current_num_tokens(cls, num_tokens: Optional[int]) -> None:
-        """Set the current num_tokens context for all runners.
+        """Set the current bucket num_tokens context for all runners.
 
         Called by PiecewiseCapturedGraph before each forward pass through the split graph.
         """
         cls._current_num_tokens = num_tokens
+
+    @classmethod
+    def set_real_num_tokens(cls, num_tokens: Optional[int]) -> None:
+        """Set the real (unpadded) num_tokens for DynamicPaddingWrapper.
+
+        Called by PiecewiseCapturedGraph before each forward pass.
+        DynamicPaddingWrapper reads this to know which output positions
+        to zero (positions beyond real_num_tokens up to bucket size).
+        """
+        cls._real_num_tokens = num_tokens
 
     @classmethod
     def set_current_phase(cls, phase: str) -> None:
@@ -356,3 +367,156 @@ class ADPiecewiseRunner(nn.Module):
     @graph_pool.setter
     def graph_pool(self, pool):
         self._graph_pool = pool
+
+
+class DynamicPaddingWrapper(nn.Module):
+    """Normalizes dynamic submodule I/O between real tokens and bucket size.
+
+    In piecewise CUDA graph execution, inputs are padded to bucket size for CG replay.
+    Dynamic ops should run on real tokens only (origin/main behavior), so this wrapper:
+      1) trims padded token dimensions on tensor inputs before submodule call
+      2) expands tensor outputs back to bucket shape and zero-fills padded tail
+
+    This centralizes padding handling and keeps custom ops padding-agnostic.
+    """
+
+    def __init__(self, submodule: nn.Module):
+        super().__init__()
+        self.submodule = submodule
+        # Cache trim plans keyed by (bucket_size, flat_arg_count) to avoid
+        # repeated full scans on every prefill call.
+        self._trim_plan_cache: Dict[
+            Tuple[int, int], Tuple[Optional[int], List[Tuple[int, int]]]
+        ] = {}
+
+    def forward(self, *args, **kwargs):
+        real = ADPiecewiseRunner._real_num_tokens
+        bucket = ADPiecewiseRunner._current_num_tokens
+        if real is None or bucket is None or real >= bucket:
+            return self.submodule(*args, **kwargs)
+
+        trimmed_args, trimmed_kwargs, trimmed_inputs = self._trim_inputs(
+            args=args, kwargs=kwargs, real=real, bucket=bucket
+        )
+        output = self.submodule(*trimmed_args, **trimmed_kwargs)
+
+        # For in-place dynamic ops, ensure original bucket-sized tensors have clean tails.
+        for token_axis, original in trimmed_inputs:
+            if token_axis == 0:
+                original[real:].zero_()
+            else:
+                original[:, real:].zero_()
+
+        return self._expand_outputs(output, real, bucket)
+
+    def _trim_inputs(self, args: Tuple[Any], kwargs: Dict[str, Any], real: int, bucket: int):
+        flat, spec = tree_flatten((args, kwargs))
+        trimmed_inputs: List[Tuple[int, torch.Tensor]] = []
+        cache_key = (bucket, len(flat))
+        trim_plan = self._trim_plan_cache.get(cache_key)
+        if trim_plan is None:
+            trim_plan = self._build_trim_plan(flat, bucket)
+            self._trim_plan_cache[cache_key] = trim_plan
+
+        primary_axis, activation_entries = trim_plan
+        if primary_axis is None:
+            trimmed_args, trimmed_kwargs = tree_unflatten(flat, spec)
+            return trimmed_args, trimmed_kwargs, trimmed_inputs
+
+        for idx, token_axis in activation_entries:
+            value = flat[idx]
+            if not isinstance(value, torch.Tensor):
+                continue
+            trimmed_inputs.append((token_axis, value))
+            if token_axis == 0:
+                flat[idx] = value[:real]
+            else:
+                flat[idx] = value[:, :real]
+
+        trimmed_args, trimmed_kwargs = tree_unflatten(flat, spec)
+        return trimmed_args, trimmed_kwargs, trimmed_inputs
+
+    @classmethod
+    def _build_trim_plan(
+        cls, flat: List[Any], bucket: int
+    ) -> Tuple[Optional[int], List[Tuple[int, int]]]:
+        primary_axis: Optional[int] = None
+        # Prefer activation tensors first.
+        for value in flat:
+            if not isinstance(value, torch.Tensor):
+                continue
+            token_axis = cls._get_token_axis(value, bucket)
+            if token_axis is not None:
+                primary_axis = token_axis
+                break
+
+        # Fallback for partitions where token activations are created inside the
+        # dynamic region (no activation-like token tensor at boundary). Infer
+        # axis from [1, bucket] token-id style inputs.
+        if primary_axis is None:
+            for value in flat:
+                if not isinstance(value, torch.Tensor):
+                    continue
+                if value.ndim >= 2 and value.shape[0] == 1 and value.shape[1] == bucket:
+                    primary_axis = 1
+                    break
+
+        if primary_axis is None:
+            return None, []
+
+        activation_entries: List[Tuple[int, int]] = []
+        for i, value in enumerate(flat):
+            if not isinstance(value, torch.Tensor):
+                continue
+            token_axis = cls._get_token_axis(value, bucket)
+            if token_axis is not None and token_axis == primary_axis:
+                activation_entries.append((i, token_axis))
+        return primary_axis, activation_entries
+
+    @classmethod
+    def _expand_outputs(cls, output: Any, real: int, bucket: int) -> Any:
+        flat, spec = tree_flatten(output)
+        for i, value in enumerate(flat):
+            if not isinstance(value, torch.Tensor):
+                continue
+            token_axis = cls._get_token_axis(value, bucket)
+            if token_axis is not None:
+                # Already bucket-sized output, just sanitize padded region.
+                if token_axis == 0:
+                    value[real:].zero_()
+                else:
+                    value[:, real:].zero_()
+                continue
+
+            token_axis = cls._get_token_axis(value, real)
+            if token_axis is None:
+                continue
+
+            if token_axis == 0:
+                expanded_shape = (bucket, *value.shape[1:])
+                expanded = value.new_zeros(expanded_shape)
+                expanded[:real].copy_(value, non_blocking=True)
+            else:
+                expanded_shape = (value.shape[0], bucket, *value.shape[2:])
+                expanded = value.new_zeros(expanded_shape)
+                expanded[:, :real].copy_(value, non_blocking=True)
+            flat[i] = expanded
+
+        return tree_unflatten(flat, spec)
+
+    @staticmethod
+    def _get_token_axis(tensor: torch.Tensor, token_size: int) -> Optional[int]:
+        # Dynamic partitions should only trim activation-like floating tensors.
+        # Avoid trimming integer metadata/caches by shape coincidence.
+        if not tensor.is_floating_point():
+            return None
+
+        # Token-major layout: [tokens, ...]. Restrict ndim to avoid cache tensors
+        # whose first dim may coincidentally match token_size.
+        if tensor.shape[0] == token_size and tensor.ndim <= 3:
+            return 0
+        # Batch-major token layout [1, tokens, ...] (e.g., hidden_states/qkv).
+        # Require ndim >= 3 to avoid trimming 2D metadata-like tensors.
+        if tensor.ndim >= 3 and tensor.shape[0] == 1 and tensor.shape[1] == token_size:
+            return 1
+        return None

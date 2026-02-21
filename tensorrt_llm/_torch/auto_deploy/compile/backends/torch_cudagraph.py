@@ -25,7 +25,7 @@ from tensorrt_llm._torch.autotuner import autotune
 from ...utils.cuda_graph import CudaGraphWarmUpPhase
 from ...utils.logger import ad_logger
 from ..compiler import CompileBackendRegistry, CompilerBackend, GetArgsKwargsForBatchSize
-from ..piecewise_runner import ADPiecewiseRunner
+from ..piecewise_runner import ADPiecewiseRunner, DynamicPaddingWrapper
 from ..piecewise_utils import SplitInfo, split_graph_at_dynamic_ops
 
 
@@ -100,7 +100,7 @@ class CapturedGraph(nn.Module):
         ]
         self._out_buffer_flat: List[torch.Tensor] = None
         self._args_hash: Optional[Tuple[int, ...]] = None
-        self._cuda_graph_mem_pool = None
+        self._cuda_graph_mem_pool = torch.cuda.graph_pool_handle()
 
         # store the in_spec and out_spec during graph capture
         self._in_spec = None
@@ -127,7 +127,6 @@ class CapturedGraph(nn.Module):
             for o_buffer, o in zip(self._out_buffer_flat, out_flat):
                 o_buffer[: o.shape[0]] = o
         torch.cuda.synchronize()
-        self._cuda_graph_mem_pool = self._cuda_graph_mem_pool or graph.pool()
         return graph
 
     def capture_graph(self, get_args_kwargs: GetArgsKwargsForBatchSize, batch_sizes: List[int]):
@@ -296,12 +295,23 @@ class PiecewiseCapturedGraph(nn.Module):
                 setattr(self.split_gm, submod_name, runner)
                 num_wrapped += 1
 
+        # Wrap dynamic submodules with DynamicPaddingWrapper so that padding
+        # positions are zeroed generically after each dynamic op, replacing
+        # the per-op padding logic previously scattered across individual ops.
+        num_dynamic_wrapped = 0
+        for idx in self.split_info.dynamic_submod_indices:
+            submod_name = f"submod_{idx}"
+            if hasattr(self.split_gm, submod_name):
+                original_submod = getattr(self.split_gm, submod_name)
+                setattr(self.split_gm, submod_name, DynamicPaddingWrapper(original_submod))
+                num_dynamic_wrapped += 1
+
         self._is_prepared = True
         ad_logger.info(
             f"PiecewiseCapturedGraph: prepared with "
             f"{self.split_info.num_submodules} submodules "
             f"({num_wrapped} wrapped for CUDA graph, {num_skipped} trivial skipped, "
-            f"{len(self.split_info.dynamic_submod_indices)} dynamic eager), "
+            f"{num_dynamic_wrapped} dynamic wrapped with padding), "
             f"piecewise_num_tokens={self.piecewise_num_tokens}"
         )
 
@@ -337,6 +347,8 @@ class PiecewiseCapturedGraph(nn.Module):
             # intermediate tensors (SSM metadata, chunk indices) whose dim0 != num_tokens,
             # so inferring from arg shapes is unreliable.
             ADPiecewiseRunner.set_current_num_tokens(nt)
+            # During warmup/capture, real == bucket (full-size batch), so wrapper is a no-op.
+            ADPiecewiseRunner.set_real_num_tokens(nt)
 
             with CudaGraphWarmUpPhase():
                 ADPiecewiseRunner.set_current_phase("warmup")
@@ -351,24 +363,30 @@ class PiecewiseCapturedGraph(nn.Module):
 
         # Clear contexts after warmup/capture phase
         ADPiecewiseRunner.set_current_num_tokens(None)
+        ADPiecewiseRunner.set_real_num_tokens(None)
         ADPiecewiseRunner.set_current_phase("replay")
 
-    def forward(self, *args, num_tokens: Optional[int] = None, **kwargs) -> Any:
+    def forward(
+        self,
+        *args,
+        bucket_num_tokens: Optional[int] = None,
+        real_num_tokens: Optional[int] = None,
+        **kwargs,
+    ) -> Any:
         """Forward pass through the piecewise graph.
 
         Each submodule handles its own capture/replay:
         - Static submodules (ADPiecewiseRunner): replay CUDA graph if available
-        - Dynamic submodules: run eagerly
+        - Dynamic submodules (DynamicPaddingWrapper): run eagerly, zero padding
 
         Args:
-            num_tokens: The total number of tokens in this batch. Must be provided
-                by the caller (DualModeCapturedGraph) — we cannot reliably infer it
-                from arg shapes because kwargs like input_ids may be [1, num_tokens]
-                (shape[0]=1, not num_tokens) and the first kwarg might not be input_ids.
+            bucket_num_tokens: The bucket size for CG entry lookup and replay.
+            real_num_tokens: The actual token count. DynamicPaddingWrapper uses
+                this to zero positions [real:bucket] in dynamic op outputs.
         """
         if self.split_gm is not None:
-            # Set num_tokens context for all ADPiecewiseRunners.
-            ADPiecewiseRunner.set_current_num_tokens(num_tokens)
+            ADPiecewiseRunner.set_current_num_tokens(bucket_num_tokens)
+            ADPiecewiseRunner.set_real_num_tokens(real_num_tokens)
             result = self.split_gm(*args, **kwargs)
             return result
         else:
@@ -385,11 +403,11 @@ class DualModeCapturedGraph(nn.Module):
       bucket -> use PiecewiseCapturedGraph with the smallest bucket >= num_tokens
     - Otherwise -> fall back to eager
 
-    Padding is handled upstream by SequenceInfo._padded_num_tokens: input_ids and
-    position_ids are shaped to the bucket size via _shape_for_forward, while all
-    metadata (batch_info_host, cu_seqlens, etc.) remains unchanged so dynamic ops
-    process only real tokens. Output logits are truncated back to the real token
-    count after the forward pass.
+    Padding strategy: inputs are padded to bucket size upstream (via
+    padded_num_tokens in _shape_for_forward). CG segments replay at bucket size.
+    DynamicPaddingWrapper on each dynamic submodule zeros padding positions in
+    the output so downstream CG segments see clean data. Logits are truncated
+    back to real token count after the model forward pass.
     """
 
     def __init__(
@@ -434,9 +452,20 @@ class DualModeCapturedGraph(nn.Module):
     def _get_num_tokens(self, **kwargs) -> int:
         """Extract total num_tokens from the batched inputs.
 
-        For prefill/mixed with flattened layout: input_ids shape = [1, total_num_tokens]
-        We use numel() which works for both [1, N] and [N] layouts.
+        Prefer batch_info_host (real tokens, unaffected by bucket padding):
+          batch_info_host = [num_prefill, num_prefill_tokens, num_decode]
+          real_num_tokens = num_prefill_tokens + num_decode
+
+        Fallback to batched input numel() only when batch_info_host is unavailable.
         """
+        batch_info = kwargs.get(self.batch_info_kwarg_name)
+        if (
+            batch_info is not None
+            and isinstance(batch_info, torch.Tensor)
+            and batch_info.numel() >= 3
+        ):
+            return int(batch_info[1].item() + batch_info[2].item())
+
         for name in self.batched_input_names:
             v = kwargs.get(name)
             if v is not None and isinstance(v, torch.Tensor):
@@ -459,8 +488,14 @@ class DualModeCapturedGraph(nn.Module):
         num_tokens = self._get_num_tokens(**kwargs)
         bucket = self._find_nearest_bucket(num_tokens)
         if bucket is not None:
-            # Piecewise CG path -- padding is handled upstream by SequenceInfo
-            return self.piecewise(*args, num_tokens=bucket, **kwargs)
+            # Piecewise CG path — inputs already padded upstream via padded_num_tokens;
+            # DynamicPaddingWrapper zeros padding in dynamic op outputs.
+            return self.piecewise(
+                *args,
+                bucket_num_tokens=bucket,
+                real_num_tokens=num_tokens,
+                **kwargs,
+            )
 
         # No bucket large enough -- eager fallback
         ad_logger.debug(

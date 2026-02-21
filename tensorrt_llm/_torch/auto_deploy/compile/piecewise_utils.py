@@ -6,6 +6,7 @@ This module provides the logic to:
 3. Return the split GraphModule and metadata about which submodules are dynamic vs static.
 """
 
+import operator
 from dataclasses import dataclass, field
 from typing import Dict, List, Set
 
@@ -55,6 +56,56 @@ _METADATA_PREP_OPS = [
 _LOGITS_GATHER_OPS = [
     "auto_deploy::gather_logits_before_lm_head",
 ]
+
+
+def _op_name(node: Node) -> str:
+    target = node.target
+    if hasattr(target, "name"):
+        return target.name()
+    if hasattr(target, "__qualname__"):
+        return target.__qualname__
+    return str(target)
+
+
+def _matches_op(op_name: str, patterns: Set[str]) -> bool:
+    for pattern in patterns:
+        if pattern in op_name:
+            return True
+    return False
+
+
+def _metadata_expected_consumers(node: Node) -> Set[str]:
+    """Return expected dynamic consumer op names for a metadata prep op."""
+    if node.op != "call_function":
+        return set()
+    name = _op_name(node)
+    if "auto_deploy::flashinfer_attention_prepare_metadata" in name:
+        return {"auto_deploy::flashinfer_attention_mha_with_cache"}
+    if "auto_deploy::mamba_ssm_prepare_metadata" in name:
+        return set(_CACHED_SSM_OPS)
+    return set()
+
+
+def _is_trivial_bridge_node(node: Node) -> bool:
+    if node.op in ("placeholder", "output"):
+        return True
+    if node.op == "call_function" and node.target in (operator.getitem,):
+        return True
+    if node.op == "call_method" and node.target in {
+        "view",
+        "reshape",
+        "contiguous",
+        "permute",
+        "transpose",
+        "unsqueeze",
+        "squeeze",
+        "expand",
+        "size",
+        "dim",
+        "to",
+    }:
+        return True
+    return False
 
 
 def _get_all_dynamic_op_names() -> Set[str]:
@@ -134,13 +185,46 @@ def split_graph_at_dynamic_ops(gm: GraphModule) -> SplitInfo:
     """
     # Assign partition IDs: each dynamic op gets its own partition,
     # static ops between dynamic ops share a partition.
+    # Special-case: co-locate metadata prep with its dynamic consumer
+    # (FI attention / Mamba SSM) when only trivial bridge nodes are in between.
     partition_counter = [0]  # mutable counter
     node_to_partition: Dict[Node, int] = {}
     dynamic_partitions: Set[int] = set()
+    metadata_region_active = False
+    metadata_region_partition = -1
+    metadata_region_consumers: Set[str] = set()
 
     # First pass: identify dynamic nodes and assign them unique partitions
     for node in gm.graph.nodes:
         if node.op in ("placeholder", "output"):
+            continue
+
+        if metadata_region_active:
+            if node.op == "call_function" and _matches_op(
+                _op_name(node), metadata_region_consumers
+            ):
+                node_to_partition[node] = metadata_region_partition
+                metadata_region_active = False
+                metadata_region_consumers = set()
+                partition_counter[0] = metadata_region_partition + 1
+                continue
+            if _is_trivial_bridge_node(node):
+                node_to_partition[node] = metadata_region_partition
+                continue
+            # Unexpected non-trivial op between metadata prep and consumer:
+            # stop co-location and resume normal splitting.
+            metadata_region_active = False
+            metadata_region_consumers = set()
+            partition_counter[0] = metadata_region_partition + 1
+
+        expected_consumers = _metadata_expected_consumers(node)
+        if expected_consumers:
+            partition_counter[0] += 1
+            metadata_region_partition = partition_counter[0]
+            node_to_partition[node] = metadata_region_partition
+            dynamic_partitions.add(metadata_region_partition)
+            metadata_region_active = True
+            metadata_region_consumers = expected_consumers
             continue
 
         if is_dynamic_cached_op(node):
@@ -183,24 +267,21 @@ def split_graph_at_dynamic_ops(gm: GraphModule) -> SplitInfo:
     # Sort by index
     submod_names.sort(key=lambda n: int(n.split("_")[1]))
 
-    # Build a mapping from partition ID to submod index
-    # The split_module assigns submod_N names in order of first-seen partition IDs
-    partition_ids_in_order = []
-    seen = set()
-    for node in gm.graph.nodes:
-        if node.op in ("placeholder", "output"):
-            continue
-        pid = node_to_partition.get(node, 0)
-        if pid not in seen:
-            seen.add(pid)
-            partition_ids_in_order.append(pid)
-
+    # Robust classification: inspect each produced submodule directly.
+    # This avoids index-mapping drift when partition IDs are sparse or when
+    # split_module drops empty partitions.
     dynamic_indices = []
     static_indices = []
-    for idx, pid in enumerate(partition_ids_in_order):
-        if idx >= len(submod_names):
-            break
-        if pid in dynamic_partitions:
+    for name in submod_names:
+        idx = int(name.split("_")[1])
+        submod = getattr(split_gm, name)
+        is_dynamic = False
+        if isinstance(submod, GraphModule):
+            for node in submod.graph.nodes:
+                if is_dynamic_cached_op(node):
+                    is_dynamic = True
+                    break
+        if is_dynamic:
             dynamic_indices.append(idx)
         else:
             static_indices.append(idx)

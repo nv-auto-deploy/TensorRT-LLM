@@ -130,10 +130,6 @@ def _triton_cached_causal_conv1d(
         )
         inp_flat[num_prefill_tokens:num_total_tokens] = y_decode
 
-    # Zero padding positions beyond valid tokens (for piecewise CUDA graph)
-    if num_total_tokens < bs:
-        inp_flat[num_total_tokens:].zero_()
-
 
 @_triton_cached_causal_conv1d.register_fake
 def _triton_cached_causal_conv1d_fake(
