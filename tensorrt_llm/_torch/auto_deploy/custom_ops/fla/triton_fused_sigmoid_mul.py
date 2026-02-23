@@ -56,7 +56,9 @@ def _fused_sigmoid_mul_kernel(
         sig = 1.0 / (1.0 + tl.exp(-gate))
 
     x = tl.load(x_ptr + row * N_COLS + col_off, mask=mask)
-    out = (sig * x.to(tl.float32)).to(x.dtype)
+    # Round sigmoid to input dtype before multiply to match PyTorch numerics
+    # (PyTorch stores sigmoid result in native dtype before the mul).
+    out = sig.to(x.dtype) * x
     tl.store(out_ptr + row * N_COLS + col_off, out, mask=mask)
 
 
