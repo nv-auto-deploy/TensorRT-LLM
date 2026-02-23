@@ -578,6 +578,7 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
+    MODEL_PATH_FP8 = "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/yeonbokl/dev/models/Qwen3.5-397B-A17B-FP8"
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
 
@@ -606,6 +607,45 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
             },
         }
 
+    def get_fp8_kwargs(self):
+        return {
+            "runtime":
+            "trtllm",
+            "compile_backend":
+            "torch-cudagraph",
+            "max_seq_len":
+            262144,
+            "max_num_tokens":
+            4096,
+            "max_batch_size":
+            32,
+            "cuda_graph_batch_sizes": [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+                19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
+            ],
+            "enable_chunked_prefill":
+            True,
+            "model_factory":
+            "AutoModelForCausalLM",
+            "kv_cache_config": {
+                "enable_block_reuse": True,
+                "free_gpu_memory_fraction": 0.8,
+                "tokens_per_block": 64,
+            },
+            "model_kwargs": {
+                "torch_dtype": "bfloat16",
+            },
+            "transforms": {
+                "export_to_gm": {
+                    "num_moe_experts_for_export": 2,
+                },
+                "multi_stream_moe": {
+                    "stage": "compile",
+                    "enabled": True,
+                },
+            },
+        }
+
     def get_default_sampling_params(self):
         eos_id = -1
         beam_width = 1
@@ -630,3 +670,20 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @pytest.mark.parametrize("world_size", [8])
+    def test_fp8(self, world_size):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = self.get_fp8_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH_FP8,
+                           tokenizer=self.MODEL_PATH_FP8,
+                           world_size=world_size,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+
+
+#            task = GSM8K(self.MODEL_NAME)
+#            task.evaluate(llm)
