@@ -2,8 +2,8 @@ runtime: trtllm
 compile_backend: torch-cudagraph
 max_seq_len: 4096
 max_num_tokens: 4096
-max_batch_size: 512
-world_size: 2
+max_batch_size: 64
+world_size: 1
 enable_chunked_prefill: true
 model_factory: AutoModelForCausalLM
 kv_cache_config:
@@ -16,3 +16,6 @@ model_kwargs:
   #   num_hidden_layers: 6
   # vision_config:
   #   depth: 2
+transforms:
+  export_to_gm:
+    num_moe_experts_for_export: 2

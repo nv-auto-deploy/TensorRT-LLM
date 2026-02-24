@@ -20,6 +20,7 @@ Gated Delta Rule is based on this paper: https://arxiv.org/abs/2412.06464
 Kernels are based on this repo: https://github.com/fla-org/flash-linear-attention
 """
 
+import os
 from typing import List
 
 import torch
@@ -39,6 +40,131 @@ from ..attention_interface import (
     ResourceHandlerDict,
     StateResourceHandler,
 )
+
+# ---------------------------------------------------------------------------
+# Debug guard: set TRTLLM_FLA_DEBUG=1 to enable cache-isolation checks.
+# Set TRTLLM_FLA_DUMP_DIR=<path> to also dump cache snapshots to disk.
+# ---------------------------------------------------------------------------
+_FLA_DEBUG = os.environ.get("TRTLLM_FLA_DEBUG", "0") == "1"
+_FLA_DUMP_DIR = os.environ.get("TRTLLM_FLA_DUMP_DIR", "")
+_fla_debug_step_counter = [0]  # mutable container for step tracking
+
+
+def _fla_debug_pre_check(delta_cache, slot_idx, num_seq, batch_info_host, q):
+    """Pre-op debug checks: metadata sanity + cache snapshot for post-check."""
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    max_slots = delta_cache.shape[0]
+    active_slots = slot_idx[:num_seq].long()
+
+    # Slot index bounds
+    assert active_slots.numel() == 0 or active_slots.max().item() < max_slots, (
+        f"[FLA DEBUG] slot_idx out of bounds: max={active_slots.max().item()}, "
+        f"cache_slots={max_slots}"
+    )
+    assert active_slots.numel() == 0 or active_slots.min().item() >= 0, (
+        f"[FLA DEBUG] negative slot_idx: {active_slots.min().item()}"
+    )
+
+    # batch_info_host consistency
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    total_tokens = q.shape[0] * q.shape[1]
+    assert num_prefill_tokens + num_decode == total_tokens, (
+        f"[FLA DEBUG] batch_info_host inconsistent: "
+        f"{num_prefill_tokens} prefill_tokens + {num_decode} decode != {total_tokens} total. "
+        f"batch_info_host={batch_info_host.tolist()}"
+    )
+    assert num_prefill + num_decode == num_seq, (
+        f"[FLA DEBUG] num_prefill({num_prefill}) + num_decode({num_decode}) != num_seq({num_seq})"
+    )
+
+    # Duplicate slot indices (two sequences sharing one cache slot)
+    if active_slots.numel() > 1:
+        unique_slots = active_slots.unique()
+        assert unique_slots.numel() == active_slots.numel(), (
+            f"[FLA DEBUG] DUPLICATE slot_idx detected! "
+            f"slots={active_slots.tolist()}, unique={unique_slots.tolist()}"
+        )
+
+    return delta_cache.clone()
+
+
+def _fla_debug_post_check(delta_cache, cache_before, slot_idx, num_seq):
+    """Post-op debug checks: slot isolation + NaN/Inf detection."""
+    if cache_before is None:
+        return
+    step = _fla_debug_step_counter[0]
+    _fla_debug_step_counter[0] += 1
+
+    active_slots = slot_idx[:num_seq].long()
+    max_slots = delta_cache.shape[0]
+
+    # Build mask of slots that SHOULD have changed
+    expected_modified = torch.zeros(max_slots, dtype=torch.bool, device=delta_cache.device)
+    if active_slots.numel() > 0:
+        expected_modified[active_slots] = True
+
+    # Check which slots actually changed
+    diff = (
+        (delta_cache.float() - cache_before.float())
+        .abs()
+        .amax(dim=tuple(range(1, delta_cache.ndim)))
+    )
+    actually_modified = diff > 0
+
+    # Slots that changed but shouldn't have
+    unexpected = actually_modified & ~expected_modified
+    if unexpected.any():
+        bad_slots = unexpected.nonzero(as_tuple=True)[0].tolist()
+        bad_diffs = diff[unexpected].tolist()
+        raise RuntimeError(
+            f"[FLA DEBUG step={step}] CACHE CONTAMINATION: "
+            f"slots {bad_slots} were modified but are NOT in active "
+            f"slot_idx={active_slots.tolist()}! Max diffs: {bad_diffs}"
+        )
+
+    # NaN/Inf in active slots
+    if active_slots.numel() > 0:
+        active_cache = delta_cache[active_slots]
+        if torch.isnan(active_cache).any():
+            nan_slots = [
+                active_slots[i].item()
+                for i in range(active_slots.numel())
+                if torch.isnan(delta_cache[active_slots[i]]).any()
+            ]
+            raise RuntimeError(f"[FLA DEBUG step={step}] NaN in cache slots {nan_slots}")
+        if torch.isinf(active_cache).any():
+            inf_slots = [
+                active_slots[i].item()
+                for i in range(active_slots.numel())
+                if torch.isinf(delta_cache[active_slots[i]]).any()
+            ]
+            raise RuntimeError(f"[FLA DEBUG step={step}] Inf in cache slots {inf_slots}")
+
+    # Optional dump
+    if _FLA_DUMP_DIR:
+        os.makedirs(_FLA_DUMP_DIR, exist_ok=True)
+        dump_path = os.path.join(_FLA_DUMP_DIR, f"fla_step_{step:06d}.safetensors")
+        try:
+            from safetensors import torch as safetensors_torch
+
+            safetensors_torch.save_file(
+                {
+                    "cache_before": cache_before.cpu(),
+                    "cache_after": delta_cache.cpu(),
+                    "slot_idx": slot_idx[:num_seq].cpu().int(),
+                },
+                dump_path,
+            )
+        except ImportError:
+            torch.save(
+                {
+                    "cache_before": cache_before.cpu(),
+                    "cache_after": delta_cache.cpu(),
+                    "slot_idx": slot_idx[:num_seq].cpu(),
+                },
+                dump_path.replace(".safetensors", ".pt"),
+            )
 
 
 @torch.library.custom_op("auto_deploy::fla_cached_gated_delta_rule", mutates_args=("delta_cache",))
@@ -71,7 +197,7 @@ def fla_cached_gated_delta_rule(
     beta_flat = beta.view(b * s, num_heads)
 
     # pre-allocate output
-    y = torch.empty_like(v, memory_format=torch.contiguous_format)
+    y = torch.zeros_like(v, memory_format=torch.contiguous_format)
     y_flat = y.view(b * s, num_heads, -1)
 
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
@@ -81,6 +207,11 @@ def fla_cached_gated_delta_rule(
     cu_seqlen_prefill = cu_seqlen[: num_prefill + 1]
     slot_idx = slot_idx[:num_seq].to(torch.long)
     use_initial_states = use_initial_states[:num_seq]
+
+    # Debug guard: pre-check
+    _cache_snapshot = None
+    if _FLA_DEBUG:
+        _cache_snapshot = _fla_debug_pre_check(delta_cache, slot_idx, num_seq, batch_info_host, q)
 
     if num_prefill > 0:
         initial_states = None
@@ -125,6 +256,10 @@ def fla_cached_gated_delta_rule(
         y_flat[None, num_prefill_tokens:] = y_decode.to(y_flat.dtype)
 
         del y_decode
+
+    # Debug guard: post-check
+    if _FLA_DEBUG and _cache_snapshot is not None:
+        _fla_debug_post_check(delta_cache, _cache_snapshot, slot_idx, num_seq)
 
     return y
 
@@ -184,15 +319,15 @@ class FlaGatedDeltaBackend(AttentionDescriptor):
         num_heads = key_node.meta["val"].shape[-2]
         key_dim = key_node.meta["val"].shape[-1]
         value_dim = value_node.meta["val"].shape[-1]
-        key_dtype = key_node.meta["val"].dtype
 
         return {
             "delta_cache": StateResourceHandler(
                 num_heads,
                 key_dim,
                 value_dim,
-                # NOTE: not configurable at the moment, using auto to match the key dtype
-                dtype=cls.resolve_cache_dtype("auto", key_dtype),
+                # NOTE: float32 cache to avoid bfloat16 quantization errors
+                # that accumulate across autoregressive decode steps.
+                dtype=torch.float32,
             )
         }
 

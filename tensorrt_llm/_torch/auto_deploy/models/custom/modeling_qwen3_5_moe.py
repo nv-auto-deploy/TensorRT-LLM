@@ -372,7 +372,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         key = torch.ops.auto_deploy.torch_l2norm(key)
 
         # 4. Compute beta and gating
-        beta = b.sigmoid()  # [B, S, num_v_heads]
+        beta = b.float().sigmoid()  # [B, S, num_v_heads]
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)  # [B, S, num_v_heads]
 

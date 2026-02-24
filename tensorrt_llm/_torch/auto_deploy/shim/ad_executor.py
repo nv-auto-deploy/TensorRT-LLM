@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -310,7 +310,8 @@ def _generate_dummy_request(
     if spec_res_mgr:
         spec_res_mgr.add_dummy_requests([request_id])
 
-    # NOTE: hack to avoid blocking a slot for the dummy request
+    # NOTE: hack to avoid blocking a slot for the dummy request. This value may be overridden
+    # by the caller when unique per-batch padding slots are required.
     dummy_request.seq_slot = slot_manager.get_max_resource_count()
     dummy_request.py_seq_slot = dummy_request.seq_slot
 
@@ -335,8 +336,8 @@ def maybe_pad_for_cuda_graph(func):
         # generate a persistent dummy request right away to ensure we can reserve the necessary
         # resources (kv page and slot) the first time we can actually run cuda graph according to
         # this rank
-        if can_run_cuda_graph and self.padding_dummy_request is None:
-            self.padding_dummy_request = _generate_dummy_request(
+        if can_run_cuda_graph and not self.padding_dummy_requests:
+            first_dummy = _generate_dummy_request(
                 resource_manager,
                 request_id=CUDA_GRAPH_DUMMY_REQUEST_ID,
                 is_gen=True,
@@ -344,9 +345,11 @@ def maybe_pad_for_cuda_graph(func):
                 use_mrope=False,
                 max_beam_width=self.max_beam_width,
             )
+            if first_dummy is not None:
+                self.padding_dummy_requests.append(first_dummy)
 
-        # check if we can pad the batch based on the availability of the dummy request
-        can_pad = self.padding_dummy_request is not None
+        # check if we can pad the batch based on the availability of the dummy request(s)
+        can_pad = bool(self.padding_dummy_requests)
 
         # in attention DP mode, we check all ranks
         if self.enable_attention_dp and self.mapping.tp_size > 1:
@@ -381,7 +384,7 @@ def maybe_pad_for_cuda_graph(func):
         num_padding = cg_batch_size - batch_size
 
         # we should only hit this point for either of these conditions
-        assert num_padding == 0 or (num_padding > 0 and self.padding_dummy_request is not None), (
+        assert num_padding == 0 or (num_padding > 0 and self.padding_dummy_requests), (
             "Padding should not be needed or available at this point"
         )
 
@@ -389,8 +392,48 @@ def maybe_pad_for_cuda_graph(func):
         if num_padding == 0:
             return _call_func()
 
-        # pad the scheduled requests with the dummy request
-        scheduled_requests.generation_requests.extend([self.padding_dummy_request] * num_padding)
+        # ensure we have enough dummy requests for padding
+        if num_padding > len(self.padding_dummy_requests):
+            for idx in range(len(self.padding_dummy_requests), num_padding):
+                # Use descending IDs to stay within uint64 range while remaining unique.
+                request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - idx
+                new_dummy = _generate_dummy_request(
+                    resource_manager,
+                    request_id=request_id,
+                    is_gen=True,
+                    max_num_draft_tokens=self.max_total_draft_tokens,
+                    use_mrope=False,
+                    max_beam_width=self.max_beam_width,
+                )
+                if new_dummy is None:
+                    return _call_func()
+                self.padding_dummy_requests.append(new_dummy)
+
+        # Assign unique seq_slot per padding request for non-mamba backends.
+        # For mamba, slot_idx is derived from mamba_cache_index using request_id, so
+        # unique dummy request IDs are sufficient.
+        kv_cache_manager: KVCacheManager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        if not hasattr(kv_cache_manager, "mamba_cache_index"):
+            slot_manager: SeqSlotManager = resource_manager.get_resource_manager(
+                ResourceManagerType.SEQ_SLOT_MANAGER
+            )
+            max_slots = slot_manager.get_max_resource_count()
+            used_slots = {
+                req.seq_slot
+                for req in scheduled_requests.all_requests()
+                if req.seq_slot is not None
+            }
+            free_slots = [s for s in range(max_slots) if s not in used_slots]
+            if len(free_slots) < num_padding:
+                return _call_func()
+            for dummy_req, slot in zip(self.padding_dummy_requests[:num_padding], free_slots):
+                dummy_req.seq_slot = slot
+                dummy_req.py_seq_slot = slot
+
+        # pad the scheduled requests with unique dummy requests
+        scheduled_requests.generation_requests.extend(self.padding_dummy_requests[:num_padding])
 
         ret = _call_func()
 
@@ -549,7 +592,7 @@ class ADEngine(ModelEngine):
             self.cuda_graph_batch_sizes = ad_config.cuda_graph_batch_sizes
 
         # keep a reference for one dummy request around
-        self.padding_dummy_request: Optional[LlmRequest] = None
+        self.padding_dummy_requests: List[LlmRequest] = []
 
         # Reuse _execute_logit_post_processors from PyTorchModelEngine
         self.mapping = mapping
@@ -765,6 +808,15 @@ class ADEngine(ModelEngine):
         # In other cases (decode-only) or when we keep all logits, we do not need to gather.
         gather_required = len(context_requests) > 0 and not gather_context_logits
         logits_gather_info = [len(logits_gather_indices), int(gather_required)]
+
+        num_sequences = len(seq_len)
+        unique_slots = len(set(slot_idx))
+        if unique_slots != len(slot_idx):
+            duplicate_slots = [s for s in set(slot_idx) if slot_idx.count(s) > 1]
+            ad_logger.info(
+                f"[AD WARNING] Duplicate slot_idx detected: num_sequences={num_sequences} "
+                f"unique_slots={unique_slots} duplicate_slots={duplicate_slots} slot_idx={slot_idx}"
+            )
 
         # update the sequence info object now
         self.cache_seq_interface.info.nest_sequences(
