@@ -380,7 +380,13 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
             weight = state_dict[weight_name]
             # ModelOpt quantized graph path
             if weight.dtype != torch.uint8:
-                assert input_scale_name in state_dict
+                # Compute default input_scale when not provided in checkpoint
+                # (e.g., shared expert weights stored in bf16 in NVFP4 checkpoints)
+                if input_scale_name not in state_dict:
+                    print(
+                        f"Warning: {input_scale_name} not found in checkpoint, using default value 1.0 / 6.0"
+                    )
+                    state_dict[input_scale_name] = torch.tensor(1.0 / 6.0)
                 # Unquantized weight
                 amax_name = weight_name + "_quantizer._amax"
                 if amax_name in state_dict:
