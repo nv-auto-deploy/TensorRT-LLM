@@ -112,14 +112,21 @@ def _pattern_matches(modname: str, pattern: str) -> bool:
 
     Supports both:
     - Glob patterns (with * or ?): use fnmatch
-    - Simple strings (no wildcards): use substring matching (HF style)
+    - Simple strings (no wildcards): suffix matching against module path
+
+    For non-wildcard patterns, this matches the module itself — not its children.
+    E.g., "shared_expert" matches "model.layers.0.mlp.shared_expert" but NOT
+    "model.layers.0.mlp.shared_expert.gate_proj".  This prevents parent-module
+    exclude entries (like "shared_expert" in ModelOPT configs) from accidentally
+    blocking quantization of their linear sub-modules.
     """
     # If pattern contains wildcards, use fnmatch
     if "*" in pattern or "?" in pattern:
         return fnmatch(modname, pattern)
-    # Otherwise, use substring matching (HF modules_to_not_convert style)
-    # Check if pattern appears as a component in the module path
-    return pattern in modname.split(".")
+    # Otherwise, check if modname ends with the pattern (module-level match).
+    # This correctly handles both short names ("gate", "lm_head") and full paths
+    # ("model.embed_tokens", "model.language_model.layers.0.mlp.shared_expert_gate").
+    return modname == pattern or modname.endswith("." + pattern)
 
 
 def should_skip_quantization(
@@ -128,8 +135,9 @@ def should_skip_quantization(
 ) -> bool:
     """Check if a node or parameter name should be skipped based on excluded patterns.
 
-    Supports both glob patterns (e.g., "*gate*") and simple substring patterns
-    (e.g., "gate" matches "model.layers.0.block_sparse_moe.gate").
+    Supports both glob patterns (e.g., "*gate*") and simple string patterns
+    (e.g., "gate" matches "model.layers.0.block_sparse_moe.gate" but not
+    "model.layers.0.mlp.shared_expert.gate_proj").
     """
     if isinstance(node_or_name, str):
         modname, _, _ = node_or_name.rpartition(".")
