@@ -205,6 +205,10 @@ transforms:
   insert_cached_gated_delta_rule:
     stage: cache_init
     backend: fla_gated_delta
+    enabled: false
+  insert_cached_sigmoid_gated_delta_rule:
+    stage: cache_init
+    backend: fla_fused_sigmoid_gated_delta
     enabled: true
   insert_cached_residual_add:
     stage: cache_init

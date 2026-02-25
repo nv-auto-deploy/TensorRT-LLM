@@ -284,7 +284,7 @@ class Qwen3_5MoeTextRotaryEmbedding(nn.Module):
 # =============================================================================
 # Adapted from the Qwen3Next GDN patch:
 #   tensorrt_llm/_torch/auto_deploy/models/patches/qwen3_next.py
-# Uses autodeploy custom ops: torch_causal_conv1d, torch_l2norm, torch_gated_delta_rule
+# Uses autodeploy custom ops: torch_causal_conv1d, torch_l2norm, torch_sigmoid_gated_delta_rule
 
 
 class Qwen3_5MoeGatedDeltaNet(nn.Module):
@@ -371,19 +371,24 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         query = torch.ops.auto_deploy.torch_l2norm(query)
         key = torch.ops.auto_deploy.torch_l2norm(key)
 
-        # 4. Compute beta and gating
-        beta = b.float().sigmoid()  # [B, S, num_v_heads]
-        # If the model is loaded in fp16, without the .float() here, A might be -inf
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)  # [B, S, num_v_heads]
-
-        # Repeat-interleave Q, K if num_v_heads > num_k_heads (GQA for linear attention)
+        # 4. Repeat-interleave Q, K if num_v_heads > num_k_heads (GQA for linear attention)
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        # 5. Gated Delta Rule via autodeploy custom op
+        # 5. Gated Delta Rule with fused sigmoid gating via autodeploy custom op
         # Op expects [B, S, H, D] layout (bsnd convention)
-        core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(query, key, value, g, beta)
+        # Raw gating params (a, b, A_log, dt_bias) are passed directly; sigmoid/softplus
+        # are computed inside the fused Triton kernel during decode.
+        core_attn_out = torch.ops.auto_deploy.torch_sigmoid_gated_delta_rule(
+            query,
+            key,
+            value,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+        )
 
         # 6. Gated RMSNorm
         z_shape_og = z.shape

@@ -311,9 +311,15 @@ class GDN_Block(nn.Module):
             q_conv = q_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             k_conv = k_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        beta = b_tensor.sigmoid()
-        g = -self.A_log.exp() * F.softplus(a + self.dt_bias)
-        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(q_conv, k_conv, v_conv, g, beta)
+        attn_out = torch.ops.auto_deploy.torch_sigmoid_gated_delta_rule(
+            q_conv,
+            k_conv,
+            v_conv,
+            a,
+            b_tensor,
+            self.A_log,
+            self.dt_bias,
+        )
 
         # Gated norm on head_v_dim, then project
         attn_out_flat = attn_out.reshape(-1, self.head_v_dim)
@@ -397,10 +403,16 @@ class GDN_Block_Unfused(nn.Module):
             q_conv = q_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             k_conv = k_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        # 5. Gated delta rule
-        beta = b_tensor.sigmoid()
-        g = -self.A_log.exp() * F.softplus(a + self.dt_bias)
-        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(q_conv, k_conv, v_conv, g, beta)
+        # 5. Gated delta rule with fused sigmoid gating
+        attn_out = torch.ops.auto_deploy.torch_sigmoid_gated_delta_rule(
+            q_conv,
+            k_conv,
+            v_conv,
+            a,
+            b_tensor,
+            self.A_log,
+            self.dt_bias,
+        )
 
         # 6. Gated norm on head_v_dim, then project
         attn_out_flat = attn_out.reshape(-1, self.head_v_dim)

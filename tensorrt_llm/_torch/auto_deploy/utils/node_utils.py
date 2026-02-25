@@ -554,6 +554,7 @@ def is_any_delta_op(node: Node) -> bool:
         node,
         ops=[
             torch.ops.auto_deploy.torch_gated_delta_rule,
+            torch.ops.auto_deploy.torch_sigmoid_gated_delta_rule,
         ],
     )
 

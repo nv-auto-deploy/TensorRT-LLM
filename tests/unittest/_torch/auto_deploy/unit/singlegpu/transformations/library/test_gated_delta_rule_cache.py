@@ -1,19 +1,19 @@
-"""Transform unit test for insert_cached_gated_delta_rule with the fla_gated_delta backend.
+"""Transform unit test for insert_cached_sigmoid_gated_delta_rule with fla_fused_sigmoid_gated_delta.
 
 Verifies the full pipeline:
-  1. Build a mock model that calls ``torch_gated_delta_rule`` internally.
+  1. Build a mock model that calls ``torch_sigmoid_gated_delta_rule`` internally.
   2. Export to GraphModule.
-  3. Apply the ``insert_cached_gated_delta_rule`` transform.
+  3. Apply the ``insert_cached_sigmoid_gated_delta_rule`` transform.
   4. Test full-sequence prefill matches uncached model output.
   5. Test token-by-token autoregressive decode output matches the cached model's
      own full-sequence prefill output.
 
 Note: the autoregressive test compares against the cached model's prefill output
 (y_prefill) rather than the uncached reference (y_model) because the FLA Triton
-kernels and the pure-torch ``torch_gated_delta_rule`` produce slightly different
-floating-point results.  Comparing cached prefill vs cached autoregressive
-verifies that "autoregressive caching reproduces the same result as full-sequence
-processing through the same kernel path."
+kernels and the pure-torch ``torch_sigmoid_gated_delta_rule`` produce slightly
+different floating-point results.  Comparing cached prefill vs cached
+autoregressive verifies that "autoregressive caching reproduces the same result
+as full-sequence processing through the same kernel path."
 
 The stale-cache fix zeroes delta_cache tensors between phases because
 ``cm.info.reset()`` only clears sequence metadata, not physical cache data.
@@ -65,15 +65,15 @@ class DummyFactory(ModelFactory):
 
 
 # ---------------------------------------------------------------------------
-# Mock model that uses torch_gated_delta_rule
+# Mock model that uses torch_sigmoid_gated_delta_rule
 # ---------------------------------------------------------------------------
 
 
-class GatedDeltaRuleModel(nn.Module):
-    """Minimal model that projects embeddings through torch_gated_delta_rule.
+class SigmoidGatedDeltaRuleModel(nn.Module):
+    """Minimal model that projects embeddings through torch_sigmoid_gated_delta_rule.
 
     Architecture:
-      input_ids -> embedding -> linear projections -> torch_gated_delta_rule -> output proj
+      input_ids -> embedding -> linear projections -> torch_sigmoid_gated_delta_rule -> output proj
     """
 
     def __init__(
@@ -93,8 +93,10 @@ class GatedDeltaRuleModel(nn.Module):
         self.q_proj = nn.Linear(hidden_size, num_heads * key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, num_heads * key_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, num_heads * value_dim, bias=False)
-        self.g_proj = nn.Linear(hidden_size, num_heads, bias=False)
-        self.beta_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        self.a_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        self.A_log = nn.Parameter(torch.randn(num_heads))
+        self.dt_bias = nn.Parameter(torch.randn(num_heads))
         self.o_proj = nn.Linear(num_heads * value_dim, hidden_size, bias=False)
 
     @torch.no_grad()
@@ -112,11 +114,18 @@ class GatedDeltaRuleModel(nn.Module):
         q = torch.nn.functional.normalize(q, dim=-1)
         k = torch.nn.functional.normalize(k, dim=-1)
 
-        # g should be negative (decay), beta should be in (0, 1)
-        g = -torch.nn.functional.softplus(self.g_proj(x))  # [B, S, H]
-        beta = torch.sigmoid(self.beta_proj(x))  # [B, S, H]
+        a = self.a_proj(x)  # [B, S, H]
+        b_raw = self.b_proj(x)  # [B, S, H]
 
-        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(q, k, v, g, beta)
+        attn_out = torch.ops.auto_deploy.torch_sigmoid_gated_delta_rule(
+            q,
+            k,
+            v,
+            a,
+            b_raw,
+            self.A_log,
+            self.dt_bias,
+        )
         # attn_out: [B, S, H, V]
 
         attn_out = attn_out.reshape(b, s, -1)
@@ -129,8 +138,8 @@ class GatedDeltaRuleModel(nn.Module):
 
 
 @torch.inference_mode()
-def test_gated_delta_rule_with_cache():
-    """Test the insert_cached_gated_delta_rule transform with fla_gated_delta backend."""
+def test_sigmoid_gated_delta_rule_with_cache():
+    """Test insert_cached_sigmoid_gated_delta_rule with fla_fused_sigmoid_gated_delta backend."""
     # Configuration
     dtype = torch.bfloat16
     # Wider tolerances for FLA Triton vs pure-torch comparison (prefill)
@@ -162,7 +171,7 @@ def test_gated_delta_rule_with_cache():
     )
 
     # Create model
-    model = GatedDeltaRuleModel(
+    model = SigmoidGatedDeltaRuleModel(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
         num_heads=num_heads,
@@ -173,7 +182,7 @@ def test_gated_delta_rule_with_cache():
     # Create input data
     input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device="cuda")
 
-    # Get uncached reference output (pure-torch torch_gated_delta_rule)
+    # Get uncached reference output (pure-torch torch_sigmoid_gated_delta_rule)
     y_model = model(input_ids)  # [B, S, hidden]
 
     # Apply the transformation pipeline
@@ -198,9 +207,9 @@ def test_gated_delta_rule_with_cache():
             "cleanup_input_constraints": {
                 "stage": "post_export",
             },
-            "insert_cached_gated_delta_rule": {
+            "insert_cached_sigmoid_gated_delta_rule": {
                 "stage": "cache_init",
-                "backend": "fla_gated_delta",
+                "backend": "fla_fused_sigmoid_gated_delta",
             },
         },
     )  # type: ignore
@@ -230,7 +239,10 @@ def test_gated_delta_rule_with_cache():
     # ---- Test 2: Token-by-token autoregressive ----
     # Compare against the cached model's full-sequence prefill output (y_prefill)
     # rather than the uncached reference (y_model) because the FLA Triton kernels
-    # and the pure-torch torch_gated_delta_rule produce slightly different results.
+    # and the pure-torch torch_sigmoid_gated_delta_rule produce slightly different
+    # results. Comparing cached prefill vs cached autoregressive verifies that
+    # "autoregressive caching reproduces the same result as full-sequence
+    # processing through the same kernel path."
     cm.info.reset()
     # CRITICAL: Zero the delta_cache tensors between test phases.
     # cm.info.reset() only clears sequence metadata, NOT the physical cache.

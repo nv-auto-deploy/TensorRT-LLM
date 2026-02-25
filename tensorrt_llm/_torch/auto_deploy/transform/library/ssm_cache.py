@@ -23,3 +23,8 @@ class InsertCachedDeltaRule(_InsertCachedOperator):
 @TransformRegistry.register("insert_cached_gated_delta_rule")
 class InsertCachedGatedDeltaRule(_InsertCachedOperator):
     """A transform to handle gated delta rule cache operations."""
+
+
+@TransformRegistry.register("insert_cached_sigmoid_gated_delta_rule")
+class InsertCachedSigmoidGatedDeltaRule(_InsertCachedOperator):
+    """A transform to handle gated delta rule cache operations with fused sigmoid gating."""
