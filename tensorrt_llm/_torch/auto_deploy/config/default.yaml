@@ -198,18 +198,19 @@ transforms:
     backend: triton_ssm
   insert_cached_causal_conv:
     stage: cache_init
-    backend: cuda_causal_conv
+    backend: triton_causal_conv
   insert_cached_delta_rule:
     stage: cache_init
     backend: fla_delta
   insert_cached_gated_delta_rule:
     stage: cache_init
+    # backend: flashinfer_gated_delta
     backend: fla_gated_delta
-    enabled: false
+    enabled: true
   insert_cached_sigmoid_gated_delta_rule:
     stage: cache_init
     backend: fla_fused_sigmoid_gated_delta
-    enabled: true
+    enabled: false
   insert_cached_residual_add:
     stage: cache_init
     backend: cached_residual_add

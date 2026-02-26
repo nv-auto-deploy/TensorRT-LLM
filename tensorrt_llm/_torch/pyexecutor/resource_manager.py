@@ -2332,6 +2332,11 @@ class SlotManager:
         self.max_num_requests = max_num_requests
         self.slot_mapping = dict()
         self.free_slots = set(range(max_num_requests))
+        self.slot_owner = {}
+        self.slot_assign_generation = {}
+        self._slot_generation = 0
+        self._unmapped_remove_warn_count = 0
+        self.last_removed_by_request = {}
 
     def get_slot(self, request_id: int):
         return self.slot_mapping.get(request_id, None)
@@ -2356,13 +2361,48 @@ class SlotManager:
         if len(self.free_slots) == 0:
             raise ValueError("No free slots")
         slot = self.free_slots.pop()
+        prior_owner = self.slot_owner.get(slot)
+        if prior_owner is not None and prior_owner != request_id:
+            logger.warning(
+                "[AD WARNING] slot reuse with stale owner record: "
+                f"slot={slot} prior_owner={prior_owner} new_request_id={request_id} "
+                f"prior_generation={self.slot_assign_generation.get(slot)}")
         self.slot_mapping[request_id] = slot
+        self.slot_owner[slot] = request_id
+        self._slot_generation += 1
+        self.slot_assign_generation[slot] = self._slot_generation
+        self.last_removed_by_request.pop(request_id, None)
         return slot
 
     def remove_slot(self, request_id: int):
         if request_id in self.slot_mapping:
+            import inspect
             slot = self.slot_mapping.pop(request_id)
+            owner = self.slot_owner.get(slot)
+            if owner is not None and owner != request_id:
+                logger.warning(
+                    "[AD WARNING] slot owner mismatch on free: "
+                    f"slot={slot} request_id={request_id} owner={owner} "
+                    f"generation={self.slot_assign_generation.get(slot)}")
+            self.slot_owner.pop(slot, None)
             self.free_slots.add(slot)
+            frame = inspect.currentframe()
+            caller = frame.f_back.f_code.co_name if frame and frame.f_back else "unknown"
+            self.last_removed_by_request[request_id] = {
+                "slot": slot,
+                "caller": caller,
+                "generation": self.slot_assign_generation.get(slot),
+                "remaining_slots": len(self.slot_mapping),
+            }
+        else:
+            if self._unmapped_remove_warn_count < 8:
+                logger.warning(
+                    f"[AD WARNING] remove_slot called for unmapped request_id={request_id}"
+                )
+                self._unmapped_remove_warn_count += 1
+
+    def get_last_remove_info(self, request_id: int):
+        return self.last_removed_by_request.get(request_id)
 
     def shutdown(self):
         req_ids_list = list(self.slot_mapping.keys())

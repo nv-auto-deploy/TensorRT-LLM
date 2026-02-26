@@ -580,20 +580,19 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
     # MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
     MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
     # MODEL_NAME = "/home/omniml_data_3/zhiyuc/checkpoints/Qwen3.5-397B-A17B-NVFP4"
-    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
-                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+    MAX_SEQ_LEN = 4352
 
     def get_default_kwargs(self):
         return {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "enable_chunked_prefill": True,
-            "compile_backend": "torch-cudagraph",
+            "compile_backend": "torch-simple",
             # "disable_overlap_scheduler": True,
-            "max_batch_size": 64,
+            "max_batch_size": 32,
             "max_seq_len": self.MAX_SEQ_LEN,
             "max_num_tokens": self.MAX_SEQ_LEN,
-            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32],
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.5,
@@ -618,7 +617,7 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
                               use_beam_search=beam_width > 1)
 
     @pytest.mark.skip_less_device_memory(3000)
-    @pytest.mark.parametrize("world_size", [1])
+    @pytest.mark.parametrize("world_size", [8])
     def test_bf16(self, world_size):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")

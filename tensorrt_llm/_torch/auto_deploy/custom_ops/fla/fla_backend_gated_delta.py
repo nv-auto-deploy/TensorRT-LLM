@@ -240,20 +240,34 @@ def fla_cached_gated_delta_rule(
         del y_prefill, initial_states, final_state
 
     if num_decode > 0:
-        cu_seqlen_decode = torch.arange(0, num_decode + 1, device=q.device, dtype=torch.long)
+        decode_use_initial_states = use_initial_states[num_prefill:num_seq]
+        decode_start = num_prefill_tokens
+        decode_end = num_prefill_tokens + num_decode
+        decode_token_indices = torch.arange(
+            decode_start, decode_end, device=q.device, dtype=torch.long
+        )
+        valid_decode_token_indices = decode_token_indices[decode_use_initial_states]
+
+        if valid_decode_token_indices.numel() == 0:
+            return y
+
+        num_valid_decode = valid_decode_token_indices.numel()
+        cu_seqlen_decode = torch.arange(0, num_valid_decode + 1, device=q.device, dtype=torch.long)
         y_decode = fused_recurrent_gated_delta_rule_update_fwd(
-            q=q_flat[None, num_prefill_tokens:].contiguous(),
-            k=k_flat[None, num_prefill_tokens:].contiguous(),
-            v=v_flat[None, num_prefill_tokens:].contiguous(),
-            g=g_flat[None, num_prefill_tokens:].contiguous(),
-            beta=beta_flat[None, num_prefill_tokens:].contiguous(),
+            q=q_flat[None, valid_decode_token_indices].contiguous(),
+            k=k_flat[None, valid_decode_token_indices].contiguous(),
+            v=v_flat[None, valid_decode_token_indices].contiguous(),
+            g=g_flat[None, valid_decode_token_indices].contiguous(),
+            beta=beta_flat[None, valid_decode_token_indices].contiguous(),
             scale=scale,
             initial_state_source=delta_cache,
-            initial_state_indices=slot_idx[num_prefill:].contiguous(),
+            initial_state_indices=slot_idx[num_prefill:num_seq][
+                decode_use_initial_states
+            ].contiguous(),
             cu_seqlens=cu_seqlen_decode,
         )
 
-        y_flat[None, num_prefill_tokens:] = y_decode.to(y_flat.dtype)
+        y_flat[valid_decode_token_indices] = y_decode.squeeze(0).to(y_flat.dtype)
 
         del y_decode
 

@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import functools
+import hashlib
 import os
 import threading
 import time
@@ -524,6 +525,9 @@ class PyExecutor:
         self.worker_lock = threading.Lock()
 
         self.kv_connector_manager = kv_connector_manager
+        self._request_debug_meta: Dict[int, Dict[str, object]] = {}
+        self._resource_mismatch_warn_count = 0
+        self._duplicate_active_req_warn_count = 0
 
         self._maybe_init_kv_connector_manager()
 
@@ -561,6 +565,51 @@ class PyExecutor:
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
         if self.async_transfer_manager.end_transfer(request):
             self._terminate_request(request)
+
+    def _debug_get_request_resource_snapshot(self,
+                                             req_id: int) -> Dict[str, object]:
+        resource_managers = self.resource_manager.resource_managers
+        seq_mgr = resource_managers.get(ResourceManagerType.SEQ_SLOT_MANAGER)
+        kv_mgr = resource_managers.get(ResourceManagerType.KV_CACHE_MANAGER)
+
+        slot_mapping = None
+        if seq_mgr is not None:
+            slot_manager = getattr(seq_mgr, "slot_manager", None)
+            if slot_manager is not None:
+                slot_mapping = getattr(slot_manager, "slot_mapping", None)
+
+        kv_cache_map = getattr(kv_mgr, "kv_cache_map",
+                               None) if kv_mgr is not None else None
+        kv_trackable = kv_cache_map is not None
+
+        in_transfer = False
+        if self.async_transfer_manager is not None:
+            in_transfer = req_id in self.async_transfer_manager.requests_in_transfer(
+            )
+
+        slot_present = slot_mapping is not None and req_id in slot_mapping
+        kv_present = kv_cache_map is not None and req_id in kv_cache_map
+        slot_value = slot_mapping.get(req_id) if slot_present else None
+        slot_last_remove = None
+        if seq_mgr is not None:
+            slot_manager = getattr(seq_mgr, "slot_manager", None)
+            if slot_manager is not None:
+                getter = getattr(slot_manager, "get_last_remove_info", None)
+                if callable(getter):
+                    slot_last_remove = getter(req_id)
+
+        return {
+            "slot_present": slot_present,
+            "slot_value": slot_value,
+            "slot_map_size":
+            len(slot_mapping) if slot_mapping is not None else None,
+            "kv_present": kv_present,
+            "kv_trackable": kv_trackable,
+            "kv_map_size":
+            len(kv_cache_map) if kv_cache_map is not None else None,
+            "in_transfer": in_transfer,
+            "slot_last_remove": slot_last_remove,
+        }
 
     def _event_loop_wrapper(self):
         try:
@@ -2243,6 +2292,118 @@ class PyExecutor:
                     self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
 
+    def _extract_debug_dataset_idx(self, request: LlmRequest):
+        for attr in (
+                "py_dataset_idx",
+                "dataset_idx",
+                "py_example_id",
+                "example_id",
+                "sample_id",
+                "task_id",
+                "py_task_id",
+        ):
+            if hasattr(request, attr):
+                value = getattr(request, attr)
+                if value is not None:
+                    return value
+        return None
+
+    def _compute_prompt_hash(self, request: LlmRequest) -> str:
+        try:
+            tokens = request.get_tokens(0)
+        except Exception:
+            return "unavailable"
+
+        if not tokens:
+            return "empty"
+
+        token_bytes = ",".join(str(int(t))
+                               for t in tokens[:256]).encode("ascii")
+        return hashlib.sha1(token_bytes).hexdigest()[:16]
+
+    def _register_request_debug_meta(self, request: LlmRequest):
+        if request.is_dummy:
+            return
+        self._request_debug_meta[int(request.py_request_id)] = {
+            "request_id":
+            int(request.py_request_id),
+            "client_id":
+            int(request.py_client_id)
+            if request.py_client_id is not None else None,
+            "dataset_idx":
+            self._extract_debug_dataset_idx(request),
+            "prompt_hash":
+            self._compute_prompt_hash(request),
+            "prompt_len":
+            int(request.py_orig_prompt_len),
+        }
+
+    def _debug_warn_response_integrity(self, req_id: int, request: LlmRequest,
+                                       response: Optional[LlmResponse]):
+        if response is None:
+            return
+
+        resp_id = int(response.request_id)
+        if resp_id != req_id:
+            logger.warning(
+                "[AD WARNING] response/request id mismatch: "
+                f"enqueued_req_id={req_id} response_request_id={resp_id} "
+                f"is_child={bool(request.is_child)} "
+                f"parent_request_id={getattr(request, 'parent_request_id', None)}"
+            )
+
+        submit_meta = self._request_debug_meta.get(req_id)
+        resp_meta = self._request_debug_meta.get(resp_id)
+        if submit_meta and resp_meta and req_id != resp_id:
+            logger.warning(
+                "[AD WARNING] possible response/request mis-association: "
+                f"enqueued_req_id={req_id} response_request_id={resp_id} "
+                f"enqueued_meta={submit_meta} response_meta={resp_meta}")
+
+    def _debug_warn_completion_diagnostics(self, request: LlmRequest):
+        if request.is_dummy:
+            return
+
+        req_id = int(request.py_request_id)
+        generated_tokens = max(
+            int(request.get_num_tokens(0)) - int(request.py_orig_prompt_len), 0)
+        first_token = None
+        last_token = None
+        if generated_tokens > 0:
+            try:
+                first_token = int(
+                    request.get_token(0, int(request.py_orig_prompt_len)))
+                last_token = int(
+                    request.get_token(0,
+                                      int(request.get_num_tokens(0)) - 1))
+            except Exception:
+                first_token = None
+                last_token = None
+
+        finish_reason = "unknown"
+        get_finished_reason = getattr(request, "get_finished_reason", None)
+        if callable(get_finished_reason):
+            try:
+                finish_reason = str(get_finished_reason(0))
+            except Exception:
+                finish_reason = "unknown"
+
+        if generated_tokens == 0 and request.is_finished:
+            logger.warning(
+                "[AD WARNING] completed request with zero generated tokens: "
+                f"request_id={req_id} finish_reason={finish_reason} "
+                f"prompt_len={request.py_orig_prompt_len} max_new_tokens={request.py_max_new_tokens}"
+            )
+
+        if (generated_tokens >= int(request.py_max_new_tokens)
+                and finish_reason != "unknown"
+                and "LENGTH" not in finish_reason):
+            logger.warning(
+                "[AD WARNING] suspicious completion at max_new_tokens without LENGTH finish: "
+                f"request_id={req_id} finish_reason={finish_reason} "
+                f"generated_tokens={generated_tokens} max_new_tokens={request.py_max_new_tokens} "
+                f"first_token={first_token} last_token={last_token}")
+
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_active_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
@@ -2427,6 +2588,9 @@ class PyExecutor:
             request for request in new_requests_cur_rank
             if not _respond_if_invalid(request)
         ]
+
+        for request in validated_requests:
+            self._register_request_debug_meta(request)
 
         self.active_requests.extend(validated_requests)
         return validated_requests
@@ -3014,7 +3178,36 @@ class PyExecutor:
             self._do_terminate_request(request)
 
     def _do_terminate_request(self, request: LlmRequest):
+        req_id = int(request.py_request_id)
+        before = self._debug_get_request_resource_snapshot(req_id)
+        kv_mismatch = before["kv_trackable"] and not before["kv_present"]
+        if (not request.is_dummy and self._resource_mismatch_warn_count < 32
+                and (not before["slot_present"] or kv_mismatch)):
+            logger.warning(
+                "[AD WARNING] pre-terminate resource mismatch: "
+                f"request_id={req_id} state={request.state} "
+                f"slot_present={before['slot_present']} slot={before['slot_value']} "
+                f"kv_present={before['kv_present']} kv_trackable={before['kv_trackable']} "
+                f"in_transfer={before['in_transfer']} "
+                f"slot_map_size={before['slot_map_size']} kv_map_size={before['kv_map_size']} "
+                f"slot_last_remove={before['slot_last_remove']}")
+            self._resource_mismatch_warn_count += 1
+
+        self._request_debug_meta.pop(req_id, None)
         self.resource_manager.free_resources(request)
+        after = self._debug_get_request_resource_snapshot(req_id)
+        kv_still_present = after["kv_trackable"] and after["kv_present"]
+        if (not request.is_dummy and self._resource_mismatch_warn_count < 32
+                and (after["slot_present"] or kv_still_present)):
+            logger.warning(
+                "[AD WARNING] post-terminate resource still present: "
+                f"request_id={req_id} state={request.state} "
+                f"slot_present={after['slot_present']} slot={after['slot_value']} "
+                f"kv_present={after['kv_present']} kv_trackable={after['kv_trackable']} "
+                f"in_transfer={after['in_transfer']} "
+                f"slot_map_size={after['slot_map_size']} kv_map_size={after['kv_map_size']} "
+                f"slot_last_remove={after['slot_last_remove']}")
+            self._resource_mismatch_warn_count += 1
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
@@ -3124,11 +3317,22 @@ class PyExecutor:
         new_responses = []
         requests_to_terminate = []
         new_active_requests = []
+        seen_active_request_ids = set()
         logger.debug(
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
         )
         for request in self.active_requests:
             req_id = request.py_request_id
+            if req_id in seen_active_request_ids:
+                if self._duplicate_active_req_warn_count < 16:
+                    logger.warning(
+                        "[AD WARNING] duplicate request in active_requests: "
+                        f"request_id={req_id} state={request.state} "
+                        f"is_child={request.is_child} parent_request_id={getattr(request, 'parent_request_id', None)}"
+                    )
+                    self._duplicate_active_req_warn_count += 1
+            else:
+                seen_active_request_ids.add(req_id)
             # no responses for dummy request, and finish it
             if request.is_attention_dp_dummy:
                 requests_to_terminate.append(request)
@@ -3166,11 +3370,14 @@ class PyExecutor:
                     request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)
                 if response:
+                    self._debug_warn_response_integrity(req_id, request,
+                                                        response)
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
                     new_responses.append((req_id, response))
 
             if request_done:
+                self._debug_warn_completion_diagnostics(request)
                 if (self.drafter is not None and getattr(
                         self.model_engine, 'enable_spec_decode', False)
                         and not self.speculation_permanently_disabled

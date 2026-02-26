@@ -722,17 +722,33 @@ class ADEngine(ModelEngine):
             normal generation requests.
             """
             is_extend = get_draft_token_length(request) > 0
+            token_count = max(
+                request.max_beam_num_tokens,
+                request.get_num_tokens(0),
+                request.py_prompt_len,
+                request.context_current_position,
+            )
+            if request.max_beam_num_tokens <= 1 and request.py_prompt_len > 1:
+                ad_logger.warning(
+                    "[AD WARNING] stale max_beam_num_tokens detected: "
+                    f"request_id={request.py_request_id} "
+                    f"max_beam_num_tokens={request.max_beam_num_tokens} "
+                    f"get_num_tokens={request.get_num_tokens(0)} "
+                    f"prompt_len={request.py_prompt_len} "
+                    f"context_current_position={request.context_current_position} "
+                    f"token_count={token_count}"
+                )
 
             if is_extend:
-                return request.max_beam_num_tokens - 1
+                return max(token_count - 1, 0)
             else:
                 # When overlap scheduler is disabled, or when new_tokens is not available,
                 # we use the previous token count
                 use_overlap = _use_overlap_scheduler(request)
                 if use_overlap:
-                    return request.max_beam_num_tokens
+                    return max(token_count, 0)
                 else:
-                    return request.max_beam_num_tokens - 1
+                    return max(token_count - 1, 0)
 
         def _build_input_ids(request) -> Tuple[List[int], List[int], bool]:
             """Build input_ids and gather indices for a request.
@@ -780,7 +796,13 @@ class ADEngine(ModelEngine):
             request.py_batch_idx = request.seq_slot
             # store seq slot idx (use mamba_cache_index if available)
             slot_idx.append(_get_slot_idx(request))
-            use_initial_states.append(input_pos[-1] > 0)
+            has_history = (
+                input_pos[-1] > 0
+                or request.context_current_position > 0
+                or request.py_prompt_len > 1
+                or request.get_num_tokens(0) > 1
+            )
+            use_initial_states.append(has_history)
 
             seq_len.append(len(input_ids[-1]))
             cu_seqlen.append(cu_seqlen[-1] + seq_len[-1])
@@ -818,12 +840,122 @@ class ADEngine(ModelEngine):
                 f"unique_slots={unique_slots} duplicate_slots={duplicate_slots} slot_idx={slot_idx}"
             )
 
+        # Use ground-truth request classification instead of the seq_len > 1
+        # heuristic.  The heuristic breaks when chunked prefill produces a last
+        # chunk of exactly 1 token – that context request would be misclassified
+        # as decode, corrupting the positional split the GDN kernel relies on.
+        num_prefill = num_ctx_requests
+        num_prefill_tokens = num_ctx_tokens
+        num_decode = len(seq_len) - num_prefill
+        decode_without_initial_state = [
+            {
+                "idx": idx,
+                "request_id": request.py_request_id,
+                "seq_len": s_l,
+                "input_pos": i_pos,
+                "slot_idx": slot,
+            }
+            for idx, (request, s_l, i_pos, slot, use_init) in enumerate(
+                zip(ordered_requests, seq_len, input_pos, slot_idx, use_initial_states)
+            )
+            if idx >= num_prefill and not use_init
+        ]
+        if decode_without_initial_state:
+            ad_logger.warning(
+                f"[AD WARNING] decode rows without initial states: {decode_without_initial_state}"
+            )
+
+        # Extra invariants to catch slot/request bookkeeping corruption in mixed batches.
+        slot_conflicts = []
+        slot_mismatches = []
+        suspicious_decode_rows = []
+        slot_owners = {}
+        max_report = 8
+        for idx, (request, s_l, i_pos, slot, use_init) in enumerate(
+            zip(ordered_requests, seq_len, input_pos, slot_idx, use_initial_states)
+        ):
+            is_decode = idx >= num_prefill
+            is_dummy = bool(getattr(request, "is_dummy", False))
+            req_id = int(request.py_request_id)
+
+            try:
+                expected_slot = _get_slot_idx(request)
+            except KeyError:
+                expected_slot = None
+
+            if expected_slot is None or expected_slot != slot:
+                if len(slot_mismatches) < max_report:
+                    slot_mismatches.append(
+                        {
+                            "idx": idx,
+                            "request_id": req_id,
+                            "is_dummy": is_dummy,
+                            "slot_idx": slot,
+                            "expected_slot": expected_slot,
+                            "seq_slot": request.seq_slot,
+                        }
+                    )
+
+            prior_owner = slot_owners.get(slot)
+            if prior_owner is None:
+                slot_owners[slot] = (req_id, is_dummy, idx)
+            else:
+                prev_req_id, prev_is_dummy, prev_idx = prior_owner
+                # Shared slot among multiple non-dummy rows in the same batch is suspicious.
+                if not is_dummy and not prev_is_dummy and req_id != prev_req_id:
+                    if len(slot_conflicts) < max_report:
+                        slot_conflicts.append(
+                            {
+                                "slot_idx": slot,
+                                "prev_idx": prev_idx,
+                                "prev_request_id": prev_req_id,
+                                "idx": idx,
+                                "request_id": req_id,
+                            }
+                        )
+
+            # Non-dummy decode rows with zero history are suspicious.
+            if is_decode and not is_dummy:
+                if i_pos == 0 or req_id >= (CUDA_GRAPH_DUMMY_REQUEST_ID - 4096):
+                    if len(suspicious_decode_rows) < max_report:
+                        suspicious_decode_rows.append(
+                            {
+                                "idx": idx,
+                                "request_id": req_id,
+                                "seq_len": s_l,
+                                "input_pos": i_pos,
+                                "slot_idx": slot,
+                                "use_initial_state": use_init,
+                            }
+                        )
+
+        if slot_conflicts:
+            ad_logger.warning(
+                f"[AD WARNING] slot ownership conflicts detected (showing up to {max_report}): "
+                f"{slot_conflicts}"
+            )
+        if slot_mismatches:
+            ad_logger.warning(
+                f"[AD WARNING] slot index mismatches detected (showing up to {max_report}): "
+                f"{slot_mismatches}"
+            )
+        if suspicious_decode_rows:
+            ad_logger.warning(
+                f"[AD WARNING] suspicious non-dummy decode rows detected (showing up to {max_report}): "
+                f"{suspicious_decode_rows}"
+            )
+
+        # Pass batch_info explicitly so nest_sequences does NOT fall back to
+        # the seq_len > 1 heuristic in attention_interface.py:902-906.
+        batch_info = [num_prefill, num_prefill_tokens, num_decode]
+
         # update the sequence info object now
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
             position_ids=position_ids,
             seq_len=seq_len,
             input_pos=input_pos,
+            batch_info=batch_info,
             cu_seqlen=cu_seqlen,
             cache_loc=cache_loc,
             pages_per_seq=pages_per_seq,
