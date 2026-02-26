@@ -736,21 +736,6 @@ class ADEngine(ModelEngine):
             **extra_args,
         )
 
-        # Zero the tail of token-level device buffers beyond total_num_tokens.
-        # The piecewise CUDA graph runner's _prepare_replay_inputs has a data_ptr()
-        # fast path that skips copying and tail-zeroing when the runtime input shares
-        # the same underlying buffer as the captured static input (common for input_ids
-        # and position_ids which are views of InputBuffer). Without this zeroing, stale
-        # token IDs from previous iterations leak into the padding region and cause
-        # out-of-bounds embedding lookups during graph replay.
-        seq_info = self.cache_seq_interface.info
-        total_tokens = seq_info.total_num_tokens
-        input_buf = seq_info._input_buffer
-        for buf_name in ("input_ids", "position_ids"):
-            device_view = input_buf.get_view(buf_name)
-            if total_tokens < device_view.numel():
-                device_view[total_tokens:].zero_()
-
         if spec_resource_manager is not None and isinstance(
             spec_resource_manager, ADHiddenStateManager
         ):
