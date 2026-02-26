@@ -22,3 +22,6 @@ transforms:
   multi_stream_moe:
     stage: compile
     enabled: true
+  multi_stream_deltanet:
+    stage: compile
+    enabled: false
