@@ -333,7 +333,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-
         # 1. Projections (separate, unlike Qwen3Next which uses combined in_proj_qkvz)
         mixed_qkv = self.in_proj_qkv(hidden_states)  # [B, S, conv_dim]
         z = self.in_proj_z(hidden_states)  # [B, S, value_dim]
@@ -367,19 +366,13 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
-        # 3. Compute beta and gating
-        beta = b.sigmoid()  # [B, S, num_v_heads]
-        # Fused gating: g = -exp(A_log) * softplus(a + dt_bias), single kernel via transform.
-        g = torch.ops.auto_deploy.torch_fused_gdn_gating(
-            self.A_log, a, self.dt_bias
-        )  # [B, S, num_v_heads]
+        # 3. Gated Delta Rule via autodeploy custom op
+        # L2 norm, GQA repeat-interleave, and g/beta computation are handled inside the op.
+        core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+            query, key, value, a, b, self.A_log, self.dt_bias
+        )
 
-        # 4. Gated Delta Rule via autodeploy custom op
-        # Op handles L2 normalization and GVA head expansion (repeat_interleave) internally.
-        # q/k have num_k_heads, v/g/beta have num_v_heads.
-        core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(query, key, value, g, beta)
-
-        # 5. Gated RMSNorm
+        # 6. Gated RMSNorm
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
@@ -387,7 +380,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
-        # 6. Output projection
+        # 7. Output projection
         output = self.out_proj(core_attn_out)
         return output
 
@@ -613,12 +606,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         w2_weights = [self.experts[i].down_proj.weight for i in range(len(self.experts))]
         w3_weights = [self.experts[i].up_proj.weight for i in range(len(self.experts))]
 
-        # Shared expert with sigmoid gating
-        shared_expert_output = self.shared_expert(hidden_states_flat)
-        shared_expert_output = (
-            F.sigmoid(self.shared_expert_gate(hidden_states_flat)) * shared_expert_output
-        )
-
         expert_output = torch.ops.auto_deploy.torch_moe(
             hidden_states_flat,
             selected_experts,
@@ -629,6 +616,11 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             is_gated_mlp=True,
         )
 
+        # Shared expert with sigmoid gating
+        shared_expert_output = self.shared_expert(hidden_states_flat)
+        shared_expert_output = (
+            F.sigmoid(self.shared_expert_gate(hidden_states_flat)) * shared_expert_output
+        )
         expert_output = expert_output + shared_expert_output
 
         expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)

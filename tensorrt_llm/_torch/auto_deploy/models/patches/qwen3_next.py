@@ -100,7 +100,7 @@ def _patched_gdn_forward(
     Removes cache-dependent control flow and uses autodeploy custom ops:
       - torch_causal_conv1d for the depthwise causal convolution
       - torch_gated_delta_rule for the core gated delta rule computation
-        (L2 normalization and GVA head expansion are handled internally)
+        (L2 norm, GQA expansion, and gating are handled inside the op)
     """
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
     batch_size, seq_len, _ = hidden_states.shape
@@ -143,19 +143,13 @@ def _patched_gdn_forward(
     key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
     value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
-    # 3. Compute beta and gating
-    beta = b.sigmoid()  # [B, S, num_v_heads]
-    # Fused gating: g = -exp(A_log) * softplus(a + dt_bias), single kernel via transform.
-    g = torch.ops.auto_deploy.torch_fused_gdn_gating(
-        self.A_log, a, self.dt_bias
-    )  # [B, S, num_v_heads]
+    # 3. Gated Delta Rule via autodeploy custom op
+    # L2 norm, GQA repeat-interleave, and g/beta computation are handled inside the op.
+    core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+        query, key, value, a, b, self.A_log, self.dt_bias
+    )
 
-    # 4. Gated Delta Rule via autodeploy custom op
-    # Op handles L2 normalization and GVA head expansion (repeat_interleave) internally.
-    # q/k have num_k_heads, v/g/beta have num_v_heads.
-    core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(query, key, value, g, beta)
-
-    # 5. Gated RMSNorm
+    # 6. Gated RMSNorm
     z_shape_og = z.shape
     core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
     z = z.reshape(-1, z.shape[-1])
@@ -163,7 +157,7 @@ def _patched_gdn_forward(
     core_attn_out = core_attn_out.reshape(z_shape_og)
     core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
-    # 6. Output projection
+    # 7. Output projection
     output = self.out_proj(core_attn_out)
     return output
 
