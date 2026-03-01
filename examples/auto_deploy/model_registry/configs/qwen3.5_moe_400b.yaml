@@ -16,6 +16,10 @@ model_kwargs:
 transforms:
   export_to_gm:
     num_moe_experts_for_export: 2
+  match_repeat_kv:
+    run_shape_prop: false
+  match_eager_attention:
+    enabled: false
   multi_stream_moe:
     stage: compile
     enabled: true

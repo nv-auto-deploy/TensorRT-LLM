@@ -398,8 +398,8 @@ class BaseTransform(ABC):
         # show debug info for debug config
         ad_logger.debug(f"{t_name} config: {self.config}")
 
-        # capture memory stats at the start
-        mem_pre = self._get_mem_stats(empty_cache=True)
+        # capture memory stats at the start (only flush cache for transforms that change memory)
+        mem_pre = self._get_mem_stats(empty_cache=self.config.expect_mem_change)
 
         # store some timing information
         elapsed_time_total = -time.time()
@@ -460,7 +460,7 @@ class BaseTransform(ABC):
         elapsed_time_total += time.time()
 
         # capture memory stats at the end and log summary (only log if enabled)
-        mem_post = self._get_mem_stats(empty_cache=True)
+        mem_post = self._get_mem_stats(empty_cache=self.config.expect_mem_change)
         if self.config.enabled:
             self._log_mem_summary(mem_pre, mem_post, self.config.expect_mem_change)
 

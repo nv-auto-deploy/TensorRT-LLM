@@ -339,7 +339,6 @@ def _expand_moe_experts_in_graph(
         num_expanded += 1
 
     if num_expanded:
-        canonicalize_graph(gm)
         ad_logger.info(f"Expanded {num_expanded} MOE node(s) in the exported graph")
 
 
@@ -362,8 +361,6 @@ def _clean_up_device_info(gm: fx.GraphModule) -> None:
             new_kwargs = dict(node.kwargs)
             new_kwargs = {k: v if v != meta_device else device for k, v in new_kwargs.items()}
             node.kwargs = new_kwargs
-
-    canonicalize_graph(gm)
 
 
 def _load_hook_for_deduplication(
@@ -409,8 +406,6 @@ def _deduplicate_params_and_buffers(gm: fx.GraphModule) -> None:
             )
 
             ad_logger.debug(f"Deduplicated: {n.target} --> {node_kept.target}")
-
-    canonicalize_graph(gm)
 
 
 def _add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> None:
@@ -579,8 +574,6 @@ def _clean_up_assertions_and_guards(gm: fx.GraphModule):
 
     if removed and hasattr(gm, "_guards_fn"):
         delattr(gm, "_guards_fn")
-    if removed:
-        canonicalize_graph(gm)
 
 
 def run_forward_for_capture(
@@ -722,6 +715,10 @@ def torch_export_to_gm(
 
     # clean up checks --> generally the sanity checks are overly conservative and we can remove them
     _clean_up_assertions_and_guards(egm)
+
+    # Run a single consolidated graph canonicalization after all post-processing steps
+    # (dedup, device cleanup, assertion cleanup, and optional MOE expansion).
+    canonicalize_graph(egm)
 
     # Rename nodes to reflect module hierarchy for better debuggability
     _rename_nodes_with_module_hierarchy(egm)
