@@ -601,8 +601,8 @@ class SequenceInfo:
         else:
             bs, sl = 1, total_num_tokens
 
-        # truncate to effective tokens now, reshape, and return
-        return tnsr[: bs * sl].view(bs, sl, *tnsr.shape[1:])
+        # truncate to total tokens now, reshape, and return
+        return tnsr[: self.total_num_tokens].view(bs, sl, *tnsr.shape[1:])
 
     def flatten(self, tnsr: torch.Tensor) -> torch.Tensor:
         """Flatten the tensor after the forward pass based on the current attention mode.
