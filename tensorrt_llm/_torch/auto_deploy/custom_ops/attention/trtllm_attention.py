@@ -87,6 +87,8 @@ class _TrtllmPlanner:
         # thop-specific host metadata NOT available from SequenceInfo
         self.host_request_types: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
         self.host_total_kv_lens: Optional[torch.Tensor] = None  # [2] int64 pinned
+        self.host_total_kv_lens_ctx: Optional[torch.Tensor] = None  # [2] int64 pinned
+        self.host_total_kv_lens_gen: Optional[torch.Tensor] = None  # [2] int64 pinned
         # thop variant of input_pos_host and seq_len_host
         # keeping a separate copy here since we sometimes have to overwrite the original values
         self.host_past_kv_lengths: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
@@ -94,6 +96,8 @@ class _TrtllmPlanner:
         # Persistent block_offsets buffer for CUDA graph compatibility.
         # Pre-allocated to max size so the tensor address is stable across replays.
         self.block_offsets: Optional[torch.Tensor] = None
+        # GPU context_lengths for thop: context_len for prefill, 0 for decode
+        self.context_lengths_cuda: Optional[torch.Tensor] = None
         # FP8 scale tensors (lazily initialized from constants on first FP8 use)
         self.kv_scale_orig_quant: Optional[torch.Tensor] = None
         self.kv_scale_quant_orig: Optional[torch.Tensor] = None
@@ -116,6 +120,12 @@ class _TrtllmPlanner:
         self.host_total_kv_lens = torch.zeros(
             2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
         )
+        self.host_total_kv_lens_ctx = torch.zeros(
+            2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
+        )
+        self.host_total_kv_lens_gen = torch.zeros(
+            2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
+        )
         self.host_request_types = torch.zeros(
             max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
@@ -128,6 +138,7 @@ class _TrtllmPlanner:
         self.host_context_lengths = torch.zeros(
             max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
+        self.context_lengths_cuda = torch.zeros(max_batch, dtype=torch.int32, device=device)
 
     def plan(
         self,
@@ -156,6 +167,12 @@ class _TrtllmPlanner:
         # Compute block_offsets for thop.attention using pre-computed page indices.
         block_offsets = self.block_offsets
         total_pages = int(cu_num_pages_host[num_seq])
+
+        # Zero block_offsets for current batch sequences before filling.
+        # This prevents stale entries from previous batches (which may have had
+        # more pages per sequence) from causing incorrect attention reads.
+        block_offsets[:, :num_seq, :, :].zero_()
+
         base_offsets = cache_loc[:total_pages] * block_offset_multiplier
         seq_idx = page_seq_indices[:total_pages]
         pg_idx = page_in_seq[:total_pages]
@@ -172,10 +189,24 @@ class _TrtllmPlanner:
             self.host_past_kv_lengths[:num_seq].fill_(max_context_length)
             self.host_context_lengths[:num_seq].fill_(max_context_length)
         else:
-            self.host_total_kv_lens[0] = seq_len_with_cache_host[:num_prefill].sum()
-            self.host_total_kv_lens[1] = seq_len_with_cache_host[num_prefill:num_seq].sum()
-            self.host_past_kv_lengths[:num_seq] = input_pos_host[:num_seq]
-            self.host_context_lengths[:num_seq] = seq_len_host[:num_seq]
+            ctx_total = int(seq_len_with_cache_host[:num_prefill].sum())
+            gen_total = int(seq_len_with_cache_host[num_prefill:num_seq].sum())
+            self.host_total_kv_lens[0] = ctx_total
+            self.host_total_kv_lens[1] = gen_total
+            # Per-sub-batch tensors for mixed batch splitting: each sub-batch
+            # should only report its own KV total, with the other component zeroed.
+            self.host_total_kv_lens_ctx[0] = ctx_total
+            self.host_total_kv_lens_ctx[1] = 0
+            self.host_total_kv_lens_gen[0] = 0
+            self.host_total_kv_lens_gen[1] = gen_total
+            # host_past_kv_lengths must equal sequence_length (total KV length
+            # including past + current tokens), matching the standard backend's
+            # kv_lens_runtime = cached_token_lens + seq_lens_kv.
+            self.host_past_kv_lengths[:num_seq] = seq_len_with_cache_host[:num_seq]
+            # host_context_lengths: context length for prefill seqs, 0 for decode seqs.
+            # The standard backend uses prompt_lens_cpu which is 0 for decode.
+            self.host_context_lengths[:num_prefill] = seq_len_host[:num_prefill]
+            self.host_context_lengths[num_prefill:num_seq].zero_()
 
     def get_pool_pointers_for_layer(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Return a per-layer ``host_pool_pointers`` tensor for this kv_cache view.
@@ -199,6 +230,12 @@ class _TrtllmPlanner:
 
 _GlobalTrtllmPlanner = _TrtllmPlanner()
 
+# Debug: per-forward layer counter (reset in prepare_trtllm_metadata_host, incremented in mha_with_cache)
+_debug_layer_counter = 0
+_debug_forward_counter = 0
+
+_SDPA_OVERRIDE = False
+_SDPA_OVERRIDE_DECODE_ONLY = False
 
 # =============================================================================
 # Host-side prepare function (analogous to prepare_flashinfer_metadata_host)
@@ -229,6 +266,7 @@ def prepare_trtllm_metadata_host(
     ``page_seq_indices`` and ``page_in_seq`` are pre-computed in SequenceInfo from
     ``pages_per_seq`` and avoid the expensive GPU searchsorted that was previously needed.
     """
+    global _debug_layer_counter, _debug_forward_counter
     num_prefill, _, num_decode = batch_info_host.tolist()
 
     # Read all max-size constants from max_seq_info_host (set at cache init time)
@@ -238,6 +276,18 @@ def prepare_trtllm_metadata_host(
 
     # One-time allocation of all persistent buffers (lazy, guards against double-init)
     _GlobalTrtllmPlanner.reset(cache_loc.device, max_batch_size, max_blocks_per_seq)
+
+    # Debug: reset layer counter at start of forward, increment forward counter
+    _debug_layer_counter = 0
+    _debug_forward_counter += 1
+    num_seq = num_prefill + num_decode
+    ad_logger.info(
+        f"[plan] fwd={_debug_forward_counter} prefill={num_prefill} decode={num_decode} "
+        f"input_pos={input_pos_host[:num_seq].tolist()} seq_len={seq_len_host[:num_seq].tolist()} "
+        f"seq_len_with_cache={seq_len_with_cache_host[:num_seq].tolist()} "
+        f"cache_loc[:8]={cache_loc[: min(8, len(cache_loc))].tolist()} "
+        f"block_offset_mult={block_offset_multiplier}"
+    )
 
     # Per-forward: fill host_request_types, block_offsets, host_total_kv_lens
     _GlobalTrtllmPlanner.plan(
@@ -295,6 +345,10 @@ def trtllm_mha_with_cache(
     pool_pointers encodes kv_cache.data_ptr() (layer-specific), and
     pool_mapping is all zeros. See module docstring for details.
     """
+    global _debug_layer_counter
+    _debug_layer_counter += 1
+    _dbg_layer = _debug_layer_counter
+
     # Infer dimensions from tensor shapes (bsnd layout)
     num_heads = q.shape[2]
     num_kv_heads = k.shape[2]
@@ -334,6 +388,39 @@ def trtllm_mha_with_cache(
     # Input is always [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed),
     # so b * s == num_tokens always holds.
     q_shape_og = q.shape
+
+    # Debug: compare context attention against PyTorch SDPA at ALL token positions.
+    # Run at ALL layers for fwd=4 (mixed batch) to find the first divergent layer.
+    # For other fwd passes, only run at layer 1.
+    _ref_sdpa_out = None
+    _do_ctx_cmp = (
+        num_prefill > 0
+        and num_prefill_tokens > 1
+        and (_dbg_layer == 1 or _debug_forward_counter == 4)
+    )
+    if _do_ctx_cmp:
+        with torch.no_grad():
+            q_ctx = q[:, :num_prefill_tokens, :, :]
+            k_ctx = k[:, :num_prefill_tokens, :, :]
+            v_ctx = v[:, :num_prefill_tokens, :, :]
+            if num_kv_heads != num_heads:
+                rep = num_heads // num_kv_heads
+                k_ctx = k_ctx.repeat_interleave(rep, dim=2)
+                v_ctx = v_ctx.repeat_interleave(rep, dim=2)
+            _ref_sdpa_out = torch.nn.functional.scaled_dot_product_attention(
+                q_ctx.transpose(1, 2),
+                k_ctx.transpose(1, 2),
+                v_ctx.transpose(1, 2),
+                is_causal=True,
+                scale=scale,
+            ).transpose(1, 2)  # [B, S, H, D]
+            ref_last = _ref_sdpa_out[0, num_prefill_tokens - 1]
+            ad_logger.info(
+                f"[ref_sdpa] fwd={_debug_forward_counter} prefill_tokens={num_prefill_tokens} "
+                f"last_tok_abs_mean={ref_last.abs().mean().item():.6f} "
+                f"last_tok[:4]={ref_last.reshape(-1)[:4].tolist()}"
+            )
+
     q_flat = q.reshape(num_tokens, num_heads * head_dim)
     k_flat = k.reshape(num_tokens, num_kv_heads * head_dim)
     v_flat = v.reshape(num_tokens, num_kv_heads * head_dim)
@@ -342,20 +429,8 @@ def trtllm_mha_with_cache(
     # Prepare output
     output = torch.empty(num_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
 
-    # Map SequenceInfo fields to thop.attention args
-    sequence_length = seq_len_with_cache[:num_seq]  # device
-    context_lengths = seq_len[:num_seq]  # device
-    host_past_kv_lengths = _GlobalTrtllmPlanner.host_past_kv_lengths[:num_seq]  # host (pinned)
-    host_context_lengths = _GlobalTrtllmPlanner.host_context_lengths[:num_seq]  # host (pinned)
-
-    # thop-specific metadata from _GlobalTrtllmPlanner
-    host_request_types = _GlobalTrtllmPlanner.host_request_types[:num_seq]
+    # Common metadata
     host_total_kv_lens = _GlobalTrtllmPlanner.host_total_kv_lens
-
-    # Block offsets from host_prepare
-    kv_cache_block_offsets = _GlobalTrtllmPlanner.block_offsets
-
-    # Pool mapping (shared, always zeros since layer offset is in pool_pointers)
     host_kv_cache_pool_mapping = _GlobalTrtllmPlanner.host_pool_mapping
 
     # Pack parameters for thop.attention
@@ -370,86 +445,395 @@ def trtllm_mha_with_cache(
 
     mla_tensor_params = [None, None]
 
-    thop.attention(
-        qkv_fused,  # q (actually fused QKV)
-        None,  # k (None when using fused QKV)
-        None,  # v (None when using fused QKV)
-        output,  # output
-        None,  # output_sf (NVFP4)
-        _GlobalTrtllmPlanner.workspace,  # workspace (module-level, like flashinfer)
-        sequence_length,  # sequence_length
-        host_past_kv_lengths,  # host_past_key_value_lengths
-        host_total_kv_lens,  # host_total_kv_lens
-        context_lengths,  # context_lengths
-        host_context_lengths,  # host_context_lengths
-        host_request_types,  # host_request_types
-        kv_cache_block_offsets,  # kv_cache_block_offsets
-        host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
-        host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
-        None,  # cache_indirection (beam search)
-        _GlobalTrtllmPlanner.kv_scale_orig_quant,  # kv_scale_orig_quant
-        _GlobalTrtllmPlanner.kv_scale_quant_orig,  # kv_scale_quant_orig
-        None,  # out_scale
-        None,  # rotary_inv_freq
-        None,  # rotary_cos_sin
-        None,  # latent_cache (MLA)
-        None,  # q_pe (MLA)
-        None,  # block_ids_per_seq
-        None,  # attention_sinks
-        True,  # is_fused_qkv
-        True,  # update_kv_cache
-        1,  # predicted_tokens_per_seq
-        0,  # layer_idx (always 0; pool_pointers already encodes the layer offset)
-        num_heads,  # num_heads
-        num_kv_heads,  # num_kv_heads
-        head_dim,  # head_size
-        tokens_per_block,  # tokens_per_block
-        max_num_requests,  # max_num_requests
-        max_context_length,  # max_context_length
-        attention_window_size,  # attention_window_size
-        0,  # sink_token_length
-        1,  # beam_width
-        int(AttentionMaskType.causal),  # mask_type
-        quant_mode,  # quant_mode
-        1.0,  # q_scaling
-        0,  # position_embedding_type
-        0,  # rotary_embedding_dim
-        10000.0,  # rotary_embedding_base
-        0,  # rotary_embedding_scale_type
-        rotary_embedding_scales,  # rotary_embedding_scales
-        rotary_embedding_max_position_info,  # rotary_embedding_max_position_info
-        True,  # use_paged_context_fmha
-        0,  # attention_input_type
-        False,  # is_mla_enable
-        max_num_requests,  # chunked_prefill_buffer_batch_size
-        None,  # q_lora_rank (MLA)
-        None,  # kv_lora_rank (MLA)
-        None,  # qk_nope_head_dim (MLA)
-        None,  # qk_rope_head_dim (MLA)
-        None,  # v_head_dim (MLA)
-        None,  # mrope_rotary_cos_sin
-        None,  # mrope_position_deltas
-        mla_tensor_params,  # mla_tensor_params
-        None,  # attention_chunk_size
-        None,  # softmax_stats_tensor
-        spec_decoding_bool_params,  # spec_decoding_bool_params
-        spec_decoding_tensor_params,  # spec_decoding_tensor_params
-        None,  # sparse_kv_indices
-        None,  # sparse_kv_offsets
-        None,  # sparse_attn_indices
-        None,  # sparse_attn_offsets
-        1,  # sparse_attn_indices_block_size
-        0,  # sparse_mla_topk
-        None,  # skip_softmax_threshold_scale_factor_prefill
-        None,  # skip_softmax_threshold_scale_factor_decode
-        None,  # skip_softmax_stat
-        None,  # cu_q_seqlens
-        None,  # cu_kv_seqlens
-        None,  # fmha_scheduler_counter
-        None,  # mla_bmm1_scale
-        None,  # mla_bmm2_scale
-        None,  # quant_q_buffer
+    # AttentionInputType enum: 0=Mixed, 1=ContextOnly, 2=GenerationOnly
+    # The C++ run() method does not offset host tensor pointers
+    # (host_past_key_value_lengths, host_context_lengths) by seq_offset when
+    # splitting a Mixed batch into context and generation sub-batches. The XQA
+    # kernel then reads wrong per-sequence metadata for the generation requests.
+    # The standard PyTorch backend avoids this by always calling thop.attention
+    # with ContextOnly or GenerationOnly (never Mixed). We follow the same
+    # pattern: for mixed batches, make two separate calls with correctly sliced
+    # per-sequence tensors.
+    _CONTEXT_ONLY = 1
+    _GENERATION_ONLY = 2
+
+    def _invoke_thop(
+        qkv_slice,
+        out_slice,
+        seq_len_slice,
+        ctx_len_slice,
+        host_past_kv_slice,
+        host_ctx_slice,
+        host_req_slice,
+        block_offsets_view,
+        attn_input_type,
+        total_kv_lens,
+    ):
+        thop.attention(
+            qkv_slice,  # q (actually fused QKV)
+            None,  # k (None when using fused QKV)
+            None,  # v (None when using fused QKV)
+            out_slice,  # output
+            None,  # output_sf (NVFP4)
+            _GlobalTrtllmPlanner.workspace,
+            seq_len_slice,  # sequence_length
+            host_past_kv_slice,  # host_past_key_value_lengths
+            total_kv_lens,  # host_total_kv_lens
+            ctx_len_slice,  # context_lengths
+            host_ctx_slice,  # host_context_lengths
+            host_req_slice,  # host_request_types
+            block_offsets_view,  # kv_cache_block_offsets
+            host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping,
+            None,  # cache_indirection (beam search)
+            _GlobalTrtllmPlanner.kv_scale_orig_quant,
+            _GlobalTrtllmPlanner.kv_scale_quant_orig,
+            None,  # out_scale
+            None,  # rotary_inv_freq
+            None,  # rotary_cos_sin
+            None,  # latent_cache (MLA)
+            None,  # q_pe (MLA)
+            None,  # block_ids_per_seq
+            None,  # attention_sinks
+            True,  # is_fused_qkv
+            True,  # update_kv_cache
+            1,  # predicted_tokens_per_seq
+            0,  # layer_idx (always 0; pool_pointers encodes the layer offset)
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            tokens_per_block,
+            max_num_requests,
+            max_context_length,
+            attention_window_size,
+            0,  # sink_token_length
+            1,  # beam_width
+            int(AttentionMaskType.causal),
+            quant_mode,
+            1.0,  # q_scaling
+            0,  # position_embedding_type
+            0,  # rotary_embedding_dim
+            10000.0,  # rotary_embedding_base
+            0,  # rotary_embedding_scale_type
+            rotary_embedding_scales,
+            rotary_embedding_max_position_info,
+            True,  # use_paged_context_fmha
+            attn_input_type,
+            False,  # is_mla_enable
+            max_num_requests,  # chunked_prefill_buffer_batch_size
+            None,  # q_lora_rank (MLA)
+            None,  # kv_lora_rank (MLA)
+            None,  # qk_nope_head_dim (MLA)
+            None,  # qk_rope_head_dim (MLA)
+            None,  # v_head_dim (MLA)
+            None,  # mrope_rotary_cos_sin
+            None,  # mrope_position_deltas
+            mla_tensor_params,
+            None,  # attention_chunk_size
+            None,  # softmax_stats_tensor
+            spec_decoding_bool_params,
+            spec_decoding_tensor_params,
+            None,  # sparse_kv_indices
+            None,  # sparse_kv_offsets
+            None,  # sparse_attn_indices
+            None,  # sparse_attn_offsets
+            1,  # sparse_attn_indices_block_size
+            0,  # sparse_mla_topk
+            None,  # skip_softmax_threshold_scale_factor_prefill
+            None,  # skip_softmax_threshold_scale_factor_decode
+            None,  # skip_softmax_stat
+            None,  # cu_q_seqlens
+            None,  # cu_kv_seqlens
+            None,  # fmha_scheduler_counter
+            None,  # mla_bmm1_scale
+            None,  # mla_bmm2_scale
+            None,  # quant_q_buffer
+        )
+
+    planner = _GlobalTrtllmPlanner
+    block_offsets = planner.block_offsets
+
+    # GPU context_lengths: context length for prefill, 0 for decode.
+    # Matches the standard backend's prompt_lens_cuda (0 for generation requests).
+    ctx_lens_gpu = planner.context_lengths_cuda
+    ctx_lens_gpu[:num_prefill].copy_(seq_len[:num_prefill])
+    ctx_lens_gpu[num_prefill:num_seq].zero_()
+
+    is_mixed = num_prefill > 0 and num_decode > 0
+    if is_mixed:
+        ad_logger.info(
+            f"[trtllm_attn] MIXED batch split: {num_prefill} ctx ({num_prefill_tokens} tok) "
+            f"+ {num_decode} gen, host_past_kv={planner.host_past_kv_lengths[:num_seq].tolist()}, "
+            f"host_ctx_len={planner.host_context_lengths[:num_seq].tolist()}"
+        )
+        # Context (prefill) sub-batch — only context KV total, zero generation
+        _invoke_thop(
+            qkv_fused[:num_prefill_tokens],
+            output[:num_prefill_tokens],
+            seq_len_with_cache[:num_prefill],
+            ctx_lens_gpu[:num_prefill],
+            planner.host_past_kv_lengths[:num_prefill],
+            planner.host_context_lengths[:num_prefill],
+            planner.host_request_types[:num_prefill],
+            block_offsets,
+            _CONTEXT_ONLY,
+            planner.host_total_kv_lens_ctx,
+        )
+        # Generation (decode) sub-batch — only generation KV total, zero context
+        _invoke_thop(
+            qkv_fused[num_prefill_tokens:],
+            output[num_prefill_tokens:],
+            seq_len_with_cache[num_prefill:num_seq],
+            ctx_lens_gpu[num_prefill:num_seq],
+            planner.host_past_kv_lengths[num_prefill:num_seq],
+            planner.host_context_lengths[num_prefill:num_seq],
+            planner.host_request_types[num_prefill:num_seq],
+            block_offsets[:, num_prefill:, :, :],
+            _GENERATION_ONLY,
+            planner.host_total_kv_lens_gen,
+        )
+    else:
+        attn_type = _CONTEXT_ONLY if num_prefill > 0 else _GENERATION_ONLY
+        _invoke_thop(
+            qkv_fused,
+            output,
+            seq_len_with_cache[:num_seq],
+            ctx_lens_gpu[:num_seq],
+            planner.host_past_kv_lengths[:num_seq],
+            planner.host_context_lengths[:num_seq],
+            planner.host_request_types[:num_seq],
+            block_offsets,
+            attn_type,
+            host_total_kv_lens,
+        )
+
+    # Debug: compare thop context output vs SDPA reference at ALL token positions
+    if _ref_sdpa_out is not None:
+        with torch.no_grad():
+            thop_ctx_out = output[:num_prefill_tokens].reshape(
+                1, num_prefill_tokens, num_heads, head_dim
+            )
+            diff = (_ref_sdpa_out - thop_ctx_out).abs()
+            per_tok_max = diff.reshape(num_prefill_tokens, -1).max(dim=1).values
+            worst_tok = per_tok_max.argmax().item()
+            ad_logger.info(
+                f"[ctx_full_cmp] fwd={_debug_forward_counter} layer={_dbg_layer} ntok={num_prefill_tokens} "
+                f"all_max_diff={per_tok_max.max().item():.8f} "
+                f"all_mean_diff={diff.mean().item():.8f} "
+                f"worst_tok={worst_tok} worst_tok_max={per_tok_max[worst_tok].item():.8f} "
+                f"tok0_max={per_tok_max[0].item():.8f} "
+                f"last_tok_max={per_tok_max[-1].item():.8f}"
+            )
+            if per_tok_max.max().item() > 0.01:
+                bad_toks = (per_tok_max > 0.01).nonzero(as_tuple=True)[0]
+                ad_logger.warning(
+                    f"[ctx_full_cmp] MISMATCH at {len(bad_toks)} tokens! "
+                    f"bad_tok_indices={bad_toks[:10].tolist()} "
+                    f"max_diffs={per_tok_max[bad_toks[:10]].tolist()}"
+                )
+
+    # Debug: verify KV cache write correctness after context call in mixed batch
+    # Check at layers 1, 16, and 32 (first, middle, last of a 32-layer model)
+    # Skip for FP8 KV cache since dtype promotion is not supported
+    if (
+        _dbg_layer in (1, 16, 32)
+        and is_mixed
+        and num_prefill > 0
+        and kv_cache.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+    ):
+        with torch.no_grad():
+            torch.cuda.synchronize()
+            k_input = k[:, :num_prefill_tokens, :, :].reshape(
+                num_prefill_tokens, num_kv_heads, head_dim
+            )
+            v_input = v[:, :num_prefill_tokens, :, :].reshape(
+                num_prefill_tokens, num_kv_heads, head_dim
+            )
+            k_block_off = block_offsets[0, 0, 0, 0].item()
+            v_block_off = block_offsets[0, 0, 1, 0].item()
+            bom = int(max_seq_info_host[2])
+            page_id = k_block_off // bom if bom > 0 else 0
+            ctx_len = int(seq_len_host[0])
+            k_cached = kv_cache[page_id, 0, :, :ctx_len, :]
+            v_cached = kv_cache[page_id, 1, :, :ctx_len, :]
+            k_input_t0 = k_input[0]
+            k_cached_t0 = k_cached[:, 0, :]
+            k_diff = (k_input_t0 - k_cached_t0).abs().max().item()
+            k_input_last = k_input[ctx_len - 1]
+            k_cached_last = k_cached[:, ctx_len - 1, :]
+            k_diff_last = (k_input_last - k_cached_last).abs().max().item()
+            v_input_t0 = v_input[0]
+            v_cached_t0 = v_cached[:, 0, :]
+            v_diff = (v_input_t0 - v_cached_t0).abs().max().item()
+            v_input_last = v_input[ctx_len - 1]
+            v_cached_last = v_cached[:, ctx_len - 1, :]
+            v_diff_last = (v_input_last - v_cached_last).abs().max().item()
+            ad_logger.info(
+                f"[kv_verify] fwd={_debug_forward_counter} page_id={page_id} ctx_len={ctx_len} "
+                f"k_block_off={k_block_off} v_block_off={v_block_off} bom={bom} "
+                f"K_diff_t0={k_diff:.8f} K_diff_last={k_diff_last:.8f} "
+                f"V_diff_t0={v_diff:.8f} V_diff_last={v_diff_last:.8f}"
+            )
+
+    # Debug: log output statistics at key layers to detect corruption
+    if _dbg_layer in (1, 2, 16, 32):
+        with torch.no_grad():
+            for seq_i in range(num_seq):
+                if seq_i < num_prefill:
+                    tok_start = sum(seq_len_host[:seq_i].tolist()) if seq_i > 0 else 0
+                    tok_end = tok_start + int(seq_len_host[seq_i])
+                    last_tok = output[tok_end - 1]
+                else:
+                    idx = num_prefill_tokens + (seq_i - num_prefill)
+                    last_tok = output[idx]
+                ad_logger.info(
+                    f"[attn_out] fwd={_debug_forward_counter} layer={_dbg_layer} seq={seq_i} "
+                    f"last_tok_abs_mean={last_tok.abs().mean().item():.6f} "
+                    f"last_tok[:4]={last_tok[:4].tolist()}"
+                )
+
+    # Debug: decode-time SDPA comparison — run at ALL layers for fwd=5 to find worst layer
+    # Skip for FP8 KV cache since dtype promotion is not supported
+    if (
+        num_prefill == 0
+        and num_decode >= 2
+        and _debug_forward_counter == 5
+        and kv_cache.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+    ):
+        with torch.no_grad():
+            torch.cuda.synchronize()
+            bom = int(max_seq_info_host[2])
+            # seq 1 = prompt 1 in decode-only batches
+            seq_idx_to_check = 1
+            past_len = int(input_pos_host[seq_idx_to_check])
+            total_len = past_len + 1  # past + new decode token
+
+            k_off = block_offsets[0, seq_idx_to_check, 0, 0].item()
+            page_id = k_off // bom if bom > 0 else 0
+
+            # After thop.attention, cache has all tokens including the new one
+            k_all = kv_cache[page_id, 0, :, :total_len, :]  # [kv_heads, total_len, hd]
+            v_all = kv_cache[page_id, 1, :, :total_len, :]
+
+            # GQA expand
+            if num_kv_heads != num_heads:
+                rep = num_heads // num_kv_heads
+                k_all = k_all.repeat_interleave(rep, dim=0)
+                v_all = v_all.repeat_interleave(rep, dim=0)
+
+            # Query for this sequence
+            q_tok = q.reshape(num_tokens, num_heads, head_dim)[seq_idx_to_check]  # [nh, hd]
+            q_sdpa = q_tok.unsqueeze(0).unsqueeze(2)  # [1, nh, 1, hd]
+            k_sdpa = k_all.unsqueeze(0)  # [1, nh, total_len, hd]
+            v_sdpa = v_all.unsqueeze(0)
+
+            ref = torch.nn.functional.scaled_dot_product_attention(
+                q_sdpa,
+                k_sdpa,
+                v_sdpa,
+                is_causal=False,
+                scale=scale,
+            )  # [1, nh, 1, hd]
+            ref_flat = ref.squeeze(0).squeeze(1)  # [nh, hd]
+
+            thop_out = output[num_prefill_tokens + seq_idx_to_check].reshape(num_heads, head_dim)
+            diff = (ref_flat - thop_out).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+            ad_logger.info(
+                f"[decode_sdpa] fwd={_debug_forward_counter} layer={_dbg_layer} seq={seq_idx_to_check} "
+                f"past_len={past_len} page_id={page_id} "
+                f"max_diff={max_diff:.8f} mean_diff={mean_diff:.8f} "
+                f"ref[:4]={ref_flat.reshape(-1)[:4].tolist()} "
+                f"thop[:4]={thop_out.reshape(-1)[:4].tolist()}"
+            )
+            if max_diff > 0.01:
+                # Verify the new decode token was written correctly
+                k_new_cached = kv_cache[page_id, 0, :, past_len, :]  # [kv_heads, hd]
+                k_new_input = k.reshape(num_tokens, num_kv_heads, head_dim)[seq_idx_to_check]
+                k_new_diff = (k_new_cached - k_new_input).abs().max().item()
+                # Verify some past tokens
+                k_past_0 = kv_cache[page_id, 0, :, 0, :]
+                ad_logger.warning(
+                    f"[decode_sdpa] MISMATCH! k_new_write_diff={k_new_diff:.8f} "
+                    f"k_cached_t0[:4]={k_past_0.reshape(-1)[:4].tolist()} "
+                    f"k_new_cached[:4]={k_new_cached.reshape(-1)[:4].tolist()}"
+                )
+
+    # Debug: override thop output with pure SDPA output (thop still ran for KV cache update)
+    _do_override = (_SDPA_OVERRIDE and _debug_forward_counter >= 3) or (
+        _SDPA_OVERRIDE_DECODE_ONLY and _debug_forward_counter >= 3 and num_decode > 0
     )
+    if _do_override:
+        with torch.no_grad():
+            bom = int(max_seq_info_host[2])
+            # Context tokens: compute SDPA from input Q/K/V (skip if decode-only override)
+            if num_prefill_tokens > 0 and not _SDPA_OVERRIDE_DECODE_ONLY:
+                q_ctx = q[:, :num_prefill_tokens, :, :]
+                k_ctx = k[:, :num_prefill_tokens, :, :]
+                v_ctx = v[:, :num_prefill_tokens, :, :]
+                if num_kv_heads != num_heads:
+                    rep = num_heads // num_kv_heads
+                    k_ctx = k_ctx.repeat_interleave(rep, dim=2)
+                    v_ctx = v_ctx.repeat_interleave(rep, dim=2)
+                sdpa_ctx = torch.nn.functional.scaled_dot_product_attention(
+                    q_ctx.transpose(1, 2),
+                    k_ctx.transpose(1, 2),
+                    v_ctx.transpose(1, 2),
+                    is_causal=True,
+                    scale=scale,
+                ).transpose(1, 2)
+                output[:num_prefill_tokens] = sdpa_ctx.reshape(
+                    num_prefill_tokens, num_heads * head_dim
+                )
+
+            # Decode tokens: compute SDPA from cached K/V + new token
+            for dec_i in range(num_decode):
+                seq_i = num_prefill + dec_i
+                tok_i = num_prefill_tokens + dec_i
+                past_len = int(input_pos_host[seq_i])
+                total_len = past_len + 1
+
+                # Find page(s) for this sequence
+                k_off = block_offsets[0, seq_i, 0, 0].item()
+                page_id = k_off // bom if bom > 0 else 0
+
+                # Read full K/V from cache (including new token just written by thop)
+                pages_needed = (total_len + tokens_per_block - 1) // tokens_per_block
+                if pages_needed == 1:
+                    k_all = kv_cache[page_id, 0, :, :total_len, :]
+                    v_all = kv_cache[page_id, 1, :, :total_len, :]
+                else:
+                    k_pages = []
+                    v_pages = []
+                    remaining = total_len
+                    for pg in range(pages_needed):
+                        pg_off = block_offsets[0, seq_i, 0, pg].item()
+                        pg_id = pg_off // bom if bom > 0 else 0
+                        n = min(tokens_per_block, remaining)
+                        k_pages.append(kv_cache[pg_id, 0, :, :n, :])
+                        v_pages.append(kv_cache[pg_id, 1, :, :n, :])
+                        remaining -= n
+                    k_all = torch.cat(k_pages, dim=1)
+                    v_all = torch.cat(v_pages, dim=1)
+
+                if num_kv_heads != num_heads:
+                    rep = num_heads // num_kv_heads
+                    k_all = k_all.repeat_interleave(rep, dim=0)
+                    v_all = v_all.repeat_interleave(rep, dim=0)
+
+                q_tok = q.reshape(num_tokens, num_heads, head_dim)[tok_i]
+                q_sdpa = q_tok.unsqueeze(0).unsqueeze(2)
+                k_sdpa = k_all.unsqueeze(0)
+                v_sdpa = v_all.unsqueeze(0)
+                ref = torch.nn.functional.scaled_dot_product_attention(
+                    q_sdpa,
+                    k_sdpa,
+                    v_sdpa,
+                    is_causal=False,
+                    scale=scale,
+                )
+                output[tok_i] = ref.squeeze(0).squeeze(1).reshape(num_heads * head_dim)
 
     return output.view(*q_shape_og)
 
