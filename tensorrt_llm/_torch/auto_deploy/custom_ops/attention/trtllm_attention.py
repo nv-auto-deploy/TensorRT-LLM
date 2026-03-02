@@ -87,19 +87,32 @@ class _TrtllmPlanner:
         # thop-specific host metadata NOT available from SequenceInfo
         self.host_request_types: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
         self.host_total_kv_lens: Optional[torch.Tensor] = None  # [2] int64 pinned
-        # Per-sub-batch host_total_kv_lens for mixed batch splitting: each sub-batch
-        # must only report its own KV total, with the other component zeroed.
+        # Per-sub-batch host_total_kv_lens for mixed batch splitting.
         self.host_total_kv_lens_ctx: Optional[torch.Tensor] = None  # [2] int64 pinned
         self.host_total_kv_lens_gen: Optional[torch.Tensor] = None  # [2] int64 pinned
-        # thop variant of input_pos_host and seq_len_host
-        # keeping a separate copy here since we sometimes have to overwrite the original values
+        # host_past_kv_lengths: total KV length per sequence (past + current tokens).
+        # Matches the standard backend's kv_lens_runtime = cached_token_lens + seq_lens_kv.
         self.host_past_kv_lengths: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
+        # host_context_lengths: prompt length for prefill, input_pos for decode.
+        # Matches the standard backend's prompt_lens (original prompt length for all seqs).
+        # Auto-Deploy doesn't track fixed prompt_lens, so decode uses input_pos instead,
+        # which equals prompt_len on the first decode step and grows thereafter.
         self.host_context_lengths: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
         # Persistent block_offsets buffer for CUDA graph compatibility.
         # Pre-allocated to max size so the tensor address is stable across replays.
         self.block_offsets: Optional[torch.Tensor] = None
-        # GPU context_lengths for thop: context_len for prefill, 0 for decode
+        # GPU context_lengths: prompt length for prefill, input_pos for decode
         self.context_lengths_cuda: Optional[torch.Tensor] = None
+        # Separate generation sub-batch buffers for mixed batch splitting.
+        # These avoid passing sliced views of host/GPU tensors to the C++ kernel,
+        # which could cause out-of-bounds reads. Data is copied to positions
+        # 0..num_decode-1 before each generation-only call.
+        self.host_past_kv_lengths_gen: Optional[torch.Tensor] = None
+        self.host_context_lengths_gen: Optional[torch.Tensor] = None
+        self.host_request_types_gen: Optional[torch.Tensor] = None
+        self.block_offsets_gen: Optional[torch.Tensor] = None
+        self.seq_len_with_cache_gen: Optional[torch.Tensor] = None
+        self.context_lengths_cuda_gen: Optional[torch.Tensor] = None
         # FP8 scale tensors (lazily initialized from constants on first FP8 use)
         self.kv_scale_orig_quant: Optional[torch.Tensor] = None
         self.kv_scale_quant_orig: Optional[torch.Tensor] = None
@@ -141,6 +154,21 @@ class _TrtllmPlanner:
             max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self.context_lengths_cuda = torch.zeros(max_batch, dtype=torch.int32, device=device)
+        # Generation sub-batch buffers (full-sized to avoid out-of-bounds reads)
+        self.host_past_kv_lengths_gen = torch.zeros(
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+        )
+        self.host_context_lengths_gen = torch.zeros(
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+        )
+        self.host_request_types_gen = torch.ones(
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+        )
+        self.block_offsets_gen = torch.zeros(
+            1, max_batch, 2, max_blocks_per_seq, dtype=torch.int32, device=device
+        )
+        self.seq_len_with_cache_gen = torch.zeros(max_batch, dtype=torch.int32, device=device)
+        self.context_lengths_cuda_gen = torch.zeros(max_batch, dtype=torch.int32, device=device)
 
     def plan(
         self,
@@ -158,6 +186,12 @@ class _TrtllmPlanner:
         """Per-forward host metadata: fills host_request_types, block_offsets, host_total_kv_lens.
 
         Called from ``prepare_trtllm_metadata_host`` before every forward (including replays).
+
+        Metadata semantics match the standard PyTorch backend (TrtllmAttentionMetadata.prepare):
+        - host_past_kv_lengths = total KV length (= kv_lens_runtime)
+        - host_context_lengths = prompt_lens (prefill: prompt length, decode: input_pos)
+        - host_total_kv_lens = [sum of context KV lengths, sum of generation KV lengths]
+        - host_request_types = 0 for context (prefill), 1 for generation (decode)
         """
         num_seq = num_prefill + num_decode
 
@@ -194,18 +228,36 @@ class _TrtllmPlanner:
             gen_total = int(seq_len_with_cache_host[num_prefill:num_seq].sum())
             self.host_total_kv_lens[0] = ctx_total
             self.host_total_kv_lens[1] = gen_total
+            # Per-sub-batch totals for mixed batch splitting
             self.host_total_kv_lens_ctx[0] = ctx_total
             self.host_total_kv_lens_ctx[1] = 0
             self.host_total_kv_lens_gen[0] = 0
             self.host_total_kv_lens_gen[1] = gen_total
-            # host_past_kv_lengths must equal sequence_length (total KV length
-            # including past + current tokens), matching the standard backend's
-            # kv_lens_runtime = cached_token_lens + seq_lens_kv.
+            # host_past_kv_lengths = total KV length (past + current tokens).
+            # Matches kv_lens_runtime = cached_token_lens + seq_lens_kv in the standard backend.
             self.host_past_kv_lengths[:num_seq] = seq_len_with_cache_host[:num_seq]
-            # host_context_lengths: context length for prefill seqs, 0 for decode seqs.
-            # The standard backend uses prompt_lens_cpu which is 0 for decode.
+            # host_context_lengths: prompt length for prefill, input_pos for decode.
+            # The standard backend uses the fixed original prompt_lens for all sequences.
+            # Auto-Deploy doesn't track prompt_lens, so decode uses input_pos instead
+            # (= seq_len_with_cache - seq_len = past KV length), which equals prompt_len
+            # on the first decode step.
             self.host_context_lengths[:num_prefill] = seq_len_host[:num_prefill]
-            self.host_context_lengths[num_prefill:num_seq].zero_()
+            self.host_context_lengths[num_prefill:num_seq] = (
+                seq_len_with_cache_host[num_prefill:num_seq] - seq_len_host[num_prefill:num_seq]
+            )
+            # Populate generation sub-batch buffers: copy decode data to positions
+            # 0..num_decode-1 so the C++ kernel reads from properly-based tensors.
+            if num_prefill > 0 and num_decode > 0:
+                self.host_past_kv_lengths_gen[:num_decode] = seq_len_with_cache_host[
+                    num_prefill:num_seq
+                ]
+                self.host_context_lengths_gen[:num_decode] = (
+                    seq_len_with_cache_host[num_prefill:num_seq] - seq_len_host[num_prefill:num_seq]
+                )
+                # Copy generation block_offsets to positions 0..num_decode-1
+                self.block_offsets_gen[:, :num_decode, :, :] = block_offsets[
+                    :, num_prefill:num_seq, :, :
+                ]
 
     def get_pool_pointers_for_layer(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Return a per-layer ``host_pool_pointers`` tensor for this kv_cache view.
@@ -287,6 +339,14 @@ def prepare_trtllm_metadata_host(
 # Cached attention op (analogous to flashinfer_mha_with_cache)
 # =============================================================================
 
+# AttentionInputType enum matching the C++ side.
+# Mixed batches are split into separate ContextOnly + GenerationOnly calls
+# because the C++ AttentionOp::run() Mixed mode produces garbage output for
+# non-FP8 models (BF16/FP16). The generation sub-batch uses dedicated buffers
+# (not tensor views) to ensure the C++ kernel reads from properly-based tensors.
+_CONTEXT_ONLY = 1
+_GENERATION_ONLY = 2
+
 
 @torch.library.custom_op("auto_deploy::trtllm_attention_mha_with_cache", mutates_args=("kv_cache",))
 def trtllm_mha_with_cache(
@@ -314,6 +374,12 @@ def trtllm_mha_with_cache(
     Infers num_heads, num_kv_heads, head_dim, and tokens_per_block from tensor shapes.
     All max-size constants (max_num_requests, max_context_length) are read from
     ``max_seq_info_host`` which is set once via ``SequenceInfo.update_cache_information()``.
+
+    Mixed batches (simultaneous prefill + decode) are split into separate
+    ``thop.attention`` calls — ContextOnly and GenerationOnly — because the C++
+    ``AttentionOp::run()`` Mixed mode produces garbage for non-FP8 models. The
+    generation sub-batch uses dedicated buffers (not tensor views of the primary
+    buffers) to avoid out-of-bounds reads in the C++ kernel.
 
     Note: ``prepare_trtllm_metadata_host`` is guaranteed to be called before this op,
     so all persistent planner buffers are already initialized.
@@ -371,9 +437,18 @@ def trtllm_mha_with_cache(
     # Prepare output
     output = torch.empty(num_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
 
-    # Common metadata
-    host_total_kv_lens = _GlobalTrtllmPlanner.host_total_kv_lens
-    host_kv_cache_pool_mapping = _GlobalTrtllmPlanner.host_pool_mapping
+    planner = _GlobalTrtllmPlanner
+    block_offsets = planner.block_offsets
+    host_kv_cache_pool_mapping = planner.host_pool_mapping
+
+    # GPU context_lengths: prompt length for prefill, input_pos for decode.
+    # Matches host_context_lengths (see plan() for rationale).
+    ctx_lens_gpu = planner.context_lengths_cuda
+    ctx_lens_gpu[:num_prefill].copy_(seq_len[:num_prefill])
+    if num_decode > 0:
+        ctx_lens_gpu[num_prefill:num_seq].copy_(
+            seq_len_with_cache[num_prefill:num_seq] - seq_len[num_prefill:num_seq]
+        )
 
     # Pack parameters for thop.attention
     rotary_embedding_scales = [1.0, 1.0, 1.0]
@@ -387,49 +462,37 @@ def trtllm_mha_with_cache(
 
     mla_tensor_params = [None, None]
 
-    # AttentionInputType enum: 0=Mixed, 1=ContextOnly, 2=GenerationOnly
-    # The C++ run() method does not offset host tensor pointers
-    # (host_past_key_value_lengths, host_context_lengths) by seq_offset when
-    # splitting a Mixed batch into context and generation sub-batches. The XQA
-    # kernel then reads wrong per-sequence metadata for the generation requests.
-    # The standard PyTorch backend avoids this by always calling thop.attention
-    # with ContextOnly or GenerationOnly (never Mixed). We follow the same
-    # pattern: for mixed batches, make two separate calls with correctly sliced
-    # per-sequence tensors.
-    _CONTEXT_ONLY = 1
-    _GENERATION_ONLY = 2
-
     def _invoke_thop(
         qkv_slice,
         out_slice,
         seq_len_slice,
         ctx_len_slice,
-        host_past_kv_slice,
-        host_ctx_slice,
-        host_req_slice,
-        block_offsets_view,
+        host_past_kv,
+        host_ctx,
+        host_req,
+        bo,
         attn_input_type,
         total_kv_lens,
     ):
         thop.attention(
-            qkv_slice,  # q (actually fused QKV)
+            qkv_slice,  # fused QKV
             None,  # k (None when using fused QKV)
             None,  # v (None when using fused QKV)
-            out_slice,  # output
+            out_slice,
             None,  # output_sf (NVFP4)
-            _GlobalTrtllmPlanner.workspace,
+            planner.workspace,
             seq_len_slice,  # sequence_length
-            host_past_kv_slice,  # host_past_key_value_lengths
+            host_past_kv,  # host_past_key_value_lengths
             total_kv_lens,  # host_total_kv_lens
             ctx_len_slice,  # context_lengths
-            host_ctx_slice,  # host_context_lengths
-            host_req_slice,  # host_request_types
-            block_offsets_view,  # kv_cache_block_offsets
+            host_ctx,  # host_context_lengths
+            host_req,  # host_request_types
+            bo,  # kv_cache_block_offsets
             host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping,
             None,  # cache_indirection (beam search)
-            _GlobalTrtllmPlanner.kv_scale_orig_quant,
-            _GlobalTrtllmPlanner.kv_scale_quant_orig,
+            planner.kv_scale_orig_quant,
+            planner.kv_scale_quant_orig,
             None,  # out_scale
             None,  # rotary_inv_freq
             None,  # rotary_cos_sin
@@ -492,18 +555,8 @@ def trtllm_mha_with_cache(
             None,  # quant_q_buffer
         )
 
-    planner = _GlobalTrtllmPlanner
-    block_offsets = planner.block_offsets
-
-    # GPU context_lengths: context length for prefill, 0 for decode.
-    # Matches the standard backend's prompt_lens_cuda (0 for generation requests).
-    ctx_lens_gpu = planner.context_lengths_cuda
-    ctx_lens_gpu[:num_prefill].copy_(seq_len[:num_prefill])
-    ctx_lens_gpu[num_prefill:num_seq].zero_()
-
     is_mixed = num_prefill > 0 and num_decode > 0
     if is_mixed:
-        # Context (prefill) sub-batch — only context KV total, zero generation
         _invoke_thop(
             qkv_fused[:num_prefill_tokens],
             output[:num_prefill_tokens],
@@ -516,16 +569,18 @@ def trtllm_mha_with_cache(
             _CONTEXT_ONLY,
             planner.host_total_kv_lens_ctx,
         )
-        # Generation (decode) sub-batch — only generation KV total, zero context
+
+        planner.seq_len_with_cache_gen[:num_decode].copy_(seq_len_with_cache[num_prefill:num_seq])
+        planner.context_lengths_cuda_gen[:num_decode].copy_(ctx_lens_gpu[num_prefill:num_seq])
         _invoke_thop(
             qkv_fused[num_prefill_tokens:],
             output[num_prefill_tokens:],
-            seq_len_with_cache[num_prefill:num_seq],
-            ctx_lens_gpu[num_prefill:num_seq],
-            planner.host_past_kv_lengths[num_prefill:num_seq],
-            planner.host_context_lengths[num_prefill:num_seq],
-            planner.host_request_types[num_prefill:num_seq],
-            block_offsets[:, num_prefill:, :, :],
+            planner.seq_len_with_cache_gen[:num_decode],
+            planner.context_lengths_cuda_gen[:num_decode],
+            planner.host_past_kv_lengths_gen[:num_decode],
+            planner.host_context_lengths_gen[:num_decode],
+            planner.host_request_types_gen[:num_decode],
+            planner.block_offsets_gen,
             _GENERATION_ONLY,
             planner.host_total_kv_lens_gen,
         )
@@ -541,7 +596,7 @@ def trtllm_mha_with_cache(
             planner.host_request_types[:num_seq],
             block_offsets,
             attn_type,
-            host_total_kv_lens,
+            planner.host_total_kv_lens,
         )
 
     return output.view(*q_shape_og)
