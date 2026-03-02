@@ -13,14 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import torch
 
 
-@torch.library.custom_op("auto_deploy::gather_logits_before_lm_head", mutates_args=())
+@torch.library.custom_op("auto_deploy::gather_logits_before_lm_head", mutates_args=("out",))
 def gather_logits_before_lm_head(
     hidden_states: torch.Tensor,
     logits_gather_indices: torch.Tensor,  # long tensor
     logits_gather_info_host: torch.Tensor,  # int tensor
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Gather hidden states using logits_gather_indices before LM head.
 
@@ -28,6 +31,7 @@ def gather_logits_before_lm_head(
         hidden_states: Hidden states tensor [b, 1, hidden] or [1, s_total, hidden]
         logits_gather_indices: indices for gathering logits.
         logits_gather_info_host: info for gathering logits.
+        out: Optional pre-allocated output tensor to write into.
     Returns:
         Gathered and flattened hidden states [num_gathered_tokens, hidden]
     """
@@ -39,10 +43,15 @@ def gather_logits_before_lm_head(
     num_tokens_to_gather, gather_required = logits_gather_info_host.tolist()
 
     if gather_required:
-        out = hidden_states.index_select(0, logits_gather_indices[:num_tokens_to_gather])
+        result = hidden_states.index_select(0, logits_gather_indices[:num_tokens_to_gather])
     else:
-        out = hidden_states.clone(memory_format=torch.contiguous_format)
-    return out.unsqueeze(int(is_decode_only))
+        result = hidden_states.clone(memory_format=torch.contiguous_format)
+    result = result.unsqueeze(int(is_decode_only))
+
+    if out is not None:
+        out.copy_(result)
+        return out.new_empty(0)
+    return result
 
 
 @gather_logits_before_lm_head.register_fake
@@ -50,7 +59,10 @@ def gather_logits_before_lm_head_fake(
     hidden_states: torch.Tensor,
     logits_gather_indices: torch.Tensor,
     logits_gather_info_host: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if out is not None:
+        return out
     # NOTE: shape is not correct in fake mode
     # see https://github.com/NVIDIA/TensorRT-LLM/issues/9878
     return torch.empty_like(hidden_states)

@@ -90,18 +90,7 @@ class CompileModel(BaseTransform):
             return (), cm.named_args
 
         def _get_mixed_args_kwargs(num_tokens: int) -> ArgsKwargs:
-            """Generate synthetic mixed-batch args for piecewise CG capture.
-
-            Creates a mixed batch with at least 1 prefill + 1 decode to exercise
-            both code paths in dynamic ops (attention, SSM). The static CUDA
-            graph segments are agnostic to the prefill/decode split -- they only
-            see total_num_tokens.
-
-            Each prefill sequence is capped to max_seq_len so that its page
-            indices stay within block_offsets capacity, matching what the
-            executor would produce at runtime. When num_tokens exceeds what a
-            single prefill can hold, multiple prefill sequences are created.
-            """
+            """Generate synthetic mixed-batch args for piecewise CG capture."""
             assert num_tokens >= 3, (
                 f"Piecewise bucket {num_tokens} too small for mixed batch. "
                 f"Minimum is 3 (1 prefill seq with len>=2 + 1 decode seq)."
@@ -117,11 +106,12 @@ class CompileModel(BaseTransform):
                 remaining -= seq_len
             input_ids.append([1])
 
-            assert remaining == 0, (
-                f"Piecewise bucket {num_tokens} exceeds batch capacity "
-                f"({max_batch - 1} seqs * {max_seq} tokens + 1 decode). "
-                f"Increase max_seq_len or max_batch_size."
-            )
+            if remaining > 0:
+                raise ValueError(
+                    f"Piecewise bucket {num_tokens} exceeds batch capacity "
+                    f"({max_batch - 1} seqs * {max_seq} tokens + 1 decode). "
+                    f"Increase max_seq_len or max_batch_size."
+                )
 
             cm.info.set_example_sequence(input_ids=input_ids)
             return (), cm.named_args
@@ -131,6 +121,10 @@ class CompileModel(BaseTransform):
 
         if self.config.piecewise_enabled:
             extra_kwargs["get_mixed_args_kwargs_for_compile"] = _get_mixed_args_kwargs
+
+            max_seq = cm.info.max_seq_len
+            max_batch = cm.info.max_batch_size
+            batch_capacity = (max_batch - 1) * max_seq + 1
 
             # Auto-generate piecewise_num_tokens if not explicitly specified
             if self.config.piecewise_num_tokens is None:
@@ -151,6 +145,20 @@ class CompileModel(BaseTransform):
                         f"minimum is 3). Remaining: {valid_buckets}"
                     )
                 config_overrides["piecewise_num_tokens"] = valid_buckets
+
+            # Filter out buckets that exceed the mixed-batch capacity
+            buckets = config_overrides.get(
+                "piecewise_num_tokens", self.config.piecewise_num_tokens or []
+            )
+            over = [nt for nt in buckets if nt > batch_capacity]
+            if over:
+                buckets = [nt for nt in buckets if nt <= batch_capacity]
+                ad_logger.warning(
+                    f"Dropping piecewise buckets {over} that exceed mixed-batch capacity "
+                    f"({max_batch - 1} seqs * {max_seq} tokens + 1 decode = {batch_capacity}). "
+                    f"Remaining: {buckets}"
+                )
+                config_overrides["piecewise_num_tokens"] = buckets
 
         # Merge config with any overrides
         config_dict = self.config.model_dump()

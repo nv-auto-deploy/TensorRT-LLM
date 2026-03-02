@@ -197,7 +197,9 @@ def _prefill_attention(
     )
 
 
-@torch.library.custom_op("auto_deploy::triton_attention_flattened_mha_with_cache", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::triton_attention_flattened_mha_with_cache", mutates_args=("out",)
+)
 def flattened_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -220,6 +222,7 @@ def flattened_mha_with_cache(
     scale: Optional[float],
     sinks: Optional[torch.Tensor] = None,
     sliding_window: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Flattened MHA with cache that takes q, k, v in BSND layout.
 
@@ -287,6 +290,13 @@ def flattened_mha_with_cache(
             sliding_window,
         )
 
+    if out is not None:
+        out_flat = out.view(bs, num_heads, v_head_dim)
+        out_flat[:num_total_tokens].copy_(y[:num_total_tokens])
+        if num_total_tokens < bs:
+            out_flat[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
     # Zero padding positions so downstream ops don't see garbage (piecewise CG)
     if num_total_tokens < bs:
         y[num_total_tokens:].zero_()
@@ -317,7 +327,10 @@ def flattened_mha_fake(
     scale: Optional[float],
     sinks: Optional[torch.Tensor] = None,
     sliding_window: Optional[int] = None,
-):
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if out is not None:
+        return out
     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
 
 

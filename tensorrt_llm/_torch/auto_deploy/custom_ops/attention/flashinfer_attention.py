@@ -315,7 +315,7 @@ def prepare_flashinfer_metadata_host(
         )
 
 
-@torch.library.custom_op("auto_deploy::flashinfer_attention_mha_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::flashinfer_attention_mha_with_cache", mutates_args=("out",))
 def flashinfer_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -339,6 +339,8 @@ def flashinfer_mha_with_cache(
     scale: Optional[float],
     k_scale: float,
     v_scale: float,
+    # OPTIONAL PRE-ALLOCATED OUTPUT
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # kv_cache shape: [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim] (HND layout)
     head_dim = kv_cache.shape[-1]
@@ -376,6 +378,75 @@ def flashinfer_mha_with_cache(
         kv_last_page_len=last_page_len[:num_seq],
         kv_layout=_GlobalFlashInferPlanner.kv_layout,
     )
+
+    if out is not None:
+        # Use pre-allocated output buffer, writing directly into it
+        out_flat = out.view(-1, n_heads, head_dim)
+
+        if num_prefill > 0:
+            q_prefill = q[:num_prefill_tokens]
+
+            pp_prefill = PlanParams(
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                head_dim=head_dim,
+                num_seq=num_prefill,
+                page_size=page_size,
+                q_dtype=q_prefill.dtype,
+                kv_dtype=kv_cache.dtype,
+                sm_scale=scale,
+            )
+
+            wrapper_prefill = _GlobalFlashInferPlanner.plan_prefill(
+                qo_indptr_host=cu_seqlen_host[: num_prefill + 1],
+                kv_page_indptr_host=cu_num_pages_host[: num_prefill + 1],
+                kv_page_indices=cache_loc,
+                kv_last_page_len_host=last_page_len_host[:num_prefill],
+                kv_lens_arr_host=seq_len_with_cache_host[:num_prefill],
+                plan_params=pp_prefill,
+            )
+
+            wrapper_prefill.run(
+                q_prefill,
+                kv_cache,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                enable_pdl=get_env_enable_pdl(),
+                out=out_flat[:num_prefill_tokens],
+            )
+
+        if num_decode > 0:
+            q_decode = q[num_prefill_tokens:num_total_tokens]
+
+            pp_decode = PlanParams(
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                head_dim=head_dim,
+                num_seq=num_decode,
+                page_size=page_size,
+                q_dtype=q_decode.dtype,
+                kv_dtype=kv_cache.dtype,
+                sm_scale=scale,
+            )
+
+            wrapper_decode = _GlobalFlashInferPlanner.plan_decode(
+                kv_page_indptr=cu_num_pages[num_prefill : num_seq + 1],
+                kv_page_indices=cache_loc,
+                kv_last_page_len=last_page_len[num_prefill:num_seq],
+                plan_params=pp_decode,
+            )
+
+            wrapper_decode.run(
+                q_decode,
+                kv_cache,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                enable_pdl=get_env_enable_pdl(),
+                out=out_flat[num_prefill_tokens:num_total_tokens],
+            )
+
+        out_flat[num_total_tokens:].zero_()
+        return out.new_empty(0)
 
     # check if we need to re-combine outputs
     if num_prefill > 0 and num_decode > 0:
@@ -494,7 +565,11 @@ def flashinfer_mha_with_cache_fake(
     scale: Optional[float],
     k_scale: float,
     v_scale: float,
+    # OPTIONAL PRE-ALLOCATED OUTPUT
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if out is not None:
+        return out
     return torch.empty_like(q.contiguous())
 
 
