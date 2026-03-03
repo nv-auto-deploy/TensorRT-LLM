@@ -1530,6 +1530,8 @@ class Qwen3_5MoeModel(nn.Module):
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
+        # TODO: Multi-modal case isn't handled here yet. Remove this once we have a proper way to handle multimodal
+        # position_ids. ADExecutor always provides a text-only position_ids.
         if position_ids is not None:
             # External position_ids (from AD runtime / nest_sequences) — pass
             # directly to the language model which handles mRoPE expansion.
