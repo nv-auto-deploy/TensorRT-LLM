@@ -61,14 +61,14 @@ def _flashinfer_cached_ssm(
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
-    # Preallocate output tensor to avoid memcpy cost for merging prefill
-    # and decode outputs
-    preallocated_ssm_out = torch.empty(
-        [bs, num_heads, head_dim],
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
-    preallocated_ssm_out_p = preallocated_ssm_out[:num_prefill_tokens]
+    if out is not None:
+        preallocated_ssm_out = out.view(bs, num_heads, head_dim)
+    else:
+        preallocated_ssm_out = torch.zeros(
+            [bs, num_heads, head_dim],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
 
     num_prefill, num_prefill_tokens, num_total_tokens, num_seq = _run_ssm_prefill(
         hs_flat,
@@ -88,7 +88,7 @@ def _flashinfer_cached_ssm(
         ssm_state_cache,
         time_step_limit,
         chunk_size,
-        preallocated_ssm_out_p.unsqueeze(0),
+        preallocated_ssm_out[:num_prefill_tokens].unsqueeze(0),
     )
 
     num_decode = num_total_tokens - num_prefill_tokens
@@ -110,7 +110,6 @@ def _flashinfer_cached_ssm(
         ssm_state_size,
     )
 
-    y_decode = None
     if decode_inputs is not None:
         (
             slot_idx_decode,
@@ -140,23 +139,15 @@ def _flashinfer_cached_ssm(
             state_batch_indices=slot_idx_decode_i32,
         )
         preallocated_ssm_out[num_prefill_tokens:num_total_tokens].copy_(y_decode)
-    if out is not None:
-        flat_out = out.view(b * s, num_heads, head_dim)
-        flat_out[:num_total_tokens].copy_(preallocated_ssm_out[:num_total_tokens])
-        if num_total_tokens < b * s:
-            flat_out[num_total_tokens:].zero_()
-        return out.new_empty(0)
 
-    if num_total_tokens > 0:
-        # Cast to input dtype if needed (prefill may compute in higher precision)
-        if preallocated_ssm_out.dtype != hidden_states.dtype:
-            preallocated_ssm_out = preallocated_ssm_out.to(hidden_states.dtype)
-        # Zero padding positions so downstream ops don't see garbage (piecewise CG)
+    if out is not None:
+        # out is reused across CUDA graph replays with varying num_total_tokens,
+        # so stale data from prior replays can linger in the padding region.
         if num_total_tokens < bs:
             preallocated_ssm_out[num_total_tokens:].zero_()
-        return preallocated_ssm_out.view(b, s, num_heads, head_dim)
-    else:
-        return torch.empty_like(hidden_states)
+        return out.new_empty(0)
+
+    return preallocated_ssm_out.view(b, s, num_heads, head_dim)
 
 
 @_flashinfer_cached_ssm.register_fake
