@@ -41,7 +41,8 @@ class MoERunner(TunableRunner):
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets,
             last_positive_power_of_2), ),
-        tune_max_num_tokens=8192,
+        #        tune_max_num_tokens=8192,
+        tune_max_num_tokens=16394,
         distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
     )
 
@@ -184,7 +185,8 @@ def fused_moe(
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     use_fused_finalize: bool = True,
-    tune_max_num_tokens: int = 8192,
+    #    tune_max_num_tokens: int = 8192,
+    tune_max_num_tokens: int = 16384,
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
     activation_type: int = int(ActivationType.Swiglu),
@@ -283,39 +285,41 @@ def fused_moe(
 
 
 @torch.library.register_fake("trtllm::fused_moe")
-def _(input: torch.Tensor,
-      token_selected_experts: torch.Tensor,
-      token_final_scales: torch.Tensor,
-      fc1_expert_weights: torch.Tensor,
-      fc1_expert_biases: Optional[torch.Tensor],
-      fc2_expert_weights: torch.Tensor,
-      fc2_expert_biases: Optional[torch.Tensor],
-      output_dtype: torch.dtype,
-      quant_scales: List[torch.Tensor],
-      input_sf: Optional[torch.Tensor] = None,
-      swizzled_input_sf: bool = True,
-      swiglu_alpha: Optional[torch.Tensor] = None,
-      swiglu_beta: Optional[torch.Tensor] = None,
-      swiglu_limit: Optional[torch.Tensor] = None,
-      tp_size: int = 1,
-      tp_rank: int = 0,
-      ep_size: int = 1,
-      ep_rank: int = 0,
-      cluster_size: int = 1,
-      cluster_rank: int = 0,
-      enable_alltoall: bool = False,
-      use_deepseek_fp8_block_scale: bool = False,
-      use_w4_group_scaling: bool = False,
-      use_int8_woq_per_channel: bool = False,
-      use_mxfp8_act_scaling: bool = False,
-      min_latency_mode: bool = False,
-      use_fused_finalize: bool = True,
-      tune_max_num_tokens: int = 8192,
-      tuner_num_tokens: Optional[int] = None,
-      tuner_top_k: Optional[int] = None,
-      activation_type: ActivationType = ActivationType.Swiglu,
-      unpadded_hidden_size: Optional[int] = None,
-      out_tensor: Optional[torch.Tensor] = None):
+def _(
+        input: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        fc1_expert_weights: torch.Tensor,
+        fc1_expert_biases: Optional[torch.Tensor],
+        fc2_expert_weights: torch.Tensor,
+        fc2_expert_biases: Optional[torch.Tensor],
+        output_dtype: torch.dtype,
+        quant_scales: List[torch.Tensor],
+        input_sf: Optional[torch.Tensor] = None,
+        swizzled_input_sf: bool = True,
+        swiglu_alpha: Optional[torch.Tensor] = None,
+        swiglu_beta: Optional[torch.Tensor] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        ep_size: int = 1,
+        ep_rank: int = 0,
+        cluster_size: int = 1,
+        cluster_rank: int = 0,
+        enable_alltoall: bool = False,
+        use_deepseek_fp8_block_scale: bool = False,
+        use_w4_group_scaling: bool = False,
+        use_int8_woq_per_channel: bool = False,
+        use_mxfp8_act_scaling: bool = False,
+        min_latency_mode: bool = False,
+        use_fused_finalize: bool = True,
+        #      tune_max_num_tokens: int = 8192,
+        tune_max_num_tokens: int = 16384,
+        tuner_num_tokens: Optional[int] = None,
+        tuner_top_k: Optional[int] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
+        unpadded_hidden_size: Optional[int] = None,
+        out_tensor: Optional[torch.Tensor] = None):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,
@@ -1400,8 +1404,10 @@ def finegrained_mixed_dtype_gemm(
 
     tuning_config = TuningConfig(dynamic_tensor_specs=(
         # For tensor index 0 (input A), tune dimension 0 (M dimension)
-        DynamicTensorSpec(0, 0, (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32,
-                                 16, 8, 4, 2, 1), last_positive_power_of_2), ))
+        #        DynamicTensorSpec(0, 0, (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32,
+        DynamicTensorSpec(0, 0, (16384, 8192, 4096, 2048, 1024, 512, 256, 128,
+                                 64, 32, 16, 8, 4, 2,
+                                 1), last_positive_power_of_2), ))
 
     # NOTE: qunant_mode equals 0 it means we use scale only (FINEGRAINED_SCALE_ONLY), zeros is not used, else we use scale and zero point
     quant_mode = 1 if has_zero_point else 0
@@ -1584,7 +1590,8 @@ def fp8_block_scaling_gemm(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
-    tune_max_num_tokens: int = 4096,
+    #    tune_max_num_tokens: int = 4096,
+    tune_max_num_tokens: int = 16384,
 ) -> torch.Tensor:
     tuner = AutoTuner.get()
     fp8_block_scaling_gemm_runner = Fp8BlockScalingGemmRunner()
@@ -1660,9 +1667,13 @@ class AllReduceRunner(TunableRunner):
     _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
     _prealloc_done: ClassVar[set] = set()
     tuning_config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-            last_positive_power_of_2), ),
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                #            0, 0, get_last_power_of_2_num_tokens_buckets(8192),
+                0,
+                0,
+                get_last_power_of_2_num_tokens_buckets(16384),
+                last_positive_power_of_2), ),
         constraint_specs=(ConstraintSpec(1, 0, lambda shapes: shapes[0][0]), ),
         distributed_tuning_strategy=DistributedTuningStrategy.MERGE,
     )
@@ -2038,7 +2049,8 @@ class QuantizeE4M3PerTensorRunner(TunableRunner):
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, -2, get_last_power_of_2_num_tokens_buckets,
             last_positive_power_of_2), ),
-        tune_max_num_tokens=8192,
+        #        tune_max_num_tokens=8192,
+        tune_max_num_tokens=16384,
     )
 
     # Lazy init for TE to avoid import errors if not installed
