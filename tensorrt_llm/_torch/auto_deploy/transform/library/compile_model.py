@@ -1,5 +1,6 @@
 from typing import List, Literal, Optional, Tuple, Type
 
+import torch
 import torch.nn as nn
 from pydantic import Field
 
@@ -109,13 +110,13 @@ class CompileModel(BaseTransform):
             max_seq = cm.info.max_seq_len
             max_batch = cm.info.max_batch_size
 
-            input_ids = []
+            seq_lens = []
             remaining = num_tokens - 1
-            while remaining > 0 and len(input_ids) < max_batch - 1:
+            while remaining > 0 and len(seq_lens) < max_batch - 1:
                 seq_len = min(remaining, max_seq)
-                input_ids.append([1] * seq_len)
+                seq_lens.append(seq_len)
                 remaining -= seq_len
-            input_ids.append([1])
+            seq_lens.append(1)  # One decode sequence.
 
             assert remaining == 0, (
                 f"Piecewise bucket {num_tokens} exceeds batch capacity "
@@ -123,7 +124,30 @@ class CompileModel(BaseTransform):
                 f"Increase max_seq_len or max_batch_size."
             )
 
-            cm.info.set_example_sequence(input_ids=input_ids)
+            cu_seqlen = torch.zeros(len(seq_lens) + 1, dtype=torch.int)
+            cu_seqlen[1:] = torch.cumsum(torch.tensor(seq_lens, dtype=torch.int), dim=0)
+
+            num_pages_per_seq = [
+                (seq_len + cm.info.tokens_per_block - 1) // cm.info.tokens_per_block
+                for seq_len in seq_lens
+            ]
+            cu_num_pages = torch.zeros(len(seq_lens) + 1, dtype=torch.int)
+            cu_num_pages[1:] = torch.cumsum(torch.tensor(num_pages_per_seq, dtype=torch.int), dim=0)
+
+            input_ids_flat = torch.ones(num_tokens, dtype=torch.int)
+            cache_loc = torch.arange(int(cu_num_pages[-1].item()), dtype=torch.int)
+            slot_idx = torch.arange(len(seq_lens), dtype=torch.int)
+            batch_info = [len(seq_lens) - 1, num_tokens - 1, 1]
+
+            cm.info.nest_sequences(
+                input_ids=input_ids_flat,
+                cu_seqlen=cu_seqlen,
+                input_pos=0,
+                batch_info=batch_info,
+                cache_loc=cache_loc,
+                cu_num_pages=cu_num_pages,
+                slot_idx=slot_idx,
+            )
             return (), cm.named_args
 
         extra_kwargs = {}
