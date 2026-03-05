@@ -19,14 +19,27 @@ Wraps TRT-LLM's ``thop.attention`` kernel with ``is_mla_enable=True`` for use in
 Auto-Deploy, following the same design pattern as the standard TRT-LLM attention
 backend (``trtllm_attention.py``).
 
-MLA stores compressed latent representations instead of separate K and V:
-- Prefill: expands compressed_kv via kv_b_proj_weight, builds full QKV,
-  computes attention via SDPA, and writes latent_cache to the paged KV cache.
-- Chunked prefill: when input_pos > 0, reads previously cached latent tokens
-  from the paged KV cache, combines with the current chunk's tokens, and runs
-  SDPA with an explicit bottom-right-aligned causal mask.
-- Decode: uses weight absorption (q_nope @ W_kn^T) to avoid expanding cached KV,
-  calls thop.attention in latent space, then projects output back via W_v.
+MLA stores compressed latent representations instead of separate K and V.
+
+Phase-specific details:
+
+- **Prefill** (``attention_input_type=context_only``):
+  Expands compressed KV via ``kv_b_proj_weight`` to get separate K_nope, V, then builds
+  ``Q = [q_nope | q_pe]``, ``K = [k_nope | k_pe]``. Each prefill sequence is processed
+  independently (matching the PyExecutor pattern) because with
+  ``use_paged_context_fmha=False`` the kernel treats all tokens as one sequence.
+  Calls ``thop.attention`` with ``is_fused_qkv=False`` and ``head_size=qk_head_dim``.
+  Output is directly in ``v_head_dim`` space.
+
+  **SDPA fallback**: When ``qk_nope_head_dim != v_head_dim`` (e.g. GLM-4.7-Flash), the
+  thop MLA context kernel internally computes ``headSizeV = qk_nope_head_dim`` causing
+  a fatal assertion. In this case prefill uses PyTorch SDPA instead.
+
+- **Decode** (``attention_input_type=generation_only``):
+  Uses weight absorption: ``q_absorbed = q_nope @ W_kn``, then
+  ``fused_q = [q_absorbed | q_pe]``. Calls ``thop.attention`` with
+  ``is_fused_qkv=True`` and ``head_size=gen_head_size``. Output is in latent space
+  and projected back to ``v_head_dim`` via ``W_v``.
 
 Cache layout:
     kv_cache: paged pool storing [compressed_kv | k_pe] per token
@@ -282,9 +295,10 @@ def _call_thop_attention_mla(
     k: Optional[torch.Tensor],
     v: Optional[torch.Tensor],
     output: torch.Tensor,
-    latent_cache: torch.Tensor,
+    latent_cache: Optional[torch.Tensor],
     q_pe: Optional[torch.Tensor],
     is_fused_qkv: bool,
+    attention_input_type: int,
     num_heads: int,
     num_kv_heads: int,
     head_size: int,
@@ -309,8 +323,20 @@ def _call_thop_attention_mla(
     cu_q_seqlens: Optional[torch.Tensor] = None,
     cu_kv_seqlens: Optional[torch.Tensor] = None,
     fmha_scheduler_counter: Optional[torch.Tensor] = None,
+    update_kv_cache: bool = True,
+    block_ids_per_seq: Optional[torch.Tensor] = None,
 ) -> None:
-    """Call thop.attention with MLA parameters enabled."""
+    """Call thop.attention with MLA parameters enabled.
+
+    Args:
+        attention_input_type: 1 = context_only (prefill), 2 = generation_only (decode).
+            MLA does not support mixed (0).
+        block_ids_per_seq: Override for the planner's block_ids_per_seq. If None,
+            uses _GlobalTrtllmMLAPlanner.block_ids_per_seq.
+    """
+    if block_ids_per_seq is None:
+        block_ids_per_seq = _GlobalTrtllmMLAPlanner.block_ids_per_seq
+
     rotary_embedding_scales = [1.0, 1.0, 1.0]
     rotary_embedding_max_position_info = [max_context_length, max_context_length]
     spec_decoding_bool_params = [False, False, False]
@@ -321,9 +347,6 @@ def _call_thop_attention_mla(
         spec_decoding_tensor_params.extend([None, None, None])
 
     mla_tensor_params = [None, None]
-
-    # MLA requires context_only (1) or generation_only (2), never mixed (0)
-    attention_input_type = 2 if is_fused_qkv else 1
 
     thop.attention(
         qkv_or_q,  # q / fused QKV
@@ -349,10 +372,10 @@ def _call_thop_attention_mla(
         None,  # rotary_cos_sin
         latent_cache,  # latent_cache (MLA)
         q_pe,  # q_pe (MLA generation)
-        _GlobalTrtllmMLAPlanner.block_ids_per_seq,  # block_ids_per_seq
+        block_ids_per_seq,  # block_ids_per_seq
         None,  # attention_sinks
         is_fused_qkv,  # is_fused_qkv
-        True,  # update_kv_cache
+        update_kv_cache,  # update_kv_cache
         1,  # predicted_tokens_per_seq
         0,  # layer_idx
         num_heads,  # num_heads
@@ -498,69 +521,196 @@ def _read_latent_cache_from_paged_kv(
 def _handle_prefill(
     q_nope_flat: torch.Tensor,
     q_pe_flat: torch.Tensor,
+    kv_b_proj_weight: torch.Tensor,
+    latent_cache: torch.Tensor,
+    num_tokens: int,
+    num_prefill: int,
+    num_heads: int,
+    num_kv_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    qk_head_dim: int,
+    v_head_dim: int,
+    kv_lora_rank: int,
+    gen_head_size: int,
+    tokens_per_block: int,
+    max_num_requests: int,
+    max_context_length: int,
+    scale: float,
+    quant_mode: int,
+    sequence_length: torch.Tensor,
+    context_lengths: torch.Tensor,
+    host_past_kv_lengths: torch.Tensor,
+    host_context_lengths: torch.Tensor,
+    host_request_types: torch.Tensor,
+    host_total_kv_lens: torch.Tensor,
+    kv_cache_block_offsets: torch.Tensor,
+    host_kv_cache_pool_pointers: torch.Tensor,
+    host_kv_cache_pool_mapping: torch.Tensor,
+) -> torch.Tensor:
+    """Handle prefill: expand compressed KV + thop.attention with separate Q, K, V.
+
+    On SM < 100, the thop kernel requires is_fused_qkv=False for context_only MLA,
+    meaning Q, K, V must be provided as separate expanded tensors (no weight absorption).
+
+    With use_paged_context_fmha=False (required for MLA on SM90), the kernel treats all
+    provided Q/K/V tokens as a single sequence when there is only one context request.
+    For multi-batch prefill the caller must either loop per-sequence or provide
+    cu_q_seqlens / cu_kv_seqlens.
+
+    The output is directly in v_head_dim space — no W_v projection is needed.
+    """
+    dtype = q_nope_flat.dtype
+    device = q_nope_flat.device
+
+    # Build Q = [q_nope | q_pe] -> [num_tokens, num_heads * qk_head_dim]
+    q = torch.empty(num_tokens, num_heads, qk_head_dim, dtype=dtype, device=device)
+    q[:, :, :qk_nope_head_dim] = q_nope_flat
+    q[:, :, qk_nope_head_dim:] = q_pe_flat
+    q = q.view(num_tokens, num_heads * qk_head_dim)
+
+    # Expand compressed_kv via kv_b_proj_weight to get per-head k_nope and v.
+    # The weight rows are grouped per-head: each head's (qk_nope_head_dim + v_head_dim)
+    # rows are contiguous.  We must reshape to per-head FIRST, then split, to match
+    # the reference torch_mla which does view(B, S, N, kv_head_dim) then split(dim=-1).
+    compressed_kv = latent_cache[:, :kv_lora_rank]
+    k_pe = latent_cache[:, kv_lora_rank:]
+
+    kv = torch.nn.functional.linear(compressed_kv, kv_b_proj_weight)
+    kv = kv.view(num_tokens, num_heads, qk_nope_head_dim + v_head_dim)
+    k_nope = kv[:, :, :qk_nope_head_dim]
+    v = kv[:, :, qk_nope_head_dim:].contiguous().view(num_tokens, num_heads * v_head_dim)
+
+    k = torch.empty(num_tokens, num_heads, qk_head_dim, dtype=dtype, device=device)
+    k[:, :, :qk_nope_head_dim] = k_nope
+    k[:, :, qk_nope_head_dim:] = k_pe.view(num_tokens, 1, qk_rope_head_dim)
+    k = k.view(num_tokens, num_heads * qk_head_dim)
+
+    output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
+
+    planner = _GlobalTrtllmMLAPlanner
+
+    if num_prefill <= 1:
+        _call_thop_attention_mla(
+            q,
+            k,
+            v,
+            output,
+            None,
+            None,
+            False,
+            1,
+            num_heads,
+            num_heads,
+            qk_head_dim,
+            tokens_per_block,
+            max_num_requests,
+            max_context_length,
+            1.0,
+            quant_mode,
+            kv_lora_rank,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim,
+            sequence_length,
+            context_lengths,
+            host_past_kv_lengths,
+            host_context_lengths,
+            host_request_types,
+            host_total_kv_lens,
+            kv_cache_block_offsets,
+            host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping,
+        )
+    else:
+        # Multiple prefill sequences: process each independently.
+        # With use_paged_context_fmha=False the kernel treats all tokens as one
+        # sequence, so we must call per-sequence to avoid cross-sequence attention.
+        torch.cuda.synchronize()
+        token_offset = 0
+        for seq_idx in range(num_prefill):
+            seq_len = int(host_context_lengths[seq_idx])
+            seq_kv_len = int(sequence_length[seq_idx])
+            t_end = token_offset + seq_len
+
+            seq_host_total_kv_lens = torch.zeros(
+                2, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            seq_host_total_kv_lens[0] = seq_kv_len
+
+            seq_block_ids = planner.block_ids_per_seq[seq_idx : seq_idx + 1].contiguous()
+            seq_block_offsets = kv_cache_block_offsets[:, seq_idx : seq_idx + 1].contiguous()
+
+            seq_output = torch.empty(seq_len, num_heads * v_head_dim, dtype=dtype, device=device)
+
+            _call_thop_attention_mla(
+                q[token_offset:t_end].contiguous(),
+                k[token_offset:t_end].contiguous(),
+                v[token_offset:t_end].contiguous(),
+                seq_output,
+                None,
+                None,
+                False,
+                1,
+                num_heads,
+                num_heads,
+                qk_head_dim,
+                tokens_per_block,
+                1,
+                seq_kv_len,
+                1.0,
+                quant_mode,
+                kv_lora_rank,
+                qk_nope_head_dim,
+                qk_rope_head_dim,
+                v_head_dim,
+                sequence_length[seq_idx : seq_idx + 1].contiguous(),
+                context_lengths[seq_idx : seq_idx + 1].contiguous(),
+                host_past_kv_lengths[seq_idx : seq_idx + 1].contiguous(),
+                host_context_lengths[seq_idx : seq_idx + 1].contiguous(),
+                host_request_types[seq_idx : seq_idx + 1].contiguous(),
+                seq_host_total_kv_lens,
+                seq_block_offsets,
+                host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping,
+                block_ids_per_seq=seq_block_ids,
+            )
+            output[token_offset:t_end] = seq_output
+            token_offset = t_end
+
+    return output
+
+
+def _handle_chunked_prefill(
+    q_nope_flat: torch.Tensor,
+    q_pe_flat: torch.Tensor,
     compressed_kv_flat: torch.Tensor,
     kpe_flat: torch.Tensor,
     kv_b_proj_weight: torch.Tensor,
     num_heads: int,
     qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
     v_head_dim: int,
+    kv_lora_rank: int,
     scale: float,
-    seq_lens: torch.Tensor,
+    seq_len_host: torch.Tensor,
     input_pos_host: torch.Tensor,
-    kv_cache: Optional[torch.Tensor] = None,
-    kv_cache_block_offsets: Optional[torch.Tensor] = None,
-    tokens_per_block: int = 0,
-    kv_lora_rank: int = 0,
-    num_prefill: int = 0,
+    kv_cache: torch.Tensor,
+    kv_cache_block_offsets: torch.Tensor,
+    tokens_per_block: int,
+    num_prefill: int,
 ) -> torch.Tensor:
-    """Handle prefill: expand compressed_kv, compute attention via SDPA.
+    """Handle chunked prefill via SDPA with cached latent tokens.
 
-    For regular prefill (input_pos == 0), Q and K/V are the same tokens with
-    a standard causal mask.  When all sequences share the same length, the
-    matmul and SDPA are batched into single calls for efficiency.
-
-    For chunked prefill (input_pos > 0), previously cached latent tokens are
-    read from the paged KV cache, combined with the current chunk, and SDPA
-    uses a bottom-right-aligned causal mask.
+    When input_pos > 0, reads previously cached latent tokens from the paged
+    KV cache, combines with the current chunk, and runs SDPA with a
+    bottom-right-aligned causal mask.
     """
-    seq_lens_list = seq_lens.tolist()
-    input_pos_list = input_pos_host[:num_prefill].tolist()
-
-    is_chunked = any(p > 0 for p in input_pos_list)
-    all_same_len = len(set(seq_lens_list)) == 1
-
-    # Fast path: non-chunked prefill with uniform sequence lengths.
-    # ONE matmul + ONE batched SDPA instead of num_prefill separate calls.
-    if not is_chunked and all_same_len and num_prefill > 0:
-        slen = int(seq_lens_list[0])
-        num_tokens = q_nope_flat.shape[0]
-
-        kv_expanded = torch.matmul(compressed_kv_flat, kv_b_proj_weight.t())
-        kv_expanded = kv_expanded.view(num_tokens, num_heads, qk_nope_head_dim + v_head_dim)
-        k_nope = kv_expanded[:, :, :qk_nope_head_dim]
-        v_states = kv_expanded[:, :, qk_nope_head_dim:]
-
-        kpe_expanded = kpe_flat.unsqueeze(1).expand(-1, num_heads, -1)
-        k_full = torch.cat([k_nope, kpe_expanded], dim=-1)
-        q_full = torch.cat([q_nope_flat, q_pe_flat], dim=-1)
-
-        # [batch, num_heads, seq_len, head_dim]
-        q_s = q_full.view(num_prefill, slen, num_heads, -1).transpose(1, 2)
-        k_s = k_full.view(num_prefill, slen, num_heads, -1).transpose(1, 2).contiguous()
-        v_s = v_states.view(num_prefill, slen, num_heads, v_head_dim).transpose(1, 2).contiguous()
-
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q_s,
-            k_s,
-            v_s,
-            is_causal=True,
-            scale=scale,
-        )
-        return out.transpose(1, 2).reshape(num_tokens, num_heads * v_head_dim).contiguous()
-
-    # General path: handles chunked prefill and variable-length sequences.
     outputs = []
     q_offset = 0
+    seq_lens_list = seq_len_host[:num_prefill].tolist()
+    input_pos_list = input_pos_host[:num_prefill].tolist()
+
     for seq_idx, slen in enumerate(seq_lens_list):
         slen = int(slen)
         input_pos = int(input_pos_list[seq_idx])
@@ -569,37 +719,33 @@ def _handle_prefill(
         ckv_seq = compressed_kv_flat[q_offset : q_offset + slen]
         kpe_seq = kpe_flat[q_offset : q_offset + slen]
 
-        if input_pos > 0 and kv_cache is not None:
+        if input_pos > 0:
             cached_latent = _read_latent_cache_from_paged_kv(
-                kv_cache, kv_cache_block_offsets, seq_idx, input_pos, tokens_per_block
+                kv_cache,
+                kv_cache_block_offsets,
+                seq_idx,
+                input_pos,
+                tokens_per_block,
             )
-            cached_ckv = cached_latent[:, :kv_lora_rank]
-            cached_kpe = cached_latent[:, kv_lora_rank:]
-            all_ckv = torch.cat([cached_ckv, ckv_seq], dim=0)
-            all_kpe = torch.cat([cached_kpe, kpe_seq], dim=0)
-        else:
-            all_ckv = ckv_seq
-            all_kpe = kpe_seq
+            ckv_seq = torch.cat([cached_latent[:, :kv_lora_rank], ckv_seq], dim=0)
+            kpe_seq = torch.cat([cached_latent[:, kv_lora_rank:], kpe_seq], dim=0)
 
-        kv_len = all_ckv.shape[0]
-
-        kv_expanded = torch.matmul(all_ckv, kv_b_proj_weight.t())
-        kv_expanded = kv_expanded.view(kv_len, num_heads, qk_nope_head_dim + v_head_dim)
+        kv_expanded = torch.matmul(ckv_seq, kv_b_proj_weight.t())
+        kv_expanded = kv_expanded.view(-1, num_heads, qk_nope_head_dim + v_head_dim)
         k_nope = kv_expanded[:, :, :qk_nope_head_dim]
         v_states = kv_expanded[:, :, qk_nope_head_dim:]
 
-        kpe_expanded = all_kpe.unsqueeze(1).expand(-1, num_heads, -1)
+        kpe_expanded = kpe_seq.unsqueeze(1).expand(-1, num_heads, -1)
         k_full = torch.cat([k_nope, kpe_expanded], dim=-1)
-
         q_full = torch.cat([q_nope_seq, q_pe_seq], dim=-1)
 
-        # [1, num_heads, seq_len, head_dim] for SDPA
+        total_kv = k_full.shape[0]
         q_s = q_full.unsqueeze(0).transpose(1, 2)
         k_s = k_full.unsqueeze(0).transpose(1, 2).contiguous()
         v_s = v_states.unsqueeze(0).transpose(1, 2).contiguous()
 
         if input_pos == 0:
-            out_seq = torch.nn.functional.scaled_dot_product_attention(
+            out = torch.nn.functional.scaled_dot_product_attention(
                 q_s,
                 k_s,
                 v_s,
@@ -607,19 +753,24 @@ def _handle_prefill(
                 scale=scale,
             )
         else:
-            q_positions = torch.arange(input_pos, input_pos + slen, device=q_nope_flat.device)
-            k_positions = torch.arange(kv_len, device=q_nope_flat.device)
-            attn_mask = q_positions.unsqueeze(-1) >= k_positions.unsqueeze(0)
-            out_seq = torch.nn.functional.scaled_dot_product_attention(
+            attn_mask = torch.full(
+                (slen, total_kv),
+                float("-inf"),
+                device=q_nope_flat.device,
+                dtype=q_nope_flat.dtype,
+            )
+            for qi in range(slen):
+                kv_end = input_pos + qi + 1
+                attn_mask[qi, :kv_end] = 0.0
+            out = torch.nn.functional.scaled_dot_product_attention(
                 q_s,
                 k_s,
                 v_s,
                 attn_mask=attn_mask.unsqueeze(0).unsqueeze(0),
                 scale=scale,
             )
-        out_seq = out_seq.transpose(1, 2).squeeze(0)
 
-        outputs.append(out_seq.reshape(slen, num_heads * v_head_dim))
+        outputs.append(out.transpose(1, 2).reshape(slen, num_heads * v_head_dim))
         q_offset += slen
 
     return torch.cat(outputs, dim=0).contiguous()
@@ -730,6 +881,7 @@ def _handle_decode(
         latent_cache,
         q_pe_flat,
         True,
+        2,  # attention_input_type = generation_only
         num_heads,
         num_kv_heads,
         head_size,
@@ -792,12 +944,12 @@ def trtllm_mla_with_cache(
 ) -> torch.Tensor:
     """TRT-LLM MLA attention with paged latent cache for Auto-Deploy.
 
-    Prefill: expands compressed_kv to full K, V, computes attention via PyTorch SDPA,
-    and writes the latent cache into the paged KV cache.
+    Prefill: expands compressed KV to separate Q, K, V and calls thop.attention with
+    is_fused_qkv=False and attention_input_type=context_only.
 
-    Decode: uses weight absorption (q_nope @ W_kn^T) to build fused_q in latent space,
-    calls thop.attention which reads from the paged latent cache, then projects output
-    back to v_head_dim using W_v.
+    Decode: uses weight absorption (q_absorbed = q_nope @ W_kn) and calls thop.attention
+    with is_fused_qkv=True and attention_input_type=generation_only, then projects output
+    from latent space back to v_head_dim via W_v.
     """
     b, s = q_nope.shape[:2]
     num_heads = q_nope.shape[2]
@@ -887,7 +1039,7 @@ def trtllm_mla_with_cache(
     #   q_scaling = 1 / (scale * sqrt(qk_head_dim))
     thop_q_scaling = 1.0 / (scale * math.sqrt(qk_head_dim))
 
-    def _make_decode_shared():
+    def _make_shared_metadata():
         return (
             num_heads,
             num_kv_heads,
@@ -913,11 +1065,49 @@ def trtllm_mla_with_cache(
             host_kv_cache_pool_mapping,
         )
 
-    prefill_seq_lens = seq_len_host[:num_prefill]
+    is_chunked = num_prefill > 0 and any(input_pos_host[i] > 0 for i in range(num_prefill))
 
-    def _run_prefill(q_nope_sl, q_pe_sl, ckv_sl, kpe_sl, lc_sl):
+    # The thop.attention MLA context kernel internally uses qk_nope_head_dim as
+    # headSizeV. When qk_nope_head_dim != v_head_dim the kernel searches for an
+    # FMHA kernel with wrong DV and hits a fatal C++ assertion. Fall back to
+    # SDPA for these models (e.g. GLM-4.7-Flash: qk_nope=192, v=256).
+    use_sdpa_for_prefill = is_chunked or (qk_nope_head_dim != v_head_dim)
+
+    def _do_prefill(q_n, q_p, lc, n_tok, n_pf):
+        """Dispatch prefill: thop.attention or SDPA for unsupported configs."""
+        if use_sdpa_for_prefill:
+            return _handle_chunked_prefill(
+                q_n,
+                q_p,
+                compressed_kv_flat[:n_tok],
+                kpe_flat[:n_tok],
+                kv_b_proj_weight,
+                num_heads,
+                qk_nope_head_dim,
+                qk_rope_head_dim,
+                v_head_dim,
+                kv_lora_rank,
+                scale,
+                seq_len_host,
+                input_pos_host,
+                kv_cache,
+                kv_cache_block_offsets,
+                tokens_per_block,
+                n_pf,
+            )
+        return _handle_prefill(
+            q_n,
+            q_p,
+            kv_b_proj_weight,
+            lc,
+            n_tok,
+            n_pf,
+            *_make_shared_metadata(),
+        )
+
+    if num_prefill > 0 and num_decode > 0:
         _write_latent_cache_to_paged_kv(
-            lc_sl,
+            latent_cache[:num_prefill_tokens],
             kv_cache,
             kv_cache_block_offsets,
             seq_len_host,
@@ -925,39 +1115,18 @@ def trtllm_mla_with_cache(
             num_prefill,
             tokens_per_block,
         )
-        y_prefill = _handle_prefill(
-            q_nope_sl,
-            q_pe_sl,
-            ckv_sl,
-            kpe_sl,
-            kv_b_proj_weight,
-            num_heads,
-            qk_nope_head_dim,
-            v_head_dim,
-            scale,
-            prefill_seq_lens,
-            input_pos_host,
-            kv_cache=kv_cache,
-            kv_cache_block_offsets=kv_cache_block_offsets,
-            tokens_per_block=tokens_per_block,
-            kv_lora_rank=kv_lora_rank,
-            num_prefill=num_prefill,
-        )
-        return y_prefill
-
-    if num_prefill > 0 and num_decode > 0:
         y = torch.empty(
             num_tokens,
             num_heads * v_head_dim,
             dtype=q_nope_flat.dtype,
             device=q_nope_flat.device,
         )
-        y[:num_prefill_tokens] = _run_prefill(
+        y[:num_prefill_tokens] = _do_prefill(
             q_nope_flat[:num_prefill_tokens],
             q_pe_flat[:num_prefill_tokens],
-            compressed_kv_flat[:num_prefill_tokens],
-            kpe_flat[:num_prefill_tokens],
             latent_cache[:num_prefill_tokens],
+            num_prefill_tokens,
+            num_prefill,
         )
         _write_decode_latent_to_cache(
             latent_cache[num_prefill_tokens:num_tokens],
@@ -976,15 +1145,24 @@ def trtllm_mla_with_cache(
             kv_cache,
             num_decode,
             num_prefill,
-            *_make_decode_shared(),
+            *_make_shared_metadata(),
         )
     elif num_prefill > 0:
-        y = _run_prefill(
+        _write_latent_cache_to_paged_kv(
+            latent_cache,
+            kv_cache,
+            kv_cache_block_offsets,
+            seq_len_host,
+            input_pos_host,
+            num_prefill,
+            tokens_per_block,
+        )
+        y = _do_prefill(
             q_nope_flat,
             q_pe_flat,
-            compressed_kv_flat,
-            kpe_flat,
             latent_cache,
+            num_prefill_tokens,
+            num_prefill,
         )
     else:
         _write_decode_latent_to_cache(
@@ -1004,7 +1182,7 @@ def trtllm_mla_with_cache(
             kv_cache,
             num_tokens,
             0,
-            *_make_decode_shared(),
+            *_make_shared_metadata(),
         )
 
     return y.view(b, s, num_heads, v_head_dim)
