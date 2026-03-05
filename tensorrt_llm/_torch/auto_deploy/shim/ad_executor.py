@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -447,7 +447,7 @@ class ADEngine(ModelEngine):
         )
 
         reporting_info = ReportingInfo(
-            print_log=False,
+            print_log=ad_config.print_iter_log,
             enable_iter_perf_stats=ad_config.enable_iter_perf_stats,
             enable_iter_req_stats=ad_config.enable_iter_req_stats,
         )

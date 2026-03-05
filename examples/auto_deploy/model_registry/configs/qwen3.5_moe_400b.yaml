@@ -28,3 +28,7 @@ transforms:
   multi_stream_deltanet:
     stage: compile
     enabled: false
+
+#enable_iter_perf_stats: true
+#enable_iter_req_stats: true
+#print_iter_log: true

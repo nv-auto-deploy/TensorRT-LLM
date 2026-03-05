@@ -793,15 +793,6 @@ class PyExecutor:
         enabled = False
         start_time = None
 
-        # These events are used to record the time of the previous batch.
-        # We need two set of the start-end events to record the time through
-        # a ping-pong way so that it works with overlap scheduler.
-        start_event_1 = None
-        end_event_1 = torch.cuda.Event(enable_timing=True)
-        start_event_2 = None
-        end_event_2 = torch.cuda.Event(enable_timing=True)
-        prev_device_step_time = None
-
         torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
         profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME,
                                             None)
@@ -826,7 +817,7 @@ class PyExecutor:
         calibrator = get_calibrator()
 
         def profile_step():
-            nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
+            nonlocal it, enabled, start_time
             calibrator.post_step(it)
             if it in self.profile_stop_iters and not self.is_warmup:
                 assert enabled, "Inconsistent CUDA profiling state"
@@ -840,38 +831,30 @@ class PyExecutor:
                 enabled = False
 
             if start_time is not None and self.print_log and self.dist.rank == 0:
-                end_time = time.time()
-                if it % 2 == 0:
-                    end_event_1.record()
-                    if start_event_2 is not None:
-                        end_event_2.synchronize()
-                        prev_device_step_time = start_event_2.elapsed_time(
-                            end_event_2)
-                else:
-                    end_event_2.record()
-                    if start_event_1 is not None:
-                        end_event_1.synchronize()
-                        prev_device_step_time = start_event_1.elapsed_time(
-                            end_event_1)
+                num_ctx_requests = self.model_engine.iter_states.get(
+                    "num_ctx_requests", 0)
+                num_decoding_req = self.model_engine.iter_states.get(
+                    "num_generation_tokens", 0)
+                num_prefill_tokens = self.model_engine.iter_states.get(
+                    "num_ctx_tokens", 0)
 
-                if prev_device_step_time is None:
-                    prev_device_step_time = "N/A"  # Handle first iteration
+                if num_ctx_requests > 0 and num_decoding_req > 0:
+                    batch_kind = "mixed"
+                elif num_ctx_requests > 0:
+                    batch_kind = "prefill"
+                elif num_decoding_req > 0:
+                    batch_kind = "decode_only"
                 else:
-                    prev_device_step_time = f"{prev_device_step_time}ms"
-                host_step_time = (end_time - start_time) * 1000  # milliseconds
-                formatted_timestamp = datetime.datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S")
-                logger.info(
-                    f"iter = {self.iter_counter}, "
-                    f"global_rank = {self.global_rank}, "
-                    f"rank = {self.dist.rank}, "
-                    f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
-                    f"{self.num_fetch_requests}, "
-                    f"host_step_time = {host_step_time}ms, "
-                    f"prev_device_step_time = {prev_device_step_time}, "
-                    f"timestamp = {formatted_timestamp}, "
-                    f"num_scheduled_requests: {self.num_scheduled_requests}, "
-                    f"states = {self.model_engine.iter_states}")
+                    batch_kind = None
+
+                if batch_kind is not None:
+                    logger.info(
+                        f"iter = {self.iter_counter}, "
+                        f"rank = {self.dist.rank}, "
+                        f"batch_kind = {batch_kind}, "
+                        f"num_prefill_req = {num_ctx_requests}, "
+                        f"num_decoding_req = {num_decoding_req}, "
+                        f"num_prefill_tokens = {num_prefill_tokens}")
 
             it += 1
 
@@ -885,14 +868,6 @@ class PyExecutor:
                 enabled = True
             calibrator.pre_step(it)
             start_time = time.time()
-            if it % 2 == 0:
-                if start_event_1 is None:
-                    start_event_1 = torch.cuda.Event(enable_timing=True)
-                start_event_1.record()
-            else:
-                if start_event_2 is None:
-                    start_event_2 = torch.cuda.Event(enable_timing=True)
-                start_event_2.record()
 
         try:
             yield profile_step
