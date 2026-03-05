@@ -28,6 +28,19 @@ from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.mapping import Mapping
 
 
+def _compute_tune_max_num_tokens(max_num_tokens: int, num_local_experts: int, top_k: int) -> int:
+    """Derive tune_max_num_tokens from the model config.
+
+    Mirrors the logic in CutlassFusedMoE: cap at
+    min(max_num_tokens, 16384 * num_local_experts // top_k) so that the
+    autotuner profiles buckets covering the actual runtime token counts.
+    Falls back to the default (8192) when max_num_tokens is not set.
+    """
+    if max_num_tokens <= 0:
+        return 8192
+    return min(max_num_tokens, 16384 * num_local_experts // top_k)
+
+
 def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mapping | None, bool]:
     """Check if MoE all-to-all mode should be used and validate parameters.
 
@@ -59,6 +72,7 @@ def _run_moe_with_alltoall(
     fc1_expert_biases: torch.Tensor | None = None,
     fc2_expert_biases: torch.Tensor | None = None,
     nvfp4_act_global_scale: torch.Tensor | None = None,
+    tune_max_num_tokens: int = 8192,
 ) -> torch.Tensor:
     """
     Execute MoE with all-to-all dispatch/combine pattern.
@@ -186,6 +200,7 @@ def _run_moe_with_alltoall(
         enable_alltoall=True,
         tuner_num_tokens=dispatched_x.shape[0],
         tuner_top_k=top_k,
+        tune_max_num_tokens=tune_max_num_tokens,
         activation_type=activation_type,
         use_deepseek_fp8_block_scale=False,
         use_w4_group_scaling=False,
@@ -247,6 +262,10 @@ def trtllm_moe_fused(
 
     mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
 
+    num_local_experts = w3_w1_stacked_weight.shape[0]
+    top_k = selected_experts.shape[1]
+    tune_max_num_tokens = _compute_tune_max_num_tokens(max_num_tokens, num_local_experts, top_k)
+
     if enable_alltoall:
         return _run_moe_with_alltoall(
             x=x,
@@ -259,6 +278,7 @@ def trtllm_moe_fused(
             activation_type=activation_type,
             mapping=mapping,
             max_num_tokens=max_num_tokens,
+            tune_max_num_tokens=tune_max_num_tokens,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
@@ -274,6 +294,7 @@ def trtllm_moe_fused(
         output_dtype=x.dtype,
         quant_scales=quant_scales,
         activation_type=activation_type,
+        tune_max_num_tokens=tune_max_num_tokens,
     )[0].view(x_shape)
 
 
@@ -383,6 +404,10 @@ def trtllm_quant_fp8_moe_fused(
 
     mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
 
+    num_local_experts = fc1_expert_weights.shape[0]
+    top_k = selected_experts.shape[1]
+    tune_max_num_tokens = _compute_tune_max_num_tokens(max_num_tokens, num_local_experts, top_k)
+
     if enable_alltoall:
         return _run_moe_with_alltoall(
             x=x_q_fp8,
@@ -395,6 +420,7 @@ def trtllm_quant_fp8_moe_fused(
             activation_type=act_fn,
             mapping=mapping,
             max_num_tokens=max_num_tokens,
+            tune_max_num_tokens=tune_max_num_tokens,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
@@ -410,6 +436,7 @@ def trtllm_quant_fp8_moe_fused(
         output_dtype=x.dtype,
         quant_scales=quant_scales,
         activation_type=act_fn,
+        tune_max_num_tokens=tune_max_num_tokens,
     )
 
     # Restore original shape
@@ -508,6 +535,10 @@ def trtllm_quant_nvfp4_moe_fused(
 
     mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
 
+    num_local_experts = fc1_expert_weights_fp4.shape[0]
+    top_k = selected_experts.shape[1]
+    tune_max_num_tokens = _compute_tune_max_num_tokens(max_num_tokens, num_local_experts, top_k)
+
     if enable_alltoall:
         # Dispatch bf16 input (not FP4-quantized) to avoid padding issues with packed
         # FP4 tensors and blockscales. Per-rank FP4 quantisation happens inside
@@ -524,6 +555,7 @@ def trtllm_quant_nvfp4_moe_fused(
             mapping=mapping,
             max_num_tokens=max_num_tokens,
             nvfp4_act_global_scale=fc1_act_global_scale,
+            tune_max_num_tokens=tune_max_num_tokens,
         ).view(x.shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
@@ -549,6 +581,7 @@ def trtllm_quant_nvfp4_moe_fused(
         quant_scales=quant_scales,
         input_sf=input_blockscale,
         activation_type=act_fn,
+        tune_max_num_tokens=tune_max_num_tokens,
     )[0].view(x.shape)
 
 
@@ -696,6 +729,10 @@ def trtllm_quant_finegrained_fp8_moe_fused(
         fc2_weight_scale_f32 = fc2_weight_scale.to(torch.float32).contiguous()
         quant_scales = (fc1_weight_scale_f32, fc2_weight_scale_f32)
 
+        num_local_experts = fc1_expert_weights.shape[0]
+        top_k = selected_experts.shape[1]
+        tune_max = _compute_tune_max_num_tokens(max_num_tokens, num_local_experts, top_k)
+
         # Call fused_moe with DeepSeek FP8 block scale mode
         output = torch.ops.trtllm.fused_moe(
             x2d,
@@ -709,6 +746,7 @@ def trtllm_quant_finegrained_fp8_moe_fused(
             quant_scales=quant_scales,
             activation_type=act_fn,
             use_deepseek_fp8_block_scale=True,
+            tune_max_num_tokens=tune_max,
         )
 
         # Restore original shape
