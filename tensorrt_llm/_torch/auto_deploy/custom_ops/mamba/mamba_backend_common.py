@@ -387,7 +387,7 @@ class BaseBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig
+        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
     ) -> ResourceHandlerDict:
         # Shapes from fake tensors
         hs_fake: torch.Tensor = source_attn_node.args[0].meta["val"]

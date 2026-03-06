@@ -165,5 +165,5 @@ class CudaBackendCausalConv(BaseCausalConvDescriptor):
     """
 
     @classmethod
-    def get_cached_attention_op(cls) -> MHACallable:
+    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
         return cuda_cached_causal_conv1d_wrapper

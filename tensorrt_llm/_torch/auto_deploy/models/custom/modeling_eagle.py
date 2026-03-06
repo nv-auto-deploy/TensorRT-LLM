@@ -36,7 +36,6 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
 
-from ....pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ...shim.interface import CachedSequenceInterface
 from ...utils._config import deep_merge_dicts
 from ...utils.logger import ad_logger
@@ -973,21 +972,6 @@ class EagleWrapper(nn.Module):
             new_tokens_lens = torch.ones(num_sequences, dtype=torch.int32, device=device)
             if num_extend > 0:
                 new_tokens_lens[num_prefill:] = new_tokens_lens_extend
-
-        # MTP-analogous state promotion: commit accepted intermediate mamba states to base state
-        # immediately after verification acceptance and before subsequent metadata/draft processing.
-        # TODO(autodeploy): Move this out of model.forward() and into ADEngine orchestration.
-        kv_cache_manager = csi.kv_cache_manager
-        if num_extend > 0:
-            is_mamba_hybrid = isinstance(kv_cache_manager, MambaHybridCacheManager)
-            manager_is_speculative = kv_cache_manager.is_speculative() if is_mamba_hybrid else None
-
-            if is_mamba_hybrid and manager_is_speculative:
-                kv_cache_manager.update_mamba_states(
-                    num_prefill,
-                    num_extend,
-                    new_tokens_lens,
-                )
 
         # compute the cache and position offset based on the number of new tokens compared to the
         # maximum draft length. NOTE: cache is currently at the position corresponding to the last

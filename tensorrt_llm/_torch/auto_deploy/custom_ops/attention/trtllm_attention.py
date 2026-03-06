@@ -554,7 +554,7 @@ class TrtllmAttention(AttentionDescriptor):
         return torch.ops.auto_deploy.torch_attention
 
     @classmethod
-    def get_cached_attention_op(cls) -> MHACallable:
+    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
         """Get the cached attention op."""
         return torch.ops.auto_deploy.trtllm_attention_mha_with_cache.default
 
@@ -569,7 +569,7 @@ class TrtllmAttention(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig
+        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
     ) -> ResourceHandlerDict:
         """Return only KV cache handler (no workspace handler, managed like flashinfer)."""
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]

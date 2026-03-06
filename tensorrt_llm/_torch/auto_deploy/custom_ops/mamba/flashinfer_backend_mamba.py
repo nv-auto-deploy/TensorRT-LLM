@@ -191,12 +191,12 @@ FLASHINFER_SUPPORTED_HEAD_DIMS = [64, 128]
 @AttentionRegistry.register("flashinfer_ssm")
 class FlashinferBackendSSM(BaseBackendSSM):
     @classmethod
-    def get_cached_attention_op(cls) -> MHACallable:
+    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
         return torch.ops.auto_deploy.flashinfer_cached_ssm.default
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig
+        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
     ) -> ResourceHandlerDict:
         ret = super().get_cache_initializers(source_attn_node, cache_config)
 
