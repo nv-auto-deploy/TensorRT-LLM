@@ -730,12 +730,31 @@ class ADEngine(ModelEngine):
         self.iter_states["num_generation_tokens"] = num_decode_tokens + num_extend_tokens
         self.iter_states["ordered_requests"] = ordered_requests
 
+    def update_mamba_states(self, model_output: Dict[str, Optional[torch.Tensor]]) -> None:
+        """Update Mamba states based on model output."""
+        kv_cache_manager = self.cache_seq_interface.kv_cache_manager
+        num_prefill, num_extend, num_decode = (
+            self.cache_seq_interface.info.batch_info.get_num_sequences()
+        )
+        num_accepted = model_output.get("new_tokens_lens", None)
+        if num_extend > 0 and isinstance(kv_cache_manager, MambaHybridCacheManager):
+            assert kv_cache_manager.is_speculative(), (
+                "if num_extend > 0, kv_cache_manager must be speculative"
+            )
+            assert num_decode == 0, "if num_extend > 0, num_decode must be 0"
+            kv_cache_manager.update_mamba_states(num_prefill, num_extend, num_accepted)
+
     @nvtx_range("ad_run_forward")
     def _run_forward(self) -> Dict[str, Optional[torch.Tensor]]:
         """Run model forward and return outputs."""
         # TODO (lucaslie): revisit this logic as part of spec dec cudagraph support...
         if getattr(self.model, "_requires_csi", False):
             model_output = self.model(cache_seq_interface=self.cache_seq_interface)
+
+            # MTP state promotion: commit accepted intermediate mamba states to base state
+            # The target model forward includes speculative tokens, some of which it rejects.
+            # We need to promote the intermediate mamba state that results from the accepted tokens alone.
+            self.update_mamba_states(model_output)
         else:
             model_output = self.model(**self.cache_seq_interface.named_args)
 

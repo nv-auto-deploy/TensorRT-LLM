@@ -500,7 +500,7 @@ class TorchBackendMLAAttention(AttentionDescriptor):
         return torch.ops.auto_deploy.torch_mla
 
     @classmethod
-    def get_cached_attention_op(cls) -> MHACallable:
+    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
         """Get the cached attention op."""
         return torch.ops.auto_deploy.torch_cached_mla_with_cache.default
 
@@ -511,7 +511,7 @@ class TorchBackendMLAAttention(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig
+        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
     ) -> ResourceHandlerDict:
         """Get cache initializers using FlashInfer MLA cache layout."""
         # Extract dimensions from source node args

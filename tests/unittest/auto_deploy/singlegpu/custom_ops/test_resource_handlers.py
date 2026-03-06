@@ -12,9 +12,13 @@ import torch
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     AttentionDescriptor,
+    CausalConvResourceHandler,
     KVPagedResourceHandler,
     ResourceHandler,
     SequenceInfo,
+    SpecCausalConvResourceHandler,
+    SpecSSMResourceHandler,
+    SSMResourceHandler,
     StateResourceHandler,
     UnpagedResourceHandler,
 )
@@ -274,8 +278,6 @@ def test_kv_paged_handler_eq_different_head_dim_or_dtype():
 
 def test_ssm_handler_eq_same_params():
     """Verify SSMResourceHandler __eq__ for same parameters."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SSMResourceHandler
-
     h1 = SSMResourceHandler(num_heads=8, head_dim=64, d_state=16, dtype=torch.bfloat16)
     h2 = SSMResourceHandler(num_heads=8, head_dim=64, d_state=16, dtype=torch.bfloat16)
 
@@ -284,8 +286,6 @@ def test_ssm_handler_eq_same_params():
 
 def test_ssm_handler_eq_different_params():
     """Verify SSMResourceHandler __eq__ returns False for different parameters."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SSMResourceHandler
-
     h1 = SSMResourceHandler(num_heads=8, head_dim=64, d_state=16, dtype=torch.bfloat16)
     h2 = SSMResourceHandler(
         num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16
@@ -306,10 +306,6 @@ def test_ssm_handler_eq_different_params():
 
 def test_conv_handler_eq_same_params():
     """Verify CausalConvResourceHandler __eq__ for same parameters."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
-        CausalConvResourceHandler,
-    )
-
     h1 = CausalConvResourceHandler(conv_dim=256, d_conv=4, dtype=torch.float32)
     h2 = CausalConvResourceHandler(conv_dim=256, d_conv=4, dtype=torch.float32)
 
@@ -318,10 +314,6 @@ def test_conv_handler_eq_same_params():
 
 def test_conv_handler_eq_different_params():
     """Verify CausalConvResourceHandler __eq__ returns False for different parameters."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
-        CausalConvResourceHandler,
-    )
-
     h1 = CausalConvResourceHandler(conv_dim=256, d_conv=4, dtype=torch.float32)
     h2 = CausalConvResourceHandler(conv_dim=512, d_conv=4, dtype=torch.float32)  # diff conv_dim
     h3 = CausalConvResourceHandler(conv_dim=256, d_conv=5, dtype=torch.float32)  # diff d_conv
@@ -330,3 +322,38 @@ def test_conv_handler_eq_different_params():
     assert h1 != h2
     assert h1 != h3
     assert h1 != h4
+
+
+def test_spec_ssm_handler_shape_and_isinstance():
+    """Verify SpecSSMResourceHandler prepends cache_steps and is an SSMResourceHandler."""
+    base = SSMResourceHandler(num_heads=8, head_dim=64, d_state=16, dtype=torch.bfloat16)
+    spec = SpecSSMResourceHandler(
+        num_heads=8,
+        head_dim=64,
+        d_state=16,
+        dtype=torch.bfloat16,
+        cache_steps=4,
+    )
+
+    assert base.state_shape == (8, 64, 16)
+    assert spec.state_shape == (4, 8, 64, 16)
+    assert isinstance(spec, SSMResourceHandler)
+    assert not isinstance(base, SpecSSMResourceHandler)
+    assert base != spec
+
+
+def test_spec_conv_handler_shape_and_isinstance():
+    """Verify SpecCausalConvResourceHandler prepends cache_steps and is a CausalConvResourceHandler."""
+    base = CausalConvResourceHandler(conv_dim=256, d_conv=4, dtype=torch.float32)
+    spec = SpecCausalConvResourceHandler(
+        conv_dim=256,
+        d_conv=4,
+        dtype=torch.float32,
+        cache_steps=5,
+    )
+
+    assert base.state_shape == (256, 3)
+    assert spec.state_shape == (5, 256, 3)
+    assert isinstance(spec, CausalConvResourceHandler)
+    assert not isinstance(base, SpecCausalConvResourceHandler)
+    assert base != spec
