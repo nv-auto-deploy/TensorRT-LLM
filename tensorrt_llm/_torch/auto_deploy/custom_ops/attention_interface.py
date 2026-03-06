@@ -1243,6 +1243,60 @@ class SequenceInfo:
         Args:
             offset: 1D tensor [batch_size] with per-sequence position offsets.
         """
+        # #region agent log
+        import json as _json
+        import time as _time
+
+        _DLP = "/home/gramnarayan/dev/TensorRT-LLM/.cursor/debug-d3c723.log"
+
+        def _opc_log(msg, data, hyp="A"):
+            entry = {
+                "sessionId": "d3c723",
+                "hypothesisId": hyp,
+                "location": "attention_interface.py:offset_pos_and_cache_",
+                "message": msg,
+                "timestamp": int(_time.time() * 1000),
+                "runId": "run1",
+            }
+            if data is not None:
+                entry["data"] = data
+            try:
+                with open(_DLP, "a") as f:
+                    f.write(_json.dumps(entry) + "\n")
+            except Exception:
+                pass
+
+        def _opc_snap(label):
+            d = {
+                "label": label,
+                "offset": offset.flatten()[:16].tolist(),
+                "is_generate_only": self.is_generate_only,
+            }
+            for k in [
+                "input_pos",
+                "position_ids",
+                "seq_len",
+                "seq_len_with_cache",
+                "last_page_len",
+                "use_initial_states",
+                "cu_seqlen",
+                "input_ids",
+            ]:
+                try:
+                    v = self.get_arg(k, truncate=True, unflatten=False)
+                    d[k] = v.flatten()[:32].tolist()
+                except Exception:
+                    pass
+            _opc_log(label, d)
+            print(f"    [offset_pos_and_cache_] {label}")
+            print(f"      offset={offset.flatten()[:8].tolist()}")
+            for k in ["input_pos", "position_ids", "seq_len_with_cache", "last_page_len"]:
+                if k in d and not isinstance(d[k], str):
+                    print(f"      {k}={d[k][:8]}")
+
+        _opc_snap("BEFORE")
+        # #endregion
+
         # check if we need a d2h sync
         _REQUIRES_UPDATE = {
             "input_pos",
@@ -1275,6 +1329,45 @@ class SequenceInfo:
             last_page_len = self.get_arg("last_page_len", truncate=True)
             last_page_len += offset
             delta = (last_page_len > self.tokens_per_block).int() - (last_page_len <= 0).int()
+            # #region agent log
+            _any_delta = delta.any().item()
+            if _any_delta:
+                try:
+                    _cu = self.get_arg("cu_num_pages")
+                    _extra = self.get_arg("extra_page_per_seq")
+                    _cl = self.get_arg("cache_loc")
+                    _N = num_sequences
+                    _page_snap = {
+                        "label": "PAGE_BOUNDARY_HIT",
+                        "delta": delta[:_N].tolist(),
+                        "lpl_after_add": last_page_len[:_N].tolist(),
+                        "offset": offset[:_N].tolist(),
+                        "tokens_per_block": self.tokens_per_block,
+                        "cu_num_pages_BEFORE": _cu[: _N + 1].tolist(),
+                        "extra_page_BEFORE": _extra[:_N].tolist(),
+                        "cache_loc_segs_BEFORE": [],
+                    }
+                    for _s in range(_N):
+                        _lo = int(_cu[_s].item())
+                        _hi = int(_cu[_s + 1].item())
+                        _page_snap["cache_loc_segs_BEFORE"].append(_cl[_lo:_hi].tolist())
+                    _invalid_extra = []
+                    for _s in range(_N):
+                        if delta[_s].item() > 0 and _extra[_s].item() < 0:
+                            _invalid_extra.append(_s)
+                    if _invalid_extra:
+                        _page_snap["INVALID_EXTRA_PAGE_SEQS"] = _invalid_extra
+                        print(
+                            f"    !!! CRITICAL: delta=+1 but extra_page=-1 for seqs {_invalid_extra} !!!"
+                        )
+                    _opc_log("PAGE_BOUNDARY_HIT_PRE", _page_snap, "PAGE")
+                    print(f"    *** PAGE BOUNDARY HIT ***  delta={delta[:_N].tolist()}")
+                    print(f"      lpl_after_add={last_page_len[:_N].tolist()}")
+                    print(f"      cu_num_pages={_cu[: _N + 1].tolist()}")
+                    print(f"      extra_page={_extra[:_N].tolist()}")
+                except Exception:
+                    pass
+            # #endregion
             torch.ops.auto_deploy.adjust_ragged_triton(
                 cache_loc=self.get_arg("cache_loc"),
                 cu_num_blocks=self.get_arg("cu_num_pages"),
@@ -1283,6 +1376,29 @@ class SequenceInfo:
                 num_sequences=num_sequences,
                 max_blocks_per_seq=self.max_blocks_per_seq,
             )
+            # #region agent log
+            if _any_delta:
+                try:
+                    _cu2 = self.get_arg("cu_num_pages")
+                    _extra2 = self.get_arg("extra_page_per_seq")
+                    _cl2 = self.get_arg("cache_loc")
+                    _page_snap2 = {
+                        "label": "PAGE_BOUNDARY_RESULT",
+                        "delta": delta[:_N].tolist(),
+                        "cu_num_pages_AFTER": _cu2[: _N + 1].tolist(),
+                        "extra_page_AFTER": _extra2[:_N].tolist(),
+                        "cache_loc_segs_AFTER": [],
+                    }
+                    for _s in range(_N):
+                        _lo2 = int(_cu2[_s].item())
+                        _hi2 = int(_cu2[_s + 1].item())
+                        _page_snap2["cache_loc_segs_AFTER"].append(_cl2[_lo2:_hi2].tolist())
+                    _opc_log("PAGE_BOUNDARY_HIT_POST", _page_snap2, "PAGE")
+                    print(f"      cu_num_pages_AFTER={_cu2[: _N + 1].tolist()}")
+                    print(f"      extra_page_AFTER={_extra2[:_N].tolist()}")
+                except Exception:
+                    pass
+            # #endregion
             last_page_len -= 1
             last_page_len %= self.tokens_per_block
             last_page_len += 1
@@ -1310,6 +1426,10 @@ class SequenceInfo:
         # the forward pass if we use cudagraph...
         if sync_to_host:
             self._input_buffer.copy_to_host()
+
+        # #region agent log
+        _opc_snap("AFTER")
+        # #endregion
 
     @nvtx_range("ad_offset_with_new_lens_")
     def offset_with_new_lens_(self, new_lens_ungathered: torch.Tensor) -> None:
@@ -1340,8 +1460,62 @@ class SequenceInfo:
         In particular, arguments that are always updated in nest_sequences are also updated here.
         Others are updated optionally depending on the argument being active.
         """
+        # #region agent log
+        import json as _json
+        import time as _time
+
+        _DLP = "/home/gramnarayan/dev/TensorRT-LLM/.cursor/debug-d3c723.log"
+
+        def _stg_log(msg, data, hyp="B"):
+            entry = {
+                "sessionId": "d3c723",
+                "hypothesisId": hyp,
+                "location": "attention_interface.py:switch_to_generate_",
+                "message": msg,
+                "timestamp": int(_time.time() * 1000),
+                "runId": "run1",
+            }
+            if data is not None:
+                entry["data"] = data
+            try:
+                with open(_DLP, "a") as f:
+                    f.write(_json.dumps(entry) + "\n")
+            except Exception:
+                pass
+
+        def _stg_snap(label):
+            d = {"label": label, "is_generate_only": self.is_generate_only}
+            for k in [
+                "input_pos",
+                "position_ids",
+                "seq_len",
+                "seq_len_with_cache",
+                "cu_seqlen",
+                "input_ids",
+                "last_page_len",
+                "use_initial_states",
+            ]:
+                try:
+                    v = self.get_arg(k, truncate=True, unflatten=False)
+                    d[k] = v.flatten()[:32].tolist()
+                except Exception:
+                    pass
+            _stg_log(label, d)
+            print(f"    [switch_to_generate_] {label}")
+            print(f"      is_generate_only={d['is_generate_only']}")
+            for k in ["input_pos", "position_ids", "seq_len", "cu_seqlen", "input_ids"]:
+                if k in d and not isinstance(d[k], str):
+                    print(f"      {k}={d[k][:8]}")
+
+        _stg_snap("BEFORE")
+        # #endregion
+
         # already in generate mode
         if self.is_generate_only:
+            # #region agent log
+            print("    [switch_to_generate_] SKIPPED (already generate_only)")
+            _stg_log("SKIPPED", {"reason": "already_generate_only"})
+            # #endregion
             return
 
         # check total number of sequences and device
@@ -1376,6 +1550,10 @@ class SequenceInfo:
             # --- update derivative metadata that change in generate-only mode if active ---
             self.copy_(f"position_ids{suffix}", input_pos, strict=False)
             self.copy_(f"use_initial_states{suffix}", input_pos > 0)
+
+        # #region agent log
+        _stg_snap("AFTER")
+        # #endregion
 
     def copy_(self, name: str, src: torch.Tensor, strict: bool = True) -> None:
         """Copy a tensor into the buffer. USE WITH CAUTION!

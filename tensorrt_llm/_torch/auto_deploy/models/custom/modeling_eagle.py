@@ -21,6 +21,7 @@ hidden states from a target model (e.g., Llama-3.1-8B-Instruct).
 This file contains model definitions used for executing Eagle3 speculative decoding in AutoDeploy.
 """
 
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -33,6 +34,106 @@ from transformers.utils import ModelOutput
 from ...shim.interface import CachedSequenceInterface
 from ...utils._config import deep_merge_dicts
 from ...utils.logger import ad_logger
+
+# #region agent log
+_DEBUG_LOG_PATH = "/home/gramnarayan/dev/TensorRT-LLM/.cursor/debug-d3c723.log"
+_DEBUG_ITER_COUNTER = 0
+
+
+def _debug_log(loc, msg, data=None, hyp="A"):
+    import json as _json
+
+    entry = {
+        "sessionId": "d3c723",
+        "hypothesisId": hyp,
+        "location": loc,
+        "message": msg,
+        "timestamp": int(time.time() * 1000),
+        "runId": "run1",
+    }
+    if data is not None:
+        entry["data"] = data
+    try:
+        with open(_DEBUG_LOG_PATH, "a") as f:
+            f.write(_json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def _snap_metadata(csi, label, extra=None, hyp="A"):
+    """Comprehensive metadata snapshot — prints to stdout AND writes to debug log."""
+    d = {}
+    d["label"] = label
+    d["iter"] = _DEBUG_ITER_COUNTER
+
+    bi = csi.info.batch_info
+    np_, npt, ne, net, nd, ndt = (
+        bi.get_num_sequences()[0],
+        bi.get_num_tokens()[0],
+        bi.get_num_sequences()[1],
+        bi.get_num_tokens()[1],
+        bi.get_num_sequences()[2],
+        bi.get_num_tokens()[2],
+    )
+    d["batch"] = {"np": np_, "npt": npt, "ne": ne, "net": net, "nd": nd, "ndt": ndt}
+    d["batch_info_raw"] = bi.serialize().tolist()
+    d["is_generate_only"] = csi.info.is_generate_only
+    d["gather_required"] = bi.is_gather_required()
+    d["num_tokens_to_gather"] = bi.get_num_tokens_to_gather()
+
+    for k in [
+        "input_ids",
+        "position_ids",
+        "input_pos",
+        "cu_seqlen",
+        "seq_len",
+        "seq_len_with_cache",
+        "last_page_len",
+        "token_gather_indices",
+        "use_initial_states",
+    ]:
+        try:
+            v = csi.info.get_arg(k, truncate=True, unflatten=False)
+            d[k] = v.flatten()[:64].tolist()
+        except Exception as e:
+            d[k] = f"ERR:{e}"
+    try:
+        ids = csi.get_arg("input_ids")
+        d["input_ids_shape"] = list(ids.shape)
+        d["input_ids_vals"] = ids.flatten()[:32].tolist()
+    except Exception:
+        pass
+
+    if extra:
+        d.update(extra)
+
+    print(f"\n[META-SNAP iter={_DEBUG_ITER_COUNTER}] {label}")
+    print(f"  batch: np={np_} npt={npt} ne={ne} net={net} nd={nd} ndt={ndt}")
+    print(f"  is_generate_only={d['is_generate_only']}  gather_req={d['gather_required']}")
+    for k in [
+        "input_ids",
+        "position_ids",
+        "input_pos",
+        "cu_seqlen",
+        "seq_len",
+        "seq_len_with_cache",
+        "last_page_len",
+        "token_gather_indices",
+    ]:
+        if k in d and not isinstance(d[k], str):
+            vals = d[k][:16]
+            print(f"  {k}: {vals}{'...' if len(d.get(k, [])) > 16 else ''}")
+    if extra:
+        for ek, ev in extra.items():
+            if isinstance(ev, (list, tuple)) and len(ev) > 16:
+                print(f"  {ek}: {ev[:16]}...")
+            else:
+                print(f"  {ek}: {ev}")
+
+    _debug_log("modeling_eagle.py:snap", label, d, hyp)
+
+
+# #endregion
 
 
 class EagleConfig(PretrainedConfig):
@@ -732,6 +833,25 @@ class EagleWrapper(nn.Module):
         num_sequences = num_prefill + num_extend + num_decode
         num_total_tokens = num_prefill_tokens + num_extend_tokens + num_decode_tokens
 
+        # #region agent log
+        global _DEBUG_ITER_COUNTER
+        _DEBUG_ITER_COUNTER += 1
+
+        _snap_metadata(
+            csi,
+            "PHASE0_entry",
+            {
+                "num_prefill": num_prefill,
+                "num_extend": num_extend,
+                "num_decode": num_decode,
+                "num_prefill_tokens": num_prefill_tokens,
+                "num_extend_tokens": num_extend_tokens,
+                "num_decode_tokens": num_decode_tokens,
+                "num_total_tokens": num_total_tokens,
+            },
+        )
+        # #endregion
+
         # some sanity checks on the batch
         assert num_decode == 0, "decode without drafting is not supported inside the eagle wrapper"
         if num_extend > 0:
@@ -744,6 +864,17 @@ class EagleWrapper(nn.Module):
         )
         # NOTE: we assume gather_context_logits is False so that gathering here works!
         target_logits = csi.info.maybe_gather_and_squeeze(out.logits)
+
+        # #region agent log
+        _snap_metadata(
+            csi,
+            "PHASE1_after_target",
+            {
+                "target_logits_shape": list(target_logits.shape),
+                "sampled_preview": torch.argmax(target_logits[:8], dim=-1).tolist(),
+            },
+        )
+        # #endregion
 
         # ---- Phase 2: Collect hidden states from cache buffers ----
         hidden_states = self._collect_hidden_states(csi.named_args, num_total_tokens)
@@ -770,6 +901,17 @@ class EagleWrapper(nn.Module):
             new_tokens_2d[num_prefill:] = new_tokens_2d_extend
         else:
             new_tokens_2d = new_tokens_2d_extend
+
+        # #region agent log
+        _snap_metadata(
+            csi,
+            "PHASE3_after_sample",
+            {
+                "sampled_tokens": sampled_tokens.tolist(),
+                "new_tokens_2d": new_tokens_2d.tolist(),
+            },
+        )
+        # #endregion
 
         # ---- Phase 4: Verify ----
         # get original input ids
@@ -811,6 +953,20 @@ class EagleWrapper(nn.Module):
         if num_prefill > 0:
             c_offset[:num_prefill].fill_(1)
 
+        # #region agent log
+        _verify_extra = {
+            "input_ids_flat": input_ids_flat.flatten()[:32].tolist(),
+            "output_ids_target": output_ids_target.flatten()[:32].tolist(),
+            "new_tokens_lens": new_tokens_lens.tolist(),
+            "c_offset": c_offset.tolist(),
+            "cu_seqlen_before_gather_update": csi.get_arg("cu_seqlen", truncate=True).tolist(),
+        }
+        if num_extend > 0:
+            _verify_extra["input_ids_extend"] = input_ids_extend.flatten()[:32].tolist()
+            _verify_extra["mask_same"] = mask_same.tolist()
+            _verify_extra["new_tokens_lens_extend"] = new_tokens_lens_extend.tolist()
+        # #endregion
+
         # updated token_gather_indices and info based on c_offset for retrieval of
         # last accepted tokens for both output and first draft iteration. It's computed as follows:
         # last_token_index = cu_seqlen[1:] - 1
@@ -821,12 +977,28 @@ class EagleWrapper(nn.Module):
         last_accepted_tokens = csi.get_arg("cu_seqlen", truncate=True)[1:] + c_offset - 2
         csi.info.copy_("token_gather_indices", last_accepted_tokens, strict=False)
 
+        # #region agent log
+        _verify_extra["last_accepted_tokens"] = last_accepted_tokens.tolist()
+        _snap_metadata(csi, "PHASE4_after_verify", _verify_extra, "C")
+        # #endregion
+
         # ---- Phase 4: Prepare for draft loop and next_new_tokens tensor ----
         device = csi.info.device
         ids_dtype = output_ids_target.dtype
 
         # store current collected output ids asinput ids for the first iteration of the draft loop
         csi.info.copy_("input_ids", output_ids_target)
+
+        # #region agent log
+        _snap_metadata(
+            csi,
+            "PHASE4b_after_copy_input_ids",
+            {
+                "output_ids_target_first32": output_ids_target.flatten()[:32].tolist(),
+            },
+            "B",
+        )
+        # #endregion
 
         # a 2D grid of latest verified + new draft tokens for each sequence. This includes:
         # 1. idx=0: latest verified token or bonus token for prefill+extend sequences
@@ -839,8 +1011,31 @@ class EagleWrapper(nn.Module):
         # which we already stored in the input_ids for the first draft iteration.
         next_new_tokens[:, 0] = csi.info.maybe_gather_and_squeeze(csi.get_arg("input_ids"))
 
+        # #region agent log
+        _snap_metadata(
+            csi,
+            "PHASE4c_before_draft_loop",
+            {
+                "next_new_tokens_col0": next_new_tokens[:, 0].tolist(),
+            },
+            "B",
+        )
+        # #endregion
+
         # ---- Phase 5: Draft loop ----
         for draft_idx in range(self.max_draft_len):
+            # #region agent log
+            _snap_metadata(
+                csi,
+                f"PHASE5_draft_iter{draft_idx}_BEFORE_fwd",
+                {
+                    "draft_idx": draft_idx,
+                    "c_offset": c_offset.tolist(),
+                },
+                "A",
+            )
+            # #endregion
+
             # run forward pass on the draft model in shape [num_sequences, 1]
             draft_output = self.draft_model(
                 inputs_embeds=self.apply_draft_embedding(csi.get_arg("input_ids")),
@@ -858,6 +1053,10 @@ class EagleWrapper(nn.Module):
             draft_tokens[:] = self.sample_greedy(latest_logits)
             draft_tokens[:] = self.apply_d2t(draft_tokens)
 
+            # #region agent log
+            print(f"  [draft_idx={draft_idx}] draft_tokens={draft_tokens.tolist()}")
+            # #endregion
+
             # update cache offset for the next draft iteration
             # for idx=0 --> we use pre-computed c_offset from the verification step
             # for idx>1 --> we offset uniformly by 1
@@ -867,9 +1066,83 @@ class EagleWrapper(nn.Module):
             # switch to generate (if not done already), store new tokens, and offset cache
             # can be skipped for last iteration since after we return metadata will be reset
             if draft_idx < self.max_draft_len - 1:
+                # #region agent log
+                _snap_metadata(
+                    csi,
+                    f"PHASE5_draft_iter{draft_idx}_BEFORE_switch",
+                    {
+                        "draft_idx": draft_idx,
+                        "c_offset": c_offset.tolist(),
+                        "draft_tokens": draft_tokens.tolist(),
+                    },
+                    "A",
+                )
+                # #endregion
+
                 csi.info.switch_to_generate_()
+
+                # #region agent log
+                _snap_metadata(
+                    csi,
+                    f"PHASE5_draft_iter{draft_idx}_AFTER_switch",
+                    {
+                        "draft_idx": draft_idx,
+                    },
+                    "B",
+                )
+                # #endregion
+
                 csi.info.copy_("input_ids", draft_tokens)
+
+                # #region agent log
+                _snap_metadata(
+                    csi,
+                    f"PHASE5_draft_iter{draft_idx}_AFTER_copy_ids",
+                    {
+                        "draft_idx": draft_idx,
+                        "draft_tokens": draft_tokens.tolist(),
+                    },
+                    "B",
+                )
+                # #endregion
+
+                # --- page-arithmetic trace ---
+                _lpl_pre = csi.info.get_arg("last_page_len", truncate=True)
+                _cu_pre = csi.info.get_arg("cu_num_pages", truncate=True)
+                _extra_pre = csi.info.get_arg("extra_page_per_seq", truncate=True)
+                _tpb = csi.info.tokens_per_block
+                print(
+                    f"  [draft_idx={draft_idx}] PRE-offset: "
+                    f"last_page_len={_lpl_pre.tolist()}, c_offset={c_offset.tolist()}, "
+                    f"tpb={_tpb}"
+                )
+                print(f"    cu_num_pages={_cu_pre.tolist()}, extra_page={_extra_pre.tolist()}")
+
                 csi.info.offset_pos_and_cache_(c_offset)
+
+                # #region agent log
+                _snap_metadata(
+                    csi,
+                    f"PHASE5_draft_iter{draft_idx}_AFTER_offset",
+                    {
+                        "draft_idx": draft_idx,
+                        "c_offset": c_offset.tolist(),
+                    },
+                    "A",
+                )
+                # #endregion
+
+        # #region agent log
+        _snap_metadata(
+            csi,
+            "PHASE6_output",
+            {
+                "new_tokens_2d": new_tokens_2d.tolist(),
+                "new_tokens_lens": new_tokens_lens.tolist(),
+                "next_new_tokens": next_new_tokens.tolist(),
+            },
+        )
+        # #endregion
 
         # ---- Phase 6: Package output ----
         return EagleWrapperOutput(
