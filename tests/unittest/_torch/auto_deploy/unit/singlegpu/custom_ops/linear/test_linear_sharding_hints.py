@@ -16,7 +16,7 @@
 """Tests for sharding hint kwargs on torch_linear_simple.
 
 AD-SHARD-001: Verify that torch_linear_simple accepts TP sharding hints
-(tp_mode, tp_fused_group_sizes, tp_min_local_shape) as keyword arguments,
+(tp_mode, output_sizes, tp_min_local_shape) as keyword arguments,
 that they are metadata-only (do not change numerical output), and that
 they are preserved on FX graph nodes.
 """
@@ -67,7 +67,7 @@ def test_tp_mode_accepted(tp_mode):
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Op accepts tp_fused_group_sizes
+# Test 2: Op accepts output_sizes
 # ---------------------------------------------------------------------------
 def test_fused_group_sizes_accepted():
     fused_n = Q_DIM + 2 * KV_DIM
@@ -77,7 +77,7 @@ def test_fused_group_sizes_accepted():
         w,
         b,
         tp_mode="colwise",
-        tp_fused_group_sizes=[Q_DIM, KV_DIM, KV_DIM],
+        output_sizes=[Q_DIM, KV_DIM, KV_DIM],
     )
     assert out.shape == (M, fused_n)
 
@@ -108,7 +108,7 @@ def test_all_hints_together():
         w,
         b,
         tp_mode="colwise",
-        tp_fused_group_sizes=[Q_DIM, KV_DIM, KV_DIM],
+        output_sizes=[Q_DIM, KV_DIM, KV_DIM],
         tp_min_local_shape=HEAD_DIM,
     )
     assert out.shape == (M, fused_n)
@@ -139,11 +139,11 @@ def _get_node_hint_args(node):
     """Extract sharding hints from a torch_linear_simple node.
 
     torch.export flattens all args positionally into node.args (not kwargs).
-    Schema: (input, weight, bias, tp_mode, tp_fused_group_sizes, tp_min_local_shape)
+    Schema: (input, weight, bias, tp_mode, output_sizes, tp_min_local_shape)
     """
     return {
         "tp_mode": node.args[3] if len(node.args) > 3 else None,
-        "tp_fused_group_sizes": node.args[4] if len(node.args) > 4 else None,
+        "output_sizes": node.args[4] if len(node.args) > 4 else None,
         "tp_min_local_shape": node.args[5] if len(node.args) > 5 else None,
     }
 
@@ -161,7 +161,7 @@ def test_hints_visible_on_graph_node():
                 self.w,
                 self.b,
                 tp_mode="colwise",
-                tp_fused_group_sizes=[Q_DIM, KV_DIM, KV_DIM],
+                output_sizes=[Q_DIM, KV_DIM, KV_DIM],
                 tp_min_local_shape=HEAD_DIM,
             )
 
@@ -175,7 +175,7 @@ def test_hints_visible_on_graph_node():
             found = True
             hints = _get_node_hint_args(node)
             assert hints["tp_mode"] == "colwise", f"tp_mode wrong, got: {hints}"
-            assert list(hints["tp_fused_group_sizes"]) == [Q_DIM, KV_DIM, KV_DIM]
+            assert list(hints["output_sizes"]) == [Q_DIM, KV_DIM, KV_DIM]
             assert hints["tp_min_local_shape"] == HEAD_DIM
             break
 

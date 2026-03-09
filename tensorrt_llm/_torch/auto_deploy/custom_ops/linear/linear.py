@@ -26,7 +26,7 @@ def simple(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     tp_mode: str = "none",
-    tp_fused_group_sizes: Optional[List[int]] = None,
+    output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     """A wrapper for the linear functional to control how it is exposed.
@@ -37,7 +37,7 @@ def simple(
 
     This wrapper avoids exposing this view op during the export graph.
 
-    Sharding hint kwargs (tp_mode, tp_fused_group_sizes, tp_min_local_shape) are
+    Sharding hint kwargs (tp_mode, output_sizes, tp_min_local_shape) are
     graph-level metadata consumed by apply_sharding_hints. They do not affect
     the computation performed by this op.
     """
@@ -45,8 +45,6 @@ def simple(
 
 
 @simple.register_fake
-def simple_fake(
-    input, weight, bias, tp_mode="none", tp_fused_group_sizes=None, tp_min_local_shape=1
-):
+def simple_fake(input, weight, bias, tp_mode="none", output_sizes=None, tp_min_local_shape=1):
     """Fake implementation of simple_linear."""
     return torch.ops.aten.linear(input, weight, bias)
