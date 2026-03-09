@@ -16,7 +16,7 @@
 """Tests for sharding hint kwargs on fake quant linear ops.
 
 AD-SHARD-002: Verify that all four fake quant linear ops accept TP sharding
-hints (tp_mode, tp_fused_group_sizes, tp_min_local_shape) as keyword
+hints (tp_mode, output_sizes, tp_min_local_shape) as keyword
 arguments without changing their schema or behavior.
 
 Tests at the schema level: the custom op schema must include the hint
@@ -69,11 +69,9 @@ def test_schema_includes_tp_mode(op_name):
 
 
 @pytest.mark.parametrize("op_name", FAKE_QUANT_OPS)
-def test_schema_includes_tp_fused_group_sizes(op_name):
+def test_schema_includes_output_sizes(op_name):
     schema = _get_op_schema(op_name)
-    assert "tp_fused_group_sizes" in schema, (
-        f"{op_name} schema missing tp_fused_group_sizes: {schema}"
-    )
+    assert "output_sizes" in schema, f"{op_name} schema missing output_sizes: {schema}"
 
 
 @pytest.mark.parametrize("op_name", FAKE_QUANT_OPS)

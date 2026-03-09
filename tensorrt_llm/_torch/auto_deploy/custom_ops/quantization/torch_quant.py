@@ -183,7 +183,7 @@ def torch_fake_quant_fp8_linear(
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
     tp_mode: str = "none",
-    tp_fused_group_sizes: Optional[List[int]] = None,
+    output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     """
@@ -221,7 +221,7 @@ def torch_fake_quant_fp8_linear(
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
     tp_mode: str = "none",
-    tp_fused_group_sizes: Optional[List[int]] = None,
+    output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     w = weight_quantized.to(input.dtype)
@@ -238,7 +238,7 @@ def torch_fake_quant_nvfp4_linear(
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
     tp_mode: str = "none",
-    tp_fused_group_sizes: Optional[List[int]] = None,
+    output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     """
@@ -303,7 +303,7 @@ def torch_fake_quant_nvfp4_linear(
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
     tp_mode: str = "none",
-    tp_fused_group_sizes: Optional[List[int]] = None,
+    output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_quantized.repeat(1, 2).to(input.dtype), bias)
@@ -319,7 +319,7 @@ def torch_fake_quant_int4_linear(
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
     tp_mode: str = "none",
-    tp_fused_group_sizes: Optional[List[int]] = None,
+    output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     BLOCK_SIZE = 128
@@ -341,7 +341,7 @@ def torch_fake_quant_int4_linear(
         w_deq,
         bias,
         tp_mode=tp_mode,
-        tp_fused_group_sizes=tp_fused_group_sizes,
+        output_sizes=output_sizes,
         tp_min_local_shape=tp_min_local_shape,
     )
 
@@ -356,7 +356,7 @@ def _fake(
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
     tp_mode: str = "none",
-    tp_fused_group_sizes: Optional[List[int]] = None,
+    output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     N_half = weight_quantized.shape[-2]
@@ -374,7 +374,7 @@ def torch_fake_quant_int4_gptq_linear(
     input_zp: List[torch.Tensor],  # unused for GPTQ
     weight_zp: List[torch.Tensor],  # GPTQ qzeros [G, N/8] int32
     tp_mode: str = "none",
-    tp_fused_group_sizes: Optional[List[int]] = None,
+    output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     """
@@ -458,7 +458,7 @@ def torch_fake_quant_int4_gptq_linear_fake(
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
     tp_mode: str = "none",
-    tp_fused_group_sizes: Optional[List[int]] = None,
+    output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     N = weight_quantized.size(1)
