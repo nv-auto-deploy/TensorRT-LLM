@@ -505,8 +505,12 @@ class PythonMambaCacheManager(BaseResourceManager):
 
         torch.cuda.empty_cache()
 
-    def _update_mamba_states(self, num_contexts: int, num_gens: int,
-                             num_accepted_tokens: torch.Tensor):
+    @torch.compile(options={"max-autotune": True})
+    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
+                            num_accepted_tokens: torch.Tensor):
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
         num_accepted_draft_tokens = num_accepted_tokens[
             num_contexts:num_contexts + num_gens] - 1
         state_indices_d = self.state_indices[num_contexts:num_contexts +
@@ -528,11 +532,6 @@ class PythonMambaCacheManager(BaseResourceManager):
                                                              src_state_indices,
                                                              num_accepted_draft_tokens]
         conv_states[:, state_indices_d, :] = accepted_conv_state
-
-    @torch.compile(options={"max-autotune": True})
-    def update_mamba_states(self, num_contexts: int, num_gens: int,
-                            num_accepted_tokens: torch.Tensor):
-        self._update_mamba_states(num_contexts, num_gens, num_accepted_tokens)
 
 
 class MambaCacheManager(BaseResourceManager):
@@ -662,11 +661,10 @@ class MambaCacheManager(BaseResourceManager):
     def shutdown(self):
         self._impl.shutdown()
 
-    def update_mamba_states(self, num_contexts: int, num_gens: int,
+    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor):
         assert not self._use_cpp, "update_mamba_states is not supported in CppMambaCacheManager"
-        self._impl.update_mamba_states(num_contexts, num_gens,
-                                       num_accepted_tokens)
+        self._impl.update_mamba_states(attn_metadata, num_accepted_tokens)
 
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
@@ -769,7 +767,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         KVCacheManager.update_resources(self, scheduled_batch, attn_metadata,
                                         kv_cache_dtype_byte_size)
 
-    def update_mamba_states(self, num_contexts: int, num_gens: int,
+    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor):
-        MambaCacheManager.update_mamba_states(self, num_contexts, num_gens,
+        MambaCacheManager.update_mamba_states(self, attn_metadata,
                                               num_accepted_tokens)

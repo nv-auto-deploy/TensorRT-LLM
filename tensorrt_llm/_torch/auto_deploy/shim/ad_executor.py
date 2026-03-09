@@ -14,7 +14,7 @@ import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
 from types import MethodType, SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -406,6 +406,19 @@ def maybe_pad_for_cuda_graph(func):
     return wrapper
 
 
+class _MambaUpdateContext(NamedTuple):
+    """Lightweight shim matching the AttentionMetadata fields read by update_mamba_states.
+
+    MambaHybridCacheManager.update_mamba_states expects an attn_metadata object
+    with .num_seqs and .num_contexts.  In AutoDeploy we don't have a real
+    AttentionMetadata, so we build this from the CachedSequenceInterface batch
+    info instead.
+    """
+
+    num_seqs: int
+    num_contexts: int
+
+
 class ADEngine(ModelEngine):
     """The AutoDeploy Engine (ADEngine) is the main engine interface to execute AutoDeploy models.
 
@@ -742,7 +755,15 @@ class ADEngine(ModelEngine):
                 "if num_extend > 0, kv_cache_manager must be speculative"
             )
             assert num_decode == 0, "if num_extend > 0, num_decode must be 0"
-            kv_cache_manager.update_mamba_states(num_prefill, num_extend, num_accepted)
+            assert num_accepted is not None, "new_tokens_lens required for mamba state update"
+            ctx = _MambaUpdateContext(
+                num_seqs=num_prefill + num_extend,
+                num_contexts=num_prefill,
+            )
+            kv_cache_manager.update_mamba_states(
+                attn_metadata=ctx,
+                num_accepted_tokens=num_accepted,
+            )
 
     @nvtx_range("ad_run_forward")
     def _run_forward(self) -> Dict[str, Optional[torch.Tensor]]:
