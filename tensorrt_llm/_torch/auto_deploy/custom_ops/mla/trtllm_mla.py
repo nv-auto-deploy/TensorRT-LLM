@@ -43,7 +43,9 @@ Phase-specific details:
 
 Cache layout:
     kv_cache: paged pool storing [compressed_kv | k_pe] per token
-    - num_kv_heads=1, head_dim=kv_lora_rank+qk_rope_head_dim, kv_factor=2 (HND)
+    - num_kv_heads=1, head_dim=kv_lora_rank+qk_rope_head_dim, kv_factor=1 (HND)
+    - kv_factor=1 because MLA K and V are the same latent data; this matches
+      the C++ thop.attention expectation and enables the flash-MLA kernel on SM90
 """
 
 import math
@@ -88,6 +90,10 @@ class _TrtllmMLAPlanner:
     output_latent, fused_q_flat, latent_cache_buf) are pre-allocated once and reused
     across all layers within a step, eliminating per-layer arange/zeros/cat/empty
     kernel launches.
+
+    Cache write indices (decode_page_idx, decode_slot_idx) are pre-computed on the
+    host during plan() and copied to GPU, eliminating per-layer subtract/div/mod/arange
+    kernel launches in the decode hot path.
     """
 
     def __init__(self):
@@ -110,11 +116,24 @@ class _TrtllmMLAPlanner:
         self.output_latent: Optional[torch.Tensor] = None
         self.fused_q_flat: Optional[torch.Tensor] = None
         self.latent_cache_buf: Optional[torch.Tensor] = None
+        self.decode_seq_indices: Optional[torch.Tensor] = None
         self._decode_buf_max_tokens: int = 0
         self._decode_buf_num_heads: int = 0
         self._decode_buf_kv_lora_rank: int = 0
         self._decode_buf_rope_dim: int = 0
         self._decode_buf_dtype: Optional[torch.dtype] = None
+
+        # Pre-computed cache write indices (host→GPU, computed in plan())
+        self.decode_page_idx: Optional[torch.Tensor] = None
+        self.decode_slot_idx: Optional[torch.Tensor] = None
+        self._decode_page_idx_host: Optional[torch.Tensor] = None
+        self._decode_slot_idx_host: Optional[torch.Tensor] = None
+        self._tokens_per_block: int = 0
+
+        # Cached contiguous weight matrices (computed once per unique weight)
+        self._cached_weight_ptr: Optional[int] = None
+        self._cached_w_kn: Optional[torch.Tensor] = None
+        self._cached_w_v_t: Optional[torch.Tensor] = None
 
     def reset(self, device: torch.device, max_batch: int, max_blocks_per_seq: int) -> None:
         """One-time allocation of ALL persistent buffers."""
@@ -142,6 +161,15 @@ class _TrtllmMLAPlanner:
         self.cu_q_seqlens: Optional[torch.Tensor] = None
         self.cu_kv_seqlens: Optional[torch.Tensor] = None
         self.fmha_scheduler_counter = torch.zeros(1, dtype=torch.int32, device=device)
+
+        self.decode_page_idx = torch.zeros(max_batch, dtype=torch.int64, device=device)
+        self.decode_slot_idx = torch.zeros(max_batch, dtype=torch.int64, device=device)
+        self._decode_page_idx_host = torch.zeros(
+            max_batch, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        self._decode_slot_idx_host = torch.zeros(
+            max_batch, dtype=torch.int64, device="cpu", pin_memory=True
+        )
 
     def ensure_decode_buffers(
         self,
@@ -183,6 +211,27 @@ class _TrtllmMLAPlanner:
             max_tokens, num_heads * gen_head_size, dtype=dtype, device=device
         )
         self.latent_cache_buf = torch.empty(max_tokens, gen_head_size, dtype=dtype, device=device)
+        self.decode_seq_indices = torch.arange(max_tokens, dtype=torch.long, device=device)
+
+    def get_weight_matrices(
+        self,
+        kv_b_proj_weight: torch.Tensor,
+        num_heads: int,
+        qk_nope_head_dim: int,
+        v_head_dim: int,
+        kv_lora_rank: int,
+    ):
+        """Return cached contiguous w_kn and w_v_t weight slices."""
+        ptr = kv_b_proj_weight.data_ptr()
+        if self._cached_weight_ptr == ptr:
+            return self._cached_w_kn, self._cached_w_v_t
+        weight_reshaped = kv_b_proj_weight.view(
+            num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank
+        )
+        self._cached_w_kn = weight_reshaped[:, :qk_nope_head_dim, :].contiguous()
+        self._cached_w_v_t = weight_reshaped[:, qk_nope_head_dim:, :].transpose(1, 2).contiguous()
+        self._cached_weight_ptr = ptr
+        return self._cached_w_kn, self._cached_w_v_t
 
     def plan(
         self,
@@ -198,11 +247,20 @@ class _TrtllmMLAPlanner:
         input_pos_host: torch.Tensor,
         seq_len_host: torch.Tensor,
     ) -> None:
-        """Per-forward host metadata: fills host_request_types, block_offsets, etc."""
+        """Per-forward host metadata: fills host_request_types, block_offsets, etc.
+
+        Also pre-computes decode cache write indices (page_idx, slot_idx) on the host
+        and copies them to GPU, eliminating per-layer subtract/div/mod GPU kernels.
+        """
         num_seq = num_prefill + num_decode
 
         self.host_request_types[:num_prefill].fill_(0)
         self.host_request_types[num_prefill:num_seq].fill_(1)
+
+        if self.host_pool_mapping.size(0) != block_offset_multiplier:
+            self.host_pool_mapping = torch.zeros(
+                block_offset_multiplier, 2, dtype=torch.int32, device="cpu", pin_memory=True
+            )
 
         block_offsets = self.block_offsets
         total_pages = int(cu_num_pages_host[num_seq])
@@ -210,10 +268,12 @@ class _TrtllmMLAPlanner:
         seq_idx = page_seq_indices[:total_pages]
         pg_idx = page_in_seq[:total_pages]
         block_offsets[0, seq_idx, 0, pg_idx] = base_offsets
-        block_offsets[0, seq_idx, 1, pg_idx] = base_offsets + 1
+        block_offsets[0, seq_idx, 1, pg_idx] = base_offsets
 
         self.block_ids_per_seq.fill_(0)
         self.block_ids_per_seq[seq_idx, pg_idx] = cache_loc[:total_pages]
+
+        tokens_per_block = self._tokens_per_block
 
         is_capturing = torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up()
         if is_capturing:
@@ -221,11 +281,31 @@ class _TrtllmMLAPlanner:
             self.host_total_kv_lens[1] = max_context_length * num_decode
             self.host_past_kv_lengths[:num_seq].fill_(max_context_length)
             self.host_context_lengths[:num_seq].fill_(max_context_length)
+            if num_decode > 0 and tokens_per_block > 0:
+                positions = max_context_length - 1
+                self._decode_page_idx_host[:num_decode].fill_(positions // tokens_per_block)
+                self._decode_slot_idx_host[:num_decode].fill_(positions % tokens_per_block)
+                self.decode_page_idx[:num_decode].copy_(
+                    self._decode_page_idx_host[:num_decode], non_blocking=True
+                )
+                self.decode_slot_idx[:num_decode].copy_(
+                    self._decode_slot_idx_host[:num_decode], non_blocking=True
+                )
         else:
             self.host_total_kv_lens[0] = seq_len_with_cache_host[:num_prefill].sum()
             self.host_total_kv_lens[1] = seq_len_with_cache_host[num_prefill:num_seq].sum()
             self.host_past_kv_lengths[:num_seq] = input_pos_host[:num_seq]
             self.host_context_lengths[:num_seq] = seq_len_host[:num_seq]
+            if num_decode > 0 and tokens_per_block > 0:
+                positions = seq_len_with_cache_host[num_prefill:num_seq] - 1
+                self._decode_page_idx_host[:num_decode] = positions // tokens_per_block
+                self._decode_slot_idx_host[:num_decode] = positions % tokens_per_block
+                self.decode_page_idx[:num_decode].copy_(
+                    self._decode_page_idx_host[:num_decode], non_blocking=True
+                )
+                self.decode_slot_idx[:num_decode].copy_(
+                    self._decode_slot_idx_host[:num_decode], non_blocking=True
+                )
 
     def get_pool_pointers_for_layer(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Return a per-layer ``host_pool_pointers`` tensor for this kv_cache view."""
@@ -478,13 +558,10 @@ def _write_latent_cache_to_paged_kv(
     seq_idx_long = seq_indices.long()
 
     k_blocks = kv_cache_block_offsets[0, seq_idx_long, 0, page_in_seq]
-    v_blocks = kv_cache_block_offsets[0, seq_idx_long, 1, page_in_seq]
 
     k_p, k_r = k_blocks // blocks_per_page, k_blocks % blocks_per_page
-    v_p, v_r = v_blocks // blocks_per_page, v_blocks % blocks_per_page
 
     kv_cache[k_p, k_r // num_kv_h, k_r % num_kv_h, slots] = latent_cache
-    kv_cache[v_p, v_r // num_kv_h, v_r % num_kv_h, slots] = latent_cache
 
 
 def _read_latent_cache_from_paged_kv(
@@ -681,6 +758,90 @@ def _handle_prefill(
     return output
 
 
+def _batched_fresh_prefill_sdpa(
+    q_nope_flat: torch.Tensor,
+    q_pe_flat: torch.Tensor,
+    compressed_kv_flat: torch.Tensor,
+    kpe_flat: torch.Tensor,
+    kv_b_proj_weight: torch.Tensor,
+    num_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    v_head_dim: int,
+    scale: float,
+    num_prefill: int,
+    seq_lens_list: list,
+) -> torch.Tensor:
+    """Batched SDPA prefill for fresh sequences (all input_pos == 0).
+
+    Replaces the per-sequence loop with a single batched SDPA call.
+    For uniform-length sequences this is a simple reshape; for variable
+    lengths, sequences are padded to max_len.  The causal mask naturally
+    prevents valid queries from attending to any padded key positions
+    (ki <= qi < seq_len), so no custom mask is needed.
+    """
+    num_tokens = q_nope_flat.shape[0]
+    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+
+    kv_expanded = torch.matmul(compressed_kv_flat, kv_b_proj_weight.t())
+    kv_expanded = kv_expanded.view(num_tokens, num_heads, qk_nope_head_dim + v_head_dim)
+    k_nope = kv_expanded[:, :, :qk_nope_head_dim]
+    v_states = kv_expanded[:, :, qk_nope_head_dim:]
+
+    kpe_expanded = kpe_flat.unsqueeze(1).expand(-1, num_heads, -1)
+    k_full = torch.cat([k_nope, kpe_expanded], dim=-1)
+    q_full = torch.cat([q_nope_flat, q_pe_flat], dim=-1)
+
+    B = num_prefill
+    uniform_len = len(set(seq_lens_list)) == 1
+
+    if uniform_len:
+        S = int(seq_lens_list[0])
+        q_s = q_full.view(B, S, num_heads, qk_head_dim).transpose(1, 2)
+        k_s = k_full.view(B, S, num_heads, qk_head_dim).transpose(1, 2).contiguous()
+        v_s = v_states.view(B, S, num_heads, v_head_dim).transpose(1, 2).contiguous()
+
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_s,
+            k_s,
+            v_s,
+            is_causal=True,
+            scale=scale,
+        )
+        return out.transpose(1, 2).reshape(num_tokens, num_heads * v_head_dim).contiguous()
+
+    max_len = max(int(s) for s in seq_lens_list)
+    q_padded = q_full.new_zeros(B, max_len, num_heads, qk_head_dim)
+    k_padded = k_full.new_zeros(B, max_len, num_heads, qk_head_dim)
+    v_padded = v_states.new_zeros(B, max_len, num_heads, v_head_dim)
+
+    offset = 0
+    for i, slen in enumerate(seq_lens_list):
+        slen = int(slen)
+        q_padded[i, :slen] = q_full[offset : offset + slen]
+        k_padded[i, :slen] = k_full[offset : offset + slen]
+        v_padded[i, :slen] = v_states[offset : offset + slen]
+        offset += slen
+
+    q_s = q_padded.transpose(1, 2)
+    k_s = k_padded.transpose(1, 2).contiguous()
+    v_s = v_padded.transpose(1, 2).contiguous()
+
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q_s,
+        k_s,
+        v_s,
+        is_causal=True,
+        scale=scale,
+    )
+    out = out.transpose(1, 2)  # [B, S, N, V]
+    results = []
+    for i, slen in enumerate(seq_lens_list):
+        slen = int(slen)
+        results.append(out[i, :slen].reshape(slen, num_heads * v_head_dim))
+    return torch.cat(results, dim=0).contiguous()
+
+
 def _handle_chunked_prefill(
     q_nope_flat: torch.Tensor,
     q_pe_flat: torch.Tensor,
@@ -702,14 +863,33 @@ def _handle_chunked_prefill(
 ) -> torch.Tensor:
     """Handle chunked prefill via SDPA with cached latent tokens.
 
-    When input_pos > 0, reads previously cached latent tokens from the paged
-    KV cache, combines with the current chunk, and runs SDPA with a
-    bottom-right-aligned causal mask.
+    When all sequences are fresh (input_pos == 0), dispatches to a single
+    batched SDPA call.  When input_pos > 0, reads previously cached latent
+    tokens from the paged KV cache, combines with the current chunk, and
+    runs SDPA with a bottom-right-aligned causal mask per sequence.
     """
-    outputs = []
-    q_offset = 0
     seq_lens_list = seq_len_host[:num_prefill].tolist()
     input_pos_list = input_pos_host[:num_prefill].tolist()
+
+    all_fresh = all(ip == 0 for ip in input_pos_list)
+    if all_fresh and num_prefill > 1:
+        return _batched_fresh_prefill_sdpa(
+            q_nope_flat,
+            q_pe_flat,
+            compressed_kv_flat,
+            kpe_flat,
+            kv_b_proj_weight,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim,
+            scale,
+            num_prefill,
+            seq_lens_list,
+        )
+
+    outputs = []
+    q_offset = 0
 
     for seq_idx, slen in enumerate(seq_lens_list):
         slen = int(slen)
@@ -780,28 +960,21 @@ def _write_decode_latent_to_cache(
     latent_cache: torch.Tensor,
     kv_cache: torch.Tensor,
     block_ids_per_seq: torch.Tensor,
-    sequence_length: torch.Tensor,
     num_prefill: int,
     num_decode: int,
-    tokens_per_block: int,
 ) -> None:
     """Write decode tokens' latent_cache to the paged KV cache.
 
-    Uses GPU tensor operations so it is safe for CUDA graph capture.
-    The thop.attention MLA generation kernel reads from the KV cache
-    but does NOT write to it; the standard TRT-LLM backend relies on
-    mla_rope_generation to do the write. Since auto-deploy skips that
-    kernel (RoPE is pre-applied), we must write the cache explicitly.
+    Uses pre-computed page_idx/slot_idx from the planner (computed on host
+    during plan()) to avoid per-layer subtract/div/mod/arange GPU kernels.
     """
-    positions = sequence_length[num_prefill : num_prefill + num_decode] - 1
-    page_idx = positions // tokens_per_block
-    slot_idx = positions % tokens_per_block
-
-    seq_indices = torch.arange(num_prefill, num_prefill + num_decode, device=latent_cache.device)
+    planner = _GlobalTrtllmMLAPlanner
+    page_idx = planner.decode_page_idx[:num_decode]
+    slot_idx = planner.decode_slot_idx[:num_decode]
+    seq_indices = planner.decode_seq_indices[num_prefill : num_prefill + num_decode]
     page_ids = block_ids_per_seq[seq_indices, page_idx]
 
     kv_cache[page_ids, 0, 0, slot_idx] = latent_cache
-    kv_cache[page_ids, 1, 0, slot_idx] = latent_cache
 
 
 def _handle_decode(
@@ -837,35 +1010,28 @@ def _handle_decode(
 ) -> torch.Tensor:
     """Handle decode: weight absorption + latent-space attention + output projection.
 
-    Uses pre-allocated buffers from _GlobalTrtllmMLAPlanner and torch.bmm instead
-    of torch.einsum for better SM90 kernel dispatch.
+    Uses pre-allocated buffers from _GlobalTrtllmMLAPlanner, cached contiguous weight
+    matrices, and torch.cat to minimize GPU kernel launches.
     """
     planner = _GlobalTrtllmMLAPlanner
     gen_head_size = kv_lora_rank + qk_rope_head_dim
 
-    weight_reshaped = kv_b_proj_weight.view(
-        num_heads,
-        qk_nope_head_dim + v_head_dim,
-        kv_lora_rank,
+    w_kn, w_v_t = planner.get_weight_matrices(
+        kv_b_proj_weight, num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank
     )
-    w_kn = weight_reshaped[:, :qk_nope_head_dim, :]  # [N, qk_nope_head_dim, kv_lora_rank]
-    w_v = weight_reshaped[:, qk_nope_head_dim:, :]  # [N, v_head_dim, kv_lora_rank]
 
-    # q_absorbed = q_nope @ W_kn -> [N, num_tokens, kv_lora_rank]
-    # bmm: [N, num_tokens, qk_nope_head_dim] @ [N, qk_nope_head_dim, kv_lora_rank]
-    q_nope_t = q_nope_flat.transpose(0, 1)  # [N, num_tokens, qk_nope_head_dim]
-    q_absorbed = torch.bmm(q_nope_t, w_kn)  # [N, num_tokens, kv_lora_rank]
+    # q_absorbed = q_nope @ W_kn -> [num_tokens, N, kv_lora_rank]
+    # einsum produces contiguous output in [B,N,K] layout, avoiding the
+    # transpose that bmm needs and the non-contiguous copy in the subsequent cat.
+    q_absorbed = torch.einsum("bnd,ndk->bnk", q_nope_flat, w_kn)
 
-    # Write q_absorbed and q_pe into pre-allocated fused_q_flat buffer (avoids cat + contiguous)
+    # Build fused_q via cat into pre-allocated buffer (1 kernel instead of 2 copies)
     fused_q_flat = planner.fused_q_flat[:num_tokens]
     fused_q_view = fused_q_flat.view(num_tokens, num_heads, gen_head_size)
-    fused_q_view[:, :, :kv_lora_rank] = q_absorbed.transpose(0, 1)
-    fused_q_view[:, :, kv_lora_rank:] = q_pe_flat
+    torch.cat([q_absorbed, q_pe_flat], dim=-1, out=fused_q_view)
 
     output_latent = planner.output_latent[:num_tokens]
 
-    # Reuse pre-allocated cu_q/cu_kv buffers.
-    # cu_kv_decode[0] is always 0 from initialization and never overwritten by cumsum.
     cu_q = planner.cu_q_decode[: num_tokens + 1]
     cu_kv = planner.cu_kv_decode[: num_tokens + 1]
     num_seq = num_prefill + num_tokens
@@ -908,12 +1074,12 @@ def _handle_decode(
         fmha_scheduler_counter=planner.fmha_scheduler_counter_decode,
     )
 
-    # Project from latent space back to v_head_dim using bmm
-    # output_latent: [num_tokens, N * kv_lora_rank] -> [N, num_tokens, kv_lora_rank]
-    output_t = output_latent.view(num_tokens, num_heads, kv_lora_rank).transpose(0, 1)
-    # bmm: [N, num_tokens, kv_lora_rank] @ [N, kv_lora_rank, v_head_dim]
-    output = torch.bmm(output_t, w_v.transpose(1, 2))  # [N, num_tokens, v_head_dim]
-    return output.transpose(0, 1).reshape(num_tokens, num_heads * v_head_dim).contiguous()
+    # Project from latent space back to v_head_dim using cached contiguous w_v_t.
+    # einsum "bnk,nkv->bnv" produces [B,N,V] contiguous, so .reshape() is a
+    # zero-copy view — eliminates the .contiguous() that bmm+transpose required.
+    output_reshaped = output_latent.view(num_tokens, num_heads, kv_lora_rank)
+    output = torch.einsum("bnk,nkv->bnv", output_reshaped, w_v_t)
+    return output.reshape(num_tokens, num_heads * v_head_dim)
 
 
 # =============================================================================
@@ -971,11 +1137,13 @@ def trtllm_mla_with_cache(
         scale = 1.0 / math.sqrt(qk_head_dim)
 
     num_kv_heads = 1
-    tokens_per_block = kv_cache.shape[3]  # HND: [blocks, 2, heads, tpb, head_dim]
+    tokens_per_block = kv_cache.shape[3]  # HND: [blocks, kv_factor, heads, tpb, head_dim]
 
     gen_head_size = kv_lora_rank + qk_rope_head_dim
 
     planner = _GlobalTrtllmMLAPlanner
+    if planner._tokens_per_block != tokens_per_block:
+        planner._tokens_per_block = tokens_per_block
     host_kv_cache_pool_pointers = planner.get_pool_pointers_for_layer(kv_cache)
 
     quant_mode = 0
@@ -1012,11 +1180,11 @@ def trtllm_mla_with_cache(
         )
 
     # Build latent_cache: [num_tokens, kv_lora_rank + qk_rope_head_dim]
-    # For decode-only, write directly into pre-allocated buffer to avoid cat+contiguous
+    # Use torch.cat with out= for decode-only to write into pre-allocated buffer
+    # with a single kernel instead of two slice-assign copies.
     if num_prefill == 0:
         latent_buf = planner.latent_cache_buf[:num_tokens]
-        latent_buf[:, :kv_lora_rank] = compressed_kv_flat
-        latent_buf[:, kv_lora_rank:] = kpe_flat
+        torch.cat([compressed_kv_flat, kpe_flat], dim=-1, out=latent_buf)
         latent_cache = latent_buf
     else:
         latent_cache = torch.cat([compressed_kv_flat, kpe_flat], dim=-1).contiguous()
@@ -1132,10 +1300,8 @@ def trtllm_mla_with_cache(
             latent_cache[num_prefill_tokens:num_tokens],
             kv_cache,
             planner.block_ids_per_seq,
-            sequence_length,
             num_prefill,
             num_decode,
-            tokens_per_block,
         )
         y[num_prefill_tokens:num_tokens] = _handle_decode(
             q_nope_flat[num_prefill_tokens:num_tokens],
@@ -1169,10 +1335,8 @@ def trtllm_mla_with_cache(
             latent_cache,
             kv_cache,
             planner.block_ids_per_seq,
-            sequence_length,
             0,
             num_tokens,
-            tokens_per_block,
         )
         y = _handle_decode(
             q_nope_flat,
@@ -1283,7 +1447,7 @@ class TrtllmMLAAttention(AttentionDescriptor):
                     cache_config.dtype,
                     compressed_kv_fake.dtype,
                 ),
-                kv_factor=2,
+                kv_factor=1,
                 kv_layout="HND",
             )
         }
