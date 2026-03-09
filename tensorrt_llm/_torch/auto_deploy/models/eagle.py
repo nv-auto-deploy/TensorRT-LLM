@@ -32,6 +32,7 @@ from torch._prims_common import DeviceLikeType
 from torch.export import Dim
 from torch.fx import GraphModule
 
+from ....llmapi.llm_args import MTPDecodingConfig
 from ..utils.logger import ad_logger
 from .custom.modeling_eagle import (
     EagleConfig,
@@ -253,6 +254,20 @@ class EagleOneModelFactory(ModelFactory):
             raise ValueError("speculative_config is required for EagleOneModelFactory.")
 
         self.speculative_config = speculative_config
+        self.is_mtp = isinstance(speculative_config, MTPDecodingConfig)
+
+        # For MTP, derive Eagle-pipeline fields from MTP-specific fields.
+        if self.is_mtp:
+            max_draft_len = (
+                speculative_config.max_draft_len or speculative_config.num_nextn_predict_layers
+            )
+            draft_model_path = speculative_config.speculative_model or model
+        else:
+            max_draft_len = speculative_config.max_draft_len
+            draft_model_path = speculative_config.speculative_model
+        if draft_model_path is None:
+            raise ValueError("speculative_config.speculative_model must be set.")
+        self._max_draft_len = max_draft_len
 
         # Create target factory (AutoModelForCausalLM)
         self.target_factory = AutoModelForCausalLMFactory(
@@ -265,9 +280,6 @@ class EagleOneModelFactory(ModelFactory):
         )
 
         # Create draft factory (EagleDrafter)
-        draft_model_path = speculative_config.speculative_model
-        if draft_model_path is None:
-            raise ValueError("speculative_config.speculative_model must be set.")
         self.draft_factory = EagleDrafterFactory(
             model=str(draft_model_path),
             model_kwargs=speculative_model_kwargs,
@@ -286,9 +298,10 @@ class EagleOneModelFactory(ModelFactory):
 
         draft_config = draft_model.config
         wrapper_config = EagleWrapperConfig(
-            max_draft_len=self.speculative_config.max_draft_len,
+            max_draft_len=self._max_draft_len,
             load_embedding_from_target=getattr(draft_config, "load_embedding_from_target", True),
             load_lm_head_from_target=getattr(draft_config, "load_lm_head_from_target", True),
+            is_mtp=self.is_mtp,
         )
 
         return EagleWrapper(

@@ -634,7 +634,7 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
 
         logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
 
-        return NemotronHCausalLMOutput(logits)
+        return NemotronHCausalLMOutput(logits=logits)
 
 
 AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
@@ -695,6 +695,8 @@ class NemotronHEagleLayer(nn.Module):
             )
 
         # Final norm (only on last layer)
+        # NOTE: The checkpoint has final_layernorm.weight only (no bias),
+        # matching RMSNorm. The PyTorch backend also uses RMSNorm here.
         if has_end_norm:
             self.final_layernorm = NemotronHRMSNorm(config.hidden_size, eps=eps)
 

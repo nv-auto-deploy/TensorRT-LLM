@@ -28,6 +28,7 @@ respective model files and registered via get_eagle_layers().
 """
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Dict, Optional, Union
 
 import torch
@@ -36,6 +37,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
 
+from ....pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ...shim.interface import CachedSequenceInterface
 from ...utils._config import deep_merge_dicts
 from ...utils.logger import ad_logger
@@ -709,6 +711,7 @@ class EagleWrapperConfig:
     max_draft_len: int
     load_embedding_from_target: bool
     load_lm_head_from_target: bool
+    is_mtp: bool = False
 
 
 class EagleWrapper(nn.Module):
@@ -729,6 +732,7 @@ class EagleWrapper(nn.Module):
         self.max_draft_len = config.max_draft_len
         self.load_embedding_from_target = config.load_embedding_from_target
         self.load_lm_head_from_target = config.load_lm_head_from_target
+        self.is_mtp = config.is_mtp
 
     @property
     def _draft_inner_model(self):
@@ -743,6 +747,31 @@ class EagleWrapper(nn.Module):
     def _draft_dtype(self):
         """Get the dtype of the draft model (works before and after export)."""
         return getattr(self._draft_inner_model, "dtype", None) or torch.bfloat16
+
+    def _apply_target_norm_f(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply the target model's final RMSNorm to hidden states.
+
+        Hidden states are captured at the residual add (pre-norm_f), but the MTP
+        head expects post-norm_f. This finds the norm_f weight from the graph's
+        parameters and applies RMSNorm inline, avoiding set_submodule which would
+        interfere with the graph's internal parameter references.
+        """
+        if not hasattr(self, "_norm_f_weight"):
+            # Lazy lookup: find norm_f weight in target model's parameters
+            self._norm_f_weight = None
+            self._norm_f_eps = 1e-5
+            for name, param in self.target_model.named_parameters():
+                if "norm_f" in name and "weight" in name:
+                    self._norm_f_weight = param
+                    break
+        if self._norm_f_weight is None:
+            return hidden_states
+        # Apply RMSNorm: x / rms(x) * weight
+        orig_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self._norm_f_eps)
+        return (self._norm_f_weight.float() * hidden_states).to(orig_dtype)
 
     def apply_eagle3_fc(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply the fc layer that fuses hidden states from multiple target layers."""
@@ -911,14 +940,24 @@ class EagleWrapper(nn.Module):
         # NOTE: we assume gather_context_logits is False so that gathering here works!
         target_logits = csi.info.maybe_gather_and_squeeze(out.logits)
 
-        # TODO: investigate root cause — without this sync the hidden_states_cache buffers
-        # read by _collect_hidden_states can contain stale data, dropping the spec-dec
-        # acceptance rate from ~31% to ~7%.
+        # ---- Phase 2: Collect hidden states ----
+        # TODO: For MTP, a cleaner approach would return hidden states as a second output
+        # from the target model (final_norm_hidden_states). However, this causes NCCL hangs
+        # at TP>1 because the export/sharding pipeline doesn't handle multiple graph outputs.
+        # For now, both MTP and Eagle3 use the detect_hidden_states_for_capture graph transform.
         torch.cuda.synchronize()
-
-        # ---- Phase 2: Collect hidden states from cache buffers ----
         hidden_states = self._collect_hidden_states(csi.named_args, num_total_tokens)
-        hidden_states = self.apply_eagle3_fc(hidden_states)
+        if self.is_mtp:
+            # MTP: hidden states are captured at the residual add (pre-norm_f).
+            # Apply the target model's final RMSNorm to match the PyTorch backend
+            # which passes norm_f(hidden_states) to MTPEagleWorker.
+            hidden_states = self._apply_target_norm_f(hidden_states)
+            # Cast to draft model dtype (e.g. target may be FP8, draft BF16).
+            hidden_states = hidden_states.to(self._draft_dtype)
+        else:
+            # Eagle3: compress hidden states from multiple captured layers via fc.
+            # apply_eagle3_fc also handles the target->draft dtype cast.
+            hidden_states = self.apply_eagle3_fc(hidden_states)
 
         # ---- Phase 3: Sample ----
         # check dtype/device
@@ -972,6 +1011,19 @@ class EagleWrapper(nn.Module):
             new_tokens_lens = torch.ones(num_sequences, dtype=torch.int32, device=device)
             if num_extend > 0:
                 new_tokens_lens[num_prefill:] = new_tokens_lens_extend
+
+        # MTP state promotion: commit accepted intermediate mamba states to base state
+        # immediately after verification, before cache offset computation and draft loop.
+        # Must happen inside model forward (not in ad_executor) for correct timing —
+        # update_mamba_states reads .num_seqs and .num_contexts from attn_metadata.
+        kv_cache_manager = csi.kv_cache_manager
+        if num_extend > 0 and isinstance(kv_cache_manager, MambaHybridCacheManager):
+            if kv_cache_manager.is_speculative():
+                _ctx = SimpleNamespace(num_seqs=num_sequences, num_contexts=num_prefill)
+                kv_cache_manager.update_mamba_states(
+                    attn_metadata=_ctx,
+                    num_accepted_tokens=new_tokens_lens,
+                )
 
         # compute the cache and position offset based on the number of new tokens compared to the
         # maximum draft length. NOTE: cache is currently at the position corresponding to the last

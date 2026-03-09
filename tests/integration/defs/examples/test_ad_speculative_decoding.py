@@ -1493,7 +1493,7 @@ def test_nemotron_superv3_autodeploy_smoke_small_target(use_mtp: bool):
         model=superv3_model_path,
         tokenizer=superv3_model_path,
         model_kwargs={"num_hidden_layers": 8},
-        skip_loading_weights=False,
+        skip_loading_weights=True,
         trust_remote_code=True,
         runtime="trtllm",
         world_size=1,

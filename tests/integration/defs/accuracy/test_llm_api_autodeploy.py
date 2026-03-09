@@ -615,14 +615,18 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         print_memory_usage("after evaluation")
 
     @pytest.mark.skip_less_device_memory(180000)
-    def test_mtp_eagle_one_model(self):
+    @pytest.mark.parametrize("use_mtp", [True, False], ids=["mtp", "no_mtp"])
+    def test_mtp_eagle_one_model(self, use_mtp):
         from tensorrt_llm import llmapi
 
-        speculative_config = llmapi.MTPDecodingConfig(
-            num_nextn_predict_layers=6,
-            mtp_eagle_one_model=True,
-            speculative_model=self.MODEL_PATH_BF16,
-        )
+        if use_mtp:
+            speculative_config = llmapi.MTPDecodingConfig(
+                num_nextn_predict_layers=6,
+                mtp_eagle_one_model=True,
+                speculative_model=self.MODEL_PATH_BF16,
+            )
+        else:
+            speculative_config = None
 
         kwargs = {
             "skip_loading_weights": False,
@@ -656,7 +660,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            self.check_acceptance_rate(llm, min_acceptance_rate=0.0)
+            if use_mtp:
+                self.check_acceptance_rate(llm, min_acceptance_rate=0.0)
 
     @pytest.mark.skip_less_device_memory(180000)
     def test_mtp_eagle_one_model_pytorch(self):

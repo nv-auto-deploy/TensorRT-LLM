@@ -14,7 +14,7 @@ import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
 from types import MethodType, SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -406,6 +406,19 @@ def maybe_pad_for_cuda_graph(func):
     return wrapper
 
 
+class _MambaUpdateContext(NamedTuple):
+    """Lightweight shim matching the AttentionMetadata fields read by update_mamba_states.
+
+    MambaHybridCacheManager.update_mamba_states expects an attn_metadata object
+    with .num_seqs and .num_contexts.  In AutoDeploy we don't have a real
+    AttentionMetadata, so we build this from the CachedSequenceInterface batch
+    info instead.
+    """
+
+    num_seqs: int
+    num_contexts: int
+
+
 class ADEngine(ModelEngine):
     """The AutoDeploy Engine (ADEngine) is the main engine interface to execute AutoDeploy models.
 
@@ -742,7 +755,15 @@ class ADEngine(ModelEngine):
                 "if num_extend > 0, kv_cache_manager must be speculative"
             )
             assert num_decode == 0, "if num_extend > 0, num_decode must be 0"
-            kv_cache_manager.update_mamba_states(num_prefill, num_extend, num_accepted)
+            assert num_accepted is not None, "new_tokens_lens required for mamba state update"
+            ctx = _MambaUpdateContext(
+                num_seqs=num_prefill + num_extend,
+                num_contexts=num_prefill,
+            )
+            kv_cache_manager.update_mamba_states(
+                attn_metadata=ctx,
+                num_accepted_tokens=num_accepted,
+            )
 
     @nvtx_range("ad_run_forward")
     def _run_forward(self) -> Dict[str, Optional[torch.Tensor]]:
@@ -750,11 +771,6 @@ class ADEngine(ModelEngine):
         # TODO (lucaslie): revisit this logic as part of spec dec cudagraph support...
         if getattr(self.model, "_requires_csi", False):
             model_output = self.model(cache_seq_interface=self.cache_seq_interface)
-
-            # MTP state promotion: commit accepted intermediate mamba states to base state
-            # The target model forward includes speculative tokens, some of which it rejects.
-            # We need to promote the intermediate mamba state that results from the accepted tokens alone.
-            self.update_mamba_states(model_output)
         else:
             model_output = self.model(**self.cache_seq_interface.named_args)
 
@@ -950,7 +966,10 @@ def instantiate_sampler(
     spec_config = ad_config.speculative_config
 
     # One-model spec dec: model performs sampling internally, returns pre-computed tokens
-    if spec_config is not None and spec_config.spec_dec_mode.is_eagle3_one_model():
+    if spec_config is not None and (
+        spec_config.spec_dec_mode.is_eagle3_one_model()
+        or spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    ):
         sampler_args = TorchSampler.Args(
             max_seq_len=ad_config.max_seq_len,
             max_draft_len=max_draft_len,
@@ -1042,10 +1061,11 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         spec_config.spec_dec_mode.is_draft_target()
         or spec_config.spec_dec_mode.is_eagle3()
         or spec_config.spec_dec_mode.is_eagle3_one_model()
+        or spec_config.spec_dec_mode.is_mtp_eagle_one_model()
     ):
         raise ValueError(
             "Currently, AutoDeploy only supports speculative decoding in "
-            "draft_target, eagle3, or eagle3_one_model mode."
+            "draft_target, eagle3, eagle3_one_model, or mtp_eagle_one_model mode."
         )
 
     if spec_config is not None and ad_config.guided_decoding_backend is not None:
@@ -1058,6 +1078,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     if (
         spec_config is not None
         and not spec_config.spec_dec_mode.is_eagle3_one_model()
+        and not spec_config.spec_dec_mode.is_mtp_eagle_one_model()
         and (spec_config.spec_dec_mode.is_draft_target() or spec_config.spec_dec_mode.is_eagle3())
     ):
         draft_model_engine = create_draft_model_engine_maybe(

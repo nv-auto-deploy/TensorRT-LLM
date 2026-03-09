@@ -10,7 +10,6 @@ from tensorrt_llm.mapping import Mapping
 
 from ...llmapi.llm_args import (
     BuildConfig,
-    Eagle3DecodingConfig,
     EagleDecodingConfig,
     MTPDecodingConfig,
     SamplerType,
@@ -127,21 +126,20 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                     raise ValueError(
                         "mtp_eagle_one_model and use_mtp_vanilla cannot both be enabled"
                     )
-                speculative_model = (
-                    mtp_cfg.speculative_model
-                    if mtp_cfg.speculative_model is not None
-                    else str(self.model)
-                )
-                self.speculative_config = Eagle3DecodingConfig(
-                    max_draft_len=mtp_cfg.num_nextn_predict_layers,
-                    speculative_model=speculative_model,
-                    eagle3_one_model=True,
-                    eagle3_layers_to_capture={-1},
-                )
+                # MTP uses the eagle one-model pipeline with hidden state capture.
+                # Capture from last layer only ({-1}), then apply norm_f in the wrapper.
+                self.model_factory = "eagle_one_model"
+                self.transforms["detect_hidden_states_for_capture"]["enabled"] = True
+                self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = {
+                    -1
+                }
+                return self
 
         if not isinstance(self.speculative_config, EagleDecodingConfig):
             return self
 
+        # Eagle3 (Llama): uses detect_hidden_states_for_capture graph transform
+        # to capture hidden states from multiple interior layers, compressed via fc.
         self.transforms["detect_hidden_states_for_capture"]["enabled"] = True
         self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
             self.speculative_config.eagle3_layers_to_capture
