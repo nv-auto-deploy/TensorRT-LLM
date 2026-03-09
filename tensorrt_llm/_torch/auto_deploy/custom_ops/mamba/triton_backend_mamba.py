@@ -376,22 +376,13 @@ def _triton_cached_ssm_spec_fake(
     )
 
 
-def triton_cached_ssm_wrapper(hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-    if kwargs:
-        raise TypeError("triton_cached_ssm_wrapper does not accept keyword arguments")
-
-    # args[14] is intermediate_ssm_state_cache (Tensor) in spec mode, or time_step_limit (list) in non-spec.
-    has_intermediate_cache = len(args) > 14 and isinstance(args[14], torch.Tensor)
-    if has_intermediate_cache:
-        return torch.ops.auto_deploy.triton_cached_ssm_spec.default(hidden_states, *args)
-    return torch.ops.auto_deploy.triton_cached_ssm.default(hidden_states, *args)
-
-
 @AttentionRegistry.register("triton_ssm")
 class TritonBackendSSM(BaseBackendSSM):
     @classmethod
     def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
-        return triton_cached_ssm_wrapper
+        if spec_config is not None:
+            return torch.ops.auto_deploy.triton_cached_ssm_spec.default
+        return torch.ops.auto_deploy.triton_cached_ssm.default
 
     @classmethod
     def get_cache_initializers(cls, source_attn_node, cache_config, spec_config=None):

@@ -182,6 +182,8 @@ def _triton_cached_causal_conv1d(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k-1]
     # CONSTANTS
@@ -295,17 +297,22 @@ def _triton_cached_causal_conv1d_spec_fake(
     pass
 
 
-def triton_cached_causal_conv1d_wrapper(input: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-    if kwargs:
-        raise TypeError("triton_cached_causal_conv1d_wrapper does not accept keyword arguments")
+def _make_inplace_wrapper(op):
+    """Create a wrapper that calls an in-place custom op and returns the mutated input."""
 
-    # args[8] is intermediate_conv_state_cache (Tensor) in spec mode, or stride (int) in non-spec.
-    has_intermediate_cache = len(args) > 8 and isinstance(args[8], torch.Tensor)
-    if has_intermediate_cache:
-        torch.ops.auto_deploy.triton_cached_causal_conv1d_spec.default(input, *args)
-    else:
-        torch.ops.auto_deploy.triton_cached_causal_conv1d.default(input, *args)
-    return input
+    def wrapper(input: torch.Tensor, *args) -> torch.Tensor:
+        op(input, *args)
+        return input
+
+    return wrapper
+
+
+_triton_conv_wrapper = _make_inplace_wrapper(
+    torch.ops.auto_deploy.triton_cached_causal_conv1d.default
+)
+_triton_conv_spec_wrapper = _make_inplace_wrapper(
+    torch.ops.auto_deploy.triton_cached_causal_conv1d_spec.default
+)
 
 
 @AttentionRegistry.register("triton_causal_conv")
@@ -339,4 +346,6 @@ class TritonBackendCausalConv(BaseCausalConvDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
-        return triton_cached_causal_conv1d_wrapper
+        if spec_config is not None:
+            return _triton_conv_spec_wrapper
+        return _triton_conv_wrapper
