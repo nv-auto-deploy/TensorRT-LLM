@@ -19,9 +19,8 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.auto_deploy.distributed import common as dist_common
-from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
+from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm.mapping import Mapping
 
 
 def _template_moe_alltoall(
@@ -30,7 +29,7 @@ def _template_moe_alltoall(
     routing_weights: torch.Tensor,
     mlps: List[Callable[[torch.Tensor], torch.Tensor]],
     apply_routing_on_input: bool,
-    mapping: Mapping,
+    mapping: DistConfig,
     max_num_tokens: int = 0,
 ) -> torch.Tensor:
     """
@@ -207,7 +206,7 @@ def _template_moe(
     """
 
     # Check if all-to-all mode is enabled
-    mapping = deserialize_mapping(mapping_config) if mapping_config else None
+    mapping = DistConfig.deserialize(mapping_config) if mapping_config else None
     enable_alltoall = (
         mapping is not None and mapping.enable_attention_dp and mapping.moe_ep_size > 1
     )
