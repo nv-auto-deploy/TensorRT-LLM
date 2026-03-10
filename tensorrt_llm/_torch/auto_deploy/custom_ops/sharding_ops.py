@@ -34,9 +34,10 @@ def view(
 ) -> torch.Tensor:
     """Sharding-aware view/reshape.
 
-    ``tp_scaled_dim`` indicates which element of ``shape`` should be divided by
-    ``tp_size`` when ``apply_sharding_hints`` processes this node.  A value of
-    ``-1`` means no dimension is scaled (unsharded).
+    ``apply_sharding_hints`` divides ``shape[tp_scaled_dim]`` by ``tp_size``.
+
+    Note: requires explicit non-negative scaling dimension (0, 1, 2, ...).
+    ``-1`` means no sharding (the dimension is not scaled).
     """
     return x.reshape(shape).clone()
 
@@ -55,11 +56,11 @@ def split_with_sizes(
     x: torch.Tensor,
     split_sizes: List[int],
     dim: int = -1,
-    tp_scale_sizes: bool = False,
+    shardable: bool = False,
 ) -> List[torch.Tensor]:
     """Sharding-aware split_with_sizes.
 
-    When ``tp_scale_sizes`` is ``True``, ``apply_sharding_hints`` divides every
+    When ``shardable`` is ``True``, ``apply_sharding_hints`` divides every
     element of ``split_sizes`` by ``tp_size``.
     """
 
@@ -71,7 +72,7 @@ def _split_with_sizes_fake(
     x: torch.Tensor,
     split_sizes: List[int],
     dim: int = -1,
-    tp_scale_sizes: bool = False,
+    shardable: bool = False,
 ) -> List[torch.Tensor]:
     return [t.clone() for t in torch.split(x, split_sizes, dim=dim)]
 

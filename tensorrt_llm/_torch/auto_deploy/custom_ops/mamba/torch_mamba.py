@@ -190,7 +190,7 @@ def _torch_ssm(
         float
     ],  # NOTE: `torch` custom ops do not like `Tuple` inputs. Using `List` is the suggested WAR.
     chunk_size: int,
-    tp_mode: str = "none",
+    shardable: bool = False,
 ) -> torch.Tensor:
     y, _ = _torch_ssm_prefill(hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size)
     return y
@@ -207,6 +207,6 @@ def _torch_ssm_meta(
     dt_bias: torch.Tensor,
     time_step_limit: List[float],
     chunk_size: int,
-    tp_mode: str = "none",
+    shardable: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states, dtype=torch.float32)

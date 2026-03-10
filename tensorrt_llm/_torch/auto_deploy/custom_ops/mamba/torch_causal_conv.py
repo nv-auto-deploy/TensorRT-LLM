@@ -15,7 +15,7 @@
 
 """Custom op collection for uncached causal conv (sliding window with 1d)."""
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -31,7 +31,8 @@ def _torch_causal_conv1d(
     dilation: int = 1,
     groups: int = 1,
     padding_mode: str = "zeros",
-    tp_mode: str = "none",
+    shardable: bool = False,
+    output_sizes: Optional[List[int]] = None,
 ) -> torch.Tensor:
     assert padding_mode == "zeros", "padding_mode must be zeros"
 
@@ -62,6 +63,7 @@ def _torch_causal_conv1d_meta(
     dilation: int = 1,
     groups: int = 1,
     padding_mode: str = "zeros",
-    tp_mode: str = "none",
+    shardable: bool = False,
+    output_sizes: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(input)

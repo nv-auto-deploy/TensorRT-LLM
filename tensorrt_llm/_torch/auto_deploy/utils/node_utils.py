@@ -274,6 +274,23 @@ class WeightBiasInfoCache:
             cls._active_instance._weight_shape_cache[node] = shape
 
 
+def get_source_nodes(node: Node) -> List[Node]:
+    """Walk backward through a computation chain and return all source (get_attr) nodes."""
+    result = []
+    visited: set[Node] = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n in visited:
+            continue
+        visited.add(n)
+        if n.op == "get_attr":
+            result.append(n)
+        elif n.op == "call_function":
+            stack.extend(n.all_input_nodes)
+    return result
+
+
 def extract_weight_nodes(node: Node) -> WeightNodes:
     """Extracts the list of weight node and optional bias node from the given parametrized node"""
     gm = node.graph.owning_module

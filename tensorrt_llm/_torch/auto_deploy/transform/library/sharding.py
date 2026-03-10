@@ -49,6 +49,7 @@ from ...utils.node_utils import (
     filtered_nodes,
     get_all_layer_subgraphs,
     get_all_weights_in_subgraph,
+    get_source_nodes,
     is_any_conv_op,
     is_any_delta_op,
     is_any_lin_op,
@@ -3333,8 +3334,8 @@ def _apply_hint_view(gm: GraphModule, node: Node, tp_size: int) -> int:
 
 def _apply_hint_split(gm: GraphModule, node: Node, tp_size: int) -> int:
     """Process a split_with_sizes node: divide all sizes by tp_size."""
-    [tp_scale_sizes] = extract_op_args(node, "tp_scale_sizes")
-    if not tp_scale_sizes:
+    [shardable] = extract_op_args(node, "shardable")
+    if not shardable:
         return 0
 
     split_sizes = list(node.args[1])
@@ -3358,10 +3359,12 @@ def _apply_hint_all_reduce(
 
 
 def _apply_hint_conv1d(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> int:
-    """Process conv1d: shard weight/bias, update groups."""
-    [tp_mode] = extract_op_args(node, "tp_mode")
-    if tp_mode == "none":
+    """Process conv1d: shard weight/bias with fused dims, update groups."""
+    [shardable, output_sizes] = extract_op_args(node, "shardable", "output_sizes")
+    if not shardable:
         return 0
+
+    fused = list(output_sizes) if output_sizes else None
 
     weight_node = node.args[1]
     if weight_node.op == "get_attr":
@@ -3373,6 +3376,7 @@ def _apply_hint_conv1d(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) 
             dim=0,
             rank=tp_rank,
             world_size=tp_size,
+            fused_weight_dims=fused,
         )
 
     bias_node = node.args[2] if len(node.args) > 2 else None
@@ -3385,6 +3389,7 @@ def _apply_hint_conv1d(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) 
             dim=0,
             rank=tp_rank,
             world_size=tp_size,
+            fused_weight_dims=fused,
         )
 
     [groups] = extract_op_args(node, "groups")
@@ -3395,28 +3400,17 @@ def _apply_hint_conv1d(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) 
 
 def _apply_hint_ssm(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> int:
     """Process SSM: shard A, D, dt_bias parameters along head dim."""
-    [tp_mode] = extract_op_args(node, "tp_mode")
-    if tp_mode == "none":
+    [shardable] = extract_op_args(node, "shardable")
+    if not shardable:
         return 0
 
     count = 0
     for arg_name in ("A", "D", "dt_bias"):
         [arg_node] = extract_op_args(node, arg_name)
-        if isinstance(arg_node, Node) and arg_node.op == "call_function":
-            for inp in arg_node.all_input_nodes:
-                if inp.op == "get_attr":
-                    pk, w = _get_weight_param(gm, inp)
-                    shard_weight_tensor(
-                        gm=gm,
-                        weight_tensor=w,
-                        param_key=pk,
-                        dim=0,
-                        rank=tp_rank,
-                        world_size=tp_size,
-                    )
-                    count += 1
-        elif isinstance(arg_node, Node) and arg_node.op == "get_attr":
-            pk, w = _get_weight_param(gm, arg_node)
+        if not isinstance(arg_node, Node):
+            continue
+        for attr_node in get_source_nodes(arg_node):
+            pk, w = _get_weight_param(gm, attr_node)
             shard_weight_tensor(
                 gm=gm,
                 weight_tensor=w,
@@ -3448,8 +3442,6 @@ def _apply_hint_norm(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) ->
             rank=tp_rank,
             world_size=tp_size,
         )
-        [group_size] = extract_op_args(node, "group_size")
-        set_op_args(node, group_size=group_size // tp_size)
         ad_logger.debug(f"  sharded norm weight {param_key}")
         return 1
     return 0
