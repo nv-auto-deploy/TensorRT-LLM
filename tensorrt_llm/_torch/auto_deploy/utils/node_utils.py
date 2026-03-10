@@ -630,6 +630,51 @@ def filtered_nodes(
                 yield node
 
 
+class ShardableOp(Enum):
+    """Ops that carry sharding hints for ``apply_sharding_hints``."""
+
+    LINEAR = "linear"
+    VIEW = "view"
+    SPLIT_WITH_SIZES = "split_with_sizes"
+    ALL_REDUCE = "all_reduce"
+    CONV1D = "conv1d"
+    SSM = "ssm"
+    NORM = "norm"
+    MOE = "moe"
+
+
+def is_any_shardable_op(node: Node) -> Union[ShardableOp, None]:
+    """Return the ``ShardableOp`` kind if *node* is a shardable custom op, else ``None``."""
+    if not isinstance(node, Node) or node.op != "call_function":
+        return None
+    if is_op(node, torch.ops.auto_deploy.torch_linear_simple):
+        return ShardableOp.LINEAR
+    if is_op(node, torch.ops.auto_deploy.view):
+        return ShardableOp.VIEW
+    if is_op(node, torch.ops.auto_deploy.split_with_sizes):
+        return ShardableOp.SPLIT_WITH_SIZES
+    if is_op(node, torch.ops.auto_deploy.all_reduce):
+        return ShardableOp.ALL_REDUCE
+    if is_op(
+        node,
+        [torch.ops.auto_deploy.torch_causal_conv1d],
+    ):
+        return ShardableOp.CONV1D
+    if is_op(node, [torch.ops.auto_deploy.torch_ssm]):
+        return ShardableOp.SSM
+    if is_op(
+        node,
+        [
+            torch.ops.auto_deploy.torch_rmsnorm_gated,
+            torch.ops.auto_deploy.triton_rmsnorm_gated,
+        ],
+    ):
+        return ShardableOp.NORM
+    if is_any_moe_op(node):
+        return ShardableOp.MOE
+    return None
+
+
 def is_any_lin_op(node: Node) -> bool:
     return is_linear_op(node) or is_fake_quantized_linear_op(node)
 
