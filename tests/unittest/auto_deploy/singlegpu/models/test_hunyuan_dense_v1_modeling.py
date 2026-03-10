@@ -126,7 +126,7 @@ def _create_small_hf_config():
     HFConfig = _get_hf_config_class()
     if HFConfig is None:
         return None
-    return HFConfig(
+    cfg = HFConfig(
         vocab_size=1000,
         hidden_size=64,
         intermediate_size=128,
@@ -146,6 +146,9 @@ def _create_small_hf_config():
         tie_word_embeddings=True,
         initializer_range=0.02,
     )
+    # Required for HF attention modules to use eager (non-flash) attention
+    cfg._attn_implementation = "eager"
+    return cfg
 
 
 def _create_small_custom_config() -> HunYuanDenseV1Config:
@@ -311,13 +314,17 @@ def test_attention_equivalence(B, S, dtype):
     x = torch.randn(B, S, hf_config.hidden_size, dtype=dtype)
     position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
 
-    # HF reference
+    # HF reference — pass causal mask to match custom model's is_causal=True
     hf_rope = HFRopeCls(hf_config).to(dtype=dtype)
     hf_cos, hf_sin = hf_rope(x, position_ids)
+    # Causal additive mask: 0 for attended, -inf for masked (future) positions
+    causal_mask = torch.full((S, S), float("-inf"), dtype=torch.float32)
+    causal_mask = torch.triu(causal_mask, diagonal=1)  # upper-tri = -inf
+    causal_mask = causal_mask[None, None, :, :].expand(B, 1, -1, -1)  # [B, 1, S, S]
     hf_out, _ = hf_attn(
         hidden_states=x,
         position_embeddings=(hf_cos, hf_sin),
-        attention_mask=None,
+        attention_mask=causal_mask,
     )
 
     # Custom
@@ -363,15 +370,19 @@ def test_decoder_layer_equivalence(B, S, dtype):
     x = torch.randn(B, S, hf_config.hidden_size, dtype=dtype)
     position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
 
-    # HF reference
+    # HF reference — pass causal mask to match custom model's is_causal=True
     hf_rope = HFRopeCls(hf_config).to(dtype=dtype)
     hf_cos, hf_sin = hf_rope(x, position_ids)
+    # Causal additive mask: 0 for attended, -inf for masked (future) positions
+    causal_mask = torch.full((S, S), float("-inf"), dtype=torch.float32)
+    causal_mask = torch.triu(causal_mask, diagonal=1)
+    causal_mask = causal_mask[None, None, :, :].expand(B, 1, -1, -1)  # [B, 1, S, S]
     # HF decoder layer returns a tuple; unpack the hidden states
     hf_out = hf_layer(
         hidden_states=x,
         position_ids=position_ids,
         position_embeddings=(hf_cos, hf_sin),
-        attention_mask=None,
+        attention_mask=causal_mask,
     )
     if isinstance(hf_out, tuple):
         hf_out = hf_out[0]
@@ -428,9 +439,9 @@ def test_full_model_equivalence(B, S, dtype):
 # ===========================================================================
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
 @torch.no_grad()
-def test_model_can_be_exported():
+def test_model_can_be_exported(device):
     """Test that the custom model can be exported with torch_export_to_gm.
 
     Verifies:
@@ -438,7 +449,6 @@ def test_model_can_be_exported():
     2. Exported graph module produces numerically equivalent output to eager model
     3. Dynamic shapes work with different batch/sequence sizes
     """
-    device = "cuda"
     dtype = torch.bfloat16
     custom_config = _create_small_custom_config()
 
@@ -480,17 +490,19 @@ def test_model_can_be_exported():
     # Compare exported vs eager output
     assert_rmse_close(logits, eager_out.logits, rmse_ratio_tol=0.05, msg="Export: ")
 
-    # Test with different shape for dynamic shapes
+    # Test with different shape to verify dynamic dims produce correct results
     B2, S2 = 1, 4
     input_ids2 = torch.randint(0, custom_config.vocab_size, (B2, S2), device=device)
     position_ids2 = torch.arange(S2, device=device).unsqueeze(0).expand(B2, -1)
+
+    eager_out2 = model(input_ids=input_ids2, position_ids=position_ids2)
 
     with torch.inference_mode():
         out_gm2 = gm(input_ids=input_ids2, position_ids=position_ids2)
 
     logits2 = out_gm2["logits"]
     assert logits2.shape == (B2, S2, custom_config.vocab_size)
-    assert torch.isfinite(logits2).all(), "Exported logits should be finite"
+    assert_rmse_close(logits2, eager_out2.logits, rmse_ratio_tol=0.05, msg="Export dynamic shape: ")
 
 
 # ===========================================================================

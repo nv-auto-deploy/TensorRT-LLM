@@ -202,7 +202,7 @@ class HunYuanDenseV1MLP(nn.Module):
 class HunYuanDenseV1Attention(nn.Module):
     """GQA attention with QK normalization for HunYuan Dense V1.
 
-    Applies RMSNorm to Q and K after projection, before RoPE.
+    Applies RMSNorm to Q and K after RoPE (matching HF implementation order).
     Uses auto_deploy torch_attention and torch_rope_with_explicit_cos_sin ops.
     """
 
@@ -246,10 +246,6 @@ class HunYuanDenseV1Attention(nn.Module):
         k = self.k_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
 
-        # QK normalization (per-head RMSNorm, before RoPE)
-        q = self.query_layernorm(q)
-        k = self.key_layernorm(k)
-
         # Get cos/sin from position_embeddings (full cached from shared rotary embedding)
         cos = position_embeddings[0]  # [max_seq_len, head_dim]
         sin = position_embeddings[1]  # [max_seq_len, head_dim]
@@ -263,6 +259,17 @@ class HunYuanDenseV1Attention(nn.Module):
             cos,
             sin,
             2,  # unsqueeze_dim=2 for BSND
+        )
+
+        # QK normalization (per-head RMSNorm, after RoPE — matches HF order).
+        # Use torch_rmsnorm custom op directly so the output nodes carry proper
+        # fake-tensor metadata for downstream AD transforms (avoids metadata loss
+        # that can occur when plain PyTorch RMSNorm is fused by fuse_rmsnorm).
+        q = torch.ops.auto_deploy.torch_rmsnorm(
+            q, self.query_layernorm.weight, self.query_layernorm.variance_epsilon
+        )
+        k = torch.ops.auto_deploy.torch_rmsnorm(
+            k, self.key_layernorm.weight, self.key_layernorm.variance_epsilon
         )
 
         # Attention using AD custom op in BSND layout
