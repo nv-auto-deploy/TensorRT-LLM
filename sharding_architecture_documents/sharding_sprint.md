@@ -16,8 +16,10 @@
 | Model rewrite | Done | |
 | apply_sharding_hints scaffold | Done | |
 | Stage I: Replicated validation | Done | Model loads, exports, compiles. Runtime SSM cache error is pre-existing. |
-| Stage II: TP linear + auxiliaries | Pending | |
-| Stage III: all_reduce | Pending | |
+| Stage II: TP linear + auxiliaries | Done | Implemented in apply_sharding_hints |
+| Stage III: all_reduce | Done | Implemented in apply_sharding_hints |
+| DistConfig refactor | Done | Decoupled auto_deploy from tensorrt_llm.mapping.Mapping |
+| ShardableOp enum + dispatch | Done | Clean dispatch pattern in apply_sharding_hints |
 | Stage IV: MoE EP | Pending | |
 
 ---
@@ -26,7 +28,7 @@
 
 - Only 5 types of shardable custom ops: **linear**, **view**, **split_with_sizes**, **all_reduce**, plus hint-annotated versions of **conv1d**, **ssm**, and **norm** for Mamba2
 - No custom sharding op for BMM (always translated to torch_moe) or generic collectives (only all_reduce needed)
-- `torch_moe` sharding is fully determined by `Mapping` -- `apply_sharding_hints` injects `a2a_size`/`a2a_rank` (0 = replicated, >0 = EP-aware routing)
+- `torch_moe` sharding is fully determined by `DistConfig` -- `apply_sharding_hints` injects `a2a_size`/`a2a_rank` (0 = replicated, >0 = EP-aware routing)
 - Auxiliary ops (view, split_with_sizes) use only `tp_scaled_dim` or `tp_scale_sizes` -- no redundant `tp_mode`
 - MoE latent projections (`fc1_latent_proj`, `fc2_latent_proj`) are **replicated**, not sharded
 
@@ -46,7 +48,10 @@
 
 - Model: `tensorrt_llm/_torch/auto_deploy/models/custom/new_sharding/modeling_nemotron_h.py`
 - New ops: `tensorrt_llm/_torch/auto_deploy/custom_ops/sharding_ops.py`
+- DistConfig: `tensorrt_llm/_torch/auto_deploy/utils/dist_config.py`
+- ShardableOp enum: `tensorrt_llm/_torch/auto_deploy/utils/node_utils.py`
 - Transform: end of `tensorrt_llm/_torch/auto_deploy/transform/library/sharding.py`
+- Config: `examples/auto_deploy/nemotron_sharding_poc.yaml`
 
 ---
 
@@ -56,3 +61,6 @@
 |------|--------|
 | 2026-03-09 | Sprint started. Branch created. |
 | 2026-03-10 | Stage I complete. Fixed aliasing in view/split ops, added tp_mode to triton_rmsnorm_gated. |
+| 2026-03-10 | Stage II+III complete. Full TP sharding + all_reduce in apply_sharding_hints. |
+| 2026-03-10 | DistConfig refactor. New DistConfig class replaces Mapping in sharding/collectives transforms. |
+| 2026-03-10 | ShardableOp enum + dispatch dict refactor. Cleaner node classification and action dispatch. |
