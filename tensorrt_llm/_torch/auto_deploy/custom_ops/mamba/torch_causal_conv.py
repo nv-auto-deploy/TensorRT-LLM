@@ -31,6 +31,7 @@ def _torch_causal_conv1d(
     dilation: int = 1,
     groups: int = 1,
     padding_mode: str = "zeros",
+    tp_mode: str = "none",
 ) -> torch.Tensor:
     assert padding_mode == "zeros", "padding_mode must be zeros"
 
@@ -61,5 +62,6 @@ def _torch_causal_conv1d_meta(
     dilation: int = 1,
     groups: int = 1,
     padding_mode: str = "zeros",
+    tp_mode: str = "none",
 ) -> torch.Tensor:
     return torch.empty_like(input)
