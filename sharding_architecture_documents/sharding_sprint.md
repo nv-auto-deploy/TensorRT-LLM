@@ -11,11 +11,11 @@
 
 | Stage | Status | Notes |
 |-------|--------|-------|
-| New custom ops (view, split_with_sizes, all_reduce) | In Progress | |
-| Add tp_mode to conv1d, ssm, norm | Pending | |
-| Model rewrite | Pending | |
-| apply_sharding_hints scaffold | Pending | |
-| Stage I: Replicated validation | Pending | |
+| New custom ops (view, split_with_sizes, all_reduce) | Done | |
+| Add tp_mode to conv1d, ssm, norm (incl. triton variant) | Done | |
+| Model rewrite | Done | |
+| apply_sharding_hints scaffold | Done | |
+| Stage I: Replicated validation | Done | Model loads, exports, compiles. Runtime SSM cache error is pre-existing. |
 | Stage II: TP linear + auxiliaries | Pending | |
 | Stage III: all_reduce | Pending | |
 | Stage IV: MoE EP | Pending | |
@@ -55,3 +55,4 @@
 | Date | Change |
 |------|--------|
 | 2026-03-09 | Sprint started. Branch created. |
+| 2026-03-10 | Stage I complete. Fixed aliasing in view/split ops, added tp_mode to triton_rmsnorm_gated. |

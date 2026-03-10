@@ -173,6 +173,7 @@ def triton_rmsnorm_gated(
     eps: float,
     group_size: int,
     norm_before_gate: bool = False,
+    tp_mode: str = "none",
 ) -> torch.Tensor:
     """
     Group RMSNorm with optional SiLU gating, using Triton kernel `_layer_norm_fwd`.
@@ -229,6 +230,7 @@ def _triton_rmsnorm_gated_meta(
     eps: float,
     group_size: int,
     norm_before_gate: bool = False,
+    tp_mode: str = "none",
 ):
     assert x.dim() >= 2, "x must be at least 2D"
     H = x.shape[-1]

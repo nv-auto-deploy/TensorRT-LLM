@@ -38,7 +38,7 @@ def view(
     ``tp_size`` when ``apply_sharding_hints`` processes this node.  A value of
     ``-1`` means no dimension is scaled (unsharded).
     """
-    return x.view(shape)
+    return x.reshape(shape).clone()
 
 
 @view.register_fake
@@ -47,7 +47,7 @@ def _view_fake(
     shape: List[int],
     tp_scaled_dim: int = -1,
 ) -> torch.Tensor:
-    return x.view(shape)
+    return x.reshape(shape).clone()
 
 
 @torch.library.custom_op("auto_deploy::split_with_sizes", mutates_args=())
@@ -62,7 +62,8 @@ def split_with_sizes(
     When ``tp_scale_sizes`` is ``True``, ``apply_sharding_hints`` divides every
     element of ``split_sizes`` by ``tp_size``.
     """
-    return list(torch.split(x, split_sizes, dim=dim))
+
+    return [t.clone() for t in torch.split(x, split_sizes, dim=dim)]
 
 
 @split_with_sizes.register_fake
@@ -72,7 +73,7 @@ def _split_with_sizes_fake(
     dim: int = -1,
     tp_scale_sizes: bool = False,
 ) -> List[torch.Tensor]:
-    return list(torch.split(x, split_sizes, dim=dim))
+    return [t.clone() for t in torch.split(x, split_sizes, dim=dim)]
 
 
 @torch.library.custom_op("auto_deploy::all_reduce", mutates_args=())
