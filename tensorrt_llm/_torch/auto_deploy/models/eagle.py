@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,8 +34,8 @@ from torch.fx import GraphModule
 
 from ..utils.logger import ad_logger
 from .custom.modeling_eagle import (
-    Eagle3DrafterForCausalLM,
     EagleConfig,
+    EagleDrafterForCausalLM,
     EagleWrapper,
     EagleWrapperConfig,
 )
@@ -47,41 +47,27 @@ from .hf import AutoModelForCausalLMFactory
 class EagleDrafterFactory(AutoModelForCausalLMFactory):
     """Factory for building Eagle drafter models.
 
-    This factory handles the mapping from base model types (e.g., "llama") to
-    their corresponding Eagle drafter model implementations. It overrides
-    _build_model() to directly construct the appropriate drafter class based
-    on the checkpoint's model_type.
+    The drafter builds its own model-specific layers internally based on
+    config.model_type, allowing it to work with different base models
+    (Llama, NemotronH, etc.) without the factory needing to know the details.
 
     The checkpoint config is expected to have the base model's model_type
     (e.g., "llama") along with Eagle-specific fields like draft_vocab_size.
     """
 
-    _drafter_classes: Dict[str, type] = {
-        "llama": Eagle3DrafterForCausalLM,
-    }
-
     def _build_model(self, device: DeviceLikeType) -> nn.Module:
         model_config, unused_kwargs = self._get_model_config()
 
-        # Select the appropriate drafter class and config based on the base model type
+        # Get model type for config
         model_type = model_config.model_type
-        if model_type not in self._drafter_classes:
-            raise ValueError(
-                f"Unsupported model_type '{model_type}' for Eagle drafter. "
-                f"Supported types: {list(self._drafter_classes.keys())}"
-            )
-        drafter_cls = self._drafter_classes[model_type]
-        ad_logger.info(
-            f"EagleDrafterFactory: model_type='{model_type}' -> drafter_cls={drafter_cls.__name__}"
-        )
+        ad_logger.info(f"EagleDrafterFactory: building drafter for model_type='{model_type}'")
 
         # Convert base config to EagleConfig, preserving existing values
         # and applying model-specific defaults based on model_type
         model_config = EagleConfig(model_config, model_type)
 
-        # Build the model (same pattern as parent's _build_model)
         with (init_empty_weights if device == "meta" else nullcontext)():
-            model = drafter_cls._from_config(model_config, **unused_kwargs)
+            model = EagleDrafterForCausalLM._from_config(model_config)
 
         if device == "meta":
             # post-init must be called explicitly for HF models with init_empty_weights
@@ -337,6 +323,11 @@ class EagleOneModelFactory(ModelFactory):
 
     def get_sharding_config(self) -> Dict[str, Any]:
         return self.target_factory.get_sharding_config()
+
+    # TODO(govind): It's possible that draft models have different quant configs than target models.
+    # We need to address this possibility.
+    def get_quant_config(self) -> Dict[str, Any]:
+        return self.target_factory.get_quant_config()
 
     def get_cache_config_updates(self) -> Dict[str, Any]:
         return self.target_factory.get_cache_config_updates()

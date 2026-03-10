@@ -131,12 +131,14 @@ class DetectHFAttnLayers(BaseTransform):
 
 def get_cached_attn(
     attn_descriptor: Type[AttentionDescriptor],
+    spec_config=None,
 ):
     """
     Returns the cached attn operator that can be called with HF attn inputs and outputs.
 
     Args:
-        ad_cached_attn_op: the cached attn operator to call.
+        attn_descriptor: the attention descriptor to use.
+        spec_config: optional speculative decoding config for selecting the right op variant.
     Returns:
         cached_attn: the cached attn operator that can be called with HF attn inputs and outputs.
     """
@@ -159,7 +161,7 @@ def get_cached_attn(
         elif attention_layout != "bnsd":
             raise ValueError(f"Unsupported attention layout: {attention_layout}")
 
-        attn_output = attn_descriptor.get_cached_attention_op()(
+        attn_output = attn_descriptor.get_cached_attention_op(spec_config=spec_config)(
             query,
             key,
             value,

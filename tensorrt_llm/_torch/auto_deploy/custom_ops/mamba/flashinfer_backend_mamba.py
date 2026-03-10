@@ -58,10 +58,11 @@ def _flashinfer_cached_ssm(
     )
     ssm_state_size = B.shape[3]
     batch_info = BatchInfo(batch_info_host)
-    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
-    num_seq = num_prefill + num_decode
-    num_total_tokens = num_prefill_tokens + num_decode
-    # Preallocate output tensor (zeros so padding positions are clean)
+    num_prefill, _, num_decode = batch_info.get_num_sequences()
+    num_prefill_tokens, _, num_decode_tokens = batch_info.get_num_tokens()
+    num_total_tokens = num_prefill_tokens + num_decode_tokens
+    # Preallocate output tensor to avoid memcpy cost for merging prefill
+    # and decode outputs
     preallocated_ssm_out = torch.zeros(
         [bs, num_heads, head_dim],
         dtype=hidden_states.dtype,
@@ -69,7 +70,7 @@ def _flashinfer_cached_ssm(
     )
     preallocated_ssm_out_p = preallocated_ssm_out[:num_prefill_tokens]
 
-    num_prefill, num_prefill_tokens, num_total_tokens, num_seq = _run_ssm_prefill(
+    _run_ssm_prefill(
         hs_flat,
         B_flat,
         C_flat,
@@ -90,7 +91,6 @@ def _flashinfer_cached_ssm(
         preallocated_ssm_out_p.unsqueeze(0),
     )
 
-    num_decode = num_total_tokens - num_prefill_tokens
     decode_inputs = _prepare_ssm_decode_inputs(
         hs_flat,
         B_flat,
@@ -102,8 +102,8 @@ def _flashinfer_cached_ssm(
         slot_idx,
         num_prefill,
         num_prefill_tokens,
-        num_seq,
-        num_total_tokens,
+        num_decode,
+        num_decode_tokens,
         num_heads,
         head_dim,
         ssm_state_size,
@@ -188,12 +188,12 @@ FLASHINFER_SUPPORTED_HEAD_DIMS = [64, 128]
 @AttentionRegistry.register("flashinfer_ssm")
 class FlashinferBackendSSM(BaseBackendSSM):
     @classmethod
-    def get_cached_attention_op(cls) -> MHACallable:
+    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
         return torch.ops.auto_deploy.flashinfer_cached_ssm.default
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig
+        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
     ) -> ResourceHandlerDict:
         ret = super().get_cache_initializers(source_attn_node, cache_config)
 
