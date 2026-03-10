@@ -10,8 +10,8 @@ enable_chunked_prefill: true
 model_factory: AutoModelForCausalLM
 kv_cache_config:
   enable_block_reuse: false
-  free_gpu_memory_fraction: 0.8
-  tokens_per_block: 32
+  free_gpu_memory_fraction: 0.7
+  tokens_per_block: 64
 model_kwargs:
   torch_dtype: bfloat16
 transforms:
