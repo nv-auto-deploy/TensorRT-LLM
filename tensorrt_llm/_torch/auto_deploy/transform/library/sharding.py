@@ -3332,6 +3332,235 @@ def detect_ep_shard(
 # New hint-driven sharding transform (PoC)
 # =============================================================================
 
+_HINT_LINEAR_OPS = [
+    "auto_deploy::torch_linear_simple",
+]
+
+_HINT_VIEW_OP = "auto_deploy::view"
+_HINT_SPLIT_OP = "auto_deploy::split_with_sizes"
+_HINT_ALL_REDUCE_OP = "auto_deploy::all_reduce"
+
+_HINT_CONV1D_OPS = [
+    "auto_deploy::torch_causal_conv1d",
+]
+
+_HINT_SSM_OPS = [
+    "auto_deploy::torch_ssm",
+]
+
+_HINT_NORM_OPS = [
+    "auto_deploy::torch_rmsnorm_gated",
+    "auto_deploy::triton_rmsnorm_gated",
+]
+
+
+def _node_op_name(node: Node) -> str:
+    if node.op != "call_function":
+        return ""
+    target = node.target
+    if hasattr(target, "_qualname"):
+        return target._qualname.split(".")[0]
+    if hasattr(target, "__module__") and hasattr(target, "__name__"):
+        return f"{target.__module__}.{target.__name__}"
+    return str(target)
+
+
+def _matches_any(node: Node, op_names: list) -> bool:
+    name = _node_op_name(node)
+    return any(op in name for op in op_names)
+
+
+def _get_weight_param(gm: GraphModule, weight_node: Node) -> Tuple[str, torch.Tensor]:
+    """Extract parameter key and tensor from a get_attr weight node."""
+    param_key = weight_node.target
+    param = gm.get_parameter(param_key)
+    return param_key, param
+
+
+def _apply_hint_linear(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> int:
+    """Process a torch_linear_simple node with TP hints."""
+    [tp_mode, output_sizes, tp_min_local_shape] = extract_op_args(
+        node, "tp_mode", "output_sizes", "tp_min_local_shape"
+    )
+    if tp_mode == "none":
+        return 0
+
+    weight_node = node.args[1]
+    if weight_node.op != "get_attr":
+        ad_logger.warning(f"apply_sharding_hints: linear weight is not get_attr: {weight_node}")
+        return 0
+
+    param_key, weight = _get_weight_param(gm, weight_node)
+    dim = 0 if tp_mode == "colwise" else 1
+
+    shard_weight_tensor(
+        gm=gm,
+        weight_tensor=weight,
+        param_key=param_key,
+        dim=dim,
+        rank=tp_rank,
+        world_size=tp_size,
+        min_local_shape=tp_min_local_shape if tp_min_local_shape else 1,
+        fused_weight_dims=list(output_sizes) if output_sizes else None,
+    )
+
+    bias_node = node.args[2] if len(node.args) > 2 else None
+    if bias_node is not None and bias_node.op == "get_attr" and tp_mode == "colwise":
+        bias_key, bias = _get_weight_param(gm, bias_node)
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=bias,
+            param_key=bias_key,
+            dim=0,
+            rank=tp_rank,
+            world_size=tp_size,
+            fused_weight_dims=list(output_sizes) if output_sizes else None,
+        )
+
+    ad_logger.debug(f"  sharded linear {param_key} tp_mode={tp_mode}")
+    return 1
+
+
+def _apply_hint_view(gm: GraphModule, node: Node, tp_size: int) -> int:
+    """Process a view node: divide shape[tp_scaled_dim] by tp_size."""
+    [tp_scaled_dim] = extract_op_args(node, "tp_scaled_dim")
+    if tp_scaled_dim == -1:
+        return 0
+
+    shape = list(node.args[1])
+    if tp_scaled_dim < 0:
+        tp_scaled_dim = len(shape) + tp_scaled_dim
+    if tp_scaled_dim < len(shape) and isinstance(shape[tp_scaled_dim], int):
+        shape[tp_scaled_dim] = shape[tp_scaled_dim] // tp_size
+        set_op_args(node, shape=shape)
+        ad_logger.debug(f"  updated view shape at dim {tp_scaled_dim}: {shape}")
+        return 1
+    return 0
+
+
+def _apply_hint_split(gm: GraphModule, node: Node, tp_size: int) -> int:
+    """Process a split_with_sizes node: divide all sizes by tp_size."""
+    [tp_scale_sizes] = extract_op_args(node, "tp_scale_sizes")
+    if not tp_scale_sizes:
+        return 0
+
+    split_sizes = list(node.args[1])
+    scaled = [s // tp_size for s in split_sizes]
+    set_op_args(node, split_sizes=scaled)
+    ad_logger.debug(f"  updated split_with_sizes: {split_sizes} -> {scaled}")
+    return 1
+
+
+def _apply_hint_all_reduce(
+    gm: GraphModule, node: Node, tp_size: int, allreduce_strategy: str
+) -> int:
+    """Replace all_reduce placeholder with real dist.all_reduce or identity."""
+    if tp_size <= 1:
+        return 0
+
+    node.target = torch.ops.auto_deploy.torch_dist_all_reduce.default
+    node.args = (node.args[0], allreduce_strategy)
+    ad_logger.debug("  inserted real all_reduce")
+    return 1
+
+
+def _apply_hint_conv1d(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> int:
+    """Process conv1d: shard weight/bias, update groups."""
+    [tp_mode] = extract_op_args(node, "tp_mode")
+    if tp_mode == "none":
+        return 0
+
+    weight_node = node.args[1]
+    if weight_node.op == "get_attr":
+        param_key, weight = _get_weight_param(gm, weight_node)
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=weight,
+            param_key=param_key,
+            dim=0,
+            rank=tp_rank,
+            world_size=tp_size,
+        )
+
+    bias_node = node.args[2] if len(node.args) > 2 else None
+    if bias_node is not None and bias_node.op == "get_attr":
+        bias_key, bias = _get_weight_param(gm, bias_node)
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=bias,
+            param_key=bias_key,
+            dim=0,
+            rank=tp_rank,
+            world_size=tp_size,
+        )
+
+    [groups] = extract_op_args(node, "groups")
+    set_op_args(node, groups=groups // tp_size)
+    ad_logger.debug(f"  sharded conv1d, groups {groups} -> {groups // tp_size}")
+    return 1
+
+
+def _apply_hint_ssm(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> int:
+    """Process SSM: shard A, D, dt_bias parameters along head dim."""
+    [tp_mode] = extract_op_args(node, "tp_mode")
+    if tp_mode == "none":
+        return 0
+
+    count = 0
+    for arg_name in ("A", "D", "dt_bias"):
+        [arg_node] = extract_op_args(node, arg_name)
+        if isinstance(arg_node, Node) and arg_node.op == "call_function":
+            for inp in arg_node.all_input_nodes:
+                if inp.op == "get_attr":
+                    pk, w = _get_weight_param(gm, inp)
+                    shard_weight_tensor(
+                        gm=gm,
+                        weight_tensor=w,
+                        param_key=pk,
+                        dim=0,
+                        rank=tp_rank,
+                        world_size=tp_size,
+                    )
+                    count += 1
+        elif isinstance(arg_node, Node) and arg_node.op == "get_attr":
+            pk, w = _get_weight_param(gm, arg_node)
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=w,
+                param_key=pk,
+                dim=0,
+                rank=tp_rank,
+                world_size=tp_size,
+            )
+            count += 1
+
+    ad_logger.debug(f"  sharded SSM params ({count} tensors)")
+    return 1 if count > 0 else 0
+
+
+def _apply_hint_norm(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> int:
+    """Process gated RMS norm: shard weight parameter."""
+    [tp_mode] = extract_op_args(node, "tp_mode")
+    if tp_mode == "none":
+        return 0
+
+    weight_node = node.args[1]
+    if weight_node.op == "get_attr":
+        param_key, weight = _get_weight_param(gm, weight_node)
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=weight,
+            param_key=param_key,
+            dim=0,
+            rank=tp_rank,
+            world_size=tp_size,
+        )
+        [group_size] = extract_op_args(node, "group_size")
+        set_op_args(node, group_size=group_size // tp_size)
+        ad_logger.debug(f"  sharded norm weight {param_key}")
+        return 1
+    return 0
+
 
 @TransformRegistry.register("apply_sharding_hints")
 class ApplyShardingHints(BaseTransform):
@@ -3364,16 +3593,43 @@ class ApplyShardingHints(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        ad_logger.info(
-            f"apply_sharding_hints: processing graph with mapping "
-            f"(tp={mapping.tp_size}, ep={mapping.moe_ep_size})"
+        tp_size = mapping.tp_size
+        tp_rank = mapping.tp_rank
+        allreduce_strategy = (
+            self.config.allreduce_strategy.name
+            if hasattr(self.config, "allreduce_strategy") and self.config.allreduce_strategy
+            else "NCCL"
         )
 
-        # TODO: Stage II -- process linear, view, split_with_sizes, conv1d, ssm, norm
-        # TODO: Stage III -- process all_reduce
-        # TODO: Stage IV -- process torch_moe
+        ad_logger.info(
+            f"apply_sharding_hints: tp_size={tp_size}, tp_rank={tp_rank}, "
+            f"ep_size={mapping.moe_ep_size}, strategy={allreduce_strategy}"
+        )
 
         num_updates = 0
+
+        for node in list(gm.graph.nodes):
+            if node.op != "call_function":
+                continue
+
+            if _matches_any(node, _HINT_LINEAR_OPS):
+                num_updates += _apply_hint_linear(gm, node, tp_rank, tp_size)
+            elif _node_op_name(node) == _HINT_VIEW_OP or _HINT_VIEW_OP in str(node.target):
+                num_updates += _apply_hint_view(gm, node, tp_size)
+            elif _node_op_name(node) == _HINT_SPLIT_OP or _HINT_SPLIT_OP in str(node.target):
+                num_updates += _apply_hint_split(gm, node, tp_size)
+            elif _node_op_name(node) == _HINT_ALL_REDUCE_OP or _HINT_ALL_REDUCE_OP in str(
+                node.target
+            ):
+                num_updates += _apply_hint_all_reduce(gm, node, tp_size, allreduce_strategy)
+            elif _matches_any(node, _HINT_CONV1D_OPS):
+                num_updates += _apply_hint_conv1d(gm, node, tp_rank, tp_size)
+            elif _matches_any(node, _HINT_SSM_OPS):
+                num_updates += _apply_hint_ssm(gm, node, tp_rank, tp_size)
+            elif _matches_any(node, _HINT_NORM_OPS):
+                num_updates += _apply_hint_norm(gm, node, tp_rank, tp_size)
+
+        ad_logger.info(f"apply_sharding_hints: {num_updates} nodes processed")
 
         gm.graph.lint()
         gm.recompile()
