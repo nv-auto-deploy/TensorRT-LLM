@@ -62,8 +62,23 @@ class PromptConfig(BaseModel):
                     "content": "How to fix slicing in golf?",
                 }
             ],
-            # More prompts...
             {"prompt": "Where is the capital of Iceland? "},
+            "What are the three laws of thermodynamics? ",
+            {"prompt": "Summarize the plot of Romeo and Juliet in two sentences: "},
+            [
+                {
+                    "role": "user",
+                    "content": "Write a Python function that checks if a number is prime.",
+                }
+            ],
+            "Explain the difference between a compiler and an interpreter: ",
+            {"prompt": "What causes the northern lights? "},
+            [
+                {
+                    "role": "user",
+                    "content": "What are the health benefits of drinking green tea?",
+                }
+            ],
         ],
         description="Example queries to prompt the model with. We support both TRT-LLM text-only "
         "queries via the 'prompt' key and full-scale HF message template called via "
