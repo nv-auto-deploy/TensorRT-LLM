@@ -1,0 +1,3 @@
+# Configuration for OLMo-2 32B (allenai/OLMo-2-0325-32B-DPO)
+world_size: 4
+trust_remote_code: true
