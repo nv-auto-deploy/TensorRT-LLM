@@ -45,11 +45,7 @@ from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactor
 
 
 class Qwen3RMSNorm(nn.Module):
-    """RMS Normalization for Qwen3.
-
-    Uses standard torch operations so AD fusion passes can replace with
-    the appropriate backend (flashinfer/triton) based on config.
-    """
+    """RMS Normalization for Qwen3 using AutoDeploy torch_rmsnorm reference op."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -57,11 +53,9 @@ class Qwen3RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return torch.ops.auto_deploy.torch_rmsnorm(
+            hidden_states, self.weight, self.variance_epsilon
+        )
 
 
 class Qwen3RotaryEmbedding(nn.Module):

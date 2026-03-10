@@ -1,10 +1,4 @@
-runtime: trtllm
-attn_backend: trtllm
-compile_backend: torch-simple
-model_factory: AutoModelForCausalLM
-skip_loading_weights: false
-max_seq_len: 512
-world_size: 1
+# Workaround: disable fused FP8 linear (NVRTC compilation failure on CUDA 13.1)
 transforms:
   fuse_finegrained_fp8_linear:
     enabled: false
