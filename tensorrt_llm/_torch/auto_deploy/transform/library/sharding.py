@@ -3326,3 +3326,61 @@ def detect_ep_shard(
     return TransformInfo(
         skipped=False, num_matches=num_moe_patterns, is_clean=False, has_valid_shapes=False
     )
+
+
+# =============================================================================
+# New hint-driven sharding transform (PoC)
+# =============================================================================
+
+
+@TransformRegistry.register("apply_sharding_hints")
+class ApplyShardingHints(BaseTransform):
+    """Deterministic, node-local sharding transform driven by hint kwargs.
+
+    Iterates graph nodes and applies sharding based on explicit hint arguments
+    (tp_mode, tp_scaled_dim, tp_scale_sizes, etc.) together with the runtime
+    Mapping object.  No cross-node propagation, no topology inference.
+    """
+
+    config: ShardingTransformConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return ShardingTransformConfig
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        mapping = shared_config.mapping
+        world_size = shared_config.world_size
+
+        if mapping is None or world_size < 2:
+            ad_logger.info("apply_sharding_hints: world_size < 2, skipping")
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        ad_logger.info(
+            f"apply_sharding_hints: processing graph with mapping "
+            f"(tp={mapping.tp_size}, ep={mapping.moe_ep_size})"
+        )
+
+        # TODO: Stage II -- process linear, view, split_with_sizes, conv1d, ssm, norm
+        # TODO: Stage III -- process all_reduce
+        # TODO: Stage IV -- process torch_moe
+
+        num_updates = 0
+
+        gm.graph.lint()
+        gm.recompile()
+
+        return gm, TransformInfo(
+            skipped=False,
+            num_matches=num_updates,
+            is_clean=(num_updates == 0),
+            has_valid_shapes=True,
+        )

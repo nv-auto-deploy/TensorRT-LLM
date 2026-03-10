@@ -112,6 +112,7 @@ def torch_rmsnorm_gated(
     eps: float,
     group_size: int,
     norm_before_gate: bool = False,
+    tp_mode: str = "none",
 ) -> torch.Tensor:
     """Custom operator for Torch gated RMSNorm implementation.
 
@@ -158,6 +159,7 @@ def _(
     eps: float,
     group_size: int,
     norm_before_gate: bool = False,
+    tp_mode: str = "none",
 ) -> torch.Tensor:
     """Fake implementation for the custom operator during tracing."""
     return x.new_empty(x.shape, dtype=x.dtype)
