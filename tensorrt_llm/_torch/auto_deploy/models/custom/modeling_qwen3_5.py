@@ -1336,6 +1336,7 @@ class Qwen3_5Model(nn.Module):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.Tensor] = None,
@@ -1343,7 +1344,12 @@ class Qwen3_5Model(nn.Module):
         video_grid_thw: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Qwen3_5Output:
-        """Forward pass with optional vision inputs."""
+        """Forward pass with optional vision inputs.
+
+        For text-only inputs the runtime-provided ``position_ids`` are used
+        directly (expanded to 3D for mRoPE).  For multimodal inputs,
+        ``get_rope_index`` computes spatial (T, H, W) positions.
+        """
         # Get input embeddings
         inputs_embeds = self.language_model.embed_tokens(input_ids)
 
@@ -1367,14 +1373,28 @@ class Qwen3_5Model(nn.Module):
             video_embeds = video_embeds.to(inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-        # Compute mRoPE position IDs
-        position_ids, mrope_position_deltas = self.get_rope_index(
-            input_ids,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            attention_mask=attention_mask,
-        )
-        self.rope_deltas = mrope_position_deltas
+        # Determine position IDs
+        has_vision = pixel_values is not None or pixel_values_videos is not None
+        if has_vision:
+            # Multimodal: compute mRoPE positions with spatial (T, H, W) layout
+            position_ids, mrope_position_deltas = self.get_rope_index(
+                input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                attention_mask=attention_mask,
+            )
+        elif position_ids is not None:
+            # Text-only with runtime-provided position_ids: expand 2D -> 3D for mRoPE
+            if position_ids.ndim == 2:
+                position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+            mrope_position_deltas = torch.zeros(
+                position_ids.shape[1], 1, device=position_ids.device, dtype=torch.long
+            )
+        else:
+            # Fallback: sequential positions
+            position_ids, mrope_position_deltas = self.get_rope_index(
+                input_ids, attention_mask=attention_mask
+            )
 
         # Compute position embeddings outside the language model
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
@@ -1411,6 +1431,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.Tensor] = None,
@@ -1420,6 +1441,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
     ) -> Qwen3_5ConditionalOutput:
         outputs = self.model(
             input_ids=input_ids,
+            position_ids=position_ids,
             attention_mask=attention_mask,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
