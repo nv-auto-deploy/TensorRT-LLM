@@ -45,7 +45,9 @@ from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactor
 class Qwen3_5TextConfig(PretrainedConfig):
     """Minimal config class for Qwen3.5 dense text model.
 
-    Mirrors the attributes of the upstream Qwen3_5TextConfig. Only attributes
+    Bundled here because ``qwen3_5`` / ``qwen3_5_text`` are not yet registered
+    in the installed transformers version (requires transformers >= 4.58).
+    Mirrors the attributes of the upstream Qwen3_5TextConfig.  Only attributes
     needed by the slimmed-down prefill model are included.
     """
 
@@ -133,7 +135,7 @@ class Qwen3_5TextConfig(PretrainedConfig):
 
 
 class Qwen3_5RMSNorm(nn.Module):
-    """RMSNorm with weight scaling.
+    """RMSNorm using the ``torch_rmsnorm`` autodeploy custom op.
 
     The HF checkpoint stores weights in ``(1 + w)`` parameterisation (zeros
     init). A load-time pre-hook adds 1.0 so that the forward can use a plain
@@ -154,28 +156,30 @@ class Qwen3_5RMSNorm(nn.Module):
             state_dict[key] = state_dict[key] + 1.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        output = x.to(torch.float32)
-        output = output * torch.rsqrt(output.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (self.weight.to(torch.float32) * output).to(input_dtype)
+        return torch.ops.auto_deploy.torch_rmsnorm(x, self.weight, self.eps)
 
 
 class Qwen3_5RMSNormGated(nn.Module):
-    """Gated RMSNorm: norm(x) * weight * silu(gate). Weight is initialized to ones."""
+    """Gated RMSNorm using the ``torch_rmsnorm_gated`` autodeploy custom op.
+
+    Computes: norm(x) * weight * silu(gate).
+    """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
+        self.hidden_size = hidden_size
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        hidden_states = self.weight * hidden_states.to(input_dtype)
-        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
-        return hidden_states.to(input_dtype)
+        return torch.ops.auto_deploy.torch_rmsnorm_gated(
+            hidden_states,
+            self.weight,
+            gate,
+            self.variance_epsilon,
+            group_size=self.hidden_size,
+            norm_before_gate=True,
+        )
 
 
 # =============================================================================
@@ -218,7 +222,12 @@ def apply_rotary_pos_emb(
 
 
 class Qwen3_5TextRotaryEmbedding(nn.Module):
-    """Simplified mRoPE for text-only prefill. Supports only the "default" rope type."""
+    """Simplified mRoPE for text-only prefill. Supports only the "default" rope type.
+
+    Note: No AD rope op is used here because the existing ``torch_rope_*`` ops do not
+    support interleaved mRoPE with 3D position_ids (shape ``(3, B, S)``).  Plain PyTorch
+    is used instead; AD fusion transforms handle replacement at deployment time.
+    """
 
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
@@ -326,7 +335,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Gated RMSNorm (per head_v_dim)
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
 
-        # Projections (separate, matching Qwen3.5 checkpoint structure)
+        # Projections — split layout matches the Qwen3.5 checkpoint directly
+        # (in_proj_qkv, in_proj_z, in_proj_b, in_proj_a).
+        # Note: HF Qwen3Next uses fused projections (in_proj_qkvz, in_proj_ba) which
+        # differ from the Qwen3.5 checkpoint format.  No load hook is needed here since
+        # the weight names already match the checkpoint.
         self.in_proj_qkv = nn.Linear(
             self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False
         )
@@ -334,58 +347,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
-
-        # Hook to handle HF Qwen3Next fused checkpoint format (in_proj_qkvz, in_proj_ba)
-        self._register_load_state_dict_pre_hook(self._split_fused_projections)
-
-    def _split_fused_projections(self, state_dict, prefix, *args):
-        """Split fused HF Qwen3Next projections into separate ones if present.
-
-        HF Qwen3Next uses:
-          - in_proj_qkvz.weight: [key_dim*2 + value_dim*2, hidden_size]
-          - in_proj_ba.weight: [num_v_heads*2, hidden_size]
-
-        Qwen3.5 checkpoint and this model use:
-          - in_proj_qkv.weight: [key_dim*2 + value_dim, hidden_size]
-          - in_proj_z.weight: [value_dim, hidden_size]
-          - in_proj_b.weight: [num_v_heads, hidden_size]
-          - in_proj_a.weight: [num_v_heads, hidden_size]
-        """
-        qkvz_key = prefix + "in_proj_qkvz.weight"
-        ba_key = prefix + "in_proj_ba.weight"
-
-        if qkvz_key in state_dict:
-            w = state_dict.pop(qkvz_key)
-            # Reshape into [num_k_heads, group_dim, hidden_size]
-            group_dim = (
-                2 * self.head_k_dim + 2 * self.head_v_dim * self.num_v_heads // self.num_k_heads
-            )
-            grouped = w.view(self.num_k_heads, group_dim, self.hidden_size)
-            split_sizes = [
-                self.head_k_dim,
-                self.head_k_dim,
-                (self.num_v_heads // self.num_k_heads) * self.head_v_dim,
-                (self.num_v_heads // self.num_k_heads) * self.head_v_dim,
-            ]
-            q, k, v, z = torch.split(grouped, split_sizes, dim=1)
-            qkv = torch.cat(
-                [
-                    q.reshape(-1, self.hidden_size),
-                    k.reshape(-1, self.hidden_size),
-                    v.reshape(-1, self.hidden_size),
-                ],
-                dim=0,
-            )
-            state_dict[prefix + "in_proj_qkv.weight"] = qkv
-            state_dict[prefix + "in_proj_z.weight"] = z.reshape(-1, self.hidden_size)
-
-        if ba_key in state_dict:
-            w = state_dict.pop(ba_key)
-            b_per_group = self.num_v_heads // self.num_k_heads
-            grouped = w.view(self.num_k_heads, 2 * b_per_group, self.hidden_size)
-            b, a = torch.split(grouped, [b_per_group, b_per_group], dim=1)
-            state_dict[prefix + "in_proj_b.weight"] = b.reshape(-1, self.hidden_size)
-            state_dict[prefix + "in_proj_a.weight"] = a.reshape(-1, self.hidden_size)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
@@ -791,7 +752,11 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
 
 
 class Qwen3_5VisionConfig(PretrainedConfig):
-    """Config class for the Qwen3.5 vision tower."""
+    """Config class for the Qwen3.5 vision tower.
+
+    Bundled here because ``qwen3_5`` is not yet registered in the installed
+    transformers version (requires transformers >= 4.58).
+    """
 
     model_type = "qwen3_5_vision"
 
