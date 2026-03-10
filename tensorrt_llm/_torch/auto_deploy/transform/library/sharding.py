@@ -40,6 +40,7 @@ from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     LayerSubgraph,
     LayerType,
+    ShardableOp,
     WeightBiasInfoCache,
     bfs,
     extract_op_args,
@@ -52,6 +53,7 @@ from ...utils.node_utils import (
     is_any_delta_op,
     is_any_lin_op,
     is_any_moe_op,
+    is_any_shardable_op,
     is_any_ssm_op,
     is_op,
     is_weight_node,
@@ -3260,43 +3262,6 @@ def detect_ep_shard(
 # New hint-driven sharding transform (PoC)
 # =============================================================================
 
-_HINT_LINEAR_OPS = [
-    "auto_deploy::torch_linear_simple",
-]
-
-_HINT_VIEW_OP = "auto_deploy::view"
-_HINT_SPLIT_OP = "auto_deploy::split_with_sizes"
-_HINT_ALL_REDUCE_OP = "auto_deploy::all_reduce"
-
-_HINT_CONV1D_OPS = [
-    "auto_deploy::torch_causal_conv1d",
-]
-
-_HINT_SSM_OPS = [
-    "auto_deploy::torch_ssm",
-]
-
-_HINT_NORM_OPS = [
-    "auto_deploy::torch_rmsnorm_gated",
-    "auto_deploy::triton_rmsnorm_gated",
-]
-
-
-def _node_op_name(node: Node) -> str:
-    if node.op != "call_function":
-        return ""
-    target = node.target
-    if hasattr(target, "_qualname"):
-        return target._qualname.split(".")[0]
-    if hasattr(target, "__module__") and hasattr(target, "__name__"):
-        return f"{target.__module__}.{target.__name__}"
-    return str(target)
-
-
-def _matches_any(node: Node, op_names: list) -> bool:
-    name = _node_op_name(node)
-    return any(op in name for op in op_names)
-
 
 def _get_weight_param(gm: GraphModule, weight_node: Node) -> Tuple[str, torch.Tensor]:
     """Extract parameter key and tensor from a get_attr weight node."""
@@ -3541,33 +3506,25 @@ class ApplyShardingHints(BaseTransform):
             f"ep_size={config.dist_config.moe_ep_size}, strategy={allreduce_strategy}"
         )
 
+        shardable_actions: Dict[ShardableOp, Callable] = {
+            ShardableOp.LINEAR: lambda n: _apply_hint_linear(gm, n, tp_rank, tp_size),
+            ShardableOp.VIEW: lambda n: _apply_hint_view(gm, n, tp_size),
+            ShardableOp.SPLIT_WITH_SIZES: lambda n: _apply_hint_split(gm, n, tp_size),
+            ShardableOp.ALL_REDUCE: lambda n: _apply_hint_all_reduce(
+                gm, n, tp_size, allreduce_strategy
+            ),
+            ShardableOp.CONV1D: lambda n: _apply_hint_conv1d(gm, n, tp_rank, tp_size),
+            ShardableOp.SSM: lambda n: _apply_hint_ssm(gm, n, tp_rank, tp_size),
+            ShardableOp.NORM: lambda n: _apply_hint_norm(gm, n, tp_rank, tp_size),
+        }
+
         num_updates = 0
-
         for node in list(gm.graph.nodes):
-            if node.op != "call_function":
-                continue
-
-            if _matches_any(node, _HINT_LINEAR_OPS):
-                num_updates += _apply_hint_linear(gm, node, tp_rank, tp_size)
-            elif _node_op_name(node) == _HINT_VIEW_OP or _HINT_VIEW_OP in str(node.target):
-                num_updates += _apply_hint_view(gm, node, tp_size)
-            elif _node_op_name(node) == _HINT_SPLIT_OP or _HINT_SPLIT_OP in str(node.target):
-                num_updates += _apply_hint_split(gm, node, tp_size)
-            elif _node_op_name(node) == _HINT_ALL_REDUCE_OP or _HINT_ALL_REDUCE_OP in str(
-                node.target
-            ):
-                num_updates += _apply_hint_all_reduce(gm, node, tp_size, allreduce_strategy)
-            elif _matches_any(node, _HINT_CONV1D_OPS):
-                num_updates += _apply_hint_conv1d(gm, node, tp_rank, tp_size)
-            elif _matches_any(node, _HINT_SSM_OPS):
-                num_updates += _apply_hint_ssm(gm, node, tp_rank, tp_size)
-            elif _matches_any(node, _HINT_NORM_OPS):
-                num_updates += _apply_hint_norm(gm, node, tp_rank, tp_size)
+            op_kind = is_any_shardable_op(node)
+            if op_kind is not None and op_kind in shardable_actions:
+                num_updates += shardable_actions[op_kind](node)
 
         ad_logger.info(f"apply_sharding_hints: {num_updates} nodes processed")
-
-        gm.graph.lint()
-        gm.recompile()
 
         return gm, TransformInfo(
             skipped=False,
