@@ -132,6 +132,7 @@ def _quantize_moe_node(
             args=tuple(args),
             kwargs=kwargs,
         )
+        new_node.meta = node.meta.copy()
         node.replace_all_uses_with(new_node)
         gm.graph.erase_node(node)
 

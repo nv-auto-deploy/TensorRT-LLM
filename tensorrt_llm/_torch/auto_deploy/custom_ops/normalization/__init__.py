@@ -20,6 +20,8 @@ This module provides various normalization implementations:
 - triton_rms_norm: Low-level Triton RMSNorm kernel
 - l2norm: L2 normalization operations
 - flashinfer_fused_add_rms_norm: Fused add + RMSNorm operation
+- trtllm_rms_norm_quant_nvfp4: Standalone RMSNorm + NVFP4 quantization
+- trtllm_fused_add_rms_norm_quant_nvfp4: Fused (Add +) RMSNorm + NVFP4 quantization
 """
 
 __all__ = [
@@ -27,4 +29,6 @@ __all__ = [
     "triton_rms_norm",
     "l2norm",
     "flashinfer_fused_add_rms_norm",
+    "trtllm_rms_norm_quant_nvfp4",
+    "trtllm_fused_add_rms_norm_quant_nvfp4",
 ]

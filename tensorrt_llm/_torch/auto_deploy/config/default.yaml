@@ -93,7 +93,11 @@ transforms:
   match_nvfp4_swiglu_pattern:
     stage: pattern_matcher
     requires_shape_prop: true
-    enabled: false
+    enabled: true
+  match_rmsnorm_quant_nvfp4_pattern:
+    stage: pattern_matcher
+    requires_shape_prop: true
+    enabled: true
   quantize_fp8_moe:
     stage: pattern_matcher
   quantize_nvfp4_moe:
@@ -189,6 +193,9 @@ transforms:
     stage: post_load_fusion
     enabled: false
   fuse_add_rms_norm:
+    stage: post_load_fusion
+    enabled: true
+  fuse_rmsnorm_quant_nvfp4:
     stage: post_load_fusion
     enabled: true
   gather_logits_before_lm_head:
