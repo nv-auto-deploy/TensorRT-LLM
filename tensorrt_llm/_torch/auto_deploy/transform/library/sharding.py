@@ -28,8 +28,8 @@ import torch.nn as nn
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import print_grid, serialize_mapping
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
+from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import print_grid, serialize_dist_config
 
 from .....functional import AllReduceStrategy
 from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
@@ -170,41 +170,27 @@ class ShardingTransformConfig(TransformConfig):
 
     dist_mapping: dict[str, int] = Field(default_factory=dict)
 
-    mapping: Mapping = Field(default_factory=Mapping)
+    mapping: Any = Field(default=None)  # Legacy: tensorrt_llm.mapping.Mapping (kept for compat)
+    dist_config: DistConfig = Field(default_factory=DistConfig)
 
     def _init_mapping(self):
-        """Initialize Mapping from dist_mapping config.
+        """Initialize DistConfig from dist_mapping config.
 
         NOTE: This method is now primarily a fallback. The preferred flow is:
-        1. Mapping is initialized in ad_executor.py from config.transforms['detect_sharding']['dist_mapping']
-        2. Passed through SharedConfig.mapping to the sharding transform
-        3. Only if SharedConfig.mapping is None, this fallback is used
-
-        This ensures Mapping is created once with the correct configuration from YAML,
-        rather than being recreated in multiple places.
+        1. DistConfig is constructed in ad_executor.py from the Mapping object
+        2. Passed through SharedConfig.dist_config to the sharding transform
+        3. Only if SharedConfig.dist_config is None, this fallback is used
         """
-        # by default, we use 1D parallelism (TP-only for token mixers and FFN, EP-only for MoE)
-        try:
-            self.mapping = Mapping(
-                world_size=self.world_size,
-                rank=self.rank,
-                tp_size=self.dist_mapping.get("tp", self.world_size),
-                moe_tp_size=self.dist_mapping.get("moe_tp", 1),
-                moe_ep_size=self.dist_mapping.get("moe_ep", self.world_size),
-                moe_cluster_size=self.dist_mapping.get("moe_cluster", 1),
-                enable_attention_dp=self.enable_attention_dp,
-            )
-        except ValueError as e:
-            ad_logger.warning(f"Invalid parallel grid config: {e}")
-            ad_logger.warning("Defaulting to TP-only sharding (EP only for MoE)")
-            self.mapping = Mapping(
-                world_size=self.world_size,
-                rank=self.rank,
-                tp_size=self.world_size,
-                moe_tp_size=1,
-                moe_ep_size=self.world_size,
-                moe_cluster_size=1,
-            )
+        self.dist_config = DistConfig(
+            world_size=self.world_size,
+            rank=self.rank,
+            tp_size=self.dist_mapping.get("tp", self.world_size),
+            moe_tp_size=self.dist_mapping.get("moe_tp", 1),
+            moe_ep_size=self.dist_mapping.get("moe_ep", self.world_size),
+            moe_cluster_size=self.dist_mapping.get("moe_cluster", 1),
+            enable_attention_dp=self.enable_attention_dp,
+            allreduce_strategy=self.allreduce_strategy.name,
+        )
 
     enable_attention_dp: bool = Field(
         default=False,
@@ -998,11 +984,11 @@ class Sharding(BaseTransform):
         config.rank = local_rank
         config.world_size = world_size
 
-        # Use Mapping from shared_config (initialized in ad_executor) if available
-        if shared_config.mapping is not None:
-            config.mapping = shared_config.mapping
+        if shared_config.dist_config is not None:
+            config.dist_config = shared_config.dist_config
+        elif shared_config.mapping is not None:
+            config.dist_config = DistConfig.from_mapping(shared_config.mapping)
         else:
-            # Fallback to creating mapping from dist_mapping config if not provided
             config._init_mapping()
 
         config.validate_config()
@@ -1030,7 +1016,7 @@ class Sharding(BaseTransform):
             )
 
         info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-        ad_logger.info(print_grid(config.mapping))
+        ad_logger.info(print_grid(config.dist_config))
         with WeightBiasInfoCache():
             # =============================
             # ======== EP sharding ========
@@ -1048,7 +1034,7 @@ class Sharding(BaseTransform):
             # ======== TP sharding ========
             if ShardingDim.TP not in config.sharding_dims:
                 return gm, info
-            if config.mapping.enable_attention_dp:
+            if config.dist_config.enable_attention_dp:
                 # only MoE all-to-all sharding is supported in attention DP mode
                 # we already enforced 1D sharding (TP=1, EP=world_size) in init_mapping
                 ad_logger.info(
@@ -1661,10 +1647,10 @@ def _insert_sharded_moe(
     # =====================================================================================
     # DISTRIBUTED GRID CONFIGURATION
     # =====================================================================================
-    ep_size = config.mapping.moe_ep_size
-    ep_rank = config.mapping.moe_ep_rank
-    tp_size = config.mapping.moe_tp_size
-    tp_rank = config.mapping.moe_tp_rank
+    ep_size = config.dist_config.moe_ep_size
+    ep_rank = config.dist_config.moe_ep_rank
+    tp_size = config.dist_config.moe_tp_size
+    tp_rank = config.dist_config.moe_tp_rank
     # All-to-all is used when:
     # 1. Attention uses data parallelism (tokens distributed across ranks)
     # 2. AND we have EP > 1 (experts distributed across ranks)
@@ -1789,7 +1775,7 @@ def _insert_sharded_moe(
 
     # Serialize Mapping for all-to-all dispatch/combine
     # (Will be used inside the op to determine enable_alltoall and workspace size)
-    mapping_config = serialize_mapping(config.mapping)
+    mapping_config = serialize_dist_config(config.dist_config)
 
     # Write back weight/scale list updates (applied above) and inject mapping args.
     # set_op_args uses the op schema to place values into kwargs or the correct
@@ -3526,26 +3512,33 @@ class ApplyShardingHints(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        mapping = shared_config.mapping
         world_size = shared_config.world_size
 
-        if mapping is None or world_size < 2:
+        if world_size < 2:
             ad_logger.info("apply_sharding_hints: world_size < 2, skipping")
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        tp_size = mapping.tp_size
-        tp_rank = mapping.tp_rank
-        allreduce_strategy = (
-            self.config.allreduce_strategy.name
-            if hasattr(self.config, "allreduce_strategy") and self.config.allreduce_strategy
-            else "NCCL"
-        )
+        config = self.config
+        config.rank = shared_config.local_rank
+        config.world_size = shared_config.world_size
+        if shared_config.dist_config is not None:
+            config.dist_config = shared_config.dist_config
+        elif shared_config.mapping is not None:
+            config.dist_config = DistConfig.from_mapping(shared_config.mapping)
+        else:
+            config._init_mapping()
+        config.validate_config()
+
+        dc = config.dist_config
+        tp_size = dc.tp_size
+        tp_rank = dc.tp_rank
+        allreduce_strategy = dc.allreduce_strategy
 
         ad_logger.info(
             f"apply_sharding_hints: tp_size={tp_size}, tp_rank={tp_rank}, "
-            f"ep_size={mapping.moe_ep_size}, strategy={allreduce_strategy}"
+            f"ep_size={config.dist_config.moe_ep_size}, strategy={allreduce_strategy}"
         )
 
         num_updates = 0

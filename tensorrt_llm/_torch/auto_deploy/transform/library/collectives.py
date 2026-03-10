@@ -6,15 +6,31 @@ The torch backend (demollm mode) does not benefit from fusion.
 """
 
 from functools import partial
-from typing import Tuple
+from typing import Tuple, Type
 
 import torch
+from pydantic import Field
 from torch.fx import GraphModule
 
+from .....functional import AllReduceStrategy
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
+
+
+class CollectiveFusionConfig(TransformConfig):
+    allreduce_strategy: AllReduceStrategy = Field(
+        default=AllReduceStrategy.NCCL,
+        description="AllReduce strategy used for pattern matching.",
+    )
+
 
 # TODO: This is an overly simplified model that works well for vanilla Llama models.
 # However, we eventually want to consider more sophisticated patterns such as
@@ -98,6 +114,12 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
     by the match_rmsnorm_pattern transform that runs earlier in the pipeline.
     """
 
+    config: CollectiveFusionConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return CollectiveFusionConfig
+
     def _apply(
         self,
         gm: GraphModule,
@@ -122,8 +144,14 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         # Instantiate Pattern Functions
         # ============================================================================
 
-        # Get the allreduce strategy from shared_config
-        strategy = gm._sharding_transform_container.config.allreduce_strategy.name
+        if shared_config.dist_config is not None:
+            strategy = shared_config.dist_config.allreduce_strategy
+        elif hasattr(shared_config, "sharding_transform_container"):
+            strategy = shared_config.sharding_transform_container.config.allreduce_strategy.name
+        elif hasattr(gm, "_sharding_transform_container"):
+            strategy = gm._sharding_transform_container.config.allreduce_strategy.name
+        else:
+            strategy = "NCCL"
 
         # TRT-LLM backend (MPI mode) - two patterns for different addition orders
         _allreduce_residual_rmsnorm_pattern_trtllm = _make_allreduce_residual_rmsnorm_pattern(
