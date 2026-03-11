@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Reduced-layer validation config for Gemma 3 27B IT.
+# Keep 6 layers so the reduced run still includes the first full-attention
+# layer in Gemma 3's 5x sliding + 1x full pattern.
+model_kwargs:
+  text_config:
+    num_hidden_layers: 6

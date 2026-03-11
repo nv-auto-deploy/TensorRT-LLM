@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Configuration for Gemma 3 27B IT.
+# Gemma 3 uses non-inclusive sliding-window attention. Match the model's
+# 1024-token local window with a 1023-token max sequence length, analogous to
+# the existing Gemma 3 1B registry entry.
+max_seq_len: 1023
