@@ -171,6 +171,30 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
     ### VALIDATION #################################################################################
     @model_validator(mode="before")
     @classmethod
+    def resolve_args_yaml_extra(cls, data: Dict) -> Dict:
+        """Resolve args.yaml_extra paths into actual config values.
+
+        Pydantic-settings does not invoke ``settings_customise_sources`` for nested
+        BaseSettings models, so ``args.yaml_extra`` file paths are never loaded.
+        This validator reads and merges those YAML files into ``args`` directly.
+        """
+        if not isinstance(data, dict):
+            return data
+        args = data.get("args", {})
+        if not isinstance(args, dict):
+            return data
+        yaml_extra = args.pop("yaml_extra", [])
+        if yaml_extra:
+            # YAML files take priority over args defaults (last arg wins in deep_merge_dicts).
+            # This is correct because args contains LlmArgs field defaults (e.g. world_size=1)
+            # due to nested_model_default_partial_update=True, and registry YAML values like
+            # world_size=4 must override those defaults.
+            merged = deep_merge_dicts(*[OmegaConf.load(p) for p in yaml_extra])
+            data["args"] = deep_merge_dicts(args, merged)
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def setup_args_from_model(cls, data: Dict) -> Dict:
         """Check for model being provided directly or via args.model."""
         msg = '"model" must be provided directly or via "args.model"'
@@ -320,10 +344,11 @@ def _inject_registry_yaml_extra() -> None:
 
     yaml_extra_paths = get_registry_yaml_extra(model_name)
 
-    # Remove --use-registry and inject --yaml-extra <path0> <path1> ...
+    # Remove --use-registry and inject --args.yaml-extra for each path.
+    # pydantic-settings CLI requires repeating the flag for each list element.
     argv = [a for a in sys.argv if a != "--use-registry"]
-    if yaml_extra_paths:
-        argv += ["--args.yaml-extra"] + yaml_extra_paths
+    for path in yaml_extra_paths:
+        argv += ["--args.yaml-extra", path]
     sys.argv = argv
 
 
