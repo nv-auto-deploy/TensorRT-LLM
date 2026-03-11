@@ -352,7 +352,7 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-MOE"
 
     CONFIG_YAML = str(
-        Path(get_llm_root()) / "examples" / "auto_deploy" / "nano_v3.yaml")
+        Path(get_llm_root()) / "examples" / "auto_deploy" / "nemotron_sharding_poc_config.yaml")
     MODEL_PATHS = {
         "bf16": f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-dev-1024",
         "fp8": f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev",

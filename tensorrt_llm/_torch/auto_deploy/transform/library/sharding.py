@@ -3458,10 +3458,48 @@ def _apply_hint_norm(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) ->
     return 0
 
 
+def _slice_stacked_tensor(gm: GraphModule, tensor_node: Node, ep_size: int, ep_rank: int):
+    """Slice a stacked [E, ...] tensor to [E_local, ...] for this EP rank."""
+    if not isinstance(tensor_node, Node) or tensor_node.op != "get_attr":
+        return
+    param_key = tensor_node.target
+    try:
+        tensor = gm.get_parameter(param_key)
+    except AttributeError:
+        tensor = getattr(gm, param_key, None)
+        if tensor is None:
+            return
+    num_experts = tensor.shape[0]
+    per_rank = num_experts // ep_size
+    start = ep_rank * per_rank
+    end_idx = num_experts if (ep_rank == ep_size - 1) else start + per_rank
+    sliced = tensor[start:end_idx].contiguous()
+    modname, _, attr_name = param_key.rpartition(".")
+    submod = gm.get_submodule(modname) if modname else gm
+    if isinstance(tensor, nn.Parameter):
+        setattr(submod, attr_name, nn.Parameter(sliced, requires_grad=False))
+    else:
+        submod.register_buffer(attr_name, sliced)
+    gm._register_load_state_dict_pre_hook(
+        partial(
+            _load_hook,
+            f_split=lambda t, d=0, r=ep_rank, ws=ep_size: (
+                t[r * (t.shape[d] // ws):(t.shape[d] if r == ws - 1 else (r + 1) * (t.shape[d] // ws))]
+            ),
+            param_key=param_key,
+            param_shape=sliced.shape,
+        )
+    )
+
+
 def _apply_hint_moe(
     gm: GraphModule, node: Node, config: "ShardingTransformConfig"
 ) -> int:
-    """Process torch_moe: EP weight partitioning, expert ID localization, mapping injection."""
+    """Process MoE ops: EP weight partitioning, expert ID localization, mapping injection.
+
+    Handles both list-based ops (torch_moe, torch_quant_*_moe) and stacked-tensor
+    ops (trtllm_*_moe_fused).
+    """
     dc = config.dist_config
     ep_size = dc.moe_ep_size
     ep_rank = dc.moe_ep_rank
@@ -3475,43 +3513,68 @@ def _apply_hint_moe(
     args = list(node.args)
     selected_experts = args[1]
     final_scales = args[2]
-    num_experts = len(args[3])
+
+    is_list_based = isinstance(args[3], (list, tuple))
+
+    if is_list_based:
+        num_experts = len(args[3])
+    else:
+        tensor_node = args[3]
+        if isinstance(tensor_node, Node) and tensor_node.op == "get_attr":
+            try:
+                num_experts = gm.get_parameter(tensor_node.target).shape[0]
+            except AttributeError:
+                num_experts = getattr(gm, tensor_node.target).shape[0]
+        else:
+            ad_logger.warning(f"Cannot determine num_experts for {node}")
+            return 0
+
     experts_per_rank = num_experts // ep_size
 
     def get_partition(lst, world_size, rank):
         n = len(lst)
         per_part = n // world_size
         start = rank * per_part
-        end = n if (rank == world_size - 1) else start + per_part
-        return lst[start:end], lst[:start] + lst[end:]
+        end_idx = n if (rank == world_size - 1) else start + per_part
+        return lst[start:end_idx], lst[:start] + lst[end_idx:]
 
-    w_up_sharded, w_up_remove = get_partition(args[3], ep_size, ep_rank)
-    w_down_sharded, w_down_remove = get_partition(args[4], ep_size, ep_rank)
-    w_gate_sharded, w_gate_remove = get_partition(args[5], ep_size, ep_rank)
+    if is_list_based:
+        w_up_sharded, _ = get_partition(args[3], ep_size, ep_rank)
+        w_down_sharded, _ = get_partition(args[4], ep_size, ep_rank)
+        w_gate_sharded, _ = get_partition(args[5], ep_size, ep_rank)
 
-    if tp_size > 1:
-        for w in w_up_sharded + w_gate_sharded:
-            shard_weight_tensor(
-                gm=gm,
-                weight_tensor=gm.get_parameter(w.target),
-                param_key=w.target,
-                dim=SplitDimension.COLUMN,
-                rank=tp_rank,
-                world_size=tp_size,
-            )
-        for w in w_down_sharded:
-            shard_weight_tensor(
-                gm=gm,
-                weight_tensor=gm.get_parameter(w.target),
-                param_key=w.target,
-                dim=SplitDimension.ROW,
-                rank=tp_rank,
-                world_size=tp_size,
-            )
+        if tp_size > 1:
+            for w in w_up_sharded + w_gate_sharded:
+                shard_weight_tensor(
+                    gm=gm,
+                    weight_tensor=gm.get_parameter(w.target),
+                    param_key=w.target,
+                    dim=SplitDimension.COLUMN,
+                    rank=tp_rank,
+                    world_size=tp_size,
+                )
+            for w in w_down_sharded:
+                shard_weight_tensor(
+                    gm=gm,
+                    weight_tensor=gm.get_parameter(w.target),
+                    param_key=w.target,
+                    dim=SplitDimension.ROW,
+                    rank=tp_rank,
+                    world_size=tp_size,
+                )
 
-    args[3] = w_up_sharded
-    args[4] = w_down_sharded
-    args[5] = w_gate_sharded
+        args[3] = w_up_sharded
+        args[4] = w_down_sharded
+        args[5] = w_gate_sharded
+
+        for i in range(6, len(args)):
+            if isinstance(args[i], (list, tuple)) and len(args[i]) == num_experts:
+                sharded, _ = get_partition(list(args[i]), ep_size, ep_rank)
+                args[i] = sharded
+    else:
+        for i in range(3, len(args)):
+            if isinstance(args[i], Node) and args[i].op == "get_attr":
+                _slice_stacked_tensor(gm, args[i], ep_size, ep_rank)
 
     if not enable_alltoall:
         with gm.graph.inserting_before(node):
@@ -3542,7 +3605,7 @@ def _apply_hint_moe(
     eliminate_dead_code(gm)
     ad_logger.debug(
         f"  sharded MoE: {num_experts} experts, ep={ep_size}, tp={tp_size}, "
-        f"alltoall={enable_alltoall}"
+        f"alltoall={enable_alltoall}, list_based={is_list_based}"
     )
     return 1
 
