@@ -20,6 +20,7 @@ The outer multimodal wrapper mirrors the checkpoint hierarchy required by
 """
 
 import copy
+import inspect
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -535,12 +536,28 @@ class Gemma3ForConditionalGeneration(PreTrainedModel, GenerationMixin):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> Gemma3CausalLMOutput:
-        return self.language_model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
+        language_model_kwargs = {}
+        if input_ids is not None:
+            language_model_kwargs["input_ids"] = input_ids
+        if position_ids is not None:
+            language_model_kwargs["position_ids"] = position_ids
+        if inputs_embeds is not None:
+            language_model_kwargs["inputs_embeds"] = inputs_embeds
+
+        language_model_signature = inspect.signature(self.language_model.forward)
+        accepts_var_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in language_model_signature.parameters.values()
         )
+        if not accepts_var_kwargs:
+            allowed_extra_kwargs = set(language_model_signature.parameters) - set(
+                language_model_kwargs
+            )
+            language_model_kwargs.update(
+                {key: value for key, value in kwargs.items() if key in allowed_extra_kwargs}
+            )
+
+        return self.language_model(**language_model_kwargs)
 
 
 AutoModelForCausalLMFactory.register_custom_model_cls("Gemma3TextConfig", Gemma3ForCausalLM)

@@ -21,7 +21,6 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_gemma3 import (
 from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForCausalLMFactory,
     AutoModelForImageTextToTextFactory,
-    TextModelExportInfo,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
@@ -352,20 +351,37 @@ def test_gemma3_rope_buffers():
     assert rope._ad_sin_cached.shape == (128, 16)
 
 
-def test_gemma3_text_export_info_tracks_cache_position():
+def test_gemma3_vlm_wrapper_does_not_forward_non_text_kwargs():
     model = Gemma3ForConditionalGeneration(_small_full_config())
-    export_info = TextModelExportInfo.from_autoinferred(model)
-    assert export_info.dynamic_shape_lookup["cache_position"] == {0: Dim.DYNAMIC}
-    assert export_info.dynamic_shape_lookup["attention_mask"]["full_attention"] == {
-        0: Dim.DYNAMIC,
-        2: Dim.DYNAMIC,
-        3: Dim.DYNAMIC,
-    }
-    assert export_info.dynamic_shape_lookup["attention_mask"]["sliding_attention"] == {
-        0: Dim.DYNAMIC,
-        2: Dim.DYNAMIC,
-        3: Dim.DYNAMIC,
-    }
+    captured_kwargs = {}
+
+    def _capture_kwargs(_module, args, kwargs):
+        assert not args
+        captured_kwargs.clear()
+        captured_kwargs.update(kwargs)
+
+    handle = model.language_model.register_forward_pre_hook(
+        _capture_kwargs, prepend=True, with_kwargs=True
+    )
+    try:
+        batch_size, seq_len = 2, 6
+        input_ids = torch.randint(0, model.config.text_config.vocab_size, (batch_size, seq_len))
+        position_ids = _make_position_ids(batch_size, seq_len, input_ids.device)
+        cache_position = torch.arange(seq_len, device=input_ids.device)
+        attention_mask = torch.ones(batch_size, seq_len, device=input_ids.device)
+
+        model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            cache_position=cache_position,
+            attention_mask=attention_mask,
+        )
+    finally:
+        handle.remove()
+
+    assert set(captured_kwargs) == {"input_ids", "position_ids"}
+    torch.testing.assert_close(captured_kwargs["input_ids"], input_ids)
+    torch.testing.assert_close(captured_kwargs["position_ids"], position_ids)
 
 
 @torch.no_grad()
