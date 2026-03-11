@@ -1,4 +1,0 @@
-# Workaround: disable fused FP8 linear (NVRTC compilation failure on CUDA 13.1)
-transforms:
-  fuse_finegrained_fp8_linear:
-    enabled: false
