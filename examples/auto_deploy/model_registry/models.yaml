@@ -426,8 +426,6 @@ models:
 - name: Qwen/Qwen3-0.6B-FP8
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Mistral updates (2025) ---
-- name: mistralai/Codestral-25.01
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: mistralai/Mistral-Large-Instruct-2501
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 # --- Qwen3-VL 2B (2025) ---
@@ -442,9 +440,9 @@ models:
 # --- Nemotron-H reasoning 8B (2025) ---
 - name: nvidia/Nemotron-H-8B-Reasoning-128K
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# --- Pixtral (2025) - VLM ---
-- name: mistralai/Pixtral-12B-2409
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
+# --- Pixtral (2025) - LM text-only ---
+- name: mistral-community/pixtral-12b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- DeepSeek Coder V2 Lite (2025) ---
 - name: deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
