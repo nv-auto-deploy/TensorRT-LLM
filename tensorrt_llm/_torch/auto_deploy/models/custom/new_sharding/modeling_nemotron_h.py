@@ -290,6 +290,7 @@ class NemotronHMLP(nn.Module):
         intermediate_size: Optional[int] = None,
         is_expert: bool = False,
         tp_sharded: bool = True,
+        add_all_reduce: bool = True,
     ):
         super().__init__()
         self.config = config
@@ -302,6 +303,7 @@ class NemotronHMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, input_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.mlp_hidden_act]
         self.tp_sharded = tp_sharded and SHARD_MLP
+        self.add_all_reduce = add_all_reduce and self.tp_sharded
 
     def forward(self, x):
         up = torch.ops.auto_deploy.torch_linear_simple(
@@ -316,7 +318,7 @@ class NemotronHMLP(nn.Module):
             self.down_proj.bias,
             tp_mode="rowwise" if self.tp_sharded else "none",
         )
-        if self.tp_sharded:
+        if self.add_all_reduce:
             down = torch.ops.auto_deploy.all_reduce(down)
         return down
 
@@ -344,6 +346,7 @@ class NemotronHMOE(nn.Module):
             layer_idx=layer_idx,
             is_expert=False,
             tp_sharded=True,
+            add_all_reduce=False,
         )
         # Latent projections are REPLICATED (not sharded)
         if getattr(config, "moe_latent_size", None) is not None:
@@ -386,6 +389,7 @@ class NemotronHMOE(nn.Module):
 
         routed_out = out_flat.view(*orig_shape)
         out = shared_out + routed_out
+        out = torch.ops.auto_deploy.all_reduce(out)
         return out
 
 
@@ -482,18 +486,21 @@ class NemotronHAttention(nn.Module):
             self.q_proj.weight,
             self.q_proj.bias,
             tp_mode="colwise" if SHARD_ATTENTION else "none",
+            tp_min_local_shape=self.head_dim,
         )
         key_states = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.k_proj.weight,
             self.k_proj.bias,
             tp_mode="colwise" if SHARD_ATTENTION else "none",
+            tp_min_local_shape=self.head_dim,
         )
         value_states = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.v_proj.weight,
             self.v_proj.bias,
             tp_mode="colwise" if SHARD_ATTENTION else "none",
+            tp_min_local_shape=self.head_dim,
         )
 
         query_states = torch.ops.auto_deploy.view(

@@ -666,6 +666,20 @@ def is_any_shardable_op(node: Node) -> Union[ShardableOp, None]:
         return None
     if is_op(node, torch.ops.auto_deploy.torch_linear_simple):
         return ShardableOp.LINEAR
+    if is_op(
+        node,
+        [
+            torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
+            torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
+            torch.ops.auto_deploy.torch_fake_quant_int4_linear,
+            torch.ops.auto_deploy.torch_fake_quant_int4_gptq_linear,
+            torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear,
+            torch.ops.auto_deploy.torch_quant_fp8_linear,
+            torch.ops.auto_deploy.trtllm_quant_fp8_linear,
+            torch.ops.auto_deploy.torch_quant_nvfp4_linear,
+        ],
+    ):
+        return ShardableOp.LINEAR
     if is_op(node, torch.ops.auto_deploy.view):
         return ShardableOp.VIEW
     if is_op(node, torch.ops.auto_deploy.split_with_sizes):

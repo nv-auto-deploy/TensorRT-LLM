@@ -3330,7 +3330,7 @@ def _get_weight_param(gm: GraphModule, weight_node: Node) -> Tuple[str, torch.Te
 
 
 def _apply_hint_linear(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> int:
-    """Process a torch_linear_simple node with TP hints."""
+    """Process a linear or quantized linear node with TP hints."""
     [tp_mode, output_sizes, tp_min_local_shape] = extract_op_args(
         node, "tp_mode", "output_sizes", "tp_min_local_shape"
     )
@@ -3338,38 +3338,49 @@ def _apply_hint_linear(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) 
         return 0
 
     weight_node = node.args[1]
-    if weight_node.op != "get_attr":
-        ad_logger.warning(f"apply_sharding_hints: linear weight is not get_attr: {weight_node}")
+    weight_attrs = (
+        [weight_node] if weight_node.op == "get_attr" else get_source_nodes(weight_node)
+    )
+    if not weight_attrs:
+        ad_logger.warning(f"apply_sharding_hints: no weight param found for {node}")
         return 0
 
-    param_key, weight = _get_weight_param(gm, weight_node)
     dim = 0 if tp_mode == "colwise" else 1
+    fused = list(output_sizes) if output_sizes else None
+    min_shape = tp_min_local_shape if tp_min_local_shape else 1
 
-    shard_weight_tensor(
-        gm=gm,
-        weight_tensor=weight,
-        param_key=param_key,
-        dim=dim,
-        rank=tp_rank,
-        world_size=tp_size,
-        min_local_shape=tp_min_local_shape if tp_min_local_shape else 1,
-        fused_weight_dims=list(output_sizes) if output_sizes else None,
-    )
-
-    bias_node = node.args[2] if len(node.args) > 2 else None
-    if bias_node is not None and bias_node.op == "get_attr" and tp_mode == "colwise":
-        bias_key, bias = _get_weight_param(gm, bias_node)
+    for attr_node in weight_attrs:
+        param_key, weight = _get_weight_param(gm, attr_node)
         shard_weight_tensor(
             gm=gm,
-            weight_tensor=bias,
-            param_key=bias_key,
-            dim=0,
+            weight_tensor=weight,
+            param_key=param_key,
+            dim=dim,
             rank=tp_rank,
             world_size=tp_size,
-            fused_weight_dims=list(output_sizes) if output_sizes else None,
+            min_local_shape=min_shape,
+            fused_weight_dims=fused,
         )
 
-    ad_logger.debug(f"  sharded linear {param_key} tp_mode={tp_mode}")
+    bias_node = node.args[2] if len(node.args) > 2 else None
+    if bias_node is not None and isinstance(bias_node, Node) and tp_mode == "colwise":
+        bias_attrs = (
+            [bias_node] if bias_node.op == "get_attr" else get_source_nodes(bias_node)
+        )
+        for attr_node in bias_attrs:
+            if attr_node.op == "get_attr":
+                bias_key, bias = _get_weight_param(gm, attr_node)
+                shard_weight_tensor(
+                    gm=gm,
+                    weight_tensor=bias,
+                    param_key=bias_key,
+                    dim=0,
+                    rank=tp_rank,
+                    world_size=tp_size,
+                    fused_weight_dims=fused,
+                )
+
+    ad_logger.debug(f"  sharded linear tp_mode={tp_mode}")
     return 1
 
 
@@ -3383,9 +3394,9 @@ def _apply_hint_view(gm: GraphModule, node: Node, tp_size: int) -> int:
     if tp_scaled_dim < 0:
         tp_scaled_dim = len(shape) + tp_scaled_dim
     if tp_scaled_dim < len(shape) and isinstance(shape[tp_scaled_dim], int):
-        shape[tp_scaled_dim] = shape[tp_scaled_dim] // tp_size
+        shape[tp_scaled_dim] = -1
         set_op_args(node, shape=shape)
-        ad_logger.debug(f"  updated view shape at dim {tp_scaled_dim}: {shape}")
+        ad_logger.debug(f"  updated view shape at dim {tp_scaled_dim} to -1 (inferred)")
         return 1
     return 0
 
@@ -3515,7 +3526,6 @@ def _apply_hint_moe(
     tp_size = dc.moe_tp_size
     tp_rank = dc.moe_tp_rank
     enable_alltoall = dc.enable_attention_dp and ep_size > 1
-    allreduce_strategy = dc.allreduce_strategy
 
     if ep_size <= 1 and tp_size <= 1:
         return 0
@@ -3586,15 +3596,6 @@ def _apply_hint_moe(
     mapping_config = serialize_dist_config(config.dist_config)
     node.args = tuple(args)
     set_op_args(node, mapping_config=mapping_config, max_num_tokens=config.max_num_tokens)
-
-    if not enable_alltoall:
-        with gm.graph.inserting_after(node):
-            dist_node = gm.graph.call_function(
-                torch.ops.auto_deploy.torch_dist_all_reduce.default,
-                args=(node, allreduce_strategy),
-            )
-            node.replace_all_uses_with(dist_node)
-            dist_node.replace_input_with(dist_node, node)
 
     eliminate_dead_code(gm)
     ad_logger.debug(
