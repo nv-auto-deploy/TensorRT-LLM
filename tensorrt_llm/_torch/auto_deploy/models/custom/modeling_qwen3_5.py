@@ -392,14 +392,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)  # [B, S, num_v_heads]
 
-        # GQA head expansion: Q/K have num_k_heads, V has num_v_heads.
-        # Expand Q/K to match V before passing to the GDN op.
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
         # 5. Gated Delta Rule via autodeploy custom op
-        # Op expects [B, S, H, D] layout (bsnd convention)
+        # Op expects [B, S, H, D] layout (bsnd convention).
+        # GQA (num_v_heads > num_k_heads) is handled inside the GDN op and backends.
         core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(query, key, value, g, beta)
 
         # 6. Gated RMSNorm
@@ -683,10 +678,11 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
             position_embeddings = (rope_cos, rope_sin)
         elif position_embeddings is None:
             if position_ids is None:
-                seq_len = inputs_embeds.shape[1]
-                position_ids = torch.arange(seq_len, device=inputs_embeds.device)
-                position_ids = position_ids.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
-            elif position_ids.ndim == 2:
+                raise ValueError(
+                    "position_ids must be provided when position_embeddings and "
+                    "rope_cos/rope_sin are not given."
+                )
+            if position_ids.ndim == 2:
                 position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
             position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
@@ -1374,11 +1370,22 @@ class Qwen3_5Model(nn.Module):
             video_embeds = video_embeds.to(inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-        # Determine position IDs
+        # Determine position IDs — position_ids is REQUIRED from the runtime.
+        # For text-only: runtime provides 2D position_ids (B, S) which we expand to 3D.
+        # For multimodal: position_ids must incorporate the mRoPE offset from image tokens.
+        #
+        # TODO: Implement a self-contained mRoPE position delta cache transform that:
+        #   1. Stores the per-sequence position delta (from image token offsets) in a state
+        #      cache keyed by slot_idx during prefill
+        #   2. Retrieves and applies the delta during decode so the runtime's sequential
+        #      position_ids are correctly offset for mRoPE
+        # See PR discussion: https://github.com/nv-auto-deploy/TensorRT-LLM/pull/189
         has_vision = pixel_values is not None or pixel_values_videos is not None
         if has_vision:
-            # Multimodal: compute mRoPE positions with spatial (T, H, W) layout
-            position_ids, mrope_position_deltas = self.get_rope_index(
+            # Multimodal: compute mRoPE positions with spatial (T, H, W) layout.
+            # NOTE: This path needs the mRoPE position delta cache transform to work
+            # correctly with the AD runtime during decode steps.
+            position_ids, _ = self.get_rope_index(
                 input_ids,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
@@ -1388,13 +1395,12 @@ class Qwen3_5Model(nn.Module):
             # Text-only with runtime-provided position_ids: expand 2D -> 3D for mRoPE
             if position_ids.ndim == 2:
                 position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-            mrope_position_deltas = torch.zeros(
-                position_ids.shape[1], 1, device=position_ids.device, dtype=torch.long
-            )
         else:
-            # Fallback: sequential positions
-            position_ids, mrope_position_deltas = self.get_rope_index(
-                input_ids, attention_mask=attention_mask
+            raise ValueError(
+                "position_ids must be provided by the runtime. The Qwen3.5 multimodal "
+                "wrapper does not support computing position_ids from scratch — use the "
+                "text model (Qwen3_5ForCausalLM) directly for standalone inference, or "
+                "ensure the AD runtime provides position_ids."
             )
 
         # Compute position embeddings outside the language model

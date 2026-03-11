@@ -61,14 +61,6 @@ def fla_cached_gated_delta_rule(
     # CONSTANTS
     scale: float,
 ) -> torch.Tensor:
-    # Handle GQA: expand Q/K heads to match V heads if needed
-    num_k_heads = q.shape[2]
-    num_v_heads = v.shape[2]
-    if num_v_heads > num_k_heads:
-        n_rep = num_v_heads // num_k_heads
-        q = q.repeat_interleave(n_rep, dim=2)
-        k = k.repeat_interleave(n_rep, dim=2)
-
     b, s, num_heads, _ = q.shape
 
     # flatten batch and sequence dims
@@ -189,9 +181,7 @@ class FlaGatedDeltaBackend(AttentionDescriptor):
     ) -> ResourceHandlerDict:
         key_node = source_attn_node.args[1]
         value_node = source_attn_node.args[2]
-        # Use V's head count for the cache — with GQA, Q/K may have fewer heads
-        # but the recurrent state has shape [H_v, K, V] after internal expansion
-        num_heads = value_node.meta["val"].shape[-2]
+        num_heads = key_node.meta["val"].shape[-2]
         key_dim = key_node.meta["val"].shape[-1]
         value_dim = value_node.meta["val"].shape[-1]
         key_dtype = key_node.meta["val"].dtype
