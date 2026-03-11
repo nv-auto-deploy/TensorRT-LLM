@@ -3861,30 +3861,37 @@ class ApplyShardingHints(BaseTransform):
             config.max_num_tokens = 0
 
         num_updates = 0
+        enable_attention_dp = dc.enable_attention_dp
 
         if config.simple_shard_only:
             num_updates = _apply_simple_shard(gm, tp_rank, tp_size, allreduce_strategy)
             ad_logger.info(f"apply_sharding_hints (simple_shard_only): {num_updates} nodes processed")
         else:
-            shardable_actions: Dict[ShardableOp, Callable] = {
-                ShardableOp.LINEAR: lambda n: _apply_hint_linear(gm, n, tp_rank, tp_size),
-                ShardableOp.VIEW: lambda n: _apply_hint_view(gm, n, tp_size),
-                ShardableOp.SPLIT_WITH_SIZES: lambda n: _apply_hint_split(gm, n, tp_size),
-                ShardableOp.ALL_REDUCE: lambda n: _apply_hint_all_reduce(
-                    gm, n, tp_size, allreduce_strategy
-                ),
-                ShardableOp.CONV1D: lambda n: _apply_hint_conv1d(gm, n, tp_rank, tp_size),
-                ShardableOp.SSM: lambda n: _apply_hint_ssm(gm, n, tp_rank, tp_size),
-                ShardableOp.NORM: lambda n: _apply_hint_norm(gm, n, tp_rank, tp_size),
-                ShardableOp.MOE: lambda n: _apply_hint_moe(gm, n, config),
-            }
+            if enable_attention_dp:
+                shardable_actions: Dict[ShardableOp, Callable] = {
+                    ShardableOp.MOE: lambda n: _apply_hint_moe(gm, n, config),
+                }
+            else:
+                shardable_actions = {
+                    ShardableOp.LINEAR: lambda n: _apply_hint_linear(gm, n, tp_rank, tp_size),
+                    ShardableOp.VIEW: lambda n: _apply_hint_view(gm, n, tp_size),
+                    ShardableOp.SPLIT_WITH_SIZES: lambda n: _apply_hint_split(gm, n, tp_size),
+                    ShardableOp.ALL_REDUCE: lambda n: _apply_hint_all_reduce(
+                        gm, n, tp_size, allreduce_strategy
+                    ),
+                    ShardableOp.CONV1D: lambda n: _apply_hint_conv1d(gm, n, tp_rank, tp_size),
+                    ShardableOp.SSM: lambda n: _apply_hint_ssm(gm, n, tp_rank, tp_size),
+                    ShardableOp.NORM: lambda n: _apply_hint_norm(gm, n, tp_rank, tp_size),
+                    ShardableOp.MOE: lambda n: _apply_hint_moe(gm, n, config),
+                }
 
             for node in list(gm.graph.nodes):
                 op_kind = is_any_shardable_op(node)
                 if op_kind is not None and op_kind in shardable_actions:
                     num_updates += shardable_actions[op_kind](node)
 
-            ad_logger.info(f"apply_sharding_hints: {num_updates} nodes processed")
+            mode = "attention_dp" if enable_attention_dp else "full"
+            ad_logger.info(f"apply_sharding_hints ({mode}): {num_updates} nodes processed")
 
         return gm, TransformInfo(
             skipped=False,
