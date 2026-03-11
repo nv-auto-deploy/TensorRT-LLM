@@ -19,7 +19,6 @@ Reference: https://docs.flashinfer.ai/api/mla.html
 
 import math
 from dataclasses import dataclass, fields
-from math import prod
 from typing import Dict, List, Literal, Optional, Tuple
 
 import flashinfer
@@ -37,11 +36,10 @@ from ..attention_interface import (
     AttentionRegistry,
     Constant,
     MHACallable,
+    MLAPagedResourceHandler,
     PrepareMetadataCallable,
     PrepareMetadataHostCallable,
-    ResourceHandler,
     ResourceHandlerDict,
-    SequenceInfo,
 )
 
 
@@ -783,56 +781,6 @@ def flashinfer_mla_with_cache_fake(
     return q_nope.new_empty(
         q_nope.shape[0], q_nope.shape[1], q_nope.shape[2], v_head_dim
     ).contiguous()
-
-
-class MLAPagedResourceHandler(ResourceHandler):
-    """Handler for paged resources in MLA that require per-layer contiguous memory.
-
-    While MLA uses paged caching, the underlying flashinfer MLA kernel uses a uint32_t to track the
-    strides for the cache. The KVCacheManager will allocate a contiguous tensor for the cache
-    across all layers with dim 0 representing the layer index. Hence, the per-layer cache has very
-    large strides to jump between pages which causes overflow in the MLA kernel that uses uint32_t
-    for strides.
-
-    We use a separate handler for this purpose to avoid registering the cache with the
-    KVCacheManager and instead rely on local allocation.
-    """
-
-    @property
-    def is_paged(self) -> bool:
-        """Whether the resource is paged."""
-        return True
-
-    def __init__(self, *token_shape: int, dtype: torch.dtype) -> None:
-        """Initialize the ContiguousPagedResourceHandler.
-
-        Args:
-            token_shape: The shape of the resource per token.
-            dtype: The dtype of the resource.
-        """
-        self.token_shape = token_shape
-        self.dtype = dtype
-
-    def _get_bytes_per_token(self) -> int:
-        """The size of the resource per token in bytes."""
-        return prod(self.token_shape) * self.dtype.itemsize
-
-    def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
-        """Allocate contiguous paged resource.
-
-        Args:
-            sequence_info: SequenceInfo with device and page information.
-
-        Returns:
-            Contiguous tensor of shape [num_blocks, tokens_per_block, *token_shape].
-        """
-        return torch.empty(
-            sequence_info.num_blocks,
-            sequence_info.tokens_per_block,
-            *self.token_shape,
-            device=sequence_info.device,
-            dtype=self.dtype,
-        )
 
 
 @AttentionRegistry.register("flashinfer_mla")

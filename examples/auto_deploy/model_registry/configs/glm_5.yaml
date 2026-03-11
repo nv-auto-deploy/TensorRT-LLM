@@ -1,0 +1,31 @@
+# Configuration for GLM-5 (zai-org/GLM-5)
+# Custom model: glm_moe_dsa — prefill-only with MLA+DSA attention and noaux_tc MoE routing
+# 78 layers total (3 dense + 75 MoE), 256 routed experts, 8-way tensor parallelism
+# Limit to 5 layers for quick validation run
+runtime: trtllm
+compile_backend: torch-cudagraph
+max_seq_len: 4096
+max_num_tokens: 4096
+max_batch_size: 64
+world_size: 8
+enable_chunked_prefill: true
+cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64]
+model_factory: AutoModelForCausalLM
+# Use GLM-4.7-Flash tokenizer since GLM-5's tokenizer_config.json specifies
+# TokenizersBackend which is not a standard transformers class
+tokenizer: zai-org/GLM-4.7-Flash
+model_kwargs:
+  torch_dtype: bfloat16
+  num_hidden_layers: 5
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.7
+  tokens_per_block: 64
+transforms:
+  match_swiglu_pattern:
+    enabled: true
+  fuse_swiglu:
+    enabled: true
+  multi_stream_mla_attn:
+    stage: compile
+    enabled: true
