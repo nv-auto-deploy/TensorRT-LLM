@@ -3447,6 +3447,105 @@ def _apply_hint_norm(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) ->
     return 0
 
 
+def _apply_hint_moe(
+    gm: GraphModule, node: Node, config: "ShardingTransformConfig"
+) -> int:
+    """Process torch_moe: EP weight partitioning, expert ID localization, mapping injection."""
+    dc = config.dist_config
+    ep_size = dc.moe_ep_size
+    ep_rank = dc.moe_ep_rank
+    tp_size = dc.moe_tp_size
+    tp_rank = dc.moe_tp_rank
+    enable_alltoall = dc.enable_attention_dp and ep_size > 1
+    allreduce_strategy = dc.allreduce_strategy
+
+    if ep_size <= 1 and tp_size <= 1:
+        return 0
+
+    args = list(node.args)
+    selected_experts = args[1]
+    final_scales = args[2]
+    num_experts = len(args[3])
+    experts_per_rank = num_experts // ep_size
+
+    def get_partition(lst, world_size, rank):
+        n = len(lst)
+        per_part = n // world_size
+        start = rank * per_part
+        end = n if (rank == world_size - 1) else start + per_part
+        return lst[start:end], lst[:start] + lst[end:]
+
+    w_up_sharded, w_up_remove = get_partition(args[3], ep_size, ep_rank)
+    w_down_sharded, w_down_remove = get_partition(args[4], ep_size, ep_rank)
+    w_gate_sharded, w_gate_remove = get_partition(args[5], ep_size, ep_rank)
+
+    if tp_size > 1:
+        for w in w_up_sharded + w_gate_sharded:
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=gm.get_parameter(w.target),
+                param_key=w.target,
+                dim=SplitDimension.COLUMN,
+                rank=tp_rank,
+                world_size=tp_size,
+            )
+        for w in w_down_sharded:
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=gm.get_parameter(w.target),
+                param_key=w.target,
+                dim=SplitDimension.ROW,
+                rank=tp_rank,
+                world_size=tp_size,
+            )
+
+    args[3] = w_up_sharded
+    args[4] = w_down_sharded
+    args[5] = w_gate_sharded
+
+    if not enable_alltoall:
+        with gm.graph.inserting_before(node):
+            lower = experts_per_rank * ep_rank
+            selected_experts_local = gm.graph.create_node(
+                "call_function", operator.sub, args=(selected_experts, lower), kwargs={}
+            )
+            div_node = gm.graph.create_node(
+                "call_function",
+                operator.floordiv,
+                args=(selected_experts, experts_per_rank),
+                kwargs={},
+            )
+            comp_op = torch.ge if ep_rank == ep_size - 1 else torch.eq
+            rank_mask = gm.graph.create_node(
+                "call_function", comp_op, args=(div_node, ep_rank), kwargs={}
+            )
+            final_scales_local = gm.graph.create_node(
+                "call_function", operator.mul, args=(final_scales, rank_mask), kwargs={}
+            )
+        args[1] = selected_experts_local
+        args[2] = final_scales_local
+
+    mapping_config = serialize_dist_config(config.dist_config)
+    node.args = tuple(args)
+    set_op_args(node, mapping_config=mapping_config, max_num_tokens=config.max_num_tokens)
+
+    if not enable_alltoall:
+        with gm.graph.inserting_after(node):
+            dist_node = gm.graph.call_function(
+                torch.ops.auto_deploy.torch_dist_all_reduce.default,
+                args=(node, allreduce_strategy),
+            )
+            node.replace_all_uses_with(dist_node)
+            dist_node.replace_input_with(dist_node, node)
+
+    eliminate_dead_code(gm)
+    ad_logger.debug(
+        f"  sharded MoE: {num_experts} experts, ep={ep_size}, tp={tp_size}, "
+        f"alltoall={enable_alltoall}"
+    )
+    return 1
+
+
 @TransformRegistry.register("apply_sharding_hints")
 class ApplyShardingHints(BaseTransform):
     """Deterministic, node-local sharding transform driven by hint kwargs.
@@ -3498,6 +3597,11 @@ class ApplyShardingHints(BaseTransform):
             f"ep_size={config.dist_config.moe_ep_size}, strategy={allreduce_strategy}"
         )
 
+        if cm and cm.info:
+            config.max_num_tokens = cm.info.max_num_tokens
+        else:
+            config.max_num_tokens = 0
+
         shardable_actions: Dict[ShardableOp, Callable] = {
             ShardableOp.LINEAR: lambda n: _apply_hint_linear(gm, n, tp_rank, tp_size),
             ShardableOp.VIEW: lambda n: _apply_hint_view(gm, n, tp_size),
@@ -3508,6 +3612,7 @@ class ApplyShardingHints(BaseTransform):
             ShardableOp.CONV1D: lambda n: _apply_hint_conv1d(gm, n, tp_rank, tp_size),
             ShardableOp.SSM: lambda n: _apply_hint_ssm(gm, n, tp_rank, tp_size),
             ShardableOp.NORM: lambda n: _apply_hint_norm(gm, n, tp_rank, tp_size),
+            ShardableOp.MOE: lambda n: _apply_hint_moe(gm, n, config),
         }
 
         num_updates = 0
