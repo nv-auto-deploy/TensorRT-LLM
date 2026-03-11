@@ -3271,6 +3271,98 @@ def _get_weight_param(gm: GraphModule, weight_node: Node) -> Tuple[str, torch.Te
     return param_key, param
 
 
+def _is_nvfp4_op(node: Node) -> bool:
+    return is_op(
+        node,
+        [
+            torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
+            torch.ops.auto_deploy.torch_quant_nvfp4_linear,
+        ],
+    )
+
+
+def _is_finegrained_fp8_op(node: Node) -> bool:
+    return is_op(
+        node,
+        [torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear],
+    )
+
+
+def _shard_quantized_scales(
+    gm: GraphModule,
+    node: Node,
+    weight_attrs: List[Node],
+    original_weight_shape: torch.Size,
+    dim: int,
+    tp_rank: int,
+    tp_size: int,
+    min_local_shape: int,
+    fused_weight_dims: Optional[list],
+) -> None:
+    """Shard scale tensors for quantized linear ops (NVFP4, FineGrained FP8)."""
+    if not weight_attrs:
+        return
+
+    weight_key = weight_attrs[0].target
+    modname = weight_key.rpartition(".")[0]
+    submod = gm.get_submodule(modname) if modname else gm
+
+    if _is_nvfp4_op(node):
+        scale_name = "weight_scale"
+        if hasattr(submod, scale_name):
+            weight_scale = submod.get_buffer(scale_name)
+            sharded_scale = _shard_fp4_weight_scale(
+                weight_scale,
+                original_weight_shape,
+                dim,
+                tp_rank,
+                tp_size,
+                min_local_shape,
+                fused_weight_dims,
+            )
+            submod.register_buffer(scale_name, sharded_scale)
+            scale_key = modname + "." + scale_name if modname else scale_name
+            gm._register_load_state_dict_pre_hook(
+                partial(
+                    _load_hook,
+                    f_split=partial(
+                        _shard_fp4_weight_scale,
+                        original_uint8_weight_shape=original_weight_shape,
+                        dim=dim,
+                        rank=tp_rank,
+                        world_size=tp_size,
+                        min_local_shape=min_local_shape,
+                        fused_weight_dims=fused_weight_dims,
+                    ),
+                    param_key=scale_key,
+                    param_shape=sharded_scale.shape,
+                )
+            )
+
+    elif _is_finegrained_fp8_op(node):
+        scale_name = "weight_scale_inv"
+        if hasattr(submod, scale_name):
+            weight_scale_inv = submod.get_buffer(scale_name)
+            sharded_scale = FineGrainedFP8WeightShardingInfo._split_scale(
+                weight_scale_inv, dim, tp_rank, tp_size
+            )
+            submod.register_buffer(scale_name, sharded_scale)
+            scale_key = modname + "." + scale_name if modname else scale_name
+            gm._register_load_state_dict_pre_hook(
+                partial(
+                    _load_hook,
+                    f_split=partial(
+                        FineGrainedFP8WeightShardingInfo._split_scale,
+                        dim=dim,
+                        rank=tp_rank,
+                        world_size=tp_size,
+                    ),
+                    param_key=scale_key,
+                    param_shape=sharded_scale.shape,
+                )
+            )
+
+
 def _apply_hint_linear(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> int:
     """Process a linear or quantized linear node with TP hints."""
     [tp_mode, output_sizes, tp_min_local_shape] = extract_op_args(
@@ -3293,6 +3385,7 @@ def _apply_hint_linear(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) 
 
     for attr_node in weight_attrs:
         param_key, weight = _get_weight_param(gm, attr_node)
+        original_weight_shape = weight.shape
         shard_weight_tensor(
             gm=gm,
             weight_tensor=weight,
@@ -3303,6 +3396,9 @@ def _apply_hint_linear(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) 
             min_local_shape=min_shape,
             fused_weight_dims=fused,
         )
+
+    _shard_quantized_scales(gm, node, weight_attrs, original_weight_shape, dim, tp_rank, tp_size,
+                            min_shape, fused)
 
     bias_node = node.args[2] if len(node.args) > 2 else None
     if bias_node is not None and isinstance(bias_node, Node) and tp_mode == "colwise":
