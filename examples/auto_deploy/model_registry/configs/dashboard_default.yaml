@@ -2,8 +2,11 @@
 # These are baseline settings that apply to all models unless overridden
 
 runtime: trtllm
-attn_backend: trtllm
 compile_backend: torch-cudagraph
 model_factory: AutoModelForCausalLM
-skip_loading_weights: false
+skip_loading_weights: true
 max_seq_len: 512
+transforms:
+  insert_cached_mla_attention:
+    stage: cache_init
+    backend: trtllm_mla

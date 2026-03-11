@@ -114,7 +114,10 @@ class _TrtllmMLAPlanner:
 
     Cache write indices (decode_page_idx, decode_slot_idx) are pre-computed on the
     host during plan() and copied to GPU, eliminating per-layer subtract/div/mod/arange
-    kernel launches in the decode hot path.
+    kernel launches in the decode hot path.  Page IDs are resolved once per step
+    and combined with the pool stride ratio into a flat write index so that
+    per-layer cache writes use a single ``index_copy_`` via ``as_strided``,
+    replacing multi-dim ``index_put`` and its internal bf16 copy overhead.
     """
 
     def __init__(self):
@@ -138,7 +141,6 @@ class _TrtllmMLAPlanner:
         self.fused_q_flat: Optional[torch.Tensor] = None
         self.q_pe_padded_buf: Optional[torch.Tensor] = None
         self.latent_cache_buf: Optional[torch.Tensor] = None
-        self.decode_seq_indices: Optional[torch.Tensor] = None
         self._cu_kv_decode_host: Optional[torch.Tensor] = None
         self._decode_buf_max_tokens: int = 0
         self._decode_buf_num_heads: int = 0
@@ -153,6 +155,17 @@ class _TrtllmMLAPlanner:
         self._decode_page_idx_host: Optional[torch.Tensor] = None
         self._decode_slot_idx_host: Optional[torch.Tensor] = None
         self._tokens_per_block: int = 0
+
+        # Pre-resolved page IDs and flat write indices for cache writes.
+        # page_ids are resolved once per step in plan(); the flat write
+        # index (page_id * rows_per_block + slot) is computed once per step
+        # (either in plan() or lazily on first layer) so that per-layer
+        # writes use a single index_copy_ via an as_strided view.
+        self.decode_cache_page_ids: Optional[torch.Tensor] = None
+        self.decode_flat_write_idx: Optional[torch.Tensor] = None
+        self._seq_range_buf: Optional[torch.Tensor] = None
+        self._cache_rows_per_block: int = 0
+        self._flat_write_idx_dirty: bool = True
 
         # Cached contiguous weight matrices (computed once per unique weight)
         self._cached_weight_ptr: Optional[int] = None
@@ -194,6 +207,9 @@ class _TrtllmMLAPlanner:
         self._decode_slot_idx_host = torch.zeros(
             max_batch, dtype=torch.int64, device="cpu", pin_memory=True
         )
+        self.decode_cache_page_ids = torch.zeros(max_batch, dtype=torch.int32, device=device)
+        self.decode_flat_write_idx = torch.zeros(max_batch, dtype=torch.int64, device=device)
+        self._seq_range_buf = torch.arange(max_batch, dtype=torch.int64, device=device)
 
         self.cu_kv_decode = torch.zeros(max_batch + 1, dtype=torch.int32, device=device)
         self._cu_kv_decode_host = torch.zeros(
@@ -254,7 +270,6 @@ class _TrtllmMLAPlanner:
         else:
             self.q_pe_padded_buf = None
         self.latent_cache_buf = torch.empty(max_tokens, gen_head_size, dtype=dtype, device=device)
-        self.decode_seq_indices = torch.arange(max_tokens, dtype=torch.long, device=device)
 
     def get_weight_matrices(
         self,
@@ -363,6 +378,23 @@ class _TrtllmMLAPlanner:
                 self.cu_kv_decode[: num_decode + 1].copy_(
                     cu_kv[: num_decode + 1], non_blocking=True
                 )
+
+        # Pre-resolve page IDs once per step (outside the CUDA graph) so
+        # per-layer cache writes skip the 2D gather from block_ids_per_seq.
+        # When the stride ratio is known (after the first forward pass),
+        # also compute the flat write index here to avoid per-layer arithmetic.
+        self._flat_write_idx_dirty = True
+        if num_decode > 0 and tokens_per_block > 0:
+            seq_range = self._seq_range_buf[num_prefill : num_prefill + num_decode]
+            page_idx = self.decode_page_idx[:num_decode]
+            slot_idx = self.decode_slot_idx[:num_decode]
+            page_ids = self.block_ids_per_seq[seq_range, page_idx]
+            self.decode_cache_page_ids[:num_decode] = page_ids
+            if self._cache_rows_per_block > 0:
+                self.decode_flat_write_idx[:num_decode] = (
+                    page_ids.long() * self._cache_rows_per_block + slot_idx
+                )
+                self._flat_write_idx_dirty = False
 
     def get_pool_pointers_for_layer(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Return a per-layer ``host_pool_pointers`` tensor for this kv_cache view."""
@@ -999,22 +1031,50 @@ def _handle_chunked_prefill(
 def _write_decode_latent_to_cache(
     latent_cache: torch.Tensor,
     kv_cache: torch.Tensor,
-    block_ids_per_seq: torch.Tensor,
-    num_prefill: int,
     num_decode: int,
 ) -> None:
     """Write decode tokens' latent_cache to the paged KV cache.
 
-    Uses pre-computed page_idx/slot_idx from the planner (computed on host
-    during plan()) to avoid per-layer subtract/div/mod/arange GPU kernels.
+    Uses an ``as_strided`` 2D view of the (possibly non-contiguous) paged
+    cache with a pre-computed flat index and ``index_copy_``.  This replaces
+    the multi-dim ``index_put`` (which internally spawns an extra bf16 copy
+    kernel per call) with a single efficient scatter.
+
+    The flat index is computed once per step — either in ``plan()`` (after
+    the stride ratio is learned) or lazily on the first layer call.
     """
     planner = _GlobalTrtllmMLAPlanner
-    page_idx = planner.decode_page_idx[:num_decode]
-    slot_idx = planner.decode_slot_idx[:num_decode]
-    seq_indices = planner.decode_seq_indices[num_prefill : num_prefill + num_decode]
-    page_ids = block_ids_per_seq[seq_indices, page_idx]
 
-    kv_cache[page_ids, 0, 0, slot_idx] = latent_cache
+    # Learn stride ratio from the first kv_cache encountered.
+    if planner._cache_rows_per_block == 0:
+        planner._cache_rows_per_block = kv_cache.stride(0) // kv_cache.stride(3)
+
+    # Compute flat write index once per step; subsequent layers reuse it.
+    if planner._flat_write_idx_dirty:
+        page_ids = planner.decode_cache_page_ids[:num_decode]
+        slot_idx = planner.decode_slot_idx[:num_decode]
+        planner.decode_flat_write_idx[:num_decode] = (
+            page_ids.long() * planner._cache_rows_per_block + slot_idx
+        )
+        planner._flat_write_idx_dirty = False
+
+    flat_idx = planner.decode_flat_write_idx[:num_decode]
+
+    # as_strided maps (block, slot) pairs to correct storage offsets even
+    # when the pool has kv_factor > 1, making the 5D tensor non-contiguous.
+    # Use a tight row count: the last block only needs tokens_per_block rows
+    # (not the full rows_per_block which includes kv_factor/kv_heads gaps),
+    # avoiding overflow past the pool's storage when there is a storage_offset.
+    D = kv_cache.shape[-1]
+    rpb = planner._cache_rows_per_block
+    tpb = kv_cache.shape[3]
+    num_rows = (kv_cache.shape[0] - 1) * rpb + tpb
+    kv_cache_2d = torch.as_strided(
+        kv_cache,
+        size=(num_rows, D),
+        stride=(kv_cache.stride(3), kv_cache.stride(4)),
+    )
+    kv_cache_2d.index_copy_(0, flat_idx, latent_cache)
 
 
 def _handle_decode(
@@ -1356,8 +1416,6 @@ def trtllm_mla_with_cache(
         _write_decode_latent_to_cache(
             latent_cache[num_prefill_tokens:num_tokens],
             kv_cache,
-            planner.block_ids_per_seq,
-            num_prefill,
             num_decode,
         )
         y[num_prefill_tokens:num_tokens] = _handle_decode(
@@ -1391,8 +1449,6 @@ def trtllm_mla_with_cache(
         _write_decode_latent_to_cache(
             latent_cache,
             kv_cache,
-            planner.block_ids_per_seq,
-            0,
             num_tokens,
         )
         y = _handle_decode(
