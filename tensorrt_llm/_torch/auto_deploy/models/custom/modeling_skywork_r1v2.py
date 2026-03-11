@@ -67,10 +67,7 @@ class SkyworkR1V2RMSNorm(nn.Module):
 
 
 class SkyworkR1V2RotaryEmbedding(nn.Module):
-    """Standard RoPE with precomputed cos/sin cache.
-
-    Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
-    """
+    """Standard RoPE with precomputed cos/sin cache."""
 
     def __init__(
         self,
