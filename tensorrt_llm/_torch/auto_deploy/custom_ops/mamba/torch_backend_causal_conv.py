@@ -154,7 +154,9 @@ def _torch_causal_conv1d_decode(
 # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
 # reference implementation to support chunked prefill.
 # Returns (seq_len, seq_start, slot_idx)
-@torch.library.custom_op("auto_deploy::torch_cached_causal_conv1d", mutates_args={})
+@torch.library.custom_op(
+    "auto_deploy::torch_cached_causal_conv1d", mutates_args={"conv_state_cache"}
+)
 def _torch_cached_causal_conv1d(
     # INPUTS (dense but may be flattened across sequences)
     input: torch.Tensor,  # [b, s, c_in]

@@ -1,0 +1,53 @@
+# Configuration for AI21-Jamba-Reasoning-3B (hybrid Mamba v1 + Attention)
+
+# LlmArgs fields are nested under 'args' so this YAML can be used with --yaml-extra
+# (top-level ExperimentConfig flag) rather than --args.yaml-extra.
+args:
+  skip_tokenizer_init: false
+  trust_remote_code: true
+
+  # SSMs do not support cache reuse.
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.7
+
+  max_batch_size: 128
+  max_seq_len: 8192
+  max_num_tokens: 8192
+
+  skip_loading_weights: false
+
+  transforms:
+    insert_cached_ssm_attention:
+      backend: torch_mamba_v1
+    compile_model:
+      backend: torch-cudagraph
+      cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128]
+
+# Chat-formatted prompts (this model requires chat template for coherent output)
+prompt:
+  queries:
+    - - role: user
+        content: "How big is the universe?"
+    - - role: user
+        content: "In simple words and a single sentence, explain the concept of gravity."
+    - - role: user
+        content: "How to fix slicing in golf?"
+    - - role: user
+        content: "Where is the capital of Iceland?"
+    - - role: user
+        content: "What are the three laws of thermodynamics?"
+    - - role: user
+        content: "Summarize the plot of Romeo and Juliet in two sentences."
+    - - role: user
+        content: "Write a Python function that checks if a number is prime."
+    - - role: user
+        content: "Explain the difference between a compiler and an interpreter."
+    - - role: user
+        content: "What causes the northern lights?"
+    - - role: user
+        content: "What are the health benefits of drinking green tea?"
+  sp_kwargs:
+    max_tokens: 100
+    top_k: null
+    temperature: 1.0
