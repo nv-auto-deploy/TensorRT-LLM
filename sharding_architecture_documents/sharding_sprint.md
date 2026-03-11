@@ -20,7 +20,13 @@
 | Stage III: all_reduce | Done | Implemented in apply_sharding_hints |
 | DistConfig refactor | Done | Decoupled auto_deploy from tensorrt_llm.mapping.Mapping |
 | ShardableOp enum + dispatch | Done | Clean dispatch pattern in apply_sharding_hints |
-| Stage IV: MoE EP | Pending | |
+| Stage IV: MoE EP | Done | Expert partitioning, ID localization, explicit all_reduce at merge point |
+| View -1 inference | Done | Replace tp_scaled_dim with -1 for robust partial replication |
+| min_local_shape for GQA | Done | K/V projections handle num_kv_heads < tp_size |
+| MoE all_reduce placement fix | Done | Single all_reduce at shared+routed merge, not per-branch |
+| Quantized linear ops in ShardableOp | Done | All FP8/NVFP4/INT4 ops classified as LINEAR |
+| Robust linear handler | Done | get_source_nodes for quantized weight traversal |
+| FP8 validation | In Progress | Testing FP8 checkpoint loading + sharding |
 
 ---
 
@@ -64,3 +70,10 @@
 | 2026-03-10 | Stage II+III complete. Full TP sharding + all_reduce in apply_sharding_hints. |
 | 2026-03-10 | DistConfig refactor. New DistConfig class replaces Mapping in sharding/collectives transforms. |
 | 2026-03-10 | ShardableOp enum + dispatch dict refactor. Cleaner node classification and action dispatch. |
+| 2026-03-10 | MoE EP sharding implemented. Expert ID localization + weight partitioning. |
+| 2026-03-10 | Fixed MoE all_reduce: single explicit node at merge point, not per-branch. |
+| 2026-03-10 | Fixed view sharding: use -1 for inferred dim, handles partial replication. |
+| 2026-03-10 | Added min_local_shape to K/V projections for GQA (num_kv_heads < tp_size). |
+| 2026-03-10 | BF16 accuracy test PASSED on 2 GPUs. 4 GPU test pending (running). |
+| 2026-03-10 | Added all quantized linear ops to ShardableOp.LINEAR dispatch. |
+| 2026-03-10 | Robust linear handler with get_source_nodes for quantized weight chains. |
