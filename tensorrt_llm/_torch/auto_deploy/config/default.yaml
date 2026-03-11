@@ -117,7 +117,6 @@ transforms:
     # NOTE: sharding_source applies only to TP sharding
     sharding_source: ['manual', 'factory', 'heuristic']
     support_partial_config: true
-
     shard_all_unprocessed: false
     enable_attention_dp: false
     allreduce_strategy: 'NCCL'
@@ -181,11 +180,11 @@ transforms:
     stage: post_load_fusion
     expect_mem_change: true
     backend: trtllm
-    allow_different_input_scales: false
+    allow_different_input_scales: true
   fuse_finegrained_fp8_moe:
     stage: post_load_fusion
     expect_mem_change: true
-    allow_different_input_scales: false
+    allow_different_input_scales: true
   fuse_nvfp4_moe:
     stage: post_load_fusion
     expect_mem_change: true

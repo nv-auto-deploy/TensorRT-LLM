@@ -3764,6 +3764,46 @@ def _apply_hint_moe(
     return 1
 
 
+def _apply_simple_shard(
+    gm: GraphModule, tp_rank: int, tp_size: int, allreduce_strategy: str
+) -> int:
+    """Simple shard fallback: column-split every linear + insert all_gather after each."""
+    num_updates = 0
+    for node in list(gm.graph.nodes):
+        if not is_any_lin_op(node):
+            continue
+
+        weight_node = node.args[1]
+        weight_attrs = (
+            [weight_node] if weight_node.op == "get_attr" else get_source_nodes(weight_node)
+        )
+        if not weight_attrs:
+            continue
+
+        for attr_node in weight_attrs:
+            param_key, weight = _get_weight_param(gm, attr_node)
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=weight,
+                param_key=param_key,
+                dim=0,
+                rank=tp_rank,
+                world_size=tp_size,
+            )
+
+        with gm.graph.inserting_after(node):
+            gather_node = gm.graph.call_function(
+                torch.ops.auto_deploy.torch_dist_all_gather.default,
+                args=(node, -1),
+            )
+            node.replace_all_uses_with(gather_node)
+            gather_node.replace_input_with(gather_node, node)
+
+        num_updates += 1
+
+    return num_updates
+
+
 @TransformRegistry.register("apply_sharding_hints")
 class ApplyShardingHints(BaseTransform):
     """Deterministic, node-local sharding transform driven by hint kwargs.
@@ -3820,26 +3860,31 @@ class ApplyShardingHints(BaseTransform):
         else:
             config.max_num_tokens = 0
 
-        shardable_actions: Dict[ShardableOp, Callable] = {
-            ShardableOp.LINEAR: lambda n: _apply_hint_linear(gm, n, tp_rank, tp_size),
-            ShardableOp.VIEW: lambda n: _apply_hint_view(gm, n, tp_size),
-            ShardableOp.SPLIT_WITH_SIZES: lambda n: _apply_hint_split(gm, n, tp_size),
-            ShardableOp.ALL_REDUCE: lambda n: _apply_hint_all_reduce(
-                gm, n, tp_size, allreduce_strategy
-            ),
-            ShardableOp.CONV1D: lambda n: _apply_hint_conv1d(gm, n, tp_rank, tp_size),
-            ShardableOp.SSM: lambda n: _apply_hint_ssm(gm, n, tp_rank, tp_size),
-            ShardableOp.NORM: lambda n: _apply_hint_norm(gm, n, tp_rank, tp_size),
-            ShardableOp.MOE: lambda n: _apply_hint_moe(gm, n, config),
-        }
-
         num_updates = 0
-        for node in list(gm.graph.nodes):
-            op_kind = is_any_shardable_op(node)
-            if op_kind is not None and op_kind in shardable_actions:
-                num_updates += shardable_actions[op_kind](node)
 
-        ad_logger.info(f"apply_sharding_hints: {num_updates} nodes processed")
+        if config.simple_shard_only:
+            num_updates = _apply_simple_shard(gm, tp_rank, tp_size, allreduce_strategy)
+            ad_logger.info(f"apply_sharding_hints (simple_shard_only): {num_updates} nodes processed")
+        else:
+            shardable_actions: Dict[ShardableOp, Callable] = {
+                ShardableOp.LINEAR: lambda n: _apply_hint_linear(gm, n, tp_rank, tp_size),
+                ShardableOp.VIEW: lambda n: _apply_hint_view(gm, n, tp_size),
+                ShardableOp.SPLIT_WITH_SIZES: lambda n: _apply_hint_split(gm, n, tp_size),
+                ShardableOp.ALL_REDUCE: lambda n: _apply_hint_all_reduce(
+                    gm, n, tp_size, allreduce_strategy
+                ),
+                ShardableOp.CONV1D: lambda n: _apply_hint_conv1d(gm, n, tp_rank, tp_size),
+                ShardableOp.SSM: lambda n: _apply_hint_ssm(gm, n, tp_rank, tp_size),
+                ShardableOp.NORM: lambda n: _apply_hint_norm(gm, n, tp_rank, tp_size),
+                ShardableOp.MOE: lambda n: _apply_hint_moe(gm, n, config),
+            }
+
+            for node in list(gm.graph.nodes):
+                op_kind = is_any_shardable_op(node)
+                if op_kind is not None and op_kind in shardable_actions:
+                    num_updates += shardable_actions[op_kind](node)
+
+            ad_logger.info(f"apply_sharding_hints: {num_updates} nodes processed")
 
         return gm, TransformInfo(
             skipped=False,
