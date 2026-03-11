@@ -432,7 +432,7 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-3-Nano"
 
     CONFIG_YAML = str(
-        Path(get_llm_root()) / "examples" / "auto_deploy" / "nano_v3.yaml")
+        Path(get_llm_root()) / "examples" / "auto_deploy" / "nemotron_sharding_poc_config.yaml")
     MODEL_PATHS = {
         "bf16":
         hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"),
