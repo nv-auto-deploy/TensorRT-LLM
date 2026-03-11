@@ -31,9 +31,10 @@ Phase-specific details:
   Calls ``thop.attention`` with ``is_fused_qkv=False`` and ``head_size=qk_head_dim``.
   Output is directly in ``v_head_dim`` space.
 
-  **SDPA fallback**: When ``qk_nope_head_dim != v_head_dim`` (e.g. GLM-4.7-Flash), the
-  thop MLA context kernel internally computes ``headSizeV = qk_nope_head_dim`` causing
-  a fatal assertion. In this case prefill uses PyTorch SDPA instead.
+  **SDPA fallback**: All MLA prefill uses PyTorch SDPA.  The AD thop.attention
+  context call has a parameter mismatch vs the PyTorch backend's TrtllmAttention
+  wrapper that causes an illegal memory access on both SM90 and SM100 (root-cause
+  TBD).  The thop MLA *decode* kernel works correctly.
 
 - **Decode** (``attention_input_type=generation_only``):
   Uses weight absorption: ``q_absorbed = q_nope @ W_kn``, then
@@ -713,7 +714,7 @@ def _handle_prefill(
             k,
             v,
             output,
-            None,
+            latent_cache,
             None,
             False,
             1,
@@ -743,7 +744,6 @@ def _handle_prefill(
         # Multiple prefill sequences: process each independently.
         # With use_paged_context_fmha=False the kernel treats all tokens as one
         # sequence, so we must call per-sequence to avoid cross-sequence attention.
-        torch.cuda.synchronize()
         token_offset = 0
         for seq_idx in range(num_prefill):
             seq_len = int(host_context_lengths[seq_idx])
@@ -765,7 +765,7 @@ def _handle_prefill(
                 k[token_offset:t_end].contiguous(),
                 v[token_offset:t_end].contiguous(),
                 seq_output,
-                None,
+                latent_cache[token_offset:t_end].contiguous(),
                 None,
                 False,
                 1,
@@ -1067,14 +1067,10 @@ def _handle_decode(
         kv_b_proj_weight, num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank
     )
 
-    # Cast to fp32 for the batched GEMM to work around
-    # CUBLAS_STATUS_EXECUTION_FAILED in cublasGemmStridedBatchedEx with bf16
-    # on SM100 (B200) during CUDA graph capture at certain batch sizes.
-    q_absorbed = (
-        torch.bmm(q_nope_flat.transpose(0, 1).float(), w_kn.float())
-        .transpose(0, 1)
-        .to(q_nope_flat.dtype)
-    )
+    # q_nope_flat: [num_tokens, num_heads, qk_nope_head_dim]
+    # w_kn:        [num_heads, qk_nope_head_dim, kv_lora_rank]
+    # q_absorbed:  [num_tokens, num_heads, kv_lora_rank]
+    q_absorbed = torch.einsum("bnd,ndk->bnk", q_nope_flat, w_kn)
 
     # Build fused_q = [q_absorbed | q_pe] into pre-allocated buffer.
     # Non-padding: single torch.cat kernel writes both halves at once.
@@ -1141,15 +1137,13 @@ def _handle_decode(
     )
 
     # Project from latent space back to v_head_dim.
-    # fp32 cast for same SM100 cuBLAS workaround as q_absorbed above.
+    # output_reshaped: [num_tokens, num_heads, kv_lora_rank]
+    # w_v_t:           [num_heads, kv_lora_rank, v_head_dim]
+    # output:          [num_tokens, num_heads, v_head_dim]
     output_reshaped = output_latent.view(num_tokens, padded_num_heads, kv_lora_rank)
     if needs_head_padding:
         output_reshaped = output_reshaped[:, :num_heads, :].contiguous()
-    output = (
-        torch.bmm(output_reshaped.transpose(0, 1).float(), w_v_t.float())
-        .transpose(0, 1)
-        .to(output_reshaped.dtype)
-    )
+    output = torch.einsum("bnk,nkv->bnv", output_reshaped, w_v_t)
     return output.reshape(num_tokens, num_heads * v_head_dim)
 
 
@@ -1305,46 +1299,35 @@ def trtllm_mla_with_cache(
             host_kv_cache_pool_mapping,
         )
 
-    is_chunked = num_prefill > 0 and any(input_pos_host[i] > 0 for i in range(num_prefill))
-
-    # Fall back to SDPA for prefill when:
-    # 1. Chunked prefill (need causal masking with cached tokens).
-    # 2. qk_nope_head_dim != v_head_dim: thop.attention internally uses
-    #    qk_nope_head_dim as headSizeV and picks the wrong FMHA kernel.
-    # 3. SM100+: thop.attention MLA context kernel hits illegal memory accesses
-    #    on Blackwell (e.g. B200) even when head dims match.
-    use_sdpa_for_prefill = is_chunked or (qk_nope_head_dim != v_head_dim) or get_sm_version() >= 100
+    # Always use SDPA for MLA prefill.  The AD thop.attention context call
+    # has a parameter mismatch vs the PyTorch backend's TrtllmAttention
+    # wrapper that causes an illegal memory access on both SM90 and SM100.
+    # Root-cause TBD — known differences already fixed (latent_cache,
+    # num_kv_heads=num_heads) but the kernel still crashes.  The thop MLA
+    # *decode* kernel (weight-absorption path) works correctly.
+    # SDPA avoids the issue: attention is computed via PyTorch and the
+    # latent cache is written separately by _write_latent_cache_to_paged_kv.
 
     def _do_prefill(q_n, q_p, lc, n_tok, n_pf):
-        """Dispatch prefill: thop.attention or SDPA for unsupported configs."""
-        if use_sdpa_for_prefill:
-            return _handle_chunked_prefill(
-                q_n,
-                q_p,
-                compressed_kv_flat[:n_tok],
-                kpe_flat[:n_tok],
-                kv_b_proj_weight,
-                num_heads,
-                qk_nope_head_dim,
-                qk_rope_head_dim,
-                v_head_dim,
-                kv_lora_rank,
-                scale,
-                seq_len_host,
-                input_pos_host,
-                kv_cache,
-                planner.block_ids_per_seq,
-                tokens_per_block,
-                n_pf,
-            )
-        return _handle_prefill(
+        """Dispatch prefill via SDPA (handles both fresh and chunked prefill)."""
+        return _handle_chunked_prefill(
             q_n,
             q_p,
+            compressed_kv_flat[:n_tok],
+            kpe_flat[:n_tok],
             kv_b_proj_weight,
-            lc,
-            n_tok,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim,
+            kv_lora_rank,
+            scale,
+            seq_len_host,
+            input_pos_host,
+            kv_cache,
+            planner.block_ids_per_seq,
+            tokens_per_block,
             n_pf,
-            *_make_shared_metadata(),
         )
 
     if num_prefill > 0 and num_decode > 0:
