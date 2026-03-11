@@ -107,6 +107,20 @@ def _create_small_chat_config() -> SkyworkChatConfig:
 
 # ---------------------------------------------------------------------------
 # Standalone HF Qwen2 reference implementations (for equivalence tests)
+#
+# Why not import transformers.models.qwen2.modeling_qwen2 directly?
+#
+# 1. Attention SDPA behavior: HF Qwen2Attention uses F.scaled_dot_product_attention
+#    with an explicit attention mask and may dispatch to flash/efficient kernels
+#    depending on transformers version and installed backends.  Our inline attention
+#    uses the same F.scaled_dot_product_attention call but with is_causal=True and
+#    no external mask, matching what our AD custom op produces.  This makes the
+#    reference deterministic and independent of transformers installation details.
+#
+# 2. The RMSNorm and MLP blocks are functionally identical to the HF versions, but
+#    keeping all reference implementations inline avoids importing from transformers
+#    private module paths (transformers.models.qwen2.modeling_qwen2) which could
+#    change across versions.
 # ---------------------------------------------------------------------------
 
 
@@ -569,7 +583,6 @@ def test_skywork_r1v2_state_dict_keys():
             f"Expected key '{key}' in state_dict, got keys: {list(state_dict.keys())[:10]}..."
         )
 
-    # Ensure no vision model keys
+    # Ensure no unexpected keys outside language_model.* (e.g. no vision_model.*, mlp1.*)
     for key in state_dict:
-        assert not key.startswith("vision_model."), f"Unexpected vision key: {key}"
-        assert not key.startswith("mlp1."), f"Unexpected mlp1 key: {key}"
+        assert key.startswith("language_model."), f"Unexpected key outside language_model: '{key}'"
