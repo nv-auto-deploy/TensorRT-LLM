@@ -57,7 +57,6 @@ Config files are stored in `configs/` subdirectory and define runtime parameters
 | `llama-4-scout.yaml` | Settings for Llama 4 Scout |
 | `openelm.yaml` | Apple OpenELM (custom tokenizer) |
 | `gemma3_1b.yaml` | Gemma 3 1B (sequence length) |
-| `gemma3_27b_it.yaml` | Gemma 3 27B IT (1023-token sequence cap) |
 | `gemma3_27b_it_6layers.yaml` | Gemma 3 27B IT reduced-layer validation |
 | `deepseek_v3_lite.yaml` | DeepSeek V3/R1 (reduced layers) |
 | `llama4_maverick_lite.yaml` | Llama 4 Maverick (reduced layers) |

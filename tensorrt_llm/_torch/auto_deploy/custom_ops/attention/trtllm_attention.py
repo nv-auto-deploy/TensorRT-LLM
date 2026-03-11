@@ -347,9 +347,11 @@ def trtllm_mha_with_cache(
     num_tokens = num_prefill_tokens + num_decode
     max_context_length = int(max_seq_info_host[0])
     max_num_requests = int(max_seq_info_host[3])
-    # Use sliding_window for attention_window_size if provided, else full context length
+    # TRTLLM's attention_window_size is exclusive, while torch_attention's sliding_window
+    # convention matches the total visible token count. Normalize here so per-layer cached
+    # attention matches the eager/export semantics without changing global KV capacity sizing.
     attention_window_size = (
-        sliding_window
+        max(sliding_window - 1, 0)
         if isinstance(sliding_window, int) and sliding_window > 0
         else max_context_length
     )
