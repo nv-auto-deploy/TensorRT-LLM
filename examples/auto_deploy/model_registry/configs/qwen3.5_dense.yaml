@@ -1,0 +1,33 @@
+# Configuration for Qwen3.5 dense models (0.8B, 27B)
+# Hybrid GatedDeltaNet + full attention, no MoE
+
+runtime: trtllm
+compile_backend: torch-cudagraph
+max_seq_len: 4096
+max_num_tokens: 4096
+max_batch_size: 512
+enable_chunked_prefill: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.95
+  tokens_per_block: 64
+model_kwargs:
+  torch_dtype: bfloat16
+transforms:
+  detect_sharding:
+    sharding_dims: ['tp']
+    # use only manual config for TP sharding
+    sharding_source: ['manual']
+    manual_config:
+      tp_plan:
+        # GDN layer
+        "in_proj_qkv": "delta"
+        # attention layer
+        "q_proj": "colwise"
+        "k_proj": "colwise"
+        "v_proj": "colwise"
+        "o_proj": "rowwise"
+        # MLP
+        "gate_proj": "colwise"
+        "up_proj": "colwise"
+        "down_proj": "rowwise"
