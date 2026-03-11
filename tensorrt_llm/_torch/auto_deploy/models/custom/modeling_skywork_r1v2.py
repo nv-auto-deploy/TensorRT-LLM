@@ -28,6 +28,12 @@ This implementation differs from the original HuggingFace version in the followi
 * Removed flash attention variants (uses torch_attention custom op)
 * Removed gradient checkpointing and training code paths
 * Removed attention dropout (inference only)
+
+The HF checkpoint config class (SkyworkChatConfig, model_type="skywork_chat") is NOT
+imported here — it uses trust_remote_code and is only available when the checkpoint is
+present in the local HF cache.  AutoDeploy loads it via AutoConfig.from_pretrained at
+runtime and dispatches to SkyworkR1V2ForCausalLM via the "SkyworkChatConfig" key
+registered below.
 """
 
 from dataclasses import dataclass
@@ -42,32 +48,6 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-
-# ---------------------------------------------------------------------------
-# Load SkyworkChatConfig from the HF checkpoint via trust_remote_code.
-#
-# The config class is defined in configuration_skywork_chat.py inside the HF
-# repo (model_type = "skywork_chat").  It is NOT in standard transformers, so
-# we load it from the local HF cache.  tie_word_embeddings is already False in
-# the checkpoint's config.json at both the top level and inside llm_config, so
-# no override is needed here.
-# ---------------------------------------------------------------------------
-
-
-def _load_skywork_chat_config_cls():
-    try:
-        from transformers import AutoConfig
-
-        cfg = AutoConfig.from_pretrained(
-            "Skywork/Skywork-R1V2-38B", trust_remote_code=True, local_files_only=True
-        )
-        return type(cfg)
-    except Exception:
-        return None
-
-
-SkyworkChatConfig = _load_skywork_chat_config_cls()
-
 
 # ---------------------------------------------------------------------------
 # Model components (Qwen2-based LLM backbone)
@@ -258,7 +238,7 @@ class SkyworkR1V2CausalLMOutput(ModelOutput):
 
 
 class SkyworkR1V2PreTrainedModel(PreTrainedModel):
-    config_class = SkyworkChatConfig
+    config_class = None  # SkyworkChatConfig uses trust_remote_code; not imported here
     base_model_prefix = "language_model"
     _no_split_modules = ["SkyworkR1V2DecoderLayer"]
     supports_gradient_checkpointing = False
@@ -374,9 +354,12 @@ class SkyworkR1V2ForCausalLM(SkyworkR1V2PreTrainedModel, GenerationMixin):
     Vision weights (vision_model.*, mlp1.*) are silently skipped during loading.
     """
 
-    def __init__(self, config: SkyworkChatConfig, **kwargs):
+    def __init__(self, config, **kwargs):
         super().__init__(config)
-        llm_config = config.llm_config
+        # At runtime, config is a SkyworkChatConfig (loaded via trust_remote_code by AD)
+        # with a nested llm_config (Qwen2Config).  In unit tests, a Qwen2Config can be
+        # passed directly; the getattr fallback handles both cases.
+        llm_config = getattr(config, "llm_config", config)
         self.language_model = SkyworkR1V2LanguageModel(llm_config)
         self.post_init()
 
@@ -411,5 +394,9 @@ class SkyworkR1V2ForCausalLM(SkyworkR1V2PreTrainedModel, GenerationMixin):
         )
 
 
-# Register with AutoModelForCausalLMFactory
+# Register with AutoModelForCausalLMFactory.
+# The key must match type(config).__name__ for the config AutoDeploy loads from the checkpoint
+# ("SkyworkChatConfig").  Without this registration, AutoDeploy would fall through to
+# AutoModelForCausalLM.from_config which instantiates the full VLM (vision + LLM) that
+# cannot be exported.
 AutoModelForCausalLMFactory.register_custom_model_cls("SkyworkChatConfig", SkyworkR1V2ForCausalLM)

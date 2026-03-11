@@ -19,6 +19,9 @@ Skywork-R1V2-38B is an InternVL-based VLM with a Qwen2 LLM backbone.
 The AD custom model only exports the LLM text path.  The LLM is standard
 Qwen2 (GQA with bias on Q/K/V, SwiGLU MLP, RMSNorm, RoPE).
 
+SkyworkR1V2ForCausalLM accepts a Qwen2Config directly (the llm_config fallback
+in the constructor) so all tests run without the HF checkpoint in the local cache.
+
 Since the HF config/model classes for this model are NOT in standard
 transformers (they use trust_remote_code), we include standalone HF
 reference implementations directly in this test file.
@@ -35,7 +38,6 @@ from transformers.activations import ACT2FN
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_skywork_r1v2 import (
-    SkyworkChatConfig,
     SkyworkR1V2Attention,
     SkyworkR1V2DecoderLayer,
     SkyworkR1V2ForCausalLM,
@@ -44,14 +46,6 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_skywork_r1v2 import 
     SkyworkR1V2RotaryEmbedding,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
-
-# SkyworkChatConfig is loaded from the HF cache (trust_remote_code=True).  If the
-# model has not been downloaded, it will be None and all tests are skipped.
-if SkyworkChatConfig is None:
-    pytest.skip(
-        "Skywork/Skywork-R1V2-38B not found in local HF cache; skipping tests.",
-        allow_module_level=True,
-    )
 
 _BATCH_AND_SEQUENCE_TEST_CASES = ((2, 6), (1, 8))
 
@@ -69,11 +63,11 @@ def set_seed():
 def _create_small_llm_config() -> Qwen2Config:
     """Create a small Qwen2 config for the LLM backbone.
 
-    architectures is set explicitly so that to_dict() carries it through to
-    SkyworkChatConfig, which uses it to select the backbone class.
+    SkyworkR1V2ForCausalLM accepts a Qwen2Config directly via the
+    getattr(config, 'llm_config', config) fallback in its constructor,
+    so no SkyworkChatConfig wrapper is needed for unit tests.
     """
     return Qwen2Config(
-        architectures=["Qwen2ForCausalLM"],
         vocab_size=1000,
         hidden_size=64,
         intermediate_size=128,
@@ -87,21 +81,6 @@ def _create_small_llm_config() -> Qwen2Config:
         rope_scaling=None,
         use_sliding_window=False,
         tie_word_embeddings=False,
-    )
-
-
-def _create_small_chat_config() -> SkyworkChatConfig:
-    """Create a small SkyworkChatConfig wrapping the Qwen2 LLM config.
-
-    tie_word_embeddings is read from the llm_config and forwarded to the outer
-    config so that post_init() does not incorrectly tie lm_head to embed_tokens
-    (PretrainedConfig defaults tie_word_embeddings=True if not passed explicitly).
-    """
-    llm_config = _create_small_llm_config()
-    llm_dict = llm_config.to_dict()
-    return SkyworkChatConfig(
-        llm_config=llm_dict,
-        tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
     )
 
 
@@ -437,11 +416,10 @@ def test_skywork_r1v2_decoder_layer_equivalence(B, S, dtype):
 def test_skywork_r1v2_full_model_equivalence(B, S, dtype, device):
     """Test full model produces numerically equivalent output to HF Qwen2."""
     config = _create_small_llm_config()
-    chat_config = _create_small_chat_config()
 
     hf_model = _HFQwen2ForCausalLM(config).to(device=device, dtype=dtype).eval()
 
-    custom_model = SkyworkR1V2ForCausalLM(chat_config).to(device=device, dtype=dtype)
+    custom_model = SkyworkR1V2ForCausalLM(config).to(device=device, dtype=dtype)
     custom_model.load_state_dict(
         _convert_hf_to_custom_state_dict(hf_model.state_dict()), strict=False
     )
@@ -471,9 +449,9 @@ def test_skywork_r1v2_model_can_be_exported():
     """Test that the custom model can be exported with torch_export_to_gm."""
     device = "cuda"
     dtype = torch.bfloat16
-    chat_config = _create_small_chat_config()
+    config = _create_small_llm_config()
 
-    model = SkyworkR1V2ForCausalLM(chat_config)
+    model = SkyworkR1V2ForCausalLM(config)
     model.to(device=device, dtype=dtype)
     model.eval()
 
@@ -530,20 +508,9 @@ def test_skywork_r1v2_model_can_be_exported():
 # =========================================================================
 
 
-def test_skywork_r1v2_config_parsing():
-    """Test that SkyworkChatConfig correctly parses nested llm_config."""
-    config = _create_small_chat_config()
-    assert config.model_type == "skywork_chat"
-    assert isinstance(config.llm_config, Qwen2Config)
-    assert config.llm_config.hidden_size == 64
-    assert config.llm_config.num_attention_heads == 4
-    assert config.llm_config.num_key_value_heads == 2
-
-
 def test_skywork_r1v2_gqa_structure():
     """Test that attention uses GQA with bias on QKV."""
-    chat_config = _create_small_chat_config()
-    model = SkyworkR1V2ForCausalLM(chat_config)
+    model = SkyworkR1V2ForCausalLM(_create_small_llm_config())
 
     attn = model.language_model.model.layers[0].self_attn
     assert attn.num_heads == 4
@@ -556,8 +523,7 @@ def test_skywork_r1v2_gqa_structure():
 
 def test_skywork_r1v2_state_dict_keys():
     """Test that state_dict keys match expected checkpoint format."""
-    chat_config = _create_small_chat_config()
-    model = SkyworkR1V2ForCausalLM(chat_config)
+    model = SkyworkR1V2ForCausalLM(_create_small_llm_config())
     state_dict = model.state_dict()
 
     expected_key_patterns = [
