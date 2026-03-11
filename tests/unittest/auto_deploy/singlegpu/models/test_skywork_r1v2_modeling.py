@@ -45,6 +45,14 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_skywork_r1v2 import 
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
+# SkyworkChatConfig is loaded from the HF cache (trust_remote_code=True).  If the
+# model has not been downloaded, it will be None and all tests are skipped.
+if SkyworkChatConfig is None:
+    pytest.skip(
+        "Skywork/Skywork-R1V2-38B not found in local HF cache; skipping tests.",
+        allow_module_level=True,
+    )
+
 _BATCH_AND_SEQUENCE_TEST_CASES = ((2, 6), (1, 8))
 
 
@@ -59,8 +67,13 @@ def set_seed():
 
 
 def _create_small_llm_config() -> Qwen2Config:
-    """Create a small Qwen2 config for the LLM backbone."""
+    """Create a small Qwen2 config for the LLM backbone.
+
+    architectures is set explicitly so that to_dict() carries it through to
+    SkyworkChatConfig, which uses it to select the backbone class.
+    """
     return Qwen2Config(
+        architectures=["Qwen2ForCausalLM"],
         vocab_size=1000,
         hidden_size=64,
         intermediate_size=128,
@@ -78,9 +91,18 @@ def _create_small_llm_config() -> Qwen2Config:
 
 
 def _create_small_chat_config() -> SkyworkChatConfig:
-    """Create a small SkyworkChatConfig wrapping the Qwen2 LLM config."""
+    """Create a small SkyworkChatConfig wrapping the Qwen2 LLM config.
+
+    tie_word_embeddings is read from the llm_config and forwarded to the outer
+    config so that post_init() does not incorrectly tie lm_head to embed_tokens
+    (PretrainedConfig defaults tie_word_embeddings=True if not passed explicitly).
+    """
     llm_config = _create_small_llm_config()
-    return SkyworkChatConfig(llm_config=llm_config.to_dict())
+    llm_dict = llm_config.to_dict()
+    return SkyworkChatConfig(
+        llm_config=llm_dict,
+        tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +519,7 @@ def test_skywork_r1v2_model_can_be_exported():
 def test_skywork_r1v2_config_parsing():
     """Test that SkyworkChatConfig correctly parses nested llm_config."""
     config = _create_small_chat_config()
-    assert config.model_type == "internvl_chat"
+    assert config.model_type == "skywork_chat"
     assert isinstance(config.llm_config, Qwen2Config)
     assert config.llm_config.hidden_size == 64
     assert config.llm_config.num_attention_heads == 4

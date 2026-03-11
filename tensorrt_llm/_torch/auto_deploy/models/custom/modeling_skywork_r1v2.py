@@ -30,99 +30,43 @@ This implementation differs from the original HuggingFace version in the followi
 * Removed attention dropout (inference only)
 """
 
-import copy
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import AutoConfig, Qwen2Config
+from transformers import Qwen2Config
 from transformers.activations import ACT2FN
-from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 
-
 # ---------------------------------------------------------------------------
-# Bundled config class for internvl_chat model_type
+# Load SkyworkChatConfig from the HF checkpoint via trust_remote_code.
+#
+# The config class is defined in configuration_skywork_chat.py inside the HF
+# repo (model_type = "skywork_chat").  It is NOT in standard transformers, so
+# we load it from the local HF cache.  tie_word_embeddings is already False in
+# the checkpoint's config.json at both the top level and inside llm_config, so
+# no override is needed here.
 # ---------------------------------------------------------------------------
-class SkyworkChatConfig(PretrainedConfig):
-    """Minimal config for Skywork-R1V2 (InternVL-based VLM).
-
-    Bundled so that AD can instantiate the model even when the HF repo's remote
-    code is not available.  When transformers already registers internvl_chat
-    (or the HF auto_map is used), the remotely-loaded config takes precedence.
-    """
-
-    model_type = "internvl_chat"
-
-    def __init__(
-        self,
-        vision_config=None,
-        llm_config=None,
-        hidden_size=5120,
-        downsample_ratio=0.5,
-        select_layer=-1,
-        force_image_size=None,
-        template=None,
-        dynamic_image_size=False,
-        use_thumbnail=False,
-        ps_version="v2",
-        min_dynamic_patch=1,
-        max_dynamic_patch=12,
-        use_backbone_lora=0,
-        use_llm_lora=0,
-        **kwargs,
-    ):
-        # Skywork/Qwen2 backbone does not tie input/output embeddings
-        kwargs.setdefault("tie_word_embeddings", False)
-        super().__init__(**kwargs)
-        # Vision config is stored but not used for the AD text-only export path
-        self.vision_config = vision_config or {}
-
-        # Parse the LLM sub-config
-        if llm_config is None:
-            llm_config = {}
-        if isinstance(llm_config, dict):
-            arch = llm_config.get("architectures", ["Qwen2ForCausalLM"])
-            if arch and arch[0] == "Qwen2ForCausalLM":
-                self.llm_config = Qwen2Config(**llm_config)
-            else:
-                self.llm_config = Qwen2Config(**llm_config)
-        else:
-            self.llm_config = llm_config
-
-        self.hidden_size = hidden_size
-        self.downsample_ratio = downsample_ratio
-        self.select_layer = select_layer
-        self.force_image_size = force_image_size
-        self.template = template
-        self.dynamic_image_size = dynamic_image_size
-        self.use_thumbnail = use_thumbnail
-        self.ps_version = ps_version
-        self.min_dynamic_patch = min_dynamic_patch
-        self.max_dynamic_patch = max_dynamic_patch
-        self.use_backbone_lora = use_backbone_lora
-        self.use_llm_lora = use_llm_lora
-
-    def to_dict(self):
-        output = copy.deepcopy(self.__dict__)
-        if hasattr(self.llm_config, "to_dict"):
-            output["llm_config"] = self.llm_config.to_dict()
-        output["model_type"] = self.__class__.model_type
-        return output
 
 
-try:
-    AutoConfig.register("internvl_chat", SkyworkChatConfig, exist_ok=True)
-except TypeError:
+def _load_skywork_chat_config_cls():
     try:
-        AutoConfig.register("internvl_chat", SkyworkChatConfig)
-    except ValueError:
-        pass
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(
+            "Skywork/Skywork-R1V2-38B", trust_remote_code=True, local_files_only=True
+        )
+        return type(cfg)
+    except Exception:
+        return None
+
+
+SkyworkChatConfig = _load_skywork_chat_config_cls()
 
 
 # ---------------------------------------------------------------------------
@@ -151,8 +95,8 @@ class SkyworkR1V2RotaryEmbedding(nn.Module):
     def __init__(
         self,
         dim: int,
-        max_position_embeddings: int = 40960,
-        base: float = 10000.0,
+        max_position_embeddings: int,
+        base: float,
     ):
         super().__init__()
         self.dim = dim
