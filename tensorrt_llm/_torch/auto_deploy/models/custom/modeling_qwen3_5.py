@@ -392,9 +392,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)  # [B, S, num_v_heads]
 
+        # GQA head expansion: expand Q/K to match V's head count before GDN op.
+        # NOTE: The GDN uncached op handles GQA internally, but we also expand here
+        # so that the delta sharding transform sees uniform head counts and applies
+        # the correct sharding. Without this, TP sharding produces garbled output.
+        if self.num_v_heads // self.num_k_heads > 1:
+            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+
         # 5. Gated Delta Rule via autodeploy custom op
-        # Op expects [B, S, H, D] layout (bsnd convention).
-        # GQA (num_v_heads > num_k_heads) is handled inside the GDN op and backends.
+        # Op expects [B, S, H, D] layout (bsnd convention)
         core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(query, key, value, g, beta)
 
         # 6. Gated RMSNorm

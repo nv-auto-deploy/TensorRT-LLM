@@ -7,6 +7,8 @@ model_kwargs:
   torch_dtype: bfloat16
 enable_lm_head_tp_in_adp: true
 transforms:
+  gather_logits_before_lm_head:
+    enabled: true
   detect_sharding:
     sharding_dims: ['tp']
     sharding_source: ['manual']
