@@ -392,7 +392,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)  # [B, S, num_v_heads]
 
-        # Repeat-interleave Q, K if num_v_heads > num_k_heads (GQA for linear attention)
+        # GQA head expansion: Q/K have num_k_heads, V has num_v_heads.
+        # Expand Q/K to match V before passing to the GDN op.
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
