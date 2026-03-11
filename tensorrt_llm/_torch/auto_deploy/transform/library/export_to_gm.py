@@ -21,6 +21,28 @@ from ..interface import (
 )
 
 
+def _build_dynamic_shapes_from_spec(value: Any, spec: Any) -> Any:
+    """Mirror the input pytree while attaching dynamic shape specs to tensor leaves."""
+    if isinstance(value, torch.Tensor):
+        return spec
+    if isinstance(value, dict):
+        spec_dict = spec if isinstance(spec, dict) else {}
+        return {k: _build_dynamic_shapes_from_spec(v, spec_dict.get(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        spec_list = spec if isinstance(spec, list) else [None] * len(value)
+        return [
+            _build_dynamic_shapes_from_spec(v, spec_list[i] if i < len(spec_list) else None)
+            for i, v in enumerate(value)
+        ]
+    if isinstance(value, tuple):
+        spec_tuple = spec if isinstance(spec, tuple) else (None,) * len(value)
+        return tuple(
+            _build_dynamic_shapes_from_spec(v, spec_tuple[i] if i < len(spec_tuple) else None)
+            for i, v in enumerate(value)
+        )
+    return None
+
+
 class ExportToGMConfig(TransformConfig):
     """Configuration for the export to graph module transform."""
 
@@ -171,7 +193,7 @@ class ExportToGM(BaseTransform):
 
             # construct dynamic shapes based on the captured kwargs and the dynamic shape lookup
             dynamic_shapes = {
-                k: e_info.dynamic_shape_lookup[k] if isinstance(v, torch.Tensor) else None
+                k: _build_dynamic_shapes_from_spec(v, e_info.dynamic_shape_lookup.get(k))
                 for k, v in captured_kwargs.items()
             }
 

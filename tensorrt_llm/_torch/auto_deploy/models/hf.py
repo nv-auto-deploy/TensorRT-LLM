@@ -675,6 +675,15 @@ class TextModelExportInfo(SubModuleExportInfo):
             "input_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
             "inputs_embeds": {0: batch_size_dynamic, 1: seq_len_dynamic},
             "position_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
+            "cache_position": {0: seq_len_dynamic},
+            "attention_mask": {
+                "full_attention": {0: batch_size_dynamic, 2: seq_len_dynamic, 3: seq_len_dynamic},
+                "sliding_attention": {
+                    0: batch_size_dynamic,
+                    2: seq_len_dynamic,
+                    3: seq_len_dynamic,
+                },
+            },
         }
 
     @classmethod

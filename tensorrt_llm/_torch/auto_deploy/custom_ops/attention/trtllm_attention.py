@@ -285,7 +285,9 @@ def prepare_trtllm_metadata_fake(
     cache_loc: torch.Tensor,
 ) -> List[torch.Tensor]:
     """Fake implementation for torch.compile tracing."""
-    _, max_blocks_per_seq, _, max_batch_size = max_seq_info_host.tolist()
+    del batch_info_host, max_seq_info_host
+    max_batch_size = cu_num_pages.shape[0] - 1
+    max_blocks_per_seq = torch.library.get_ctx().new_dynamic_size(min=1)
     return [
         torch.empty(
             1, max_batch_size, 2, max_blocks_per_seq, dtype=torch.int32, device=cache_loc.device
