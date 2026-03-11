@@ -94,13 +94,12 @@ class Qwen3RotaryEmbedding(nn.Module):
         self.register_buffer("_ad_sin_cached", emb.sin(), persistent=False)
 
     def forward(
-        self, x: torch.Tensor, seq_len: Optional[int] = None
+        self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Return full cached cos/sin (not sliced) for export compatibility
-        return (
-            self._ad_cos_cached.to(dtype=x.dtype, device=x.device),
-            self._ad_sin_cached.to(dtype=x.dtype, device=x.device),
-        )
+        # Slice cos/sin by position_ids here (once) instead of in every attention layer
+        cos = self._ad_cos_cached.to(dtype=x.dtype, device=x.device)
+        sin = self._ad_sin_cached.to(dtype=x.dtype, device=x.device)
+        return cos[position_ids], sin[position_ids]
 
 
 class Qwen3MLP(nn.Module):
@@ -162,7 +161,6 @@ class Qwen3Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
@@ -176,11 +174,8 @@ class Qwen3Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # Get cos/sin from position_embeddings (full cached from shared rotary embedding)
-        cos = position_embeddings[0]  # Full table: [max_seq_len, head_dim]
-        sin = position_embeddings[1]  # Full table: [max_seq_len, head_dim]
-        cos = cos[position_ids]  # [B, S, head_dim]
-        sin = sin[position_ids]  # [B, S, head_dim]
+        # Get pre-sliced cos/sin from position_embeddings (already indexed by position_ids)
+        cos, sin = position_embeddings  # [B, S, head_dim]
 
         # Apply RoPE using custom op (BSND layout, unsqueeze_dim=2)
         q, k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
@@ -228,13 +223,12 @@ class Qwen3DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         # Self attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_ids, position_embeddings)
+        hidden_states = self.self_attn(hidden_states, position_embeddings)
         hidden_states = residual + hidden_states
 
         # MLP
@@ -323,6 +317,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         elif input_ids is None and inputs_embeds is None:
             raise ValueError("Must specify either input_ids or inputs_embeds")
 
+        assert position_ids is not None, "position_ids must be provided for AD export"
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -330,20 +326,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # output may be FP8 but downstream ops (RMSNorm, attention) require FP16/BF16
         inputs_embeds = inputs_embeds.to(self.norm.weight.dtype)
 
-        batch_size, seq_length = inputs_embeds.shape[:2]
-
-        if position_ids is None:
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
-            position_ids = torch.arange(seq_length, dtype=torch.long, device=device)
-            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
-
-        # Compute position embeddings once from shared rotary embedding
-        position_embeddings = self.rotary_emb(inputs_embeds)
+        # Compute position embeddings once (sliced by position_ids in RoPE)
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
         hidden_states = inputs_embeds
 
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(hidden_states, position_ids, position_embeddings)
+            hidden_states = decoder_layer(hidden_states, position_embeddings)
 
         hidden_states = self.norm(hidden_states)
 
@@ -385,6 +374,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> Qwen3CausalLMOutput:
+        assert position_ids is not None, "position_ids must be provided for AD export"
         outputs = self.model(
             input_ids=input_ids,
             position_ids=position_ids,

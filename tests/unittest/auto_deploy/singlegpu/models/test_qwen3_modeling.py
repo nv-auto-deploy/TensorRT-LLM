@@ -198,13 +198,13 @@ def test_qwen3_attention_equivalence(B, S, dtype):
     hf_rotary = HFRotary(config=config, device=device)
     hf_cos, hf_sin = hf_rotary(x, position_ids)  # [B, S, head_dim]
 
-    # Compute custom position embeddings
+    # Compute custom position embeddings (pre-sliced by position_ids)
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     custom_rotary = Qwen3RotaryEmbedding(
         head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
     )
     custom_rotary.to(device=device, dtype=dtype)
-    cos_table, sin_table = custom_rotary(x)
+    custom_cos, custom_sin = custom_rotary(x, position_ids)
 
     # Run HF attention (needs attention_mask=None for causal)
     hf_out, _ = hf_attn(
@@ -213,11 +213,10 @@ def test_qwen3_attention_equivalence(B, S, dtype):
         attention_mask=None,
     )
 
-    # Run custom attention
+    # Run custom attention (position_embeddings are pre-sliced)
     custom_out = custom_attn(
         hidden_states=x,
-        position_ids=position_ids,
-        position_embeddings=(cos_table, sin_table),
+        position_embeddings=(custom_cos, custom_sin),
     )
 
     # Attention uses custom ops, allow wider tolerance
@@ -262,13 +261,13 @@ def test_qwen3_decoder_layer_equivalence(B, S, dtype):
     hf_rotary = HFRotary(config=config, device=device)
     hf_cos, hf_sin = hf_rotary(x, position_ids)
 
-    # Compute custom position embeddings
+    # Compute custom position embeddings (pre-sliced by position_ids)
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     custom_rotary = Qwen3RotaryEmbedding(
         head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
     )
     custom_rotary.to(device=device, dtype=dtype)
-    cos_table, sin_table = custom_rotary(x)
+    custom_cos, custom_sin = custom_rotary(x, position_ids)
 
     # Run HF decoder layer (returns tensor directly, but handle tuple for safety)
     hf_out = hf_layer(
@@ -280,11 +279,10 @@ def test_qwen3_decoder_layer_equivalence(B, S, dtype):
     if isinstance(hf_out, tuple):
         hf_out = hf_out[0]
 
-    # Run custom decoder layer
+    # Run custom decoder layer (position_embeddings are pre-sliced)
     custom_out = custom_layer(
         hidden_states=x,
-        position_ids=position_ids,
-        position_embeddings=(cos_table, sin_table),
+        position_embeddings=(custom_cos, custom_sin),
     )
 
     assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.05, msg="Decoder layer: ")
