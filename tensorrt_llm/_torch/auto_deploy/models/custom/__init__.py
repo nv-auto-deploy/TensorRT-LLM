@@ -1,14 +1,25 @@
+from .modeling_cohere import CohereForCausalLM
+from .modeling_decilm import DeciLMForCausalLM
 from .modeling_deepseek import DeepSeekV3ForCausalLM
+from .modeling_deepseek_v2 import DeepSeekV2ForCausalLM
 from .modeling_glm4_moe_lite import Glm4MoeLiteForCausalLM
 from .modeling_granite_moe_hybrid import GraniteMoeHybridForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEForCausalLM
 from .modeling_kimi_k2 import KimiK2ForCausalLM, KimiK25ForConditionalGeneration
+from .modeling_llama3 import Llama3ForCausalLM
 from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreTrainedTokenizerFast
 from .modeling_nemotron_h import NemotronHForCausalLM
+from .modeling_qwen3 import Qwen3ForCausalLM
+from .modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
 from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration
+from .modeling_skywork_r1v2 import SkyworkR1V2ForConditionalGeneration
+from .modeling_starcoder2 import Starcoder2ForCausalLM
 
 __all__ = (
+    "CohereForCausalLM",
+    "DeciLMForCausalLM",
+    "DeepSeekV2ForCausalLM",
     "DeepSeekV3ForCausalLM",
     "Glm4MoeLiteForCausalLM",
     "HunYuanDenseForCausalLM",
@@ -16,9 +27,15 @@ __all__ = (
     "HunYuanMoEForCausalLM",
     "KimiK2ForCausalLM",
     "KimiK25ForConditionalGeneration",
+    "Llama3ForCausalLM",
     "NemotronFlashForCausalLM",
     "NemotronFlashPreTrainedTokenizerFast",
     "NemotronHForCausalLM",
+    "Qwen3ForCausalLM",
+    "Qwen3_5ForCausalLM",
+    "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
+    "SkyworkR1V2ForConditionalGeneration",
+    "Starcoder2ForCausalLM",
 )
