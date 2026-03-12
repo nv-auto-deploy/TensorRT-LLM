@@ -241,10 +241,11 @@ class GlmMoeDsaMLP(nn.Module):
 
 
 class GlmMoeDsaMoEGate(nn.Module):
-    """MoE Gating with noaux_tc-style top-k selection (vanilla PyTorch).
+    """MoE Gating with noaux_tc top-k selection.
 
-    Implements: sigmoid scoring → bias correction → group top-k → normalize → scale.
-    AD transforms can replace this with fused trtllm kernels at deployment time.
+    Uses fused TensorRT-LLM custom ops for efficient routing:
+    - dsv3_router_gemm_op: Fused router GEMM for non-float32 weights
+    - noaux_tc_op: Fused sigmoid + bias + group top-k + normalize + scale
     """
 
     def __init__(self, config):
@@ -256,6 +257,12 @@ class GlmMoeDsaMoEGate(nn.Module):
         self.n_group = config.n_group
         self.topk_group = config.topk_group
         self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
+
+        if not self.norm_topk_prob:
+            raise ValueError(
+                "GlmMoeDsaMoEGate requires norm_topk_prob=True when using fused ops. "
+                "The noaux_tc_op kernel always normalizes routing weights."
+            )
 
         self.weight = nn.Parameter(
             torch.empty((self.n_routed_experts, config.hidden_size), dtype=torch.float32)
@@ -269,41 +276,27 @@ class GlmMoeDsaMoEGate(nn.Module):
     def reset_parameters(self) -> None:
         torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
-    @torch.no_grad()
-    def _get_topk_indices(self, scores: torch.Tensor) -> torch.Tensor:
-        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
-        group_scores = (
-            scores_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group)
-            .topk(2, dim=-1)[0]
-            .sum(dim=-1)
-        )
-        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
-        score_mask = (
-            group_mask.unsqueeze(-1)
-            .expand(-1, self.n_group, self.n_routed_experts // self.n_group)
-            .reshape(-1, self.n_routed_experts)
-        )
-        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
-        topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
-        return topk_indices
-
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         bsz, seq_len, hidden_dim = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
-        router_logits = F.linear(hidden_states_flat.float(), self.weight.float())
-        scores = router_logits.sigmoid()
+        # Router GEMM - use fused op when weights are not float32
+        if self.weight.dtype == torch.float32:
+            router_logits = F.linear(hidden_states_flat.float(), self.weight)
+        else:
+            router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
+                hidden_states_flat, self.weight.t(), bias=None, out_dtype=torch.float32
+            )
 
-        topk_indices = self._get_topk_indices(scores)
-        topk_weights = scores.gather(1, topk_indices)
-
-        if self.norm_topk_prob:
-            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
-            topk_weights = topk_weights / denominator
-
-        topk_weights = topk_weights * self.routed_scaling_factor
+        # Fused routing: sigmoid + bias + group top-k + normalize + scale
+        topk_weights, topk_indices = torch.ops.trtllm.noaux_tc_op(
+            router_logits,
+            self.e_score_correction_bias,
+            self.n_group,
+            self.topk_group,
+            self.top_k,
+            self.routed_scaling_factor,
+        )
 
         return topk_indices, topk_weights
 
