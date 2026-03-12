@@ -24,8 +24,6 @@ HF reference classes are defined inline (copied strictly from the InternLM3
 HF source) because InternLM3Config/modeling is not part of standard transformers.
 """
 
-import math
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -236,15 +234,14 @@ class _RefInternLM3Attention(nn.Module):
         key_states = _ref_repeat_kv(key_states, self.num_key_value_groups)
         value_states = _ref_repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
-            self.head_dim
+        is_causal = attention_mask is None
+        attn_output = F.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=None if is_causal else attention_mask,
+            is_causal=is_causal,
         )
-        if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, -1)
         return self.o_proj(attn_output), None
