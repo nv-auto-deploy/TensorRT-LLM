@@ -8,12 +8,13 @@ Exports:
 - torch_backend_mla_with_cache: Cached backend op with FlashInfer-compatible cache
 - flashinfer_mla_with_cache: Cached backend op using FlashInfer MLA kernels
 - trtllm_mla_with_cache: Cached backend op using TRT-LLM thop.attention with MLA
+- trtllm_mla_fused_rope_with_cache: Fused RoPE + cached TRT-LLM MLA op
 """
 
 from .flashinfer_mla import FlashInferMLAAttention, flashinfer_mla_with_cache
 from .torch_backend_mla import TorchBackendMLAAttention, torch_backend_mla_with_cache
 from .torch_mla import torch_mla
-from .trtllm_mla import TrtllmMLAAttention, trtllm_mla_with_cache
+from .trtllm_mla import TrtllmMLAAttention, trtllm_mla_fused_rope_with_cache, trtllm_mla_with_cache
 
 __all__ = [
     "TorchBackendMLAAttention",
@@ -23,4 +24,5 @@ __all__ = [
     "torch_backend_mla_with_cache",
     "flashinfer_mla_with_cache",
     "trtllm_mla_with_cache",
+    "trtllm_mla_fused_rope_with_cache",
 ]
