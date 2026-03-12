@@ -241,11 +241,11 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 # --- DeepSeek V3.2 (Dec 2025) ---
 - name: deepseek-ai/DeepSeek-V3.2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'deepseek_v2_ep.yaml']
 - name: deepseek-ai/DeepSeek-V3.2-Speciale
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'deepseek_v2_ep.yaml']
 - name: nvidia/DeepSeek-V3.2-NVFP4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'deepseek_v2_ep.yaml']
 # --- GLM-4.6 (Sep 2025) ---
 - name: zai-org/GLM-4.6
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
