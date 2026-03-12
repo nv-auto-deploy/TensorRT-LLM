@@ -405,9 +405,6 @@ class DeepSeekV32Attention(nn.Module):
         # Indexer (for weight loading — not used in forward)
         self.indexer = DeepSeekV32Indexer(config)
 
-        # Initialize rotary embedding
-        self._init_rope()
-
         # Softmax scale
         self.softmax_scale = self.q_head_dim ** (-0.5)
         if config.rope_scaling is not None:
@@ -419,47 +416,11 @@ class DeepSeekV32Attention(nn.Module):
                 )
                 self.softmax_scale = self.softmax_scale * mscale * mscale
 
-    def _init_rope(self):
-        if self.config.rope_scaling is None:
-            self.rotary_emb = DeepSeekV32RotaryEmbedding(
-                self.qk_rope_head_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                base=self.rope_theta,
-            )
-        else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
-
-            if scaling_type == "yarn":
-                kwargs = {
-                    key: self.config.rope_scaling[key]
-                    for key in [
-                        "original_max_position_embeddings",
-                        "beta_fast",
-                        "beta_slow",
-                        "mscale",
-                        "mscale_all_dim",
-                    ]
-                    if key in self.config.rope_scaling
-                }
-                self.rotary_emb = DeepSeekV32YarnRotaryEmbedding(
-                    self.qk_rope_head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                    base=self.rope_theta,
-                    **kwargs,
-                )
-            else:
-                self.rotary_emb = DeepSeekV32RotaryEmbedding(
-                    self.qk_rope_head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=self.rope_theta,
-                )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
@@ -484,13 +445,8 @@ class DeepSeekV32Attention(nn.Module):
         # k_pe: [B, S, 1, qk_rope_head_dim] (BSND layout, shared across heads)
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
 
-        kv_seq_len = q_len
-
-        cos, sin = self.rotary_emb(hidden_states, seq_len=kv_seq_len)
-        cos = cos[position_ids]
-        sin = sin[position_ids]
-
         # Apply RoPE using custom op (weights pre-permuted to NeoX format at load time)
+        # cos/sin are pre-sliced by position_ids at the model level
         q_pe_rotated, kpe = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
             q_pe,
             k_pe,
@@ -549,12 +505,13 @@ class DeepSeekV32DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
     ) -> torch.Tensor:
         # Self attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_ids)
+        hidden_states = self.self_attn(hidden_states, cos, sin)
         hidden_states = residual + hidden_states
 
         # MLP/MoE
@@ -652,7 +609,47 @@ class DeepSeekV32Model(DeepSeekV32PreTrainedModel):
 
         self.norm = DeepSeekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # RoPE (computed once, shared across all layers)
+        self._init_rope(config)
+
         self.post_init()
+
+    def _init_rope(self, config):
+        if config.rope_scaling is None:
+            self.rotary_emb = DeepSeekV32RotaryEmbedding(
+                config.qk_rope_head_dim,
+                max_position_embeddings=config.max_position_embeddings,
+                base=config.rope_theta,
+            )
+        else:
+            scaling_type = config.rope_scaling["type"]
+            scaling_factor = config.rope_scaling["factor"]
+
+            if scaling_type == "yarn":
+                kwargs = {
+                    key: config.rope_scaling[key]
+                    for key in [
+                        "original_max_position_embeddings",
+                        "beta_fast",
+                        "beta_slow",
+                        "mscale",
+                        "mscale_all_dim",
+                    ]
+                    if key in config.rope_scaling
+                }
+                self.rotary_emb = DeepSeekV32YarnRotaryEmbedding(
+                    config.qk_rope_head_dim,
+                    max_position_embeddings=config.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=config.rope_theta,
+                    **kwargs,
+                )
+            else:
+                self.rotary_emb = DeepSeekV32RotaryEmbedding(
+                    config.qk_rope_head_dim,
+                    max_position_embeddings=config.max_position_embeddings,
+                    base=config.rope_theta,
+                )
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -679,9 +676,14 @@ class DeepSeekV32Model(DeepSeekV32PreTrainedModel):
 
         hidden_states = inputs_embeds
 
+        # Compute RoPE cos/sin once for all layers
+        cos, sin = self.rotary_emb(hidden_states)
+        cos = cos[position_ids]  # [B, S, head_dim]
+        sin = sin[position_ids]  # [B, S, head_dim]
+
         # Only process main decoder layers (skip MTP layers)
         for idx in range(self.config.num_hidden_layers):
-            hidden_states = self.layers[idx](hidden_states, position_ids)
+            hidden_states = self.layers[idx](hidden_states, cos, sin)
 
         hidden_states = self.norm(hidden_states)
 

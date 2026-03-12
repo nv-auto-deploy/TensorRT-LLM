@@ -90,6 +90,19 @@ def _create_config_no_mtp(**kwargs):
     return _create_config(num_nextn_predict_layers=0, **kwargs)
 
 
+def _make_cos_sin(config, B, S, device, dtype):
+    """Create pre-sliced cos/sin for testing attention/layer directly."""
+    rope = DeepSeekV32RotaryEmbedding(
+        config.qk_rope_head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=config.rope_theta,
+    ).to(device)
+    x_dummy = torch.randn(1, 1, 1, config.qk_rope_head_dim, dtype=dtype, device=device)
+    cos, sin = rope(x_dummy)
+    position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
+    return cos[position_ids].to(dtype), sin[position_ids].to(dtype)
+
+
 # =============================================================================
 # RMSNorm Tests
 # =============================================================================
@@ -247,9 +260,9 @@ class TestDeepSeekV32Attention:
 
         B, S = 2, 4
         hidden_states = torch.randn(B, S, config.hidden_size, dtype=self.dtype, device=self.device)
-        position_ids = torch.arange(S, device=self.device).unsqueeze(0).expand(B, -1)
+        cos, sin = _make_cos_sin(config, B, S, self.device, self.dtype)
 
-        output = attn(hidden_states, position_ids)
+        output = attn(hidden_states, cos, sin)
         assert output.shape == hidden_states.shape
         assert torch.isfinite(output).all()
         assert not torch.allclose(output, torch.zeros_like(output))
@@ -260,9 +273,9 @@ class TestDeepSeekV32Attention:
 
         B, S = 2, 4
         hidden_states = torch.randn(B, S, config.hidden_size, dtype=self.dtype, device=self.device)
-        position_ids = torch.arange(S, device=self.device).unsqueeze(0).expand(B, -1)
+        cos, sin = _make_cos_sin(config, B, S, self.device, self.dtype)
 
-        output = attn(hidden_states, position_ids)
+        output = attn(hidden_states, cos, sin)
         assert output.shape == hidden_states.shape
         assert torch.isfinite(output).all()
         assert not torch.allclose(output, torch.zeros_like(output))
@@ -285,8 +298,8 @@ class TestDeepSeekV32Attention:
             hidden_states = torch.randn(
                 B, S, config.hidden_size, dtype=self.dtype, device=self.device
             )
-            position_ids = torch.arange(S, device=self.device).unsqueeze(0).expand(B, -1)
-            output = attn(hidden_states, position_ids)
+            cos, sin = _make_cos_sin(config, B, S, self.device, self.dtype)
+            output = attn(hidden_states, cos, sin)
             assert output.shape == (B, S, config.hidden_size)
 
     def test_different_sequence_lengths(self):
@@ -297,8 +310,8 @@ class TestDeepSeekV32Attention:
             hidden_states = torch.randn(
                 B, S, config.hidden_size, dtype=self.dtype, device=self.device
             )
-            position_ids = torch.arange(S, device=self.device).unsqueeze(0).expand(B, -1)
-            output = attn(hidden_states, position_ids)
+            cos, sin = _make_cos_sin(config, B, S, self.device, self.dtype)
+            output = attn(hidden_states, cos, sin)
             assert output.shape == (B, S, config.hidden_size)
 
 
@@ -320,8 +333,8 @@ class TestDeepSeekV32DecoderLayer:
 
         B, S = 2, 4
         hidden_states = torch.randn(B, S, config.hidden_size, dtype=self.dtype, device=self.device)
-        position_ids = torch.arange(S, device=self.device).unsqueeze(0).expand(B, -1)
-        output = layer(hidden_states, position_ids)
+        cos, sin = _make_cos_sin(config, B, S, self.device, self.dtype)
+        output = layer(hidden_states, cos, sin)
         assert output.shape == hidden_states.shape
         assert torch.isfinite(output).all()
         assert not torch.allclose(output, torch.zeros_like(output))
@@ -334,8 +347,8 @@ class TestDeepSeekV32DecoderLayer:
 
         B, S = 2, 4
         hidden_states = torch.randn(B, S, config.hidden_size, dtype=self.dtype, device=self.device)
-        position_ids = torch.arange(S, device=self.device).unsqueeze(0).expand(B, -1)
-        output = layer(hidden_states, position_ids)
+        cos, sin = _make_cos_sin(config, B, S, self.device, self.dtype)
+        output = layer(hidden_states, cos, sin)
         assert output.shape == hidden_states.shape
         assert torch.isfinite(output).all()
         assert not torch.allclose(output, torch.zeros_like(output))
@@ -821,7 +834,8 @@ def test_deepseek_v32_attention_numerical_equivalence(B, S, dtype):
 
     pos_emb = hf_rope(x, position_ids)
     hf_out, _ = hf_attn(x, position_embeddings=pos_emb, position_ids=position_ids)
-    custom_out = custom_attn(x, position_ids)
+    cos, sin = _make_cos_sin(config, B, S, device, dtype)
+    custom_out = custom_attn(x, cos, sin)
 
     from _model_test_utils import assert_rmse_close
 
@@ -857,7 +871,8 @@ def test_deepseek_v32_decoder_layer_numerical_equivalence(B, S, dtype):
 
     pos_emb = hf_rope(x, position_ids)
     hf_out = hf_layer(x, position_ids=position_ids, position_embeddings=pos_emb)
-    custom_out = custom_layer(x, position_ids)
+    cos, sin = _make_cos_sin(config, B, S, device, dtype)
+    custom_out = custom_layer(x, cos, sin)
 
     from _model_test_utils import assert_rmse_close
 
@@ -897,7 +912,8 @@ def test_deepseek_v32_moe_decoder_layer_numerical_equivalence(B, S, dtype):
 
     pos_emb = hf_rope(x, position_ids)
     hf_out = hf_layer(x, position_ids=position_ids, position_embeddings=pos_emb)
-    custom_out = custom_layer(x, position_ids)
+    cos, sin = _make_cos_sin(config, B, S, device, dtype)
+    custom_out = custom_layer(x, cos, sin)
 
     from _model_test_utils import assert_rmse_close
 
