@@ -221,13 +221,7 @@ class GptOssExperts(nn.Module):
 
 
 class GptOssTopKRouter(nn.Module):
-    """MoE top-k router.
-
-    Uses standard torch ops (not torch_moe_router) to ensure all tensors follow
-    the parameter device during export with lift_to_meta, avoiding device
-    mismatches between routing weights (from custom op fake kernel on input
-    device) and expert computation (on parameter/meta device).
-    """
+    """MoE top-k router using torch_moe_router canonical op."""
 
     def __init__(self, config: GptOssConfig):
         super().__init__()
@@ -239,12 +233,9 @@ class GptOssTopKRouter(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Returns sparse routing scores [B*S, num_experts]."""
-        flat = hidden_states.reshape(-1, self.hidden_dim)
-        logits = torch.nn.functional.linear(flat, self.weight, self.bias)  # [T, E]
-        top_values, top_indices = torch.topk(logits, self.top_k, dim=-1)  # [T, top_k]
-        top_values = torch.softmax(top_values, dim=-1, dtype=top_values.dtype)
-        scores = torch.zeros_like(logits).scatter(1, top_indices, top_values)
-        return scores
+        return torch.ops.auto_deploy.torch_moe_router(
+            hidden_states, self.weight, self.bias, self.top_k
+        )
 
 
 class GptOssMLP(nn.Module):

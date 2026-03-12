@@ -134,6 +134,9 @@ class CapturedGraph(nn.Module):
         """Capture and pre-fetch the graph for desired batch sizes."""
         assert not self.cudagraphs, "Graphs already captured."
 
+        if not batch_sizes:
+            return
+
         # sort batch sizes in descending order
         batch_sizes = sorted(batch_sizes, reverse=True)
 
@@ -194,6 +197,10 @@ class CapturedGraph(nn.Module):
 
     def forward(self, *args, **kwargs) -> Any:
         """Run the compiled graph."""
+        # If no graphs were captured (empty batch_sizes), run eagerly
+        if self._in_spec is None:
+            return self.model(*args, **kwargs)
+
         # flatten args, kwargs
         all_args_flat = _args_kwargs_flatten_spec(self._in_spec, *args, **kwargs)
 

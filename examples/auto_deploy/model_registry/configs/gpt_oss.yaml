@@ -1,0 +1,7 @@
+# Configuration for GPT-OSS models
+# Uses torch attention backend because attention sinks are only supported
+# by torch_attention, not flashinfer or trtllm backends.
+# CUDA graph capture disabled because torch_backend_attention uses .item()
+# calls that are incompatible with CUDA graph capture.
+attn_backend: torch
+cuda_graph_batch_sizes: []

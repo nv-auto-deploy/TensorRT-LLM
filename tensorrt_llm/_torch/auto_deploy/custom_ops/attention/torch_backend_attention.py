@@ -139,7 +139,9 @@ def _torch_generate_mha(
 
         # Apply sinks if provided (following the model file pattern)
         if sinks is not None:
-            # Concatenate sinks to attention scores
+            # Slice sinks to local head count for tensor parallelism
+            if sinks.numel() != n_heads:
+                sinks = sinks[:n_heads]
             sinks = sinks.reshape(-1, 1, 1)
             attn_weights = torch.cat([attn_scores, sinks], dim=-1)
             attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
@@ -253,7 +255,10 @@ def _torch_context_mha(
 
         # Apply sinks if provided (following the model file pattern)
         if sinks is not None:
-            # Concatenate sinks to attention scores
+            # Slice sinks to local head count for tensor parallelism
+            n_local_heads = attn_scores.shape[1]
+            if sinks.numel() != n_local_heads:
+                sinks = sinks[:n_local_heads]
             new_sinks = sinks.reshape(1, -1, 1, 1).expand(
                 attn_scores.shape[0], -1, attn_scores.shape[2], 1
             )
