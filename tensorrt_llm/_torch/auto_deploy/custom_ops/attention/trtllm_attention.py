@@ -347,9 +347,12 @@ def trtllm_mha_with_cache(
     num_tokens = num_prefill_tokens + num_decode
     max_context_length = int(max_seq_info_host[0])
     max_num_requests = int(max_seq_info_host[3])
-    # TRTLLM's attention_window_size is exclusive, while torch_attention's sliding_window
-    # convention matches the total visible token count. Normalize here so per-layer cached
-    # attention matches the eager/export semantics without changing global KV capacity sizing.
+    # TRTLLM's attention_window_size follows the kernel convention
+    # [max(0, query_idx - window), query_idx], while AutoDeploy torch_attention uses
+    # sliding_window as the total visible-token count. Normalize at the backend boundary,
+    # matching the existing FlashInfer precedent in tensorrt_llm/_torch/attention_backend/
+    # flashinfer.py:605, so cached TRTLLM attention preserves the same eager/export semantics
+    # without changing global KV capacity sizing.
     attention_window_size = (
         max(sliding_window - 1, 0)
         if isinstance(sliding_window, int) and sliding_window > 0
