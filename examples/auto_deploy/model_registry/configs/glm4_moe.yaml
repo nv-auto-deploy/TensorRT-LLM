@@ -1,0 +1,7 @@
+# Configuration for GLM-4 MoE family (GLM-4.6, GLM-4.7)
+# Full models have 92 layers and 160 experts - reduce for CI/testing
+model_kwargs:
+  num_hidden_layers: 5
+transforms:
+  export_to_gm:
+    num_moe_experts_for_export: 2
