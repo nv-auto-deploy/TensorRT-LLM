@@ -4,6 +4,7 @@ from .modeling_deepseek_v2 import DeepSeekV2ForCausalLM
 from .modeling_glm4_moe_lite import Glm4MoeLiteForCausalLM
 from .modeling_granite_moe_hybrid import GraniteMoeHybridForCausalLM
 from .modeling_hunyuan_dense_v1 import HunYuanDenseV1ForCausalLM
+from .modeling_jamba import JambaForCausalLM
 from .modeling_kimi_k2 import KimiK2ForCausalLM, KimiK25ForConditionalGeneration
 from .modeling_llama3 import Llama3ForCausalLM
 from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreTrainedTokenizerFast
@@ -20,6 +21,7 @@ __all__ = (
     "Glm4MoeLiteForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "GraniteMoeHybridForCausalLM",
+    "JambaForCausalLM",
     "KimiK2ForCausalLM",
     "KimiK25ForConditionalGeneration",
     "Llama3ForCausalLM",

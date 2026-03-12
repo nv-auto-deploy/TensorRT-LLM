@@ -1,0 +1,6 @@
+# Configuration for AI21-Jamba-Reasoning-3B (hybrid Mamba v1 + Attention)
+
+args:
+  transforms:
+    insert_cached_ssm_attention:
+      backend: torch_mamba_v1

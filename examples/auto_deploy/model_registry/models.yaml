@@ -119,8 +119,6 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: deepseek-ai/DeepSeek-V2.5
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'deepseek_v2_ep.yaml']
-- name: ai21labs/AI21-Jamba-1.5-Mini
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/Llama-3.2-11B-Vision-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: meta-llama/Meta-Llama-3-70B-Instruct
@@ -283,10 +281,10 @@ models:
 - name: ibm-granite/granite-4.0-h-small
   yaml_extra: ['granite_4.0_h_small.yaml']
 # --- AI21 Jamba (2025) - hybrid SSM-Transformer ---
-- name: ai21labs/AI21-Jamba-Large-1.7
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: ai21labs/AI21-Jamba-Reasoning-3B
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'jamba_reasoning_3b.yaml']
+- name: ai21labs/AI21-Jamba-Mini-1.5
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'jamba_mini_1.5.yaml']
 # --- Skywork (2025) ---
 - name: Skywork/Skywork-R1V2-38B
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']

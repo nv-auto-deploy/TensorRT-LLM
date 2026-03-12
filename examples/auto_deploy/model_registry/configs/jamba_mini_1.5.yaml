@@ -1,0 +1,9 @@
+# Configuration for AI21-Jamba-Mini-1.5 (hybrid Mamba v1 + Attention)
+# Uses attention_dp + EP: Mamba/Attention layers replicated, MoE experts distributed.
+
+args:
+  transforms:
+    detect_sharding:
+      enable_attention_dp: true
+    insert_cached_ssm_attention:
+      backend: torch_mamba_v1
