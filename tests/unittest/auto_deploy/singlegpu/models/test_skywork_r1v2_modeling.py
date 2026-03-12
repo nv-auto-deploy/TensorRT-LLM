@@ -19,12 +19,8 @@ Skywork-R1V2-38B is an InternVL-based VLM with a Qwen2 LLM backbone.
 The AD custom model only exports the LLM text path.  The LLM is standard
 Qwen2 (GQA with bias on Q/K/V, SwiGLU MLP, RMSNorm, RoPE).
 
-SkyworkR1V2ForCausalLM accepts a Qwen2Config directly (the llm_config fallback
-in the constructor) so all tests run without the HF checkpoint in the local cache.
-
-Since the HF config/model classes for this model are NOT in standard
-transformers (they use trust_remote_code), we include standalone HF
-reference implementations directly in this test file.
+Reference implementations for equivalence tests are imported directly from
+transformers.models.qwen2.modeling_qwen2.
 """
 
 import pytest
@@ -33,8 +29,8 @@ import torch.nn.functional as F
 from _model_test_utils import assert_rmse_close
 from torch import nn
 from torch.export import Dim
-from transformers import AutoConfig, Qwen2Config
-from transformers.activations import ACT2FN
+from transformers import AutoConfig, Qwen2Config, Qwen2ForCausalLM
+from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_skywork_r1v2 import (
@@ -112,39 +108,26 @@ def _create_small_chat_config() -> SkyworkChatConfig:
     )
 
 
+def _convert_hf_to_custom_state_dict(hf_state_dict):
+    """Convert Qwen2ForCausalLM state dict keys to our custom model hierarchy.
+
+    Qwen2ForCausalLM: model.embed_tokens.weight, model.layers.0.*, lm_head.weight
+    Custom model:     language_model.model.embed_tokens.weight, ..., language_model.lm_head.weight
+    """
+    return {f"language_model.{key}": value for key, value in hf_state_dict.items()}
+
+
 # ---------------------------------------------------------------------------
-# Standalone HF Qwen2 reference implementations (for equivalence tests)
+# Inline Qwen2 reference implementations for attention/decoder-layer tests
 #
-# Why not import transformers.models.qwen2.modeling_qwen2 directly?
-#
-# 1. Attention SDPA behavior: HF Qwen2Attention uses F.scaled_dot_product_attention
-#    with an explicit attention mask and may dispatch to flash/efficient kernels
-#    depending on transformers version and installed backends.  Our inline attention
-#    uses the same F.scaled_dot_product_attention call but with is_causal=True and
-#    no external mask, matching what our AD custom op produces.  This makes the
-#    reference deterministic and independent of transformers installation details.
-#
-# 2. The RMSNorm and MLP blocks are functionally identical to the HF versions, but
-#    keeping all reference implementations inline avoids importing from transformers
-#    private module paths (transformers.models.qwen2.modeling_qwen2) which could
-#    change across versions.
+# Qwen2Attention and Qwen2DecoderLayer are imported from transformers for the
+# RMSNorm, MLP, and full-model tests above.  For the standalone attention and
+# decoder-layer equivalence tests we keep inline references because
+# SkyworkR1V2Attention uses AD custom ops (torch_rope_with_explicit_cos_sin,
+# torch_attention in "bsnd" layout) whose numerical output differs from HF's
+# standard SDPA even with identical weights.  The inline reference matches the
+# AD convention exactly, allowing tight numerical comparison.
 # ---------------------------------------------------------------------------
-
-
-class _HFQwen2RMSNorm(nn.Module):
-    """Reference RMSNorm from HF Qwen2."""
-
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
 
 
 def _hf_rotate_half(x):
@@ -161,9 +144,7 @@ def _hf_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-class _HFQwen2RotaryEmbedding(nn.Module):
-    """Reference RoPE from HF Qwen2."""
-
+class _InlineQwen2RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=512, base=10000.0):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
@@ -180,20 +161,6 @@ class _HFQwen2RotaryEmbedding(nn.Module):
         return cos, sin
 
 
-class _HFQwen2MLP(nn.Module):
-    """Reference MLP from HF Qwen2."""
-
-    def __init__(self, config):
-        super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-
 def _hf_repeat_kv(hidden_states, n_rep):
     if n_rep == 1:
         return hidden_states
@@ -204,8 +171,8 @@ def _hf_repeat_kv(hidden_states, n_rep):
     return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 
 
-class _HFQwen2Attention(nn.Module):
-    """Reference Attention from HF Qwen2 (eager mode)."""
+class _InlineQwen2Attention(nn.Module):
+    """Inline Qwen2 attention reference matching AD custom-op conventions."""
 
     def __init__(self, config, layer_idx=0):
         super().__init__()
@@ -250,15 +217,15 @@ class _HFQwen2Attention(nn.Module):
         return self.o_proj(attn_output)
 
 
-class _HFQwen2DecoderLayer(nn.Module):
-    """Reference decoder layer from HF Qwen2."""
+class _InlineQwen2DecoderLayer(nn.Module):
+    """Inline Qwen2 decoder layer reference."""
 
     def __init__(self, config, layer_idx=0):
         super().__init__()
-        self.self_attn = _HFQwen2Attention(config, layer_idx=layer_idx)
-        self.mlp = _HFQwen2MLP(config)
-        self.input_layernorm = _HFQwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = _HFQwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = _InlineQwen2Attention(config, layer_idx=layer_idx)
+        self.mlp = Qwen2MLP(config)
+        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, hidden_states, position_embeddings):
         residual = hidden_states
@@ -271,47 +238,6 @@ class _HFQwen2DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
-
-
-class _HFQwen2ForCausalLM(nn.Module):
-    """Reference full model from HF Qwen2 (for equivalence tests)."""
-
-    def __init__(self, config):
-        super().__init__()
-        head_dim = config.hidden_size // config.num_attention_heads
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(
-            [_HFQwen2DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
-        )
-        self.norm = _HFQwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.rotary_emb = _HFQwen2RotaryEmbedding(
-            head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
-        )
-
-    def forward(self, input_ids, position_ids):
-        hidden_states = self.embed_tokens(input_ids)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, position_embeddings)
-        hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states).float()
-        return logits
-
-
-def _convert_hf_to_custom_state_dict(hf_state_dict):
-    """Convert HF reference state dict keys to match our custom model hierarchy.
-
-    HF reference: embed_tokens.weight, layers.0.*, norm.weight, lm_head.weight
-    Custom model: language_model.model.embed_tokens.weight, language_model.model.layers.0.*, ...
-    """
-    converted = {}
-    for key, value in hf_state_dict.items():
-        if key.startswith("lm_head."):
-            converted[f"language_model.{key}"] = value
-        else:
-            converted[f"language_model.model.{key}"] = value
-    return converted
 
 
 # =========================================================================
@@ -328,7 +254,7 @@ def test_skywork_r1v2_rmsnorm_equivalence(B, S, dtype):
     config = _create_small_llm_config()
 
     hf_norm = (
-        _HFQwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         .to(device=device, dtype=dtype)
         .eval()
     )
@@ -350,7 +276,7 @@ def test_skywork_r1v2_mlp_equivalence(B, S, dtype):
     device = "cpu"
     config = _create_small_llm_config()
 
-    hf_mlp = _HFQwen2MLP(config).to(device=device, dtype=dtype).eval()
+    hf_mlp = Qwen2MLP(config).to(device=device, dtype=dtype).eval()
     custom_mlp = SkyworkR1V2MLP(config).to(device=device, dtype=dtype)
     custom_mlp.load_state_dict(hf_mlp.state_dict())
     custom_mlp.eval()
@@ -367,7 +293,7 @@ def test_skywork_r1v2_attention_equivalence(B, S, dtype):
     device = "cpu"
     config = _create_small_llm_config()
 
-    hf_attn = _HFQwen2Attention(config, layer_idx=0).to(device=device, dtype=dtype).eval()
+    hf_attn = _InlineQwen2Attention(config, layer_idx=0).to(device=device, dtype=dtype).eval()
     custom_attn = SkyworkR1V2Attention(config, layer_idx=0).to(device=device, dtype=dtype)
     custom_attn.load_state_dict(hf_attn.state_dict())
     custom_attn.eval()
@@ -375,18 +301,16 @@ def test_skywork_r1v2_attention_equivalence(B, S, dtype):
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
-    # HF reference position embeddings
     head_dim = config.hidden_size // config.num_attention_heads
-    hf_rotary = _HFQwen2RotaryEmbedding(
+    hf_rotary = _InlineQwen2RotaryEmbedding(
         head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
     ).to(device=device, dtype=dtype)
     hf_cos, hf_sin = hf_rotary(x, position_ids)
 
-    # Custom position embeddings: rotary returns full tables; attention slices by position_ids.
     custom_rotary = SkyworkR1V2RotaryEmbedding(
         head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
     ).to(device=device, dtype=dtype)
-    custom_cos, custom_sin = custom_rotary(x, position_ids)  # full [max_seq_len, head_dim] tables
+    custom_cos, custom_sin = custom_rotary(x, position_ids)
 
     hf_out = hf_attn(x, (hf_cos, hf_sin))
     custom_out = custom_attn(x, (custom_cos, custom_sin), position_ids)
@@ -407,7 +331,7 @@ def test_skywork_r1v2_decoder_layer_equivalence(B, S, dtype):
     device = "cpu"
     config = _create_small_llm_config()
 
-    hf_layer = _HFQwen2DecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype).eval()
+    hf_layer = _InlineQwen2DecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype).eval()
     custom_layer = SkyworkR1V2DecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype)
     custom_layer.load_state_dict(hf_layer.state_dict())
     custom_layer.eval()
@@ -416,7 +340,7 @@ def test_skywork_r1v2_decoder_layer_equivalence(B, S, dtype):
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
     head_dim = config.hidden_size // config.num_attention_heads
-    hf_rotary = _HFQwen2RotaryEmbedding(
+    hf_rotary = _InlineQwen2RotaryEmbedding(
         head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
     ).to(device=device, dtype=dtype)
     hf_pos_emb = hf_rotary(x, position_ids)
@@ -424,7 +348,7 @@ def test_skywork_r1v2_decoder_layer_equivalence(B, S, dtype):
     custom_rotary = SkyworkR1V2RotaryEmbedding(
         head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
     ).to(device=device, dtype=dtype)
-    custom_pos_emb = custom_rotary(x, position_ids)  # full [max_seq_len, head_dim] tables
+    custom_pos_emb = custom_rotary(x, position_ids)
 
     hf_out = hf_layer(x, hf_pos_emb)
     custom_out = custom_layer(x, custom_pos_emb, position_ids)
@@ -442,11 +366,11 @@ def test_skywork_r1v2_decoder_layer_equivalence(B, S, dtype):
 @pytest.mark.parametrize("device", ["cpu"])
 @torch.no_grad()
 def test_skywork_r1v2_full_model_equivalence(B, S, dtype, device):
-    """Test full model produces numerically equivalent output to HF Qwen2."""
+    """Test full model produces numerically equivalent output to HF Qwen2ForCausalLM."""
     config = _create_small_llm_config()
     chat_config = _create_small_chat_config()
 
-    hf_model = _HFQwen2ForCausalLM(config).to(device=device, dtype=dtype).eval()
+    hf_model = Qwen2ForCausalLM(config).to(device=device, dtype=dtype).eval()
 
     custom_model = SkyworkR1V2ForCausalLM(chat_config).to(device=device, dtype=dtype)
     custom_model.load_state_dict(
@@ -457,7 +381,7 @@ def test_skywork_r1v2_full_model_equivalence(B, S, dtype, device):
     input_ids = torch.randint(0, config.vocab_size, (B, S), device=device)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
-    hf_logits = hf_model(input_ids, position_ids)
+    hf_logits = hf_model(input_ids=input_ids, position_ids=position_ids).logits
     custom_out = custom_model(input_ids=input_ids, position_ids=position_ids)
 
     assert_rmse_close(
