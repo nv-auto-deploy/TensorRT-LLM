@@ -6,6 +6,7 @@ from .modeling_granite_moe_hybrid import GraniteMoeHybridForCausalLM
 from .modeling_hunyuan_dense_v1 import HunYuanDenseV1ForCausalLM
 from .modeling_kimi_k2 import KimiK2ForCausalLM, KimiK25ForConditionalGeneration
 from .modeling_llama3 import Llama3ForCausalLM
+from .modeling_mistral3 import Mistral3ForConditionalGeneration, Mistral3TextForCausalLM
 from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreTrainedTokenizerFast
 from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_qwen3 import Qwen3ForCausalLM
@@ -22,6 +23,8 @@ __all__ = (
     "KimiK2ForCausalLM",
     "KimiK25ForConditionalGeneration",
     "Llama3ForCausalLM",
+    "Mistral3ForConditionalGeneration",
+    "Mistral3TextForCausalLM",
     "NemotronFlashForCausalLM",
     "NemotronFlashPreTrainedTokenizerFast",
     "NemotronHForCausalLM",
