@@ -67,7 +67,7 @@ _HF_DEFAULT_INITIALIZER_FACTOR: float = (
 # ---------------------------------------------------------------------------
 
 
-class _VisionRMSNorm(nn.Module):
+class VisionRMSNorm(nn.Module):
     """Plain-PyTorch RMSNorm for the vision encoder (runs in eager mode only)."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
@@ -83,7 +83,7 @@ class _VisionRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-class _VisionEmbeddings(nn.Module):
+class VisionEmbeddings(nn.Module):
     """Patch + class + positional embeddings for the ViT encoder."""
 
     def __init__(self, vision_config):
@@ -135,7 +135,7 @@ class _VisionEmbeddings(nn.Module):
         return embeddings + position_embedding.to(target_dtype)
 
 
-class _VisionAttention(nn.Module):
+class VisionAttention(nn.Module):
     """Multi-head self-attention for the ViT (naive SDPA, no flash attention)."""
 
     def __init__(self, vision_config):
@@ -150,8 +150,8 @@ class _VisionAttention(nn.Module):
 
         self.qk_normalization = vision_config.qk_normalization
         if self.qk_normalization:
-            self.q_norm = _VisionRMSNorm(self.embed_dim, eps=vision_config.layer_norm_eps)
-            self.k_norm = _VisionRMSNorm(self.embed_dim, eps=vision_config.layer_norm_eps)
+            self.q_norm = VisionRMSNorm(self.embed_dim, eps=vision_config.layer_norm_eps)
+            self.k_norm = VisionRMSNorm(self.embed_dim, eps=vision_config.layer_norm_eps)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         B, N, C = hidden_states.shape
@@ -173,7 +173,7 @@ class _VisionAttention(nn.Module):
         return self.proj(x)
 
 
-class _VisionMLP(nn.Module):
+class VisionMLP(nn.Module):
     def __init__(self, vision_config):
         super().__init__()
         self.fc1 = nn.Linear(vision_config.hidden_size, vision_config.intermediate_size)
@@ -184,21 +184,21 @@ class _VisionMLP(nn.Module):
         return self.fc2(self.act(self.fc1(hidden_states)))
 
 
-class _VisionEncoderLayer(nn.Module):
+class VisionEncoderLayer(nn.Module):
     def __init__(self, vision_config):
         super().__init__()
         self.embed_dim = vision_config.hidden_size
         norm_type = getattr(vision_config, "norm_type", _HF_DEFAULT_NORM_TYPE)
         eps = vision_config.layer_norm_eps
         if norm_type == "rms_norm":
-            self.norm1 = _VisionRMSNorm(self.embed_dim, eps=eps)
-            self.norm2 = _VisionRMSNorm(self.embed_dim, eps=eps)
+            self.norm1 = VisionRMSNorm(self.embed_dim, eps=eps)
+            self.norm2 = VisionRMSNorm(self.embed_dim, eps=eps)
         else:
             self.norm1 = nn.LayerNorm(self.embed_dim, eps=eps)
             self.norm2 = nn.LayerNorm(self.embed_dim, eps=eps)
 
-        self.attn = _VisionAttention(vision_config)
-        self.mlp = _VisionMLP(vision_config)
+        self.attn = VisionAttention(vision_config)
+        self.mlp = VisionMLP(vision_config)
 
         initializer_factor = getattr(
             vision_config, "initializer_factor", _HF_DEFAULT_INITIALIZER_FACTOR
@@ -219,11 +219,11 @@ class _VisionEncoderLayer(nn.Module):
         return hidden_states
 
 
-class _VisionEncoder(nn.Module):
+class VisionEncoder(nn.Module):
     def __init__(self, vision_config):
         super().__init__()
         self.layers = nn.ModuleList(
-            [_VisionEncoderLayer(vision_config) for _ in range(vision_config.num_hidden_layers)]
+            [VisionEncoderLayer(vision_config) for _ in range(vision_config.num_hidden_layers)]
         )
 
     def forward(
@@ -237,13 +237,13 @@ class _VisionEncoder(nn.Module):
         return hidden_states, all_hidden_states
 
 
-class _VisionModel(nn.Module):
+class VisionModel(nn.Module):
     """Skywork ViT vision encoder — eager only, never torch.export-ed."""
 
     def __init__(self, vision_config):
         super().__init__()
-        self.embeddings = _VisionEmbeddings(vision_config)
-        self.encoder = _VisionEncoder(vision_config)
+        self.embeddings = VisionEmbeddings(vision_config)
+        self.encoder = VisionEncoder(vision_config)
 
     def forward(
         self, pixel_values: torch.Tensor, output_hidden_states: bool = False
@@ -575,7 +575,7 @@ class SkyworkR1V2ForCausalLM(SkyworkR1V2PreTrainedModel, GenerationMixin):
         # the vision components are skipped (only the LLM path is needed for AD export).
         vision_config = getattr(config, "vision_config", None)
         if vision_config is not None:
-            self.vision_model = _VisionModel(vision_config)
+            self.vision_model = VisionModel(vision_config)
             self._select_layer = getattr(config, "select_layer", _HF_DEFAULT_SELECT_LAYER)
             self._downsample_ratio = getattr(
                 config, "downsample_ratio", _HF_DEFAULT_DOWNSAMPLE_RATIO
