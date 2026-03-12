@@ -98,18 +98,13 @@ class PixtralForCausalLM(PixtralPreTrainedModel, GenerationMixin):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        **kwargs,
     ):
-        kwargs.pop("use_cache", None)
-        outputs = self.language_model(
+        assert position_ids is not None, "position_ids must be provided for AD export"
+        return self.language_model(
             input_ids=input_ids,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
             use_cache=False,
-            **kwargs,
         )
-        return outputs
 
 
 # Registration — visible to both AutoModelForCausalLM and
