@@ -25,6 +25,7 @@ This implementation differs from the original HuggingFace version in the followi
 * Removed gradient checkpointing and training code paths
 * Removed attention dropout (inference only)
 * No repeat_kv — AD attention ops handle GQA natively
+* Bundled InternLM3Config so tests/tooling can instantiate without AutoConfig or HF Hub
 
 InternLM3 is a Llama-style architecture with GQA, SiLU MLP, RMSNorm, and
 dynamic NTK-aware RoPE scaling.
@@ -38,11 +39,67 @@ from torch import nn
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, rope_config_validation
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+
+
+class InternLM3Config(PretrainedConfig):
+    """Configuration for InternLM3 models.
+
+    Bundled here so tests and tooling can instantiate the config without
+    relying on AutoConfig.from_pretrained or the HuggingFace Hub. At
+    inference time the real checkpoint config (loaded via trust_remote_code)
+    will also have __name__ == "InternLM3Config", satisfying the AD factory
+    registration lookup.
+    """
+
+    model_type = "internlm3"
+
+    def __init__(
+        self,
+        vocab_size: int = 128512,
+        hidden_size: int = 4096,
+        intermediate_size: int = 11008,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int = 32,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 32768,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
+        rope_theta: float = 10000.0,
+        rope_scaling=None,
+        qkv_bias: bool = False,
+        attention_dropout: float = 0.0,
+        bias: bool = False,
+        head_dim: Optional[int] = None,
+        **kwargs,
+    ):
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.hidden_act = hidden_act
+        self.max_position_embeddings = max_position_embeddings
+        self.initializer_range = initializer_range
+        self.rms_norm_eps = rms_norm_eps
+        self.use_cache = use_cache
+        self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
+        self.qkv_bias = qkv_bias
+        self.attention_dropout = attention_dropout
+        self.bias = bias
+        self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
+        if self.rope_scaling is not None and "type" in self.rope_scaling:
+            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
+        rope_config_validation(self)
+        super().__init__(**kwargs)
 
 
 class InternLM3RMSNorm(nn.Module):
@@ -70,7 +127,7 @@ class InternLM3RotaryEmbedding(nn.Module):
     Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
     """
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: InternLM3Config):
         super().__init__()
         if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
             rope_type = config.rope_scaling.get(
@@ -104,7 +161,7 @@ class InternLM3RotaryEmbedding(nn.Module):
 class InternLM3MLP(nn.Module):
     """MLP layer for InternLM3 (SiLU gated activation)."""
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: InternLM3Config):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -124,7 +181,7 @@ class InternLM3Attention(nn.Module):
     by torch_attention — no repeat_kv needed.
     """
 
-    def __init__(self, config: PretrainedConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: InternLM3Config, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -189,7 +246,7 @@ class InternLM3Attention(nn.Module):
 class InternLM3DecoderLayer(nn.Module):
     """Transformer decoder layer for InternLM3."""
 
-    def __init__(self, config: PretrainedConfig, layer_idx: int):
+    def __init__(self, config: InternLM3Config, layer_idx: int):
         super().__init__()
         self.self_attn = InternLM3Attention(config, layer_idx=layer_idx)
         self.mlp = InternLM3MLP(config)
@@ -234,7 +291,7 @@ class InternLM3CausalLMOutput(ModelOutput):
 class InternLM3PreTrainedModel(PreTrainedModel):
     """Base class for InternLM3 models."""
 
-    config_class = PretrainedConfig
+    config_class = InternLM3Config
     base_model_prefix = "model"
     _no_split_modules = ["InternLM3DecoderLayer"]
     supports_gradient_checkpointing = False
@@ -254,7 +311,7 @@ class InternLM3PreTrainedModel(PreTrainedModel):
 class InternLM3Model(InternLM3PreTrainedModel):
     """InternLM3 transformer decoder model."""
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: InternLM3Config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -310,7 +367,7 @@ class InternLM3ForCausalLM(InternLM3PreTrainedModel, GenerationMixin):
 
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config: PretrainedConfig, **kwargs):
+    def __init__(self, config: InternLM3Config, **kwargs):
         super().__init__(config)
         self.model = InternLM3Model(config)
         self.vocab_size = config.vocab_size
