@@ -214,11 +214,17 @@ def test_seed_oss_attention_equivalence(B, S, dtype):
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
-    # Run HF attention (needs attention_mask=None for causal)
+    # Construct causal mask for HF eager attention (which does NOT apply causal masking
+    # when attention_mask=None — unlike our custom model which always uses is_causal=True)
+    causal_mask = torch.full((S, S), float("-inf"), device=device, dtype=dtype)
+    causal_mask = torch.triu(causal_mask, diagonal=1)
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
+
+    # Run HF attention with explicit causal mask
     hf_out, _ = hf_attn(
         hidden_states=x,
         position_embeddings=(hf_cos, hf_sin),
-        attention_mask=None,
+        attention_mask=causal_mask,
     )
 
     # Run custom attention (position_embeddings are pre-sliced)
@@ -278,10 +284,15 @@ def test_seed_oss_decoder_layer_equivalence(B, S, dtype):
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
+    # Construct causal mask for HF eager attention
+    causal_mask = torch.full((S, S), float("-inf"), device=device, dtype=dtype)
+    causal_mask = torch.triu(causal_mask, diagonal=1)
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
+
     # Run HF decoder layer (returns tensor directly, but handle tuple for safety)
     hf_out = hf_layer(
         hidden_states=x,
-        attention_mask=None,
+        attention_mask=causal_mask,
         position_ids=position_ids,
         position_embeddings=(hf_cos, hf_sin),
     )
