@@ -220,10 +220,10 @@ def test_llama3_attention_equivalence(B, S, dtype):
     hf_rotary = HFRotary(config=config, device=device)
     hf_cos, hf_sin = hf_rotary(x, position_ids)
 
-    # Custom position embeddings (returns full table, attention slices by position_ids)
+    # Custom position embeddings (pre-sliced by position_ids)
     custom_rotary = Llama3RotaryEmbedding(config)
     custom_rotary.to(device=device, dtype=dtype)
-    custom_cos, custom_sin = custom_rotary(x)
+    custom_cos, custom_sin = custom_rotary(x, position_ids)
 
     # Run HF attention
     hf_out, _ = hf_attn(
@@ -232,11 +232,10 @@ def test_llama3_attention_equivalence(B, S, dtype):
         attention_mask=None,
     )
 
-    # Run custom attention (passes full table + position_ids for slicing)
+    # Run custom attention
     custom_out = custom_attn(
         hidden_states=x,
         position_embeddings=(custom_cos, custom_sin),
-        position_ids=position_ids,
     )
 
     assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.10, msg="Attention: ")
@@ -277,10 +276,10 @@ def test_llama3_decoder_layer_equivalence(B, S, dtype):
     hf_rotary = HFRotary(config=config, device=device)
     hf_cos, hf_sin = hf_rotary(x, position_ids)
 
-    # Custom position embeddings (returns full table)
+    # Custom position embeddings (pre-sliced by position_ids)
     custom_rotary = Llama3RotaryEmbedding(config)
     custom_rotary.to(device=device, dtype=dtype)
-    custom_cos, custom_sin = custom_rotary(x)
+    custom_cos, custom_sin = custom_rotary(x, position_ids)
 
     # Run HF decoder layer
     hf_out = hf_layer(
@@ -292,11 +291,10 @@ def test_llama3_decoder_layer_equivalence(B, S, dtype):
     if isinstance(hf_out, tuple):
         hf_out = hf_out[0]
 
-    # Run custom decoder layer (passes full table + position_ids)
+    # Run custom decoder layer
     custom_out = custom_layer(
         hidden_states=x,
         position_embeddings=(custom_cos, custom_sin),
-        position_ids=position_ids,
     )
 
     assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.05, msg="Decoder layer: ")

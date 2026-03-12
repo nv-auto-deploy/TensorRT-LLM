@@ -64,7 +64,7 @@ class Llama3RotaryEmbedding(nn.Module):
 
     Supports all rope types (default, llama3, linear, dynamic, etc.) via
     transformers ROPE_INIT_FUNCTIONS. Precomputes and caches cos/sin values.
-    Returns full cached values (not sliced by seq_len) to enable export.
+    Slices by position_ids once and returns pre-sliced cos/sin to all layers.
 
     Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
     """
@@ -90,10 +90,12 @@ class Llama3RotaryEmbedding(nn.Module):
         self.register_buffer("_ad_cos_cached", emb.cos() * self.attention_scaling, persistent=False)
         self.register_buffer("_ad_sin_cached", emb.sin() * self.attention_scaling, persistent=False)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         cos = self._ad_cos_cached.to(dtype=x.dtype, device=x.device)
         sin = self._ad_sin_cached.to(dtype=x.dtype, device=x.device)
-        return cos, sin
+        return cos[position_ids], sin[position_ids]
 
 
 class Llama3MLP(nn.Module):
@@ -153,7 +155,6 @@ class Llama3Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        position_ids: torch.Tensor,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
@@ -162,10 +163,8 @@ class Llama3Attention(nn.Module):
         k = self.k_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
 
-        # Get full cos/sin table from position_embeddings and slice by position_ids
-        cos, sin = position_embeddings  # [max_seq_len, head_dim]
-        cos = cos[position_ids]  # [B, S, head_dim]
-        sin = sin[position_ids]  # [B, S, head_dim]
+        # Get pre-sliced cos/sin from position_embeddings (already indexed by position_ids)
+        cos, sin = position_embeddings  # [B, S, head_dim]
 
         # Apply RoPE using custom op (BSND layout, unsqueeze_dim=2)
         q, k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
@@ -214,12 +213,11 @@ class Llama3DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        position_ids: torch.Tensor,
     ) -> torch.Tensor:
         # Self attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings, position_ids)
+        hidden_states = self.self_attn(hidden_states, position_embeddings)
         hidden_states = residual + hidden_states
 
         # MLP
@@ -311,13 +309,13 @@ class Llama3Model(Llama3PreTrainedModel):
         # Cast to compute dtype for FP8 models
         inputs_embeds = inputs_embeds.to(self.norm.weight.dtype)
 
-        # Compute full position embedding tables (slicing by position_ids in attention)
-        position_embeddings = self.rotary_emb(inputs_embeds)
+        # Compute position embeddings once (sliced by position_ids in RoPE)
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
         hidden_states = inputs_embeds
 
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(hidden_states, position_embeddings, position_ids)
+            hidden_states = decoder_layer(hidden_states, position_embeddings)
 
         hidden_states = self.norm(hidden_states)
 
