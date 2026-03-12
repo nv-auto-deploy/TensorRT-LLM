@@ -230,11 +230,20 @@ def test_qwen3_moe_attention_equivalence(B, S, dtype):
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
-    # Run HF attention (needs attention_mask=None for causal)
+    q_len = S
+    causal_mask = (
+        torch.triu(
+            torch.full((q_len, q_len), float("-inf"), device=device, dtype=dtype),
+            diagonal=1,
+        )
+        .unsqueeze(0)
+        .unsqueeze(0)
+    )
+
     hf_out, _ = hf_attn(
         hidden_states=x,
         position_embeddings=(hf_cos, hf_sin),
-        attention_mask=None,
+        attention_mask=causal_mask,
     )
 
     # Run custom attention (position_embeddings are pre-sliced)
@@ -327,10 +336,20 @@ def test_qwen3_moe_decoder_layer_equivalence(B, S, dtype):
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
+    q_len = S
+    causal_mask = (
+        torch.triu(
+            torch.full((q_len, q_len), float("-inf"), device=device, dtype=dtype),
+            diagonal=1,
+        )
+        .unsqueeze(0)
+        .unsqueeze(0)
+    )
+
     # Run HF decoder layer
     hf_out = hf_layer(
         hidden_states=x,
-        attention_mask=None,
+        attention_mask=causal_mask,
         position_ids=position_ids,
         position_embeddings=(hf_cos, hf_sin),
     )
