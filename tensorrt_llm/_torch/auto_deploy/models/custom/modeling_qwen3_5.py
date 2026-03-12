@@ -65,7 +65,7 @@ class Qwen3_5TextConfig(PretrainedConfig):
         max_position_embeddings=262144,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
-        tie_word_embeddings=True,
+        tie_word_embeddings=False,
         rope_parameters=None,
         attention_bias=False,
         attention_dropout=0.0,
@@ -808,7 +808,7 @@ class Qwen3_5Config(PretrainedConfig):
         video_token_id: int = 248057,
         vision_start_token_id: int = 248053,
         vision_end_token_id: int = 248054,
-        tie_word_embeddings: bool = True,
+        tie_word_embeddings: bool = False,
         **kwargs,
     ):
         if isinstance(vision_config, dict):

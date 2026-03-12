@@ -14,8 +14,8 @@ transforms:
     sharding_source: ['manual']
     manual_config:
       tp_plan:
-        # GDN layer — skipped for now to isolate TP correctness issue
-        # "in_proj_qkv": "delta"
+        # GDN layer
+        "in_proj_qkv": "delta"
         # attention layer
         "q_proj": "colwise"
         "k_proj": "colwise"
