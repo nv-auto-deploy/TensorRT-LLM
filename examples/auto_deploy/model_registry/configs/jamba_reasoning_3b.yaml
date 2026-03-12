@@ -3,7 +3,6 @@
 # LlmArgs fields are nested under 'args' so this YAML can be used with --yaml-extra
 # (top-level ExperimentConfig flag) rather than --args.yaml-extra.
 args:
-  skip_tokenizer_init: false
   trust_remote_code: true
 
   # SSMs do not support cache reuse.
@@ -13,9 +12,6 @@ args:
 
   max_batch_size: 128
   max_seq_len: 8192
-  max_num_tokens: 8192
-
-  skip_loading_weights: false
 
   transforms:
     insert_cached_ssm_attention:

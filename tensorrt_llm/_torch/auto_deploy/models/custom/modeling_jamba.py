@@ -166,11 +166,9 @@ class JambaRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return torch.ops.auto_deploy.torch_rmsnorm(
+            hidden_states, self.weight, self.variance_epsilon
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -435,11 +433,7 @@ class JambaAttentionDecoderLayer(nn.Module):
         # Feed-forward
         residual = hidden_states
         hidden_states = self.pre_ff_layernorm(hidden_states)
-        ff_output = self.feed_forward(hidden_states)
-        # Handle tuple output from SparseMoeBlock
-        if isinstance(ff_output, tuple):
-            ff_output = ff_output[0]
-        hidden_states = residual + ff_output
+        hidden_states = residual + self.feed_forward(hidden_states)
 
         return hidden_states
 
@@ -470,10 +464,7 @@ class JambaMambaDecoderLayer(nn.Module):
         # Feed-forward
         residual = hidden_states
         hidden_states = self.pre_ff_layernorm(hidden_states)
-        ff_output = self.feed_forward(hidden_states)
-        if isinstance(ff_output, tuple):
-            ff_output = ff_output[0]
-        hidden_states = residual + ff_output
+        hidden_states = residual + self.feed_forward(hidden_states)
 
         return hidden_states
 

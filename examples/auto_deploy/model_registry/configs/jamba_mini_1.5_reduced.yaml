@@ -2,7 +2,6 @@
 # Reduced layers for initial testing (single GPU)
 
 args:
-  skip_tokenizer_init: false
   trust_remote_code: true
 
   # SSMs do not support cache reuse.
@@ -12,9 +11,6 @@ args:
 
   max_batch_size: 128
   max_seq_len: 8192
-  max_num_tokens: 8192
-
-  skip_loading_weights: false
 
   model_kwargs:
     num_hidden_layers: 5

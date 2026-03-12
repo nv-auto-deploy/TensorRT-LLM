@@ -3,7 +3,6 @@
 
 # LlmArgs fields are nested under 'args' so this YAML can be used with --yaml-extra
 args:
-  skip_tokenizer_init: false
   trust_remote_code: true
 
   # SSMs do not support cache reuse.
@@ -14,11 +13,6 @@ args:
   max_batch_size: 64
   max_seq_len: 4096
   max_num_tokens: 4096
-
-  skip_loading_weights: false
-
-  # EP across 2 GPUs to fit ~96GB model
-  world_size: 2
 
   transforms:
     detect_sharding:
