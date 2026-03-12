@@ -109,7 +109,7 @@ Create `tests/unittest/_torch/auto_deploy/unit/singlegpu/models/test_{name}_mode
 
 **HF Reference Strategy:** Equivalence tests compare our custom implementation against the HF reference with identical weights and inputs. **Use actual HF classes if they exist — prefer importing directly over standalone HF-like implementations for unit tests.** Standalone "reference" implementations are effectively alternative AD IR models and defeat the purpose of the reference test; they also tend to silently agree with whatever bugs exist in the custom model.
 - **If HF modules exist in the installed `transformers`**: import them directly (e.g., `from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM`). Wrap imports in `_get_hf_*_class()` try/except helpers that return `None` on `ImportError`, and use `pytest.skip` when `None`.
-- **If HF modules are NOT in the installed `transformers`**: strongly prefer loading them from the HF cache downloaded in Phase 0. Use `importlib.util` or insert the cache snapshot directory into `sys.path` to import the model's `modeling_*.py` directly (e.g., `~/.cache/huggingface/hub/.../modeling_{name}.py`). Try to make tests pass with this approach first. If the HF source truly cannot be loaded at test time, copy the minimal module definitions from the HF `modeling_*.py` source into the test file as standalone reference classes — but only as a last resort. **Important**: make sure the copy is minimal and strictly faithful to the HF implementation only. Do NOT tweak the functionality of the reference.
+- **If HF modules are NOT in the installed `transformers`**: strongly prefer loading them from the HF cache downloaded in Phase 0. If the HF source truly cannot be loaded at test time, copy the minimal module definitions from the HF `modeling_*.py` source into the test file as standalone reference classes — but only as a last resort. **Important**: make sure the copy is minimal and strictly faithful to the HF implementation only. Do NOT tweak the functionality of the reference.
 - **Weight conversion helpers**: Write test-only helpers for any weight format differences between HF and custom (e.g., RoPE de-interleaving, stacked-to-per-expert MoE weights, gate weight key remapping). For full-model tests, prefer using `load_state_dict` pre-hooks already registered on the custom model.
 
 **Numerical comparison:** For equivalence tests comparing custom ops against HF reference, use the shared `assert_rmse_close` utility from `_model_test_utils`:
@@ -202,7 +202,7 @@ The model is run via:
 ```bash
 CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
 ```
-The `--use-registry` flag automatically resolves the model's config from `models.yaml`, so no manual `--args.yaml-extra` is needed. The `ad-run-agent` will determine the required `world_size` from the registry, check GPU availability via `nvidia-smi`, select free GPUs, and wait if not enough are available.
+The `ad-run-agent` will determine the required `world_size` from the registry, check GPU availability via `nvidia-smi`, select free GPUs, and wait if not enough are available.
 
 The ad-run-agent will build+run the model, check generation quality, archive logs, and update its worklog.
 
