@@ -156,7 +156,7 @@ class _HFExaoneAttention(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.out_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
 
-    def forward(self, hidden_states, position_ids, position_embeddings):
+    def forward(self, hidden_states, position_embeddings):
         bsz, q_len, _ = hidden_states.shape
 
         # BNSD layout
@@ -176,9 +176,8 @@ class _HFExaoneAttention(nn.Module):
             .transpose(1, 2)
         )
 
-        # Slice cos/sin by position_ids
-        cos = position_embeddings[0][position_ids]
-        sin = position_embeddings[1][position_ids]
+        # cos/sin already pre-sliced by position_ids
+        cos, sin = position_embeddings
         q, k = _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
         k = _repeat_kv(k, self.num_kv_groups)
@@ -203,8 +202,8 @@ class _HFExaoneAttentionBlock(nn.Module):
         super().__init__()
         self.attention = _HFExaoneAttention(config, layer_idx)
 
-    def forward(self, hidden_states, position_ids, position_embeddings):
-        return self.attention(hidden_states, position_ids, position_embeddings)
+    def forward(self, hidden_states, position_embeddings):
+        return self.attention(hidden_states, position_embeddings)
 
 
 class _HFExaoneDecoderLayer(nn.Module):
@@ -217,10 +216,10 @@ class _HFExaoneDecoderLayer(nn.Module):
         self.ln_2 = _HFExaoneRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = _HFExaoneMLP(config)
 
-    def forward(self, hidden_states, position_ids, position_embeddings):
+    def forward(self, hidden_states, position_embeddings):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
-        hidden_states = self.attn(hidden_states, position_ids, position_embeddings)
+        hidden_states = self.attn(hidden_states, position_embeddings)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -247,10 +246,10 @@ class _HFExaoneModel(nn.Module):
         )
         self.ln_f = _HFExaoneRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, input_ids, position_ids, position_embeddings):
+    def forward(self, input_ids, position_embeddings):
         hidden_states = self.wte(input_ids)
         for layer in self.h:
-            hidden_states = layer(hidden_states, position_ids, position_embeddings)
+            hidden_states = layer(hidden_states, position_embeddings)
         hidden_states = self.ln_f(hidden_states)
         return hidden_states
 
@@ -263,8 +262,8 @@ class _HFExaoneForCausalLM(nn.Module):
         self.transformer = _HFExaoneModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(self, input_ids, position_ids, position_embeddings):
-        hidden_states = self.transformer(input_ids, position_ids, position_embeddings)
+    def forward(self, input_ids, position_embeddings):
+        hidden_states = self.transformer(input_ids, position_embeddings)
         logits = self.lm_head(hidden_states).float()
         return _HFExaoneCausalLMOutput(logits=logits)
 
@@ -344,19 +343,17 @@ def test_exaone_attention_equivalence(B, S, dtype):
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
-    # Compute full position embedding tables
+    # Compute pre-sliced position embeddings
     rotary = ExaoneRotaryEmbedding(config)
     rotary.to(device=device, dtype=dtype)
-    position_embeddings = rotary(x)
+    position_embeddings = rotary(x, position_ids)
 
     hf_out = hf_attn(
         hidden_states=x,
-        position_ids=position_ids,
         position_embeddings=position_embeddings,
     )
     custom_out = custom_attn(
         hidden_states=x,
-        position_ids=position_ids,
         position_embeddings=position_embeddings,
     )
 
@@ -390,16 +387,14 @@ def test_exaone_decoder_layer_equivalence(B, S, dtype):
 
     rotary = ExaoneRotaryEmbedding(config)
     rotary.to(device=device, dtype=dtype)
-    position_embeddings = rotary(x)
+    position_embeddings = rotary(x, position_ids)
 
     hf_out = hf_layer(
         hidden_states=x,
-        position_ids=position_ids,
         position_embeddings=position_embeddings,
     )
     custom_out = custom_layer(
         hidden_states=x,
-        position_ids=position_ids,
         position_embeddings=position_embeddings,
     )
 
@@ -441,14 +436,13 @@ def test_exaone_full_model_equivalence(B, S, dtype, device):
     # Custom model takes input_ids + position_ids
     custom_out = custom_model(input_ids=input_ids, position_ids=position_ids)
 
-    # HF reference needs position embeddings explicitly
+    # HF reference needs pre-sliced position embeddings explicitly
     rotary = ExaoneRotaryEmbedding(config)
     rotary.to(device=device, dtype=dtype)
     dummy_x = custom_model.transformer.wte(input_ids)
-    position_embeddings = rotary(dummy_x)
+    position_embeddings = rotary(dummy_x, position_ids)
     hf_out = hf_model(
         input_ids=input_ids,
-        position_ids=position_ids,
         position_embeddings=position_embeddings,
     )
 

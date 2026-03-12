@@ -142,7 +142,7 @@ class ExaoneRotaryEmbedding(nn.Module):
 
     Supports all rope types (default, llama3, linear, dynamic, etc.) via
     transformers ROPE_INIT_FUNCTIONS. Precomputes and caches cos/sin values.
-    Returns the full cached table; position slicing is done downstream.
+    Slices by position_ids once and returns pre-sliced cos/sin to all layers.
 
     Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
     """
@@ -170,13 +170,11 @@ class ExaoneRotaryEmbedding(nn.Module):
         self.register_buffer("_ad_sin_cached", emb.sin() * self.attention_scaling, persistent=False)
 
     def forward(
-        self, x: torch.Tensor, seq_len: Optional[int] = None
+        self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Return full cached cos/sin tables for export compatibility
-        return (
-            self._ad_cos_cached.to(dtype=x.dtype, device=x.device),
-            self._ad_sin_cached.to(dtype=x.dtype, device=x.device),
-        )
+        cos = self._ad_cos_cached.to(dtype=x.dtype, device=x.device)
+        sin = self._ad_sin_cached.to(dtype=x.dtype, device=x.device)
+        return cos[position_ids], sin[position_ids]
 
 
 class ExaoneMLP(nn.Module):
@@ -203,7 +201,6 @@ class ExaoneAttention(nn.Module):
 
     Uses AD canonical ops for attention and RoPE. GQA is handled natively
     by torch_attention — no repeat_kv needed.
-    Receives full cos/sin tables and slices by position_ids internally.
     """
 
     def __init__(self, config, layer_idx: Optional[int] = None):
@@ -227,7 +224,6 @@ class ExaoneAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
@@ -237,11 +233,8 @@ class ExaoneAttention(nn.Module):
         k = self.k_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
 
-        # Slice cos/sin by position_ids from full cached tables
-        cos = position_embeddings[0]  # [max_pos, head_dim]
-        sin = position_embeddings[1]  # [max_pos, head_dim]
-        cos = cos[position_ids]  # [B, S, head_dim]
-        sin = sin[position_ids]  # [B, S, head_dim]
+        # Get pre-sliced cos/sin from position_embeddings (already indexed by position_ids)
+        cos, sin = position_embeddings  # [B, S, head_dim]
 
         # Apply RoPE using custom op (BSND layout, unsqueeze_dim=2)
         q, k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 2)
@@ -278,10 +271,9 @@ class ExaoneAttentionBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        return self.attention(hidden_states, position_ids, position_embeddings)
+        return self.attention(hidden_states, position_embeddings)
 
 
 class ExaoneDecoderLayer(nn.Module):
@@ -299,13 +291,12 @@ class ExaoneDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         # Self attention
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
-        hidden_states = self.attn(hidden_states, position_ids, position_embeddings)
+        hidden_states = self.attn(hidden_states, position_embeddings)
         hidden_states = residual + hidden_states
 
         # MLP
@@ -394,13 +385,13 @@ class ExaoneModel(ExaonePreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
 
-        # Compute full position embedding tables once from shared rotary embedding
-        position_embeddings = self.rotary_emb(inputs_embeds)
+        # Compute position embeddings once (sliced by position_ids in RoPE)
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
         hidden_states = inputs_embeds
 
         for decoder_layer in self.h:
-            hidden_states = decoder_layer(hidden_states, position_ids, position_embeddings)
+            hidden_states = decoder_layer(hidden_states, position_embeddings)
 
         hidden_states = self.ln_f(hidden_states)
 
