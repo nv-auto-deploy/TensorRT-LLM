@@ -215,7 +215,7 @@ def test_qwen2_attention_equivalence(B, S, dtype):
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
     # HF position embeddings
-    hf_rotary = HFQwen2RotaryEmbedding(config=config, device=device)
+    hf_rotary = HFRotary(config=config, device=device)
     hf_cos, hf_sin = hf_rotary(x, position_ids)
 
     # Custom position embeddings (pre-sliced by position_ids)
@@ -245,15 +245,6 @@ def test_qwen2_attention_equivalence(B, S, dtype):
     )
 
     assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.10, msg="Attention: ")
-
-
-# Need HF class for the rotary import in attention test
-try:
-    from transformers.models.qwen2.modeling_qwen2 import (
-        Qwen2RotaryEmbedding as HFQwen2RotaryEmbedding,
-    )
-except ImportError:
-    HFQwen2RotaryEmbedding = None
 
 
 # =========================================================================
