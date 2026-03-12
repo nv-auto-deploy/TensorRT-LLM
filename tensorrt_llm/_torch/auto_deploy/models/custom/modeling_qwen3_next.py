@@ -340,7 +340,6 @@ class Qwen3NextAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
@@ -362,10 +361,8 @@ class Qwen3NextAttention(nn.Module):
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
-        # Slice cos/sin by position_ids from the full cached table
-        cos, sin = position_embeddings  # Full tables: (max_pos, rotary_dim)
-        cos = cos[position_ids]  # (B, S, rotary_dim)
-        sin = sin[position_ids]  # (B, S, rotary_dim)
+        # Position embeddings already sliced by position_ids at model level
+        cos, sin = position_embeddings  # (B, S, rotary_dim)
 
         # Split into rotary and pass-through portions for partial RoPE
         q_rot = query_states[..., : self.rotary_dim]  # (B, S, N, rotary_dim)
@@ -526,7 +523,6 @@ class Qwen3NextDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         # Token mixer
@@ -538,7 +534,6 @@ class Qwen3NextDecoderLayer(nn.Module):
         elif self.layer_type == "full_attention":
             hidden_states = self.self_attn(
                 hidden_states,
-                position_ids=position_ids,
                 position_embeddings=position_embeddings,
             )
 
@@ -630,14 +625,17 @@ class Qwen3NextModel(Qwen3NextPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # Compute position embeddings once (returns full cached table)
-        position_embeddings = self.rotary_emb(inputs_embeds)
+        # Compute position embeddings: get full table then slice once by position_ids
+        cos_full, sin_full = self.rotary_emb(inputs_embeds)
+        position_embeddings = (
+            cos_full[position_ids],  # (B, S, rotary_dim)
+            sin_full[position_ids],  # (B, S, rotary_dim)
+        )
 
         hidden_states = inputs_embeds
         for decoder_layer in self.layers:
             hidden_states = decoder_layer(
                 hidden_states,
-                position_ids=position_ids,
                 position_embeddings=position_embeddings,
             )
 

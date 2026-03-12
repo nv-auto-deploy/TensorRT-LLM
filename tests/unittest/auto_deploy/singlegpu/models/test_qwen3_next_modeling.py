@@ -18,7 +18,6 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_next import (
     Qwen3NextGatedDeltaNet,
     Qwen3NextMLP,
     Qwen3NextRMSNorm,
-    Qwen3NextRotaryEmbedding,
     Qwen3NextSparseMoeBlock,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
@@ -386,7 +385,7 @@ def test_qwen3_next_attention_numerical_equivalence(B, S, dtype):
 
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
 
-    # Compute position embeddings for HF (sliced by position_ids)
+    # Compute position embeddings (sliced by position_ids) — shared by HF and custom
     from transformers.models.qwen3_next.modeling_qwen3_next import (
         Qwen3NextRotaryEmbedding as HFRoPE,
     )
@@ -394,21 +393,17 @@ def test_qwen3_next_attention_numerical_equivalence(B, S, dtype):
     hf_rope = HFRoPE(config)
     hf_rope.to(device=device)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
-    hf_position_embeddings = hf_rope(x, position_ids)
+    position_embeddings = hf_rope(x, position_ids)  # (cos, sin), each (B, S, rotary_dim)
 
     # HF attention forward: returns (attn_output, attn_weights)
     hf_out, _ = hf_attn(
         hidden_states=x,
-        position_embeddings=hf_position_embeddings,
+        position_embeddings=position_embeddings,
         attention_mask=None,
     )
 
-    # Custom attention gets full cos/sin table and position_ids
-    rotary_emb_custom = Qwen3NextRotaryEmbedding(config)
-    rotary_emb_custom.to(device=device)
-    full_pos_emb = rotary_emb_custom(x)
-
-    custom_out = custom_attn(x, position_ids=position_ids, position_embeddings=full_pos_emb)
+    # Custom attention also gets pre-sliced position embeddings (slicing done at model level)
+    custom_out = custom_attn(x, position_embeddings=position_embeddings)
 
     assert_rmse_close(
         custom_out,
@@ -448,7 +443,7 @@ def test_qwen3_next_linear_decoder_layer_equivalence(B, S, dtype):
 
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
 
-    # HF gets sliced position embeddings
+    # Compute position embeddings (sliced) — shared by HF and custom
     from transformers.models.qwen3_next.modeling_qwen3_next import (
         Qwen3NextRotaryEmbedding as HFRoPE,
     )
@@ -463,12 +458,8 @@ def test_qwen3_next_linear_decoder_layer_equivalence(B, S, dtype):
     if isinstance(hf_out, tuple):
         hf_out = hf_out[0]
 
-    # Custom decoder layer gets full cos/sin table and position_ids
-    rotary_emb_custom = Qwen3NextRotaryEmbedding(config)
-    rotary_emb_custom.to(device=device)
-    full_pos_emb = rotary_emb_custom(x)
-
-    custom_out = custom_layer(x, position_ids=position_ids, position_embeddings=full_pos_emb)
+    # Custom decoder layer gets same pre-sliced position embeddings
+    custom_out = custom_layer(x, position_embeddings=position_embeddings)
 
     assert_rmse_close(
         custom_out,
@@ -503,7 +494,7 @@ def test_qwen3_next_full_attention_decoder_layer_equivalence(B, S, dtype):
 
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
 
-    # HF gets sliced position embeddings
+    # Compute position embeddings (sliced) — shared by HF and custom
     from transformers.models.qwen3_next.modeling_qwen3_next import (
         Qwen3NextRotaryEmbedding as HFRoPE,
     )
@@ -517,12 +508,8 @@ def test_qwen3_next_full_attention_decoder_layer_equivalence(B, S, dtype):
     if isinstance(hf_out, tuple):
         hf_out = hf_out[0]
 
-    # Custom gets full cos/sin table + position_ids
-    rotary_emb_custom = Qwen3NextRotaryEmbedding(config)
-    rotary_emb_custom.to(device=device)
-    full_pos_emb = rotary_emb_custom(x)
-
-    custom_out = custom_layer(x, position_ids=position_ids, position_embeddings=full_pos_emb)
+    # Custom gets same pre-sliced position embeddings
+    custom_out = custom_layer(x, position_embeddings=position_embeddings)
 
     assert_rmse_close(
         custom_out,
