@@ -19,7 +19,6 @@ Source:
 https://huggingface.co/internlm/internlm3-8b-instruct
 
 This implementation differs from the original HuggingFace version in the following ways:
-* Bundled InternLM3Config (model uses auto_map, not in standard transformers library)
 * Simplified for prefill-only inference (no KV caching)
 * Uses auto_deploy custom ops for export compatibility
 * Removed flash attention variants (uses torch_attention canonical op)
@@ -36,7 +35,6 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import AutoConfig
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
@@ -45,68 +43,6 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-
-
-class InternLM3Config(PretrainedConfig):
-    """Configuration class for InternLM3 models.
-
-    Bundled here because InternLM3Config is not part of the standard
-    transformers library — the checkpoint uses auto_map to load it from
-    model-specific files.
-    """
-
-    model_type = "internlm3"
-    keys_to_ignore_at_inference = ["past_key_values"]
-
-    def __init__(
-        self,
-        vocab_size: int = 128512,
-        hidden_size: int = 4096,
-        intermediate_size: int = 11008,
-        num_hidden_layers: int = 32,
-        num_attention_heads: int = 32,
-        num_key_value_heads: int = 32,
-        hidden_act: str = "silu",
-        max_position_embeddings: int = 32768,
-        initializer_range: float = 0.02,
-        rms_norm_eps: float = 1e-6,
-        use_cache: bool = True,
-        tie_word_embeddings: bool = False,
-        rope_theta: float = 10000.0,
-        rope_scaling: Optional[dict] = None,
-        qkv_bias: bool = False,
-        attention_dropout: float = 0.0,
-        bias: bool = False,
-        head_dim: Optional[int] = None,
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
-        self.num_key_value_heads = num_key_value_heads
-        self.hidden_act = hidden_act
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.use_cache = use_cache
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self.qkv_bias = qkv_bias
-        self.attention_dropout = attention_dropout
-        self.bias = bias
-        self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
-        # BC: move 'type' field to 'rope_type' if present
-        if self.rope_scaling is not None and "type" in self.rope_scaling:
-            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
-
-
-# Register so that AutoConfig.from_pretrained("internlm/internlm3-8b-instruct") works
-AutoConfig.register("internlm3", InternLM3Config, exist_ok=True)
 
 
 class InternLM3RMSNorm(nn.Module):
@@ -134,7 +70,7 @@ class InternLM3RotaryEmbedding(nn.Module):
     Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
     """
 
-    def __init__(self, config: InternLM3Config):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
             rope_type = config.rope_scaling.get(
@@ -168,7 +104,7 @@ class InternLM3RotaryEmbedding(nn.Module):
 class InternLM3MLP(nn.Module):
     """MLP layer for InternLM3 (SiLU gated activation)."""
 
-    def __init__(self, config: InternLM3Config):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -188,7 +124,7 @@ class InternLM3Attention(nn.Module):
     by torch_attention — no repeat_kv needed.
     """
 
-    def __init__(self, config: InternLM3Config, layer_idx: Optional[int] = None):
+    def __init__(self, config: PretrainedConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -253,7 +189,7 @@ class InternLM3Attention(nn.Module):
 class InternLM3DecoderLayer(nn.Module):
     """Transformer decoder layer for InternLM3."""
 
-    def __init__(self, config: InternLM3Config, layer_idx: int):
+    def __init__(self, config: PretrainedConfig, layer_idx: int):
         super().__init__()
         self.self_attn = InternLM3Attention(config, layer_idx=layer_idx)
         self.mlp = InternLM3MLP(config)
@@ -298,7 +234,7 @@ class InternLM3CausalLMOutput(ModelOutput):
 class InternLM3PreTrainedModel(PreTrainedModel):
     """Base class for InternLM3 models."""
 
-    config_class = InternLM3Config
+    config_class = PretrainedConfig
     base_model_prefix = "model"
     _no_split_modules = ["InternLM3DecoderLayer"]
     supports_gradient_checkpointing = False
@@ -318,7 +254,7 @@ class InternLM3PreTrainedModel(PreTrainedModel):
 class InternLM3Model(InternLM3PreTrainedModel):
     """InternLM3 transformer decoder model."""
 
-    def __init__(self, config: InternLM3Config):
+    def __init__(self, config: PretrainedConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -374,7 +310,7 @@ class InternLM3ForCausalLM(InternLM3PreTrainedModel, GenerationMixin):
 
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config: InternLM3Config, **kwargs):
+    def __init__(self, config: PretrainedConfig, **kwargs):
         super().__init__(config)
         self.model = InternLM3Model(config)
         self.vocab_size = config.vocab_size

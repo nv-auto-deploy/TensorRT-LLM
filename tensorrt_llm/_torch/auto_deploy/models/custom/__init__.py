@@ -9,18 +9,18 @@ from .modeling_granite import GraniteForCausalLM
 from .modeling_granite_moe_hybrid import GraniteMoeHybridForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEForCausalLM
-from .modeling_internlm3 import InternLM3Config, InternLM3ForCausalLM
+from .modeling_internlm3 import InternLM3ForCausalLM
 from .modeling_kimi_k2 import KimiK2ForCausalLM, KimiK25ForConditionalGeneration
 from .modeling_llama3 import Llama3ForCausalLM
 from .modeling_mistral3 import Mistral3ForConditionalGeneration, Mistral3TextForCausalLM
 from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreTrainedTokenizerFast
 from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_olmo3 import Olmo3ForCausalLM
-from .modeling_qwen2 import Qwen2ForCausalLM
 from .modeling_phi4 import Phi4ForCausalLM
 from .modeling_phi4_visionr import Phi4VisionRForConditionalGeneration
 from .modeling_phi4flash import Phi4FlashForCausalLM
 from .modeling_phi4mm import Phi4MMForCausalLM
+from .modeling_qwen2 import Qwen2ForCausalLM
 from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
 from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration
@@ -32,7 +32,6 @@ from .modeling_starcoder2 import Starcoder2ForCausalLM
 __all__ = (
     "CohereForCausalLM",
     "DeciLMForCausalLM",
-    "InternLM3Config",
     "InternLM3ForCausalLM",
     "DeepSeekV2ForCausalLM",
     "DeepSeekV3ForCausalLM",
