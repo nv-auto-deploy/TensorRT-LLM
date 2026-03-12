@@ -245,7 +245,7 @@ When you post a PR, you **MUST** include:
 ```
 python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
 ```
-3. A detailed pytest command for the unit tests you added so they can be run by the reviewer as well.
+3. A detailed pytest command for the unit tests you added so they can be run by the reviewer as well. Make sure you have run this pytest command on the latest commit that you are pushing, and include these results in the PR.
 
 ## Key Gotchas
 - **Canonical ops first:** Always use `torch.ops.auto_deploy.torch_*` canonical ops whenever one exists for the operation. This is how AD knows what to optimize. Writing manual attention, MoE, RoPE, or normalization in plain PyTorch instead of using the canonical op will prevent AD transforms from working.
