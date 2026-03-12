@@ -139,7 +139,7 @@ class Glm4MoeMoEGate(nn.Module):
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)))
         self.register_buffer(
             "e_score_correction_bias",
-            torch.zeros(self.n_routed_experts, dtype=torch.float32),
+            torch.zeros(self.n_routed_experts),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -151,7 +151,7 @@ class Glm4MoeMoEGate(nn.Module):
         scores = router_logits.sigmoid()
 
         # Group top-k selection
-        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+        scores_for_choice = scores + self.e_score_correction_bias.to(scores).unsqueeze(0)
         group_scores = (
             scores_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group)
             .topk(2, dim=-1)[0]
