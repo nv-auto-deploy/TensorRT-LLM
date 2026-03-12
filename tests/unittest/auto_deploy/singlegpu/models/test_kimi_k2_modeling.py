@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Tests for Kimi-K2 / Kimi-K2.5 custom model implementation.
 
 This module tests the custom Kimi-K2 model implementation (DeepSeek-V3 variant)
@@ -653,8 +667,11 @@ def test_kimi_k2_dense_layer_numerical_equivalence(B, S, dtype):
     # Run custom layer
     custom_out = custom_layer(x, position_ids, (full_cos, full_sin))
 
+    # HF decoder layers return a tuple (hidden_states, ...) — extract tensor
+    hf_hidden = hf_out[0]
+
     # Compare
-    assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.05, msg="Dense layer: ")
+    assert_rmse_close(custom_out, hf_hidden, rmse_ratio_tol=0.05, msg="Dense layer: ")
 
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
@@ -712,8 +729,11 @@ def test_kimi_k2_moe_layer_numerical_equivalence(B, S, dtype):
     # Run custom layer
     custom_out = custom_layer(x, position_ids, (full_cos, full_sin))
 
+    # HF decoder layers return a tuple (hidden_states, ...) — extract tensor
+    hf_hidden = hf_out[0]
+
     # Compare — includes MoE routing differences
-    assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.05, msg="MoE layer: ")
+    assert_rmse_close(custom_out, hf_hidden, rmse_ratio_tol=0.05, msg="MoE layer: ")
 
 
 # --- Level 3: Full Model Equivalence ---
