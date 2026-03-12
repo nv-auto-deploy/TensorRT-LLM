@@ -274,11 +274,26 @@ class WeightBiasInfoCache:
             cls._active_instance._weight_shape_cache[node] = shape
 
 
-def get_source_nodes(node: Node) -> List[Node]:
-    """Walk backward through a computation chain and return all source (get_attr) nodes."""
+def get_source_nodes(
+    node: Union[Node, List[Node]],
+    allowed_ops: Optional[set] = None,
+) -> List[Node]:
+    """Walk backward through a computation chain and return all source (get_attr) nodes.
+
+    Args:
+        node: Starting node or list of starting nodes.
+        allowed_ops: If provided, only traverse through ``call_function`` nodes
+            whose ``target`` is in this set.  Nodes with targets outside the set
+            act as traversal boundaries (their inputs are NOT explored).  This
+            prevents cross-layer contamination through linear/conv/view ops when
+            searching for elementwise parameter chains (e.g., A_log -> exp -> neg).
+            When ``None``, all ``call_function`` nodes are traversed (original
+            behaviour).
+    """
+    roots = [node] if isinstance(node, Node) else list(node)
     result = []
     visited: set[Node] = set()
-    stack = [node]
+    stack = list(roots)
     while stack:
         n = stack.pop()
         if n in visited:
@@ -287,7 +302,8 @@ def get_source_nodes(node: Node) -> List[Node]:
         if n.op == "get_attr":
             result.append(n)
         elif n.op == "call_function":
-            stack.extend(n.all_input_nodes)
+            if allowed_ops is None or n.target in allowed_ops:
+                stack.extend(n.all_input_nodes)
     return result
 
 
@@ -656,6 +672,7 @@ class ShardableOp(Enum):
     ALL_REDUCE = "all_reduce"
     CONV1D = "conv1d"
     SSM = "ssm"
+    GATED_DELTA = "gated_delta"
     NORM = "norm"
     MOE = "moe"
 
@@ -693,6 +710,8 @@ def is_any_shardable_op(node: Node) -> Union[ShardableOp, None]:
         return ShardableOp.CONV1D
     if is_op(node, [torch.ops.auto_deploy.torch_ssm]):
         return ShardableOp.SSM
+    if is_op(node, [torch.ops.auto_deploy.torch_gated_delta_rule]):
+        return ShardableOp.GATED_DELTA
     if is_op(
         node,
         [
