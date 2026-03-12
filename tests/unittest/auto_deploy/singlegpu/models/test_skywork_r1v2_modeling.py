@@ -40,7 +40,7 @@ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_skywork_r1v2 import (
     SkyworkR1V2Attention,
     SkyworkR1V2DecoderLayer,
-    SkyworkR1V2ForCausalLM,
+    SkyworkR1V2ForConditionalGeneration,
     SkyworkR1V2MLP,
     SkyworkR1V2RMSNorm,
     SkyworkR1V2RotaryEmbedding,
@@ -101,7 +101,7 @@ def _create_small_chat_config() -> SkyworkChatConfig:
     """Create a small SkyworkChatConfig wrapping the Qwen2 LLM config.
 
     Mirrors how AutoDeploy's factory builds the model: AutoConfig returns a
-    SkyworkChatConfig, which is then passed to SkyworkR1V2ForCausalLM._from_config.
+    SkyworkChatConfig, which is then passed to SkyworkR1V2ForConditionalGeneration._from_config.
     tie_word_embeddings is forwarded explicitly to prevent PretrainedConfig from
     defaulting to True and spuriously tying lm_head to embed_tokens.
     """
@@ -273,7 +273,7 @@ def test_skywork_r1v2_full_model_equivalence(B, S, dtype, device):
 
     hf_model = Qwen2ForCausalLM(config).to(device=device, dtype=dtype).eval()
 
-    custom_model = SkyworkR1V2ForCausalLM(chat_config).to(device=device, dtype=dtype)
+    custom_model = SkyworkR1V2ForConditionalGeneration(chat_config).to(device=device, dtype=dtype)
     custom_model.load_state_dict(
         _convert_hf_to_custom_state_dict(hf_model.state_dict()), strict=False
     )
@@ -305,7 +305,7 @@ def test_skywork_r1v2_model_can_be_exported():
     dtype = torch.bfloat16
     chat_config = _create_small_chat_config()
 
-    model = SkyworkR1V2ForCausalLM(chat_config)
+    model = SkyworkR1V2ForConditionalGeneration(chat_config)
     model.to(device=device, dtype=dtype)
     model.eval()
 
@@ -374,7 +374,7 @@ def test_skywork_r1v2_config_parsing():
 
 def test_skywork_r1v2_gqa_structure():
     """Test that attention uses GQA with bias on QKV."""
-    model = SkyworkR1V2ForCausalLM(_create_small_chat_config())
+    model = SkyworkR1V2ForConditionalGeneration(_create_small_chat_config())
 
     attn = model.language_model.model.layers[0].self_attn
     assert attn.num_heads == 4
@@ -392,7 +392,7 @@ def test_skywork_r1v2_state_dict_keys():
     instantiates the vision tower and mlp1 projector.  Their keys follow the HF
     checkpoint layout: vision_model.* and mlp1.*.
     """
-    model = SkyworkR1V2ForCausalLM(_create_small_chat_config())
+    model = SkyworkR1V2ForConditionalGeneration(_create_small_chat_config())
     state_dict = model.state_dict()
 
     # LLM backbone keys

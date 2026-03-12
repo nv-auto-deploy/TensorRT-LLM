@@ -32,8 +32,8 @@ This implementation differs from the original HuggingFace version in the followi
 The HF checkpoint config class (SkyworkChatConfig, model_type="skywork_chat") is NOT
 imported here — it uses trust_remote_code and is only available when the checkpoint is
 present in the local HF cache.  AutoDeploy loads it via AutoConfig.from_pretrained at
-runtime and dispatches to SkyworkR1V2ForCausalLM via the "SkyworkChatConfig" key
-registered below.
+runtime and dispatches to SkyworkR1V2ForConditionalGeneration via the "SkyworkChatConfig"
+key registered below.
 """
 
 from dataclasses import dataclass
@@ -437,24 +437,6 @@ class SkyworkR1V2CausalLMOutput(ModelOutput):
 # ---------------------------------------------------------------------------
 
 
-class SkyworkR1V2PreTrainedModel(PreTrainedModel):
-    config_class = None  # SkyworkChatConfig uses trust_remote_code; not imported here
-    base_model_prefix = "language_model"
-    _no_split_modules = ["SkyworkR1V2DecoderLayer"]
-    supports_gradient_checkpointing = False
-
-    def _init_weights(self, module):
-        std = getattr(self.config, "initializer_range", 0.02)
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-
-
 class SkyworkR1V2TransformerModel(nn.Module):
     """Qwen2 transformer body (maps to language_model.model.*)."""
 
@@ -539,7 +521,7 @@ class SkyworkR1V2LanguageModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class SkyworkR1V2ForCausalLM(SkyworkR1V2PreTrainedModel, GenerationMixin):
+class SkyworkR1V2ForConditionalGeneration(PreTrainedModel, GenerationMixin):
     """Skywork-R1V2 model for AutoDeploy.
 
     When constructed with a full SkyworkChatConfig (runtime path), instantiates the
@@ -561,6 +543,22 @@ class SkyworkR1V2ForCausalLM(SkyworkR1V2PreTrainedModel, GenerationMixin):
     AD exports only the LLM forward path (input_ids → logits).  The vision tower
     runs in eager PyTorch and is not included in the torch.export graph.
     """
+
+    config_class = None  # SkyworkChatConfig uses trust_remote_code; not imported here
+    base_model_prefix = "language_model"
+    _no_split_modules = ["SkyworkR1V2DecoderLayer"]
+    supports_gradient_checkpointing = False
+
+    def _init_weights(self, module):
+        std = getattr(self.config, "initializer_range", 0.02)
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
 
     def __init__(self, config, **kwargs):
         super().__init__(config)
@@ -657,4 +655,6 @@ class SkyworkR1V2ForCausalLM(SkyworkR1V2PreTrainedModel, GenerationMixin):
 # ("SkyworkChatConfig").  Without this, AD falls through to
 # AutoModelForCausalLM.from_config which loads the full VLM — the HF vision
 # component imports 'timm' (not installed) and crashes before any export begins.
-AutoModelForCausalLMFactory.register_custom_model_cls("SkyworkChatConfig", SkyworkR1V2ForCausalLM)
+AutoModelForCausalLMFactory.register_custom_model_cls(
+    "SkyworkChatConfig", SkyworkR1V2ForConditionalGeneration
+)
