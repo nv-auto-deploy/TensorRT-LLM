@@ -9,6 +9,7 @@ from .modeling_granite import GraniteForCausalLM
 from .modeling_granite_moe_hybrid import GraniteMoeHybridForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEForCausalLM
+from .modeling_internlm3 import InternLM3Config, InternLM3ForCausalLM
 from .modeling_kimi_k2 import KimiK2ForCausalLM, KimiK25ForConditionalGeneration
 from .modeling_llama3 import Llama3ForCausalLM
 from .modeling_mistral3 import Mistral3ForConditionalGeneration, Mistral3TextForCausalLM
@@ -31,6 +32,8 @@ from .modeling_starcoder2 import Starcoder2ForCausalLM
 __all__ = (
     "CohereForCausalLM",
     "DeciLMForCausalLM",
+    "InternLM3Config",
+    "InternLM3ForCausalLM",
     "DeepSeekV2ForCausalLM",
     "DeepSeekV3ForCausalLM",
     "GemmaADForCausalLM",
