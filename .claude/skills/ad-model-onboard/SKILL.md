@@ -107,9 +107,9 @@ The custom model's forward signature must follow these rules:
 ## Phase 6 — Hierarchical Tests
 Create `tests/unittest/_torch/auto_deploy/unit/singlegpu/models/test_{name}_modeling.py`. Use `test_glm4_moe_lite_modeling.py` as template. **No smoke tests.** Small config (hidden=64, layers=2-3, vocab=1000). Use `pytest.skip` if HF class unavailable.
 
-**HF Reference Strategy:** Equivalence tests compare our custom implementation against the HF reference with identical weights and inputs. **Always use actual HF classes — never write standalone HF-like implementations for unit tests.** Standalone "reference" implementations are effectively alternative AD IR models and defeat the purpose of the reference test; they also tend to silently agree with whatever bugs exist in the custom model.
+**HF Reference Strategy:** Equivalence tests compare our custom implementation against the HF reference with identical weights and inputs. **Use actual HF classes if they exist — prefer importing directly over standalone HF-like implementations for unit tests.** Standalone "reference" implementations are effectively alternative AD IR models and defeat the purpose of the reference test; they also tend to silently agree with whatever bugs exist in the custom model.
 - **If HF modules exist in the installed `transformers`**: import them directly (e.g., `from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM`). Wrap imports in `_get_hf_*_class()` try/except helpers that return `None` on `ImportError`, and use `pytest.skip` when `None`.
-- **If HF modules are NOT in the installed `transformers`**: load them from the HF cache downloaded in Phase 0. Use `importlib.util` or insert the cache snapshot directory into `sys.path` to import the model's `modeling_*.py` directly (e.g., `~/.cache/huggingface/hub/.../modeling_{name}.py`). Do **NOT** copy or rewrite class definitions into the test file — the test must import from actual HF source. If the HF source cannot be loaded at all, skip with `pytest.skip("HF reference unavailable")`.
+- **If HF modules are NOT in the installed `transformers`**: strongly prefer loading them from the HF cache downloaded in Phase 0. Use `importlib.util` or insert the cache snapshot directory into `sys.path` to import the model's `modeling_*.py` directly (e.g., `~/.cache/huggingface/hub/.../modeling_{name}.py`). Try to make tests pass with this approach first. If the HF source truly cannot be loaded at test time, copy the minimal module definitions from the HF `modeling_*.py` source into the test file as standalone reference classes — but only as a last resort. **Important**: make sure the copy is minimal and strictly faithful to the HF implementation only. Do NOT tweak the functionality of the reference.
 - **Weight conversion helpers**: Write test-only helpers for any weight format differences between HF and custom (e.g., RoPE de-interleaving, stacked-to-per-expert MoE weights, gate weight key remapping). For full-model tests, prefer using `load_state_dict` pre-hooks already registered on the custom model.
 
 **Numerical comparison:** For equivalence tests comparing custom ops against HF reference, use the shared `assert_rmse_close` utility from `_model_test_utils`:
@@ -167,6 +167,21 @@ See `examples/auto_deploy/model_registry/README.md` for full documentation on th
 
 ## Phase 9 — AutoDeploy End-to-End Run
 
+### ⚠️ MANDATORY: You MUST use `build_and_run_ad.py --use-registry` EXACTLY AS-IS ⚠️
+
+**You MUST run the model using the model registry YAML configs. No exceptions. No workarounds. No manual `--args.yaml-extra` overrides. The command is:**
+
+```bash
+CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
+```
+
+**The `--use-registry` flag resolves ALL configuration from the model's entry in `examples/auto_deploy/model_registry/models.yaml` and its referenced YAML files under `examples/auto_deploy/model_registry/configs/`. This is the production path. You MUST validate the model works through it.**
+
+**If the run FAILS with `--use-registry`:**
+1. **DO NOT bypass the registry.** DO NOT fall back to manual `--args.yaml-extra` flags.
+2. Instead, **fix the registry configs** — update the model's entry in `models.yaml`, modify or create config YAMLs under `configs/`, and re-run with `--use-registry` again.
+3. The registry configs are the source of truth. If they are wrong, fix them. If they are missing, add them. The model MUST work via `--use-registry` before you are done.
+
 Invoke the `ad-run-agent` subagent to run the model through AutoDeploy on GPU. Pass it:
 
 Step 1: Reduced num layers
@@ -193,14 +208,28 @@ The ad-run-agent will build+run the model, check generation quality, archive log
 
 If the run **fails** or produces **bad generation**:
 1. Read the ad-run-agent's worklog and log file to understand the error
-2. Fix the issue (model code, registry config yaml, weight hooks, etc.)
+2. Fix the issue (model code, **registry config yaml**, weight hooks, etc.)
 3. Re-invoke the ad-run-agent with an updated description reflecting the change (e.g., "retry after fixing RoPE scaling in config")
-4. Repeat until the run succeeds with meaningful generation
+4. **Always re-run with `--use-registry`.** Never bypass the registry.
+5. Repeat until the run succeeds with meaningful generation
 
 Do NOT proceed to Phase 10 until the step 2 with full layers reports a successful run with coherent generation.
 
 ## Phase 10 — Summary Report
-Print (not file) after completion: (1) model overview + unique features, (2) tricky parts needing human review, (3) files created/modified (including any new registry configs), (4) test results table (name | validates | PASS/FAIL), (5) known limitations, (6) reviewer result (PASS + how many review iterations it took), (7) AD end-to-end run result (success/fail, number of iterations, final generation quality), (8) registry entry added/updated in `models.yaml` and any new config YAMLs created.
+
+### ⚠️ MANDATORY: You MUST include ALL raw prompts and generated outputs from the final `build_and_run_ad.py` run ⚠️
+
+Print (not file) after completion:
+
+1. Model overview + unique features
+2. Tricky parts needing human review
+3. Files created/modified (including any new registry configs)
+4. Test results table (name | validates | PASS/FAIL)
+5. Known limitations
+6. Reviewer result (PASS + how many review iterations it took)
+7. AD end-to-end run result (success/fail, number of iterations, final generation quality)
+8. Registry entry added/updated in `models.yaml` and any new config YAMLs created
+9. **ALL raw prompts and their corresponding generated outputs from the final successful `build_and_run_ad.py --use-registry` run.** Copy-paste the COMPLETE prompt→output pairs verbatim from the run log. Do NOT summarize, truncate, or paraphrase them. The user needs to see exactly what the model generated to judge quality.
 
 ## Phase 11 — Prepare a Pull Request
 
@@ -210,11 +239,13 @@ Prepare a pull request against `origin` (https://github.com/nv-auto-deploy/Tenso
 branch `feat/paperclip_maximizer`. Then, ask the user to provide feedback on the PR and wait for the
 user to get back to you when the feedback has been posted. Then continue iterating according to the
 user's feedback. For any comment or other post, please prepend your message with "[AGENT]" so that it is clear that this was a coding agent posting the comment.
-When you post a PR, the reported test results **must** come strictly from the model-registry command:
+When you post a PR, you **MUST** include:
+1. **ALL raw prompts and their complete generated outputs** from the final successful `build_and_run_ad.py --use-registry` run. Copy-paste the COMPLETE prompt→output pairs verbatim — do NOT summarize, truncate, or paraphrase. The reviewer needs to see exactly what the model generated.
+2. A reproducible command:
 ```
 python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
 ```
-This is the canonical reproducible command and is what reviewers will use to verify. You may run other local experiments during development (reduced layers, custom prompts, debug flags, etc.) to iterate and diagnose issues, but **do not report those results in the PR**. Only the output of the `--use-registry` command (with no extra flags or explicit prompts) may be cited as the test result. **Record results for every model in the family** — every model identified in Phase 1 Step 2 that shares this architecture must have its own `--use-registry` run result included in the PR. Include the exact command for each model so reviewers can reproduce them. Also include a detailed pytest command for the unit tests you added so they can be run by the reviewer as well.
+3. A detailed pytest command for the unit tests you added so they can be run by the reviewer as well.
 
 ## Key Gotchas
 - **Canonical ops first:** Always use `torch.ops.auto_deploy.torch_*` canonical ops whenever one exists for the operation. This is how AD knows what to optimize. Writing manual attention, MoE, RoPE, or normalization in plain PyTorch instead of using the canonical op will prevent AD transforms from working.
@@ -223,7 +254,7 @@ This is the canonical reproducible command and is what reviewers will use to ver
 - **Reuse config classes:** Import from `transformers` or load from checkpoint whenever possible. Only bundle a config class if it truly doesn't exist anywhere.
 - **Assert `position_ids`:** Always assert `position_ids is not None` — it is a required input, never optional.
 - **Self-contained files only**: Never import from other AD custom models. Each `modeling_{name}.py` is a standalone translation from HF source.
-- RoPE buffers: `_ad_` prefix. The `RotaryEmbedding.forward(x, position_ids)` should slice by `position_ids` once and return pre-sliced `(cos, sin)` to all layers. Do NOT pass `position_ids` through to every attention forward — that is wasteful redundant slicing.
+- **RoPE cos/sin: slice ONCE, not per layer.** `_ad_` prefix for RoPE buffers. `RotaryEmbedding.forward(x, position_ids)` MUST slice by `position_ids` once and return pre-sliced `(cos, sin)`. Pass those tensors to all layers. NEVER pass `position_ids` through to each layer/attention forward to re-index — that is redundant compute that bloats the exported graph. See Phase 2 for the full pattern.
 - MoE weights: use `nn.ModuleList` per-expert for checkpoint compatibility. Write test-only state_dict converters for HF stacked format.
 - `noaux_tc` routers (DeepSeek-V3 style): use vanilla PyTorch (sigmoid + bias + group topk + normalize + scale). AD transforms can replace with fused `trtllm` kernels at deployment time.
 - Vision towers are typically **not** exported. Keep vision logic in eager PyTorch and export only the text path unless explicitly requested otherwise.
