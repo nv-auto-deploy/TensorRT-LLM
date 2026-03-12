@@ -1392,6 +1392,11 @@ class Qwen3_5Model(nn.Module):
             # Multimodal: compute mRoPE positions with spatial (T, H, W) layout.
             # NOTE: This path needs the mRoPE position delta cache transform to work
             # correctly with the AD runtime during decode steps.
+            assert False, (
+                "Vision path not yet supported in AD runtime. Requires mRoPE position "
+                "delta cache transform. See: "
+                "https://github.com/nv-auto-deploy/TensorRT-LLM/pull/189#discussion_r2915084063"
+            )
             position_ids, _ = self.get_rope_index(
                 input_ids,
                 image_grid_thw=image_grid_thw,
