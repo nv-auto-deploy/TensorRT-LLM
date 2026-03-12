@@ -561,11 +561,17 @@ def test_skywork_r1v2_gqa_structure():
 
 
 def test_skywork_r1v2_state_dict_keys():
-    """Test that state_dict keys match expected checkpoint format."""
+    """Test that state_dict keys match expected checkpoint format.
+
+    With a full SkyworkChatConfig (which includes vision_config), the model also
+    instantiates the vision tower and mlp1 projector.  Their keys follow the HF
+    checkpoint layout: vision_model.* and mlp1.*.
+    """
     model = SkyworkR1V2ForCausalLM(_create_small_chat_config())
     state_dict = model.state_dict()
 
-    expected_key_patterns = [
+    # LLM backbone keys
+    expected_llm_keys = [
         "language_model.model.embed_tokens.weight",
         "language_model.model.layers.0.self_attn.q_proj.weight",
         "language_model.model.layers.0.self_attn.q_proj.bias",
@@ -582,12 +588,37 @@ def test_skywork_r1v2_state_dict_keys():
         "language_model.model.norm.weight",
         "language_model.lm_head.weight",
     ]
-
-    for key in expected_key_patterns:
+    for key in expected_llm_keys:
         assert key in state_dict, (
-            f"Expected key '{key}' in state_dict, got keys: {list(state_dict.keys())[:10]}..."
+            f"Expected LLM key '{key}' in state_dict, got keys: {list(state_dict.keys())[:10]}..."
         )
 
-    # Ensure no unexpected keys outside language_model.* (e.g. no vision_model.*, mlp1.*)
+    # Vision tower keys (present because _create_small_chat_config includes vision_config)
+    expected_vision_keys = [
+        "vision_model.embeddings.class_embedding",
+        "vision_model.embeddings.patch_embedding.weight",
+        "vision_model.embeddings.position_embedding",
+        "vision_model.encoder.layers.0.attn.qkv.weight",
+        "vision_model.encoder.layers.0.attn.proj.weight",
+        "vision_model.encoder.layers.0.norm1.weight",
+        "vision_model.encoder.layers.0.norm2.weight",
+        "vision_model.encoder.layers.0.ls1",
+        "vision_model.encoder.layers.0.ls2",
+        "mlp1.0.weight",  # LayerNorm
+        "mlp1.0.bias",
+        "mlp1.1.weight",  # Linear
+        "mlp1.1.bias",
+        "mlp1.3.weight",  # Linear
+        "mlp1.3.bias",
+    ]
+    for key in expected_vision_keys:
+        assert key in state_dict, (
+            f"Expected vision key '{key}' in state_dict, got keys: {list(state_dict.keys())[:10]}..."
+        )
+
+    # All keys must be under language_model.*, vision_model.*, or mlp1.*
+    valid_prefixes = ("language_model.", "vision_model.", "mlp1.")
     for key in state_dict:
-        assert key.startswith("language_model."), f"Unexpected key outside language_model: '{key}'"
+        assert any(key.startswith(p) for p in valid_prefixes), (
+            f"Unexpected key '{key}' — expected prefix in {valid_prefixes}"
+        )

@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen2Config
 from transformers.activations import ACT2FN
@@ -48,6 +49,201 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+
+# ---------------------------------------------------------------------------
+# Defaults from configuration_skywork_chat.py (HuggingFace source)
+# ---------------------------------------------------------------------------
+_HF_DEFAULT_SELECT_LAYER: int = -1  # use last ViT layer output
+_HF_DEFAULT_DOWNSAMPLE_RATIO: float = 0.5  # pixel-shuffle spatial compression
+_HF_DEFAULT_PS_VERSION: str = "v1"  # pixel-shuffle version
+
+# ---------------------------------------------------------------------------
+# Vision tower components (eager PyTorch, never exported)
+# ---------------------------------------------------------------------------
+
+
+class _VisionRMSNorm(nn.Module):
+    """Plain-PyTorch RMSNorm for the vision encoder (runs in eager mode only)."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
+class _VisionEmbeddings(nn.Module):
+    """Patch + class + positional embeddings for the ViT encoder."""
+
+    def __init__(self, vision_config):
+        super().__init__()
+        self.embed_dim = vision_config.hidden_size
+        self.image_size = vision_config.image_size
+        self.patch_size = vision_config.patch_size
+
+        self.class_embedding = nn.Parameter(torch.randn(1, 1, self.embed_dim))
+        self.patch_embedding = nn.Conv2d(
+            in_channels=3,
+            out_channels=self.embed_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+        )
+        self.num_patches = (self.image_size // self.patch_size) ** 2
+        self.num_positions = self.num_patches + 1
+        self.position_embedding = nn.Parameter(torch.randn(1, self.num_positions, self.embed_dim))
+
+    def _get_pos_embed(self, pos_embed: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        target_dtype = pos_embed.dtype
+        pos_embed = (
+            pos_embed.float()
+            .reshape(1, self.image_size // self.patch_size, self.image_size // self.patch_size, -1)
+            .permute(0, 3, 1, 2)
+        )
+        pos_embed = (
+            F.interpolate(pos_embed, size=(H, W), mode="bicubic", align_corners=False)
+            .reshape(1, -1, H * W)
+            .permute(0, 2, 1)
+            .to(target_dtype)
+        )
+        return pos_embed
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        target_dtype = self.patch_embedding.weight.dtype
+        patch_embeds = self.patch_embedding(pixel_values)
+        batch_size, _, height, width = patch_embeds.shape
+        patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
+        class_embeds = self.class_embedding.expand(batch_size, 1, -1).to(target_dtype)
+        embeddings = torch.cat([class_embeds, patch_embeds], dim=1)
+        position_embedding = torch.cat(
+            [
+                self.position_embedding[:, :1, :],
+                self._get_pos_embed(self.position_embedding[:, 1:, :], height, width),
+            ],
+            dim=1,
+        )
+        return embeddings + position_embedding.to(target_dtype)
+
+
+class _VisionAttention(nn.Module):
+    """Multi-head self-attention for the ViT (naive SDPA, no flash attention)."""
+
+    def __init__(self, vision_config):
+        super().__init__()
+        self.embed_dim = vision_config.hidden_size
+        self.num_heads = vision_config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
+        self.scale = self.head_dim**-0.5
+
+        self.qkv = nn.Linear(self.embed_dim, 3 * self.embed_dim, bias=vision_config.qkv_bias)
+        self.proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+        self.qk_normalization = vision_config.qk_normalization
+        if self.qk_normalization:
+            self.q_norm = _VisionRMSNorm(self.embed_dim, eps=vision_config.layer_norm_eps)
+            self.k_norm = _VisionRMSNorm(self.embed_dim, eps=vision_config.layer_norm_eps)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        B, N, C = hidden_states.shape
+        qkv = (
+            self.qkv(hidden_states)
+            .reshape(B, N, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv.unbind(0)  # [B, H, N, D]
+
+        if self.qk_normalization:
+            B_, H_, N_, D_ = q.shape
+            q = self.q_norm(q.transpose(1, 2).flatten(-2, -1)).view(B_, N_, H_, D_).transpose(1, 2)
+            k = self.k_norm(k.transpose(1, 2).flatten(-2, -1)).view(B_, N_, H_, D_).transpose(1, 2)
+
+        attn = (q * self.scale) @ k.transpose(-2, -1)
+        attn = attn.softmax(dim=-1)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return self.proj(x)
+
+
+class _VisionMLP(nn.Module):
+    def __init__(self, vision_config):
+        super().__init__()
+        self.fc1 = nn.Linear(vision_config.hidden_size, vision_config.intermediate_size)
+        self.fc2 = nn.Linear(vision_config.intermediate_size, vision_config.hidden_size)
+        self.act = ACT2FN[vision_config.hidden_act]
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.act(self.fc1(hidden_states)))
+
+
+class _VisionEncoderLayer(nn.Module):
+    def __init__(self, vision_config):
+        super().__init__()
+        self.embed_dim = vision_config.hidden_size
+        norm_type = getattr(vision_config, "norm_type", "rms_norm")
+        eps = vision_config.layer_norm_eps
+        if norm_type == "rms_norm":
+            self.norm1 = _VisionRMSNorm(self.embed_dim, eps=eps)
+            self.norm2 = _VisionRMSNorm(self.embed_dim, eps=eps)
+        else:
+            self.norm1 = nn.LayerNorm(self.embed_dim, eps=eps)
+            self.norm2 = nn.LayerNorm(self.embed_dim, eps=eps)
+
+        self.attn = _VisionAttention(vision_config)
+        self.mlp = _VisionMLP(vision_config)
+
+        initializer_factor = getattr(vision_config, "initializer_factor", 0.1)
+        self.ls1 = nn.Parameter(initializer_factor * torch.ones(self.embed_dim))
+        self.ls2 = nn.Parameter(initializer_factor * torch.ones(self.embed_dim))
+        # DropPath is for training only; at inference it is always identity.
+        self.drop_path1 = nn.Identity()
+        self.drop_path2 = nn.Identity()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states + self.drop_path1(
+            self.attn(self.norm1(hidden_states).to(hidden_states.dtype)) * self.ls1
+        )
+        hidden_states = hidden_states + self.drop_path2(
+            self.mlp(self.norm2(hidden_states).to(hidden_states.dtype)) * self.ls2
+        )
+        return hidden_states
+
+
+class _VisionEncoder(nn.Module):
+    def __init__(self, vision_config):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [_VisionEncoderLayer(vision_config) for _ in range(vision_config.num_hidden_layers)]
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor, output_hidden_states: bool = False
+    ) -> Tuple[torch.Tensor, Optional[list]]:
+        all_hidden_states = [] if output_hidden_states else None
+        for layer in self.layers:
+            hidden_states = layer(hidden_states)
+            if output_hidden_states:
+                all_hidden_states.append(hidden_states)
+        return hidden_states, all_hidden_states
+
+
+class _VisionModel(nn.Module):
+    """Skywork ViT vision encoder — eager only, never torch.export-ed."""
+
+    def __init__(self, vision_config):
+        super().__init__()
+        self.embeddings = _VisionEmbeddings(vision_config)
+        self.encoder = _VisionEncoder(vision_config)
+
+    def forward(
+        self, pixel_values: torch.Tensor, output_hidden_states: bool = False
+    ) -> Tuple[torch.Tensor, Optional[list]]:
+        hidden_states = self.embeddings(pixel_values)
+        return self.encoder(hidden_states, output_hidden_states=output_hidden_states)
+
 
 # ---------------------------------------------------------------------------
 # Model components (Qwen2-based LLM backbone)
@@ -337,9 +533,16 @@ class SkyworkR1V2LanguageModel(nn.Module):
 
 
 class SkyworkR1V2ForCausalLM(SkyworkR1V2PreTrainedModel, GenerationMixin):
-    """Skywork-R1V2 model for AutoDeploy (text-only, no vision tower).
+    """Skywork-R1V2 model for AutoDeploy.
+
+    When constructed with a full SkyworkChatConfig (runtime path), instantiates the
+    vision tower (vision_model.*) and MLP projector (mlp1.*) alongside the LLM backbone.
+    When constructed with a bare Qwen2Config (unit-test path), only the LLM is created.
 
     Weight hierarchy matches the HF checkpoint:
+      vision_model.embeddings.*
+      vision_model.encoder.layers.X.*
+      mlp1.{0,1,3}.{weight,bias}
       language_model.model.embed_tokens.weight
       language_model.model.layers.X.self_attn.{q,k,v}_proj.{weight,bias}
       language_model.model.layers.X.self_attn.o_proj.weight
@@ -348,7 +551,8 @@ class SkyworkR1V2ForCausalLM(SkyworkR1V2PreTrainedModel, GenerationMixin):
       language_model.model.norm.weight
       language_model.lm_head.weight
 
-    Vision weights (vision_model.*, mlp1.*) are silently skipped during loading.
+    AD exports only the LLM forward path (input_ids → logits).  The vision tower
+    runs in eager PyTorch and is not included in the torch.export graph.
     """
 
     def __init__(self, config, **kwargs):
@@ -358,6 +562,28 @@ class SkyworkR1V2ForCausalLM(SkyworkR1V2PreTrainedModel, GenerationMixin):
         # passed directly; the getattr fallback handles both cases.
         llm_config = getattr(config, "llm_config", config)
         self.language_model = SkyworkR1V2LanguageModel(llm_config)
+
+        # Vision tower — instantiated only when a full SkyworkChatConfig is provided.
+        # When a bare Qwen2Config is passed (unit tests), vision_config is absent and
+        # the vision components are skipped (only the LLM path is needed for AD export).
+        vision_config = getattr(config, "vision_config", None)
+        if vision_config is not None:
+            self.vision_model = _VisionModel(vision_config)
+            self._select_layer = getattr(config, "select_layer", _HF_DEFAULT_SELECT_LAYER)
+            self._downsample_ratio = getattr(
+                config, "downsample_ratio", _HF_DEFAULT_DOWNSAMPLE_RATIO
+            )
+            self._ps_version = getattr(config, "ps_version", _HF_DEFAULT_PS_VERSION)
+            scale = int(1 / self._downsample_ratio)
+            vit_hidden = vision_config.hidden_size
+            llm_hidden = llm_config.hidden_size
+            self.mlp1 = nn.Sequential(
+                nn.LayerNorm(vit_hidden * scale**2),
+                nn.Linear(vit_hidden * scale**2, llm_hidden),
+                nn.GELU(),
+                nn.Linear(llm_hidden, llm_hidden),
+            )
+
         self.post_init()
 
     def get_input_embeddings(self):
@@ -374,6 +600,34 @@ class SkyworkR1V2ForCausalLM(SkyworkR1V2PreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.language_model.model
+
+    def pixel_shuffle(self, x: torch.Tensor, scale_factor: float = 0.5) -> torch.Tensor:
+        n, w, h, c = x.size()
+        x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
+        x = x.permute(0, 2, 1, 3).contiguous()
+        x = x.view(
+            n,
+            int(h * scale_factor),
+            int(w * scale_factor),
+            int(c / (scale_factor * scale_factor)),
+        )
+        if self._ps_version != "v1":
+            x = x.permute(0, 2, 1, 3).contiguous()
+        return x
+
+    def extract_feature(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Run the vision tower + MLP projector; returns embeddings in LLM hidden space."""
+        if self._select_layer == -1:
+            vit_embeds, _ = self.vision_model(pixel_values)
+        else:
+            _, all_hidden = self.vision_model(pixel_values, output_hidden_states=True)
+            vit_embeds = all_hidden[self._select_layer]
+        vit_embeds = vit_embeds[:, 1:, :]  # strip CLS token
+        h = w = int(vit_embeds.shape[1] ** 0.5)
+        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
+        vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self._downsample_ratio)
+        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
+        return self.mlp1(vit_embeds)
 
     def forward(
         self,
@@ -392,8 +646,8 @@ class SkyworkR1V2ForCausalLM(SkyworkR1V2PreTrainedModel, GenerationMixin):
 
 
 # Register with AutoModelForCausalLMFactory.
-# The key must match type(config).__name__ for the config AutoDeploy loads from the checkpoint
-# ("SkyworkChatConfig").  Without this registration, AutoDeploy would fall through to
-# AutoModelForCausalLM.from_config which instantiates the full VLM (vision + LLM) that
-# cannot be exported.
+# The key must match type(config).__name__ for the config AD loads at runtime
+# ("SkyworkChatConfig").  Without this, AD falls through to
+# AutoModelForCausalLM.from_config which loads the full VLM — the HF vision
+# component imports 'timm' (not installed) and crashes before any export begins.
 AutoModelForCausalLMFactory.register_custom_model_cls("SkyworkChatConfig", SkyworkR1V2ForCausalLM)
