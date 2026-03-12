@@ -167,10 +167,13 @@ class _TrtllmMLAPlanner:
         self._cache_rows_per_block: int = 0
         self._flat_write_idx_dirty: bool = True
 
-        # Cached contiguous weight matrices (computed once per unique weight)
-        self._cached_weight_ptr: Optional[int] = None
-        self._cached_w_kn: Optional[torch.Tensor] = None
-        self._cached_w_v_t: Optional[torch.Tensor] = None
+        # Per-layer weight cache: dict[data_ptr → (w_kn, w_v_t)].
+        # Each layer has a different kv_b_proj_weight; caching by data_ptr
+        # ensures the .contiguous() materialisation runs only once (at warmup).
+        self._weight_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        # Pre-allocated V-projection output buffer (allocated in ensure_decode_buffers)
+        self.v_proj_output: Optional[torch.Tensor] = None
 
     def reset(self, device: torch.device, max_batch: int, max_blocks_per_seq: int) -> None:
         """One-time allocation of ALL persistent buffers."""
@@ -225,6 +228,7 @@ class _TrtllmMLAPlanner:
         num_kv_heads: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
+        v_head_dim: int,
         dtype: torch.dtype,
     ) -> None:
         """Allocate or grow decode-path scratch buffers (once, then reused).
@@ -270,6 +274,9 @@ class _TrtllmMLAPlanner:
         else:
             self.q_pe_padded_buf = None
         self.latent_cache_buf = torch.empty(max_tokens, gen_head_size, dtype=dtype, device=device)
+        self.v_proj_output = torch.empty(
+            max_tokens, num_heads, v_head_dim, dtype=dtype, device=device
+        )
 
     def get_weight_matrices(
         self,
@@ -279,17 +286,24 @@ class _TrtllmMLAPlanner:
         v_head_dim: int,
         kv_lora_rank: int,
     ):
-        """Return cached contiguous w_kn and w_v_t weight slices."""
+        """Return cached contiguous w_kn and w_v_t weight slices.
+
+        Uses a per-``data_ptr`` dict so every layer's weight is materialised
+        exactly once (at warmup) instead of every step.
+        """
         ptr = kv_b_proj_weight.data_ptr()
-        if self._cached_weight_ptr == ptr:
-            return self._cached_w_kn, self._cached_w_v_t
+        cached = self._weight_cache.get(ptr)
+        if cached is not None:
+            return cached
         weight_reshaped = kv_b_proj_weight.view(
             num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank
         )
-        self._cached_w_kn = weight_reshaped[:, :qk_nope_head_dim, :].contiguous()
-        self._cached_w_v_t = weight_reshaped[:, qk_nope_head_dim:, :].transpose(1, 2).contiguous()
-        self._cached_weight_ptr = ptr
-        return self._cached_w_kn, self._cached_w_v_t
+        # w_kn: [H, qk_nope_head_dim, kv_lora_rank] — used by bmm_out
+        w_kn = weight_reshaped[:, :qk_nope_head_dim, :].contiguous()
+        # w_v_t: [H, kv_lora_rank, v_head_dim] — used by bmm_out
+        w_v_t = weight_reshaped[:, qk_nope_head_dim:, :].transpose(1, 2).contiguous()
+        self._weight_cache[ptr] = (w_kn, w_v_t)
+        return w_kn, w_v_t
 
     def plan(
         self,
@@ -1110,8 +1124,10 @@ def _handle_decode(
 ) -> torch.Tensor:
     """Handle decode: weight absorption + latent-space attention + output projection.
 
-    Uses pre-allocated buffers from _GlobalTrtllmMLAPlanner, cached contiguous weight
-    matrices, and torch.cat to minimize GPU kernel launches.
+    Follows the PyTorch backend pattern: ``bmm_out`` writes the Q absorption
+    result directly into a pre-allocated ``fused_q`` slice (no intermediate
+    tensor, no ``torch.cat``), and the V projection also uses ``bmm_out`` into
+    a pre-allocated buffer.
 
     On SM100+ the FMHA MLA decode kernel requires a power-of-2 Q/KV head ratio.
     When ``num_heads / num_kv_heads`` is not a power of two (e.g. GLM-4.7-Flash
@@ -1127,23 +1143,25 @@ def _handle_decode(
         kv_b_proj_weight, num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank
     )
 
-    # q_nope_flat: [num_tokens, num_heads, qk_nope_head_dim]
-    # w_kn:        [num_heads, qk_nope_head_dim, kv_lora_rank]
-    # q_absorbed:  [num_tokens, num_heads, kv_lora_rank]
-    q_absorbed = torch.einsum("bnd,ndk->bnk", q_nope_flat, w_kn)
-
     # Build fused_q = [q_absorbed | q_pe] into pre-allocated buffer.
-    # Non-padding: single torch.cat kernel writes both halves at once.
-    # Padding (SM100): buffer was pre-zeroed at allocation so padding heads
-    # stay zero — only 2 slice-assign kernels, no per-step zero_().
+    # bmm_out writes q_absorbed directly into the left slice of fused_q,
+    # then q_pe is copied into the right slice — no torch.cat needed.
     fused_q_flat = planner.fused_q_flat[:num_tokens]
-    if needs_head_padding:
-        fused_q_view = fused_q_flat.view(num_tokens, padded_num_heads, gen_head_size)
-        fused_q_view[:, :num_heads, :kv_lora_rank] = q_absorbed
-        fused_q_view[:, :num_heads, kv_lora_rank:] = q_pe_flat
-    else:
-        fused_q_view = fused_q_flat.view(num_tokens, num_heads, gen_head_size)
-        torch.cat([q_absorbed, q_pe_flat], dim=-1, out=fused_q_view)
+    fused_q_view = fused_q_flat.view(
+        num_tokens,
+        padded_num_heads if needs_head_padding else num_heads,
+        gen_head_size,
+    )
+
+    # q_nope_flat: [T, H, D]  → transpose → [H, T, D]
+    # w_kn:        [H, D, K]
+    # target:      fused_q_view[:, :H, :K] transposed → [H, T, K]
+    q_nope_t = q_nope_flat.transpose(0, 1)
+    q_absorbed_target = fused_q_view[:, :num_heads, :kv_lora_rank].transpose(0, 1)
+    torch.ops.trtllm.bmm_out(q_nope_t, w_kn, q_absorbed_target)
+
+    # Copy q_pe into the rope portion of fused_q.
+    fused_q_view[:, :num_heads, kv_lora_rank:] = q_pe_flat
 
     # q_pe is also passed separately to thop.attention for MLA generation;
     # it must match the padded head count.  Padding buffer was pre-zeroed at
@@ -1196,15 +1214,21 @@ def _handle_decode(
         fmha_scheduler_counter=planner.fmha_scheduler_counter_decode,
     )
 
-    # Project from latent space back to v_head_dim.
-    # output_reshaped: [num_tokens, num_heads, kv_lora_rank]
-    # w_v_t:           [num_heads, kv_lora_rank, v_head_dim]
-    # output:          [num_tokens, num_heads, v_head_dim]
+    # Project from latent space back to v_head_dim using bmm_out into
+    # a pre-allocated buffer (matching the PT backend pattern).
+    # output_reshaped: [T, H, K] → transpose → [H, T, K]
+    # w_v_t:           [H, K, V]
+    # v_proj_out:      [T, H, V] → transpose → [H, T, V]
     output_reshaped = output_latent.view(num_tokens, padded_num_heads, kv_lora_rank)
     if needs_head_padding:
         output_reshaped = output_reshaped[:, :num_heads, :].contiguous()
-    output = torch.einsum("bnk,nkv->bnv", output_reshaped, w_v_t)
-    return output.reshape(num_tokens, num_heads * v_head_dim)
+    v_proj_out = planner.v_proj_output[:num_tokens]
+    torch.ops.trtllm.bmm_out(
+        output_reshaped.transpose(0, 1),
+        w_v_t,
+        v_proj_out.transpose(0, 1),
+    )
+    return v_proj_out.reshape(num_tokens, num_heads * v_head_dim)
 
 
 # =============================================================================
@@ -1302,6 +1326,7 @@ def trtllm_mla_with_cache(
             num_kv_heads,
             kv_lora_rank,
             qk_rope_head_dim,
+            v_head_dim,
             q_nope.dtype,
         )
 
