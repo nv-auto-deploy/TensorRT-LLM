@@ -1,5 +1,8 @@
+import logging
 from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional, Tuple, Union
+
+logger = logging.getLogger("postprocess_handlers")
 
 from tensorrt_llm.serve.responses_utils import ResponsesStreamingProcessor
 from tensorrt_llm.serve.responses_utils import \
@@ -159,6 +162,11 @@ def apply_tool_parser(args: ChatPostprocArgs, output_index: int, text: str,
     return normal_text, calls
 
 
+# Per-request debug counters for token_ids vs text tracking
+# key: request id, value: dict with counters
+_osl_debug_counters: dict[int, dict] = {}
+
+
 @nvtx_range_debug("chat_stream_post_processor")
 def chat_stream_post_processor(rsp: GenerationResultBase,
                                args: ChatPostprocArgs) -> List[str]:
@@ -211,7 +219,30 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         if finish_reason_sent[i]:
             continue
 
+        # --- OSL debug tracking ---
+        req_id = rsp.id
+        if req_id not in _osl_debug_counters:
+            _osl_debug_counters[req_id] = {
+                "total_iters": 0,
+                "empty_text_iters": 0,
+                "total_token_ids": 0,
+                "total_text_len": 0,
+                "skipped_iters": 0,
+            }
+        counters = _osl_debug_counters[req_id]
+        counters["total_iters"] += 1
+        n_new_token_ids = len(output.token_ids_diff)
+        counters["total_token_ids"] += n_new_token_ids
+        # --- end OSL debug tracking ---
+
         delta_text = output.text_diff
+
+        # --- OSL debug: track text length ---
+        if not delta_text:
+            counters["empty_text_iters"] += 1
+        else:
+            counters["total_text_len"] += len(delta_text)
+        # --- end ---
 
         delta_text, reasoning_delta_text = apply_reasoning_parser(
             args, i, delta_text, True)
@@ -258,6 +289,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                     reasoning_content=reasoning_delta_text,
                     tool_calls=tool_calls if tool_calls else None)
             else:
+                counters["skipped_iters"] += 1
                 continue
 
         choice = ChatCompletionResponseStreamChoice(
@@ -281,6 +313,20 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 choice.finish_reason = output.finish_reason
             choice.stop_reason = output.stop_reason
             finish_reason_sent[i] = True
+
+            # --- OSL debug: log per-request summary on finish ---
+            logger.warning(
+                "[OSL_DEBUG] req_id=%s finish_reason=%s stop_reason=%s "
+                "total_token_ids=%d total_text_len=%d output.length=%d "
+                "total_iters=%d empty_text_iters=%d skipped_iters=%d",
+                req_id, output.finish_reason, output.stop_reason,
+                counters["total_token_ids"], counters["total_text_len"],
+                output.length,
+                counters["total_iters"], counters["empty_text_iters"],
+                counters["skipped_iters"],
+            )
+            _osl_debug_counters.pop(req_id, None)
+            # --- end OSL debug ---
         chunk = ChatCompletionStreamResponse(choices=[choice], model=args.model)
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
