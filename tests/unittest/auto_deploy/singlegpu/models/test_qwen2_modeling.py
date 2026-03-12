@@ -223,11 +223,19 @@ def test_qwen2_attention_equivalence(B, S, dtype):
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
+    # Build causal mask so HF attention uses causal masking (matching our is_causal=True)
+    causal_mask = (
+        torch.triu(torch.full((S, S), float("-inf"), device=device, dtype=dtype), diagonal=1)
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .expand(B, 1, S, S)
+    )
+
     # Run HF attention
     hf_out, _ = hf_attn(
         hidden_states=x,
         position_embeddings=(hf_cos, hf_sin),
-        attention_mask=None,
+        attention_mask=causal_mask,
     )
 
     # Run custom attention
@@ -288,10 +296,18 @@ def test_qwen2_decoder_layer_equivalence(B, S, dtype):
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
+    # Build causal mask so HF attention uses causal masking (matching our is_causal=True)
+    causal_mask = (
+        torch.triu(torch.full((S, S), float("-inf"), device=device, dtype=dtype), diagonal=1)
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .expand(B, 1, S, S)
+    )
+
     # Run HF decoder layer
     hf_out = hf_layer(
         hidden_states=x,
-        attention_mask=None,
+        attention_mask=causal_mask,
         position_ids=position_ids,
         position_embeddings=(hf_cos, hf_sin),
     )
