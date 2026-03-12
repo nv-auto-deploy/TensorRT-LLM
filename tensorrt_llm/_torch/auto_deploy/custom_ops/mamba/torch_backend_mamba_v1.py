@@ -178,6 +178,7 @@ def _torch_cached_mamba_v1(
 
     seq_len_t = seq_len[:num_seq]
     slot_idx_t = slot_idx[:num_seq].to(torch.long)
+    use_initial_states_t = use_initial_states[:num_seq]
 
     # Squeeze head_dim=1 from cache: [max_bs, D_inner, 1, d_state] -> [max_bs, D_inner, d_state]
     cache_3d = ssm_state_cache.squeeze(2)
@@ -199,6 +200,12 @@ def _torch_cached_mamba_v1(
         return y.unsqueeze(1).to(hidden_states.dtype)  # [b, 1, D]
 
     # === Prefill (flattened sequences) ===
+    if any(use_initial_states_t[:num_prefill]):
+        raise ValueError(
+            "torch_mamba_v1 backend does not yet support chunked prefill "
+            "and cannot correctly handle initial states."
+        )
+
     bs = b * s
     hs_flat = hidden_states.reshape(bs, d_inner)
     B_flat = B.reshape(bs, B.shape[-1])

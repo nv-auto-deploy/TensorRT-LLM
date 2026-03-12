@@ -530,6 +530,7 @@ class JambaModel(JambaPreTrainedModel):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> JambaModelOutput:
+        assert position_ids is not None
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -561,6 +562,7 @@ class JambaForCausalLM(JambaPreTrainedModel, GenerationMixin):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> JambaCausalLMOutput:
+        assert position_ids is not None
         outputs = self.model(
             input_ids=input_ids, position_ids=position_ids, inputs_embeds=inputs_embeds
         )

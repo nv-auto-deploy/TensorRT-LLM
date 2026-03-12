@@ -39,6 +39,7 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_jamba import (
     JambaMambaDecoderLayer,
     JambaMambaMixer,
     JambaMLP,
+    JambaSparseMoeBlock,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
@@ -129,6 +130,18 @@ def _get_hf_mamba_decoder_layer():
         return None
 
 
+def _get_hf_sparse_moe_block():
+    """Get HF JambaSparseMoeBlock class."""
+    try:
+        from transformers.models.jamba.modeling_jamba import (
+            JambaSparseMoeBlock as HFJambaSparseMoeBlock,
+        )
+
+        return HFJambaSparseMoeBlock
+    except ImportError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Small config for testing
 # ---------------------------------------------------------------------------
@@ -174,6 +187,85 @@ def _create_small_config():
         tie_word_embeddings=True,
         initializer_range=0.02,
     )
+
+
+def _create_moe_config(num_experts=4):
+    """Create a small Jamba config with MoE enabled for testing JambaSparseMoeBlock.
+
+    3 layers: [mamba+MoE, attention+MoE, mamba+MoE]
+    (expert_layer_offset=0, expert_layer_period=1 -> all layers have MoE)
+    """
+    try:
+        from transformers.models.jamba.configuration_jamba import JambaConfig
+    except ImportError:
+        from tensorrt_llm._torch.auto_deploy.models.custom.modeling_jamba import JambaConfig
+
+    return JambaConfig(
+        vocab_size=1000,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        hidden_act="silu",
+        max_position_embeddings=512,
+        rms_norm_eps=1e-5,
+        num_experts=num_experts,
+        num_experts_per_tok=2,
+        expert_layer_offset=0,
+        expert_layer_period=1,
+        attn_layer_offset=1,
+        attn_layer_period=2,
+        attention_dropout=0.0,
+        mamba_d_state=8,
+        mamba_d_conv=4,
+        mamba_dt_rank=16,
+        mamba_expand=2,
+        mamba_proj_bias=False,
+        mamba_conv_bias=True,
+        use_mamba_kernels=False,
+        pad_token_id=0,
+        tie_word_embeddings=True,
+        initializer_range=0.02,
+    )
+
+
+def _create_hf_moe_config(num_experts=4):
+    """Create HF-compatible MoE config for equivalence tests."""
+    HFConfig = _get_jamba_config()
+    if HFConfig is None:
+        return None
+
+    config = HFConfig(
+        vocab_size=1000,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        hidden_act="silu",
+        max_position_embeddings=512,
+        rms_norm_eps=1e-5,
+        num_experts=num_experts,
+        num_experts_per_tok=2,
+        expert_layer_offset=0,
+        expert_layer_period=1,
+        attn_layer_offset=1,
+        attn_layer_period=2,
+        attention_dropout=0.0,
+        mamba_d_state=8,
+        mamba_d_conv=4,
+        mamba_dt_rank=16,
+        mamba_expand=2,
+        mamba_proj_bias=False,
+        mamba_conv_bias=True,
+        use_mamba_kernels=False,
+        pad_token_id=0,
+        tie_word_embeddings=True,
+        initializer_range=0.02,
+    )
+    config._attn_implementation = "eager"
+    return config
 
 
 def _create_hf_config():
@@ -394,6 +486,78 @@ def test_jamba_mamba_decoder_layer_equivalence(B, S, dtype):
     custom_out = custom_layer(x)
 
     assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.05, msg="Mamba decoder layer")
+
+
+# =========================================================================
+# Level 2b: MoE Block and Layer Equivalence
+# =========================================================================
+
+
+@pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@torch.no_grad()
+def test_jamba_sparse_moe_block_equivalence(B, S, dtype):
+    """Test sparse MoE block produces numerically close output to HF."""
+    HFMoeBlock = _get_hf_sparse_moe_block()
+    if HFMoeBlock is None:
+        pytest.skip("transformers doesn't have jamba model")
+
+    device = "cuda"
+    config = _create_moe_config(num_experts=4)
+    hf_config = _create_hf_moe_config(num_experts=4)
+    if hf_config is None:
+        pytest.skip("transformers doesn't have jamba model")
+
+    hf_moe = HFMoeBlock(hf_config)
+    hf_moe.to(device=device, dtype=dtype)
+    hf_moe.eval()
+
+    custom_moe = JambaSparseMoeBlock(config)
+    custom_moe.to(device=device, dtype=dtype)
+    custom_moe.load_state_dict(hf_moe.state_dict())
+    custom_moe.eval()
+
+    x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
+
+    # HF MoE returns (hidden_states, router_logits)
+    hf_out = hf_moe(x)[0]
+    custom_out = custom_moe(x)
+
+    assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.02, msg="Sparse MoE block")
+
+
+@pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@torch.no_grad()
+def test_jamba_mamba_moe_decoder_layer_equivalence(B, S, dtype):
+    """Test mamba decoder layer with MoE feed-forward against HF."""
+    HFLayer = _get_hf_mamba_decoder_layer()
+    if HFLayer is None:
+        pytest.skip("transformers doesn't have jamba model")
+
+    device = "cuda"
+    config = _create_moe_config(num_experts=4)
+    hf_config = _create_hf_moe_config(num_experts=4)
+    if hf_config is None:
+        pytest.skip("transformers doesn't have jamba model")
+    hf_config.use_mamba_kernels = False
+
+    # Layer 0 is mamba+MoE in the MoE config (expert_layer_offset=0, expert_layer_period=1)
+    hf_layer = HFLayer(hf_config, layer_idx=0)
+    hf_layer.to(device=device, dtype=dtype)
+    hf_layer.eval()
+
+    custom_layer = JambaMambaDecoderLayer(config, layer_idx=0)
+    custom_layer.to(device=device, dtype=dtype)
+    custom_layer.load_state_dict(hf_layer.state_dict())
+    custom_layer.eval()
+
+    x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
+
+    hf_out = hf_layer(x)[0]
+    custom_out = custom_layer(x)
+
+    assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.05, msg="Mamba+MoE decoder layer")
 
 
 # =========================================================================

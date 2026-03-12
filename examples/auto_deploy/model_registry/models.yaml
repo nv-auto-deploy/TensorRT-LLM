@@ -275,8 +275,6 @@ models:
 - name: ibm-granite/granite-4.0-h-small
   yaml_extra: ['granite_4.0_h_small.yaml']
 # --- AI21 Jamba (2025) - hybrid SSM-Transformer ---
-- name: ai21labs/AI21-Jamba-Large-1.7
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: ai21labs/AI21-Jamba-Reasoning-3B
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'jamba_reasoning_3b.yaml']
 - name: ai21labs/AI21-Jamba-Mini-1.5
