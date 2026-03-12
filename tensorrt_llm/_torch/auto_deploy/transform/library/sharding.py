@@ -3430,9 +3430,7 @@ def _apply_hint_linear(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) 
         return 0
 
     weight_node = node.args[1]
-    weight_attrs = (
-        [weight_node] if weight_node.op == "get_attr" else get_source_nodes(weight_node)
-    )
+    weight_attrs = [weight_node] if weight_node.op == "get_attr" else get_source_nodes(weight_node)
     if not weight_attrs:
         ad_logger.warning(f"apply_sharding_hints: no weight param found for {node}")
         return 0
@@ -3455,14 +3453,13 @@ def _apply_hint_linear(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) 
             fused_weight_dims=fused,
         )
 
-    _shard_quantized_scales(gm, node, weight_attrs, original_weight_shape, dim, tp_rank, tp_size,
-                            min_shape, fused)
+    _shard_quantized_scales(
+        gm, node, weight_attrs, original_weight_shape, dim, tp_rank, tp_size, min_shape, fused
+    )
 
     bias_node = node.args[2] if len(node.args) > 2 else None
     if bias_node is not None and isinstance(bias_node, Node) and tp_mode == "colwise":
-        bias_attrs = (
-            [bias_node] if bias_node.op == "get_attr" else get_source_nodes(bias_node)
-        )
+        bias_attrs = [bias_node] if bias_node.op == "get_attr" else get_source_nodes(bias_node)
         for attr_node in bias_attrs:
             if attr_node.op == "get_attr":
                 bias_key, bias = _get_weight_param(gm, attr_node)
@@ -3612,9 +3609,7 @@ def _apply_hint_norm(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) ->
     return 0
 
 
-def _apply_hint_moe(
-    gm: GraphModule, node: Node, config: "ShardingTransformConfig"
-) -> int:
+def _apply_hint_moe(gm: GraphModule, node: Node, config: "ShardingTransformConfig") -> int:
     """Process MoE ops: EP weight partitioning, expert ID localization, mapping injection.
 
     Handles both list-based ops (torch_moe, torch_quant_*_moe) and stacked-tensor
@@ -3797,7 +3792,7 @@ class ApplyShardingHints(BaseTransform):
 
         ad_logger.info(
             f"apply_sharding_hints: tp_size={tp_size}, tp_rank={tp_rank}, "
-            f"ep_size={dc.moe_ep_size}, strategy={ar_strategy}"
+            f"moe grid: [ep x tp] = [{dc.moe_ep_size} x {dc.moe_tp_size}], strategy={ar_strategy}"
         )
 
         if cm and cm.info:
@@ -3810,7 +3805,9 @@ class ApplyShardingHints(BaseTransform):
 
         if config.simple_shard_only:
             num_updates = _apply_simple_shard(gm, tp_rank, tp_size, ar_strategy)
-            ad_logger.info(f"apply_sharding_hints (simple_shard_only): {num_updates} nodes processed")
+            ad_logger.info(
+                f"apply_sharding_hints (simple_shard_only): {num_updates} nodes processed"
+            )
         else:
             if enable_attention_dp:
                 # If enable_attention_dp is True, only MoE is sharded.
@@ -3822,7 +3819,9 @@ class ApplyShardingHints(BaseTransform):
                     ShardableOp.LINEAR: lambda n: _apply_hint_linear(gm, n, tp_rank, tp_size),
                     ShardableOp.VIEW: lambda n: _apply_hint_view(gm, n, tp_size),
                     ShardableOp.SPLIT_WITH_SIZES: lambda n: _apply_hint_split(gm, n, tp_size),
-                    ShardableOp.ALL_REDUCE: lambda n: _apply_hint_all_reduce(gm, n, tp_size, ar_strategy),
+                    ShardableOp.ALL_REDUCE: lambda n: _apply_hint_all_reduce(
+                        gm, n, tp_size, ar_strategy
+                    ),
                     ShardableOp.CONV1D: lambda n: _apply_hint_conv1d(gm, n, tp_rank, tp_size),
                     ShardableOp.SSM: lambda n: _apply_hint_ssm(gm, n, tp_rank, tp_size),
                     ShardableOp.NORM: lambda n: _apply_hint_norm(gm, n, tp_rank, tp_size),

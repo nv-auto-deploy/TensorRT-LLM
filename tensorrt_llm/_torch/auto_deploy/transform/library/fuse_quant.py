@@ -218,13 +218,7 @@ def _register_quant_fp4_linear_patterns(patterns: ADPatternMatcherPass) -> None:
     cutlass_vec = torch.randint(0, 255, (cutlass_len,), device="meta", dtype=torch.uint8)
 
     # no-bias variant
-    dummy_args_fp4_1 = [
-        x_fp4,
-        w_fp4,
-        s_in2,
-        cutlass_vec,
-        alpha,
-    ]
+    dummy_args_fp4_1 = [x_fp4, w_fp4, s_in2, cutlass_vec, alpha]
     register_ad_pattern(
         search_fn=_fp4_ref_pattern_1,
         replace_fn=_fp4_ref_repl_1,
@@ -236,7 +230,7 @@ def _register_quant_fp4_linear_patterns(patterns: ADPatternMatcherPass) -> None:
     dummy_args_fp4_2 = [
         x_fp4,
         w_fp4,
-        torch.randn(N, device="meta", dtype=torch.float16),  # bias
+        torch.randn(N, device="meta", dtype=torch.float16),
         s_in2,
         cutlass_vec,
         alpha,
@@ -306,6 +300,40 @@ class FuseNVFP4LinearConfig(TransformConfig):
     )
 
 
+_SHARDING_HINT_NAMES = frozenset({"tp_mode", "output_sizes", "tp_min_local_shape"})
+
+
+def _strip_sharding_hints(gm: GraphModule) -> None:
+    """Remove sharding hint args from quantized op nodes before pattern matching.
+
+    Sharding hints (tp_mode, output_sizes, tp_min_local_shape) are graph-level
+    metadata consumed by apply_sharding_hints. They are not part of the
+    canonical op signatures used by the fake→real fusion patterns and must be
+    stripped so the pattern matcher can recognise the standard call shape.
+
+    These hints are positional args (not kwarg_only) appended after the 7
+    canonical arguments of torch_fake_quant_nvfp4_linear.
+    """
+    _NVFP4_CANONICAL_NARGS = (
+        7  # input, weight, bias, input_scale, weight_scale, input_zp, weight_zp
+    )
+
+    for node in gm.graph.nodes:
+        if node.op != "call_function":
+            continue
+        if node.target in (
+            torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear.default,
+            torch.ops.auto_deploy.torch_fake_quant_fp8_linear.default,
+        ):
+            if len(node.args) > _NVFP4_CANONICAL_NARGS:
+                node.args = node.args[:_NVFP4_CANONICAL_NARGS]
+        if node.kwargs:
+            if _SHARDING_HINT_NAMES & node.kwargs.keys():
+                node.kwargs = {
+                    k: v for k, v in node.kwargs.items() if k not in _SHARDING_HINT_NAMES
+                }
+
+
 @TransformRegistry.register("fuse_nvfp4_linear")
 class FuseNVFP4Linear(BaseTransform):
     """Matches and replaces NVFP4 fake quantized linear ops with fused TensorRT-LLM ops."""
@@ -325,6 +353,8 @@ class FuseNVFP4Linear(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         if self.config.backend.lower() != "trtllm":
             raise ValueError(f"Unsupported NVFP4 backend: {self.config.backend}")
+
+        _strip_sharding_hints(gm)
 
         patterns = ADPatternMatcherPass()
         _register_quant_fp4_linear_patterns(patterns)

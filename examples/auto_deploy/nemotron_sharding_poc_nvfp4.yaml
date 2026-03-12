@@ -8,8 +8,10 @@ args:
   enable_chunked_prefill: true
   attn_backend: trtllm
   model_factory: AutoModelForCausalLM
-  skip_loading_weights: false
+  # skip_loading_weights: true
   cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]
+  # model_kwargs:
+  #   num_hidden_layers: 8
   kv_cache_config:
     free_gpu_memory_fraction: 0.88
     # tunable mamba cache dtype
@@ -26,6 +28,9 @@ args:
       stage: sharding
       enabled: true
       run_shape_prop: true
+      enable_attention_dp: false
+      dist_mapping: {'tp': 8, 'moe_ep': 4, 'moe_tp': 2}
+      simple_shard_only: false
       allreduce_strategy: NCCL
     multi_stream_moe:
       stage: compile
