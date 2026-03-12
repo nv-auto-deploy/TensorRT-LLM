@@ -3529,6 +3529,57 @@ def _apply_hint_ssm(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> 
     return 1 if count > 0 else 0
 
 
+_GDN_ELEMENTWISE_OPS = {
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.mul.Scalar,
+    torch.ops.aten.neg.default,
+    torch.ops.aten.exp.default,
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.to.dtype,
+    torch.ops.aten.sigmoid.default,
+    torch.ops.aten.softplus.default,
+    torch.ops.prims.convert_element_type.default,
+}
+
+
+def _apply_hint_gdn(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> int:
+    """Process GatedDeltaNet: shard A_log, dt_bias parameters along head dim.
+
+    Follows the same pattern as _apply_hint_ssm: extract specific named args
+    (g, beta) that carry parameters, then traverse backward through elementwise
+    ops only to find A_log and dt_bias get_attr nodes.
+    """
+    [shardable] = extract_op_args(node, "shardable")
+    if not shardable:
+        return 0
+
+    count = 0
+    for arg_name in ("g", "beta"):
+        [arg_node] = extract_op_args(node, arg_name)
+        if not isinstance(arg_node, Node):
+            continue
+        for attr_node in get_source_nodes(arg_node, allowed_ops=_GDN_ELEMENTWISE_OPS):
+            pk = attr_node.target
+            try:
+                w = gm.get_parameter(pk)
+            except AttributeError:
+                continue
+            if w.ndim != 1:
+                continue
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=w,
+                param_key=pk,
+                dim=0,
+                rank=tp_rank,
+                world_size=tp_size,
+            )
+            count += 1
+
+    ad_logger.debug(f"  sharded GDN params ({count} tensors)")
+    return 1 if count > 0 else 0
+
+
 def _apply_hint_norm(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> int:
     """Process gated RMS norm: shard weight parameter."""
     [tp_mode] = extract_op_args(node, "tp_mode")
@@ -3766,6 +3817,7 @@ class ApplyShardingHints(BaseTransform):
                     ),
                     ShardableOp.CONV1D: lambda n: _apply_hint_conv1d(gm, n, tp_rank, tp_size),
                     ShardableOp.SSM: lambda n: _apply_hint_ssm(gm, n, tp_rank, tp_size),
+                    ShardableOp.GATED_DELTA: lambda n: _apply_hint_gdn(gm, n, tp_rank, tp_size),
                     ShardableOp.NORM: lambda n: _apply_hint_norm(gm, n, tp_rank, tp_size),
                     ShardableOp.MOE: lambda n: _apply_hint_moe(gm, n, config),
                 }

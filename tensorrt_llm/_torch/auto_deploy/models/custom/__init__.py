@@ -5,6 +5,10 @@ from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreT
 from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration
 from .new_sharding.modeling_nemotron_h import NemotronHForCausalLM  # noqa: F811
+from .new_sharding.modeling_qwen3_5_moe import (  # noqa: F811
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
+)
 
 __all__ = (
     "DeepSeekV3ForCausalLM",

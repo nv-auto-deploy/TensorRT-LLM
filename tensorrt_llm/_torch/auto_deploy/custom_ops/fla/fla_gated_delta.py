@@ -139,6 +139,7 @@ def torch_gated_delta_rule(
     g: torch.Tensor,
     beta: torch.Tensor,
     scale: Optional[float] = None,
+    shardable: bool = False,
 ) -> torch.Tensor:
     """Gated Delta Rule custom op for linear attention (torch reference implementation).
 
@@ -151,6 +152,8 @@ def torch_gated_delta_rule(
         g:    [B, S, H]    - gating/decay values
         beta: [B, S, H]    - beta scaling values
         scale: optional query scaling factor (defaults to K^-0.5)
+        shardable: if True, apply_sharding_hints will shard parameter ancestors
+                   (A_log, dt_bias) along the head dimension.
 
     Returns:
         output: [B, S, H, V]
@@ -176,5 +179,6 @@ def torch_gated_delta_rule_fake(
     g: torch.Tensor,
     beta: torch.Tensor,
     scale: Optional[float] = None,
+    shardable: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(v)
