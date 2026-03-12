@@ -1253,9 +1253,11 @@ def _handle_fused_rope_decode(
 
     output_latent = planner.output_latent[:num_tokens]
 
-    # thop.attention with update_kv_cache=False: cache already written by
-    # mla_rope_generation, and rotary_embedding_dim=0 ensures the C++ kernel
-    # skips its internal mlaRopeGeneration.
+    # thop.attention with update_kv_cache=True (required by C++ assertion).
+    # mla_rope_generation already wrote the cache, so thop.attention will
+    # overwrite with the same data — a benign double-write.  The benefit is
+    # that mla_rope_generation fuses RoPE + q_pe copy + scheduler fill into
+    # a single kernel, eliminating 3 separate kernel launches.
     _call_thop_attention_mla(
         fused_q_flat,
         None,
@@ -1289,7 +1291,6 @@ def _handle_fused_rope_decode(
         cu_q_seqlens=cu_q,
         cu_kv_seqlens=cu_kv,
         fmha_scheduler_counter=planner.fmha_scheduler_counter_decode,
-        update_kv_cache=False,
     )
 
     # V projection

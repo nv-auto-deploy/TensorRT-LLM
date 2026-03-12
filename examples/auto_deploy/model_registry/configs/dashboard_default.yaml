@@ -9,7 +9,7 @@ max_seq_len: 512
 transforms:
   insert_cached_mla_attention:
     stage: cache_init
-    backend: flashinfer_mla
+    backend: trtllm_mla
   fuse_rope_into_trtllm_mla:
     stage: cache_init
     enabled: true
