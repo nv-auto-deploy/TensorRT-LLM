@@ -94,7 +94,7 @@ Available canonical ops (see `tensorrt_llm/_torch/auto_deploy/custom_ops/README.
 1. Bottom of model file: `AutoModelForCausalLMFactory.register_custom_model_cls("ConfigClassName", ForCausalLM)`.
 2. Add import + `__all__` entry in `models/custom/__init__.py`.
 3. **Prefer reusing the existing config class** — if the config can be loaded via `AutoConfig.from_pretrained(model_id)` (either from the installed `transformers` or from files in the HF cache downloaded in Phase 0), import it from `transformers` and use it directly. Do NOT recreate or copy the config class into the modeling file when it is already available. Note: AD's factory already calls `AutoConfig.from_pretrained(model_id, trust_remote_code=True)` and passes the result to your model, so you rarely need to import the config at all — if you find yourself doing so, sanity-check that it's genuinely needed (e.g. for `config_class` or type annotations).
-4. Only if the config is truly not available (not in `transformers` and not bundled with the checkpoint), define a minimal config class in the modeling file and `AutoConfig.register(model_type, ConfigCls, exist_ok=True)`.
+4. Only if the config is truly not available (not in `transformers` and not bundled with the checkpoint), define a minimal config class in the modeling file and `AutoConfig.register(model_type, ConfigCls, exist_ok=True)`. A good sanity check: if the E2E test passes without a custom config class, you don't need one — `AutoConfig.from_pretrained` already picked up the right class.
 
 ## Phase 5 — Model Input Contract
 The custom model's forward signature must follow these rules:
