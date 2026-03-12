@@ -1104,32 +1104,41 @@ def _apply_rope_from_table(
     positions: torch.Tensor,
     qk_rope_head_dim: int,
 ) -> tuple:
-    """Apply NeoX-style RoPE using a flat interleaved cos/sin table.
+    """Apply GPTJ-style (interleaved) RoPE using a flat cos/sin table.
+
+    The fuse_rope_into_trtllm_mla transform reverses the AD weight
+    de-interleaving at compile time, so q_pe / kpe arrive in GPTJ
+    (interleaved) layout at runtime.  This function applies GPTJ rotation
+    (pairing adjacent elements (2j, 2j+1)) to match the mla_rope_generation
+    decode kernel, ensuring prefill and decode produce consistent cache data.
 
     Args:
-        q_pe: [T, H, D] pre-RoPE query positional component.
-        kpe: [T, D] pre-RoPE key positional encoding.
-        rotary_cos_sin: [1, max_pos * D * 2] flat float32 table.
+        q_pe: [T, H, D] pre-RoPE query positional component (GPTJ layout).
+        kpe: [T, D] pre-RoPE key positional encoding (GPTJ layout).
+        rotary_cos_sin: [1, max_pos * D * 2] flat float32 table with
+            D float2 (cos, sin) entries per position.
         positions: [T] int position IDs for each token.
         qk_rope_head_dim: D, the RoPE head dimension.
 
     Returns:
-        (q_pe_rotated, kpe_rotated) with RoPE applied.
+        (q_pe_rotated, kpe_rotated) with GPTJ RoPE applied.
     """
     table = rotary_cos_sin.view(-1, qk_rope_head_dim, 2)
-    cos = table[positions.long(), :, 0].to(q_pe.dtype)  # [T, D]
-    sin = table[positions.long(), :, 1].to(q_pe.dtype)  # [T, D]
-
-    cos_q = cos.unsqueeze(1)  # [T, 1, D]
-    sin_q = sin.unsqueeze(1)  # [T, 1, D]
     half = qk_rope_head_dim // 2
-    q1, q2 = q_pe[..., :half], q_pe[..., half:]
-    q_pe_rot = torch.cat([-q2, q1], dim=-1)
-    q_pe_rotated = q_pe * cos_q + q_pe_rot * sin_q
+    cos_half = table[positions.long(), :half, 0].to(q_pe.dtype)  # [T, D/2]
+    sin_half = table[positions.long(), :half, 1].to(q_pe.dtype)  # [T, D/2]
 
-    k1, k2 = kpe[..., :half], kpe[..., half:]
-    k_rot = torch.cat([-k2, k1], dim=-1)
-    kpe_rotated = kpe * cos + k_rot * sin
+    def _rotate_interleaved(x, cos_h, sin_h):
+        pairs = x.unflatten(-1, (-1, 2))  # [..., D/2, 2]
+        even, odd = pairs[..., 0], pairs[..., 1]
+        r_even = even * cos_h - odd * sin_h
+        r_odd = even * sin_h + odd * cos_h
+        return torch.stack([r_even, r_odd], dim=-1).flatten(-2)
+
+    cos_q = cos_half.unsqueeze(1)  # [T, 1, D/2]
+    sin_q = sin_half.unsqueeze(1)  # [T, 1, D/2]
+    q_pe_rotated = _rotate_interleaved(q_pe, cos_q, sin_q)
+    kpe_rotated = _rotate_interleaved(kpe, cos_half, sin_half)
 
     return q_pe_rotated, kpe_rotated
 
@@ -1171,6 +1180,10 @@ def _handle_fused_rope_decode(
     Replaces _handle_decode's 3 separate kernels (q_pe copy, cache write,
     scheduler fill) with a single ``mla_rope_generation`` call, then runs
     the same Q absorption + thop.attention + V projection pipeline.
+
+    Note: thop.attention with update_kv_cache=True also writes the cache
+    (required by C++ assertion), so the cache is written twice.  This benign
+    double-write is cheaper than the alternative of separate Python kernels.
     """
     planner = _GlobalTrtllmMLAPlanner
     gen_head_size = kv_lora_rank + qk_rope_head_dim
@@ -1207,7 +1220,6 @@ def _handle_fused_rope_decode(
     else:
         q_pe_for_kernel = q_pe_flat
 
-    # fused_q_3d for mla_rope_generation: [T, padded_H, gen_head_size]
     fused_q_3d = fused_q_view
 
     torch.ops.trtllm.mla_rope_generation(
@@ -1253,11 +1265,6 @@ def _handle_fused_rope_decode(
 
     output_latent = planner.output_latent[:num_tokens]
 
-    # thop.attention with update_kv_cache=True (required by C++ assertion).
-    # mla_rope_generation already wrote the cache, so thop.attention will
-    # overwrite with the same data — a benign double-write.  The benefit is
-    # that mla_rope_generation fuses RoPE + q_pe copy + scheduler fill into
-    # a single kernel, eliminating 3 separate kernel launches.
     _call_thop_attention_mla(
         fused_q_flat,
         None,
