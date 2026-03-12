@@ -28,12 +28,21 @@ Read the actual source code for each check. Cite `file:line_number` for every PA
 | # | Check | How to verify |
 |---|-------|---------------|
 | B1 | No imports from other AD custom models (`from .modeling_*`) | Grep for `from .modeling_` — only `from .` imports of non-model utilities are OK (e.g., `mla_rope_utils`) |
-| B2 | Config class is imported from `transformers` whenever possible — NOT recreated/copied into the modeling file when it already exists in transformers or is bundled with the checkpoint | Check where the config class comes from. If a `from transformers import ...Config` would work, the file should use it. A locally-defined config class when one is available in `transformers` is a FAIL. |
+| B2 | Config class is imported from `transformers` whenever possible — NOT recreated/copied into the modeling file when it already exists in transformers or is bundled with the checkpoint | Check where the config class comes from. If a `from transformers import ...Config` would work, the file should use it. A locally-defined config class when one is available in `transformers` is a FAIL. A custom config class is only justified when: (a) the config does not exist in `transformers` and cannot be loaded via `AutoConfig.from_pretrained` (e.g., a speculative-decoding draft model like Eagle whose config has no upstream HF class), or (b) the model code requires config attributes not present in the checkpoint's `config.json` and not available in the standard HF class. Both conditions must be confirmed; if neither applies, the custom class is a FAIL. |
 | B3 | If config is truly unavailable (not in `transformers`, not in checkpoint), file defines a minimal config class and calls `AutoConfig.register()` | Grep for `AutoConfig.register` — should only exist when the config is genuinely missing from transformers |
 
 ### BA Checkpoint compatibility
 | BA1 | Make sure the custom modeling code nn.module hierarchy matches the model hierarchy that is expected in the checkpoint safetensor json. |
 | BA2 | If our modeling code has expert-list style moe experts and the checkpoint has fused moe experts, add a load hook to load the safetensors correctly into our expert list weights.
+
+### BB. Vision / Multi-Modal Support
+
+| # | Check | How to verify |
+|---|-------|---------------|
+| BB1 | If the model has a vision tower (multi-modal), the full `nn.Module` hierarchy for the vision component is present in the modeling file — it is NOT omitted, stubbed out, or replaced with a `pass` body | Grep for vision-related class names (e.g., `VisionTower`, `ViT`, `CLIPVision`, `SiglipVision`) from the HF source. If the model is multi-modal and none appear, flag as FAIL. |
+| BB3 | The test file asserts that vision-related weight keys are present in the model's `state_dict` after `load_state_dict` | Grep the test file for assertions on vision weight key names (or a check that vision-prefixed keys are in the loaded state_dict). Absence of any such assertion is a FAIL for multi-modal models. |
+
+Note: BB1–BB3 only apply if the HF source indicates the model is multi-modal (has image/audio inputs). Mark N/A with justification for pure language models.
 
 ### C. Ops & Compatibility (STRICT — canonical ops are the backbone of AD)
 
@@ -76,7 +85,7 @@ Mark as N/A with justification if the model doesn't have the relevant component.
 | F1 | Uses small config (hidden_size ~64, num_hidden_layers 2-3, vocab_size ~1000) | Read the test config creation |
 | F2 | No smoke tests — every test has meaningful assertions (`assert_close`, `assert_rmse_close`, shape checks, finiteness checks) | Check each test for substantive assertions |
 | F3 | Do not rely on only `isnan`/`isinf` checks; include functional equivalence assertions | Check tests use `assert_close` or `assert_rmse_close` against reference outputs |
-| F4 | Test imports must be self-contained (transformers imports or copied reference classes only); no hardcoded local/temp path imports | Inspect imports and helper loaders |
+| F4 | Test imports must be self-contained (transformers imports or HF cache imports only); no hardcoded local/temp path imports. HF reference classes must be imported from actual HF source — either from `transformers` directly, or from the HF cache via `importlib`/`sys.path`. **No standalone class definitions** that mirror the model architecture (e.g., hand-written `HFAttention`, `HFDecoderLayer`, `RefModel`). Such definitions are effectively a second AD IR and cannot catch bugs shared between both implementations. If any class is defined in the test file that replicates model architecture, flag as FAIL. | Inspect all class definitions and imports in the test file. |
 
 ### G. Test File — Hierarchical Levels
 
