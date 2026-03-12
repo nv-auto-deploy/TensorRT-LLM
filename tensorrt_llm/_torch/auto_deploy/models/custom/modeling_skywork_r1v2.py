@@ -524,9 +524,9 @@ class SkyworkR1V2LanguageModel(nn.Module):
 class SkyworkR1V2ForConditionalGeneration(PreTrainedModel, GenerationMixin):
     """Skywork-R1V2 model for AutoDeploy.
 
-    When constructed with a full SkyworkChatConfig (runtime path), instantiates the
-    vision tower (vision_model.*) and MLP projector (mlp1.*) alongside the LLM backbone.
-    When constructed with a bare Qwen2Config (unit-test path), only the LLM is created.
+    Always constructed with a SkyworkChatConfig (loaded via trust_remote_code by AD),
+    which includes a nested llm_config (Qwen2Config) for the LLM backbone and a
+    vision_config for the vision tower.
 
     Weight hierarchy matches the HF checkpoint:
       vision_model.embeddings.*
@@ -562,15 +562,11 @@ class SkyworkR1V2ForConditionalGeneration(PreTrainedModel, GenerationMixin):
 
     def __init__(self, config, **kwargs):
         super().__init__(config)
-        # At runtime, config is a SkyworkChatConfig (loaded via trust_remote_code by AD)
-        # with a nested llm_config (Qwen2Config).  In unit tests, a Qwen2Config can be
-        # passed directly; the getattr fallback handles both cases.
+        # config is a SkyworkChatConfig with a nested llm_config (Qwen2Config).
         llm_config = getattr(config, "llm_config", config)
         self.language_model = SkyworkR1V2LanguageModel(llm_config)
 
-        # Vision tower — instantiated only when a full SkyworkChatConfig is provided.
-        # When a bare Qwen2Config is passed (unit tests), vision_config is absent and
-        # the vision components are skipped (only the LLM path is needed for AD export).
+        # Vision tower — only present when config includes a vision_config.
         vision_config = getattr(config, "vision_config", None)
         if vision_config is not None:
             self.vision_model = VisionModel(vision_config)
