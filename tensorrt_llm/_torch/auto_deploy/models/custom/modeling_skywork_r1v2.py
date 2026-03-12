@@ -51,11 +51,16 @@ from transformers.utils import ModelOutput
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 
 # ---------------------------------------------------------------------------
-# Defaults from configuration_skywork_chat.py (HuggingFace source)
+# Defaults from HuggingFace source (configuration_skywork_chat.py /
+# configuration_skywork_vit.py in the checkpoint's remote code)
 # ---------------------------------------------------------------------------
 _HF_DEFAULT_SELECT_LAYER: int = -1  # use last ViT layer output
 _HF_DEFAULT_DOWNSAMPLE_RATIO: float = 0.5  # pixel-shuffle spatial compression
 _HF_DEFAULT_PS_VERSION: str = "v1"  # pixel-shuffle version
+_HF_DEFAULT_NORM_TYPE: str = "rms_norm"  # vision encoder norm (SkyworkVisionConfig.norm_type)
+_HF_DEFAULT_INITIALIZER_FACTOR: float = (
+    0.1  # layer-scale init (SkyworkVisionConfig.initializer_factor)
+)
 
 # ---------------------------------------------------------------------------
 # Vision tower components (eager PyTorch, never exported)
@@ -183,7 +188,7 @@ class _VisionEncoderLayer(nn.Module):
     def __init__(self, vision_config):
         super().__init__()
         self.embed_dim = vision_config.hidden_size
-        norm_type = getattr(vision_config, "norm_type", "rms_norm")
+        norm_type = getattr(vision_config, "norm_type", _HF_DEFAULT_NORM_TYPE)
         eps = vision_config.layer_norm_eps
         if norm_type == "rms_norm":
             self.norm1 = _VisionRMSNorm(self.embed_dim, eps=eps)
@@ -195,7 +200,9 @@ class _VisionEncoderLayer(nn.Module):
         self.attn = _VisionAttention(vision_config)
         self.mlp = _VisionMLP(vision_config)
 
-        initializer_factor = getattr(vision_config, "initializer_factor", 0.1)
+        initializer_factor = getattr(
+            vision_config, "initializer_factor", _HF_DEFAULT_INITIALIZER_FACTOR
+        )
         self.ls1 = nn.Parameter(initializer_factor * torch.ones(self.embed_dim))
         self.ls2 = nn.Parameter(initializer_factor * torch.ones(self.embed_dim))
         # DropPath is for training only; at inference it is always identity.
