@@ -1,4 +1,5 @@
 from .modeling_deepseek import DeepSeekV3ForCausalLM
+from .modeling_gemma3n import Gemma3nForCausalLM, Gemma3nForConditionalGeneration
 from .modeling_glm4_moe_lite import Glm4MoeLiteForCausalLM
 from .modeling_kimi_k2 import KimiK2ForCausalLM, KimiK25ForConditionalGeneration
 from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreTrainedTokenizerFast
@@ -7,6 +8,8 @@ from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditiona
 
 __all__ = (
     "DeepSeekV3ForCausalLM",
+    "Gemma3nForCausalLM",
+    "Gemma3nForConditionalGeneration",
     "Glm4MoeLiteForCausalLM",
     "KimiK2ForCausalLM",
     "KimiK25ForConditionalGeneration",
