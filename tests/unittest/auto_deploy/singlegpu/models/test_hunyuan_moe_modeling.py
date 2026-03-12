@@ -34,12 +34,12 @@ import torch.nn.functional as F
 from _model_test_utils import assert_rmse_close
 from torch import nn
 from torch.export import Dim
+from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_hunyuan_moe import (
     HunYuanMoEAttention,
-    HunYuanMoEConfig,
     HunYuanMoEDecoderLayer,
     HunYuanMoEForCausalLM,
     HunYuanMoEMLP,
@@ -396,8 +396,8 @@ _NUM_EXPERTS = 4
 _TOPK = 2
 
 
-def _create_small_custom_config() -> HunYuanMoEConfig:
-    return HunYuanMoEConfig(
+def _create_small_custom_config() -> PretrainedConfig:
+    return PretrainedConfig(
         vocab_size=1000,
         hidden_size=64,
         intermediate_size=32,
@@ -423,7 +423,7 @@ def _create_small_custom_config() -> HunYuanMoEConfig:
     )
 
 
-def _hf_config_from_custom(cfg: HunYuanMoEConfig):
+def _hf_config_from_custom(cfg: PretrainedConfig):
     """Return a namespace-like config usable by HF reference classes."""
 
     class _Cfg:
@@ -720,10 +720,9 @@ def test_model_can_be_exported(device):
 
 
 def test_config_registration():
-    """Bundled config is registered and factory knows the model class."""
+    """Factory knows the model class under the real HF config name."""
     from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 
-    assert "HunYuanMoEConfig" in AutoModelForCausalLMFactory._custom_model_mapping
     assert "HunYuanConfig" in AutoModelForCausalLMFactory._custom_model_mapping
 
 

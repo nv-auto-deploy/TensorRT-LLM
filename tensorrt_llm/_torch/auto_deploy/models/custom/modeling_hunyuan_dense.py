@@ -37,78 +37,12 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import AutoConfig, PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-
-
-class HunYuanDenseConfig(PretrainedConfig):
-    """Configuration class for HunYuan Dense V1 model.
-
-    Bundled with the custom model implementation to enable loading on
-    transformers versions that don't have this model natively registered.
-    """
-
-    model_type = "hunyuan_v1_dense"
-
-    def __init__(
-        self,
-        vocab_size: int = 128256,
-        hidden_size: int = 4096,
-        intermediate_size: int = 14336,
-        num_hidden_layers: int = 32,
-        num_attention_heads: int = 32,
-        num_key_value_heads: int = 8,
-        head_dim: int = 128,
-        hidden_act: str = "silu",
-        max_position_embeddings: int = 32768,
-        rms_norm_eps: float = 1e-5,
-        rope_theta: float = 10000.0,
-        rope_scaling: Optional[dict] = None,
-        attention_bias: bool = False,
-        attention_dropout: float = 0.0,
-        use_qk_norm: bool = True,
-        tie_word_embeddings: bool = True,
-        initializer_range: float = 0.02,
-        pad_token_id: int = 0,
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = num_key_value_heads
-        self.head_dim = head_dim
-        self.hidden_act = hidden_act
-        self.max_position_embeddings = max_position_embeddings
-        self.rms_norm_eps = rms_norm_eps
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self.attention_bias = attention_bias
-        self.attention_dropout = attention_dropout
-        self.use_qk_norm = use_qk_norm
-        self.initializer_range = initializer_range
-
-        super().__init__(
-            pad_token_id=pad_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
-
-
-# Register config with transformers' AutoConfig
-try:
-    AutoConfig.register("hunyuan_v1_dense", HunYuanDenseConfig, exist_ok=True)
-except TypeError:
-    try:
-        AutoConfig.register("hunyuan_v1_dense", HunYuanDenseConfig)
-    except ValueError:
-        pass
 
 
 class HunYuanDenseRMSNorm(nn.Module):
@@ -354,7 +288,7 @@ class HunYuanDenseCausalLMOutput(ModelOutput):
 class HunYuanDensePreTrainedModel(PreTrainedModel):
     """Base class for HunYuan Dense V1 models."""
 
-    config_class = HunYuanDenseConfig
+    config_class = None
     base_model_prefix = "model"
     _no_split_modules = ["HunYuanDenseDecoderLayer"]
     supports_gradient_checkpointing = False
@@ -488,5 +422,8 @@ class HunYuanDenseForCausalLM(HunYuanDensePreTrainedModel, GenerationMixin):
         return HunYuanDenseCausalLMOutput(logits=logits)
 
 
-# Register with AutoModelForCausalLMFactory
-AutoModelForCausalLMFactory.register_custom_model_cls("HunYuanDenseConfig", HunYuanDenseForCausalLM)
+# Register with AutoModelForCausalLMFactory under the real HF config class name
+# (HunYuanDenseV1Config from transformers.models.hunyuan_v1_dense).
+AutoModelForCausalLMFactory.register_custom_model_cls(
+    "HunYuanDenseV1Config", HunYuanDenseForCausalLM
+)

@@ -35,12 +35,11 @@ The HunYuan A13B model is an MoE transformer with:
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import AutoConfig, PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
@@ -48,74 +47,6 @@ from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
-
-# ---------------------------------------------------------------------------
-# Bundled config class for HunYuan A13B-Instruct
-# ---------------------------------------------------------------------------
-
-
-class HunYuanMoEConfig(PretrainedConfig):
-    """Config for HunYuan A13B-Instruct bundled with the custom AD model.
-
-    Inherits from PretrainedConfig so the model can be instantiated directly
-    in tests without requiring the real HF dynamic-remote-code HunYuanConfig.
-    """
-
-    model_type = "hunyuan_moe_a13b"
-
-    def __init__(
-        self,
-        vocab_size: int = 128167,
-        hidden_size: int = 4096,
-        intermediate_size: int = 3072,
-        moe_intermediate_size: Union[int, List[int]] = 3072,
-        num_hidden_layers: int = 32,
-        num_attention_heads: int = 32,
-        num_key_value_heads: int = 8,
-        attention_head_dim: int = 128,
-        hidden_act: str = "silu",
-        max_position_embeddings: int = 32768,
-        rms_norm_eps: float = 1e-5,
-        rope_theta: float = 10000.0,
-        rope_scaling: Optional[dict] = None,
-        attention_bias: bool = False,
-        use_qk_norm: bool = True,
-        num_experts: int = 64,
-        num_shared_expert: Union[int, List[int]] = 1,
-        moe_topk: Union[int, List[int]] = 8,
-        use_mixed_mlp_moe: bool = True,
-        tie_word_embeddings: bool = True,
-        initializer_range: float = 0.02,
-        pad_token_id: int = 127961,
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.moe_intermediate_size = moe_intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = num_key_value_heads
-        self.attention_head_dim = attention_head_dim
-        self.hidden_act = hidden_act
-        self.max_position_embeddings = max_position_embeddings
-        self.rms_norm_eps = rms_norm_eps
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self.attention_bias = attention_bias
-        self.use_qk_norm = use_qk_norm
-        self.num_experts = num_experts
-        self.num_shared_expert = num_shared_expert
-        self.moe_topk = moe_topk
-        self.use_mixed_mlp_moe = use_mixed_mlp_moe
-        self.initializer_range = initializer_range
-
-        super().__init__(
-            pad_token_id=pad_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
-
 
 # ---------------------------------------------------------------------------
 # Helper: extract per-layer value from list-or-scalar config field
@@ -617,23 +548,9 @@ class HunYuanMoEForCausalLM(HunYuanMoEPreTrainedModel, GenerationMixin):
 
 
 # ---------------------------------------------------------------------------
-# Register with AutoConfig and AutoModelForCausalLMFactory
+# Register with AutoModelForCausalLMFactory
 # ---------------------------------------------------------------------------
-
-# Register the bundled config so tests and model-zoo runs using model_type=
-# "hunyuan_moe_a13b" can instantiate the model without trust_remote_code.
-try:
-    AutoConfig.register("hunyuan_moe_a13b", HunYuanMoEConfig, exist_ok=True)
-except TypeError:
-    try:
-        AutoConfig.register("hunyuan_moe_a13b", HunYuanMoEConfig)
-    except ValueError:
-        pass
 
 # Register with the AD factory under the REAL checkpoint config class name
 # (HunYuanConfig — dynamically loaded via trust_remote_code from the HF repo).
-# This string-based registration does not require importing HunYuanConfig here.
 AutoModelForCausalLMFactory.register_custom_model_cls("HunYuanConfig", HunYuanMoEForCausalLM)
-
-# Also register under our bundled config for test use.
-AutoModelForCausalLMFactory.register_custom_model_cls("HunYuanMoEConfig", HunYuanMoEForCausalLM)

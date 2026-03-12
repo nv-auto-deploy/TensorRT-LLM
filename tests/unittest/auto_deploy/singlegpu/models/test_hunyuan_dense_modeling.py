@@ -26,11 +26,11 @@ import pytest
 import torch
 from _model_test_utils import assert_rmse_close
 from torch.export import Dim
+from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_hunyuan_dense import (
     HunYuanDenseAttention,
-    HunYuanDenseConfig,
     HunYuanDenseDecoderLayer,
     HunYuanDenseForCausalLM,
     HunYuanDenseMLP,
@@ -151,9 +151,9 @@ def _create_small_hf_config():
     return cfg
 
 
-def _create_small_custom_config() -> HunYuanDenseConfig:
+def _create_small_custom_config() -> PretrainedConfig:
     """Create a small custom config for testing."""
-    return HunYuanDenseConfig(
+    return PretrainedConfig(
         vocab_size=1000,
         hidden_size=64,
         intermediate_size=128,
@@ -511,13 +511,10 @@ def test_model_can_be_exported(device):
 
 
 def test_config_registration():
-    """Test that the config has correct model_type and is registered."""
-    config = _create_small_custom_config()
-    assert config.model_type == "hunyuan_v1_dense"
-
+    """Factory knows the model class under the real HF config name."""
     from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 
-    assert "HunYuanDenseConfig" in AutoModelForCausalLMFactory._custom_model_mapping
+    assert "HunYuanDenseV1Config" in AutoModelForCausalLMFactory._custom_model_mapping
 
 
 def test_tied_weights():
