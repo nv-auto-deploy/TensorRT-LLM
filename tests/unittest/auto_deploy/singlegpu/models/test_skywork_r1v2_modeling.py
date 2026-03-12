@@ -25,12 +25,16 @@ transformers.models.qwen2.modeling_qwen2.
 
 import pytest
 import torch
-import torch.nn.functional as F
 from _model_test_utils import assert_rmse_close
-from torch import nn
 from torch.export import Dim
 from transformers import AutoConfig, Qwen2Config, Qwen2ForCausalLM
-from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
+from transformers.models.qwen2.modeling_qwen2 import (
+    Qwen2Attention,
+    Qwen2DecoderLayer,
+    Qwen2MLP,
+    Qwen2RMSNorm,
+    Qwen2RotaryEmbedding,
+)
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_skywork_r1v2 import (
@@ -117,129 +121,6 @@ def _convert_hf_to_custom_state_dict(hf_state_dict):
     return {f"language_model.{key}": value for key, value in hf_state_dict.items()}
 
 
-# ---------------------------------------------------------------------------
-# Inline Qwen2 reference implementations for attention/decoder-layer tests
-#
-# Qwen2Attention and Qwen2DecoderLayer are imported from transformers for the
-# RMSNorm, MLP, and full-model tests above.  For the standalone attention and
-# decoder-layer equivalence tests we keep inline references because
-# SkyworkR1V2Attention uses AD custom ops (torch_rope_with_explicit_cos_sin,
-# torch_attention in "bsnd" layout) whose numerical output differs from HF's
-# standard SDPA even with identical weights.  The inline reference matches the
-# AD convention exactly, allowing tight numerical comparison.
-# ---------------------------------------------------------------------------
-
-
-def _hf_rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _hf_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (_hf_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_hf_rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-class _InlineQwen2RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=512, base=10000.0):
-        super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        t = torch.arange(max_position_embeddings, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
-
-    def forward(self, x, position_ids):
-        cos = self.cos_cached[position_ids].to(x.dtype)
-        sin = self.sin_cached[position_ids].to(x.dtype)
-        return cos, sin
-
-
-def _hf_repeat_kv(hidden_states, n_rep):
-    if n_rep == 1:
-        return hidden_states
-    batch, num_kv_heads, slen, head_dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_kv_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
-
-
-class _InlineQwen2Attention(nn.Module):
-    """Inline Qwen2 attention reference matching AD custom-op conventions."""
-
-    def __init__(self, config, layer_idx=0):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_kv_groups = self.num_heads // self.num_kv_heads
-        self.scaling = self.head_dim ** (-0.5)
-
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-
-    def forward(self, hidden_states, position_embeddings):
-        bsz, q_len, _ = hidden_states.size()
-        q = (
-            self.q_proj(hidden_states)
-            .view(bsz, q_len, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        k = (
-            self.k_proj(hidden_states)
-            .view(bsz, q_len, self.num_kv_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        v = (
-            self.v_proj(hidden_states)
-            .view(bsz, q_len, self.num_kv_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-
-        cos, sin = position_embeddings
-        q, k = _hf_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
-
-        k = _hf_repeat_kv(k, self.num_kv_groups)
-        v = _hf_repeat_kv(v, self.num_kv_groups)
-
-        attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scaling)
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
-        return self.o_proj(attn_output)
-
-
-class _InlineQwen2DecoderLayer(nn.Module):
-    """Inline Qwen2 decoder layer reference."""
-
-    def __init__(self, config, layer_idx=0):
-        super().__init__()
-        self.self_attn = _InlineQwen2Attention(config, layer_idx=layer_idx)
-        self.mlp = Qwen2MLP(config)
-        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def forward(self, hidden_states, position_embeddings):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
-
-
 # =========================================================================
 # Block equivalence tests (Level 1)
 # =========================================================================
@@ -290,10 +171,11 @@ def test_skywork_r1v2_mlp_equivalence(B, S, dtype):
 @torch.no_grad()
 def test_skywork_r1v2_attention_equivalence(B, S, dtype):
     """Test Attention layer produces numerically equivalent output to HF Qwen2 Attention."""
-    device = "cpu"
+    device = "cuda"
     config = _create_small_llm_config()
+    config._attn_implementation = "eager"
 
-    hf_attn = _InlineQwen2Attention(config, layer_idx=0).to(device=device, dtype=dtype).eval()
+    hf_attn = Qwen2Attention(config, layer_idx=0).to(device=device, dtype=dtype).eval()
     custom_attn = SkyworkR1V2Attention(config, layer_idx=0).to(device=device, dtype=dtype)
     custom_attn.load_state_dict(hf_attn.state_dict())
     custom_attn.eval()
@@ -301,18 +183,24 @@ def test_skywork_r1v2_attention_equivalence(B, S, dtype):
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
-    head_dim = config.hidden_size // config.num_attention_heads
-    hf_rotary = _InlineQwen2RotaryEmbedding(
-        head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
-    ).to(device=device, dtype=dtype)
+    hf_rotary = Qwen2RotaryEmbedding(config, device=device)
     hf_cos, hf_sin = hf_rotary(x, position_ids)
 
+    head_dim = config.hidden_size // config.num_attention_heads
     custom_rotary = SkyworkR1V2RotaryEmbedding(
         head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
     ).to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
-    hf_out = hf_attn(x, (hf_cos, hf_sin))
+    # Build causal mask in additive form to match AD's is_causal=True behaviour.
+    # HF eager attention adds this to QK^T before softmax; shape [1, 1, S, S].
+    causal_mask = (
+        torch.triu(torch.full((S, S), float("-inf"), device=device, dtype=dtype), diagonal=1)
+        .unsqueeze(0)
+        .unsqueeze(0)
+    )
+
+    hf_out, _ = hf_attn(x, (hf_cos, hf_sin), attention_mask=causal_mask)
     custom_out = custom_attn(x, (custom_cos, custom_sin), position_ids)
 
     assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.10, msg="Attention: ")
@@ -328,10 +216,11 @@ def test_skywork_r1v2_attention_equivalence(B, S, dtype):
 @torch.no_grad()
 def test_skywork_r1v2_decoder_layer_equivalence(B, S, dtype):
     """Test decoder layer produces numerically equivalent output to HF Qwen2."""
-    device = "cpu"
+    device = "cuda"
     config = _create_small_llm_config()
+    config._attn_implementation = "eager"
 
-    hf_layer = _InlineQwen2DecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype).eval()
+    hf_layer = Qwen2DecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype).eval()
     custom_layer = SkyworkR1V2DecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype)
     custom_layer.load_state_dict(hf_layer.state_dict())
     custom_layer.eval()
@@ -339,19 +228,31 @@ def test_skywork_r1v2_decoder_layer_equivalence(B, S, dtype):
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
-    head_dim = config.hidden_size // config.num_attention_heads
-    hf_rotary = _InlineQwen2RotaryEmbedding(
-        head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
-    ).to(device=device, dtype=dtype)
-    hf_pos_emb = hf_rotary(x, position_ids)
+    hf_rotary = Qwen2RotaryEmbedding(config, device=device)
+    hf_cos, hf_sin = hf_rotary(x, position_ids)
 
+    head_dim = config.hidden_size // config.num_attention_heads
     custom_rotary = SkyworkR1V2RotaryEmbedding(
         head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
     ).to(device=device, dtype=dtype)
-    custom_pos_emb = custom_rotary(x, position_ids)
+    custom_cos, custom_sin = custom_rotary(x, position_ids)
 
-    hf_out = hf_layer(x, hf_pos_emb)
-    custom_out = custom_layer(x, custom_pos_emb, position_ids)
+    # Build causal mask in additive form to match AD's is_causal=True behaviour.
+    causal_mask = (
+        torch.triu(torch.full((S, S), float("-inf"), device=device, dtype=dtype), diagonal=1)
+        .unsqueeze(0)
+        .unsqueeze(0)
+    )
+
+    hf_out = hf_layer(
+        hidden_states=x,
+        attention_mask=causal_mask,
+        position_ids=position_ids,
+        position_embeddings=(hf_cos, hf_sin),
+    )
+    if isinstance(hf_out, tuple):
+        hf_out = hf_out[0]
+    custom_out = custom_layer(x, (custom_cos, custom_sin), position_ids)
 
     assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.05, msg="Decoder layer: ")
 
