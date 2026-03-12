@@ -1,6 +1,7 @@
 from .modeling_decilm import DeciLMForCausalLM
 from .modeling_deepseek import DeepSeekV3ForCausalLM
 from .modeling_deepseek_v2 import DeepSeekV2ForCausalLM
+from .modeling_gemma import GemmaADForCausalLM
 from .modeling_glm4_moe_lite import Glm4MoeLiteForCausalLM
 from .modeling_granite_moe_hybrid import GraniteMoeHybridForCausalLM
 from .modeling_hunyuan_dense_v1 import HunYuanDenseV1ForCausalLM
@@ -16,6 +17,7 @@ __all__ = (
     "DeciLMForCausalLM",
     "DeepSeekV2ForCausalLM",
     "DeepSeekV3ForCausalLM",
+    "GemmaADForCausalLM",
     "Glm4MoeLiteForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "GraniteMoeHybridForCausalLM",
