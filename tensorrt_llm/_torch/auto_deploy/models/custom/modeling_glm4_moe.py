@@ -122,8 +122,8 @@ class Glm4MoeMLP(nn.Module):
 class Glm4MoeMoEGate(nn.Module):
     """MoE Gating for GLM4 MoE with sigmoid + bias + group top-k routing.
 
-    Uses vanilla PyTorch for the routing logic. AD transforms can replace
-    with fused kernels at deployment time.
+    Uses fused TensorRT-LLM custom ops for efficient routing:
+    - noaux_tc_op: Fused sigmoid + bias + group top-k + normalize + scale
     """
 
     def __init__(self, config: Glm4MoeConfig):
@@ -136,10 +136,12 @@ class Glm4MoeMoEGate(nn.Module):
         self.topk_group = config.topk_group
         self.norm_topk_prob = config.norm_topk_prob
 
-        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)))
+        self.weight = nn.Parameter(
+            torch.empty((self.n_routed_experts, config.hidden_size), dtype=torch.float32)
+        )
         self.register_buffer(
             "e_score_correction_bias",
-            torch.zeros(self.n_routed_experts),
+            torch.zeros(self.n_routed_experts, dtype=torch.float32),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -148,32 +150,16 @@ class Glm4MoeMoEGate(nn.Module):
 
         # Router GEMM in float32
         router_logits = F.linear(hidden_states_flat.float(), self.weight.float())
-        scores = router_logits.sigmoid()
 
-        # Group top-k selection
-        scores_for_choice = scores + self.e_score_correction_bias.to(scores).unsqueeze(0)
-        group_scores = (
-            scores_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group)
-            .topk(2, dim=-1)[0]
-            .sum(dim=-1)
+        # Fused routing: sigmoid + bias + group top-k + normalize + scale
+        topk_weights, topk_indices = torch.ops.trtllm.noaux_tc_op(
+            router_logits,
+            self.e_score_correction_bias.float(),
+            self.n_group,
+            self.topk_group,
+            self.top_k,
+            self.routed_scaling_factor,
         )
-        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
-        score_mask = (
-            group_mask.unsqueeze(-1)
-            .expand(-1, self.n_group, self.n_routed_experts // self.n_group)
-            .reshape(-1, self.n_routed_experts)
-        )
-        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
-        topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
-        topk_weights = scores.gather(1, topk_indices)
-
-        if self.norm_topk_prob:
-            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
-            topk_weights = topk_weights / denominator
-
-        topk_weights = topk_weights * self.routed_scaling_factor
 
         return topk_indices, topk_weights
 
