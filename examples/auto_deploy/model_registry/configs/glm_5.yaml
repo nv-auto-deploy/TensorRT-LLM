@@ -1,7 +1,6 @@
 # Configuration for GLM-5 (zai-org/GLM-5)
 # Custom model: glm_moe_dsa — prefill-only with MLA+DSA attention and noaux_tc MoE routing
 # 78 layers total (3 dense + 75 MoE), 256 routed experts, 8-way tensor parallelism
-# Limit to 5 layers for quick validation run
 runtime: trtllm
 compile_backend: torch-cudagraph
 max_seq_len: 4096
@@ -16,7 +15,6 @@ model_factory: AutoModelForCausalLM
 tokenizer: zai-org/GLM-4.7-Flash
 model_kwargs:
   torch_dtype: bfloat16
-  num_hidden_layers: 5
 kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.7
@@ -26,6 +24,13 @@ transforms:
     enabled: true
   fuse_swiglu:
     enabled: true
+  # GLM-5 uses torch_dsa (DSA = DeepSeek Sparse Attention) not torch_mla.
+  # Override the MLA cache insertion to use torch_dsa backend so the KV cache
+  # is correctly inserted around the torch_dsa attention nodes.
+  insert_cached_mla_attention:
+    stage: cache_init
+    requires_shape_prop: true
+    backend: torch_dsa
   multi_stream_mla_attn:
     stage: compile
     enabled: true

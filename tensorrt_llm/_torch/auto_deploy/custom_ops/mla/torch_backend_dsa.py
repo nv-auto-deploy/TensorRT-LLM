@@ -134,96 +134,106 @@ def _torch_dsa_generate_with_absorption(
     v_head_dim: int,
     out: torch.Tensor,
 ) -> None:
-    """Generate-phase DSA with MLA weight absorption + sparse index masking."""
-    b = q_nope.shape[0]
+    """Generate-phase DSA with MLA weight absorption + sparse index masking.
+
+    Vectorized implementation without .item() calls for CUDA graph compatibility.
+    Uses full max_seq slices from the cache with a validity mask to avoid
+    variable-length slicing that would require CPU synchronization.
+    """
+    max_seq = mla_cache.shape[1]
     index_head_dim = index_q.shape[-1]
     index_softmax_scale = 1.0 / math.sqrt(index_head_dim)
+    compute_dtype = q_nope.dtype
+    cache_dtype = mla_cache.dtype
+    idx_cache_dtype = index_k_cache.dtype
 
-    # Extract MLA weight components
-    weight_reshaped = kv_b_proj_weight.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
-    w_k_nope = weight_reshaped[:, :qk_nope_head_dim, :]  # [N, qk_nope_head_dim, kv_lora_rank]
-    w_v = weight_reshaped[:, qk_nope_head_dim:, :]  # [N, v_head_dim, kv_lora_rank]
-
-    # Update both caches with current tokens
+    # Flatten inputs (remove the seq=1 dimension)
     compressed_kv_flat = compressed_kv.squeeze(1)  # [B, kv_lora_rank]
     kpe_flat = kpe.squeeze(1).squeeze(1)  # [B, qk_rope_head_dim]
     index_k_flat = index_k.squeeze(1)  # [B, D_idx]
 
-    cache_dtype = mla_cache.dtype
-    idx_cache_dtype = index_k_cache.dtype
+    # -----------------------------------------------------------------------
+    # Cache update — vectorized via advanced indexing (no .item() needed)
+    # slot_idx: [B], input_pos: [B] are GPU tensors used directly as indices
+    # -----------------------------------------------------------------------
+    mla_write = torch.cat(
+        [compressed_kv_flat.to(cache_dtype), kpe_flat.to(cache_dtype)], dim=-1
+    )  # [B, kv_lora_rank + qk_rope_head_dim]
+    mla_cache[slot_idx, input_pos] = mla_write
+    index_k_cache[slot_idx, input_pos] = index_k_flat.to(idx_cache_dtype)
 
-    for i in range(b):
-        cache_idx = slot_idx[i].item()
-        pos = input_pos[i].item()
+    # -----------------------------------------------------------------------
+    # Read full cached slices via batch gather (no variable-length slicing)
+    # cached_mla:     [B, max_seq, kv_lora_rank + qk_rope_head_dim]
+    # cached_index_k: [B, max_seq, D_idx]
+    # -----------------------------------------------------------------------
+    cached_mla = mla_cache[slot_idx].to(compute_dtype)  # [B, max_seq, kv_lora+qk_rope]
+    cached_index_k = index_k_cache[slot_idx].to(compute_dtype)  # [B, max_seq, D_idx]
 
-        ckv = compressed_kv_flat[i]
-        kpe_i = kpe_flat[i]
-        if ckv.dtype != cache_dtype:
-            ckv = ckv.to(cache_dtype)
-        if kpe_i.dtype != cache_dtype:
-            kpe_i = kpe_i.to(cache_dtype)
-        mla_cache[cache_idx, pos, :kv_lora_rank] = ckv
-        mla_cache[cache_idx, pos, kv_lora_rank:] = kpe_i
+    compressed_kv_cached = cached_mla[:, :, :kv_lora_rank]  # [B, max_seq, kv_lora_rank]
+    kpe_cached = cached_mla[:, :, kv_lora_rank:]  # [B, max_seq, qk_rope_head_dim]
 
-        ik = index_k_flat[i]
-        if ik.dtype != idx_cache_dtype:
-            ik = ik.to(idx_cache_dtype)
-        index_k_cache[cache_idx, pos] = ik
+    # -----------------------------------------------------------------------
+    # Validity mask: position range 0..input_pos[i] is valid for sequence i
+    # pos_range: [max_seq], input_pos: [B] -> valid_mask: [B, max_seq]
+    # -----------------------------------------------------------------------
+    pos_range = torch.arange(max_seq, device=input_pos.device, dtype=input_pos.dtype)
+    valid_mask = pos_range.unsqueeze(0) <= input_pos.unsqueeze(1)  # [B, max_seq]
 
-    # Compute attention per sequence
-    compute_dtype = q_nope.dtype
-    for i in range(b):
-        cache_idx = slot_idx[i].item()
-        pos = input_pos[i].item()
+    # -----------------------------------------------------------------------
+    # DSA index score — vectorized over batch
+    # index_q_bh: [B, H, D_idx], cached_index_k: [B, max_seq, D_idx]
+    # -----------------------------------------------------------------------
+    index_q_bh = index_q[:, 0]  # [B, H, D_idx]
+    index_w_bh = index_weights[:, 0]  # [B, H]
 
-        q_nope_i = q_nope[i, 0]  # [N, qk_nope_head_dim]
-        q_pe_i = q_pe[i, 0]  # [N, qk_rope_head_dim]
+    # per_head_scores: [B, H, max_seq]
+    per_head_scores = torch.einsum("bhd,btd->bht", index_q_bh.float(), cached_index_k.float())
+    # index_score: [B, max_seq]
+    index_score = torch.einsum("bht,bh->bt", per_head_scores, index_w_bh.float())
+    index_score = index_score * index_softmax_scale
 
-        # MLA cached data
-        cached_data = mla_cache[cache_idx, : pos + 1]  # [T, kv_lora_rank + qk_rope_head_dim]
-        compressed_kv_cached = cached_data[:, :kv_lora_rank]
-        kpe_cached = cached_data[:, kv_lora_rank:]
-        if compressed_kv_cached.dtype != compute_dtype:
-            compressed_kv_cached = compressed_kv_cached.to(compute_dtype)
-        if kpe_cached.dtype != compute_dtype:
-            kpe_cached = kpe_cached.to(compute_dtype)
+    # Mask out invalid (future) positions before top-k selection
+    index_score = index_score.masked_fill(~valid_mask, float("-inf"))
 
-        # Index key cache
-        index_k_cached = index_k_cache[cache_idx, : pos + 1]  # [T, D_idx]
-        if index_k_cached.dtype != compute_dtype:
-            index_k_cached = index_k_cached.to(compute_dtype)
+    # Top-k selection (fixed shape → CUDA-graph compatible)
+    effective_topk = min(index_topk, max_seq)
+    topk_indices = index_score.topk(effective_topk, dim=-1).indices  # [B, topk]
+    index_mask = index_score.new_full(index_score.shape, float("-inf"))
+    index_mask.scatter_(-1, topk_indices, 0.0)  # [B, max_seq]
 
-        # --- DSA index mask ---
-        index_q_i = index_q[i, 0]  # [H, D_idx]
-        index_w_i = index_weights[i, 0]  # [H]
-        index_mask = _compute_seq_index_score(
-            index_q_i.unsqueeze(0),
-            index_k_cached,
-            index_w_i.unsqueeze(0),
-            index_softmax_scale,
-            index_topk,
-            causal_diagonal=pos + 2,  # all positions valid (pos+1 is current, no future)
-        )  # [1, T]
-        index_mask = index_mask.squeeze(0)  # [T]
+    # -----------------------------------------------------------------------
+    # MLA weight absorption + attention
+    # -----------------------------------------------------------------------
+    weight_reshaped = kv_b_proj_weight.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+    w_k_nope = weight_reshaped[:, :qk_nope_head_dim, :]  # [N, qk_nope, kv_lora_rank]
+    w_v = weight_reshaped[:, qk_nope_head_dim:, :]  # [N, v_head_dim, kv_lora_rank]
 
-        # --- MLA weight absorption ---
-        # q_absorbed: [N, kv_lora_rank]
-        q_absorbed = torch.einsum("nd,ndk->nk", q_nope_i, w_k_nope)
+    q_nope_bn = q_nope[:, 0]  # [B, N, qk_nope_head_dim]
+    q_pe_bn = q_pe[:, 0]  # [B, N, qk_rope_head_dim]
 
-        scores_nope = torch.matmul(q_absorbed.float(), compressed_kv_cached.float().t())  # [N, T]
-        scores_pe = torch.matmul(q_pe_i.float(), kpe_cached.float().t())  # [N, T]
-        attn_scores = (scores_nope + scores_pe) * scale  # [N, T]
+    # q_absorbed: [B, N, kv_lora_rank]
+    q_absorbed = torch.einsum("bnd,ndk->bnk", q_nope_bn.float(), w_k_nope.float())
 
-        # Add DSA sparse mask (broadcast [T] -> [N, T])
-        attn_scores = attn_scores + index_mask.unsqueeze(0)
+    # scores_nope: [B, N, max_seq]
+    scores_nope = torch.matmul(q_absorbed, compressed_kv_cached.float().transpose(1, 2))
+    # scores_pe: [B, N, max_seq]
+    scores_pe = torch.matmul(q_pe_bn.float(), kpe_cached.float().transpose(1, 2))
 
-        attn_weights = torch.softmax(attn_scores, dim=-1).to(compute_dtype)  # [N, T]
+    attn_scores = (scores_nope + scores_pe) * scale  # [B, N, max_seq]
 
-        # Weighted sum over compressed_kv, then project to v_head_dim
-        weighted_kv = torch.matmul(attn_weights, compressed_kv_cached)  # [N, kv_lora_rank]
-        attn_out = torch.einsum("nk,nvk->nv", weighted_kv, w_v)  # [N, v_head_dim]
+    # Apply causal validity mask and DSA sparse mask: [B, max_seq] -> [B, 1, max_seq]
+    attn_scores = attn_scores.masked_fill(~valid_mask.unsqueeze(1), float("-inf"))
+    attn_scores = attn_scores + index_mask.unsqueeze(1)
 
-        out[i] = attn_out
+    attn_weights = torch.softmax(attn_scores, dim=-1).to(compute_dtype)  # [B, N, max_seq]
+
+    # weighted_kv: [B, N, kv_lora_rank]
+    weighted_kv = torch.matmul(attn_weights, compressed_kv_cached)
+    # attn_out: [B, N, v_head_dim]
+    attn_out = torch.einsum("bnk,nvk->bnv", weighted_kv, w_v.to(compute_dtype))
+
+    out[:] = attn_out
 
 
 def _torch_dsa_context_with_expansion(

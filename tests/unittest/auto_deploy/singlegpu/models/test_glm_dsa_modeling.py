@@ -150,18 +150,17 @@ class _HFNaiveMoE(nn.Module):
     def forward(self, hidden_states, topk_indices, topk_weights):
         """Reference MoE dispatch using scatter-reduce."""
         T, top_k = topk_indices.shape
-        H = hidden_states.shape[-1]
         output = torch.zeros_like(hidden_states)
 
         for t in range(T):
             for k in range(top_k):
                 expert_idx = topk_indices[t, k].item()
                 w = topk_weights[t, k].item()
-                gate_up = self.gate_up_proj[expert_idx]  # [2*interm, H]
-                down = self.down_proj[expert_idx]  # [H, interm]
-                interm = gate_up.shape[0] // 2
+                gate_up = self.gate_up_proj[expert_idx]  # [2*mid, H]
+                down = self.down_proj[expert_idx]  # [H, mid]
+                mid = gate_up.shape[0] // 2
                 x = hidden_states[t : t + 1]  # [1, H]
-                gate_out = F.silu(x @ gate_up[:interm].t()) * (x @ gate_up[interm:].t())
+                gate_out = F.silu(x @ gate_up[:mid].t()) * (x @ gate_up[mid:].t())
                 output[t] += w * (gate_out @ down.t()).squeeze(0)
 
         return output
@@ -213,14 +212,14 @@ def _stacked_to_per_expert_state_dict(full_sd: dict, config) -> dict:
     """Convert HF-style stacked expert weights to our per-expert ModuleList format."""
     out = {}
     n = config.n_routed_experts
-    interm = config.moe_intermediate_size
+    mid = config.moe_intermediate_size
 
     for k, v in full_sd.items():
         if ".mlp.experts.gate_up_proj" in k:
             prefix = k[: k.index(".experts.gate_up_proj") + len(".experts.")]
             for i in range(n):
-                out[f"{prefix}{i}.gate_proj.weight"] = v[i, :interm]
-                out[f"{prefix}{i}.up_proj.weight"] = v[i, interm:]
+                out[f"{prefix}{i}.gate_proj.weight"] = v[i, :mid]
+                out[f"{prefix}{i}.up_proj.weight"] = v[i, mid:]
         elif ".mlp.experts.down_proj" in k:
             prefix = k[: k.index(".experts.down_proj") + len(".experts.")]
             for i in range(n):
@@ -467,10 +466,10 @@ def _build_hf_decoder_layer(custom_layer, config, is_moe):
         ref.gate_weight = nn.Parameter(cm.gate.weight.data.clone())
         ref.e_score_correction_bias = nn.Parameter(cm.gate.e_score_correction_bias.data.clone())
         n = config.n_routed_experts
-        interm = config.moe_intermediate_size
+        mid = config.moe_intermediate_size
         for j in range(n):
-            ref.routed_experts.gate_up_proj.data[j, :interm] = cm.experts[j].gate_proj.weight.data
-            ref.routed_experts.gate_up_proj.data[j, interm:] = cm.experts[j].up_proj.weight.data
+            ref.routed_experts.gate_up_proj.data[j, :mid] = cm.experts[j].gate_proj.weight.data
+            ref.routed_experts.gate_up_proj.data[j, mid:] = cm.experts[j].up_proj.weight.data
             ref.routed_experts.down_proj.data[j] = cm.experts[j].down_proj.weight.data
         ref.shared_expert.gate_proj.weight = cm.shared_experts.gate_proj.weight
         ref.shared_expert.up_proj.weight = cm.shared_experts.up_proj.weight
@@ -532,12 +531,12 @@ def _build_hf_model(custom_model, config):
                 cm.gate.e_score_correction_bias.data.clone()
             )
             n = config.n_routed_experts
-            interm = config.moe_intermediate_size
+            mid = config.moe_intermediate_size
             for j in range(n):
-                ref_layer.routed_experts.gate_up_proj.data[j, :interm] = cm.experts[
+                ref_layer.routed_experts.gate_up_proj.data[j, :mid] = cm.experts[
                     j
                 ].gate_proj.weight.data
-                ref_layer.routed_experts.gate_up_proj.data[j, interm:] = cm.experts[
+                ref_layer.routed_experts.gate_up_proj.data[j, mid:] = cm.experts[
                     j
                 ].up_proj.weight.data
                 ref_layer.routed_experts.down_proj.data[j] = cm.experts[j].down_proj.weight.data
@@ -888,7 +887,7 @@ def test_moe_weight_expand_hook():
     model = GlmDSAForCausalLM(config)
 
     n = config.n_routed_experts
-    interm = config.moe_intermediate_size
+    mid = config.moe_intermediate_size
     H = config.hidden_size
 
     # Build a fake stacked-format state_dict (layer 1 is MoE)
@@ -902,11 +901,11 @@ def test_moe_weight_expand_hook():
             stacked_sd[k] = v
 
     # Stack the expert weights back (simulate HF checkpoint format)
-    gate_up = torch.zeros(n, 2 * interm, H)
-    down = torch.zeros(n, H, interm)
+    gate_up = torch.zeros(n, 2 * mid, H)
+    down = torch.zeros(n, H, mid)
     for i in range(n):
-        gate_up[i, :interm] = original_sd[f"model.layers.1.mlp.experts.{i}.gate_proj.weight"]
-        gate_up[i, interm:] = original_sd[f"model.layers.1.mlp.experts.{i}.up_proj.weight"]
+        gate_up[i, :mid] = original_sd[f"model.layers.1.mlp.experts.{i}.gate_proj.weight"]
+        gate_up[i, mid:] = original_sd[f"model.layers.1.mlp.experts.{i}.up_proj.weight"]
         down[i] = original_sd[f"model.layers.1.mlp.experts.{i}.down_proj.weight"]
 
     stacked_sd["model.layers.1.mlp.experts.gate_up_proj"] = gate_up
@@ -962,6 +961,16 @@ def test_model_export():
     assert out["logits"].shape == (B, S, config.vocab_size)
     assert torch.isfinite(out["logits"]).all()
 
+    # Numerical equivalence between eager and exported graph
+    with torch.no_grad():
+        eager_out = model(input_ids=input_ids, position_ids=pos)
+    assert_rmse_close(
+        out["logits"].float(),
+        eager_out.logits.float(),
+        rmse_ratio_tol=0.05,
+        msg="Export vs eager (shape 1): ",
+    )
+
     # Test second shape
     B2, S2 = 1, 4
     input_ids2 = torch.randint(0, config.vocab_size, (B2, S2), device=device)
@@ -972,3 +981,12 @@ def test_model_export():
 
     assert out2["logits"].shape == (B2, S2, config.vocab_size)
     assert torch.isfinite(out2["logits"]).all()
+
+    with torch.no_grad():
+        eager_out2 = model(input_ids=input_ids2, position_ids=pos2)
+    assert_rmse_close(
+        out2["logits"].float(),
+        eager_out2.logits.float(),
+        rmse_ratio_tol=0.05,
+        msg="Export vs eager (shape 2): ",
+    )

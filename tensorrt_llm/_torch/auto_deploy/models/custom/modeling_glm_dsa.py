@@ -20,7 +20,7 @@ Source: https://huggingface.co/zai-org/GLM-5 (model_type = "glm_moe_dsa")
 
 Differences from the HuggingFace reference:
 - Prefill-only (no KV caching — caching is handled by AutoDeploy graph transforms)
-- RMSNorm uses plain PyTorch (AD fusion passes replace later)
+- RMSNorm uses torch.ops.auto_deploy.torch_rmsnorm canonical op
 - Attention uses torch_dsa custom op in BSND layout
 - MoE gate uses vanilla PyTorch noaux_tc routing (AD transforms can replace with trtllm kernels)
 - Indexer is a separate GlmDSAIndexer submodule matching checkpoint key names
@@ -184,7 +184,7 @@ AutoConfig.register("glm_moe_dsa", GlmMoeDsaConfig, exist_ok=True)
 
 
 class GlmDSARMSNorm(nn.Module):
-    """RMS Normalization — plain PyTorch (AD fusion passes replace later)."""
+    """RMS Normalization using the canonical AutoDeploy torch_rmsnorm op."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -192,11 +192,9 @@ class GlmDSARMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return (self.weight * hidden_states).to(input_dtype)
+        return torch.ops.auto_deploy.torch_rmsnorm(
+            hidden_states, self.weight, self.variance_epsilon
+        )
 
 
 class GlmDSARotaryEmbedding(nn.Module):
@@ -763,11 +761,8 @@ class GlmDSAModel(GlmDSAPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        assert position_ids is not None, "position_ids must be provided for AD export"
         batch_size, seq_length = inputs_embeds.shape[:2]
-        if position_ids is None:
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
-            position_ids = torch.arange(seq_length, dtype=torch.long, device=device)
-            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
         hidden_states = inputs_embeds
         for decoder_layer in self.layers:

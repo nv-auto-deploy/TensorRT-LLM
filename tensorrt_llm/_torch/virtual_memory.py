@@ -7,9 +7,19 @@ from strenum import StrEnum
 
 from tensorrt_llm.bindings.internal.runtime import \
     CudaVirtualMemoryAllocatorRestoreMode as RestoreMode
-from tensorrt_llm.bindings.internal.runtime import (
-    clear_virtual_memory_allocator, get_virtual_memory_manager,
-    set_virtual_memory_allocator)
+
+try:
+    from tensorrt_llm.bindings.internal.runtime import (
+        clear_virtual_memory_allocator, get_virtual_memory_manager,
+        set_virtual_memory_allocator)
+except ImportError:
+    # Newer bindings renamed set/clear to push/pop
+    from tensorrt_llm.bindings.internal.runtime import \
+        get_virtual_memory_manager
+    from tensorrt_llm.bindings.internal.runtime import \
+        pop_virtual_memory_allocator as clear_virtual_memory_allocator
+    from tensorrt_llm.bindings.internal.runtime import \
+        push_virtual_memory_allocator as set_virtual_memory_allocator
 
 __all__ = [
     "RestoreMode", "maybe_scope", "scope", "release_with_tag",
