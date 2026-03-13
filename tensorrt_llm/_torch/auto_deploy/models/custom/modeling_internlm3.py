@@ -234,7 +234,7 @@ class InternLM3CausalLMOutput(ModelOutput):
 class InternLM3PreTrainedModel(PreTrainedModel):
     """Base class for InternLM3 models."""
 
-    config_class = PretrainedConfig
+    config_class = None  # InternLM3Config uses trust_remote_code; not imported here
     base_model_prefix = "model"
     _no_split_modules = ["InternLM3DecoderLayer"]
     supports_gradient_checkpointing = False
