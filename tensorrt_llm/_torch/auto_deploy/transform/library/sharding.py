@@ -3318,7 +3318,7 @@ def detect_ep_shard(
 
 
 # =============================================================================
-# New hint-driven sharding transform (PoC)
+# Hint-driven sharding transform
 # =============================================================================
 
 
@@ -3483,12 +3483,12 @@ def _apply_hint_view(gm: GraphModule, node: Node, tp_size: int) -> int:
     if tp_scaled_dim == -1:
         return 0
 
-    shape = list(node.args[1])
+    view_shape = list(node.args[1])
     if tp_scaled_dim < 0:
-        tp_scaled_dim = len(shape) + tp_scaled_dim
-    if tp_scaled_dim < len(shape) and isinstance(shape[tp_scaled_dim], int):
-        shape[tp_scaled_dim] = -1
-        set_op_args(node, shape=shape)
+        tp_scaled_dim = len(view_shape) + tp_scaled_dim
+    if tp_scaled_dim < len(view_shape) and isinstance(view_shape[tp_scaled_dim], int):
+        view_shape[tp_scaled_dim] = -1
+        set_op_args(node, shape=view_shape)
         ad_logger.debug(f"  updated view shape at dim {tp_scaled_dim} to -1 (inferred)")
         return 1
     return 0
@@ -3501,6 +3501,12 @@ def _apply_hint_split(gm: GraphModule, node: Node, tp_size: int) -> int:
         return 0
 
     split_sizes = list(node.args[1])
+    for s in split_sizes:
+        assert s % tp_size == 0, (
+            f"split_with_sizes: size {s} is not divisible by tp_size={tp_size}. "
+            f"Full split_sizes={split_sizes}. Ensure the model dimensions are "
+            f"compatible with the tensor parallel degree."
+        )
     scaled = [s // tp_size for s in split_sizes]
     set_op_args(node, split_sizes=scaled)
     ad_logger.debug(f"  updated split_with_sizes: {split_sizes} -> {scaled}")
