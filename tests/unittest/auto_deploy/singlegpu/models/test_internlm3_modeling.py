@@ -32,12 +32,12 @@ from _model_test_utils import assert_rmse_close
 from torch import nn
 from torch.export import Dim
 from transformers.activations import ACT2FN
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, rope_config_validation
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_internlm3 import (
     InternLM3Attention,
-    InternLM3Config,
     InternLM3DecoderLayer,
     InternLM3ForCausalLM,
     InternLM3MLP,
@@ -45,6 +45,60 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_internlm3 import (
     InternLM3RotaryEmbedding,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
+
+
+class InternLM3Config(PretrainedConfig):
+    """Local copy of InternLM3Config for unit tests.
+
+    This mirrors the config that InternLM3 checkpoints expose via
+    trust_remote_code. Kept here so unit tests can instantiate the model
+    without hitting AutoConfig or the HuggingFace Hub.
+    """
+
+    model_type = "internlm3"
+
+    def __init__(
+        self,
+        vocab_size: int = 128512,
+        hidden_size: int = 4096,
+        intermediate_size: int = 11008,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int = 32,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 32768,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
+        rope_theta: float = 10000.0,
+        rope_scaling=None,
+        qkv_bias: bool = False,
+        attention_dropout: float = 0.0,
+        bias: bool = False,
+        head_dim=None,
+        **kwargs,
+    ):
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.hidden_act = hidden_act
+        self.max_position_embeddings = max_position_embeddings
+        self.initializer_range = initializer_range
+        self.rms_norm_eps = rms_norm_eps
+        self.use_cache = use_cache
+        self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
+        self.qkv_bias = qkv_bias
+        self.attention_dropout = attention_dropout
+        self.bias = bias
+        self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
+        if self.rope_scaling is not None and "type" in self.rope_scaling:
+            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
+        rope_config_validation(self)
+        super().__init__(**kwargs)
 
 
 class _RefInternLM3RMSNorm(nn.Module):
