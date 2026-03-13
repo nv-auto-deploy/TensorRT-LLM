@@ -17,6 +17,7 @@ from .modeling_internlm3 import InternLM3ForCausalLM
 from .modeling_kimi_k2 import KimiK2ForCausalLM, KimiK25ForConditionalGeneration
 from .modeling_llama3 import Llama3ForCausalLM
 from .modeling_llama4 import Llama4ForCausalLM, Llama4ForConditionalGeneration
+from .modeling_mimo_v2_flash import MiMoV2FlashForCausalLM
 from .modeling_minimax_m2 import MiniMaxM2ForCausalLM
 from .modeling_mistral import MistralForCausalLM
 from .modeling_mistral3 import Mistral3ForConditionalGeneration, Mistral3TextForCausalLM
@@ -61,6 +62,7 @@ __all__ = (
     "Llama3ForCausalLM",
     "Llama4ForCausalLM",
     "Llama4ForConditionalGeneration",
+    "MiMoV2FlashForCausalLM",
     "MiniMaxM2ForCausalLM",
     "MistralForCausalLM",
     "Mistral3ForConditionalGeneration",

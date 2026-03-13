@@ -232,7 +232,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
 # --- MiMo-V2-Flash (Feb 2026) ---
 - name: XiaomiMiMo/MiMo-V2-Flash
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  yaml_extra: ['mimo_v2_flash.yaml', 'world_size_4.yaml']
 # --- Kimi-K2.5 (Jan 2026) ---
 - name: moonshotai/Kimi-K2.5
   yaml_extra: ['kimi_k2.yaml']

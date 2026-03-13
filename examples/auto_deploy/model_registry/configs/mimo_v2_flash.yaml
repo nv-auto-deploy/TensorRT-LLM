@@ -1,0 +1,7 @@
+# Configuration for MiMo-V2-Flash
+# Uses simple sharding only because Q/K head_dim (192) differs from V head_dim (128),
+# which is not yet supported by the row-col attention sharding heuristic.
+attn_backend: trtllm
+transforms:
+  detect_sharding:
+    simple_shard_only: true

@@ -810,6 +810,12 @@ class FineGrainedFP8LinearQuantization(Quantization):
         FineGrained FP8 checkpoints store:
         - weight: float8_e4m3fn tensor
         - weight_scale_inv: per-block scale tensor
+
+        Some checkpoints (e.g., MiMo-V2-Flash) pad weight_scale_inv to
+        multiples of the block size. When the weight dimension is not a
+        multiple of 128, the checkpoint may store extra scale rows/cols.
+        We slice them to match the expected shape derived from the actual
+        weight dimensions.
         """
         if weight_name not in state_dict:
             return
@@ -820,7 +826,18 @@ class FineGrainedFP8LinearQuantization(Quantization):
             if scale_inv_name in state_dict:
                 # Rename to match our buffer name
                 mod_prefix = weight_name.rsplit(".", 1)[0]
-                state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
+                scale_inv = state_dict[scale_inv_name]
+
+                # Handle padded scale_inv from checkpoints: slice to expected shape
+                if scale_inv.ndim == 2:
+                    N, K = weight.shape
+                    block_n, block_k = 128, 128
+                    expected_n = math.ceil(N / block_n)
+                    expected_k = math.ceil(K / block_k)
+                    if scale_inv.shape[0] > expected_n or scale_inv.shape[1] > expected_k:
+                        scale_inv = scale_inv[:expected_n, :expected_k]
+
+                state_dict[mod_prefix + ".weight_scale_inv"] = scale_inv
 
     def _apply(
         self,
