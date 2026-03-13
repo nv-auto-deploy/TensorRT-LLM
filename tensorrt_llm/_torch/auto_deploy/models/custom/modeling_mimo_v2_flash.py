@@ -380,10 +380,9 @@ class MiMoV2FlashAttention(nn.Module):
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
-        # Project and reshape to BSND layout
+        # Project Q/K/V to BSND layout
         q = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.v_head_dim)
 
         # Partial rotary: split into rope and nope parts
         q_rope, q_nope = q.split([self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
@@ -403,7 +402,12 @@ class MiMoV2FlashAttention(nn.Module):
         q = torch.cat([q_rope, q_nope], dim=-1)
         k = torch.cat([k_rope, k_nope], dim=-1)
 
-        # Attention with GQA support, optional sinks and sliding window
+        # V: project and pad to head_dim so Q/K/V have uniform last dim in BSND.
+        # AD's cached attention transform expects uniform head_dim across Q/K/V.
+        v = self.v_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.v_head_dim)
+        v = F.pad(v, (0, self.head_dim - self.v_head_dim))  # [B, S, N_kv, head_dim]
+
+        # Attention with GQA support, optional sinks and sliding window (BSND layout)
         attn_output = torch.ops.auto_deploy.torch_attention(
             q,
             k,
@@ -418,7 +422,8 @@ class MiMoV2FlashAttention(nn.Module):
             "bsnd",
         )
 
-        # [B, S, N, v_head_dim] -> [B, S, N * v_head_dim]
+        # Slice back to v_head_dim and reshape
+        attn_output = attn_output[..., : self.v_head_dim]  # [B, S, N, v_head_dim]
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output)
 

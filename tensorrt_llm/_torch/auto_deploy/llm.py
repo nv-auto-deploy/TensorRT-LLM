@@ -49,18 +49,30 @@ class ADInputProcessor(DefaultInputProcessor):
             # Normalize message content to list-of-dicts format for multimodal
             # processors (e.g., Llama4) that expect {"type": "text", "text": "..."}
             # instead of plain strings when tokenize=True.
+            # Some text-only models' chat templates can't handle list-of-dicts content,
+            # so we try the multimodal format first and fall back to plain strings.
             messages = inputs["messages"]
+            messages_original = [{**msg} for msg in messages]  # shallow copy
             for msg in messages:
                 if isinstance(msg.get("content"), str):
                     msg["content"] = [{"type": "text", "text": msg["content"]}]
 
             # TODO: we don't really need this but it makes for a good sanity check. Consider
             # removing this in the future if we need to speed things up.
-            prompt = self.processor.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=False,
-            )
+            try:
+                prompt = self.processor.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            except (TypeError, Exception):
+                # Fall back to plain string content for text-only models
+                messages = messages_original
+                prompt = self.processor.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
             inputs["prompt"] = prompt
 
             all_args = self.processor.apply_chat_template(

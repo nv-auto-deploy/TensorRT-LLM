@@ -1,7 +1,14 @@
-# Configuration for MiMo-V2-Flash
+# MiMo-V2-Flash configuration for AutoDeploy
 # Uses simple sharding only because Q/K head_dim (192) differs from V head_dim (128),
 # which is not yet supported by the row-col attention sharding heuristic.
+# Disable fuse_finegrained_fp8_moe: the trtllm fused MoE kernel fails with
+# NVRTC compilation error for MiMo-V2-Flash's MoE config (256 experts, block-wise FP8).
+# Use torch-simple compile backend since the Triton MoE fallback is not
+# CUDA-graph-capturable.
 attn_backend: trtllm
+compile_backend: torch-simple
 transforms:
   detect_sharding:
     simple_shard_only: true
+  fuse_finegrained_fp8_moe:
+    enabled: false
