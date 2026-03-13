@@ -530,6 +530,9 @@ def torch_fake_quant_finegrained_fp8_linear(
     weight_scale: List[torch.Tensor],  # [weight_scale_inv]
     input_zp: List[torch.Tensor],  # unused
     weight_zp: List[torch.Tensor],  # unused
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     """FineGrainedFP8 linear operation.
     - weight_scale[0] = weight_scale_inv (per-block weight scale)
@@ -573,6 +576,9 @@ def _torch_fake_quant_finegrained_fp8_linear_fake(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
     out_features = weight_quantized.shape[0]
@@ -585,6 +591,9 @@ def trtllm_finegrained_fp8_linear(
     weight: torch.Tensor,  # [N, K] float8_e4m3fn
     bias: Optional[torch.Tensor],  # [N] or None
     weight_scale: torch.Tensor,  # [N/128, K/128] per-block weight scale
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     """TRT-LLM optimized FineGrainedFP8 linear operation.
 
@@ -655,6 +664,9 @@ def _trtllm_finegrained_fp8_linear_fake(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     weight_scale: torch.Tensor,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
     out_features = weight.shape[0]

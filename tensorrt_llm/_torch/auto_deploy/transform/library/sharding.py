@@ -3644,6 +3644,35 @@ def _apply_hint_gdn(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> 
     return 1 if count > 0 else 0
 
 
+def _apply_hint_mla(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> int:
+    """Process MLA: shard kv_b_proj_weight (arg[4]) colwise along head dim."""
+    [shardable] = extract_op_args(node, "shardable")
+    if not shardable:
+        return 0
+
+    kv_b_weight_node = node.args[4]
+    if not isinstance(kv_b_weight_node, Node):
+        return 0
+
+    for attr_node in get_source_nodes(kv_b_weight_node):
+        pk = attr_node.target
+        try:
+            w = gm.get_parameter(pk)
+        except AttributeError:
+            continue
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=w,
+            param_key=pk,
+            dim=0,
+            rank=tp_rank,
+            world_size=tp_size,
+        )
+        ad_logger.debug(f"  sharded MLA kv_b_proj weight {pk}")
+        return 1
+    return 0
+
+
 def _apply_hint_norm(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> int:
     """Process gated RMS norm: shard weight parameter."""
     [tp_mode] = extract_op_args(node, "tp_mode")
@@ -3882,6 +3911,7 @@ class ApplyShardingHints(BaseTransform):
                     ShardableOp.CONV1D: lambda n: _apply_hint_conv1d(gm, n, tp_rank, tp_size),
                     ShardableOp.SSM: lambda n: _apply_hint_ssm(gm, n, tp_rank, tp_size),
                     ShardableOp.GATED_DELTA: lambda n: _apply_hint_gdn(gm, n, tp_rank, tp_size),
+                    ShardableOp.MLA: lambda n: _apply_hint_mla(gm, n, tp_rank, tp_size),
                     ShardableOp.NORM: lambda n: _apply_hint_norm(gm, n, tp_rank, tp_size),
                     ShardableOp.MOE: lambda n: _apply_hint_moe(gm, n, config),
                 }
