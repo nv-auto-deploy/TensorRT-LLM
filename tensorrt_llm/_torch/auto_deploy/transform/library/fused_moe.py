@@ -1794,16 +1794,16 @@ def _stack_fp8_moe_weights(
         ).item()
 
         if not w1_input_scales_identical or not w2_input_scales_identical:
-            # if not allow_different_input_scales:
-            #     # Fail with assertion
-            #     assert w1_input_scales_identical, (
-            #         "All w1 input scales should have the same value. "
-            #         "Set allow_different_input_scales=True to allow different scales (uses max)."
-            #     )
-            #     assert w2_input_scales_identical, (
-            #         "All w2 input scales should have the same value. "
-            #         "Set allow_different_input_scales=True to allow different scales (uses max)."
-            #     )
+            if not allow_different_input_scales:
+                # Fail with assertion
+                assert w1_input_scales_identical, (
+                    "All w1 input scales should have the same value. "
+                    "Set allow_different_input_scales=True to allow different scales (uses max)."
+                )
+                assert w2_input_scales_identical, (
+                    "All w2 input scales should have the same value. "
+                    "Set allow_different_input_scales=True to allow different scales (uses max)."
+                )
             # Issue warning once and continue - max() will be used
             ad_logger.warning_once(
                 "FP8 MoE: Input scales differ across experts. Using max(input_scale) for quantization. "
@@ -2043,11 +2043,11 @@ def _stack_nvfp4_cutlass_moe_weights(
                 fc1_act_scale = w1_input_scale_stacked[0]
                 fc1_alpha_stacked = w1_alpha_stacked
             else:
-                # if not allow_different_input_scales:
-                #     assert False, (
-                #         "FC1 input scales differ across experts (w1 and/or w3). "
-                #         "Set allow_different_input_scales=True to allow different scales (uses min)."
-                #     )
+                if not allow_different_input_scales:
+                    assert False, (
+                        "FC1 input scales differ across experts (w1 and/or w3). "
+                        "Set allow_different_input_scales=True to allow different scales (uses min)."
+                    )
                 # Issue warning once and continue - min() will be used
                 ad_logger.warning_once(
                     "NVFP4 MoE: Input scales differ across experts. Using min(input_scale) for "
@@ -2077,11 +2077,11 @@ def _stack_nvfp4_cutlass_moe_weights(
                 fc1_act_scale = w1_input_scale_stacked[0]
                 fc1_alpha_stacked = w1_alpha_stacked
             else:
-                # if not allow_different_input_scales:
-                #     assert False, (
-                #         "FC1 input scales differ across experts (w1). "
-                #         "Set allow_different_input_scales=True to allow different scales (uses min)."
-                #     )
+                if not allow_different_input_scales:
+                    assert False, (
+                        "FC1 input scales differ across experts (w1). "
+                        "Set allow_different_input_scales=True to allow different scales (uses min)."
+                    )
                 # Issue warning once and continue - min() will be used
                 ad_logger.warning_once(
                     "NVFP4 MoE: Input scales differ across experts. Using min(input_scale) for "
@@ -2536,11 +2536,11 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
         w2_alpha_stacked = _stack(w2_alpha, dim=0).reshape(-1).to(torch.float32)
         w3_alpha_stacked = _stack(w3_alpha, dim=0).reshape(-1).to(torch.float32)
 
-        # if is_gated_mlp and not allow_different_input_scales:
-        #     assert torch.allclose(w1_input_scale_stacked, w3_input_scale_stacked), (
-        #         "TRTLLM-Gen NVFP4 expects w1 and w3 input scales to match per expert. "
-        #         "Set allow_different_input_scales=True to override."
-        #     )
+        if is_gated_mlp and not allow_different_input_scales:
+            assert torch.allclose(w1_input_scale_stacked, w3_input_scale_stacked), (
+                "TRTLLM-Gen NVFP4 expects w1 and w3 input scales to match per expert. "
+                "Set allow_different_input_scales=True to override."
+            )
 
         if is_gated_mlp:
             fc1_act_global = (

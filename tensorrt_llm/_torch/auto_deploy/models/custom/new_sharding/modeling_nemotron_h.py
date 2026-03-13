@@ -37,9 +37,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
-from sympy.logic.boolalg import false
 import torch
-import torch.utils.checkpoint
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
@@ -199,16 +197,19 @@ class NemotronHMamba2Mixer(nn.Module):
         A = -torch.exp(self.A_log.float())
         y = torch.ops.auto_deploy.torch_ssm(
             hidden_states=torch.ops.auto_deploy.view(
-                hidden_states, [batch_size, seq_len, -1, self.head_dim],
+                hidden_states,
+                [batch_size, seq_len, -1, self.head_dim],
                 tp_scaled_dim=2 if _s else -1,
             ),
             A=A,
             B=torch.ops.auto_deploy.view(
-                B, [batch_size, seq_len, -1, self.ssm_state_size],
+                B,
+                [batch_size, seq_len, -1, self.ssm_state_size],
                 tp_scaled_dim=2 if _s else -1,
             ),
             C=torch.ops.auto_deploy.view(
-                C, [batch_size, seq_len, -1, self.ssm_state_size],
+                C,
+                [batch_size, seq_len, -1, self.ssm_state_size],
                 tp_scaled_dim=2 if _s else -1,
             ),
             D=self.D,
@@ -269,7 +270,7 @@ class NemotronHBlock(nn.Module):
         elif self.block_type == "moe":
             self.mixer = NemotronHMOE(config, layer_idx=layer_idx)
         else:
-            raise ValueError(f"Invalid layer pattern {config.hybrid_override_pattern[layer_idx]}")
+            raise ValueError(f"Invalid block type {self.block_type!r} at layer {layer_idx}")
 
     def forward(self, hidden_states):
         residual = hidden_states
@@ -478,7 +479,7 @@ class NemotronHAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
         query_states = torch.ops.auto_deploy.torch_linear_simple(
@@ -622,7 +623,7 @@ class NemotronHModel(NemotronHPreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> Union[Tuple, NemotronHOutput]:
         if (input_ids is None) ^ (inputs_embeds is not None):
