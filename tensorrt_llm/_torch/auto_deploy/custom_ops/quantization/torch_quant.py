@@ -496,8 +496,6 @@ def torch_fake_quant_finegrained_fp8_linear(
     - input_scale, input_zp, weight_zp are unused
     - block_size is inferred from weight and weight_scale_inv shapes
     """
-    from transformers.integrations.finegrained_fp8 import w8a8_block_fp8_matmul_triton
-
     weight_scale_inv = weight_scale[0]
 
     # Infer block_size from weight and weight_scale_inv shapes
@@ -506,6 +504,19 @@ def torch_fake_quant_finegrained_fp8_linear(
     scale_n, scale_k = weight_scale_inv.shape
     block_n = N // scale_n
     block_k = K // scale_k
+
+    # The HF Triton kernel (w8a8_block_fp8_matmul_triton) requires block dimensions
+    # to be powers of 2.  When TP sharding produces non-power-of-2 weight dimensions
+    # (e.g. 192, 384), fall back to BF16 dequant + cuBLAS.
+    if block_n & (block_n - 1) != 0 or block_k & (block_k - 1) != 0:
+        weight_dequant = _dequant_block_fp8_weight(
+            weight_quantized, weight_scale_inv, block_n, block_k, dtype=input.dtype
+        )
+        output = torch.nn.functional.linear(input, weight_dequant, bias)
+        return output
+
+    from transformers.integrations.finegrained_fp8 import w8a8_block_fp8_matmul_triton
+
     block_size = [block_n, block_k]
 
     qinput, scale = _safe_act_quant(input, block_size[1])
