@@ -41,7 +41,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
-from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from .communication import (
     AllGatherReduceScatter,
     Communication,
@@ -51,11 +50,7 @@ from .communication import (
     NVLinkOneSided,
     NVLinkTwoSided,
 )
-
-if IS_CUTLASS_DSL_AVAILABLE:
-    from .fused_moe_cute_dsl import CuteDslFusedMoE
-else:
-    CuteDslFusedMoE = None  # type: ignore[assignment,misc]
+from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
