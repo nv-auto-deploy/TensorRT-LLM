@@ -20,9 +20,11 @@ auto_deploy custom ops (torch_attention, torch_rope_with_explicit_cos_sin)
 for export compatibility. InternLM3 uses GQA with SwiGLU MLP, RMSNorm,
 and dynamic NTK-scaled RoPE.
 
-Since InternLM3 is not natively in the installed transformers (requires
-trust_remote_code), HF reference classes are defined inline for equivalence
-testing.
+HF reference classes are defined inline for equivalence testing because the
+HF modeling_internlm3.py (from the HF checkpoint) cannot be imported on the
+installed transformers version — it requires ``LossKwargs`` from
+``transformers.utils`` which is only available in transformers >=4.48.
+The config class *can* be loaded via AutoConfig with trust_remote_code.
 """
 
 import math
@@ -33,13 +35,13 @@ import torch.nn.functional as F
 from _model_test_utils import assert_rmse_close
 from torch import nn
 from torch.export import Dim
+from transformers import AutoConfig
 from transformers.activations import ACT2FN
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_internlm3 import (
     InternLM3Attention,
-    InternLM3Config,
     InternLM3DecoderLayer,
     InternLM3ForCausalLM,
     InternLM3MLP,
@@ -50,14 +52,26 @@ from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
 _BATCH_AND_SEQUENCE_TEST_CASES = ((2, 6), (1, 8))
 
+# Load InternLM3Config from the HF checkpoint cache (trust_remote_code).
+# The config class is not in the installed transformers but is bundled with the HF repo.
+try:
+    _hf_config = AutoConfig.from_pretrained(
+        "internlm/internlm3-8b-instruct", trust_remote_code=True
+    )
+    InternLM3Config = type(_hf_config)
+except Exception:
+    InternLM3Config = None
+
 
 @pytest.fixture(scope="function", autouse=True)
 def set_seed():
     torch.manual_seed(42)
 
 
-def _create_small_config() -> InternLM3Config:
+def _create_small_config():
     """Create a small InternLM3 config for testing."""
+    if InternLM3Config is None:
+        pytest.skip("InternLM3Config not available (internlm/internlm3-8b-instruct not cached)")
     return InternLM3Config(
         vocab_size=1000,
         hidden_size=64,

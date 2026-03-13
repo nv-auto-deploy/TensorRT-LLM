@@ -19,13 +19,14 @@ Source:
 https://huggingface.co/internlm/internlm3-8b-instruct
 
 This implementation differs from the original HuggingFace version in the following ways:
-* Bundled config class to work without trust_remote_code (model not in transformers)
 * Simplified for prefill-only inference (no KV caching)
 * Uses auto_deploy custom ops for export compatibility
 * Removed flash attention variants (uses torch_attention custom op)
 * Removed gradient checkpointing and training code paths
 * Removed attention dropout (inference only)
 * No repeat_kv — AD attention ops handle GQA natively
+
+Config is loaded from the HF checkpoint via trust_remote_code=True (not bundled here).
 
 The InternLM3 model uses GQA with SwiGLU MLP, RMSNorm, and dynamic NTK-scaled RoPE.
 """
@@ -35,7 +36,6 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import AutoConfig, PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
@@ -43,79 +43,6 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-
-
-class InternLM3Config(PretrainedConfig):
-    """Configuration class for InternLM3 model.
-
-    Bundled with the custom model implementation since InternLM3 is not natively
-    registered in transformers (requires trust_remote_code).
-    """
-
-    model_type = "internlm3"
-
-    def __init__(
-        self,
-        vocab_size: int = 128512,
-        hidden_size: int = 4096,
-        intermediate_size: int = 11008,
-        num_hidden_layers: int = 32,
-        num_attention_heads: int = 32,
-        num_key_value_heads: int = 32,
-        hidden_act: str = "silu",
-        max_position_embeddings: int = 32768,
-        initializer_range: float = 0.02,
-        rms_norm_eps: float = 1e-6,
-        tie_word_embeddings: bool = False,
-        rope_theta: float = 10000.0,
-        rope_scaling: Optional[dict] = None,
-        qkv_bias: bool = False,
-        attention_dropout: float = 0.0,
-        bias: bool = False,
-        head_dim: Optional[int] = None,
-        pad_token_id: Optional[int] = None,
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = (
-            num_key_value_heads if num_key_value_heads is not None else num_attention_heads
-        )
-        self.hidden_act = hidden_act
-        self.max_position_embeddings = max_position_embeddings
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self.qkv_bias = qkv_bias
-        self.attention_dropout = attention_dropout
-        self.bias = bias
-        self.head_dim = (
-            head_dim if head_dim is not None else self.hidden_size // self.num_attention_heads
-        )
-
-        # Normalize rope_scaling type field
-        if self.rope_scaling is not None and "type" in self.rope_scaling:
-            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-
-        super().__init__(
-            pad_token_id=pad_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
-
-
-# Register config with AutoConfig so it can be loaded from HF hub
-try:
-    AutoConfig.register("internlm3", InternLM3Config, exist_ok=True)
-except TypeError:
-    try:
-        AutoConfig.register("internlm3", InternLM3Config)
-    except ValueError:
-        pass
 
 
 class InternLM3RMSNorm(nn.Module):
@@ -310,7 +237,6 @@ class InternLM3CausalLMOutput(ModelOutput):
 class InternLM3PreTrainedModel(PreTrainedModel):
     """Base class for InternLM3 models."""
 
-    config_class = InternLM3Config
     base_model_prefix = "model"
     _no_split_modules = ["InternLM3DecoderLayer"]
     supports_gradient_checkpointing = False
