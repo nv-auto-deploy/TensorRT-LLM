@@ -35,7 +35,7 @@ from .....functional import AllReduceStrategy
 from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import del_attr_by_name, eliminate_dead_code
+from ...utils._graph import del_attr_by_name, eliminate_dead_code, get_lm_head_node
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     LayerSubgraph,
@@ -3170,6 +3170,15 @@ def detect_column_row_shard(
             num_column_row_shards += 1
             if layer.layer_type == LayerType.ATTENTION:
                 num_mha_shards += 1
+
+    # always simple-shard the lm_head (column split + all_gather) if it is unprocessed
+    lm_head_node = get_lm_head_node(gm)
+    if is_any_lin_op(lm_head_node) and lm_head_node in unprocessed_linear_nodes:
+        ad_logger.info("Applying simple shard to lm_head node")
+        num_simple_shards += _process_simple_shard(
+            [lm_head_node], transform_container
+        )
+        unprocessed_linear_nodes.discard(lm_head_node)
 
     # simple shard remaining linear nodes
     if config.shard_all_unprocessed:
