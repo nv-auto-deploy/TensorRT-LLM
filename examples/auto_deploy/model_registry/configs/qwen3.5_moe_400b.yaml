@@ -26,6 +26,7 @@ transforms:
     allreduce_strategy: SYMM_MEM
     shard_all_unprocessed: true
     simple_shard_filter: "lm_head"
+    shard_all_unprocessed: true
   multi_stream_moe:
     stage: compile
     enabled: true
