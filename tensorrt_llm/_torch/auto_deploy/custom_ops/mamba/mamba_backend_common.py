@@ -301,54 +301,6 @@ def _prepare_ssm_grouped_state_update_inputs(
     return slot_idx_slice, x_slice, B_slice, C_slice, dt_hp_slice, A_full, D_full, dt_bias_hp
 
 
-def _prepare_ssm_extend_inputs(
-    hs_flat: torch.Tensor,
-    B_flat: torch.Tensor,
-    C_flat: torch.Tensor,
-    dt_flat: torch.Tensor,
-    A: torch.Tensor,
-    D: torch.Tensor,
-    dt_bias: torch.Tensor,
-    slot_idx: torch.Tensor,
-    num_prefill: int,
-    num_prefill_tokens: int,
-    num_extend: int,
-    num_extend_tokens: int,
-    num_heads: int,
-    head_dim: int,
-    ssm_state_size: int,
-) -> Optional[
-    Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]
-]:
-    grouped_inputs = _prepare_ssm_grouped_state_update_inputs(
-        hs_flat,
-        B_flat,
-        C_flat,
-        dt_flat,
-        A,
-        D,
-        dt_bias,
-        slot_idx,
-        seq_start=num_prefill,
-        token_start=num_prefill_tokens,
-        num_seq=num_extend,
-        num_tokens=num_extend_tokens,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        ssm_state_size=ssm_state_size,
-    )
-    return grouped_inputs
-
-
 class BaseBackendSSM(AttentionDescriptor):
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:

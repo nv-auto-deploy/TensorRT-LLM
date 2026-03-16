@@ -25,7 +25,7 @@ from .mamba_backend_common import (
     BaseBackendSSM,
     _flatten_ssm_inputs,
     _prepare_ssm_decode_inputs,
-    _prepare_ssm_extend_inputs,
+    _prepare_ssm_grouped_state_update_inputs,
     _run_ssm_prefill,
 )
 
@@ -104,7 +104,7 @@ def _triton_cached_ssm_impl(
     )
 
     # EXTEND: use verify/decode-style state-update kernel with intermediate-write semantics.
-    extend_inputs = _prepare_ssm_extend_inputs(
+    extend_inputs = _prepare_ssm_grouped_state_update_inputs(
         hs_flat,
         B_flat,
         C_flat,
@@ -113,13 +113,13 @@ def _triton_cached_ssm_impl(
         D,
         dt_bias,
         slot_idx,
-        num_prefill,
-        num_prefill_tokens,
-        num_extend,
-        num_extend_tokens,
-        num_heads,
-        head_dim,
-        ssm_state_size,
+        seq_start=num_prefill,
+        token_start=num_prefill_tokens,
+        num_seq=num_extend,
+        num_tokens=num_extend_tokens,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        ssm_state_size=ssm_state_size,
     )
     if extend_inputs is not None:
         if intermediate_ssm_state_cache is None:

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -707,6 +707,15 @@ class ADEngine(ModelEngine):
         num_decode_tokens = num_decode
         num_extend = len(extend_requests)
         num_extend_tokens = len(input_ids) - num_prefill_tokens - num_decode_tokens
+        if num_extend > 1:
+            extend_lens = [
+                cu_seqlen[num_prefill + i + 1] - cu_seqlen[num_prefill + i]
+                for i in range(num_extend)
+            ]
+            if len(set(extend_lens)) > 1:
+                raise ValueError(
+                    "Non-uniform extend lengths are not currently supported in AutoDeploy."
+                )
         batch_info = [num_prefill, num_prefill_tokens]
         batch_info.extend([num_extend, num_extend_tokens])
         batch_info.extend([num_decode, num_decode_tokens])
