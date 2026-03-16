@@ -32,7 +32,7 @@ Reference:
   - Gated Delta Networks paper: https://arxiv.org/abs/2412.06464
 """
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -218,6 +218,7 @@ def torch_cached_gated_delta_rule(
     delta_cache: torch.Tensor,  # [max_batch_size, HV, K, V]
     # CONSTANTS
     scale: float,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Cached gated delta rule using pure-torch recurrence.
 
@@ -231,6 +232,7 @@ def torch_cached_gated_delta_rule(
 
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode
 
     cu_seqlen_prefill = cu_seqlen[: num_prefill + 1]
     slot_idx = slot_idx[:num_seq].to(torch.long)
@@ -321,6 +323,13 @@ def torch_cached_gated_delta_rule(
             y_flat[token_idx] = o_tok.squeeze(0).to(y_flat.dtype)
             delta_cache[slot] = new_state.squeeze(0).to(delta_cache.dtype)
 
+    if out is not None:
+        out_flat = out.reshape(bsz * s, HV, -1)
+        out_flat[:num_total_tokens].copy_(y_flat[:num_total_tokens])
+        if num_total_tokens < bsz * s:
+            out_flat[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
     return y
 
 
@@ -339,7 +348,10 @@ def torch_cached_gated_delta_rule_fake(
     use_initial_states: torch.Tensor,
     delta_cache: torch.Tensor,
     scale: float,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if out is not None:
+        return out.new_empty(0)
     return torch.empty_like(v)
 
 
