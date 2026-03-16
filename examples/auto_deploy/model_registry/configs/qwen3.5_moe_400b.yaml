@@ -24,6 +24,7 @@ transforms:
   detect_sharding:
     allreduce_strategy: SYMM_MEM
     dist_mapping: {moe_tp: 8, moe_ep: 1}
+    shard_all_unprocessed: true
   multi_stream_moe:
     stage: compile
     enabled: true
