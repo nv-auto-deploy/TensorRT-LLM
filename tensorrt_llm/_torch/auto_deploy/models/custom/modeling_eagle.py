@@ -748,30 +748,20 @@ class EagleWrapper(nn.Module):
         """Get the dtype of the draft model (works before and after export)."""
         return getattr(self._draft_inner_model, "dtype", None) or torch.bfloat16
 
-    def _apply_target_norm_f(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply the target model's final RMSNorm to hidden states.
+    def normalize_target_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply the target model's final normalization to hidden states.
 
-        Hidden states are captured at the residual add (pre-norm_f), but the MTP
-        head expects post-norm_f. This finds the norm_f weight from the graph's
-        parameters and applies RMSNorm inline, avoiding set_submodule which would
-        interfere with the graph's internal parameter references.
+        MTP hidden states are captured at the residual add (pre-norm_f), but the
+        MTP head expects post-norm_f input. The target model must expose
+        get_final_normalization() for this to work.
         """
-        if not hasattr(self, "_norm_f_weight"):
-            # Lazy lookup: find norm_f weight in target model's parameters
-            self._norm_f_weight = None
-            self._norm_f_eps = 1e-5
-            for name, param in self.target_model.named_parameters():
-                if "norm_f" in name and "weight" in name:
-                    self._norm_f_weight = param
-                    break
-        if self._norm_f_weight is None:
-            return hidden_states
-        # Apply RMSNorm: x / rms(x) * weight
-        orig_dtype = hidden_states.dtype
-        hidden_states = hidden_states.float()
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self._norm_f_eps)
-        return (self._norm_f_weight.float() * hidden_states).to(orig_dtype)
+        norm_fn = getattr(self.target_model, "get_final_normalization", None)
+        if norm_fn is None:
+            raise RuntimeError(
+                "MTP requires the target model to expose get_final_normalization(), "
+                f"but {type(self.target_model).__name__} does not implement it."
+            )
+        return norm_fn()(hidden_states)
 
     def apply_eagle3_fc(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply the fc layer that fuses hidden states from multiple target layers."""
@@ -949,9 +939,9 @@ class EagleWrapper(nn.Module):
         hidden_states = self._collect_hidden_states(csi.named_args, num_total_tokens)
         if self.is_mtp:
             # MTP: hidden states are captured at the residual add (pre-norm_f).
-            # Apply the target model's final RMSNorm to match the PyTorch backend
+            # Apply the target model's final normalization to match the PyTorch backend
             # which passes norm_f(hidden_states) to MTPEagleWorker.
-            hidden_states = self._apply_target_norm_f(hidden_states)
+            hidden_states = self.normalize_target_hidden_states(hidden_states)
             # Cast to draft model dtype (e.g. target may be FP8, draft BF16).
             hidden_states = hidden_states.to(self._draft_dtype)
         else:

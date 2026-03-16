@@ -14,7 +14,7 @@ import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
 from types import MethodType, SimpleNamespace
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -406,19 +406,6 @@ def maybe_pad_for_cuda_graph(func):
     return wrapper
 
 
-class _MambaUpdateContext(NamedTuple):
-    """Lightweight shim matching the AttentionMetadata fields read by update_mamba_states.
-
-    MambaHybridCacheManager.update_mamba_states expects an attn_metadata object
-    with .num_seqs and .num_contexts.  In AutoDeploy we don't have a real
-    AttentionMetadata, so we build this from the CachedSequenceInterface batch
-    info instead.
-    """
-
-    num_seqs: int
-    num_contexts: int
-
-
 class ADEngine(ModelEngine):
     """The AutoDeploy Engine (ADEngine) is the main engine interface to execute AutoDeploy models.
 
@@ -751,28 +738,6 @@ class ADEngine(ModelEngine):
         # TODO: handle extend requests and draft requests for specdec
         self.iter_states["num_generation_tokens"] = num_decode_tokens + num_extend_tokens
         self.iter_states["ordered_requests"] = ordered_requests
-
-    def update_mamba_states(self, model_output: Dict[str, Optional[torch.Tensor]]) -> None:
-        """Update Mamba states based on model output."""
-        kv_cache_manager = self.cache_seq_interface.kv_cache_manager
-        num_prefill, num_extend, num_decode = (
-            self.cache_seq_interface.info.batch_info.get_num_sequences()
-        )
-        num_accepted = model_output.get("new_tokens_lens", None)
-        if num_extend > 0 and isinstance(kv_cache_manager, MambaHybridCacheManager):
-            assert kv_cache_manager.is_speculative(), (
-                "if num_extend > 0, kv_cache_manager must be speculative"
-            )
-            assert num_decode == 0, "if num_extend > 0, num_decode must be 0"
-            assert num_accepted is not None, "new_tokens_lens required for mamba state update"
-            ctx = _MambaUpdateContext(
-                num_seqs=num_prefill + num_extend,
-                num_contexts=num_prefill,
-            )
-            kv_cache_manager.update_mamba_states(
-                attn_metadata=ctx,
-                num_accepted_tokens=num_accepted,
-            )
 
     @nvtx_range("ad_run_forward")
     def _run_forward(self) -> Dict[str, Optional[torch.Tensor]]:

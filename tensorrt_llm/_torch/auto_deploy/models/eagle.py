@@ -148,6 +148,23 @@ class TargetModelExportInfo(SubModuleExportInfo):
                 torch._assert, args=(n_lm_head, "Avoid lm_head getting deleted from graph.")
             )
 
+        # --- Final normalization: only if target model exposes it (e.g., NemotronH for MTP) ---
+        if hasattr(sub_mod, "get_final_normalization"):
+            norm_module = sub_mod.get_final_normalization()
+            sub_gm.get_final_normalization = types.MethodType(
+                sub_mod.get_final_normalization.__func__, sub_gm
+            )
+            for norm_name, subsubmod in sub_mod.named_modules():
+                if subsubmod is norm_module:
+                    break
+            else:
+                raise RuntimeError("Could not find final normalization module in target model.")
+            sub_gm.set_submodule(norm_name, norm_module)
+            n_norm = sub_gm.graph.get_attr(f"{norm_name}.weight")
+            sub_gm.graph.call_function(
+                torch._assert, args=(n_norm, "Avoid final norm getting deleted from graph.")
+            )
+
 
 class DraftModelExportInfo(SubModuleExportInfo):
     """Export info for the draft model inside EagleWrapper."""
