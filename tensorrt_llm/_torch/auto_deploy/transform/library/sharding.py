@@ -1007,7 +1007,7 @@ class Sharding(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # NOTE: Draft-model sharding is not supported at the moment.
+        # Draft models are not sharded — they run unsharded inside EagleWrapper.
         if getattr(gm, "is_draft", False):
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
@@ -1131,7 +1131,7 @@ class ShardingTransformExecutor(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # NOTE: Draft-model sharding is not supported at the moment.
+        # Draft models are not sharded — they run unsharded inside EagleWrapper.
         if getattr(gm, "is_draft", False):
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True

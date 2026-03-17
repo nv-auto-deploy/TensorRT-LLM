@@ -317,57 +317,6 @@ class PythonMambaCacheManager(BaseResourceManager):
         # Store max_batch_size for resource management
         self._max_batch_size = max_batch_size
 
-    def ensure_speculative_intermediate_buffers(
-            self, speculative_num_draft_tokens: int) -> None:
-        """Lazily allocate speculative intermediate buffers after manager construction.
-
-        TODO: Move this allocation back to MambaHybridCacheManager constructor once AutoDeploy's
-        speculative-layer handling is reconciled with KVCacheManager construction.
-        """
-        if speculative_num_draft_tokens < 0:
-            raise ValueError(
-                f"speculative_num_draft_tokens must be non-negative, got {speculative_num_draft_tokens}"
-            )
-
-        if (isinstance(self.mamba_cache, self.SpeculativeState)
-                and self.speculative_num_draft_tokens
-                == speculative_num_draft_tokens):
-            return
-
-        conv_states = self.mamba_cache.conv
-        ssm_states = self.mamba_cache.temporal
-        num_local_layers = conv_states.shape[0]
-        conv_state_shape = tuple(conv_states.shape[2:])
-        ssm_state_shape = tuple(ssm_states.shape[2:])
-
-        intermediate_ssm_states = torch.zeros(
-            size=(
-                num_local_layers,
-                self.spec_state_size,
-                speculative_num_draft_tokens + 1,
-            ) + ssm_state_shape,
-            dtype=ssm_states.dtype,
-            device=ssm_states.device,
-        )
-
-        intermediate_conv_window_cache = torch.zeros(
-            size=(
-                num_local_layers,
-                self.spec_state_size,
-                speculative_num_draft_tokens + 1,
-            ) + conv_state_shape,
-            dtype=conv_states.dtype,
-            device=conv_states.device,
-        )
-
-        self.mamba_cache = self.SpeculativeState(
-            conv=conv_states,
-            temporal=ssm_states,
-            intermediate_ssm=intermediate_ssm_states,
-            intermediate_conv_window=intermediate_conv_window_cache,
-        )
-        self.speculative_num_draft_tokens = speculative_num_draft_tokens
-
     def get_max_resource_count(self) -> int:
         """Return the maximum number of sequences that can be cached."""
         return self._max_batch_size
