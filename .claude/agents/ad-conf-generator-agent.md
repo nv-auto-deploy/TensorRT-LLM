@@ -16,6 +16,11 @@ Analyze AD graph dumps, profiling logs, and model architecture to generate optim
 - **tried_configs**: List of previously tried config descriptions
 - **nsys_trace_path**: Path to nsys trace (if available, from bench-sweep)
 - **world_size**: Current world_size being used
+- **gpu_type**: GPU name (e.g., "NVIDIA H100 80GB HBM3")
+- **gpu_vram_gb**: Per-GPU VRAM in GB
+- **gpu_count**: Number of GPUs
+- **max_seq_len**: Maximum sequence length configured
+- **max_batch_size**: Maximum batch size configured
 
 If any required inputs are missing, ask the caller.
 
@@ -33,9 +38,9 @@ If any required inputs are missing, ask the caller.
    - Record which transforms were effective vs no-ops
 3. Build a list of already-tried config combinations
 
-### Step B — Config Collection (launch 3 subagents in parallel)
+### Step B — Config Collection (launch 4 subagents in parallel)
 
-Launch these 3 specialized subagents in parallel. Each writes its results to a YAML file in the session dir. **Each subagent will also scan the model registry for configs from models with similar architecture** (same attention type, MoE structure, etc.) and use those proven configs as strong candidates.
+Launch these 4 specialized subagents in parallel. Each writes its results to a YAML file in the session dir. **Each subagent will also scan the model registry for configs from models with similar architecture** (same attention type, MoE structure, etc.) and use those proven configs as strong candidates.
 
 1. **`ad-conf-fusion-analyst`** subagent — analyze graph dumps for fusion opportunities + check similar-model configs
    - Pass: graph_dump_dir, tried_configs, model_arch, session_dir
@@ -45,16 +50,20 @@ Launch these 3 specialized subagents in parallel. Each writes its results to a Y
    - Pass: session_dir, model_arch, world_size, nsys_trace_path, tried_configs
    - Writes: `<session_dir>/sharding_suggestions.yaml`
 
-3. **`ad-conf-ops-analyst`** subagent — analyze attention/compile backends, other ops + check similar-model configs
+3. **`ad-conf-ops-analyst`** subagent — analyze compile backends, CUDA graph settings, other ops + check similar-model configs
    - Pass: graph_dump_dir, model_arch, tried_configs, session_dir
    - Writes: `<session_dir>/ops_suggestions.yaml`
+
+4. **`ad-conf-attn-analyst`** subagent — analyze attention backends, free GPU memory for KV cache sizing, KV cache compression
+   - Pass: graph_dump_dir, model_arch, tried_configs, session_dir, gpu_type, gpu_vram_gb, gpu_count, max_seq_len, max_batch_size
+   - Writes: `<session_dir>/attn_suggestions.yaml`
 
 ### Step C — Combine Results & Generate Candidates
 
 After subagents complete, read all suggestion files and combine:
 
 #### 1. Read all subagent suggestions
-Read `fusion_suggestions.yaml`, `sharding_suggestions.yaml`, `ops_suggestions.yaml`.
+Read `fusion_suggestions.yaml`, `sharding_suggestions.yaml`, `ops_suggestions.yaml`, `attn_suggestions.yaml`.
 
 #### 2. Decide runtime config based on perf priority
 
@@ -71,8 +80,9 @@ Read `fusion_suggestions.yaml`, `sharding_suggestions.yaml`, `ops_suggestions.ya
 - Sort by expected impact (rough priority order):
   1. **Fusions** — highest impact, directly eliminates kernel launch overhead and memory traffic
   2. **Sharding/parallelism** — significant impact on multi-GPU models
-  3. **Attention/compile backends** — moderate impact
-  4. **Runtime tuning** — fine-tuning, lower individual impact
+  3. **Attention backend / KV cache compression** — moderate-to-high impact (KV cache compression unlocks more concurrent requests)
+  4. **Compile backends / CUDA graph tuning** — moderate impact
+  5. **Runtime tuning** — fine-tuning, lower individual impact
 
 #### 4. Generate candidate YAML files
 

@@ -93,7 +93,7 @@ Ask the user for:
    - If bench-sweep selected: ask whether nsys trace capture is desired (only available with bench-sweep)
 6. **Profiling approach** — single method throughout, OR two-stage (trtllm-bench for fast screening, bench-sweep for final serving eval of winner)
 7. If model estimated size > single GPU VRAM: ask about `skip_loading_weights: true` for fast iteration
-8. If trtllm-bench: need dataset JSONL path, or offer to generate with `trtllm-bench --model <MODEL> prepare-dataset --stdout --num-requests 512 --output-sequence-length <OSL> --input-sequence-length <ISL> > <path>`
+8. If trtllm-bench: need dataset JSONL path, or offer to generate with `trtllm-bench --model <MODEL> prepare-dataset --stdout --num-requests 512 --output-sequence-length <OSL> --input-sequence-length <ISL> > <path>`. Then create per-concurrency datasets with right-sized request counts: `max(concurrency * 5, 100)` requests per concurrency level (e.g., c1→100, c4→100, c16→80). This avoids wasting time on low-concurrency runs where 512 requests at c1 takes ~68 min vs ~13 min with 100 requests.
 9. If existing config found in Step 0.4 and user didn't provide one in Step 0.5: ask whether to use it as baseline
 
 Record all answers in `session_state.yaml` and `session_log.md`.
@@ -128,7 +128,7 @@ Invoke the `ad-conf-generator-agent` subagent with:
 
 The generator agent:
 1. **Preprocesses**: Reads all `trials/*/trial_record.yaml`, checks profiler logs for actual transform application (`num_matches`, `Skipping`, `Applied` patterns)
-2. **Launches 3 subagents in parallel**: fusion-analyst, sharding-analyst, ops-analyst
+2. **Launches 4 subagents in parallel**: fusion-analyst, sharding-analyst, ops-analyst, attn-analyst
 3. **Combines results** and generates up to 3 candidate YAML files in `trials/candidates/`
 
 **Wrap-up:**
@@ -138,6 +138,11 @@ The generator agent:
 ---
 
 ## Step 3 — Profiler (invoke `ad-conf-profiler-agent`)
+
+**Memory check before profiling:** Before launching any profiling run, estimate per-instance GPU memory:
+- Model weights (param_count × bytes_per_param) + KV cache + ~5-10 GB runtime overhead
+- **Never run multiple benchmark instances simultaneously** unless you have verified each GPU has sufficient VRAM independently. OOM kills (signal 9) waste 20-30+ minutes per failed run.
+- When in doubt, run benchmarks sequentially on a single GPU.
 
 Invoke the `ad-conf-profiler-agent` subagent for each config to profile. Pass it:
 - Model HF ID

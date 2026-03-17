@@ -24,7 +24,21 @@ If any required inputs are missing, ask the caller.
 
 ## Workflow
 
-### 0. GPU Selection
+### 0. GPU Selection & Memory Estimation
+
+**Memory estimation (MUST do before launching):**
+
+Before running any benchmark, estimate per-instance GPU memory:
+1. **Model weights:** `param_count × bytes_per_param` (bf16 = 2 bytes, fp8 = 1 byte)
+2. **KV cache:** `2 × num_layers × kv_heads × head_dim × max_seq_len × max_batch_size × dtype_bytes`
+3. **Runtime overhead:** ~5-10 GB (activations, CUDA context, graph compilation)
+4. **Total per instance** = weights + KV cache + overhead
+
+**CRITICAL: Never launch multiple benchmark instances on the same GPU or on separate GPUs simultaneously without verifying that total memory across all instances fits within available VRAM.** Running two instances of a 7B model (each needing ~30-35 GB) on an 80 GB GPU will OOM and waste significant time.
+
+**When parallelizing across GPUs:** Each GPU must independently have enough VRAM for its instance. Also account for shared host memory pressure from multiple model loads.
+
+**Rule of thumb:** When in doubt, run sequentially. The time lost to OOM retries exceeds the time saved by parallelism.
 
 Follow the same GPU selection pattern as `ad-run-agent`:
 
@@ -35,6 +49,7 @@ Follow the same GPU selection pattern as `ad-run-agent`:
 2. A GPU is **free** if memory usage < 1000 MiB and utilization is 0%.
 3. Select `world_size` contiguous free GPUs (prefer lowest indices).
 4. If not enough free GPUs: report which are busy, wait 60 seconds, check again. Repeat until enough are available.
+5. **Verify** estimated per-instance memory fits within the free GPU's total VRAM with ≥10% safety margin.
 
 ### 1. Create Trial Directory
 
@@ -53,6 +68,10 @@ echo "# No extra config — using AD defaults" > <trial_dir>/config.yaml
 Dispatch based on `profiling_method`:
 
 #### trtllm-bench
+
+**Dataset sizing:** Use a right-sized dataset per concurrency level to avoid unnecessarily long runs. Low-concurrency runs (c1) process requests serially and have low variance, so fewer requests suffice. Use separate dataset files per concurrency:
+- Number of requests = `max(concurrency * 5, 100)` — e.g., c1→100, c4→100, c16→80
+- Generate with: `head -<N> <full_dataset> > <dataset_N>.jsonl`
 
 For each concurrency level in `concurrency_levels`, run via gpu-shell:
 ```bash
