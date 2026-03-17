@@ -555,6 +555,11 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             "nvidia/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726"),
     }
     MODEL_PATH_BF16 = MODEL_PATHS["bf16"]
+    # A12B checkpoint for MTP tests (consistent with upstream PR 12243)
+    # TODO: FP8/NVFP4 MTP testing
+    MTP_MODEL_NAME = "nvidia/Nemotron-Super-V3"
+    MTP_MODEL_PATH_BF16 = hf_id_to_local_model_dir(
+        "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16")
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
 
@@ -623,7 +628,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             speculative_config = llmapi.MTPDecodingConfig(
                 num_nextn_predict_layers=6,
                 mtp_eagle_one_model=True,
-                speculative_model=self.MODEL_PATH_BF16,
+                speculative_model=self.MTP_MODEL_PATH_BF16,
             )
         else:
             speculative_config = None
@@ -654,11 +659,11 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             "max_seq_len": self.MAX_SEQ_LEN,
         }
         with AutoDeployLLM(
-                model=self.MODEL_PATH_BF16,
-                tokenizer=self.MODEL_PATH_BF16,
+                model=self.MTP_MODEL_PATH_BF16,
+                tokenizer=self.MTP_MODEL_PATH_BF16,
                 **kwargs,
         ) as llm:
-            task = GSM8K(self.MODEL_NAME)
+            task = GSM8K(self.MTP_MODEL_NAME)
             task.evaluate(llm)
             if use_mtp:
                 self.check_acceptance_rate(llm, min_acceptance_rate=0.0)
@@ -670,12 +675,12 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         speculative_config = llmapi.MTPDecodingConfig(
             num_nextn_predict_layers=6,
             mtp_eagle_one_model=True,
-            speculative_model=self.MODEL_PATH_BF16,
+            speculative_model=self.MTP_MODEL_PATH_BF16,
         )
 
         with LLM(
-                model=self.MODEL_PATH_BF16,
-                tokenizer=self.MODEL_PATH_BF16,
+                model=self.MTP_MODEL_PATH_BF16,
+                tokenizer=self.MTP_MODEL_PATH_BF16,
                 tensor_parallel_size=4,
                 trust_remote_code=True,
                 kv_cache_config=llmapi.KvCacheConfig(
@@ -688,7 +693,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                 attn_backend="flashinfer",
                 max_seq_len=self.MAX_SEQ_LEN,
         ) as llm:
-            task = GSM8K(self.MODEL_NAME)
+            task = GSM8K(self.MTP_MODEL_NAME)
             task.evaluate(llm)
             self.check_acceptance_rate(llm, min_acceptance_rate=0.0)
 
