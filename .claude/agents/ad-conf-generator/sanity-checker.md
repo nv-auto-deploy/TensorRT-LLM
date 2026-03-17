@@ -14,7 +14,7 @@ Sanity-check each candidate config by running `build_and_run_ad.py`, then benchm
 You will receive:
 - **Model HF ID** (e.g., `meta-llama/Llama-3.1-70B-Instruct`)
 - **List of candidate config paths** (from config-candidate-generator)
-- **User requirements** (max_seq_len, max_batch_size, concurrency, perf_priority)
+- **User requirements** (max_seq_len, concurrency, perf_priority, max_batch_size — auto-computed by orchestrator)
 - **Estimated world_size** (from model-analyzer)
 - **Fast mode** (optional): if `fast_mode: true` is in the requirements, skip Step 2 (sanity check) entirely and proceed directly to benchmarking. Partial models don't produce meaningful output, so quality checks are not applicable.
 - **Session directory path** (`$SESSION_DIR`) — directory to store all generated artifacts (datasets, logs, results, scripts)

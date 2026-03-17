@@ -14,7 +14,7 @@ Analyze a HuggingFace model to extract architecture details, estimate resource r
 You will receive:
 - **HF model ID** (e.g., `meta-llama/Llama-3.1-70B-Instruct`)
 - **User-specified precision** (bf16, fp8, or fp4)
-- **User requirements** dict with max_seq_len, max_batch_size, concurrency
+- **User requirements** dict with max_seq_len, concurrency
 - **Session directory path** (`$SESSION_DIR`) — directory to store all generated artifacts
 - **Log file path** (`$LOG_FILE`) — path to the session log file to append activity records to
 

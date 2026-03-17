@@ -2,7 +2,7 @@
 name: ad-conf-generator
 description: >
   Generate and evaluate optimal AutoDeploy configs for a user's model.
-  Asks for model, precision, max_seq_len, max_batch_size, concurrency,
+  Asks for model, precision, max_seq_len, concurrency,
   then runs 4 agents: model analysis, config candidate generation,
   sanity check + trtllm-bench, and final trtllm-serve evaluation.
 ---
@@ -38,7 +38,6 @@ echo "|-----------|-------|" >> "$LOG_FILE"
 echo "| Model | $MODEL |" >> "$LOG_FILE"
 echo "| Precision | $PRECISION |" >> "$LOG_FILE"
 echo "| max_seq_len | $MAX_SEQ_LEN |" >> "$LOG_FILE"
-echo "| max_batch_size | $MAX_BATCH_SIZE |" >> "$LOG_FILE"
 echo "| Concurrency | $CONCURRENCY |" >> "$LOG_FILE"
 echo "| Performance priority | $PERF_PRIORITY |" >> "$LOG_FILE"
 echo "" >> "$LOG_FILE"
@@ -100,10 +99,11 @@ Before launching any agents, gather the following from the user. If the user has
 | **Model** | HuggingFace model ID or local path | `meta-llama/Llama-3.1-70B-Instruct` |
 | **Precision** | bf16, fp8, or fp4 (can be deduced from model name/config) | `fp8` |
 | **max_seq_len** | Target max sequence length (ISL + OSL) | `4096` |
-| **max_batch_size** | Maximum batch size for serving | `64` |
-| **Concurrency** | Typical number of concurrent requests | `32` |
+| **Concurrency** | Typical number of concurrent requests in production | `512` |
 | **Performance priority** | Which metric matters most for ranking configs | `OTPS` |
 | **Benchmark mode** | `trtllm-bench` only (faster) or `trtllm-bench` + `bench-sweep` (comprehensive) | `trtllm-bench` |
+
+**Do NOT ask the user for `max_batch_size`.** It is auto-computed after Phase 1 based on concurrency and GPU memory. See [Auto-Computing max_batch_size](#auto-computing-max_batch_size) below.
 
 Ask the user which performance metric they want to prioritize for ranking configs. Present these options:
 1. **OTPS** — Output Tokens Per Second (total throughput) — *default*
@@ -126,10 +126,10 @@ requirements = {
     "model": "<HF_MODEL_ID>",
     "precision": "<bf16|fp8|fp4>",
     "max_seq_len": <int>,
-    "max_batch_size": <int>,
     "concurrency": <int>,
     "perf_priority": "<OTPS|req_per_sec|TTFT|TPOT|E2E_latency>",
     "bench_mode": "<trtllm-bench|trtllm-bench+bench-sweep>",
+    # max_batch_size is auto-computed after Phase 1 — see "Auto-Computing max_batch_size"
 }
 ```
 
@@ -171,6 +171,65 @@ Include key details from the model analysis (architecture type, layer diversity,
 - N must include all architecturally distinct layer types. The model-analyzer report includes the recommended N.
 - Example: Nemotron Super V3 has attention layers starting at layer 8 — so N must be >= 8 to capture all layer types.
 - Default heuristic: `N = max(8, first_layer_with_all_unique_types + 2)`
+
+## Auto-Computing max_batch_size
+
+After Phase 1 returns the model analysis report (model size, architecture, GPU memory), **auto-compute `max_batch_size`** and add it to the requirements dict. Do NOT ask the user for this value.
+
+### Formula
+
+```python
+# Inputs from model analysis report
+gpu_memory_gb = <per_gpu_memory>          # e.g., 80 for H100
+model_size_gb = <estimated_model_size>    # total model weight size in GB
+world_size = <recommended_world_size>     # e.g., 2
+num_kv_heads = <num_key_value_heads>      # from model config
+head_dim = <hidden_size> / <num_attention_heads>
+num_layers = <num_hidden_layers>
+max_seq_len = <user_max_seq_len>
+concurrency = <user_concurrency>
+
+# KV cache dtype bytes (2 for bf16/fp16, 1 for fp8)
+kv_dtype_bytes = 1 if precision in ("fp8", "fp4") else 2
+
+# KV cache memory per batch slot per GPU (bytes)
+# Each token needs: 2 (K+V) * num_kv_heads_per_gpu * head_dim * num_layers * kv_dtype_bytes
+kv_bytes_per_token = 2 * (num_kv_heads / world_size) * head_dim * num_layers * kv_dtype_bytes
+kv_per_slot_gb = kv_bytes_per_token * max_seq_len / 1e9
+
+# Available GPU memory for KV cache (after model weights + runtime overhead)
+model_per_gpu_gb = model_size_gb / world_size
+overhead_gb = 2.0  # CUDA context, activations, CUDA graphs, etc.
+free_fraction = 0.90
+available_for_kv_gb = gpu_memory_gb * free_fraction - model_per_gpu_gb - overhead_gb
+
+# Memory-based max batch size (how many slots fit in available KV memory)
+memory_max_batch = int(available_for_kv_gb / kv_per_slot_gb) if kv_per_slot_gb > 0 else 2048
+
+# Final: match concurrency but cap by memory, with a floor of 1
+max_batch_size = max(1, min(concurrency, memory_max_batch))
+```
+
+### Reporting
+
+After computing `max_batch_size`, report to the user:
+
+> **Auto-computed max_batch_size = {max_batch_size}** (based on concurrency={concurrency}, GPU memory={gpu_memory_gb}GB, model={model_per_gpu_gb:.1f}GB/GPU, KV per slot={kv_per_slot_gb:.3f}GB, memory limit={memory_max_batch})
+
+Add to the requirements dict:
+```python
+requirements["max_batch_size"] = max_batch_size
+```
+
+Log to session:
+```bash
+echo "| max_batch_size | $MAX_BATCH_SIZE (auto-computed) |" >> "$LOG_FILE"
+echo "  - KV per slot: ${kv_per_slot_gb}GB, memory limit: ${memory_max_batch}, concurrency cap: ${concurrency}" >> "$LOG_FILE"
+```
+
+### Why This Matters
+
+Setting `max_batch_size` too low relative to concurrency causes massive request queuing (TTFT degrades by orders of magnitude). Setting it too high wastes KV cache reservation memory. This formula ensures the batch size matches the concurrency target while staying within GPU memory limits.
 
 ## Phase 1.5 — Baseline Performance + Time Estimation
 
@@ -247,7 +306,7 @@ Launch the `ad-conf-sanity-checker` agent (`.claude/agents/ad-conf-generator/san
 **Pass to agent:**
 - HF model ID
 - List of candidate config paths from Phase 2
-- User requirements (max_seq_len, max_batch_size, concurrency, bench_mode)
+- User requirements (max_seq_len, concurrency, bench_mode) + auto-computed max_batch_size
 - Estimated world_size from Phase 1
 - Baseline duration (`BASELINE_DURATION_SEC`) from Phase 1.5 for progress reporting
 - Session directory path (`$SESSION_DIR`) and log file path (`$LOG_FILE`)
@@ -261,28 +320,28 @@ The agent should use `BASELINE_DURATION_SEC` to report estimated remaining time 
 > "Here's how your candidates compare to the vanilla baseline:"
 > (show table with baseline row highlighted)
 
-## Phase 4 — Serving Evaluation (bench-sweep)
+## Phase 4 — Validation Benchmark
 
-The final evaluation **always** uses `bench-sweep` to get production-representative serving metrics with multi-concurrency sweeps. This applies regardless of the user's `bench_mode` choice in Phase 0 (which only controls Phase 3 screening).
+Run a **single validation benchmark** for the **winner config only** at the user's target concurrency. Do NOT re-run all candidates — the Phase 3 screening already ranked them. Validation confirms the winner works correctly at the target concurrency.
 
-Launch the `ad-conf-serving-evaluator` agent (`.claude/agents/ad-conf-generator/serving-evaluator.md`).
+If Phase 3 flagged similar candidates (within 5%), present them to the user for tie-breaking **before** running validation, so only one config is validated.
 
-**Pass to agent:**
+**Pass to agent (`ad-conf-serving-evaluator`):**
 - HF model ID
-- Top 3 config paths from Phase 3 (or fewer if tie-breaking already happened)
+- **Single winner config path** from Phase 3 (after tie-breaking if needed)
 - User concurrency target
 - Dataset path generated in Phase 3
 - Baseline duration (`BASELINE_DURATION_SEC`) for time estimates
 - Session directory path (`$SESSION_DIR`) and log file path (`$LOG_FILE`)
 
-The agent runs `bench-sweep` for each config with a concurrency sweep (e.g., `"1 4 8 16 32 64"`). Before starting, report the estimated time:
-> "Running bench-sweep serving evaluation for N configs. Estimated ~X minutes per config (based on baseline timing). Total: ~Y minutes."
+The agent runs `trtllm-bench` for the winner config at the user's target concurrency. Before starting, report the estimated time:
+> "Running validation benchmark for the winner config. Estimated ~X minutes (based on baseline timing)."
 
-**Expect back:** Final config recommendation with full comparison table across all configs. If multiple candidates have similar serving performance (within 5% on the priority metric), the agent will flag this for user decision.
+**Expect back:** Validated performance numbers for the winner config. If the validation fails (OOM, crash), adjust the config (e.g., reduce `max_num_tokens`, lower `free_gpu_memory_fraction`) and retry once.
 
 ## Phase 4.5 — User Tie-Breaking (if needed)
 
-If the serving-evaluator reports that top candidates are within 5% of each other on the user's priority metric, present the close candidates side by side with all metrics and ask the user to pick their preferred config. Explain the tradeoffs (e.g., "Config A has 2% higher OTPS but Config B has 15% lower TTFT p99").
+If Phase 3 flagged similar candidates (within 5% on the priority metric), present them side by side **before Phase 4 validation** and ask the user to pick. Only validate the chosen config. Explain the tradeoffs (e.g., "Config A has 2% higher OTPS but Config B has 15% lower TTFT p99").
 
 ## Phase 5 — Final Report
 
@@ -313,7 +372,7 @@ Present to the user:
 
 - If Phase 1 fails (model not found, GPU unavailable), report error and stop.
 - If Phase 2 produces no candidates, fall back to the closest existing config from `examples/auto_deploy/model_registry/configs/`.
-- If all candidates fail sanity check in Phase 3, report failures and suggest the user adjust requirements (e.g., lower max_batch_size, increase world_size).
+- If all candidates fail sanity check in Phase 3, report failures and suggest the user adjust requirements (e.g., reduce concurrency, increase world_size, or lower max_seq_len).
 - If Phase 4 serving evaluation fails for all configs, fall back to the best `trtllm-bench` result from Phase 3.
 
 ## Fallback: Script Generation Mode

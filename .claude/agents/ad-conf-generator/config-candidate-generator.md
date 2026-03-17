@@ -13,7 +13,7 @@ Generate 1-5 AutoDeploy YAML config candidates for a given model. Use judgment t
 
 You will receive:
 - **Model analysis report** from the model-analyzer agent (architecture, param count, classification, world_size, GPU info)
-- **User requirements** dict with model, precision, max_seq_len, max_batch_size, concurrency
+- **User requirements** dict with model, precision, max_seq_len, concurrency, and **max_batch_size** (auto-computed by the orchestrator based on concurrency and GPU memory — do not ask the user for this)
 - **Fast mode** (optional): if `fast_mode: true` and `num_hidden_layers: N` are in the requirements, add `num_hidden_layers: N` to every generated config YAML. This enables partial model loading for faster benchmarking of large models.
 - **Session directory path** (`$SESSION_DIR`) — directory to store all generated artifacts (candidate configs, etc.)
 - **Log file path** (`$LOG_FILE`) — path to the session log file to append activity records to
@@ -110,20 +110,25 @@ Generate 1-5 candidates based on model complexity. Use judgment to pick the righ
 - **3 candidates**: Standard case — conservative, throughput, and latency variants cover the tradeoff space.
 - **4-5 candidates**: MoE, hybrid architectures, unusual models, or when multiple knobs have unclear tradeoffs (attention backends, sharding strategies).
 
+**Important: `max_batch_size` is auto-computed** by the orchestrator to match the user's concurrency target within GPU memory limits. All candidates MUST use the same `max_batch_size` from `requirements["max_batch_size"]`. Do NOT hardcode a smaller `max_batch_size` — this causes massive TTFT degradation due to request queuing when concurrency exceeds batch size. Candidates should differentiate on other knobs (attention backend, max_num_tokens, free_gpu_memory_fraction, transforms, etc.), not batch size.
+
 **Candidate 1 — Conservative Baseline** (always generate):
 - Matches the closest existing config from the model registry
 - Safe defaults, proven to work for similar models
+- `max_batch_size` from requirements (auto-computed)
 - Lower `free_gpu_memory_fraction` (0.85)
 
 **Candidate 2 — Throughput-Optimized** (if applicable):
-- Larger `max_batch_size` and `max_num_tokens`
+- `max_batch_size` from requirements (auto-computed)
+- Larger `max_num_tokens` to batch more tokens per forward pass
 - More CUDA graph batch sizes for better batching
 - `enable_chunked_prefill: true`
 - Higher `free_gpu_memory_fraction` (0.92-0.95)
 - `fp8` KV cache if precision allows
 
 **Candidate 3 — Latency-Optimized** (if applicable):
-- Smaller `max_batch_size`
+- `max_batch_size` from requirements (auto-computed)
+- Smaller `max_num_tokens` to reduce per-step latency
 - Fewer but targeted CUDA graph batch sizes (small values)
 - `enable_chunked_prefill: false` (avoid chunking overhead for short sequences)
 - `torch-cudagraph` compile backend
