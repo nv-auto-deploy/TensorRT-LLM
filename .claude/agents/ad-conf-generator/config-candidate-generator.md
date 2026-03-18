@@ -110,25 +110,31 @@ Generate 1-5 candidates based on model complexity. Use judgment to pick the righ
 - **3 candidates**: Standard case — conservative, throughput, and latency variants cover the tradeoff space.
 - **4-5 candidates**: MoE, hybrid architectures, unusual models, or when multiple knobs have unclear tradeoffs (attention backends, sharding strategies).
 
-**Important: `max_batch_size` is auto-computed** by the orchestrator to match the user's concurrency target within GPU memory limits. All candidates MUST use the same `max_batch_size` from `requirements["max_batch_size"]`. Do NOT hardcode a smaller `max_batch_size` — this causes massive TTFT degradation due to request queuing when concurrency exceeds batch size. Candidates should differentiate on other knobs (attention backend, max_num_tokens, free_gpu_memory_fraction, transforms, etc.), not batch size.
+**Important: `max_batch_size`, `world_size`, and `free_gpu_memory_fraction` are auto-computed** by the orchestrator as a coherent memory layout based on concurrency, max_seq_len, and GPU memory. All candidates MUST use the same values from `requirements["max_batch_size"]`, `requirements["world_size"]`, and `requirements["free_gpu_memory_fraction"]`.
+
+- Do NOT hardcode a smaller `max_batch_size` — causes massive TTFT degradation from request queuing
+- Do NOT override `world_size` — it's computed to ensure enough total GPU memory for KV cache
+- Do NOT override `free_gpu_memory_fraction` — it balances KV cache vs. activation memory
+
+Candidates should differentiate on other knobs: attention backend, max_num_tokens, transforms (fuse_gemms, multi_stream_moe), tokens_per_block, cuda_graph_batch_sizes, etc.
 
 **Candidate 1 — Conservative Baseline** (always generate):
 - Matches the closest existing config from the model registry
 - Safe defaults, proven to work for similar models
-- `max_batch_size` from requirements (auto-computed)
-- Lower `free_gpu_memory_fraction` (0.85)
+- `max_batch_size`, `world_size`, `free_gpu_memory_fraction` from requirements
+- Standard `max_num_tokens` (8192)
 
 **Candidate 2 — Throughput-Optimized** (if applicable):
-- `max_batch_size` from requirements (auto-computed)
-- Larger `max_num_tokens` to batch more tokens per forward pass
+- `max_batch_size`, `world_size`, `free_gpu_memory_fraction` from requirements
+- Larger `max_num_tokens` (e.g., 16384) to batch more tokens per forward pass
 - More CUDA graph batch sizes for better batching
 - `enable_chunked_prefill: true`
-- Higher `free_gpu_memory_fraction` (0.92-0.95)
 - `fp8` KV cache if precision allows
+- `fuse_gemms_mixed_children` for MoE models
 
 **Candidate 3 — Latency-Optimized** (if applicable):
-- `max_batch_size` from requirements (auto-computed)
-- Smaller `max_num_tokens` to reduce per-step latency
+- `max_batch_size`, `world_size`, `free_gpu_memory_fraction` from requirements
+- Smaller `max_num_tokens` (e.g., 4096) to reduce per-step latency
 - Fewer but targeted CUDA graph batch sizes (small values)
 - `enable_chunked_prefill: false` (avoid chunking overhead for short sequences)
 - `torch-cudagraph` compile backend

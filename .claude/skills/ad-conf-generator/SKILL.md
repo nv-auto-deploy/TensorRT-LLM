@@ -172,17 +172,19 @@ Include key details from the model analysis (architecture type, layer diversity,
 - Example: Nemotron Super V3 has attention layers starting at layer 8 — so N must be >= 8 to capture all layer types.
 - Default heuristic: `N = max(8, first_layer_with_all_unique_types + 2)`
 
-## Auto-Computing max_batch_size
+## Auto-Computing Memory Layout (world_size, max_batch_size, free_gpu_memory_fraction)
 
-After Phase 1 returns the model analysis report (model size, architecture, GPU memory), **auto-compute `max_batch_size`** and add it to the requirements dict. Do NOT ask the user for this value.
+After Phase 1 returns the model analysis report, **auto-compute the memory layout** — `world_size`, `max_batch_size`, and `free_gpu_memory_fraction` — as a coherent set. Do NOT ask the user for `max_batch_size` or `free_gpu_memory_fraction`.
 
-### Formula
+The scheduler uses `GUARANTEED_NO_EVICT` policy, meaning it reserves KV cache blocks for each admitted request up to `max_seq_len`. This means memory planning must account for worst-case KV usage per request.
+
+### Step 1 — Compute KV cache per request
 
 ```python
 # Inputs from model analysis report
 gpu_memory_gb = <per_gpu_memory>          # e.g., 80 for H100
+num_gpus = <total_gpus_available>         # e.g., 8
 model_size_gb = <estimated_model_size>    # total model weight size in GB
-world_size = <recommended_world_size>     # e.g., 2
 num_kv_heads = <num_key_value_heads>      # from model config
 head_dim = <hidden_size> / <num_attention_heads>
 num_layers = <num_hidden_layers>
@@ -192,44 +194,114 @@ concurrency = <user_concurrency>
 # KV cache dtype bytes (2 for bf16/fp16, 1 for fp8)
 kv_dtype_bytes = 1 if precision in ("fp8", "fp4") else 2
 
-# KV cache memory per batch slot per GPU (bytes)
-# Each token needs: 2 (K+V) * num_kv_heads_per_gpu * head_dim * num_layers * kv_dtype_bytes
-kv_bytes_per_token = 2 * (num_kv_heads / world_size) * head_dim * num_layers * kv_dtype_bytes
-kv_per_slot_gb = kv_bytes_per_token * max_seq_len / 1e9
+# KV cache per token per GPU (bytes) — kv_heads are split across TP GPUs
+def kv_bytes_per_token(ws):
+    return 2 * (num_kv_heads / ws) * head_dim * num_layers * kv_dtype_bytes
 
-# Available GPU memory for KV cache (after model weights + runtime overhead)
-model_per_gpu_gb = model_size_gb / world_size
-overhead_gb = 2.0  # CUDA context, activations, CUDA graphs, etc.
-free_fraction = 0.90
-available_for_kv_gb = gpu_memory_gb * free_fraction - model_per_gpu_gb - overhead_gb
+# KV cache per request at max_seq_len per GPU (GB)
+def kv_per_request_gb(ws):
+    return kv_bytes_per_token(ws) * max_seq_len / 1e9
+```
 
-# Memory-based max batch size (how many slots fit in available KV memory)
-memory_max_batch = int(available_for_kv_gb / kv_per_slot_gb) if kv_per_slot_gb > 0 else 2048
+### Step 2 — Find minimum feasible world_size
 
-# Final: match concurrency but cap by memory, with a floor of 1
+Start from Phase 1's recommended world_size (based on model weight fitting). Then verify it can handle the target concurrency with max_seq_len:
+
+```python
+# Overhead includes: CUDA context, activations during forward pass, CUDA graphs,
+# flashinfer workspace, fused kernel buffers. Use 6 GB for configs with extra
+# optimization knobs (flashinfer, fuse_gemms, multi_stream_moe), 3 GB for vanilla.
+overhead_gb = 6.0  # conservative for optimized configs
+
+def check_feasibility(ws, target_concurrent):
+    """Check if world_size=ws can serve target_concurrent requests at max_seq_len."""
+    model_per_gpu = model_size_gb / ws
+    kv_per_req = kv_per_request_gb(ws)
+
+    # Total KV for target concurrent requests
+    total_kv_needed = kv_per_req * target_concurrent
+
+    # Available memory for KV cache (at free_gpu_memory_fraction=0.90)
+    available_for_kv = gpu_memory_gb * 0.90 - model_per_gpu - overhead_gb
+
+    # Can we fit all concurrent requests?
+    if available_for_kv < total_kv_needed:
+        return False, available_for_kv, total_kv_needed
+    return True, available_for_kv, total_kv_needed
+
+# Start from Phase 1's recommended world_size, scale up if needed
+for ws in [recommended_world_size, recommended_world_size * 2, recommended_world_size * 4]:
+    if ws > num_gpus:
+        break
+    feasible, avail, needed = check_feasibility(ws, concurrency)
+    if feasible:
+        world_size = ws
+        break
+else:
+    # Even max GPUs can't fit — reduce max_batch_size to what fits
+    world_size = num_gpus
+```
+
+### Step 3 — Compute free_gpu_memory_fraction and max_batch_size
+
+```python
+model_per_gpu = model_size_gb / world_size
+kv_per_req = kv_per_request_gb(world_size)
+
+# Compute free_gpu_memory_fraction to fit concurrency requests + overhead
+# Required memory = model_per_gpu + overhead + kv_per_req * concurrency
+required_gb = model_per_gpu + overhead_gb + kv_per_req * concurrency
+
+# free_fraction must satisfy: gpu_memory * free_fraction >= required_gb
+min_free_fraction = required_gb / gpu_memory_gb
+# Round up to nearest 0.05, clamp to [0.80, 0.95]
+free_gpu_memory_fraction = min(0.95, max(0.80, math.ceil(min_free_fraction * 20) / 20))
+
+# Recompute available KV with chosen fraction
+available_for_kv = gpu_memory_gb * free_gpu_memory_fraction - model_per_gpu - overhead_gb
+
+# max_batch_size: how many requests fit in KV memory
+memory_max_batch = int(available_for_kv / kv_per_req) if kv_per_req > 0 else 2048
+
+# Final: match concurrency but cap by memory
 max_batch_size = max(1, min(concurrency, memory_max_batch))
+
+# If max_batch_size < concurrency, some queuing will occur — warn the user
+if max_batch_size < concurrency:
+    print(f"WARNING: max_batch_size={max_batch_size} < concurrency={concurrency}. "
+          f"Some request queuing expected. Consider increasing world_size or reducing max_seq_len.")
 ```
 
 ### Reporting
 
-After computing `max_batch_size`, report to the user:
+After computing, report the full memory layout to the user:
 
-> **Auto-computed max_batch_size = {max_batch_size}** (based on concurrency={concurrency}, GPU memory={gpu_memory_gb}GB, model={model_per_gpu_gb:.1f}GB/GPU, KV per slot={kv_per_slot_gb:.3f}GB, memory limit={memory_max_batch})
+> **Memory Layout (auto-computed):**
+> | Parameter | Value | Rationale |
+> |-----------|-------|-----------|
+> | world_size | {world_size} | min TP to fit {concurrency} concurrent reqs at max_seq_len={max_seq_len} |
+> | max_batch_size | {max_batch_size} | min(concurrency={concurrency}, memory_limit={memory_max_batch}) |
+> | free_gpu_memory_fraction | {free_gpu_memory_fraction} | {required_gb:.1f}GB needed / {gpu_memory_gb}GB per GPU |
+> | KV per request | {kv_per_req:.3f} GB/GPU | {num_kv_heads}/{world_size} heads x {head_dim} dim x {num_layers} layers x {max_seq_len} tokens |
+> | Model per GPU | {model_per_gpu:.1f} GB | {model_size_gb:.1f}GB / {world_size} |
+> | Overhead budget | {overhead_gb} GB | activations, CUDA graphs, flashinfer workspace |
 
-Add to the requirements dict:
+Add to requirements:
 ```python
+requirements["world_size"] = world_size
 requirements["max_batch_size"] = max_batch_size
-```
-
-Log to session:
-```bash
-echo "| max_batch_size | $MAX_BATCH_SIZE (auto-computed) |" >> "$LOG_FILE"
-echo "  - KV per slot: ${kv_per_slot_gb}GB, memory limit: ${memory_max_batch}, concurrency cap: ${concurrency}" >> "$LOG_FILE"
+requirements["free_gpu_memory_fraction"] = free_gpu_memory_fraction
 ```
 
 ### Why This Matters
 
-Setting `max_batch_size` too low relative to concurrency causes massive request queuing (TTFT degrades by orders of magnitude). Setting it too high wastes KV cache reservation memory. This formula ensures the batch size matches the concurrency target while staying within GPU memory limits.
+These three parameters form a **coherent memory budget**:
+- `world_size` determines how model weights and KV heads are split across GPUs
+- `max_batch_size` caps inflight requests — too low causes TTFT queuing, too high causes OOM
+- `free_gpu_memory_fraction` controls how much GPU memory goes to KV cache vs. reserved for activations/overhead
+- `max_seq_len` determines worst-case KV reservation per request under `GUARANTEED_NO_EVICT`
+
+All must be computed together. Setting any one independently risks OOM (too aggressive) or wasted capacity (too conservative).
 
 ## Phase 1.5 — Baseline Performance + Time Estimation
 

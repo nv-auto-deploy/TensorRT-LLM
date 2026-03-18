@@ -211,7 +211,17 @@ GPU Environment:
   GPU Type: <type>
   GPU Memory: <X> GB per device
 
-Recommended world_size: <1|2|4|8>
+Recommended min world_size: <1|2|4|8>  (for model weights only — orchestrator may increase based on max_seq_len + concurrency)
+
+GPU Environment:
+  GPU Count: <N>
+  GPU Type: <type>
+  GPU Memory: <X> GB per device
+
+KV Cache Parameters (for memory planning):
+  num_kv_heads: <value>
+  head_dim: <value>  (hidden_size / num_attention_heads)
+  num_layers: <value>
 
 Fast Mode Eligible: <yes|no>
   Reason: <model size X GB exceeds 100 GB threshold | model size X GB within threshold>
