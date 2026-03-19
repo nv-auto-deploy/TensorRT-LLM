@@ -325,7 +325,11 @@ def test_conv_handler_eq_different_params():
 
 
 def test_spec_ssm_handler_shape_and_isinstance():
-    """Verify SpecSSMResourceHandler prepends cache_steps and is an SSMResourceHandler."""
+    """Verify SpecSSMResourceHandler prepends cache_steps and is NOT an SSMResourceHandler.
+
+    SpecSSMResourceHandler deliberately inherits from StateResourceHandler (not SSMResourceHandler)
+    to eliminate isinstance exclusion guards throughout the codebase.
+    """
     base = SSMResourceHandler(num_heads=8, head_dim=64, d_state=16, dtype=torch.bfloat16)
     spec = SpecSSMResourceHandler(
         num_heads=8,
@@ -337,7 +341,9 @@ def test_spec_ssm_handler_shape_and_isinstance():
 
     assert base.state_shape == (8, 64, 16)
     assert spec.state_shape == (4, 8, 64, 16)
-    assert isinstance(spec, SSMResourceHandler)
+    # Spec does NOT inherit from SSMResourceHandler — intent of the inheritance break.
+    assert not isinstance(spec, SSMResourceHandler)
+    assert isinstance(spec, SpecSSMResourceHandler)
     assert not isinstance(base, SpecSSMResourceHandler)
     assert base != spec
     assert base.has_compatible_dims(spec)
@@ -345,7 +351,11 @@ def test_spec_ssm_handler_shape_and_isinstance():
 
 
 def test_spec_conv_handler_shape_and_isinstance():
-    """Verify SpecCausalConvResourceHandler prepends cache_steps and is a CausalConvResourceHandler."""
+    """Verify SpecCausalConvResourceHandler prepends cache_steps and is NOT a CausalConvResourceHandler.
+
+    SpecCausalConvResourceHandler deliberately inherits from StateResourceHandler (not
+    CausalConvResourceHandler) to eliminate isinstance exclusion guards throughout the codebase.
+    """
     base = CausalConvResourceHandler(conv_dim=256, d_conv=4, dtype=torch.float32)
     spec = SpecCausalConvResourceHandler(
         conv_dim=256,
@@ -356,7 +366,9 @@ def test_spec_conv_handler_shape_and_isinstance():
 
     assert base.state_shape == (256, 3)
     assert spec.state_shape == (5, 256, 3)
-    assert isinstance(spec, CausalConvResourceHandler)
+    # Spec does NOT inherit from CausalConvResourceHandler — intent of the inheritance break.
+    assert not isinstance(spec, CausalConvResourceHandler)
+    assert isinstance(spec, SpecCausalConvResourceHandler)
     assert not isinstance(base, SpecCausalConvResourceHandler)
     assert base != spec
     assert base.has_compatible_dims(spec)

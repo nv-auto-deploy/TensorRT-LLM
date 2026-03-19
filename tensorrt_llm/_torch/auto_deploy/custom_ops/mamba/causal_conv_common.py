@@ -29,6 +29,7 @@ from ..attention_interface import (
     Constant,
     MHACallable,
     ResourceHandlerDict,
+    SpecCausalConvResourceHandler,
 )
 
 
@@ -93,7 +94,23 @@ class BaseCausalConvDescriptor(AttentionDescriptor):
             d_conv=max(1, kernel_size),  # state_shape[-1] = d_conv - 1 = kernel_size - 1
             dtype=cls.resolve_cache_dtype("auto", inp_fake.dtype),
         )
-        return {"conv_state_cache": conv_state_handler}
+        if spec_config is not None and spec_config.max_draft_len is not None:
+            spec_handler = SpecCausalConvResourceHandler(
+                conv_dim=in_channels,
+                d_conv=max(1, kernel_size),
+                dtype=cls.resolve_cache_dtype("auto", inp_fake.dtype),
+                cache_steps=spec_config.max_draft_len + 1,
+            )
+        else:
+            spec_handler = SpecCausalConvResourceHandler.placeholder(
+                conv_dim=in_channels,
+                d_conv=max(1, kernel_size),
+                dtype=cls.resolve_cache_dtype("auto", inp_fake.dtype),
+            )
+        return {
+            "conv_state_cache": conv_state_handler,
+            "intermediate_conv_state_cache": spec_handler,
+        }
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:

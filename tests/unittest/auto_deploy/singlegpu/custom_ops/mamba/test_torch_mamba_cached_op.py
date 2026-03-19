@@ -92,6 +92,7 @@ def test_generate_only_with_slot_mapping(mamba_env):
         use_initial_states,
         # CACHES
         ssm_state_cache,
+        None,
         # CONSTANTS
         time_step_limit,
         chunk_size,
@@ -166,6 +167,7 @@ def test_context_flattened_and_state_writeback(mamba_env):
         use_initial_states,
         # CACHES
         ssm_state_cache,
+        None,
         # CONSTANTS
         time_step_limit,
         chunk_size,

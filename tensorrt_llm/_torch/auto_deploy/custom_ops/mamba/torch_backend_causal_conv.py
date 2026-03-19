@@ -171,6 +171,7 @@ def _torch_cached_causal_conv1d(
     #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k]
+    intermediate_conv_state_cache: torch.Tensor,  # unused placeholder/spec cache
     # CONSTANTS
     stride: int,
     padding: int,
@@ -272,6 +273,7 @@ def _torch_cached_causal_conv1d_fake(
     #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k]
+    intermediate_conv_state_cache: torch.Tensor,  # unused placeholder/spec cache
     # CONSTANTS
     stride: int,
     padding: int,

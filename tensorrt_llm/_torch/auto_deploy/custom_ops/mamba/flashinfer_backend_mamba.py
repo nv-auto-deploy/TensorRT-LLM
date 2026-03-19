@@ -50,6 +50,7 @@ def _flashinfer_cached_ssm(
     seq_idx_prefill: torch.Tensor,  # [1, num_prefill_tokens]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
+    intermediate_ssm_state_cache: torch.Tensor,  # unused placeholder/spec cache
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
@@ -176,6 +177,7 @@ def _flashinfer_cached_ssm_fake(
     seq_idx_prefill: torch.Tensor,  # [1, num_prefill_tokens]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
+    intermediate_ssm_state_cache: torch.Tensor,  # unused placeholder/spec cache
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
@@ -205,7 +207,7 @@ class FlashinferBackendSSM(BaseBackendSSM):
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
     ) -> ResourceHandlerDict:
-        ret = super().get_cache_initializers(source_attn_node, cache_config)
+        ret = super().get_cache_initializers(source_attn_node, cache_config, spec_config)
 
         # check head_dim is supported by flashinfer
         if ret["ssm_state_cache"].head_dim not in FLASHINFER_SUPPORTED_HEAD_DIMS:

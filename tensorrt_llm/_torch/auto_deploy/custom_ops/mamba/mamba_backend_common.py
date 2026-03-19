@@ -31,6 +31,7 @@ from ..attention_interface import (
     Constant,
     PrepareMetadataCallable,
     ResourceHandlerDict,
+    SpecSSMResourceHandler,
     SSMResourceHandler,
 )
 
@@ -356,13 +357,31 @@ class BaseBackendSSM(AttentionDescriptor):
         # extract ssm_state_dtype from cache_config or hs_fake
         ssm_state_dtype = cls.resolve_cache_dtype(cache_config.mamba_ssm_cache_dtype, hs_fake.dtype)
 
-        return {
-            "ssm_state_cache": SSMResourceHandler(
+        base_handler = SSMResourceHandler(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            d_state=ssm_state_size,
+            dtype=ssm_state_dtype,
+        )
+        if spec_config is not None and spec_config.max_draft_len is not None:
+            spec_handler = SpecSSMResourceHandler(
+                num_heads=num_heads,
+                head_dim=head_dim,
+                d_state=ssm_state_size,
+                dtype=ssm_state_dtype,
+                cache_steps=spec_config.max_draft_len + 1,
+            )
+        else:
+            spec_handler = SpecSSMResourceHandler.placeholder(
                 num_heads=num_heads,
                 head_dim=head_dim,
                 d_state=ssm_state_size,
                 dtype=ssm_state_dtype,
             )
+
+        return {
+            "ssm_state_cache": base_handler,
+            "intermediate_ssm_state_cache": spec_handler,
         }
 
     @classmethod

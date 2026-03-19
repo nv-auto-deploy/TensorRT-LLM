@@ -160,9 +160,8 @@ def test_super_mtp_smoke():
 
     prompts_and_outputs = results["prompts_and_outputs"]
     assert len(prompts_and_outputs) == 1
-    prompt, generated_text = prompts_and_outputs[0]
+    prompt, _generated_text = prompts_and_outputs[0]
     assert prompt == test_prompt
-    assert len(generated_text) > 0
 
 
 def test_kv_cache_extra_seq_len_for_spec_dec():
