@@ -299,6 +299,7 @@ def _triton_mla_prefill(
     qk_rope_head_dim = q_pe.shape[2]
     num_seq = seq_len.shape[0]
     seq_lengths = seq_len.long()
+    seq_start = seq_start.long()
     total_tokens = seq_lengths.sum().item()
 
     if total_tokens == 0:
@@ -318,11 +319,13 @@ def _triton_mla_prefill(
     base_in_dense = cum_lengths[:-1].repeat_interleave(seq_lengths)
     within_offsets = torch.arange(total_tokens, device=device) - base_in_dense
 
+    # Index into flattened/padded input tensors using true per-sequence starts.
+    token_input_idx = seq_start.repeat_interleave(seq_lengths) + within_offsets  # [total_tokens]
     token_cache_pos = base_positions + within_offsets  # [total_tokens]
 
     # Vectorized cache write
-    kpe_flat = kpe[:total_tokens].squeeze(1)  # [total_tokens, qk_rope_head_dim]
-    ckv_actual = compressed_kv[:total_tokens]  # [total_tokens, kv_lora_rank]
+    kpe_flat = kpe.index_select(0, token_input_idx).squeeze(1)  # [total_tokens, qk_rope_head_dim]
+    ckv_actual = compressed_kv.index_select(0, token_input_idx)  # [total_tokens, kv_lora_rank]
 
     cache_dtype = mla_cache.dtype
     ckv_for_cache = ckv_actual.to(cache_dtype) if ckv_actual.dtype != cache_dtype else ckv_actual
@@ -338,8 +341,10 @@ def _triton_mla_prefill(
     w_k_nope = weight_reshaped[:, :qk_nope_head_dim, :]  # [N, qk_nope_head_dim, kv_lora_rank]
     w_v = weight_reshaped[:, qk_nope_head_dim:, :]  # [N, v_head_dim, kv_lora_rank]
 
-    q_nope_actual = q_nope[:total_tokens]  # [total_tokens, N, qk_nope_head_dim]
-    q_pe_actual = q_pe[:total_tokens].contiguous()  # [total_tokens, N, qk_rope_head_dim]
+    q_nope_actual = q_nope.index_select(0, token_input_idx)  # [total_tokens, N, qk_nope_head_dim]
+    q_pe_actual = q_pe.index_select(
+        0, token_input_idx
+    ).contiguous()  # [total_tokens, N, qk_rope_head_dim]
 
     # q_absorbed: [total_tokens, N, kv_lora_rank]
     # Use fp32 for absorption to minimize bf16 reduction error over qk_nope_head_dim
@@ -388,7 +393,8 @@ def _triton_mla_prefill(
         q_nope.dtype
     )  # [total_tokens, N, v_head_dim]
 
-    out[:total_tokens].copy_(attn_out)
+    out.zero_()
+    out.index_copy_(0, token_input_idx, attn_out)
 
 
 @torch.library.custom_op("auto_deploy::triton_cached_mla_with_cache", mutates_args=())

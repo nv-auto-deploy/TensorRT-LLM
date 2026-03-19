@@ -419,6 +419,100 @@ class TestTritonMLAPrefill:
         # paths — the bf16 reduction in the expansion path is the dominant error source.
         torch.testing.assert_close(out_triton, out_torch, rtol=2e-1, atol=1.0)
 
+    def test_prefill_ragged_with_padded_flatten(self):
+        """Prefill correctness when flattened inputs contain per-sequence padding gaps."""
+        batch_size, padded_seq_len, num_heads = 3, 6, 8
+        qk_nope_head_dim, qk_rope_head_dim = 64, 32
+        kv_lora_rank, v_head_dim = 256, 64
+        max_seq_len = 128
+        dtype = torch.bfloat16
+        device = self.device
+
+        kv_head_dim = qk_nope_head_dim + v_head_dim
+        total_padded = batch_size * padded_seq_len
+
+        q_nope = torch.randn(
+            1, total_padded, num_heads, qk_nope_head_dim, dtype=dtype, device=device
+        )
+        q_pe = torch.randn(1, total_padded, num_heads, qk_rope_head_dim, dtype=dtype, device=device)
+        compressed_kv = torch.randn(1, total_padded, kv_lora_rank, dtype=dtype, device=device)
+        kpe = torch.randn(1, total_padded, 1, qk_rope_head_dim, dtype=dtype, device=device)
+        kv_b_proj_weight = torch.randn(
+            num_heads * kv_head_dim, kv_lora_rank, dtype=dtype, device=device
+        )
+
+        # Ragged active lengths stored inside padded [B, S] flatten layout.
+        seq_len = torch.tensor([4, 2, 5], device=device, dtype=torch.int32)
+        seq_start = torch.tensor(
+            [0, padded_seq_len, 2 * padded_seq_len], device=device, dtype=torch.int32
+        )
+        input_pos = torch.tensor([1, 0, 2], device=device, dtype=torch.int32)
+        slot_idx = torch.arange(batch_size, device=device, dtype=torch.int32)
+
+        total_tokens = int(seq_len.sum().item())
+        _bi = BatchInfo()
+        _bi.update([batch_size, total_tokens, 0, 0, 0, 0])
+        batch_info_host = _bi.serialize()
+
+        # Active-token indices into the padded flatten [B * S] layout.
+        token_indices = torch.cat(
+            [
+                torch.arange(start, start + length, device=device, dtype=torch.long)
+                for start, length in zip(seq_start.tolist(), seq_len.tolist())
+            ]
+        )
+
+        mla_cache_torch = torch.zeros(
+            batch_size,
+            max_seq_len,
+            kv_lora_rank + qk_rope_head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        mla_cache_triton = mla_cache_torch.clone()
+
+        # Torch reference path expects dense packing for prefill outputs.
+        # Build packed tensors with equivalent active-token content.
+        q_nope_packed = q_nope.index_select(1, token_indices)
+        q_pe_packed = q_pe.index_select(1, token_indices)
+        compressed_kv_packed = compressed_kv.index_select(1, token_indices)
+        kpe_packed = kpe.index_select(1, token_indices)
+        seq_start_packed = torch.zeros_like(seq_len)
+        seq_start_packed[1:] = seq_len.cumsum(0)[:-1]
+
+        out_torch = torch.ops.auto_deploy.torch_cached_mla_with_cache(
+            q_nope_packed,
+            q_pe_packed,
+            compressed_kv_packed,
+            kpe_packed,
+            kv_b_proj_weight,
+            batch_info_host,
+            seq_len,
+            input_pos,
+            slot_idx,
+            seq_start_packed,
+            mla_cache_torch,
+            None,
+            kv_lora_rank,
+        )
+        out_triton = torch.ops.auto_deploy.triton_cached_mla_with_cache(
+            q_nope,
+            q_pe,
+            compressed_kv,
+            kpe,
+            kv_b_proj_weight,
+            batch_info_host,
+            seq_len,
+            input_pos,
+            slot_idx,
+            seq_start,
+            mla_cache_triton,
+            None,
+            kv_lora_rank,
+        )
+
+        torch.testing.assert_close(out_triton[0, token_indices], out_torch[0], rtol=2e-1, atol=1.0)
+
 
 class TestTritonMLADescriptor:
     """Test TritonMLAAttention descriptor configuration."""
