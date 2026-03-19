@@ -19,9 +19,9 @@ This module provides:
 - triton_cached_mla_with_cache: Triton-optimized cached MLA with KV cache
 - TritonMLAAttention: Attention descriptor for Triton MLA backend
 
-Decode path uses a Triton kernel for fused attention scoring with online softmax,
-eliminating Python loops over batch elements. Prefill path reuses the PyTorch
-reference implementation from torch_backend_mla.
+Both prefill and decode paths use Triton-accelerated attention with weight
+absorption, eliminating Python loops entirely. A single shared kernel handles
+both phases via per-token KV length metadata for causal masking.
 
 MLA Cache Layout (same as torch_mla backend):
     mla_cache: [max_batch, max_seq, kv_lora_rank + qk_rope_head_dim]
@@ -49,18 +49,17 @@ from ..attention_interface import (
     ResourceHandlerDict,
     UnpagedResourceHandler,
 )
-from .torch_backend_mla import _torch_mla_context_with_expansion
 
 
 @triton.jit
-def _mla_decode_attention_kernel(
+def _mla_attention_kernel(
     # Tensor pointers
-    q_absorbed_ptr,  # [num_decode, N, kv_lora_rank]
-    q_pe_ptr,  # [num_decode, N, qk_rope_head_dim]
+    q_absorbed_ptr,  # [num_tokens, N, kv_lora_rank]
+    q_pe_ptr,  # [num_tokens, N, qk_rope_head_dim]
     mla_cache_ptr,  # [max_batch, max_seq, cache_dim]
-    slot_idx_ptr,  # [num_decode]
-    input_pos_ptr,  # [num_decode]
-    out_ptr,  # [num_decode, N, kv_lora_rank] (float32)
+    token_slot_ptr,  # [num_tokens] - cache slot per token
+    token_kv_len_ptr,  # [num_tokens] - KV length per token (causal boundary)
+    out_ptr,  # [num_tokens, N, kv_lora_rank] (float32)
     # Constexpr parameters
     SCALE: tl.constexpr,
     MAX_SEQ_LEN: tl.constexpr,
@@ -72,30 +71,31 @@ def _mla_decode_attention_kernel(
     PE_BLOCK: tl.constexpr,  # next_power_of_2(qk_rope_head_dim)
     SEQ_BLOCK: tl.constexpr,  # sequence tile size
 ):
-    """MLA decode attention kernel with online softmax.
+    """MLA attention kernel with online softmax (shared by prefill and decode).
 
-    Each program processes one (batch, head) pair. Iterates over the full
-    cached sequence using online softmax to compute the softmax-weighted
+    Each program processes one (token, head) pair. Iterates over the cached
+    KV sequence using online softmax to compute the softmax-weighted
     sum of compressed_kv values.
 
-    Grid: (num_decode, N_HEADS)
+    Grid: (num_tokens, N_HEADS)
 
-    This kernel implements the core MLA decode attention:
+    This kernel implements the core MLA attention in compressed space:
         score[t] = (q_absorbed . compressed_kv[t] + q_pe . kpe[t]) * scale
-        attn_weights = softmax(scores)
+        attn_weights = softmax(scores[:kv_len])
         weighted_kv = sum(attn_weights[t] * compressed_kv[t])
 
     The weight absorption (q_absorbed = q_nope @ w_k_nope^T) and the final
     value projection (out = weighted_kv @ w_v^T) are done outside this kernel.
+    Per-token kv_len provides causal masking for prefill tokens.
     """
-    batch_id = tl.program_id(0)
+    token_id = tl.program_id(0)
     head_id = tl.program_id(1)
 
-    kv_position = tl.load(input_pos_ptr + batch_id)
-    slot_idx = tl.load(slot_idx_ptr + batch_id)
+    slot_idx = tl.load(token_slot_ptr + token_id)
+    kv_len = tl.load(token_kv_len_ptr + token_id)
 
     # Load absorbed query for this head: [KV_BLOCK]
-    q_abs_base = batch_id * N_HEADS * KV_LORA_RANK + head_id * KV_LORA_RANK
+    q_abs_base = token_id * N_HEADS * KV_LORA_RANK + head_id * KV_LORA_RANK
     kv_offsets = tl.arange(0, KV_BLOCK)
     kv_mask = kv_offsets < KV_LORA_RANK
     q_abs = tl.load(q_absorbed_ptr + q_abs_base + kv_offsets, mask=kv_mask, other=0.0).to(
@@ -103,7 +103,7 @@ def _mla_decode_attention_kernel(
     )
 
     # Load q_pe for this head: [PE_BLOCK]
-    q_pe_base = batch_id * N_HEADS * QK_ROPE_HEAD_DIM + head_id * QK_ROPE_HEAD_DIM
+    q_pe_base = token_id * N_HEADS * QK_ROPE_HEAD_DIM + head_id * QK_ROPE_HEAD_DIM
     pe_offsets = tl.arange(0, PE_BLOCK)
     pe_mask = pe_offsets < QK_ROPE_HEAD_DIM
     q_pe = tl.load(q_pe_ptr + q_pe_base + pe_offsets, mask=pe_mask, other=0.0).to(tl.float32)
@@ -114,13 +114,12 @@ def _mla_decode_attention_kernel(
     acc = tl.zeros([KV_BLOCK], dtype=tl.float32)  # running weighted sum of compressed_kv
 
     cache_batch_base = slot_idx * MAX_SEQ_LEN * CACHE_DIM
-    seq_len = kv_position + 1
-    num_blocks = (seq_len + SEQ_BLOCK - 1) // SEQ_BLOCK
+    num_blocks = (kv_len + SEQ_BLOCK - 1) // SEQ_BLOCK
 
     for block_id in range(0, num_blocks):
         block_start = block_id * SEQ_BLOCK
         seq_offsets = block_start + tl.arange(0, SEQ_BLOCK)
-        seq_mask = seq_offsets < seq_len
+        seq_mask = seq_offsets < kv_len
 
         # Load compressed_kv for this block: [SEQ_BLOCK, KV_BLOCK]
         ckv_ptrs = (
@@ -166,7 +165,7 @@ def _mla_decode_attention_kernel(
     acc = acc / safe_l_i
 
     # Store weighted_kv result
-    out_base = batch_id * N_HEADS * KV_LORA_RANK + head_id * KV_LORA_RANK
+    out_base = token_id * N_HEADS * KV_LORA_RANK + head_id * KV_LORA_RANK
     tl.store(out_ptr + out_base + kv_offsets, acc, mask=kv_mask)
 
 
@@ -235,13 +234,16 @@ def _triton_mla_decode(
     kv_block = triton.next_power_of_2(kv_lora_rank)
     pe_block = triton.next_power_of_2(qk_rope_head_dim)
 
+    # Per-token KV length: decode attends to positions [0, input_pos]
+    kv_len = (input_pos + 1).to(torch.int32)
+
     grid = (b, num_heads)
-    _mla_decode_attention_kernel[grid](
+    _mla_attention_kernel[grid](
         q_absorbed,
         q_pe_2d,
         mla_cache,
         slot_idx,
-        input_pos,
+        kv_len,
         weighted_kv,
         SCALE=scale,
         MAX_SEQ_LEN=max_seq_len,
@@ -261,6 +263,132 @@ def _triton_mla_decode(
     attn_out = torch.einsum("bnk,nvk->bnv", weighted_kv, w_v)  # [B, N, v_head_dim]
 
     out.copy_(attn_out)
+
+
+def _triton_mla_prefill(
+    q_nope: torch.Tensor,  # [total_padded, N, qk_nope_head_dim]
+    q_pe: torch.Tensor,  # [total_padded, N, qk_rope_head_dim]
+    compressed_kv: torch.Tensor,  # [total_padded, kv_lora_rank]
+    kpe: torch.Tensor,  # [total_padded, 1, qk_rope_head_dim]
+    kv_b_proj_weight: torch.Tensor,  # [N * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
+    mla_cache: torch.Tensor,  # [max_batch, max_seq, kv_lora_rank + qk_rope_head_dim]
+    input_pos: torch.Tensor,  # [num_seq] - starting cache position per sequence
+    slot_idx: torch.Tensor,  # [num_seq] - cache slot per sequence
+    seq_len: torch.Tensor,  # [num_seq] - token count per sequence
+    seq_start: torch.Tensor,  # [num_seq] - start index in flattened tensor
+    scale: float,
+    kv_lora_rank: int,
+    num_heads: int,
+    qk_nope_head_dim: int,
+    v_head_dim: int,
+    out: torch.Tensor,  # [total_padded, N, v_head_dim]
+) -> None:
+    """Triton-accelerated MLA prefill with weight absorption.
+
+    Uses the same attention kernel as decode but with per-token causal masking.
+    Replaces the PyTorch reference (_torch_mla_context_with_expansion) which had
+    Python loops over sequences.
+
+    Steps:
+    1. Vectorized cache update (no Python loops)
+    2. Weight absorption: q_absorbed = q_nope @ W_kn^T (PyTorch einsum)
+    3. Triton kernel: fused attention scoring + online softmax + weighted sum
+    4. Value projection: out = weighted_kv @ W_v^T (PyTorch einsum)
+    """
+    device = q_nope.device
+    qk_rope_head_dim = q_pe.shape[2]
+    num_seq = seq_len.shape[0]
+    seq_lengths = seq_len.long()
+    total_tokens = seq_lengths.sum().item()
+
+    if total_tokens == 0:
+        out.zero_()
+        return
+
+    # =====================================================================
+    # Step 1: Vectorized cache update (no Python loops)
+    # =====================================================================
+    # Build per-token metadata from per-sequence metadata
+    token_slots = slot_idx.long().repeat_interleave(seq_lengths)  # [total_tokens]
+    base_positions = input_pos.long().repeat_interleave(seq_lengths)  # [total_tokens]
+
+    # Within-sequence offsets: [0,1,...,sl0-1, 0,1,...,sl1-1, ...]
+    cum_lengths = torch.zeros(num_seq + 1, device=device, dtype=torch.long)
+    cum_lengths[1:] = seq_lengths.cumsum(0)
+    base_in_dense = cum_lengths[:-1].repeat_interleave(seq_lengths)
+    within_offsets = torch.arange(total_tokens, device=device) - base_in_dense
+
+    token_cache_pos = base_positions + within_offsets  # [total_tokens]
+
+    # Vectorized cache write
+    kpe_flat = kpe[:total_tokens].squeeze(1)  # [total_tokens, qk_rope_head_dim]
+    ckv_actual = compressed_kv[:total_tokens]  # [total_tokens, kv_lora_rank]
+
+    cache_dtype = mla_cache.dtype
+    ckv_for_cache = ckv_actual.to(cache_dtype) if ckv_actual.dtype != cache_dtype else ckv_actual
+    kpe_for_cache = kpe_flat.to(cache_dtype) if kpe_flat.dtype != cache_dtype else kpe_flat
+
+    mla_cache[token_slots, token_cache_pos, :kv_lora_rank] = ckv_for_cache
+    mla_cache[token_slots, token_cache_pos, kv_lora_rank:] = kpe_for_cache
+
+    # =====================================================================
+    # Step 2: Weight absorption
+    # =====================================================================
+    weight_reshaped = kv_b_proj_weight.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+    w_k_nope = weight_reshaped[:, :qk_nope_head_dim, :]  # [N, qk_nope_head_dim, kv_lora_rank]
+    w_v = weight_reshaped[:, qk_nope_head_dim:, :]  # [N, v_head_dim, kv_lora_rank]
+
+    q_nope_actual = q_nope[:total_tokens]  # [total_tokens, N, qk_nope_head_dim]
+    q_pe_actual = q_pe[:total_tokens].contiguous()  # [total_tokens, N, qk_rope_head_dim]
+
+    # q_absorbed: [total_tokens, N, kv_lora_rank]
+    # Use fp32 for absorption to minimize bf16 reduction error over qk_nope_head_dim
+    q_absorbed = torch.einsum("tnd,ndk->tnk", q_nope_actual.float(), w_k_nope.float()).contiguous()
+
+    # =====================================================================
+    # Step 3: Triton attention kernel
+    # =====================================================================
+    # Per-token KV length for causal masking: token at cache position p attends to [0, p]
+    token_kv_len = (token_cache_pos + 1).to(torch.int32)  # [total_tokens]
+
+    weighted_kv = torch.empty(
+        total_tokens, num_heads, kv_lora_rank, device=device, dtype=torch.float32
+    )
+
+    max_seq_len = mla_cache.shape[1]
+    cache_dim = mla_cache.shape[2]
+    kv_block = triton.next_power_of_2(kv_lora_rank)
+    pe_block = triton.next_power_of_2(qk_rope_head_dim)
+
+    grid = (total_tokens, num_heads)
+    _mla_attention_kernel[grid](
+        q_absorbed,
+        q_pe_actual,
+        mla_cache,
+        token_slots,
+        token_kv_len,
+        weighted_kv,
+        SCALE=scale,
+        MAX_SEQ_LEN=max_seq_len,
+        N_HEADS=num_heads,
+        KV_LORA_RANK=kv_lora_rank,
+        QK_ROPE_HEAD_DIM=qk_rope_head_dim,
+        CACHE_DIM=cache_dim,
+        KV_BLOCK=kv_block,
+        PE_BLOCK=pe_block,
+        SEQ_BLOCK=16,  # Larger blocks for prefill (longer sequences)
+        num_warps=4,
+        num_stages=2,
+    )
+
+    # =====================================================================
+    # Step 4: Value projection (fp32 to minimize bf16 reduction error over kv_lora_rank)
+    # =====================================================================
+    attn_out = torch.einsum("tnk,nvk->tnv", weighted_kv, w_v.float()).to(
+        q_nope.dtype
+    )  # [total_tokens, N, v_head_dim]
+
+    out[:total_tokens].copy_(attn_out)
 
 
 @torch.library.custom_op("auto_deploy::triton_cached_mla_with_cache", mutates_args=())
@@ -285,8 +413,8 @@ def triton_cached_mla_with_cache(
 ) -> torch.Tensor:
     """Triton backend MLA with compressed cache.
 
-    Decode path uses a Triton kernel for fused attention scoring with online
-    softmax, eliminating Python loops. Prefill path uses the PyTorch reference.
+    Both prefill and decode use Triton-accelerated attention with weight
+    absorption and online softmax. No Python loops in either path.
 
     Cache Layout:
         mla_cache: [max_batch, max_seq, kv_lora_rank + qk_rope_head_dim]
@@ -347,7 +475,7 @@ def triton_cached_mla_with_cache(
         return y.unsqueeze(1)  # [B, 1, N, v_head_dim]
     else:
         # =================================================================
-        # Context phase: Reuse PyTorch reference (expand + standard attn)
+        # Context phase: Triton attention with absorption (no Python loops)
         # =================================================================
         bs_view = (b * s,)
 
@@ -358,7 +486,7 @@ def triton_cached_mla_with_cache(
 
         y = q_nope.new_empty(*bs_view, num_heads, v_head_dim).contiguous()
 
-        _torch_mla_context_with_expansion(
+        _triton_mla_prefill(
             q_nope_flat,
             q_pe_flat,
             compressed_kv_flat,
@@ -415,8 +543,8 @@ class TritonMLAAttention(AttentionDescriptor):
     Uses the same cache layout as torch_mla:
         mla_cache: [max_batch, max_seq, kv_lora_rank + qk_rope_head_dim]
 
-    Decode: Triton kernel with weight absorption + online softmax
-    Prefill: PyTorch reference (expand compressed_kv + standard attention)
+    Both prefill and decode use a shared Triton kernel with weight absorption
+    + online softmax. Per-token KV length metadata provides causal masking.
     """
 
     @classmethod

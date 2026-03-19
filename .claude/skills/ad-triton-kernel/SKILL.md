@@ -37,6 +37,25 @@ tensorrt_llm/_torch/auto_deploy/transform/library/<op_name>.py
 - Custom op wrappers (all backends): `custom_ops/normalization/rms_norm.py`
 - Graph transform with dispatch: `transform/library/rms_norm.py`
 
+## Decision Tree
+
+Before starting, classify the op to determine which phases apply:
+
+```
+Is this a simple op (elementwise / row-reduction / fused)?
+  YES → Standard flow: Phase 0 → 1 → 2 → 3 (if dispatch needed) → 4 → 5 → 6
+  NO  → Is this an attention op with prefill/decode phases?
+          YES → Standard flow BUT use dual-phase pattern in Phase 1
+                (see PATTERNS.md#dual-phase-kernels-for-attention-ops)
+          NO  → Assess complexity, discuss with user before proceeding
+
+Does the op already have a graph transform in transform/library/?
+  YES → Phase 3 Option A or B (add backend to existing dispatch)
+  NO  → Does it need configurable backend selection?
+          YES → Phase 3 Option C (create new transform)
+          NO  → Skip Phase 3
+```
+
 ## Phase 0 — Locate and Validate the `torch_*` Reference
 
 ### Step 1 — Find the torch_* op
@@ -70,154 +89,19 @@ Report the signature, semantics, and confirmation that no Triton backend exists 
 
 Create `custom_ops/<category>/triton_<op_name>.py`.
 
-### Kernel structure
+Use the kernel + launcher template from **TEMPLATES.md#triton-kernel-and-launcher**.
 
-```python
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-# ... (full license header)
+Choose the appropriate Triton pattern from **PATTERNS.md**:
+- Elementwise ops → **PATTERNS.md#elementwise**
+- Row-wise reduction ops → **PATTERNS.md#row-wise-reduction**
+- Fused elementwise + reduction → **PATTERNS.md#fused-elementwise--reduction**
+- Attention with prefill/decode → **PATTERNS.md#dual-phase-kernels-for-attention-ops**
 
-import torch
-import triton
-import triton.language as tl
-from torch import Tensor
-
-
-@triton.jit
-def <op_name>_kernel(
-    # --- Pointer arguments (one per tensor) ---
-    input_ptr,
-    output_ptr,
-    # --- Scalar arguments ---
-    stride_row: tl.constexpr,   # strides for pointer arithmetic
-    N_COLS: tl.constexpr,       # problem size dimensions
-    BLOCK_SIZE: tl.constexpr,   # tile size (power of 2)
-    # ... other constexpr params
-):
-    """Triton kernel for <op_name>.
-
-    Grid: (num_rows,) — one program per row.
-    """
-    # 1. Identify which row this program handles
-    row_idx = tl.program_id(0)
-
-    # 2. Compute column offsets within the tile
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < N_COLS  # bounds check
-
-    # 3. Load input data
-    input_row_ptr = input_ptr + row_idx * stride_row
-    x = tl.load(input_row_ptr + col_offsets, mask=mask, other=0.0)
-
-    # 4. Compute — upcast to float32 for numerical stability
-    xf = x.to(tl.float32)
-    # ... actual computation ...
-    result = xf  # placeholder
-
-    # 5. Cast back and store
-    out = result.to(x.dtype)
-    output_row_ptr = output_ptr + row_idx * stride_row
-    tl.store(output_row_ptr + col_offsets, out, mask=mask)
-
-
-def <op_name>(input: Tensor, ...) -> Tensor:
-    """Python launcher for the Triton kernel.
-
-    Handles grid computation, block size selection, output allocation,
-    and kernel launch.
-    """
-    # Compute grid dimensions
-    *batch_dims, N = input.shape
-    num_rows = input.numel() // N
-    stride_row = input.stride(-2)
-
-    # Choose block size (must be power of 2, >= N)
-    BLOCK_SIZE = triton.next_power_of_2(N)
-
-    # Allocate output
-    out = torch.empty_like(input)
-
-    # Launch kernel
-    grid = (num_rows,)
-    <op_name>_kernel[grid](
-        input,
-        out,
-        stride_row=stride_row,
-        N_COLS=N,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=4,     # tune: 1, 2, 4, 8
-        num_stages=3,    # tune: 1, 2, 3, 4
-    )
-
-    return out
-```
-
-### Triton kernel checklist
-
-- [ ] **Grid design**: One program per independent work unit (typically one row). Use `tl.program_id(0)` for 1D grids. Use 2D grids (`tl.program_id(0)`, `tl.program_id(1)`) for tiled matmuls or 2D reductions.
-- [ ] **Block size**: Must be `tl.constexpr` and a power of 2. Use `triton.next_power_of_2(N)` in the launcher.
-- [ ] **Masking**: Always use `mask=offsets < N_COLS` on `tl.load`/`tl.store` to avoid out-of-bounds access when `N` is not a power of 2.
-- [ ] **Numerical precision**: Upcast to `tl.float32` for reductions (sum, mean, variance). Cast back to input dtype before store.
-- [ ] **Strides**: Use tensor strides for pointer arithmetic, not hardcoded shapes. This handles non-contiguous inputs.
-- [ ] **`other=0.0`**: Set on `tl.load` with mask to avoid undefined values in masked-off lanes (important for reductions).
-- [ ] **Reductions**: Use `tl.sum`, `tl.max`, etc. with appropriate axis. For row-wise reduction, axis=0 on a 1D `tl.arange` block.
-- [ ] **No Python control flow inside `@triton.jit`**: All branching must use `tl.where` or constexpr parameters, not Python `if`.
-- [ ] **Warp/stage tuning**: Start with `num_warps=4, num_stages=3`. Profile and tune later.
-
-### Common Triton patterns
-
-**Elementwise** (e.g., activation functions):
-```python
-# Grid: one program per BLOCK_SIZE chunk of elements
-pid = tl.program_id(0)
-offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-mask = offsets < n_elements
-x = tl.load(input_ptr + offsets, mask=mask)
-out = tl.sigmoid(x) * x  # SiLU example
-tl.store(output_ptr + offsets, out, mask=mask)
-```
-
-**Row-wise reduction** (e.g., softmax, layer norm):
-```python
-# Grid: one program per row
-row_idx = tl.program_id(0)
-offsets = tl.arange(0, BLOCK_SIZE)
-mask = offsets < N_COLS
-x = tl.load(input_ptr + row_idx * stride + offsets, mask=mask, other=-float('inf'))
-max_val = tl.max(x, axis=0)
-x = tl.exp(x - max_val)
-sum_val = tl.sum(x, axis=0)
-out = x / sum_val
-```
-
-**Fused elementwise + reduction** (e.g., RMSNorm):
-```python
-# Load, reduce for variance, normalize, scale — all in one kernel
-x = tl.load(...)
-xf = x.to(tl.float32)
-var = tl.sum(xf * xf, 0) * (1.0 / N_COLS)
-out = xf / tl.sqrt(var + eps)
-out = (w * out).to(x.dtype)
-tl.store(...)
-```
+After writing, verify against **CHECKLIST.md#triton-kernel**.
 
 ## Phase 2 — Register the `triton_*` Custom Op
 
-In the same file as the `torch_*` op (e.g., `custom_ops/<category>/<op_name>.py`), add:
-
-```python
-from .triton_<op_name> import <op_name> as _triton_<op_name>
-
-@torch.library.custom_op("auto_deploy::triton_<op_name>", mutates_args=())
-def triton_<op_name>(input: torch.Tensor, ...) -> torch.Tensor:
-    """Triton backend for <op_name>."""
-    return _triton_<op_name>(input, ...)
-
-@triton_<op_name>.register_fake
-def _(input: torch.Tensor, ...) -> torch.Tensor:
-    """Fake implementation for torch.export tracing."""
-    return torch.empty_like(input)
-```
+In the same file as the `torch_*` op (e.g., `custom_ops/<category>/<op_name>.py`), add the registration using the template from **TEMPLATES.md#custom-op-registration**.
 
 **Requirements:**
 - The `triton_*` custom op MUST have the **exact same signature** (parameter names, types, order) as the `torch_*` op. This is critical for the graph transform to swap them.
@@ -257,21 +141,7 @@ class TritonAttentionDescriptor(AttentionDescriptor):
 
 ### Option C: New transform (for a new op category)
 
-If no graph transform exists for this op yet, create `transform/library/<op_name>.py` following the `rms_norm.py` pattern:
-
-1. **Pattern match stage** (`MatchXxxPattern`): Match raw PyTorch subgraphs → replace with `torch_*` canonical op
-2. **Fusion stage** (`FuseXxx`): Replace `torch_*` op with backend-specific op based on config
-
-Register both transforms:
-```python
-@TransformRegistry.register("match_<op_name>_pattern")
-class MatchXxxPattern(BaseTransform):
-    ...
-
-@TransformRegistry.register("fuse_<op_name>")
-class FuseXxx(BaseTransform):
-    ...
-```
+If no graph transform exists for this op yet, create `transform/library/<op_name>.py` following the `rms_norm.py` pattern. See **TEMPLATES.md#graph-transform** for the template.
 
 Add the transforms to the appropriate pipeline stages (check existing transform ordering in the AD pipeline configuration).
 
@@ -279,63 +149,11 @@ Add the transforms to the appropriate pipeline stages (check existing transform 
 
 Create `tests/unittest/auto_deploy/singlegpu/custom_ops/<category>/test_triton_<op_name>.py`.
 
-**Structure:**
-
-```python
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-# ... (full license header)
-
-import pytest
-import torch
-
-# Import the torch reference and triton backend
-from tensorrt_llm._torch.auto_deploy.custom_ops.<category>.<op_file> import (
-    torch_<op_name>,
-    triton_<op_name>,
-)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("shape", [(1, 128), (4, 512), (8, 1024), (32, 4096)])
-def test_triton_<op_name>_matches_torch(shape, dtype):
-    """Triton kernel output matches torch reference within tolerance."""
-    torch.manual_seed(42)
-    input = torch.randn(*shape, device="cuda", dtype=dtype)
-    # ... other inputs (weights, etc.)
-
-    expected = torch_<op_name>(input, ...)
-    actual = triton_<op_name>(input, ...)
-
-    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
-
-
-@pytest.mark.parametrize("shape", [(1, 128), (4, 513), (8, 1023)])  # include non-power-of-2
-def test_triton_<op_name>_non_power_of_2(shape):
-    """Triton kernel handles non-power-of-2 dimensions correctly."""
-    input = torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
-    expected = torch_<op_name>(input, ...)
-    actual = triton_<op_name>(input, ...)
-    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
-
-
-def test_triton_<op_name>_large():
-    """Triton kernel works on large realistic shapes."""
-    input = torch.randn(2048, 8192, device="cuda", dtype=torch.bfloat16)
-    expected = torch_<op_name>(input, ...)
-    actual = triton_<op_name>(input, ...)
-    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-```
-
-**Test checklist:**
-- [ ] Multiple dtypes (bf16, fp16, fp32)
-- [ ] Multiple shapes including non-power-of-2 dimensions
-- [ ] Large realistic shapes (e.g., hidden_size=4096, 8192)
-- [ ] Edge cases: single-element, single-row, very wide rows
-- [ ] All optional parameters exercised
-- [ ] Gradient correctness (if the op needs to support autograd)
+Use the test template from **TEMPLATES.md#correctness-tests**.
 
 Also add the `"triton"` variant to existing transform fusion tests if they exist (e.g., `test_fuse_<op_name>.py`).
+
+Verify against **CHECKLIST.md#correctness-tests**.
 
 Run tests:
 ```bash
@@ -344,35 +162,7 @@ pytest tests/unittest/auto_deploy/singlegpu/custom_ops/<category>/test_triton_<o
 
 ## Phase 5 — Performance Validation
 
-After correctness is verified, benchmark the Triton kernel against the torch reference.
-
-```python
-import torch
-import triton
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['N'],
-        x_vals=[128, 256, 512, 1024, 2048, 4096, 8192],
-        line_arg='provider',
-        line_vals=['torch', 'triton'],
-        line_names=['PyTorch', 'Triton'],
-        ylabel='GB/s',
-        plot_name='<op_name>-performance',
-        args={'M': 2048},
-    )
-)
-def benchmark(M, N, provider):
-    x = torch.randn(M, N, device='cuda', dtype=torch.bfloat16)
-    # ... setup
-    if provider == 'torch':
-        fn = lambda: torch_<op_name>(x, ...)
-    else:
-        fn = lambda: triton_<op_name>(x, ...)
-    ms = triton.testing.do_bench(fn)
-    gbps = 2 * x.numel() * x.element_size() / ms * 1e-6  # read + write
-    return gbps
-```
+After correctness is verified, benchmark the Triton kernel against the torch reference using the template from **TEMPLATES.md#performance-benchmark**.
 
 The Triton kernel should be **at least as fast** as the torch reference for typical shapes. If it is slower, investigate:
 - Block size tuning (`BLOCK_SIZE`, `num_warps`, `num_stages`)
