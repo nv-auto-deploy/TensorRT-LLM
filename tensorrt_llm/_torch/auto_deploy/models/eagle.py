@@ -115,9 +115,6 @@ class TargetModelExportInfo(SubModuleExportInfo):
         """Preserve embedding (always) and optionally lm_head on the exported GraphModule."""
         # --- Embedding: always needed (target embeds input_ids for both target and draft) ---
         embed_tokens = sub_mod.get_input_embeddings()
-        sub_gm.get_input_embeddings = types.MethodType(
-            sub_mod.get_input_embeddings.__func__, sub_gm
-        )
         # Find the submodule path for the embedding
         for embed_name, subsubmod in sub_mod.named_modules():
             if subsubmod is embed_tokens:
@@ -125,6 +122,9 @@ class TargetModelExportInfo(SubModuleExportInfo):
         else:
             raise RuntimeError("Could not find embedding module in target model.")
         sub_gm.set_submodule(embed_name, embed_tokens)
+        sub_gm.get_input_embeddings = types.MethodType(
+            lambda self, _n=embed_name: self.get_submodule(_n), sub_gm
+        )
         # Add impure node to prevent GC
         n_embed = sub_gm.graph.get_attr(f"{embed_name}.weight")
         sub_gm.graph.call_function(
@@ -134,15 +134,15 @@ class TargetModelExportInfo(SubModuleExportInfo):
         # --- lm_head: only if draft model loads it from target ---
         if self.load_lm_head_from_target:
             lm_head = sub_mod.get_output_embeddings()
-            sub_gm.get_output_embeddings = types.MethodType(
-                sub_mod.get_output_embeddings.__func__, sub_gm
-            )
             for lm_head_name, subsubmod in sub_mod.named_modules():
                 if subsubmod is lm_head:
                     break
             else:
                 raise RuntimeError("Could not find lm_head module in target model.")
             sub_gm.set_submodule(lm_head_name, lm_head)
+            sub_gm.get_output_embeddings = types.MethodType(
+                lambda self, _n=lm_head_name: self.get_submodule(_n), sub_gm
+            )
             n_lm_head = sub_gm.graph.get_attr(f"{lm_head_name}.weight")
             sub_gm.graph.call_function(
                 torch._assert, args=(n_lm_head, "Avoid lm_head getting deleted from graph.")
@@ -151,15 +151,15 @@ class TargetModelExportInfo(SubModuleExportInfo):
         # --- Final normalization: only if target model exposes it (e.g., NemotronH for MTP) ---
         if hasattr(sub_mod, "get_final_normalization"):
             norm_module = sub_mod.get_final_normalization()
-            sub_gm.get_final_normalization = types.MethodType(
-                sub_mod.get_final_normalization.__func__, sub_gm
-            )
             for norm_name, subsubmod in sub_mod.named_modules():
                 if subsubmod is norm_module:
                     break
             else:
                 raise RuntimeError("Could not find final normalization module in target model.")
             sub_gm.set_submodule(norm_name, norm_module)
+            sub_gm.get_final_normalization = types.MethodType(
+                lambda self, _n=norm_name: self.get_submodule(_n), sub_gm
+            )
             n_norm = sub_gm.graph.get_attr(f"{norm_name}.weight")
             sub_gm.graph.call_function(
                 torch._assert, args=(n_norm, "Avoid final norm getting deleted from graph.")
@@ -195,7 +195,7 @@ class DraftModelExportInfo(SubModuleExportInfo):
         if not self.load_embedding_from_target:
             sub_gm.set_submodule("model.embed_tokens", inner_model.embed_tokens)
             sub_gm.get_input_embeddings = types.MethodType(
-                sub_mod.get_input_embeddings.__func__, sub_gm
+                lambda self: self.get_submodule("model.embed_tokens"), sub_gm
             )
             n_embed = sub_gm.graph.get_attr("model.embed_tokens.weight")
             sub_gm.graph.call_function(
@@ -206,7 +206,7 @@ class DraftModelExportInfo(SubModuleExportInfo):
         if not self.load_lm_head_from_target:
             sub_gm.set_submodule("lm_head", sub_mod.lm_head)
             sub_gm.get_output_embeddings = types.MethodType(
-                sub_mod.get_output_embeddings.__func__, sub_gm
+                lambda self: self.get_submodule("lm_head"), sub_gm
             )
             n_lm_head = sub_gm.graph.get_attr("lm_head.weight")
             sub_gm.graph.call_function(

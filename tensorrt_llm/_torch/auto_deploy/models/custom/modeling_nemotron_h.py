@@ -611,10 +611,10 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         self.post_init()
 
     def get_input_embeddings(self):
-        return self.backbone.embeddings
+        return self.backbone.get_input_embeddings()
 
     def set_input_embeddings(self, new_embeddings):
-        self.backbone.embeddings = new_embeddings
+        self.backbone.set_input_embeddings(new_embeddings)
 
     def get_final_normalization(self):
         return self.backbone.norm_f
