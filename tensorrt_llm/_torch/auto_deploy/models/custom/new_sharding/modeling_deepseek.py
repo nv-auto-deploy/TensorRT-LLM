@@ -15,6 +15,12 @@
 
 """DeepSeekV3 model with explicit sharding hint ops.
 
+WARNING: tested only on up to 8 layers (8xH100 machine can't fit the full model,
+the output is not fully verified). The sharding pipeline processes all nodes
+correctly (41 nodes at 4 layers, 59+ at 8 layers) but coherent end-to-end output
+has not been validated due to memory constraints. Additionally, the DeepSeek-V3/R1
+FP8 checkpoints use dsv3_router_gemm_op which crashes on H100 (pre-existing bug).
+
 Based on the original modeling_deepseek.py. All shardable operations use
 AutoDeploy custom ops with sharding hint kwargs. The graph produced by this
 model is a complete, self-contained specification of "how this model should be

@@ -34,7 +34,7 @@ OperatorLike = Union[OpOrOverload, Callable]
 class LayerType(Enum):
     """Enum for layer type."""
 
-    ATTENTION = "attention"
+    MHA = "mha"
     SSM = "ssm"
     MLP = "mlp"
     MOE = "moe"
