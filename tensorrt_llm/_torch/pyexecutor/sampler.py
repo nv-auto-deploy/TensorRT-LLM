@@ -3871,20 +3871,27 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         Returns:
             The logits with min length penalty applied
         """
-        if any(r.py_min_length and r.max_beam_num_tokens < r.py_min_length[0] for r in requests):
+        if any(
+            r.py_min_length and r.max_beam_num_tokens - r.py_orig_prompt_len < r.py_min_length[0]
+            for r in requests
+        ):
             current_offset = 0
             for index, r in enumerate(requests):
                 if r.py_min_length:
                     for beam_idx in range(num_beams[index]):
                         for step in range(num_steps[index]):
-                            if r.get_num_tokens(beam_idx) + step < r.py_min_length[0]:
+                            if (
+                                r.get_num_tokens(beam_idx) - r.py_orig_prompt_len + step
+                                < r.py_min_length[0]
+                            ):
                                 # NOTE(jthomson04): We can NOT just assign logits[...] = float("-inf").
                                 # This introduces a pageable HtoD transfer, which wreaks havoc on TPOT (up to ~20%)
                                 # Instead, we create a little tensor on device, then assign to that.
                                 # This way, we avoid the pageable transfer.
                                 neg_inf_tensor = torch.full((), float("-inf"), device=logits.device)
+                                end_id = getattr(r, "py_original_end_id", r.py_end_id)
                                 logits[
-                                    current_offset + num_steps[index] * beam_idx + step, r.py_end_id
+                                    current_offset + num_steps[index] * beam_idx + step, end_id
                                 ] = neg_inf_tensor
                             else:
                                 # early exit
