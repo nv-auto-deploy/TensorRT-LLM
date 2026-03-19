@@ -1653,11 +1653,7 @@ class SSMResourceHandler(StateResourceHandler):
         return (self.num_heads, self.head_dim, self.d_state)
 
     def has_compatible_dims(self, other: Optional["SSMResourceHandler"]) -> bool:
-        """Return whether this handler can share Mamba state dimensions with ``other``.
-
-        Spec handlers prepend ``cache_steps`` to the state shape, so compatibility needs to be
-        checked from the base SSM dimensions instead of relying on ``__eq__``.
-        """
+        """Return whether this handler can share Mamba state dimensions with ``other``."""
         if other is None:
             return False
         return (
@@ -1712,10 +1708,11 @@ class CausalConvResourceHandler(StateResourceHandler):
 
 
 class SpecSSMResourceHandler(StateResourceHandler):
-    """Intermediate SSM state cache for speculative decoding.
+    """Intermediate SSM state cache descriptor for speculative decoding.
 
-    Shape: [max_batch_size, cache_steps, num_heads, head_dim, d_state]
-    (prepends cache_steps to the base SSM state shape).
+    Acts as a type marker conveying the per-layer SSM shape to the cache interface.
+    The actual buffer shape (including cache_steps = max_draft_len + 1) is determined
+    by the MambaHybridCacheManager using spec_config, not by this handler.
 
     Inherits from StateResourceHandler (not SSMResourceHandler) so that
     isinstance(h, SSMResourceHandler) returns False for spec handlers, eliminating
@@ -1728,52 +1725,41 @@ class SpecSSMResourceHandler(StateResourceHandler):
         head_dim: int,
         d_state: int,
         dtype: torch.dtype,
-        cache_steps: int,
     ) -> None:
-        self.cache_steps = cache_steps
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.d_state = d_state
         super().__init__(dtype=dtype)
 
     @property
-    def state_shape(self) -> Tuple[int, int, int, int]:
-        return (self.cache_steps, self.num_heads, self.head_dim, self.d_state)
-
-    def has_compatible_dims(self, other: Optional[SSMResourceHandler]) -> bool:
-        """Return whether this handler can share Mamba state dimensions with ``other``."""
-        if other is None:
-            return False
-        return (
-            self.num_heads == other.num_heads
-            and self.head_dim == other.head_dim
-            and self.d_state == other.d_state
-            and self.dtype == other.dtype
-        )
+    def state_shape(self) -> Tuple[int, int, int]:
+        return (self.num_heads, self.head_dim, self.d_state)
 
     @classmethod
-    def placeholder(
-        cls,
-        num_heads: int,
-        head_dim: int,
-        d_state: int,
-        dtype: torch.dtype,
-    ) -> "SpecSSMResourceHandler":
-        """Create a minimal placeholder intermediate cache when spec-decoding is disabled."""
+    def from_base(cls, base: "SSMResourceHandler") -> "SpecSSMResourceHandler":
+        """Create a spec handler with identical dims to an existing SSMResourceHandler."""
         return cls(
-            num_heads=num_heads,
-            head_dim=head_dim,
-            d_state=d_state,
-            dtype=dtype,
-            cache_steps=1,
+            num_heads=base.num_heads, head_dim=base.head_dim, d_state=base.d_state, dtype=base.dtype
+        )
+
+    def has_compatible_dims(self, base: Optional[SSMResourceHandler]) -> bool:
+        """Return whether this handler has compatible dims with a base SSMResourceHandler."""
+        if base is None:
+            return False
+        return (
+            self.num_heads == base.num_heads
+            and self.head_dim == base.head_dim
+            and self.d_state == base.d_state
+            and self.dtype == base.dtype
         )
 
 
 class SpecCausalConvResourceHandler(StateResourceHandler):
-    """Intermediate conv state cache for speculative decoding.
+    """Intermediate conv state cache descriptor for speculative decoding.
 
-    Shape: [max_batch_size, cache_steps, conv_dim, d_conv - 1]
-    (prepends cache_steps to the base conv state shape).
+    Acts as a type marker conveying the per-layer conv shape to the cache interface.
+    The actual buffer shape (including cache_steps = max_draft_len + 1) is determined
+    by the MambaHybridCacheManager using spec_config, not by this handler.
 
     Inherits from StateResourceHandler (not CausalConvResourceHandler) so that
     isinstance(h, CausalConvResourceHandler) returns False for spec handlers.
@@ -1784,40 +1770,28 @@ class SpecCausalConvResourceHandler(StateResourceHandler):
         conv_dim: int,
         d_conv: int,
         dtype: torch.dtype,
-        cache_steps: int,
     ) -> None:
-        self.cache_steps = cache_steps
         self.conv_dim = conv_dim
         self.d_conv = d_conv
         super().__init__(dtype=dtype)
 
     @property
-    def state_shape(self) -> Tuple[int, int, int]:
-        return (self.cache_steps, self.conv_dim, self.d_conv - 1)
-
-    def has_compatible_dims(self, other: Optional[CausalConvResourceHandler]) -> bool:
-        """Return whether this handler can share Mamba state dimensions with ``other``."""
-        if other is None:
-            return False
-        return (
-            self.conv_dim == other.conv_dim
-            and self.d_conv == other.d_conv
-            and self.dtype == other.dtype
-        )
+    def state_shape(self) -> Tuple[int, int]:
+        return (self.conv_dim, self.d_conv - 1)
 
     @classmethod
-    def placeholder(
-        cls,
-        conv_dim: int,
-        d_conv: int,
-        dtype: torch.dtype,
-    ) -> "SpecCausalConvResourceHandler":
-        """Create a minimal placeholder intermediate cache when spec-decoding is disabled."""
-        return cls(
-            conv_dim=conv_dim,
-            d_conv=d_conv,
-            dtype=dtype,
-            cache_steps=1,
+    def from_base(cls, base: "CausalConvResourceHandler") -> "SpecCausalConvResourceHandler":
+        """Create a spec handler with identical dims to an existing CausalConvResourceHandler."""
+        return cls(conv_dim=base.conv_dim, d_conv=base.d_conv, dtype=base.dtype)
+
+    def has_compatible_dims(self, base: Optional[CausalConvResourceHandler]) -> bool:
+        """Return whether this handler has compatible dims with a base CausalConvResourceHandler."""
+        if base is None:
+            return False
+        return (
+            self.conv_dim == base.conv_dim
+            and self.d_conv == base.d_conv
+            and self.dtype == base.dtype
         )
 
 
@@ -1892,7 +1866,7 @@ class AttentionDescriptor(ABC):
 
     @classmethod
     @abstractmethod
-    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
+    def get_cached_attention_op(cls) -> MHACallable:
         """Get the cached attention op .
 
         The attention_op should follow the below signature:
@@ -1958,7 +1932,7 @@ class AttentionDescriptor(ABC):
     @classmethod
     @abstractmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
         """Provide a dictionary of resource handlers that can be used to initialize the resources.
 
@@ -1971,8 +1945,7 @@ class AttentionDescriptor(ABC):
         global CacheManager and passed back to the model during the forward pass.
 
         If the cache initializer requires information about the attention op, it can retrieve
-        the necessary information from the source attention node, cache config, and optional
-        speculative decoding config.
+        the necessary information from the source attention node and cache config.
         """
 
     @classmethod

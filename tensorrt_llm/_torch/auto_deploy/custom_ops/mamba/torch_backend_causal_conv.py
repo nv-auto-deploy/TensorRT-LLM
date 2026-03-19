@@ -171,7 +171,6 @@ def _torch_cached_causal_conv1d(
     #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k]
-    intermediate_conv_state_cache: torch.Tensor,  # unused placeholder/spec cache
     # CONSTANTS
     stride: int,
     padding: int,
@@ -273,7 +272,6 @@ def _torch_cached_causal_conv1d_fake(
     #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k]
-    intermediate_conv_state_cache: torch.Tensor,  # unused placeholder/spec cache
     # CONSTANTS
     stride: int,
     padding: int,
@@ -304,7 +302,7 @@ class TorchBackendCausalConv(AttentionDescriptor):
         return torch.ops.auto_deploy.torch_causal_conv1d
 
     @classmethod
-    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
+    def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.auto_deploy.torch_cached_causal_conv1d.default
 
     @classmethod
@@ -313,7 +311,7 @@ class TorchBackendCausalConv(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
         inp_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
         w_fake: torch.Tensor = source_attn_node.args[1].meta["val"]

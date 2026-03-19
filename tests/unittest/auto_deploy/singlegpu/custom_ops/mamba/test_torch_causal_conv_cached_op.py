@@ -78,7 +78,6 @@ def test_generate_only_with_slot_mapping(conv_env):
         use_initial_states,
         # CACHES
         conv_state_cache,
-        None,
         # CONSTANTS
         s,
         p,
@@ -146,7 +145,6 @@ def test_context_flattened_and_state_writeback(conv_env):
         use_initial_states,
         # CACHES
         conv_state_cache,
-        None,
         # CONSTANTS
         s,
         p,

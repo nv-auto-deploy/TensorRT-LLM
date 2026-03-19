@@ -33,11 +33,17 @@ from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 
-from ..attention_interface import AttentionRegistry, BatchInfo, MHACallable
+from ..attention_interface import (
+    AttentionRegistry,
+    BatchInfo,
+    MHACallable,
+    SpecCausalConvResourceHandler,
+)
 from .causal_conv_common import BaseCausalConvDescriptor
 
 
-def _triton_cached_causal_conv1d_impl(
+@torch.library.custom_op("auto_deploy::triton_cached_causal_conv1d", mutates_args={"input"})
+def _triton_cached_causal_conv1d(
     # INPUTS (dense but may be flattened across sequences)
     input: torch.Tensor,  # [b, s, c_in]
     weight: torch.Tensor,  # [c_out, c_in/groups, k] but we expect depthwise use: [c_in, k]
@@ -48,10 +54,20 @@ def _triton_cached_causal_conv1d_impl(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k-1]
+    intermediate_conv_state_cache: Optional[
+        torch.Tensor
+    ],  # [spec_state_size, max_draft_len+1, c_in, k-1]
+    # CONSTANTS
+    stride: int,
+    padding: int,
+    dilation: int,
+    groups: int,
+    padding_mode: str,
     activation: Optional[str],
-    intermediate_conv_state_cache: torch.Tensor,
 ) -> None:
     """Flattened cached causal conv that respects slot-indexed state caches (Triton backend).
 
@@ -169,8 +185,8 @@ def _triton_cached_causal_conv1d_impl(
         inp_flat[num_total_tokens:].zero_()
 
 
-@torch.library.custom_op("auto_deploy::triton_cached_causal_conv1d", mutates_args={"input"})
-def _triton_cached_causal_conv1d(
+@_triton_cached_causal_conv1d.register_fake
+def _triton_cached_causal_conv1d_fake(
     # INPUTS (dense but may be flattened across sequences)
     input: torch.Tensor,  # [b, s, c_in]
     weight: torch.Tensor,  # [c_out, c_in/groups, k] but we expect depthwise use: [c_in, k]
@@ -185,45 +201,9 @@ def _triton_cached_causal_conv1d(
     #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k-1]
-    intermediate_conv_state_cache: torch.Tensor,  # [spec_state_size, max_draft_len+1, c_in, k-1]
-    # CONSTANTS
-    stride: int,
-    padding: int,
-    dilation: int,
-    groups: int,
-    padding_mode: str,
-    activation: Optional[str],
-) -> None:
-    _triton_cached_causal_conv1d_impl(
-        input,
-        weight,
-        bias,
-        batch_info_host,
-        seq_len,
-        cu_seqlen,
-        slot_idx,
-        use_initial_states,
-        conv_state_cache,
-        activation,
-        intermediate_conv_state_cache=intermediate_conv_state_cache,
-    )
-
-
-@_triton_cached_causal_conv1d.register_fake
-def _triton_cached_causal_conv1d_fake(
-    # INPUTS (dense but may be flattened across sequences)
-    input: torch.Tensor,  # [b, s, c_in]
-    weight: torch.Tensor,  # [c_out, c_in/groups, k] but we expect depthwise use: [c_in, k]
-    bias: Optional[torch.Tensor],
-    # STANDARD METADATA
-    batch_info_host: torch.Tensor,
-    seq_len: torch.Tensor,
-    cu_seqlen: torch.Tensor,
-    slot_idx: torch.Tensor,
-    use_initial_states: torch.Tensor,
-    # CACHES
-    conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k-1]
-    intermediate_conv_state_cache: torch.Tensor,  # [spec_state_size, max_draft_len+1, c_in, k-1]
+    intermediate_conv_state_cache: Optional[
+        torch.Tensor
+    ],  # [spec_state_size, max_draft_len+1, c_in, k-1]
     # CONSTANTS
     stride: int,
     padding: int,
@@ -235,19 +215,9 @@ def _triton_cached_causal_conv1d_fake(
     pass
 
 
-def _make_inplace_wrapper(op):
-    """Create a wrapper that calls an in-place custom op and returns the mutated input."""
-
-    def wrapper(input: torch.Tensor, *args) -> torch.Tensor:
-        op(input, *args)
-        return input
-
-    return wrapper
-
-
-_triton_conv_wrapper = _make_inplace_wrapper(
-    torch.ops.auto_deploy.triton_cached_causal_conv1d.default
-)
+def triton_cached_causal_conv1d_wrapper(input: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    torch.ops.auto_deploy.triton_cached_causal_conv1d(input, *args, **kwargs)
+    return input
 
 
 @AttentionRegistry.register("triton_causal_conv")
@@ -259,13 +229,17 @@ class TritonBackendCausalConv(BaseCausalConvDescriptor):
     """
 
     @classmethod
-    def get_cache_initializers(cls, source_attn_node, cache_config, spec_config=None):
-        return super().get_cache_initializers(source_attn_node, cache_config, spec_config)
+    def get_cache_initializers(cls, source_attn_node, cache_config):
+        ret = super().get_cache_initializers(source_attn_node, cache_config)
+        ret["intermediate_conv_state_cache"] = SpecCausalConvResourceHandler.from_base(
+            ret["conv_state_cache"]
+        )
+        return ret
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
         return ["batch_info_host", "seq_len", "cu_seqlen", "slot_idx", "use_initial_states"]
 
     @classmethod
-    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
-        return _triton_conv_wrapper
+    def get_cached_attention_op(cls) -> MHACallable:
+        return triton_cached_causal_conv1d_wrapper

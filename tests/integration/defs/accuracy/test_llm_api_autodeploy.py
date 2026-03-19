@@ -569,6 +569,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [4, 8])
     def test_mtp(self, world_size):
+        if get_device_count() < world_size:
+            pytest.skip(f"Not enough devices for world_size={world_size}")
         from tensorrt_llm import llmapi
 
         MTP_MODEL_NAME = "nvidia/Nemotron-Super-V3"

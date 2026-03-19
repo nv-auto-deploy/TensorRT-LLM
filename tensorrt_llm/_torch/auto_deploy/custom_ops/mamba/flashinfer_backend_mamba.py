@@ -50,7 +50,6 @@ def _flashinfer_cached_ssm(
     seq_idx_prefill: torch.Tensor,  # [1, num_prefill_tokens]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
-    intermediate_ssm_state_cache: torch.Tensor,  # unused placeholder/spec cache
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
@@ -67,8 +66,6 @@ def _flashinfer_cached_ssm(
     if out is not None:
         preallocated_ssm_out = out.view(bs, num_heads, head_dim)
     else:
-        # Preallocate one contiguous output buffer so prefill and decode can
-        # write their results without an additional merge copy.
         preallocated_ssm_out = torch.zeros(
             [bs, num_heads, head_dim],
             dtype=hidden_states.dtype,
@@ -177,7 +174,6 @@ def _flashinfer_cached_ssm_fake(
     seq_idx_prefill: torch.Tensor,  # [1, num_prefill_tokens]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
-    intermediate_ssm_state_cache: torch.Tensor,  # unused placeholder/spec cache
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
@@ -200,14 +196,14 @@ FLASHINFER_SUPPORTED_HEAD_DIMS = [64, 128]
 @AttentionRegistry.register("flashinfer_ssm")
 class FlashinferBackendSSM(BaseBackendSSM):
     @classmethod
-    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
+    def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.auto_deploy.flashinfer_cached_ssm.default
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
-        ret = super().get_cache_initializers(source_attn_node, cache_config, spec_config)
+        ret = super().get_cache_initializers(source_attn_node, cache_config)
 
         # check head_dim is supported by flashinfer
         if ret["ssm_state_cache"].head_dim not in FLASHINFER_SUPPORTED_HEAD_DIMS:

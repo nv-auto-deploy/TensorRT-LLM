@@ -325,22 +325,17 @@ def test_conv_handler_eq_different_params():
 
 
 def test_spec_ssm_handler_shape_and_isinstance():
-    """Verify SpecSSMResourceHandler prepends cache_steps and is NOT an SSMResourceHandler.
+    """Verify SpecSSMResourceHandler mirrors base SSM dims and is NOT an SSMResourceHandler.
 
     SpecSSMResourceHandler deliberately inherits from StateResourceHandler (not SSMResourceHandler)
-    to eliminate isinstance exclusion guards throughout the codebase.
+    to eliminate isinstance exclusion guards throughout the codebase. cache_steps is determined
+    by MambaHybridCacheManager from spec_config, not stored on the handler.
     """
     base = SSMResourceHandler(num_heads=8, head_dim=64, d_state=16, dtype=torch.bfloat16)
-    spec = SpecSSMResourceHandler(
-        num_heads=8,
-        head_dim=64,
-        d_state=16,
-        dtype=torch.bfloat16,
-        cache_steps=4,
-    )
+    spec = SpecSSMResourceHandler.from_base(base)
 
     assert base.state_shape == (8, 64, 16)
-    assert spec.state_shape == (4, 8, 64, 16)
+    assert spec.state_shape == (8, 64, 16)
     # Spec does NOT inherit from SSMResourceHandler — intent of the inheritance break.
     assert not isinstance(spec, SSMResourceHandler)
     assert isinstance(spec, SpecSSMResourceHandler)
@@ -351,21 +346,17 @@ def test_spec_ssm_handler_shape_and_isinstance():
 
 
 def test_spec_conv_handler_shape_and_isinstance():
-    """Verify SpecCausalConvResourceHandler prepends cache_steps and is NOT a CausalConvResourceHandler.
+    """Verify SpecCausalConvResourceHandler mirrors base conv dims and is NOT a CausalConvResourceHandler.
 
     SpecCausalConvResourceHandler deliberately inherits from StateResourceHandler (not
     CausalConvResourceHandler) to eliminate isinstance exclusion guards throughout the codebase.
+    cache_steps is determined by MambaHybridCacheManager from spec_config, not stored on the handler.
     """
     base = CausalConvResourceHandler(conv_dim=256, d_conv=4, dtype=torch.float32)
-    spec = SpecCausalConvResourceHandler(
-        conv_dim=256,
-        d_conv=4,
-        dtype=torch.float32,
-        cache_steps=5,
-    )
+    spec = SpecCausalConvResourceHandler.from_base(base)
 
     assert base.state_shape == (256, 3)
-    assert spec.state_shape == (5, 256, 3)
+    assert spec.state_shape == (256, 3)
     # Spec does NOT inherit from CausalConvResourceHandler — intent of the inheritance break.
     assert not isinstance(spec, CausalConvResourceHandler)
     assert isinstance(spec, SpecCausalConvResourceHandler)

@@ -71,7 +71,6 @@ def _bamba_mixer_torch_forward(
                 use_initial_states_t,
                 # CACHES
                 cache_params.conv_states[self.layer_idx],
-                None,
                 # CONSTANTS
                 self.conv1d.stride[0],
                 self.conv1d.padding[0],
@@ -127,7 +126,6 @@ def _bamba_mixer_torch_forward(
             use_initial_states=use_initial_states_t,
             # CACHES
             ssm_state_cache=cache_params.ssm_states[self.layer_idx],
-            intermediate_ssm_state_cache=None,
             # CONSTANTS
             time_step_limit=list(self.time_step_limit),
             chunk_size=self.chunk_size,

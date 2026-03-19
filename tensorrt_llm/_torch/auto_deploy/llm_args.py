@@ -125,9 +125,19 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                 return self
             if spec_config.use_mtp_vanilla:
                 raise ValueError("mtp_eagle_one_model and use_mtp_vanilla cannot both be enabled")
+            if spec_config.max_draft_len is None:
+                raise ValueError(
+                    "MTPDecodingConfig.max_draft_len must not be None when mtp_eagle_one_model is "
+                    "enabled. Ensure num_nextn_predict_layers is set in the model config."
+                )
             capture_layers = {-1}
             self.model_factory = "eagle_one_model"
         elif isinstance(spec_config, EagleDecodingConfig):
+            if spec_config.max_draft_len is None:
+                raise ValueError(
+                    "EagleDecodingConfig.max_draft_len must not be None. "
+                    "Provide a positive integer for max_draft_len."
+                )
             capture_layers = spec_config.eagle3_layers_to_capture
             if spec_config.eagle3_one_model:
                 self.model_factory = "eagle_one_model"

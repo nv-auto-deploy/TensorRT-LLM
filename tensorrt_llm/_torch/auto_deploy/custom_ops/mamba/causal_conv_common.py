@@ -29,7 +29,6 @@ from ..attention_interface import (
     Constant,
     MHACallable,
     ResourceHandlerDict,
-    SpecCausalConvResourceHandler,
 )
 
 
@@ -65,7 +64,7 @@ class BaseCausalConvDescriptor(AttentionDescriptor):
 
     @classmethod
     @abstractmethod
-    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
+    def get_cached_attention_op(cls) -> MHACallable:
         """Return the cached attention op for this backend.
 
         Must be implemented by subclasses.
@@ -78,7 +77,7 @@ class BaseCausalConvDescriptor(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
         inp_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
         w_fake: torch.Tensor = source_attn_node.args[1].meta["val"]
@@ -94,23 +93,7 @@ class BaseCausalConvDescriptor(AttentionDescriptor):
             d_conv=max(1, kernel_size),  # state_shape[-1] = d_conv - 1 = kernel_size - 1
             dtype=cls.resolve_cache_dtype("auto", inp_fake.dtype),
         )
-        if spec_config is not None and spec_config.max_draft_len is not None:
-            spec_handler = SpecCausalConvResourceHandler(
-                conv_dim=in_channels,
-                d_conv=max(1, kernel_size),
-                dtype=cls.resolve_cache_dtype("auto", inp_fake.dtype),
-                cache_steps=spec_config.max_draft_len + 1,
-            )
-        else:
-            spec_handler = SpecCausalConvResourceHandler.placeholder(
-                conv_dim=in_channels,
-                d_conv=max(1, kernel_size),
-                dtype=cls.resolve_cache_dtype("auto", inp_fake.dtype),
-            )
-        return {
-            "conv_state_cache": conv_state_handler,
-            "intermediate_conv_state_cache": spec_handler,
-        }
+        return {"conv_state_cache": conv_state_handler}
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:

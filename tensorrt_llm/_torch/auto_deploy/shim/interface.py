@@ -274,38 +274,28 @@ class CachedSequenceInterface:
 
     def _identify_managed_state_resources(
         self,
-    ) -> Tuple[
-        Optional[SSMResourceHandler],
-        List[Tuple[Tuple[str, SSMResourceHandler], Optional[Tuple[str, SpecSSMResourceHandler]]]],
-        Optional[CausalConvResourceHandler],
-        List[
-            Tuple[
-                Tuple[str, CausalConvResourceHandler],
-                Optional[Tuple[str, SpecCausalConvResourceHandler]],
-            ]
-        ],
-    ]:
+    ) -> Tuple[Optional[SSMResourceHandler], list, Optional[CausalConvResourceHandler], list]:
         """Identify SSM and Conv resources compatible with MambaHybridCacheManager.
 
         Finds base reference handlers for SSM and Conv resources, checks the n_groups
-        constraint, and collects all compatible resources as pre-paired (base, spec_or_None)
+        constraint, and collects all compatible resources as pre-paired (base, Optional[spec])
         tuples.
 
         Returns:
             Tuple of (ssm_ref, ssm_pairs, conv_ref, conv_pairs) where:
             - ssm_ref: Reference base SSM handler or None
-            - ssm_pairs: List of (base_entry, spec_entry_or_None) for compatible SSM resources.
+            - ssm_pairs: List of (base_entry, Optional[spec_entry]) for compatible SSM resources.
               spec_entry is non-None only when spec decoding is enabled and a matching spec
               handler is registered. A length mismatch when spec is enabled is a registration bug.
             - conv_ref: Reference base Conv handler or None (may be None if constraint fails)
-            - conv_pairs: List of (base_entry, spec_entry_or_None) for compatible Conv resources.
+            - conv_pairs: List of (base_entry, Optional[spec_entry]) for compatible Conv resources.
         """
         ssm_ref: Optional[SSMResourceHandler] = None
         conv_ref: Optional[CausalConvResourceHandler] = None
 
-        # Find the first BASE (non-spec) handler of each type as reference.
-        # After breaking inheritance, isinstance(h, SSMResourceHandler) is already False
-        # for SpecSSMResourceHandler, so no exclusion guard is needed.
+        # Find the first base (non-spec) handler of each type as reference.
+        # SpecSSMResourceHandler inherits from StateResourceHandler (not SSMResourceHandler),
+        # so isinstance guards are not needed to exclude spec handlers here.
         for handler in self._resource_lookup.values():
             if isinstance(handler, SSMResourceHandler) and ssm_ref is None:
                 ssm_ref = handler
@@ -331,16 +321,15 @@ class CachedSequenceInterface:
             for name, handler in self._resource_lookup.items()
             if isinstance(handler, SSMResourceHandler) and handler.has_compatible_dims(ssm_ref)
         ]
-        # Collect spec SSM handlers separately. Placeholder spec resources are kept
-        # local when speculative decoding is disabled.
-        ssm_spec_list = [
-            (name, handler)
-            for name, handler in self._resource_lookup.items()
-            if isinstance(handler, SpecSSMResourceHandler) and handler.has_compatible_dims(ssm_ref)
-        ]
         if include_spec_resources:
-            # Every base layer must have a paired spec layer when spec decoding is enabled.
-            # A mismatch means a registration bug in get_cache_initializers().
+            # Spec handlers are only registered by backends that support spec decoding.
+            # Every base layer must have a paired spec layer — a mismatch is a registration bug.
+            ssm_spec_list = [
+                (name, handler)
+                for name, handler in self._resource_lookup.items()
+                if isinstance(handler, SpecSSMResourceHandler)
+                and handler.has_compatible_dims(ssm_ref)
+            ]
             assert len(ssm_base_list) == len(ssm_spec_list), (
                 f"Mismatched SSM base/spec layer counts: "
                 f"{len(ssm_base_list)} vs {len(ssm_spec_list)}"
@@ -356,14 +345,13 @@ class CachedSequenceInterface:
             if isinstance(handler, CausalConvResourceHandler)
             and handler.has_compatible_dims(conv_ref)
         ]
-        # Collect spec Conv handlers separately.
-        conv_spec_list = [
-            (name, handler)
-            for name, handler in self._resource_lookup.items()
-            if isinstance(handler, SpecCausalConvResourceHandler)
-            and handler.has_compatible_dims(conv_ref)
-        ]
         if include_spec_resources:
+            conv_spec_list = [
+                (name, handler)
+                for name, handler in self._resource_lookup.items()
+                if isinstance(handler, SpecCausalConvResourceHandler)
+                and handler.has_compatible_dims(conv_ref)
+            ]
             assert len(conv_base_list) == len(conv_spec_list), (
                 f"Mismatched Conv base/spec layer counts: "
                 f"{len(conv_base_list)} vs {len(conv_spec_list)}"
@@ -496,24 +484,24 @@ class CachedSequenceInterface:
         self,
         kv_cache_kwargs: Dict,
         ssm_ref: Optional[SSMResourceHandler],
-        ssm_pairs: list,  # [(base_entry, spec_entry_or_None), ...]
+        ssm_pairs: list,  # [(base_entry, Optional[spec_entry]), ...]
         conv_ref: Optional[CausalConvResourceHandler],
-        conv_pairs: list,  # [(base_entry, spec_entry_or_None), ...]
+        conv_pairs: list,  # [(base_entry, Optional[spec_entry]), ...]
     ) -> Tuple[MambaHybridCacheManager, int]:
         """Create MambaHybridCacheManager and assign views for state resources.
 
         Creates the hybrid cache manager with mamba parameters derived from the reference
         handlers, then retrieves and assigns buffer views for all managed SSM and Conv resources.
-        Each pair is (base_entry, spec_entry_or_None); spec_entry is non-None only when spec
+        Each pair is (base_entry, Optional[spec_entry]); spec_entry is non-None only when spec
         decoding is enabled. Overflow base handlers (beyond num_managed_mamba_layers) fall
         through to local allocation.
 
         Args:
             kv_cache_kwargs: Base kwargs for cache manager (will be extended with mamba params).
             ssm_ref: Reference SSM handler or None.
-            ssm_pairs: List of (base_entry, spec_entry_or_None) for SSM resources.
+            ssm_pairs: List of (base_entry, Optional[spec_entry]) for SSM resources.
             conv_ref: Reference Conv handler or None.
-            conv_pairs: List of (base_entry, spec_entry_or_None) for Conv resources.
+            conv_pairs: List of (base_entry, Optional[spec_entry]) for Conv resources.
 
         Returns:
             Tuple of (manager, num_managed_mamba_layers).
@@ -532,7 +520,7 @@ class CachedSequenceInterface:
             **kv_cache_kwargs,
         )
 
-        # Bind SSM views. Each pair carries (base_entry, spec_entry_or_None) so no zip needed.
+        # Bind SSM views. Each pair is (base_entry, Optional[spec_entry]).
         for layer_idx, (base_entry, spec_entry) in enumerate(ssm_pairs):
             if layer_idx >= num_managed_mamba_layers:
                 break
@@ -683,7 +671,6 @@ class CachedSequenceInterface:
         num_state_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, StateResourceHandler)
         )
-        # Include spec handlers explicitly since they no longer inherit from SSM/Conv base classes.
         num_ssm_total = sum(
             1
             for h in self._resource_lookup.values()
@@ -696,14 +683,16 @@ class CachedSequenceInterface:
         )
         num_state_other = num_state_total - num_ssm_total - num_conv_total
 
-        # Pairs already carry spec-or-None, so spec_count is just the number of non-None
-        # spec entries within the managed base count.
-        ssm_base_count = min(len(ssm_pairs), num_managed_mamba_layers)
-        ssm_spec_count = sum(1 for _, s in ssm_pairs[:ssm_base_count] if s is not None)
-        ssm_managed_count = ssm_base_count + ssm_spec_count
-        conv_base_count = min(len(conv_pairs), num_managed_mamba_layers)
-        conv_spec_count = sum(1 for _, s in conv_pairs[:conv_base_count] if s is not None)
-        conv_managed_count = conv_base_count + conv_spec_count
+        # Count individual cache buffers (base + spec each count separately since both
+        # are distinct allocations owned by the cache manager).
+        ssm_managed_count = sum(
+            len([x for x in (base, spec) if x is not None])
+            for base, spec in ssm_pairs[:num_managed_mamba_layers]
+        )
+        conv_managed_count = sum(
+            len([x for x in (base, spec) if x is not None])
+            for base, spec in conv_pairs[:num_managed_mamba_layers]
+        )
         total_managed = len(kv_managed) + ssm_managed_count + conv_managed_count
 
         paged_total = sum(1 for h in self._resource_lookup.values() if h.is_paged)

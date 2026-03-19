@@ -77,7 +77,6 @@ def test_triton_generate_only_with_slot_mapping(mamba_env):
         use_initial_states,
         # CACHES
         ssm_state_cache_torch,
-        None,
         # CONSTANTS
         time_step_limit,
         chunk_size,
@@ -179,7 +178,6 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         use_initial_states,
         # CACHES
         ssm_state_cache_torch,
-        None,
         # CONSTANTS
         time_step_limit,
         chunk_size,

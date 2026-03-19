@@ -214,7 +214,7 @@ class FlaGatedDeltaBackend(AttentionDescriptor):
         return torch.ops.auto_deploy.torch_gated_delta_rule
 
     @classmethod
-    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
+    def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.auto_deploy.fla_cached_gated_delta_rule.default
 
     @classmethod
@@ -229,7 +229,7 @@ class FlaGatedDeltaBackend(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
         key_node = source_attn_node.args[1]
         value_node = source_attn_node.args[2]

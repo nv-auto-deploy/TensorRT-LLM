@@ -90,7 +90,6 @@ def test_flashinfer_decode_matches_triton(mamba_env):
         None,  # seq_idx_prefill
         # CACHES
         ssm_state_cache_flashinfer,
-        None,
         # CONSTANTS
         time_step_limit,
         chunk_size,

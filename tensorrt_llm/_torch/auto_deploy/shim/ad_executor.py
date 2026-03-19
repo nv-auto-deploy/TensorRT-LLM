@@ -1047,12 +1047,14 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
             "Guided decoding is not currently supported for speculative decoding in AutoDeploy."
         )
 
-    ssm_config = ad_config.transforms.get("insert_cached_ssm_attention", {})
-    ssm_backend = ssm_config.get("backend")
-    if spec_config is not None and ssm_backend not in (None, "triton_ssm"):
+    ssm_backend = ad_config.transforms.get("insert_cached_ssm_attention", {}).get("backend")
+    conv_backend = ad_config.transforms.get("insert_cached_causal_conv", {}).get("backend")
+    if spec_config is not None and (
+        ssm_backend not in (None, "triton_ssm") or conv_backend not in (None, "triton_causal_conv")
+    ):
         raise ValueError(
-            "Speculative decoding with cached SSM in AutoDeploy currently requires the "
-            f"'triton_ssm' backend, but got backend={ssm_backend!r}."
+            "Speculative decoding in AutoDeploy requires triton backends for SSM and causal conv. "
+            f"Got ssm_backend={ssm_backend!r}, conv_backend={conv_backend!r}."
         )
 
     # One-model spec dec: no separate draft engine or spec resource manager.

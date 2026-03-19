@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -50,7 +50,6 @@ def _cuda_cached_causal_conv1d(
     #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k-1]
-    intermediate_conv_state_cache: torch.Tensor,  # unused placeholder/spec cache
     # CONSTANTS
     stride: int,
     padding: int,
@@ -141,7 +140,6 @@ def _cuda_cached_causal_conv1d_fake(
     #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k-1]
-    intermediate_conv_state_cache: torch.Tensor,  # unused placeholder/spec cache
     # CONSTANTS
     stride: int,
     padding: int,
@@ -167,5 +165,5 @@ class CudaBackendCausalConv(BaseCausalConvDescriptor):
     """
 
     @classmethod
-    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
+    def get_cached_attention_op(cls) -> MHACallable:
         return cuda_cached_causal_conv1d_wrapper

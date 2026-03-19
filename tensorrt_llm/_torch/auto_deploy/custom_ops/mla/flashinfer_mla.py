@@ -891,7 +891,7 @@ class FlashInferMLAAttention(AttentionDescriptor):
         return torch.ops.auto_deploy.torch_mla
 
     @classmethod
-    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
+    def get_cached_attention_op(cls) -> MHACallable:
         """Get the cached attention op."""
         return torch.ops.auto_deploy.flashinfer_mla_with_cache.default
 
@@ -918,7 +918,7 @@ class FlashInferMLAAttention(AttentionDescriptor):
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
         """Get cache initializers using FlashInfer MLA paged cache layout.
 
