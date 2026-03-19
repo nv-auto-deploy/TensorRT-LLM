@@ -40,21 +40,27 @@ def _rope_deinterleave_load_hook(
         q_key = layer_prefix + "q_b_proj.weight"
         if q_key in state_dict:
             w = state_dict[q_key]
+            orig_dtype = w.dtype
+            if not w.is_floating_point() or w.dtype == torch.float8_e4m3fn:
+                w = w.to(torch.bfloat16)
             w = w.view(num_heads, qk_head_dim, -1)
             w_nope = w[:, :qk_nope_head_dim, :]
             w_rope = w[:, qk_nope_head_dim:, :]
             w_rope = w_rope[:, perm, :]
             w = torch.cat([w_nope, w_rope], dim=1)
-            state_dict[q_key] = w.view(-1, w.shape[-1])
+            state_dict[q_key] = w.view(-1, w.shape[-1]).to(orig_dtype)
 
         # --- kv_a_proj_with_mqa.weight ---
         kv_key = layer_prefix + "kv_a_proj_with_mqa.weight"
         if kv_key in state_dict:
             w = state_dict[kv_key]
+            orig_dtype = w.dtype
+            if not w.is_floating_point() or w.dtype == torch.float8_e4m3fn:
+                w = w.to(torch.bfloat16)
             w_kv = w[:kv_lora_rank, :]
             w_pe = w[kv_lora_rank:, :]
             w_pe = w_pe[perm, :]
-            state_dict[kv_key] = torch.cat([w_kv, w_pe], dim=0)
+            state_dict[kv_key] = torch.cat([w_kv, w_pe], dim=0).to(orig_dtype)
 
         # --- kv_a_proj_with_mqa.bias (if present) ---
         kv_bias_key = layer_prefix + "kv_a_proj_with_mqa.bias"

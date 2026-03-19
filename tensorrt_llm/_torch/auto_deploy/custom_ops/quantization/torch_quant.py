@@ -31,6 +31,11 @@ e2m1_values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -
 
 
 # ===== Helpers =====
+def cdiv(a: int, b: int) -> int:
+    """Compute ceiling division of two integers."""
+    return (a + b - 1) // b
+
+
 def _expect_single_scale(scales: List[Optional[torch.Tensor]], name: str) -> torch.Tensor:
     if len(scales) == 0 or scales[0] is None:
         raise ValueError(f"{name} must provide at least one scale tensor (scales[0]).")
@@ -623,8 +628,8 @@ def trtllm_finegrained_fp8_linear(
             f"(shape={weight_scale.shape}), weight shape={weight.shape}. "
             f"This usually means scale tensor sharding produced an empty tensor."
         )
-    block_n = N // scale_n
-    block_k = K // scale_k
+    block_n = cdiv(N, scale_n)
+    block_k = cdiv(K, scale_k)
 
     # TRT-LLM fp8_block_scaling_gemm requires exact 128x128 blocks.
     # For small layers where a dimension < 128 (e.g. N=64), the derived block
