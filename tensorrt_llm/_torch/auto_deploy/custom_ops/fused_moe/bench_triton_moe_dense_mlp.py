@@ -66,12 +66,10 @@ if __name__ == "__main__":
         """Get kernel 1 launch config matching the launcher in triton_moe_dense_mlp.py."""
         if total_rows <= 128:
             block_i = 1024
-            num_warps = 16
         else:
             block_i = triton.next_power_of_2(inter)
-            num_warps = 4
         num_i_blocks = triton.cdiv(inter, block_i)
-        return num_warps, 2, block_i, num_i_blocks
+        return 16, 2, block_i, num_i_blocks
 
     def _get_k2_config(E, T, H):
         """Get kernel 2 launch config matching the launcher in triton_moe_dense_mlp.py."""

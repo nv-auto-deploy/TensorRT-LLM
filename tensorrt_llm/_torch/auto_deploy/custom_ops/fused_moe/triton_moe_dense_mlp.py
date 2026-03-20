@@ -209,14 +209,14 @@ def _moe_dense_mlp_triton(
 
     # Adaptive BLOCK_I: use smaller blocks with 2D grid when total_rows is small
     # (low parallelism) to increase occupancy. For large total_rows, use full-width
-    # blocks to minimize grid overhead.
+    # blocks to minimize grid overhead. num_warps=16 is best across all configs
+    # with coalesced loads.
     if total_rows <= 128:
         BLOCK_I = 1024
-        k1_num_warps = 16
     else:
         BLOCK_I = triton.next_power_of_2(intermediate_size)
-        k1_num_warps = 4
     num_i_blocks = triton.cdiv(intermediate_size, BLOCK_I)
+    k1_num_warps = 16
 
     grid = (total_rows, num_i_blocks)
     _fused_glu_activation_kernel[grid](
