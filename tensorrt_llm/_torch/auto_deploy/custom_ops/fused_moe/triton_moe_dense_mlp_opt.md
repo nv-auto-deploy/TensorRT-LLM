@@ -287,33 +287,81 @@ ______________________________________________________________________
 
 **Correctness:** PASS (31/31)
 
+### Iteration 10 — K1: unified num_warps=16
+
+- Re-sweep revealed w=16 is now optimal for large-T K1 (was w=4 before coalesced loads).
+- A3: 31.8->30.5 (-4.1%), A4: 101.4->99.2 (-2.2%), A5: 379.6->375.4 (-1.1%)
+
+### Iteration 11 — Remove deinterleave, revert to stride-2 kernel
+
+- Reverted K1 to stride-2 reads and removed launcher deinterleave (slicing+cat+contiguous).
+- K1 kernel ~15% slower, but E2E ~12-16% faster (deinterleave copy was more expensive).
+- A4 E2E: 3199->2826 (-12%), A5 E2E: 7982->6735 (-16%)
+
+### Iteration 12 — Remove redundant .contiguous()
+
+- BMM output is already contiguous. Removed no-op call. Also tested K2 routing preload — dead end.
+
+### Iteration 13 — K1: native dtype compute
+
+- Removed explicit fp32 upcast. Triton handles dtype promotion internally.
+- Cleaner code, no perf regression. Tested eviction_policy and BLOCK_I=2048 — both dead ends.
+
+### Iteration 14 — Bandwidth analysis
+
+K1 is at **74-79% of H100 peak memory bandwidth** for large shapes — approaching hardware limits.
+K2 with sparse routing is **latency-bound** (0.1-6% peak BW) — dominated by launch overhead.
+
+| Kernel | Shape | BW utilization |
+|--------|-------|---------------|
+| K1 | A5 (65536 rows) | 79.2% |
+| K1 | A4 (16384 rows) | 74.0% |
+| K1 | A3 (4096 rows) | 58.8% |
+| K1 | A1 (128 rows) | 10.0% |
+| K2 | B3 sparse (T=512) | 33.6% |
+| K2 | A1 sparse (T=1) | 0.1% |
+
+Also tested: K2 w=8 marginally better than w=16 for sparse (~4%), K1 num_stages sweep flat.
+
 ______________________________________________________________________
 
-## Current Best Results (iter 9) — Summary vs Baseline
+## Current Best Results (iter 14) — Summary vs Baseline
 
 **Dense routing (benchmark default):**
 
 | ID | K1 baseline | K1 best | K2 baseline | K2 best | Total baseline | Total best | Delta |
 |----|------------|---------|------------|---------|---------------|-----------|-------|
-| A1 | 7.7 | 6.4 | 108.6 | 59.3 | 116.3 | 65.7 | -43.5% |
-| A2 | 13.8 | 12.7 | 113.5 | 60.8 | 127.3 | 73.5 | -42.3% |
-| A3 | 33.4 | 31.8 | 121.3 | 65.4 | 154.7 | 97.2 | -37.2% |
-| A4 | 107.4 | 101.4 | 131.1 | 73.8 | 238.5 | 175.2 | -26.5% |
-| A5 | 402.4 | 379.6 | 172.0 | 146.0 | 574.4 | 525.6 | -8.5% |
-| B1 | 7.5 | 5.8 | 31.3 | 18.5 | 38.8 | 24.3 | -37.4% |
-| B2 | 13.6 | 13.0 | 34.2 | 20.2 | 47.8 | 33.2 | -30.5% |
-| B3 | 107.1 | 101.2 | 56.0 | 47.7 | 163.1 | 148.9 | -8.7% |
+| A1 | 7.7 | 6.8 | 108.6 | 59.5 | 116.3 | 66.3 | -43.0% |
+| A2 | 13.8 | 13.9 | 113.5 | 60.9 | 127.3 | 74.8 | -41.2% |
+| A3 | 33.4 | 36.0 | 121.3 | 65.8 | 154.7 | 101.8 | -34.2% |
+| A4 | 107.4 | 114.3 | 131.1 | 74.0 | 238.5 | 188.3 | -21.0% |
+| A5 | 402.4 | 427.4 | 172.0 | 146.2 | 574.4 | 573.6 | -0.1% |
+| B1 | 7.5 | 6.0 | 31.3 | 18.7 | 38.8 | 24.7 | -36.3% |
+| B2 | 13.6 | 13.7 | 34.2 | 20.2 | 47.8 | 33.9 | -29.1% |
+| B3 | 107.1 | 114.3 | 56.0 | 47.9 | 163.1 | 162.2 | -0.6% |
+
+Note: K1 kernel isolated time is higher than iter 4-5 because iter 11 removed the
+deinterleave copy (which was more expensive at E2E level). E2E is what matters.
 
 **With sparse top-4 routing (real-world GPT-OSS):**
 
 | ID | K2 sparse (us) | K1 (us) | Total (us) | vs baseline |
 |----|---------------|---------|-----------|-------------|
-| A1 | ~12.8 | 6.4 | ~19.2 | **-83.5%** |
-| A2 | ~13.2 | 12.7 | ~25.9 | **-79.7%** |
-| A3 | ~14.0 | 31.8 | ~45.8 | **-70.4%** |
-| A4 | ~19.2 | 101.4 | ~120.6 | **-49.4%** |
-| B1 | ~7.6 | 5.8 | ~13.4 | **-65.5%** |
-| B2 | ~8.2 | 13.0 | ~21.2 | **-55.6%** |
+| A1 | ~12.8 | 6.8 | ~19.6 | **-83.1%** |
+| A2 | ~13.2 | 13.9 | ~27.1 | **-78.7%** |
+| A3 | ~13.6 | 36.0 | ~49.6 | **-67.9%** |
+| A4 | ~19.0 | 114.3 | ~133.3 | **-44.1%** |
+| B1 | ~7.6 | 6.0 | ~13.6 | **-64.9%** |
+| B2 | ~8.2 | 13.7 | ~21.9 | **-54.2%** |
+
+**E2E improvement (including BMM):**
+
+| ID | E2E baseline (us) | E2E best (us) | Delta |
+|----|-------------------|---------------|-------|
+| A1 | 2130.8 | 2108.9 | -1.0% |
+| A4 | 2879.3 | 2826.3 | -1.8% |
+| A5 | 6751.8 | 6701.5 | -0.7% |
+| B3 | 1693.1 | 1691.5 | -0.1% |
 
 ______________________________________________________________________
 
@@ -321,20 +369,23 @@ ______________________________________________________________________
 
 - \[x\] **num_warps / num_stages sweep:** Done in iter 1-2.
 - \[x\] **Kernel 2: 2D grid (T x H_blocks):** Done in iter 3.
-- \[x\] **Coalesced loads for K1:** Done in iter 4. 5-7% K1 improvement.
+- \[x\] **Coalesced loads for K1:** Done in iter 4, reverted in iter 11 (deinterleave cost > kernel gain).
 - \[x\] **K2 BLOCK_H sweep:** Done in iter 4.
 - \[x\] **K1 persistent kernel:** Dead end (iter 4).
 - \[x\] **K2 dtype_probe removal:** Cleanup (iter 6).
 - \[x\] **K1 weight rearrange per-forward:** Dead end (iter 7).
 - \[x\] **K2 skip zero routing weights:** Done in iter 8. 59-79% K2 speedup with sparse routing.
 - \[x\] **K1 2D grid over I dimension:** Done in iter 9. ~1% improvement.
-- \[ \] **Kernel 2: preload routing weights before loop.** Load all E weights at once.
-- \[ \] **K2: vectorized loads** for expert output rows.
+- \[x\] **K1 num_warps re-sweep:** Done in iter 10. w=16 unified.
+- \[x\] **K1 remove deinterleave:** Done in iter 11. E2E 12-16% faster.
+- \[x\] **K1 native dtype compute:** Done in iter 13. Cleaner, no regression.
+- \[x\] **Bandwidth analysis:** Done in iter 14. K1 at 74-79% peak BW. Near HW limits.
+- \[x\] **K2 routing preload:** Dead end (iter 12). E2E is BMM-dominated.
+- \[x\] **K1 eviction_policy / BLOCK_I=2048:** Dead ends (iter 13).
+- \[x\] **K2 num_warps re-sweep with sparse:** Done (iter 14). w=8 marginal, not worth complexity.
 - \[ \] **K1: eliminate deinterleave via load-time weight rearrange** (outside the op).
-- \[ \] **K1: num_warps/num_stages re-sweep** with new 2D grid + coalesced loads.
-- \[ \] **K2: num_warps re-sweep** with zero-skip + 2D grid.
-- \[ \] **K1: try BLOCK_I=512 or 2048** for the 2D path.
 - \[ \] **Fuse kernel 1 + BMM:** Longer-term, fuse activation into GEMM epilogue.
+- \[ \] **K2: completely rewrite for sparse-only** (skip the expert loop entirely, use gather).
 
 ______________________________________________________________________
 
