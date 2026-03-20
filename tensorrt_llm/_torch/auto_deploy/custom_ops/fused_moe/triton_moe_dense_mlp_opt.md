@@ -459,23 +459,143 @@ ______________________________________________________________________
 - \[x\] **torch.compile on launcher:** Dead end (iter 18). 3x slower (.item() graph break).
 - \[x\] **Launcher profiling:** Done in iter 19-22. BMMs=94%, overhead\<0.2%.
 - \[x\] **Pre-allocated buffers:** Dead end (iter 22). 3 us savings on 2-7 ms E2E.
-- \[ \] **baddbmm vs bmm+bias:** Test fused bias-add BMM.
-- \[ \] **matmul (broadcast) vs bmm (expand):** Test if matmul is faster.
-- \[ \] **Triton matmul vs cuBLAS:** Test if custom Triton GEMM with fused epilogue beats cuBLAS+K1.
-- \[ \] **K1: eliminate deinterleave via load-time weight rearrange** (outside the op).
+- **Out of scope (BMM optimization):** baddbmm, matmul broadcast, Triton GEMM with fused epilogue.
+- **Future (outside op boundary):** K1 weight rearrange at model load time for coalesced loads.
 
 ______________________________________________________________________
 
 ## 5. Final Best Configuration
 
-> (To be filled after optimization loop completes)
+### Kernel 1: `_fused_glu_activation_kernel`
 
-| Kernel | Config | Notes |
-|--------|--------|-------|
-| `_fused_glu_activation_kernel` | | |
-| `_weighted_expert_sum_kernel` | | |
+| Parameter | Small T (total_rows \<= 128) | Medium T (129-1024) | Large T (>1024) |
+|-----------|---------------------------|---------------------|-----------------|
+| BLOCK_I | 1024 | 2048 | next_power_of_2(I) |
+| Grid | (total_rows, cdiv(I, 1024)) | (total_rows, cdiv(I, 2048)) | (total_rows, 1) |
+| num_warps | 16 | 16 | 8 |
+| num_stages | 2 | 2 | 2 |
+
+**Key design decisions:**
+
+- Stride-2 reads from interleaved `[g0,u0,g1,u1,...]` layout (no deinterleave in launcher).
+- Native dtype compute (no fp32 upcast — Triton promotes internally for sigmoid).
+- 2D grid for small T (more parallelism), 1D for large T (less grid overhead).
+- BW utilization: 74-79% peak for large T. At hardware limits.
+
+### Kernel 2: `_weighted_expert_sum_kernel` (dense fallback)
+
+| Parameter | Small E+T (E\<=32, T\<=32) | Medium T (T\<=128) | Large T (>128) |
+|-----------|-------------------------|-------------------|----------------|
+| BLOCK_H | 256 | 1024 | next_power_of_2(H) |
+| Grid | (T, cdiv(H, 256)) | (T, cdiv(H, 1024)) | (T, 1) |
+| num_warps | 16 | 16 | 16 |
+| num_stages | 2 | 2 | 2 |
+
+**Key design decisions:**
+
+- Zero-weight skip (`if w_f != 0.0`) avoids loading expert outputs for inactive experts.
+- 2D grid for low T, 1D for high T (same adaptive logic as K1).
+- OUTPUT_DTYPE as constexpr (no dtype_probe load needed).
+
+### Kernel 2b: `_weighted_expert_gather_kernel` (sparse routing)
+
+| Parameter | Value |
+|-----------|-------|
+| BLOCK_H | Same adaptive logic as K2 |
+| Grid | (T, cdiv(H, BLOCK_H)) |
+| num_warps | 8 |
+| num_stages | 2 |
+
+**Key design decisions:**
+
+- Used when routing is sparse (has zeros) AND T >= 64.
+- Loops only over TOP_K active experts using pre-extracted indices.
+- 50-59% faster than zero-skip K2 for E=128 sparse (top-4).
+- For T \< 64, the `torch.topk` extraction overhead outweighs kernel savings.
 
 ______________________________________________________________________
+
+## 6. Summary of All 22 Iterations
+
+### Wins (applied to final kernel)
+
+| Iter | Change | Kernel | Impact |
+|------|--------|--------|--------|
+| 1-2 | num_warps=16 for K2 | K2 | -45% K2 |
+| 3 | Adaptive 2D/1D grid for K2 | K2 | -10% additional K2 |
+| 8 | Zero-weight skip in K2 loop | K2 | -78% K2 (sparse routing) |
+| 9 | 2D grid for K1 | K1 | -1% |
+| 10 | Unified num_warps=16 for K1 | K1 | -2-4% |
+| 11 | Remove deinterleave, use stride-2 kernel | E2E | -12-16% E2E |
+| 13 | Native dtype compute (no fp32 upcast) | K1 | cleanup |
+| 15 | Gather kernel for sparse routing | K2 | -50-59% beyond zero-skip |
+| 16 | Cheap sparse detection + BLOCK_I=2048 for medium T | K1/launcher | -4% K1 for medium T |
+| 17 | Gather threshold T>=64 | launcher | avoid topk overhead for small T |
+| 18 | num_warps=8 for K1 large T | K1 | -1.5% |
+| 6,12,19-22 | Cleanups: dtype_probe, .contiguous(), profiling | all | cleanup |
+
+### Dead ends (tested and rejected)
+
+| Iter | Idea | Why it failed |
+|------|------|--------------|
+| 4 | Coalesced loads (deinterleave in launcher) | Kernel 5-7% faster but deinterleave copy cost > savings |
+| 4 | K1 persistent kernel (multi-row) | rpp=1 always wins; GPU already saturated |
+| 7 | Weight rearrange per-forward | Weight tensor \[128,2880,5760\] = 2.5GB; 4x E2E regression |
+| 12 | K2 routing weight preload | E2E is BMM-dominated; K2 too small to matter |
+| 13 | K1 eviction_policy | No benefit; memory-BW-bound |
+| 13 | BLOCK_I=2048 for large T | No benefit over 4096 |
+| 14 | K2 num_warps re-sweep with sparse | w=8 marginal (~4%), not worth per-shape complexity |
+| 18 | fast_sigmoid (tl.math.fast_expf) | K1 is BW-bound, not compute-bound |
+| 18 | tl.where vs tl.minimum | No benefit |
+| 18 | Explicit output cast | No benefit |
+| 18 | torch.compile on launcher | 3x slower (.item() graph break) |
+| 22 | Pre-allocated buffers | 3 us savings on 2-7 ms E2E |
+| 3 (partial) | K2 2D grid for large T | Regression at T=512 (too many blocks) |
+| 18 | K2 multi-token per program | Serialization destroys parallelism |
+| 18 | K2 bf16 accumulation | Marginal (~1%), numerical precision risk |
+
+### Hardware limits reached
+
+| Metric | Value | Note |
+|--------|-------|------|
+| K1 BW utilization (A5, 65536 rows) | 79.2% | Near H100 peak (3350 GB/s) |
+| K1 BW utilization (A4, 16384 rows) | 74.0% | Solid |
+| K2 sparse (A1, T=1) | 0.1% peak BW | Latency-bound (launch overhead) |
+| K2 sparse (B3, T=512) | 33.6% peak BW | Limited by small traffic volume |
+
+### Total improvement
+
+**Triton kernel isolated (dense routing):**
+
+| ID | Baseline (us) | Final (us) | Improvement |
+|----|--------------|-----------|-------------|
+| A1 (120B, T=1) | 116.3 | 65.7 | -43% |
+| A3 (120B, T=32) | 154.7 | 101.8 | -34% |
+| A4 (120B, T=128) | 238.5 | 188.1 | -21% |
+| B1 (20B, T=1) | 38.8 | 24.4 | -37% |
+| B2 (20B, T=32) | 47.8 | 33.8 | -29% |
+
+**Triton kernel isolated (sparse top-4 routing, real-world GPT-OSS):**
+
+| ID | Baseline (us) | Final (us) | Improvement |
+|----|--------------|-----------|-------------|
+| A1 (120B, T=1) | 116.3 | ~12.2 | **-90%** |
+| A3 (120B, T=32) | 154.7 | ~42.6 | **-72%** |
+| A4 (120B, T=128) | 238.5 | ~121.8 | **-49%** |
+| B1 (20B, T=1) | 38.8 | ~11.4 | **-71%** |
+
+### Future opportunities (outside Triton kernel scope)
+
+1. **Rearrange gate_up_w at model load time** (not per-forward) to enable coalesced loads in K1.
+   This would recover the 5-7% K1 kernel improvement without the deinterleave copy overhead.
+1. **Fuse BMM + activation** via custom Triton GEMM with epilogue. This is the only way to
+   significantly improve beyond the current state, since BMMs dominate 94% of E2E.
+1. **Pass top-k indices directly** from the router to avoid the `torch.topk` extraction in
+   the launcher. The upstream MoE router already computes these.
+
+______________________________________________________________________
+
+## Appendix: How to Reproduce
 
 ## Appendix: How to Reproduce
 
