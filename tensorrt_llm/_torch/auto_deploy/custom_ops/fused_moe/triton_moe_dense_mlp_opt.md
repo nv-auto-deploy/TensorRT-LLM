@@ -277,6 +277,44 @@ ______________________________________________________________________
 - Branch overhead for dense routing is small (~10%) — acceptable tradeoff.
 - Combined with all prior optimizations, K2 went from baseline 108 us to 13 us for A1 (88% reduction).
 
+### Iteration 9 — K1: 2D grid with adaptive BLOCK_I
+
+**What changed:**
+
+- K1 now uses 2D grid `(total_rows, cdiv(I, BLOCK_I))` with BLOCK_I=1024 for small total_rows.
+- Falls back to 1D grid for large total_rows.
+- ~1% K1 improvement at large T (A5: 383.7->379.6 us). Marginal but consistent.
+
+**Correctness:** PASS (31/31)
+
+______________________________________________________________________
+
+## Current Best Results (iter 9) — Summary vs Baseline
+
+**Dense routing (benchmark default):**
+
+| ID | K1 baseline | K1 best | K2 baseline | K2 best | Total baseline | Total best | Delta |
+|----|------------|---------|------------|---------|---------------|-----------|-------|
+| A1 | 7.7 | 6.4 | 108.6 | 59.3 | 116.3 | 65.7 | -43.5% |
+| A2 | 13.8 | 12.7 | 113.5 | 60.8 | 127.3 | 73.5 | -42.3% |
+| A3 | 33.4 | 31.8 | 121.3 | 65.4 | 154.7 | 97.2 | -37.2% |
+| A4 | 107.4 | 101.4 | 131.1 | 73.8 | 238.5 | 175.2 | -26.5% |
+| A5 | 402.4 | 379.6 | 172.0 | 146.0 | 574.4 | 525.6 | -8.5% |
+| B1 | 7.5 | 5.8 | 31.3 | 18.5 | 38.8 | 24.3 | -37.4% |
+| B2 | 13.6 | 13.0 | 34.2 | 20.2 | 47.8 | 33.2 | -30.5% |
+| B3 | 107.1 | 101.2 | 56.0 | 47.7 | 163.1 | 148.9 | -8.7% |
+
+**With sparse top-4 routing (real-world GPT-OSS):**
+
+| ID | K2 sparse (us) | K1 (us) | Total (us) | vs baseline |
+|----|---------------|---------|-----------|-------------|
+| A1 | ~12.8 | 6.4 | ~19.2 | **-83.5%** |
+| A2 | ~13.2 | 12.7 | ~25.9 | **-79.7%** |
+| A3 | ~14.0 | 31.8 | ~45.8 | **-70.4%** |
+| A4 | ~19.2 | 101.4 | ~120.6 | **-49.4%** |
+| B1 | ~7.6 | 5.8 | ~13.4 | **-65.5%** |
+| B2 | ~8.2 | 13.0 | ~21.2 | **-55.6%** |
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
@@ -289,10 +327,13 @@ ______________________________________________________________________
 - \[x\] **K2 dtype_probe removal:** Cleanup (iter 6).
 - \[x\] **K1 weight rearrange per-forward:** Dead end (iter 7).
 - \[x\] **K2 skip zero routing weights:** Done in iter 8. 59-79% K2 speedup with sparse routing.
+- \[x\] **K1 2D grid over I dimension:** Done in iter 9. ~1% improvement.
 - \[ \] **Kernel 2: preload routing weights before loop.** Load all E weights at once.
-- \[ \] **K1: 2D tiling over I dimension.** Try splitting I into multiple blocks.
 - \[ \] **K2: vectorized loads** for expert output rows.
 - \[ \] **K1: eliminate deinterleave via load-time weight rearrange** (outside the op).
+- \[ \] **K1: num_warps/num_stages re-sweep** with new 2D grid + coalesced loads.
+- \[ \] **K2: num_warps re-sweep** with zero-skip + 2D grid.
+- \[ \] **K1: try BLOCK_I=512 or 2048** for the 2D path.
 - \[ \] **Fuse kernel 1 + BMM:** Longer-term, fuse activation into GEMM epilogue.
 
 ______________________________________________________________________
