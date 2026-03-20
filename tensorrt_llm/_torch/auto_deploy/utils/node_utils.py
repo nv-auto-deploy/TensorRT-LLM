@@ -813,6 +813,30 @@ def is_any_mla_op(node: Node) -> bool:
     )
 
 
+def is_any_view_op(node: Node) -> bool:
+    """Check if the node is a view/reshape op (aten or auto_deploy variant)."""
+    return is_op(
+        node,
+        [
+            torch.ops.aten.view,
+            torch.ops.aten.reshape,
+            torch.ops.auto_deploy.view,
+        ],
+    )
+
+
+def is_any_split_op(node: Node) -> bool:
+    """Check if the node is a split/split_with_sizes op (aten or auto_deploy variant)."""
+    return is_op(
+        node,
+        [
+            torch.ops.aten.split,
+            torch.ops.aten.split_with_sizes,
+            torch.ops.auto_deploy.split_with_sizes,
+        ],
+    )
+
+
 def is_linear_op(node: Node) -> bool:
     """Check if the node is a linear op.
 
@@ -1564,7 +1588,7 @@ def get_layer_after_linear_node(
             head_size = shape(attention_nodes[0])[-1]
             if len(intermediate_lin_nodes) > 0:
                 return LayerType.UNKNOWN, 1
-            return LayerType.ATTENTION, head_size
+            return LayerType.MHA, head_size
 
         if len(ssm_nodes) == 1:
             head_size = shape(ssm_nodes[0])[-1]

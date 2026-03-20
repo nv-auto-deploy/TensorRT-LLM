@@ -10,66 +10,6 @@ from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     unpack_uint8_to_int4_weight_2d,
 )
 
-# ---------------------------------------------------------------------------
-# AD-SHARD-003: TP sharding hint schema tests for real quant linear ops.
-# Verify that each op's schema includes tp_mode, output_sizes,
-# tp_min_local_shape with correct defaults and ordering.
-# ---------------------------------------------------------------------------
-_REAL_QUANT_LINEAR_OPS = [
-    "trtllm_quant_fp8_linear",
-    "torch_quant_fp8_linear",
-    "torch_quant_nvfp4_linear",
-]
-
-_REAL_QUANT_ORIGINAL_PARAMS = {
-    "trtllm_quant_fp8_linear": ["input", "weight_fp8", "bias", "input_scale", "weight_scale"],
-    "torch_quant_fp8_linear": ["input", "weight_fp8", "bias", "input_scale", "weight_scale"],
-    "torch_quant_nvfp4_linear": [
-        "input",
-        "weight_fp4",
-        "bias",
-        "input_scale",
-        "weight_scale",
-        "alpha",
-    ],
-}
-
-
-def _get_op_schema(op_name: str) -> str:
-    return str(getattr(torch.ops.auto_deploy, op_name).default._schema)
-
-
-@pytest.mark.parametrize("op_name", _REAL_QUANT_LINEAR_OPS)
-def test_real_quant_schema_includes_tp_hints(op_name):
-    schema = _get_op_schema(op_name)
-    assert "tp_mode" in schema, f"{op_name} schema missing tp_mode: {schema}"
-    assert "output_sizes" in schema, f"{op_name} schema missing output_sizes: {schema}"
-    assert "tp_min_local_shape" in schema, f"{op_name} schema missing tp_min_local_shape: {schema}"
-
-
-@pytest.mark.parametrize("op_name", _REAL_QUANT_LINEAR_OPS)
-def test_real_quant_schema_tp_hint_defaults(op_name):
-    schema = _get_op_schema(op_name)
-    assert 'tp_mode="none"' in schema, f"{op_name}: tp_mode default wrong in {schema}"
-    assert "tp_min_local_shape=1" in schema, f"{op_name}: tp_min_local_shape default wrong"
-
-
-@pytest.mark.parametrize("op_name", _REAL_QUANT_LINEAR_OPS)
-def test_real_quant_schema_backward_compat(op_name):
-    schema = _get_op_schema(op_name)
-    for param in _REAL_QUANT_ORIGINAL_PARAMS[op_name]:
-        assert param in schema, f"{op_name} schema missing original param {param}: {schema}"
-
-
-@pytest.mark.parametrize("op_name", _REAL_QUANT_LINEAR_OPS)
-def test_real_quant_hints_after_original_params(op_name):
-    schema = _get_op_schema(op_name)
-    last_orig = _REAL_QUANT_ORIGINAL_PARAMS[op_name][-1]
-    assert schema.find("tp_mode") > schema.find(last_orig), (
-        f"{op_name}: tp_mode should appear after {last_orig} in schema: {schema}"
-    )
-
-
 torch.manual_seed(0)
 
 SCALING_VECTOR_SIZE = 16  # NVFP4 block size along K

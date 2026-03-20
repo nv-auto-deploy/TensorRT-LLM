@@ -55,7 +55,9 @@ from ...utils.node_utils import (
     is_any_lin_op,
     is_any_moe_op,
     is_any_shardable_op,
+    is_any_split_op,
     is_any_ssm_op,
+    is_any_view_op,
     is_fake_quantized_linear_op,
     is_op,
     is_weight_node,
@@ -1351,7 +1353,7 @@ def _validate_sharded_shapes(
     next_lin_node, _ = bfs(node, is_any_lin_op, include_root=False)
     nodes_to_validate = subgraph(
         [node],
-        include=lambda n: is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape]),
+        include=is_any_view_op,
         boundary_condition=is_any_lin_op,
     )
     for view_node in nodes_to_validate:
@@ -1378,7 +1380,7 @@ def _validate_sharded_shapes(
         split_nodes = subgraph(
             [node],
             [next_lin_node],
-            include=lambda n: is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes]),
+            include=is_any_split_op,
         )
         for split_node in split_nodes:
             orig_sizes = split_node.args[1]
@@ -2005,9 +2007,7 @@ def _process_ssm_sharding(
     # in_proj and conv1d are fused, followed up by split nodes. Infer split sizes:
     assert len(entry_node.users) == 1, "Expecting exactly one user for the entry node"
     split_node_0 = list(entry_node.users)[0]
-    assert is_op(split_node_0, [torch.ops.aten.split_with_sizes]), (
-        "Expecting split_with_sizes node for the entry node"
-    )
+    assert is_any_split_op(split_node_0), "Expecting split_with_sizes node for the entry node"
     split_sizes_0 = split_node_0.args[1]
     # extract the single conv1d node
     conv1d_nodes = [
@@ -2019,9 +2019,7 @@ def _process_ssm_sharding(
     silu_node_1 = list(conv1d_node.users)[0]
     assert len(silu_node_1.users) == 1, "Expecting exactly one user for the silu node"
     split_node_1 = list(silu_node_1.users)[0]
-    assert is_op(split_node_1, [torch.ops.aten.split_with_sizes]), (
-        "Expecting split_with_sizes node for the split node"
-    )
+    assert is_any_split_op(split_node_1), "Expecting split_with_sizes node for the split node"
     split_sizes_1 = split_node_1.args[1]
     assert split_sizes_0[1] == sum(split_sizes_1)
     fused_weight_dims = {
@@ -2120,9 +2118,7 @@ def _process_ssm_sharding(
     # ##############################################################
     # ############## update the view and reshape nodes #############
     # ##############################################################
-    nodes_to_validate = [
-        n for n in subgraph_nodes if is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape])
-    ]
+    nodes_to_validate = [n for n in subgraph_nodes if is_any_view_op(n)]
     for view_node in nodes_to_validate:
         if len(view_node.args) < 2:
             continue
@@ -2201,8 +2197,7 @@ def _process_delta_sharding(
     # Find split([key_dim, key_dim, value_dim]) after conv1d (produces 3 outputs: q, k, v)
     split_node_after_conv, depth = bfs(
         conv1d_node,
-        lambda n: is_op(n, [torch.ops.aten.split_with_sizes, torch.ops.aten.split])
-        and len(list(n.users)) >= 3,
+        lambda n: is_any_split_op(n) and len(list(n.users)) >= 3,
     )
 
     # Extract conv split sizes early (needed for fused_weight_dims on unfused in_proj_qkv)
@@ -2331,9 +2326,7 @@ def _process_delta_sharding(
     # ############## update the view and reshape nodes #############
     # ##############################################################
     # Shard dim 2 (head count) in view/reshape nodes with concrete num_heads values
-    nodes_to_validate = [
-        n for n in subgraph_nodes if is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape])
-    ]
+    nodes_to_validate = [n for n in subgraph_nodes if is_any_view_op(n)]
     for view_node in nodes_to_validate:
         if len(view_node.args) < 2:
             continue
@@ -2483,7 +2476,7 @@ def _process_mla_sharding(
     # attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
     # attn_output = self.o_proj(attn_output)
     candidate_reshape = layer_subgraph.terminating_node.args[0]
-    if is_op(candidate_reshape, [torch.ops.aten.reshape]):
+    if is_any_view_op(candidate_reshape):
         # reshape args are (attn_output, [bsz, q_len, num_heads * v_head_dim])
         # set 3rd arg (num_heads * v_head_dim) to -1
         reshape_args = list(candidate_reshape.args)
@@ -2526,9 +2519,7 @@ def _determine_fused_weight_dims(
     if len(linear_nodes) == 1:
         linear_node = linear_nodes[0]
         # check if there are split nodes in the subgraph. They may indicate fused weights (e.g., QKV)
-        linear_split_users = list(
-            filtered_nodes(linear_node.users, ops=torch.ops.aten.split_with_sizes)
-        )
+        linear_split_users = list(filtered_nodes(linear_node.users, target=is_any_split_op))
         linear_slice_users = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.slice))
         linear_chunk_users = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.chunk))
         if len(linear_split_users) > 0:
@@ -2584,6 +2575,7 @@ def _find_upstream_qk_proj(node: Node, gm: GraphModule) -> Optional[str]:
     passthrough_ops = [
         torch.ops.aten.view,
         torch.ops.aten.reshape,
+        torch.ops.auto_deploy.view,
         torch.ops.aten.contiguous,
         torch.ops.aten.clone,
         torch.ops.aten.to,
@@ -2662,7 +2654,7 @@ def _shard_qk_norm(
     Returns:
         Number of nodes added for sharding
     """
-    if layer_subgraph.layer_type != LayerType.ATTENTION or layer_subgraph.terminating_node is None:
+    if layer_subgraph.layer_type != LayerType.MHA or layer_subgraph.terminating_node is None:
         return 0
 
     config = transform_container.config
@@ -2791,9 +2783,7 @@ def _process_column_sharding(
         ad_logger.debug("No nodes were added for column sharding. Skipping.")
         return 0
 
-    nodes_to_validate = [
-        n for n in subgraph_nodes if is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape])
-    ]
+    nodes_to_validate = [n for n in subgraph_nodes if is_any_view_op(n)]
     for view_node in nodes_to_validate:
         if len(view_node.args) < 2:
             continue
@@ -2815,7 +2805,7 @@ def _process_column_sharding(
 
         # fused weight may either be processed by several slice nodes or a single split node
         linear_node = linear_nodes[0]
-        split_nodes = list(filtered_nodes(linear_node.users, ops=[torch.ops.aten.split_with_sizes]))
+        split_nodes = list(filtered_nodes(linear_node.users, target=is_any_split_op))
         slice_nodes = list(filtered_nodes(linear_node.users, ops=[torch.ops.aten.slice]))
         if len(split_nodes) > 0:
             user = split_nodes[0]
@@ -2949,7 +2939,7 @@ def detect_sharding_from_config(
                             layer_type=layer_type,
                         )
                     ):
-                        if layer_type == LayerType.ATTENTION:
+                        if layer_type == LayerType.MHA:
                             num_attention_shards += 1
                         num_row_col_shards += 1
                 elif config == "mamba":
@@ -3149,7 +3139,7 @@ def detect_column_row_shard(
             )
             continue
 
-        if layer.layer_type == LayerType.ATTENTION:
+        if layer.layer_type == LayerType.MHA:
             head_dim = layer.min_local_shape
             # if the QKV projection is fused, check if num_kv_heads is divisible by world_size
             if len(opening) == 1:
@@ -3189,7 +3179,7 @@ def detect_column_row_shard(
             )
         ):
             num_column_row_shards += 1
-            if layer.layer_type == LayerType.ATTENTION:
+            if layer.layer_type == LayerType.MHA:
                 num_mha_shards += 1
 
     # simple shard remaining linear nodes

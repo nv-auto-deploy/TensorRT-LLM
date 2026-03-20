@@ -21,8 +21,13 @@ from .dist_config import DistConfig
 
 
 def deserialize_mapping(mapping_config: str) -> Mapping:
-    """Deserialize a Mapping from JSON string (legacy interface for MoE ops)."""
-    return Mapping.from_dict(json.loads(mapping_config))
+    """Deserialize a Mapping from a serialized DistConfig JSON string.
+
+    The canonical serialization format for ``mapping_config`` is
+    ``DistConfig.serialize()``.  This helper round-trips through DistConfig
+    and converts to Mapping for callers that still need a Mapping object.
+    """
+    return DistConfig.deserialize(mapping_config).to_mapping()
 
 
 def serialize_mapping(mapping: Mapping) -> str:
