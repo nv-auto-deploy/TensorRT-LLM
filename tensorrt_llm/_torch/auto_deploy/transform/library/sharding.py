@@ -200,6 +200,13 @@ class ShardingTransformConfig(TransformConfig):
         description="When True, skip TP sharding as attention data parallelism is enabled.",
     )
 
+    shard_layers: Optional[List[str]] = Field(
+        default=None,
+        description="When set, only shard nodes whose layer_type hint is in this list. "
+        "Nodes with layer_type='unknown' or missing are NOT sharded. "
+        "When None (default), all shardable nodes are processed regardless of layer_type.",
+    )
+
     dist_mapping: dict[str, int] = Field(default_factory=dict)
 
     mapping: Any = Field(default=None)  # Legacy: tensorrt_llm.mapping.Mapping (kept for compat)
@@ -3916,13 +3923,27 @@ class ApplyShardingHints(BaseTransform):
                     ShardableOp.MOE: lambda n: _apply_hint_moe(gm, n, config),
                 }
 
+            shard_layers = config.shard_layers
+            num_skipped = 0
+
             for node in list(gm.graph.nodes):
                 op_kind = is_any_shardable_op(node)
                 if op_kind is not None and op_kind in shardable_actions:
+                    if shard_layers is not None:
+                        [lt] = extract_op_args(node, "layer_type")
+                        if lt not in shard_layers:
+                            num_skipped += 1
+                            continue
                     num_updates += shardable_actions[op_kind](node)
 
             mode = "attention_dp" if enable_attention_dp else "full"
-            ad_logger.info(f"apply_sharding_hints ({mode}): {num_updates} nodes processed")
+            if shard_layers is not None:
+                ad_logger.info(
+                    f"apply_sharding_hints ({mode}): {num_updates} nodes processed, "
+                    f"{num_skipped} skipped (shard_layers={shard_layers})"
+                )
+            else:
+                ad_logger.info(f"apply_sharding_hints ({mode}): {num_updates} nodes processed")
 
         return gm, TransformInfo(
             skipped=False,

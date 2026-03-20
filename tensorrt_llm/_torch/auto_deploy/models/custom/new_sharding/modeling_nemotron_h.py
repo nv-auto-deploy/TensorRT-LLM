@@ -22,15 +22,16 @@ model should be sharded."  The ``apply_sharding_hints`` transform reads the
 hints together with a runtime ``Mapping`` to apply deterministic, node-local
 sharding transformations.
 
-Shardable custom ops used:
-  - torch.ops.auto_deploy.torch_linear_simple  (tp_mode, output_sizes)
-  - torch.ops.auto_deploy.view                 (tp_scaled_dim)
-  - torch.ops.auto_deploy.split_with_sizes     (shardable)
-  - torch.ops.auto_deploy.all_reduce           (identity / dist.all_reduce)
-  - torch.ops.auto_deploy.torch_causal_conv1d  (shardable)
-  - torch.ops.auto_deploy.torch_ssm            (shardable)
-  - torch.ops.auto_deploy.torch_rmsnorm_gated  (tp_mode)
-  - torch.ops.auto_deploy.torch_moe            (sharded by apply_sharding_hints)
+Shardable custom ops used (each carries a ``layer_type`` hint as the last kwarg):
+  - torch.ops.auto_deploy.torch_linear_simple  (tp_mode, output_sizes, layer_type)
+  - torch.ops.auto_deploy.view                 (tp_scaled_dim, layer_type)
+  - torch.ops.auto_deploy.split_with_sizes     (shardable, layer_type)
+  - torch.ops.auto_deploy.all_reduce           (layer_type)
+  - torch.ops.auto_deploy.torch_causal_conv1d  (shardable, layer_type)
+  - torch.ops.auto_deploy.torch_ssm            (shardable, layer_type)
+  - torch.ops.auto_deploy.torch_rmsnorm_gated  (tp_mode, layer_type)
+  - torch.ops.auto_deploy.torch_attention      (sharding-invariant, no hints needed)
+  - torch.ops.auto_deploy.torch_moe            (layer_type; sharded by apply_sharding_hints)
 """
 
 import math
@@ -48,10 +49,6 @@ import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register all 
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
 
-SHARD_MAMBA = True
-SHARD_ATTENTION = True
-SHARD_MLP = True
-
 
 class MambaRMSNormGated(torch.nn.Module):
     def __init__(self, hidden_size, group_size, eps=1e-5):
@@ -68,7 +65,8 @@ class MambaRMSNormGated(torch.nn.Module):
             eps=self.variance_epsilon,
             group_size=self.group_size,
             norm_before_gate=False,
-            tp_mode="colwise" if SHARD_MAMBA else "none",
+            tp_mode="colwise",
+            layer_type="ssm",
         )
 
 
@@ -150,20 +148,21 @@ class NemotronHMamba2Mixer(nn.Module):
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
 
-        _s = SHARD_MAMBA
         # 1. Gated MLP's linear projection (colwise-sharded, 5-part fused)
         projected_states = torch.ops.auto_deploy.torch_linear_simple(
             input_states,
             self.in_proj.weight,
             self.in_proj.bias,
-            tp_mode="colwise" if _s else "none",
-            output_sizes=self._in_proj_output_sizes if _s else None,
+            tp_mode="colwise",
+            output_sizes=self._in_proj_output_sizes,
+            layer_type="ssm",
         )
         gate, hidden_states_B_C, dt = torch.ops.auto_deploy.split_with_sizes(
             projected_states,
             [self.intermediate_size, self.conv_dim, self.num_heads],
             dim=-1,
-            shardable=_s,
+            shardable=True,
+            layer_type="ssm",
         )
 
         # 2. Convolution sequence transformation
@@ -177,8 +176,9 @@ class NemotronHMamba2Mixer(nn.Module):
                 self.conv1d.dilation[0],
                 self.conv1d.groups,
                 self.conv1d.padding_mode,
-                shardable=_s,
-                output_sizes=self._conv1d_output_sizes if _s else None,
+                shardable=True,
+                output_sizes=self._conv1d_output_sizes,
+                layer_type="ssm",
             )
         )
 
@@ -190,7 +190,8 @@ class NemotronHMamba2Mixer(nn.Module):
                 self.n_groups * self.ssm_state_size,
             ],
             dim=-1,
-            shardable=_s,
+            shardable=True,
+            layer_type="ssm",
         )
 
         # 3. SSM transformation
@@ -199,25 +200,29 @@ class NemotronHMamba2Mixer(nn.Module):
             hidden_states=torch.ops.auto_deploy.view(
                 hidden_states,
                 [batch_size, seq_len, -1, self.head_dim],
-                tp_scaled_dim=2 if _s else -1,
+                tp_scaled_dim=2,
+                layer_type="ssm",
             ),
             A=A,
             B=torch.ops.auto_deploy.view(
                 B,
                 [batch_size, seq_len, -1, self.ssm_state_size],
-                tp_scaled_dim=2 if _s else -1,
+                tp_scaled_dim=2,
+                layer_type="ssm",
             ),
             C=torch.ops.auto_deploy.view(
                 C,
                 [batch_size, seq_len, -1, self.ssm_state_size],
-                tp_scaled_dim=2 if _s else -1,
+                tp_scaled_dim=2,
+                layer_type="ssm",
             ),
             D=self.D,
             dt=dt,
             dt_bias=self.dt_bias,
             time_step_limit=list(self.time_step_limit),
             chunk_size=self.chunk_size,
-            shardable=_s,
+            shardable=True,
+            layer_type="ssm",
         )
         y = y.reshape(batch_size, seq_len, -1)
 
@@ -228,10 +233,12 @@ class NemotronHMamba2Mixer(nn.Module):
             scan_output.to(dtype),
             self.out_proj.weight,
             self.out_proj.bias,
-            tp_mode="rowwise" if _s else "none",
+            tp_mode="rowwise",
+            layer_type="ssm",
         )
-        if _s:
-            contextualized_states = torch.ops.auto_deploy.all_reduce(contextualized_states)
+        contextualized_states = torch.ops.auto_deploy.all_reduce(
+            contextualized_states, layer_type="ssm"
+        )
         return contextualized_states
 
     def forward(self, hidden_states):
@@ -292,6 +299,7 @@ class NemotronHMLP(nn.Module):
         is_expert: bool = False,
         tp_sharded: bool = True,
         add_all_reduce: bool = True,
+        sharding_layer_type: str = "mlp",
     ):
         super().__init__()
         self.config = config
@@ -303,7 +311,8 @@ class NemotronHMLP(nn.Module):
         self.up_proj = nn.Linear(input_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, input_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.mlp_hidden_act]
-        self.tp_sharded = tp_sharded and SHARD_MLP
+        self.tp_sharded = tp_sharded
+        self.sharding_layer_type = sharding_layer_type
         self.add_all_reduce = add_all_reduce and self.tp_sharded
 
     def forward(self, x):
@@ -312,15 +321,17 @@ class NemotronHMLP(nn.Module):
             self.up_proj.weight,
             self.up_proj.bias,
             tp_mode="colwise" if self.tp_sharded else "none",
+            layer_type=self.sharding_layer_type,
         )
         down = torch.ops.auto_deploy.torch_linear_simple(
             self.act_fn(up),
             self.down_proj.weight,
             self.down_proj.bias,
             tp_mode="rowwise" if self.tp_sharded else "none",
+            layer_type=self.sharding_layer_type,
         )
         if self.add_all_reduce:
-            down = torch.ops.auto_deploy.all_reduce(down)
+            down = torch.ops.auto_deploy.all_reduce(down, layer_type=self.sharding_layer_type)
         return down
 
 
@@ -336,6 +347,7 @@ class NemotronHMOE(nn.Module):
                     intermediate_size=config.moe_intermediate_size,
                     is_expert=True,
                     tp_sharded=False,
+                    sharding_layer_type="moe",
                 )
                 for _ in range(config.n_routed_experts)
             ]
@@ -348,6 +360,7 @@ class NemotronHMOE(nn.Module):
             is_expert=False,
             tp_sharded=True,
             add_all_reduce=False,
+            sharding_layer_type="moe",
         )
         # Latent projections are REPLICATED (not sharded)
         if getattr(config, "moe_latent_size", None) is not None:
@@ -383,6 +396,7 @@ class NemotronHMOE(nn.Module):
             w3_weight=[],
             act_fn=ActivationType.Relu2,
             is_gated_mlp=False,
+            layer_type="moe",
         )
 
         if has_latent_proj:
@@ -390,7 +404,7 @@ class NemotronHMOE(nn.Module):
 
         routed_out = out_flat.view(*orig_shape)
         out = shared_out + routed_out
-        out = torch.ops.auto_deploy.all_reduce(out)
+        out = torch.ops.auto_deploy.all_reduce(out, layer_type="moe")
         return out
 
 
@@ -486,38 +500,44 @@ class NemotronHAttention(nn.Module):
             hidden_states,
             self.q_proj.weight,
             self.q_proj.bias,
-            tp_mode="colwise" if SHARD_ATTENTION else "none",
+            tp_mode="colwise",
             tp_min_local_shape=self.head_dim,
+            layer_type="mha",
         )
         key_states = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.k_proj.weight,
             self.k_proj.bias,
-            tp_mode="colwise" if SHARD_ATTENTION else "none",
+            tp_mode="colwise",
             tp_min_local_shape=self.head_dim,
+            layer_type="mha",
         )
         value_states = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.v_proj.weight,
             self.v_proj.bias,
-            tp_mode="colwise" if SHARD_ATTENTION else "none",
+            tp_mode="colwise",
             tp_min_local_shape=self.head_dim,
+            layer_type="mha",
         )
 
         query_states = torch.ops.auto_deploy.view(
             query_states,
             [bsz, q_len, self.num_heads, self.head_dim],
-            tp_scaled_dim=2 if SHARD_ATTENTION else -1,
+            tp_scaled_dim=2,
+            layer_type="mha",
         )
         key_states = torch.ops.auto_deploy.view(
             key_states,
             [bsz, q_len, self.num_key_value_heads, self.head_dim],
-            tp_scaled_dim=2 if SHARD_ATTENTION else -1,
+            tp_scaled_dim=2,
+            layer_type="mha",
         )
         value_states = torch.ops.auto_deploy.view(
             value_states,
             [bsz, q_len, self.num_key_value_heads, self.head_dim],
-            tp_scaled_dim=2 if SHARD_ATTENTION else -1,
+            tp_scaled_dim=2,
+            layer_type="mha",
         )
 
         attn_output = torch.ops.auto_deploy.torch_attention(
@@ -533,17 +553,18 @@ class NemotronHAttention(nn.Module):
         attn_output = torch.ops.auto_deploy.view(
             attn_output,
             [bsz, q_len, self.num_heads * self.head_dim],
-            tp_scaled_dim=2 if SHARD_ATTENTION else -1,
+            tp_scaled_dim=2,
+            layer_type="mha",
         )
 
         attn_output = torch.ops.auto_deploy.torch_linear_simple(
             attn_output,
             self.o_proj.weight,
             self.o_proj.bias,
-            tp_mode="rowwise" if SHARD_ATTENTION else "none",
+            tp_mode="rowwise",
+            layer_type="mha",
         )
-        if SHARD_ATTENTION:
-            attn_output = torch.ops.auto_deploy.all_reduce(attn_output)
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
 
         return attn_output
 

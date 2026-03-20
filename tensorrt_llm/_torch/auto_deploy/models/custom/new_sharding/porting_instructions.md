@@ -17,25 +17,31 @@ Study these before porting a new model:
 
 | Original | Sharded | Layer types |
 |----------|---------|-------------|
-| `models/custom/modeling_nemotron_h.py` | `new_sharding/modeling_nemotron_h.py` | Mamba SSM, Attention, SwiGLU MLP, MoE |
-| `models/custom/modeling_qwen3_5_moe.py` | `new_sharding/modeling_qwen3_5_moe.py` | GatedDeltaNet, Gated Attention, SwiGLU MLP, MoE |
+| `modeling_nemotron_h.py` | `new_sharding/modeling_nemotron_h.py` | Mamba SSM, MHA, SwiGLU MLP, MoE |
+| `modeling_qwen3_5_moe.py` | `new_sharding/modeling_qwen3_5_moe.py` | GatedDeltaNet, Gated MHA, SwiGLU MLP, MoE |
+| `modeling_mistral.py` | `new_sharding/modeling_mistral.py` | MHA, SwiGLU MLP (simplest) |
+| `modeling_deepseek_v2.py` | `new_sharding/modeling_deepseek_v2.py` | MLA, SwiGLU MLP, MoE |
 
 ______________________________________________________________________
 
 ## Available Sharding-Aware Custom Ops
 
+Every sharding-aware op accepts a `layer_type: str = "unknown"` as its LAST
+parameter. This tag classifies the op for selective layer sharding via
+`config.shard_layers`.
+
 | Op | Sharding hints | When to use |
 |----|---------------|-------------|
-| `torch.ops.auto_deploy.torch_linear_simple` | `tp_mode: str`, `output_sizes: List[int]`, `tp_min_local_shape: int` | Replace every `nn.Linear` / `self.proj(x)` call |
-| `torch.ops.auto_deploy.view` | `tp_scaled_dim: int` | Replace `.view()` / `.reshape()` where a dimension contains a concrete head count that scales with TP |
-| `torch.ops.auto_deploy.split_with_sizes` | `shardable: bool` | Replace `torch.split` / `torch.split_with_sizes` after a colwise-sharded projection |
-| `torch.ops.auto_deploy.all_reduce` | *(none)* | Insert after every rowwise projection. Identity when `world_size=1`; real `dist.all_reduce` when sharded |
-| `torch.ops.auto_deploy.torch_causal_conv1d` | `shardable: bool`, `output_sizes: List[int]` | Already used in model code; add sharding hints |
-| `torch.ops.auto_deploy.torch_ssm` | `shardable: bool` | Already used in Mamba models; add sharding hint |
-| `torch.ops.auto_deploy.torch_gated_delta_rule` | `shardable: bool` | Already used in GatedDeltaNet models; add sharding hint |
-| `torch.ops.auto_deploy.torch_rmsnorm_gated` | `tp_mode: str` | Gated RMSNorm whose weight scales with TP (e.g., Mamba norm) |
-| `torch.ops.auto_deploy.torch_mla` | `shardable: bool` | MLA attention op; when shardable, `_apply_hint_mla` shards `kv_b_proj_weight` (arg\[4\]) colwise |
-| `torch.ops.auto_deploy.torch_moe` | *(none)* | Already used in MoE models; `apply_sharding_hints` handles EP/TP automatically |
+| `torch.ops.auto_deploy.torch_linear_simple` | `tp_mode`, `output_sizes`, `tp_min_local_shape`, `layer_type` | Replace every `nn.Linear` / `self.proj(x)` call |
+| `torch.ops.auto_deploy.view` | `tp_scaled_dim`, `layer_type` | Replace `.view()` / `.reshape()` where a dimension contains a concrete head count that scales with TP |
+| `torch.ops.auto_deploy.split_with_sizes` | `shardable`, `layer_type` | Replace `torch.split` / `torch.split_with_sizes` after a colwise-sharded projection |
+| `torch.ops.auto_deploy.all_reduce` | `layer_type` | Insert after every rowwise projection. Identity when `world_size=1`; real `dist.all_reduce` when sharded |
+| `torch.ops.auto_deploy.torch_causal_conv1d` | `shardable`, `output_sizes`, `layer_type` | Already used in model code; add sharding hints |
+| `torch.ops.auto_deploy.torch_ssm` | `shardable`, `layer_type` | Already used in Mamba models; add sharding hint |
+| `torch.ops.auto_deploy.torch_gated_delta_rule` | `shardable`, `layer_type` | Already used in GatedDeltaNet models; add sharding hint |
+| `torch.ops.auto_deploy.torch_rmsnorm_gated` | `tp_mode`, `layer_type` | Gated RMSNorm whose weight scales with TP (e.g., Mamba norm) |
+| `torch.ops.auto_deploy.torch_mla` | `shardable`, `layer_type` | MLA attention op; when shardable, `_apply_hint_mla` shards `kv_b_proj_weight` (arg\[4\]) colwise |
+| `torch.ops.auto_deploy.torch_moe` | `layer_type` | Already used in MoE models; `apply_sharding_hints` handles EP/TP automatically |
 
 ### Hint parameter reference
 
@@ -46,6 +52,19 @@ ______________________________________________________________________
 | `tp_min_local_shape` | `int` | `1` | Minimum output size per rank. Used for GQA where `num_kv_heads < tp_size` (set to `head_dim`). |
 | `tp_scaled_dim` | `int` | `-1` | Index of the shape dimension that scales with TP. `-1` means no scaling. `apply_sharding_hints` replaces `shape[tp_scaled_dim]` with `-1` (inferred). |
 | `shardable` | `bool` | `False` | When True, `apply_sharding_hints` shards the op's weights/parameters along the head dimension. |
+| `layer_type` | `str` | `"unknown"` | Layer classification for selective sharding. Must match `LayerType` enum values: `"mha"`, `"mla"`, `"ssm"`, `"delta"`, `"mlp"`, `"moe"`, `"unknown"`. |
+
+### Layer type values
+
+| Value | When to use |
+|-------|------------|
+| `"mha"` | Standard multi-head attention: Q/K/V/O projections, head reshape views, all_reduce |
+| `"mla"` | Multi-head latent attention (DeepSeek): q_a/q_b/kv_a projections, torch_mla, o_proj, all_reduce |
+| `"mlp"` | SwiGLU MLP: gate/up/down projections, all_reduce |
+| `"moe"` | MoE block: torch_moe, shared expert projections, merge all_reduce |
+| `"ssm"` | Mamba SSM: in_proj, conv1d, torch_ssm, norm, out_proj, views, splits, all_reduce |
+| `"delta"` | GatedDeltaNet: in_proj_qkv/z/b/a, conv1d, torch_gated_delta_rule, views, splits, out_proj, all_reduce |
+| `"unknown"` | Default. Nodes with this value are skipped when `shard_layers` is set. |
 
 ______________________________________________________________________
 
@@ -65,16 +84,8 @@ Add at the top of the file:
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register all ops
 ```
 
-Add sharding control flags (one per layer family):
-
-```python
-SHARD_ATTENTION = True
-SHARD_MLP = True
-SHARD_SSM = True  # or SHARD_GDN, etc.
-```
-
-These flags let you toggle sharding per layer type during debugging.
-Use `_s = SHARD_ATTENTION` as a local alias in each forward method.
+Do NOT add global `SHARD_*` flags. Layer-level sharding control is handled
+by the `layer_type` hint on each op and the `shard_layers` config in YAML.
 
 ### Step 3: Replace linear projections
 
@@ -89,16 +100,21 @@ output = torch.ops.auto_deploy.torch_linear_simple(
     hidden_states,
     self.proj.weight,
     self.proj.bias,              # None if no bias
-    tp_mode="colwise" if _s else "none",  # or "rowwise"
+    tp_mode="colwise",           # or "rowwise"
+    layer_type="mha",            # or "mlp", "moe", "ssm", "delta", "mla"
 )
 ```
+
+Always set `tp_mode` unconditionally (no `if _s else "none"` conditionals).
+The `layer_type` tag enables selective sharding at the transform level via
+`config.shard_layers`.
 
 **Rules for choosing `tp_mode`:**
 
 - **Opening projections** (Q, K, V, gate, up, in_proj) -> `"colwise"`
 - **Closing projections** (O, down, out_proj) -> `"rowwise"`
 - **Tiny projections** (shared_expert_gate with output_dim=1) -> `"none"` (cannot shard)
-- **Latent projections** (MLA q_a_proj, kv_a_proj) -> keep replicated or use `"gather"`
+- **Latent projections** (MLA q_a_proj, kv_a_proj) -> `"none"` (replicated)
 
 **Fused weights** -- when a single linear produces concatenated outputs that are
 later split (e.g., QKV fused, or Mamba in_proj = \[gate | conv_input | dt\]):
@@ -106,42 +122,34 @@ later split (e.g., QKV fused, or Mamba in_proj = \[gate | conv_input | dt\]):
 ```python
 output = torch.ops.auto_deploy.torch_linear_simple(
     x, self.in_proj.weight, self.in_proj.bias,
-    tp_mode="colwise" if _s else "none",
-    output_sizes=[gate_dim, conv_dim, dt_dim] if _s else None,
+    tp_mode="colwise",
+    output_sizes=[gate_dim, conv_dim, dt_dim],
+    layer_type="ssm",
 )
 ```
-
-`output_sizes` tells the sharder to split the output dimension proportionally
-across ranks, preserving the group structure.
 
 **GQA (num_kv_heads \< num_q_heads)** -- K/V projections need:
 
 ```python
 key = torch.ops.auto_deploy.torch_linear_simple(
     x, self.k_proj.weight, self.k_proj.bias,
-    tp_mode="colwise" if _s else "none",
+    tp_mode="colwise",
     tp_min_local_shape=self.head_dim,
+    layer_type="mha",
 )
 ```
-
-`tp_min_local_shape=head_dim` ensures each rank keeps at least one full head,
-enabling partial replication when `num_kv_heads < tp_size`.
 
 ### Step 4: Replace split / chunk operations
 
 After a colwise-sharded fused projection, replace `torch.split` with:
 
 ```python
-# BEFORE
-gate, up = torch.split(projected, [gate_dim, up_dim], dim=-1)
-
-# AFTER
 gate, up = torch.ops.auto_deploy.split_with_sizes(
-    projected, [gate_dim, up_dim], dim=-1, shardable=_s,
+    projected, [gate_dim, up_dim], dim=-1,
+    shardable=True,
+    layer_type="ssm",
 )
 ```
-
-When `shardable=True`, `apply_sharding_hints` divides all split sizes by `tp_size`.
 
 ### Step 5: Replace view / reshape with concrete head counts
 
@@ -151,26 +159,19 @@ these concrete values become wrong. Any reshape dimension that scales with TP
 **must** use `auto_deploy::view`.
 
 ```python
-# BEFORE
-key = key_proj_output.view(bsz, seq_len, self.num_kv_heads, self.head_dim)
-
-# AFTER
 key = torch.ops.auto_deploy.view(
     key_proj_output,
     [bsz, seq_len, self.num_kv_heads, self.head_dim],
-    tp_scaled_dim=2 if _s else -1,
+    tp_scaled_dim=2,
+    layer_type="mha",
 )
 ```
-
-`tp_scaled_dim=2` tells the sharder to replace `shape[2]` with `-1` (inferred)
-so the view adapts to the sharded tensor size.
 
 **When NOT to use `auto_deploy::view`:**
 
 - Flattening to 2D: `x.reshape(-1, x.shape[-1])` -- safe, no head count
 - Flattening heads back: `x.reshape(bsz, seq_len, -1)` -- safe IF the input
-  tensor already has the correct sharded shape (check that no concrete head
-  count is baked in upstream)
+  tensor already has the correct sharded shape
 
 **When you MUST use `auto_deploy::view`:**
 
@@ -180,15 +181,15 @@ so the view adapts to the sharded tensor size.
 
 ### Step 6: Insert all_reduce
 
-After every rowwise projection, add:
+After every rowwise projection, add unconditionally:
 
 ```python
 output = torch.ops.auto_deploy.torch_linear_simple(
     x, self.out_proj.weight, self.out_proj.bias,
-    tp_mode="rowwise" if _s else "none",
+    tp_mode="rowwise",
+    layer_type="mha",
 )
-if _s:
-    output = torch.ops.auto_deploy.all_reduce(output)
+output = torch.ops.auto_deploy.all_reduce(output, layer_type="mha")
 ```
 
 **MoE shared expert exception**: when the shared expert MLP is inside a MoE
@@ -198,13 +199,12 @@ block, defer all_reduce to the merge point:
 class SharedExpertMLP(nn.Module):
     def __init__(self, ..., add_all_reduce=True):
         self.add_all_reduce = add_all_reduce
-        ...
 
     def forward(self, x):
         # gate/up colwise, down rowwise (no all_reduce here if deferred)
         ...
-        if self.tp_sharded and self.add_all_reduce:
-            down = torch.ops.auto_deploy.all_reduce(down)
+        if self.add_all_reduce:
+            down = torch.ops.auto_deploy.all_reduce(down, layer_type="mlp")
         return down
 
 class MoEBlock(nn.Module):
@@ -212,17 +212,16 @@ class MoEBlock(nn.Module):
         self.shared_expert = SharedExpertMLP(..., add_all_reduce=False)
 
     def forward(self, x):
-        routed_out = torch.ops.auto_deploy.torch_moe(...)
+        routed_out = torch.ops.auto_deploy.torch_moe(..., layer_type="moe")
         shared_out = self.shared_expert(x)
         out = routed_out + shared_out
-        if SHARD_MLP:
-            out = torch.ops.auto_deploy.all_reduce(out)
+        out = torch.ops.auto_deploy.all_reduce(out, layer_type="moe")
         return out
 ```
 
 ### Step 7: Handle special layer-specific ops
 
-**Conv1d** (Mamba, GatedDeltaNet) -- add hints:
+**Conv1d** (Mamba, GatedDeltaNet):
 
 ```python
 conv_out = torch.ops.auto_deploy.torch_causal_conv1d(
@@ -230,33 +229,33 @@ conv_out = torch.ops.auto_deploy.torch_causal_conv1d(
     self.conv1d.stride[0], self.conv1d.padding[0],
     self.conv1d.dilation[0], self.conv1d.groups,
     self.conv1d.padding_mode,
-    shardable=_s,
-    output_sizes=[key_dim, key_dim, value_dim] if _s else None,
+    shardable=True,
+    output_sizes=[key_dim, key_dim, value_dim],
+    layer_type="delta",
 )
 ```
 
-**SSM** (Mamba) -- add `shardable`:
+**SSM** (Mamba):
 
 ```python
-y = torch.ops.auto_deploy.torch_ssm(
-    ..., shardable=_s,
-)
+y = torch.ops.auto_deploy.torch_ssm(..., shardable=True, layer_type="ssm")
 ```
 
-**GatedDeltaNet** -- add `shardable`:
+**GatedDeltaNet**:
 
 ```python
 out = torch.ops.auto_deploy.torch_gated_delta_rule(
-    query, key, value, g, beta, shardable=_s,
+    query, key, value, g, beta, shardable=True, layer_type="delta",
 )
 ```
 
-**Gated RMSNorm** (Mamba) -- use custom op with `tp_mode`:
+**Gated RMSNorm** (Mamba):
 
 ```python
 out = torch.ops.auto_deploy.torch_rmsnorm_gated(
     x, self.norm.weight, gate, self.norm.eps, group_size,
-    tp_mode="colwise" if _s else "none",
+    tp_mode="colwise",
+    layer_type="ssm",
 )
 ```
 
@@ -265,12 +264,13 @@ scale with TP), keep it as a plain PyTorch module -- no custom op needed.
 
 ### Step 8: Handle MoE
 
-`torch_moe` is sharded automatically by `apply_sharding_hints` (EP partitioning,
-TP weight sharding, expert ID localization). No changes needed to the `torch_moe`
-call itself.
+`torch_moe` is sharded automatically by `apply_sharding_hints`:
 
-The routed expert weights (gate_proj, up_proj, down_proj per expert) are passed
-as lists and sharded by the `_apply_hint_moe` handler.
+```python
+expert_output = torch.ops.auto_deploy.torch_moe(
+    ..., layer_type="moe",
+)
+```
 
 ### Step 9: Register the new model
 
@@ -280,16 +280,16 @@ In `models/custom/__init__.py`, add an override import:
 from .new_sharding.modeling_foo import FooForCausalLM  # noqa: F811
 ```
 
-The `# noqa: F811` suppresses the redefinition warning. The last import wins,
-so the new_sharding version replaces the original.
+Or for self-registering models (using `register_custom_model_cls`):
+
+```python
+import tensorrt_llm._torch.auto_deploy.models.custom.new_sharding.modeling_foo  # noqa: F401
+```
 
 ### Step 10: Create YAML config
 
 Create a YAML config file at `examples/auto_deploy/new_sharding/<model_family>/<model>_sharding_poc.yaml`.
 This is REQUIRED -- without it the model cannot be tested.
-
-Use this template (adapted from the working Qwen3.5 config at
-`examples/auto_deploy/new_sharding/qwen/qwen3_5_moe_sharding_poc.yaml`):
 
 ```yaml
 model: org/Model-Name
@@ -323,31 +323,25 @@ args:
       enabled: true                    # Enable new hint-driven sharding
       run_shape_prop: true
       allreduce_strategy: NCCL
+      # shard_layers: ['mha', 'mlp']  # Optional: selective layer sharding
     gather_logits_before_lm_head:
       enabled: true
 ```
 
-Key points:
+The optional `shard_layers` config enables selective layer sharding:
 
-- `detect_sharding` and `sharding_transform_executor` MUST be disabled
-- `apply_sharding_hints` MUST be enabled with `run_shape_prop: true`
-- Add `num_moe_experts_for_export: 2` under `export_to_gm` for MoE models
-- Add model-specific transforms (e.g., `fuse_mamba_a_log`, `insert_cached_ssm_attention`)
-  as needed -- check the model's existing config for these
-
-Run with:
-
-```bash
-export HF_HOME=/path/to/hf/cache
-cd examples/auto_deploy
-python build_and_run_ad.py --yaml-extra new_sharding/<family>/<model>_sharding_poc.yaml
-```
+- Not set or `null`: shard ALL shardable nodes (default)
+- `['moe']`: shard only MoE layers
+- `['moe', 'mha']`: shard MoE and attention layers
+- Only nodes with a matching `layer_type` hint are processed
 
 ______________________________________________________________________
 
 ## Layer-Specific Sharding Patterns
 
-### Attention (standard or gated)
+### MHA (standard or gated)
+
+All ops use `layer_type="mha"`:
 
 ```
 q_proj  -> colwise (+ tp_min_local_shape for GQA)
@@ -364,6 +358,8 @@ colwise sharding is correct -- no `output_sizes` needed.
 
 ### SwiGLU MLP
 
+All ops use `layer_type="mlp"`:
+
 ```
 gate_proj -> colwise
 up_proj   -> colwise
@@ -372,6 +368,8 @@ down_proj -> rowwise
 ```
 
 ### Mamba / SSM
+
+All ops use `layer_type="ssm"`:
 
 ```
 in_proj   -> colwise + output_sizes=[gate, conv_input, dt]
@@ -385,6 +383,8 @@ out_proj  -> rowwise + all_reduce
 ```
 
 ### GatedDeltaNet
+
+All ops use `layer_type="delta"`:
 
 ```
 in_proj_qkv -> colwise + output_sizes=[key_dim, key_dim, value_dim]
@@ -402,18 +402,22 @@ out_proj    -> rowwise + all_reduce
 
 ### MoE + Shared Expert
 
+All ops use `layer_type="moe"`:
+
 ```
-router      -> replicated (not sharded)
+router      -> replicated (not sharded, tp_mode="none")
 torch_moe   -> automatic (EP/TP by apply_sharding_hints)
 shared_expert:
   gate_proj -> colwise
   up_proj   -> colwise
   down_proj -> rowwise (NO all_reduce here)
-shared_expert_gate -> replicated (output dim=1)
+shared_expert_gate -> replicated (output dim=1, tp_mode="none")
 merge: routed + shared -> all_reduce
 ```
 
 ### MLA (DeepSeek)
+
+All ops use `layer_type="mla"`:
 
 MLA uses `torch_mla` which absorbs `kv_b_proj_weight` internally. Do NOT
 decompose `torch_mla` into explicit `kv_b_proj` + `torch_attention` -- the
@@ -476,6 +480,23 @@ ______________________________________________________________________
    (e.g., Qwen3.5 `in_proj_qkv = [all_Q | all_K | all_V]`), you MUST provide
    `output_sizes` for proportional splitting.
 
+1. **Missing `layer_type` when `shard_layers` is set.** When the YAML config
+   specifies `shard_layers`, only nodes whose `layer_type` matches the list
+   are sharded. Nodes with `layer_type="unknown"` (the default) are skipped.
+   Always set `layer_type` explicitly on every sharding-aware op call.
+
+1. **Adding `layer_type` to non-shardable ops.** Do NOT add `layer_type` to
+   ops that are not in the "Available Sharding-Aware Custom Ops" table.
+   Ops like `torch_attention`, `torch_l2norm`, `torch_rope_*` are
+   sharding-invariant -- they operate correctly on whatever tensor shapes
+   they receive. Adding `layer_type` to these ops will cause the string to
+   be interpreted as another positional argument, breaking the op call.
+
+1. **Using conditional `if _s else "none"` patterns.** Do NOT use global
+   `SHARD_*` flags or conditional hint values. Always set sharding hints
+   unconditionally (e.g., `tp_mode="colwise"`, not `tp_mode="colwise" if _s else "none"`). Layer-level sharding control is handled by `layer_type` +
+   `shard_layers` at the transform level.
+
 ______________________________________________________________________
 
 ## Validation Checklist
@@ -490,3 +511,5 @@ ______________________________________________________________________
 1. **Check node count**: The `apply_sharding_hints` log prints
    `N nodes processed`. Verify this matches your expectation (count all
    shardable ops in the model).
+1. **Selective sharding**: Test with `shard_layers: ['moe']` in the YAML to
+   verify only MoE layers are sharded while others remain replicated.

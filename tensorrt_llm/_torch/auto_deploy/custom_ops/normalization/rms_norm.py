@@ -113,6 +113,7 @@ def torch_rmsnorm_gated(
     group_size: int,
     norm_before_gate: bool = False,
     tp_mode: str = "none",
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Custom operator for Torch gated RMSNorm implementation.
 
@@ -160,6 +161,7 @@ def _(
     group_size: int,
     norm_before_gate: bool = False,
     tp_mode: str = "none",
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for the custom operator during tracing."""
     return x.new_empty(x.shape, dtype=x.dtype)
@@ -174,6 +176,7 @@ def triton_rmsnorm_gated(
     group_size: int,
     norm_before_gate: bool = False,
     tp_mode: str = "none",
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """
     Group RMSNorm with optional SiLU gating, using Triton kernel `_layer_norm_fwd`.
@@ -231,6 +234,7 @@ def _triton_rmsnorm_gated_meta(
     group_size: int,
     norm_before_gate: bool = False,
     tp_mode: str = "none",
+    layer_type: str = "unknown",
 ):
     assert x.dim() >= 2, "x must be at least 2D"
     H = x.shape[-1]

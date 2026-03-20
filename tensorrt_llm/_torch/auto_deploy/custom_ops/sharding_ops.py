@@ -31,6 +31,7 @@ def view(
     x: torch.Tensor,
     shape: List[int],
     tp_scaled_dim: int = -1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Sharding-aware view/reshape.
 
@@ -47,6 +48,7 @@ def _view_fake(
     x: torch.Tensor,
     shape: List[int],
     tp_scaled_dim: int = -1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     return x.reshape(shape).clone()
 
@@ -57,6 +59,7 @@ def split_with_sizes(
     split_sizes: List[int],
     dim: int = -1,
     shardable: bool = False,
+    layer_type: str = "unknown",
 ) -> List[torch.Tensor]:
     """Sharding-aware split_with_sizes.
 
@@ -73,12 +76,13 @@ def _split_with_sizes_fake(
     split_sizes: List[int],
     dim: int = -1,
     shardable: bool = False,
+    layer_type: str = "unknown",
 ) -> List[torch.Tensor]:
     return [t.clone() for t in torch.split(x, split_sizes, dim=dim)]
 
 
 @torch.library.custom_op("auto_deploy::all_reduce", mutates_args=())
-def all_reduce(x: torch.Tensor) -> torch.Tensor:
+def all_reduce(x: torch.Tensor, layer_type: str = "unknown") -> torch.Tensor:
     """Sharding-aware all-reduce placeholder.
 
     Identity when running unsharded.  ``apply_sharding_hints`` replaces this
@@ -89,5 +93,5 @@ def all_reduce(x: torch.Tensor) -> torch.Tensor:
 
 
 @all_reduce.register_fake
-def _all_reduce_fake(x: torch.Tensor) -> torch.Tensor:
+def _all_reduce_fake(x: torch.Tensor, layer_type: str = "unknown") -> torch.Tensor:
     return torch.empty_like(x)

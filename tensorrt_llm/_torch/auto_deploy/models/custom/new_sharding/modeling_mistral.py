@@ -23,9 +23,9 @@ hints together with a runtime ``DistConfig`` to apply deterministic, node-local
 sharding transformations.
 
 Shardable custom ops used:
-  - torch.ops.auto_deploy.torch_linear_simple  (tp_mode, tp_min_local_shape)
-  - torch.ops.auto_deploy.view                 (tp_scaled_dim)
-  - torch.ops.auto_deploy.all_reduce           (identity / dist.all_reduce)
+  - torch.ops.auto_deploy.torch_linear_simple  (tp_mode, tp_min_local_shape, layer_type)
+  - torch.ops.auto_deploy.view                 (tp_scaled_dim, layer_type)
+  - torch.ops.auto_deploy.all_reduce           (identity / dist.all_reduce, layer_type)
 """
 
 from dataclasses import dataclass
@@ -42,9 +42,6 @@ from transformers.utils import ModelOutput
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register all ops
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-
-SHARD_ATTENTION = True
-SHARD_MLP = True
 
 
 class MistralRMSNorm(nn.Module):
@@ -116,27 +113,28 @@ class MistralMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _s = SHARD_MLP
         gate = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.gate_proj.weight,
             self.gate_proj.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
+            layer_type="mlp",
         )
         up = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.up_proj.weight,
             self.up_proj.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
+            layer_type="mlp",
         )
         down = torch.ops.auto_deploy.torch_linear_simple(
             self.act_fn(gate) * up,
             self.down_proj.weight,
             self.down_proj.bias,
-            tp_mode="rowwise" if _s else "none",
+            tp_mode="rowwise",
+            layer_type="mlp",
         )
-        if _s:
-            down = torch.ops.auto_deploy.all_reduce(down)
+        down = torch.ops.auto_deploy.all_reduce(down, layer_type="mlp")
         return down
 
 
@@ -180,46 +178,51 @@ class MistralAttention(nn.Module):
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
-        _s = SHARD_ATTENTION
 
         # Q/K/V projections with sharding hints
         q = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.q_proj.weight,
             self.q_proj.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
             tp_min_local_shape=self.head_dim,
+            layer_type="mha",
         )
         k = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.k_proj.weight,
             self.k_proj.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
             tp_min_local_shape=self.head_dim,
+            layer_type="mha",
         )
         v = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.v_proj.weight,
             self.v_proj.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
             tp_min_local_shape=self.head_dim,
+            layer_type="mha",
         )
 
         # Reshape to [B, S, N, head_dim] using sharding-aware view
         q = torch.ops.auto_deploy.view(
             q,
             [bsz, q_len, self.num_heads, self.head_dim],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="mha",
         )
         k = torch.ops.auto_deploy.view(
             k,
             [bsz, q_len, self.num_kv_heads, self.head_dim],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="mha",
         )
         v = torch.ops.auto_deploy.view(
             v,
             [bsz, q_len, self.num_kv_heads, self.head_dim],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="mha",
         )
 
         # Apply RoPE using custom op (BSND layout, unsqueeze_dim=2)
@@ -251,7 +254,8 @@ class MistralAttention(nn.Module):
         attn_output = torch.ops.auto_deploy.view(
             attn_output,
             [bsz, q_len, self.num_heads * self.head_dim],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="mha",
         )
 
         # Output projection (rowwise) + all_reduce
@@ -259,10 +263,10 @@ class MistralAttention(nn.Module):
             attn_output,
             self.o_proj.weight,
             self.o_proj.bias,
-            tp_mode="rowwise" if _s else "none",
+            tp_mode="rowwise",
+            layer_type="mha",
         )
-        if _s:
-            attn_output = torch.ops.auto_deploy.all_reduce(attn_output)
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
 
         return attn_output
 

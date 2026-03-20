@@ -23,6 +23,7 @@ def torch_mla(
     scale: Optional[float] = None,
     layout: str = "bsnd",
     shardable: bool = False,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Multi-head Latent Attention (MLA) with FlashInfer-compatible compressed KV.
 
@@ -137,6 +138,7 @@ def torch_mla_fake(
     scale: Optional[float] = None,
     layout: str = "bsnd",
     shardable: bool = False,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for torch_mla."""
     # Infer v_head_dim from kv_b_proj_weight

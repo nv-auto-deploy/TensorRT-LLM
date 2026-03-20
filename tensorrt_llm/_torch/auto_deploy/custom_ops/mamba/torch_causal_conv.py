@@ -33,6 +33,7 @@ def _torch_causal_conv1d(
     padding_mode: str = "zeros",
     shardable: bool = False,
     output_sizes: Optional[List[int]] = None,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     assert padding_mode == "zeros", "padding_mode must be zeros"
 
@@ -65,5 +66,6 @@ def _torch_causal_conv1d_meta(
     padding_mode: str = "zeros",
     shardable: bool = False,
     output_sizes: Optional[List[int]] = None,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     return torch.empty_like(input)

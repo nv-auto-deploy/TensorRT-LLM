@@ -149,6 +149,7 @@ def torch_gated_delta_rule(
     dt_bias: torch.Tensor,
     scale: Optional[float] = None,
     shardable: bool = False,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Gated Delta Rule custom op for linear attention (torch reference implementation).
 
@@ -210,6 +211,7 @@ def torch_gated_delta_rule_fake(
     dt_bias: torch.Tensor,
     scale: Optional[float] = None,
     shardable: bool = False,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     # Output shape is [B, S, H, V] matching v (not q/k which may have fewer heads)
     return torch.empty_like(v)

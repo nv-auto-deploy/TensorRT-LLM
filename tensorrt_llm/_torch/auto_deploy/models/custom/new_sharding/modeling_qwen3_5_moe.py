@@ -37,10 +37,6 @@ from transformers.utils import ModelOutput
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register all ops
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 
-SHARD_GDN = True
-SHARD_ATTENTION = True
-SHARD_MLP = True
-
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -350,38 +346,42 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        _s = SHARD_GDN
 
         # 1. Projections with sharding hints
         mixed_qkv = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.in_proj_qkv.weight,
             self.in_proj_qkv.bias,
-            tp_mode="colwise" if _s else "none",
-            output_sizes=self._conv_split_sizes if _s else None,
+            tp_mode="colwise",
+            output_sizes=self._conv_split_sizes,
+            layer_type="delta",
         )
         z = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.in_proj_z.weight,
             self.in_proj_z.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
+            layer_type="delta",
         )
         z = torch.ops.auto_deploy.view(
             z,
             [batch_size, seq_len, self.num_v_heads, self.head_v_dim],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="delta",
         )
         b = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.in_proj_b.weight,
             self.in_proj_b.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
+            layer_type="delta",
         )
         a = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.in_proj_a.weight,
             self.in_proj_a.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
+            layer_type="delta",
         )
 
         # 2. Causal Conv1d with sharding hint
@@ -394,8 +394,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             self.conv1d.dilation[0],
             self.conv1d.groups,
             self.conv1d.padding_mode,
-            shardable=_s,
-            output_sizes=self._conv_split_sizes if _s else None,
+            shardable=True,
+            output_sizes=self._conv_split_sizes,
+            layer_type="delta",
         )
         mixed_qkv = F.silu(mixed_qkv)
 
@@ -404,24 +405,28 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             mixed_qkv,
             [self.key_dim, self.key_dim, self.value_dim],
             dim=-1,
-            shardable=_s,
+            shardable=True,
+            layer_type="delta",
         )
 
         # Reshape to per-head: [B, S, num_heads, head_dim]
         query = torch.ops.auto_deploy.view(
             query,
             [batch_size, seq_len, self.num_k_heads, self.head_k_dim],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="delta",
         )
         key = torch.ops.auto_deploy.view(
             key,
             [batch_size, seq_len, self.num_k_heads, self.head_k_dim],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="delta",
         )
         value = torch.ops.auto_deploy.view(
             value,
             [batch_size, seq_len, self.num_v_heads, self.head_v_dim],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="delta",
         )
 
         # 3. L2 normalize Q and K
@@ -444,7 +449,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             value,
             g,
             beta,
-            shardable=_s,
+            shardable=True,
+            layer_type="delta",
         )
 
         # 6. Gated RMSNorm (norm weight is replicated -- constant head_v_dim)
@@ -454,7 +460,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         core_attn_out = torch.ops.auto_deploy.view(
             core_attn_out,
             [batch_size, seq_len, self.num_v_heads, self.head_v_dim],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="delta",
         )
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
@@ -463,10 +470,10 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             core_attn_out,
             self.out_proj.weight,
             self.out_proj.bias,
-            tp_mode="rowwise" if _s else "none",
+            tp_mode="rowwise",
+            layer_type="delta",
         )
-        if _s:
-            output = torch.ops.auto_deploy.all_reduce(output)
+        output = torch.ops.auto_deploy.all_reduce(output, layer_type="delta")
         return output
 
 
@@ -526,7 +533,6 @@ class Qwen3_5MoeAttention(nn.Module):
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
-        _s = SHARD_ATTENTION
 
         # Q projection with gate: output shape (B, S, N, 2*D)
         # Weight is interleaved per-head [q_h0, g_h0, q_h1, g_h1, ...] so plain
@@ -535,12 +541,14 @@ class Qwen3_5MoeAttention(nn.Module):
             hidden_states,
             self.q_proj.weight,
             self.q_proj.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
+            layer_type="mha",
         )
         qg = torch.ops.auto_deploy.view(
             qg,
             [bsz, q_len, self.num_heads, self.head_dim * 2],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="mha",
         )
         query_states, gate = torch.chunk(qg, 2, dim=-1)
         gate = gate.reshape(bsz, q_len, -1)  # flatten heads*dim, safe after chunk
@@ -550,25 +558,29 @@ class Qwen3_5MoeAttention(nn.Module):
             hidden_states,
             self.k_proj.weight,
             self.k_proj.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
             tp_min_local_shape=self.head_dim,
+            layer_type="mha",
         )
         key_states = torch.ops.auto_deploy.view(
             key_states,
             [bsz, q_len, self.num_key_value_heads, self.head_dim],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="mha",
         )
         value_states = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.v_proj.weight,
             self.v_proj.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
             tp_min_local_shape=self.head_dim,
+            layer_type="mha",
         )
         value_states = torch.ops.auto_deploy.view(
             value_states,
             [bsz, q_len, self.num_key_value_heads, self.head_dim],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="mha",
         )
 
         # Per-head Q/K norms (norm operates on last dim = head_dim, no sharding)
@@ -601,10 +613,10 @@ class Qwen3_5MoeAttention(nn.Module):
             attn_output,
             self.o_proj.weight,
             self.o_proj.bias,
-            tp_mode="rowwise" if _s else "none",
+            tp_mode="rowwise",
+            layer_type="mha",
         )
-        if _s:
-            attn_output = torch.ops.auto_deploy.all_reduce(attn_output)
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
         return attn_output
 
 
@@ -633,31 +645,35 @@ class Qwen3_5MoeMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.tp_sharded = SHARD_MLP
         self.add_all_reduce = add_all_reduce
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _s = self.tp_sharded
+        # Shared expert inside MoE (add_all_reduce=False) uses layer_type="moe";
+        # standalone MLP uses layer_type="mlp".
+        _lt = "moe" if not self.add_all_reduce else "mlp"
         gate = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.gate_proj.weight,
             self.gate_proj.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
+            layer_type=_lt,
         )
         up = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.up_proj.weight,
             self.up_proj.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
+            layer_type=_lt,
         )
         down = torch.ops.auto_deploy.torch_linear_simple(
             self.act_fn(gate) * up,
             self.down_proj.weight,
             self.down_proj.bias,
-            tp_mode="rowwise" if _s else "none",
+            tp_mode="rowwise",
+            layer_type=_lt,
         )
-        if _s and self.add_all_reduce:
-            down = torch.ops.auto_deploy.all_reduce(down)
+        if self.add_all_reduce:
+            down = torch.ops.auto_deploy.all_reduce(down, layer_type=_lt)
         return down
 
 
@@ -771,6 +787,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             w2_weights,
             w3_weights,
             is_gated_mlp=True,
+            layer_type="moe",
         )
 
         # Shared expert with sigmoid gating (all_reduce deferred)
@@ -781,8 +798,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
 
         # Merge routed + shared, then single all_reduce
         expert_output = expert_output + shared_expert_output
-        if SHARD_MLP:
-            expert_output = torch.ops.auto_deploy.all_reduce(expert_output)
+        expert_output = torch.ops.auto_deploy.all_reduce(expert_output, layer_type="moe")
 
         expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
         return expert_output

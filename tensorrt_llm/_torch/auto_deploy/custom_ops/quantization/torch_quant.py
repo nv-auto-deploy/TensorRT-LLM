@@ -190,6 +190,7 @@ def torch_fake_quant_fp8_linear(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """
     Reference (eager) implementation for multiple quant formats via `format_type`.
@@ -228,6 +229,7 @@ def torch_fake_quant_fp8_linear(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     w = weight_quantized.to(input.dtype)
     return torch.ops.aten.linear(input, w, bias)
@@ -245,6 +247,7 @@ def torch_fake_quant_nvfp4_linear(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """
     Reference (eager) implementation for multiple quant formats via `format_type`.
@@ -310,6 +313,7 @@ def torch_fake_quant_nvfp4_linear(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_quantized.repeat(1, 2).to(input.dtype), bias)
 
@@ -326,6 +330,7 @@ def torch_fake_quant_int4_linear(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     BLOCK_SIZE = 128
     # activation pre-scale
@@ -363,6 +368,7 @@ def _fake(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     N_half = weight_quantized.shape[-2]
     N = N_half * 2
@@ -381,6 +387,7 @@ def torch_fake_quant_int4_gptq_linear(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """
     GPTQ INT4 linear with compatible signature to other quant ops.
@@ -465,6 +472,7 @@ def torch_fake_quant_int4_gptq_linear_fake(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     N = weight_quantized.size(1)
     return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)
@@ -538,6 +546,7 @@ def torch_fake_quant_finegrained_fp8_linear(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FineGrainedFP8 linear operation.
     - weight_scale[0] = weight_scale_inv (per-block weight scale)
@@ -584,6 +593,7 @@ def _torch_fake_quant_finegrained_fp8_linear_fake(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
     out_features = weight_quantized.shape[0]
@@ -599,6 +609,7 @@ def trtllm_finegrained_fp8_linear(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """TRT-LLM optimized FineGrainedFP8 linear operation.
 
@@ -672,6 +683,7 @@ def _trtllm_finegrained_fp8_linear_fake(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
     out_features = weight.shape[0]

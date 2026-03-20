@@ -53,9 +53,6 @@ from tensorrt_llm._torch.auto_deploy.models.custom import mla_rope_utils
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
 
-SHARD_ATTENTION = True
-SHARD_MLP = True
-
 
 class DeepSeekV3RMSNorm(nn.Module):
     """RMS Normalization for DeepSeekV3."""
@@ -208,6 +205,7 @@ class DeepSeekV3MLP(nn.Module):
         hidden_size: Optional[int] = None,
         intermediate_size: Optional[int] = None,
         add_all_reduce: bool = True,
+        layer_type: str = "mlp",
     ):
         super().__init__()
         self.config = config
@@ -218,31 +216,33 @@ class DeepSeekV3MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.tp_sharded = SHARD_MLP
         self.add_all_reduce = add_all_reduce
+        self.layer_type = layer_type
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _s = self.tp_sharded
         gate = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.gate_proj.weight,
             self.gate_proj.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
+            layer_type=self.layer_type,
         )
         up = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.up_proj.weight,
             self.up_proj.bias,
-            tp_mode="colwise" if _s else "none",
+            tp_mode="colwise",
+            layer_type=self.layer_type,
         )
         down = torch.ops.auto_deploy.torch_linear_simple(
             self.act_fn(gate) * up,
             self.down_proj.weight,
             self.down_proj.bias,
-            tp_mode="rowwise" if _s else "none",
+            tp_mode="rowwise",
+            layer_type=self.layer_type,
         )
-        if _s and self.add_all_reduce:
-            down = torch.ops.auto_deploy.all_reduce(down)
+        if self.add_all_reduce:
+            down = torch.ops.auto_deploy.all_reduce(down, layer_type=self.layer_type)
         return down
 
 
@@ -320,7 +320,10 @@ class DeepSeekV3MoE(nn.Module):
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepSeekV3MLP(
-                config, intermediate_size=intermediate_size, add_all_reduce=False
+                config,
+                intermediate_size=intermediate_size,
+                add_all_reduce=False,
+                layer_type="moe",
             )
         else:
             self.shared_experts = None
@@ -340,6 +343,7 @@ class DeepSeekV3MoE(nn.Module):
             w3_weight=[expert.up_proj.weight for expert in self.experts],
             is_gated_mlp=True,
             act_fn=int(ActivationType.Silu),
+            layer_type="moe",
         )
 
         final_hidden_states = final_hidden_states.view(*orig_shape)
@@ -347,8 +351,9 @@ class DeepSeekV3MoE(nn.Module):
         if self.shared_experts is not None:
             final_hidden_states = final_hidden_states + self.shared_experts(identity)
 
-        if SHARD_MLP:
-            final_hidden_states = torch.ops.auto_deploy.all_reduce(final_hidden_states)
+        final_hidden_states = torch.ops.auto_deploy.all_reduce(
+            final_hidden_states, layer_type="moe"
+        )
 
         return final_hidden_states.to(hidden_states.dtype)
 
@@ -466,7 +471,6 @@ class DeepSeekV3Attention(nn.Module):
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
-        _s = SHARD_ATTENTION
 
         # Q projection: latent projections are replicated, q_b_proj is colwise
         if self.q_lora_rank is None:
@@ -474,7 +478,8 @@ class DeepSeekV3Attention(nn.Module):
                 hidden_states,
                 self.q_proj.weight,
                 self.q_proj.bias,
-                tp_mode="colwise" if _s else "none",
+                tp_mode="colwise",
+                layer_type="mla",
             )
         else:
             q = torch.ops.auto_deploy.torch_linear_simple(
@@ -482,20 +487,23 @@ class DeepSeekV3Attention(nn.Module):
                 self.q_a_proj.weight,
                 self.q_a_proj.bias,
                 tp_mode="none",
+                layer_type="mla",
             )
             q = self.q_a_layernorm(q)
             q = torch.ops.auto_deploy.torch_linear_simple(
                 q,
                 self.q_b_proj.weight,
                 self.q_b_proj.bias,
-                tp_mode="colwise" if _s else "none",
+                tp_mode="colwise",
+                layer_type="mla",
             )
 
         # Shape: [B, S, N, q_head_dim] -- num_heads at dim 2 scales with TP
         q = torch.ops.auto_deploy.view(
             q,
             [bsz, q_len, self.num_heads, self.q_head_dim],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="mla",
         )
         # Split on last dim (head_dim) -- does NOT scale with TP, plain torch.split
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -506,6 +514,7 @@ class DeepSeekV3Attention(nn.Module):
             self.kv_a_proj_with_mqa.weight,
             self.kv_a_proj_with_mqa.bias,
             tp_mode="none",
+            layer_type="mla",
         )
         compressed_kv, k_pe = torch.split(
             kv_a_output, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -540,23 +549,25 @@ class DeepSeekV3Attention(nn.Module):
             True,
             self.softmax_scale,
             "bsnd",
-            shardable=_s,
+            shardable=True,
+            layer_type="mla",
         )
 
         # Output: [B, S, N, v_head_dim] -> [B, S, N * v_head_dim]
         attn_output = torch.ops.auto_deploy.view(
             attn_output,
             [bsz, q_len, self.num_heads * self.v_head_dim],
-            tp_scaled_dim=2 if _s else -1,
+            tp_scaled_dim=2,
+            layer_type="mla",
         )
         attn_output = torch.ops.auto_deploy.torch_linear_simple(
             attn_output,
             self.o_proj.weight,
             self.o_proj.bias,
-            tp_mode="rowwise" if _s else "none",
+            tp_mode="rowwise",
+            layer_type="mla",
         )
-        if _s:
-            attn_output = torch.ops.auto_deploy.all_reduce(attn_output)
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mla")
 
         return attn_output
 

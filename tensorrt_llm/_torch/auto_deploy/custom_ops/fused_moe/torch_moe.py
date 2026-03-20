@@ -278,6 +278,7 @@ def torch_moe(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """
     Unified Mixture-of-Experts (MoE) operator that uses a Mixtral-style dispatch
@@ -302,6 +303,9 @@ def torch_moe(
                                 This means: silu(input) * routing_weight
     Returns:
         torch.Tensor: Output tensor with the same shape as the input x.
+
+    ``layer_type`` is graph metadata for ``apply_sharding_hints`` and does not
+    affect the numeric result.
     """
     torch_act_fn = _resolve_torch_fn(act_fn)
 
@@ -351,6 +355,7 @@ def torch_moe_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     return torch.empty_like(x)
 

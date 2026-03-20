@@ -146,6 +146,7 @@ def trtllm_quant_fp8_linear(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FP8 linear op similar to torch.nn.linear using TensorRT-LLM FP8 operations.
 
@@ -199,6 +200,7 @@ def trtllm_quant_fp8_linear_fake(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     # Match real op behavior: FP8 input requires explicit output dtype.
     if input.dtype == torch.float8_e4m3fn:
@@ -267,6 +269,7 @@ def fp8_linear(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FP8 linear op similar to torch.nn.linear.
 
@@ -345,6 +348,7 @@ def fp8_linear_fake(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_fp8.to(input.dtype), bias)
 
@@ -434,6 +438,7 @@ def nvfp4_linear(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FP4 linear op similar to torch.nn.linear.
 
@@ -505,6 +510,7 @@ def fp4_linear_fake(
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_fp4.repeat(1, 2).to(input.dtype), bias)
 
