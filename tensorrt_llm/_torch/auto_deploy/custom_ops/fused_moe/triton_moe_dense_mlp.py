@@ -198,6 +198,9 @@ def _moe_dense_mlp_triton(
     total_rows = num_experts * num_tokens
     BLOCK_I = triton.next_power_of_2(intermediate_size)
 
+    # Select num_warps for activation kernel based on total rows (small T benefits from more warps)
+    k1_num_warps = 16 if total_rows <= 128 else 4
+
     gate_up_contig = gate_up.contiguous()
     grid = (total_rows,)
     _fused_glu_activation_kernel[grid](
@@ -209,8 +212,8 @@ def _moe_dense_mlp_triton(
         float(limit),
         I_SIZE=intermediate_size,
         BLOCK_I=BLOCK_I,
-        num_warps=4,
-        num_stages=3,
+        num_warps=k1_num_warps,
+        num_stages=2,
     )
 
     # Step 6: Down projection (BMM)
@@ -240,8 +243,8 @@ def _moe_dense_mlp_triton(
         num_experts=num_experts,
         H_SIZE=hidden_size,
         BLOCK_H=BLOCK_H,
-        num_warps=4,
-        num_stages=3,
+        num_warps=16,
+        num_stages=2,
     )
 
     return output.reshape(*leading_shape, hidden_size)
