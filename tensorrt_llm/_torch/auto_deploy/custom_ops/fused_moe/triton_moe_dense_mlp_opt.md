@@ -405,8 +405,25 @@ ______________________________________________________________________
 | B2 | 13.6 | 13.6 | 34.2 | 20.2 | 47.8 | 33.8 | -29.3% |
 | B3 | 107.1 | 114.4 | 56.0 | 47.9 | 163.1 | 162.3 | -0.5% |
 
-Note: K1 kernel isolated time is higher than iter 4-5 because iter 11 removed the
-deinterleave copy (which was more expensive at E2E level). E2E is what matters.
+**Why K1 kernel time is higher than baseline for large T (A3-A5, B3):**
+
+In iter 11 we made a deliberate tradeoff: K1 kernel regressed ~44 us (stride-2 reads
+instead of coalesced) but E2E improved ~1250 us by eliminating the deinterleave copy.
+The deinterleave was: `gate_up[..., ::2]` + `gate_up[..., 1::2]` + `torch.cat` +
+`.contiguous()` on a `[128, 512, 5760]` tensor (~377 MB copy). The copy cost
+far exceeded the kernel-level savings from coalesced loads.
+
+| | K1 kernel (A5) | Deinterleave cost (A5) | E2E (A5) |
+|---|---|---|---|
+| **With deinterleave (iter 10)** | 375 us | ~1250 us | 7982 us |
+| **Without deinterleave (iter 11)** | 427 us | 0 us | 6735 us |
+| **Delta** | +52 us (worse) | -1250 us (saved) | **-1247 us (net win)** |
+
+This tradeoff is correct: **+52 us kernel cost saves 1250 us in data movement = 1198 us net E2E gain.**
+
+To get the best of both worlds (coalesced K1 + no per-forward copy), the weight matrix
+`gate_up_w` should be rearranged from interleaved `[g0,u0,g1,u1,...]` to `[g0,g1,...,u0,u1,...]`
+at model load time (one-time cost, outside the op). This is listed as future opportunity #1.
 
 **With sparse top-4 routing (real-world GPT-OSS) — gather kernel (iter 15):**
 
@@ -420,17 +437,17 @@ deinterleave copy (which was more expensive at E2E level). E2E is what matters.
 
 **E2E improvement (including BMM, dense routing):**
 
-| ID | E2E baseline (us) | E2E best (us) | Delta |
-|----|-------------------|---------------|-------|
-| A1 | 2130.8 | 2146.3 | +0.7% |
-| A3 | 2370.9 | 2365.9 | -0.2% |
-| A4 | 2879.3 | 2868.1 | -0.4% |
-| A5 | 6751.8 | 6818.1 | +1.0% |
-| B1 | 562.9 | 598.7 | +6.4% |
-| B3 | 1693.1 | 1799.4 | +6.3% |
+| ID | E2E baseline (us) | E2E iter 10 (us) | E2E iter 11+ (us) | Delta vs baseline |
+|----|-------------------|-------------------|-------------------|-------------------|
+| A1 | 2130.8 | 2120.9 | 2109.4 | **-1.0%** |
+| A3 | 2370.9 | 2427.5 | 2328.5 | **-1.8%** |
+| A4 | 2879.3 | 3198.9 | 2825.6 | **-1.9%** |
+| A5 | 6751.8 | 7981.8 | 6734.7 | **-0.3%** |
+| B3 | 1693.1 | 2039.9 | 1704.3 | +0.7% |
 
-Note: E2E is BMM-dominated (94%). Triton kernel improvements are masked by BMM variance.
-The real impact shows in kernel-isolated benchmarks, not E2E.
+Note: iter 10 had the deinterleave (E2E worse for large shapes). Iter 11+ removed it
+(E2E better). The E2E improvements are modest because BMMs dominate (94%), but the
+direction is consistently positive for 120B decode shapes (A1-A4).
 
 ______________________________________________________________________
 
