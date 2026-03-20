@@ -126,13 +126,18 @@ def _weighted_expert_sum_kernel(
         w = tl.load(routing_weights_ptr + token_idx * stride_routing_t + e * stride_routing_e)
         w_f = w.to(tl.float32)
 
-        # Load expert output for this token
-        expert_row_ptr = expert_out_ptr + e * stride_expert_out_e + token_idx * stride_expert_out_t
-        expert_vals = tl.load(
-            expert_row_ptr + col_offsets * stride_expert_out_h, mask=mask, other=0.0
-        )
+        # Skip zero-weight experts (common with top-k routing: e.g., top-4 of 128)
+        # This avoids expensive global loads for experts that don't contribute.
+        if w_f != 0.0:
+            # Load expert output for this token
+            expert_row_ptr = (
+                expert_out_ptr + e * stride_expert_out_e + token_idx * stride_expert_out_t
+            )
+            expert_vals = tl.load(
+                expert_row_ptr + col_offsets * stride_expert_out_h, mask=mask, other=0.0
+            )
 
-        acc += w_f * expert_vals.to(tl.float32)
+            acc += w_f * expert_vals.to(tl.float32)
 
     # Store result
     out_ptr = output_ptr + token_idx * stride_out_t

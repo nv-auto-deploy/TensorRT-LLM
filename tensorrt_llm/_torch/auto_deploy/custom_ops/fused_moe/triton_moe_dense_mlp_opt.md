@@ -249,6 +249,34 @@ ______________________________________________________________________
 
 **Lesson:** Weight rearrange must be done at model load time (outside the op), not per-forward.
 
+### Iteration 8 — K2: skip zero routing weights
+
+**What changed:**
+
+- Added `if w_f != 0.0:` guard in K2 expert loop to skip loading expert outputs
+  when routing weight is zero. For GPT-OSS top-4/128 routing, 124/128 are zero.
+
+**Correctness:** PASS (31/31 tests)
+
+**Dense routing (benchmark default, all non-zero):** ~10% slower due to branch overhead.
+**Sparse routing (top-4 of 128, real-world):** Massive improvement:
+
+| ID | Dense (us) | Sparse (us) | Delta |
+|----|-----------|------------|-------|
+| A1 (E=128, T=1) | 59.2 | 12.8 | -78.4% |
+| A2 (E=128, T=8) | 61.1 | 13.2 | -78.4% |
+| A3 (E=128, T=32) | 65.4 | 14.0 | -78.6% |
+| A4 (E=128, T=128) | 73.7 | 19.2 | -73.9% |
+| B1 (E=32, T=1) | 18.6 | 7.6 | -58.9% |
+| B2 (E=32, T=32) | 20.2 | 8.2 | -59.3% |
+
+**Analysis:**
+
+- For E=128 with top-4 routing, K2 drops from ~60 us to ~13 us (78% faster).
+- For E=32 with top-4 routing, K2 drops from ~19 us to ~8 us (59% faster).
+- Branch overhead for dense routing is small (~10%) — acceptable tradeoff.
+- Combined with all prior optimizations, K2 went from baseline 108 us to 13 us for A1 (88% reduction).
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
@@ -259,10 +287,10 @@ ______________________________________________________________________
 - \[x\] **K2 BLOCK_H sweep:** Done in iter 4.
 - \[x\] **K1 persistent kernel:** Dead end (iter 4).
 - \[x\] **K2 dtype_probe removal:** Cleanup (iter 6).
-- \[x\] **K1 weight rearrange per-forward:** Dead end (iter 7). Must do at load time.
+- \[x\] **K1 weight rearrange per-forward:** Dead end (iter 7).
+- \[x\] **K2 skip zero routing weights:** Done in iter 8. 59-79% K2 speedup with sparse routing.
 - \[ \] **Kernel 2: preload routing weights before loop.** Load all E weights at once.
 - \[ \] **K1: 2D tiling over I dimension.** Try splitting I into multiple blocks.
-- \[ \] **K2: skip zero routing weights.** For top-k=4 out of 128, skip 124 experts.
 - \[ \] **K2: vectorized loads** for expert output rows.
 - \[ \] **K1: eliminate deinterleave via load-time weight rearrange** (outside the op).
 - \[ \] **Fuse kernel 1 + BMM:** Longer-term, fuse activation into GEMM epilogue.
