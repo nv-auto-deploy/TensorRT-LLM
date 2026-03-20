@@ -74,13 +74,10 @@ def _fused_glu_activation_kernel(
     gate_vals = tl.load(gate_up_row_ptr + gate_offsets, mask=mask, other=0.0)
     up_vals = tl.load(gate_up_row_ptr + up_offsets, mask=mask, other=0.0)
 
-    # Upcast to float32 for numerical stability
-    gate_f = gate_vals.to(tl.float32)
-    up_f = up_vals.to(tl.float32)
-
-    # Clamp: gate max=limit, up min=-limit max=limit
-    gate_f = tl.minimum(gate_f, limit_val)
-    up_f = tl.maximum(tl.minimum(up_f, limit_val), -limit_val)
+    # Compute in native dtype (no fp32 upcast) — Triton's sigmoid promotes
+    # to fp32 internally when needed, so numerical stability is preserved.
+    gate_f = tl.minimum(gate_vals, limit_val)
+    up_f = tl.maximum(tl.minimum(up_vals, limit_val), -limit_val)
 
     # GLU: glu = gate * sigmoid(gate * alpha)
     glu = gate_f * tl.sigmoid(gate_f * alpha_val)
@@ -90,7 +87,7 @@ def _fused_glu_activation_kernel(
 
     # Store result — offset output by I-block
     out_row_ptr = output_ptr + row_idx * stride_out_row
-    tl.store(out_row_ptr + col_offsets, result.to(gate_vals.dtype), mask=mask)
+    tl.store(out_row_ptr + col_offsets, result, mask=mask)
 
 
 @triton.jit
