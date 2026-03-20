@@ -107,7 +107,7 @@ def _weighted_expert_sum_kernel(
     BLOCK_H: tl.constexpr,
     OUTPUT_DTYPE: tl.constexpr,
 ):
-    """Weighted summation over experts for each token.
+    """Weighted summation over experts for each token (dense fallback).
 
     For each token t and hidden dim h:
         output[t, h] = sum_e(routing_weights[t, e] * expert_out[e, t, h])
@@ -141,6 +141,59 @@ def _weighted_expert_sum_kernel(
             acc += w_f * expert_vals.to(tl.float32)
 
     # Store result
+    out_ptr = output_ptr + token_idx * stride_out_t
+    tl.store(out_ptr + col_offsets * stride_out_h, acc.to(OUTPUT_DTYPE), mask=mask)
+
+
+@triton.jit
+def _weighted_expert_gather_kernel(
+    expert_out_ptr,
+    topk_indices_ptr,
+    topk_weights_ptr,
+    output_ptr,
+    stride_expert_out_e,
+    stride_expert_out_t,
+    stride_expert_out_h,
+    stride_idx_t,
+    stride_idx_k,
+    stride_w_t,
+    stride_w_k,
+    stride_out_t,
+    stride_out_h,
+    TOP_K: tl.constexpr,
+    H_SIZE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    OUTPUT_DTYPE: tl.constexpr,
+):
+    """Gather-based weighted expert sum using top-k indices.
+
+    Instead of looping over all E experts and checking for zero weights,
+    this kernel directly gathers only the TOP_K active experts per token.
+    Much faster when TOP_K << num_experts (e.g., 4 out of 128).
+
+    Grid: (num_tokens, cdiv(H_SIZE, BLOCK_H))
+    """
+    token_idx = tl.program_id(0)
+    h_block_idx = tl.program_id(1)
+    col_offsets = h_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = col_offsets < H_SIZE
+
+    acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+
+    for k in range(TOP_K):
+        # Load expert index and routing weight for this top-k slot
+        e = tl.load(topk_indices_ptr + token_idx * stride_idx_t + k * stride_idx_k)
+        w = tl.load(topk_weights_ptr + token_idx * stride_w_t + k * stride_w_k)
+        w_f = w.to(tl.float32)
+
+        # Gather expert output for this token
+        expert_row_ptr = expert_out_ptr + e * stride_expert_out_e + token_idx * stride_expert_out_t
+        expert_vals = tl.load(
+            expert_row_ptr + col_offsets * stride_expert_out_h, mask=mask, other=0.0
+        )
+
+        acc += w_f * expert_vals.to(tl.float32)
+
     out_ptr = output_ptr + token_idx * stride_out_t
     tl.store(out_ptr + col_offsets * stride_out_h, acc.to(OUTPUT_DTYPE), mask=mask)
 
@@ -248,28 +301,64 @@ def _moe_dense_mlp_triton(
         BLOCK_H = triton.next_power_of_2(hidden_size)  # high T: 1D grid
     num_h_blocks = triton.cdiv(hidden_size, BLOCK_H)
     grid_sum = (num_tokens, num_h_blocks)
-    _weighted_expert_sum_kernel[grid_sum](
-        next_states,
-        routing_weights,
-        output,
-        stride_expert_out_e=next_states.stride(0),
-        stride_expert_out_t=next_states.stride(1),
-        stride_expert_out_h=next_states.stride(2),
-        stride_routing_t=routing_weights.stride(0),
-        stride_routing_e=routing_weights.stride(1),
-        stride_out_t=output.stride(0),
-        stride_out_h=output.stride(1),
-        num_experts=num_experts,
-        H_SIZE=hidden_size,
-        BLOCK_H=BLOCK_H,
-        OUTPUT_DTYPE={
-            torch.bfloat16: tl.bfloat16,
-            torch.float16: tl.float16,
-            torch.float32: tl.float32,
-        }[hidden_states.dtype],
-        num_warps=16,
-        num_stages=2,
-    )
+
+    output_dtype = {
+        torch.bfloat16: tl.bfloat16,
+        torch.float16: tl.float16,
+        torch.float32: tl.float32,
+    }[hidden_states.dtype]
+
+    # Use gather kernel when routing is sparse (has zeros).
+    # Extract top-k indices and weights for the gather kernel.
+    # For dense routing (all non-zero), fall back to the loop-based kernel.
+    nonzero_per_token = (routing_weights != 0).sum(dim=1)
+    max_active = nonzero_per_token.max().item()
+
+    if max_active < num_experts:
+        # Sparse routing: extract top-k indices and weights
+        topk_weights, topk_indices = torch.topk(routing_weights, k=max_active, dim=1)
+        topk_indices = topk_indices.to(torch.int32)
+        _weighted_expert_gather_kernel[grid_sum](
+            next_states,
+            topk_indices,
+            topk_weights,
+            output,
+            stride_expert_out_e=next_states.stride(0),
+            stride_expert_out_t=next_states.stride(1),
+            stride_expert_out_h=next_states.stride(2),
+            stride_idx_t=topk_indices.stride(0),
+            stride_idx_k=topk_indices.stride(1),
+            stride_w_t=topk_weights.stride(0),
+            stride_w_k=topk_weights.stride(1),
+            stride_out_t=output.stride(0),
+            stride_out_h=output.stride(1),
+            TOP_K=max_active,
+            H_SIZE=hidden_size,
+            BLOCK_H=BLOCK_H,
+            OUTPUT_DTYPE=output_dtype,
+            num_warps=8,
+            num_stages=2,
+        )
+    else:
+        # Dense routing: use the loop-based kernel with zero-skip
+        _weighted_expert_sum_kernel[grid_sum](
+            next_states,
+            routing_weights,
+            output,
+            stride_expert_out_e=next_states.stride(0),
+            stride_expert_out_t=next_states.stride(1),
+            stride_expert_out_h=next_states.stride(2),
+            stride_routing_t=routing_weights.stride(0),
+            stride_routing_e=routing_weights.stride(1),
+            stride_out_t=output.stride(0),
+            stride_out_h=output.stride(1),
+            num_experts=num_experts,
+            H_SIZE=hidden_size,
+            BLOCK_H=BLOCK_H,
+            OUTPUT_DTYPE=output_dtype,
+            num_warps=16,
+            num_stages=2,
+        )
 
     return output.reshape(*leading_shape, hidden_size)
 
