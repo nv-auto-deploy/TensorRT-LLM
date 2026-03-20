@@ -230,20 +230,41 @@ ______________________________________________________________________
 - Net effect is positive across all shapes. Biggest wins at decode (47-65%), modest at prefill (8%).
 - E2E cost slightly up for large shapes (deinterleave overhead) but Triton kernel time is lower.
 
+### Iteration 6 — K2: remove dtype_probe load, use OUTPUT_DTYPE constexpr
+
+**What changed:**
+
+- Removed `_dtype_probe = tl.load(expert_out_ptr, ...)` and added `OUTPUT_DTYPE: tl.constexpr`.
+- No measurable perf change — cleanup only.
+
+**Correctness:** PASS (31/31). Numbers identical to iter 4-5.
+
+### Iteration 7 — K1: weight rearrange instead of activation deinterleave (REVERTED)
+
+**What changed:**
+
+- Tried rearranging `gate_up_w` from interleaved to `[gate|up]` layout so BMM output is already coalesced.
+
+**Result:** REGRESSION. Weight tensor `[128,2880,5760]` is ~2.5GB — rearranging per forward is ~4x more expensive than activation deinterleave. E2E A1: 2117→8517 us. Reverted.
+
+**Lesson:** Weight rearrange must be done at model load time (outside the op), not per-forward.
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
 
-- \[x\] **num_warps / num_stages sweep:** Done in iter 1-2. K2 w=16 is a clear win.
-- \[x\] **Kernel 2: 2D grid (T x H_blocks):** Done in iter 3. Adaptive 2D/1D grid.
+- \[x\] **num_warps / num_stages sweep:** Done in iter 1-2.
+- \[x\] **Kernel 2: 2D grid (T x H_blocks):** Done in iter 3.
 - \[x\] **Coalesced loads for K1:** Done in iter 4. 5-7% K1 improvement.
-- \[x\] **K2 BLOCK_H sweep:** Done in iter 4. 1024 optimal for most, 256 for small E+T.
-- \[x\] **K1 persistent kernel:** Tested, no benefit. rpp=1 wins. Dead end.
-- \[ \] **Kernel 2 expert unrolling:** For small E (e.g., 32), unroll the expert loop.
-- \[ \] **Kernel 2: preload routing weights:** Load all E routing weights at once before loop.
+- \[x\] **K2 BLOCK_H sweep:** Done in iter 4.
+- \[x\] **K1 persistent kernel:** Dead end (iter 4).
+- \[x\] **K2 dtype_probe removal:** Cleanup (iter 6).
+- \[x\] **K1 weight rearrange per-forward:** Dead end (iter 7). Must do at load time.
+- \[ \] **Kernel 2: preload routing weights before loop.** Load all E weights at once.
 - \[ \] **K1: 2D tiling over I dimension.** Try splitting I into multiple blocks.
-- \[ \] **K1: eliminate deinterleave overhead.** Rearrange weights at load time instead.
+- \[ \] **K2: skip zero routing weights.** For top-k=4 out of 128, skip 124 experts.
 - \[ \] **K2: vectorized loads** for expert output rows.
+- \[ \] **K1: eliminate deinterleave via load-time weight rearrange** (outside the op).
 - \[ \] **Fuse kernel 1 + BMM:** Longer-term, fuse activation into GEMM epilogue.
 
 ______________________________________________________________________
