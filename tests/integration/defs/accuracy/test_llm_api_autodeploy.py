@@ -22,7 +22,7 @@ from defs.conftest import get_llm_root, get_sm_version, skip_pre_blackwell
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.llmapi import Eagle3DecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -564,59 +564,33 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
 
         print_memory_usage("after evaluation")
 
-    # TODO: Reconcile these parameters with accuracy test above.
-    # Currently tests only bf16 model
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [4, 8])
     def test_mtp(self, world_size):
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
-        from tensorrt_llm import llmapi
 
-        MTP_MODEL_NAME = "nvidia/Nemotron-Super-V3"
-        MTP_MODEL_PATH_BF16 = hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16")
-        MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
-                          GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
-
-        speculative_config = llmapi.MTPDecodingConfig(
+        model_path = self.MODEL_PATHS["bf16"]
+        speculative_config = MTPDecodingConfig(
             num_nextn_predict_layers=6,
             mtp_eagle_one_model=True,
-            speculative_model=MTP_MODEL_PATH_BF16,
+            speculative_model=model_path,
         )
 
-        kwargs = {
-            "skip_loading_weights": False,
-            "trust_remote_code": True,
-            "runtime": "trtllm",
-            "world_size": world_size,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.4
-            },
-            "enable_iter_perf_stats": True,
-            "speculative_config": speculative_config,
-            "transforms": {
-                "insert_cached_causal_conv": {
-                    "backend": "triton_causal_conv"
-                },
-                "insert_cached_ssm_attention": {
-                    "backend": "triton_ssm"
-                },
-            },
-            "compile_backend": "torch-simple",
-            "max_batch_size": 128,
-            "max_num_tokens": MAX_SEQ_LEN,
-            "attn_backend": "flashinfer",
-            "max_seq_len": MAX_SEQ_LEN,
-        }
+        print_memory_usage("test start")
         with AutoDeployLLM(
-                model=MTP_MODEL_PATH_BF16,
-                tokenizer=MTP_MODEL_PATH_BF16,
-                **kwargs,
+                model=model_path,
+                tokenizer=model_path,
+                world_size=world_size,
+                yaml_extra=[str(_AD_CONFIGS_DIR / 'super_v3_mtp.yaml')],
+                speculative_config=speculative_config,
+                enable_iter_perf_stats=True,
         ) as llm:
-            task = GSM8K(MTP_MODEL_NAME)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             self.check_acceptance_rate(llm, min_acceptance_rate=0.45)
+
+        print_memory_usage("after evaluation")
 
 
 class TestGLM4Flash(LlmapiAccuracyTestHarness):
