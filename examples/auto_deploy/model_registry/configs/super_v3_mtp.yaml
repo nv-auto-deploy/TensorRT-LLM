@@ -1,0 +1,20 @@
+# Config for SuperV3 with MTP speculative decoding (triton SSM/conv backends).
+# Based on test_mtp in tests/integration/defs/accuracy/test_llm_api_autodeploy.py.
+compile_backend: torch-simple
+attn_backend: flashinfer
+trust_remote_code: true
+max_batch_size: 128
+max_seq_len: 4352
+max_num_tokens: 4352
+kv_cache_config:
+  free_gpu_memory_fraction: 0.4
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 6
+  mtp_eagle_one_model: true
+  speculative_model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+transforms:
+  insert_cached_ssm_attention:
+    backend: triton_ssm
+  insert_cached_causal_conv:
+    backend: triton_causal_conv
