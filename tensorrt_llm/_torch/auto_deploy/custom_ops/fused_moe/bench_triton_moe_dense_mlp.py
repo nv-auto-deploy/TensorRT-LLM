@@ -66,9 +66,11 @@ if __name__ == "__main__":
         num_warps = 16 if total_rows <= 128 else 4
         return num_warps, 2
 
-    def _get_k2_config(T, H):
+    def _get_k2_config(E, T, H):
         """Get kernel 2 launch config matching the launcher in triton_moe_dense_mlp.py."""
-        if T <= 128:
+        if T <= 32 and E <= 32:
+            block_h = 256
+        elif T <= 128:
             block_h = 1024
         else:
             block_h = triton.next_power_of_2(H)
@@ -76,8 +78,9 @@ if __name__ == "__main__":
         return 16, 2, block_h, num_h_blocks
 
     def bench_activation_kernel(E, T, H, inter):
-        """Benchmark _fused_glu_activation_kernel in isolation."""
+        """Benchmark _fused_glu_activation_kernel in isolation with coalesced layout."""
         total_rows = E * T
+        # Create coalesced layout: [gate_half | up_half] instead of interleaved
         gate_up = torch.randn(total_rows, 2 * inter, device="cuda", dtype=DTYPE)
         act_out = torch.empty(total_rows, inter, device="cuda", dtype=DTYPE)
         block_i = triton.next_power_of_2(inter)
@@ -107,7 +110,7 @@ if __name__ == "__main__":
         expert_out = torch.randn(E, T, H, device="cuda", dtype=DTYPE).contiguous()
         routing_weights = torch.randn(T, E, device="cuda", dtype=DTYPE).softmax(dim=-1)
         output = torch.empty(T, H, device="cuda", dtype=DTYPE)
-        nw, ns, block_h, num_h_blocks = _get_k2_config(T, H)
+        nw, ns, block_h, num_h_blocks = _get_k2_config(E, T, H)
 
         def _run():
             _weighted_expert_sum_kernel[(T, num_h_blocks)](
