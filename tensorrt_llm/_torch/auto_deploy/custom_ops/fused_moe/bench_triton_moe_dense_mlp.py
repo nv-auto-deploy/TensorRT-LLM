@@ -37,6 +37,7 @@ if __name__ == "__main__":
 
     import torch
     import triton
+    import triton.language as tl
     from triton_moe_dense_mlp import (
         _fused_glu_activation_kernel,
         _moe_dense_mlp_triton,
@@ -127,6 +128,7 @@ if __name__ == "__main__":
                 num_experts=E,
                 H_SIZE=H,
                 BLOCK_H=block_h,
+                OUTPUT_DTYPE=tl.bfloat16,
                 num_warps=nw,
                 num_stages=ns,
             )

@@ -104,6 +104,7 @@ def _weighted_expert_sum_kernel(
     num_experts: tl.constexpr,
     H_SIZE: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    OUTPUT_DTYPE: tl.constexpr,
 ):
     """Weighted summation over experts for each token.
 
@@ -120,9 +121,6 @@ def _weighted_expert_sum_kernel(
     # Accumulate weighted expert outputs in float32
     acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
 
-    # Probe input dtype before the loop (Triton can't see loop-scoped vars after the loop)
-    _dtype_probe = tl.load(expert_out_ptr, eviction_policy="evict_first")
-
     for e in range(num_experts):
         # Load routing weight for this token-expert pair
         w = tl.load(routing_weights_ptr + token_idx * stride_routing_t + e * stride_routing_e)
@@ -138,7 +136,7 @@ def _weighted_expert_sum_kernel(
 
     # Store result
     out_ptr = output_ptr + token_idx * stride_out_t
-    tl.store(out_ptr + col_offsets * stride_out_h, acc.to(_dtype_probe.dtype), mask=mask)
+    tl.store(out_ptr + col_offsets * stride_out_h, acc.to(OUTPUT_DTYPE), mask=mask)
 
 
 def _moe_dense_mlp_triton(
@@ -256,6 +254,11 @@ def _moe_dense_mlp_triton(
         num_experts=num_experts,
         H_SIZE=hidden_size,
         BLOCK_H=BLOCK_H,
+        OUTPUT_DTYPE={
+            torch.bfloat16: tl.bfloat16,
+            torch.float16: tl.float16,
+            torch.float32: tl.float32,
+        }[hidden_states.dtype],
         num_warps=16,
         num_stages=2,
     )
