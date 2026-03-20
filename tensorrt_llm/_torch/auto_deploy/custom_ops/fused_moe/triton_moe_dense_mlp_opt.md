@@ -201,19 +201,49 @@ ______________________________________________________________________
 - A5/B3 (prefill) use 1D grid, same as iter 2 — no regression.
 - The adaptive threshold (T\<=128) works well. Could fine-tune further.
 
+### Iteration 4-5 — K1 coalesced loads + K2 adaptive BLOCK_H
+
+**What changed:**
+
+- K1: Rewrote kernel to read contiguous `[gate | up]` layout instead of stride-2 interleaved.
+  Launcher deinterleaves `gate_up` via `gate_up[..., ::2]` / `gate_up[..., 1::2]` + `cat`.
+- K2: Adaptive BLOCK_H: 256 for small E+T (B1), 1024 for medium T, next_pow2(H) for high T.
+- K1 multi-row variant tested — no benefit, rpp=1 wins everywhere. Dead end.
+
+**Correctness:** PASS (31/31 tests)
+
+| ID | K1 (us) | K2 (us) | Total (us) | Baseline Total (us) | Delta vs baseline |
+|----|---------|---------|------------|---------------------|-------------------|
+| A1 | 6.6 | 54.4 | 61.0 | 116.3 | -47.5% |
+| A2 | 12.8 | 55.5 | 68.3 | 127.3 | -46.3% |
+| A3 | 31.3 | 61.0 | 92.3 | 154.7 | -40.3% |
+| A4 | 101.9 | 70.0 | 171.9 | 238.5 | -27.9% |
+| A5 | 383.7 | 145.2 | 528.9 | 574.4 | -7.9% |
+| B1 | 6.0 | 7.6 | 13.6 | 38.8 | -64.9% |
+| B2 | 12.6 | 10.1 | 22.7 | 47.8 | -52.5% |
+| B3 | 101.9 | 47.3 | 149.2 | 163.1 | -8.5% |
+
+**Analysis:**
+
+- K1 coalesced loads: 5-7% improvement across all shapes. Well worth the deinterleave cost.
+- K2 BLOCK_H=256 for B1 reduced from 7.8 to 7.6 us (marginal).
+- Net effect is positive across all shapes. Biggest wins at decode (47-65%), modest at prefill (8%).
+- E2E cost slightly up for large shapes (deinterleave overhead) but Triton kernel time is lower.
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
 
 - \[x\] **num_warps / num_stages sweep:** Done in iter 1-2. K2 w=16 is a clear win.
 - \[x\] **Kernel 2: 2D grid (T x H_blocks):** Done in iter 3. Adaptive 2D/1D grid.
-- \[ \] **2D tiling for kernel 1:** Current 1D block (BLOCK_I=4096) may be too wide for I=2880. Try tiling rows into multiple blocks.
-- \[ \] **Vectorized loads for kernel 1:** Interleaved access (stride-2) is unfriendly to coalescing. Explore load-then-deinterleave.
-- \[ \] **Kernel 2: sweep BLOCK_H for 2D path:** Try 512, 1024, 2048 for the 2D grid path.
+- \[x\] **Coalesced loads for K1:** Done in iter 4. 5-7% K1 improvement.
+- \[x\] **K2 BLOCK_H sweep:** Done in iter 4. 1024 optimal for most, 256 for small E+T.
+- \[x\] **K1 persistent kernel:** Tested, no benefit. rpp=1 wins. Dead end.
 - \[ \] **Kernel 2 expert unrolling:** For small E (e.g., 32), unroll the expert loop.
-- \[ \] **Memory layout:** Explore contiguous gate/up layout instead of interleaved.
-- \[ \] **Kernel 2: preload routing weights to SRAM:** routing_weights\[t,:\] is small (E scalars), load once.
-- \[ \] **Kernel 1: persistent kernel:** Process multiple rows per program.
+- \[ \] **Kernel 2: preload routing weights:** Load all E routing weights at once before loop.
+- \[ \] **K1: 2D tiling over I dimension.** Try splitting I into multiple blocks.
+- \[ \] **K1: eliminate deinterleave overhead.** Rearrange weights at load time instead.
+- \[ \] **K2: vectorized loads** for expert output rows.
 - \[ \] **Fuse kernel 1 + BMM:** Longer-term, fuse activation into GEMM epilogue.
 
 ______________________________________________________________________
