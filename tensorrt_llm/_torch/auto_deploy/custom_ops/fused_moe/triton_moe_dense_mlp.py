@@ -192,8 +192,7 @@ def _moe_dense_mlp_triton(
 
     # Step 2-5: Fused interleaved-split + clamp + GLU activation (Triton kernel)
     # The kernel reads the interleaved layout directly (stride-2 indexing).
-    # No deinterleave needed — saves the slicing+cat+contiguous overhead.
-    gate_up_contig = gate_up.contiguous()
+    # BMM output is already contiguous — no copy needed.
 
     # Output: [E, T, I]
     act_out = torch.empty(
@@ -219,9 +218,9 @@ def _moe_dense_mlp_triton(
 
     grid = (total_rows, num_i_blocks)
     _fused_glu_activation_kernel[grid](
-        gate_up_contig,
+        gate_up,
         act_out,
-        gate_up_contig.stride(-2),
+        gate_up.stride(-2),
         act_out.stride(-2),
         float(alpha),
         float(limit),
