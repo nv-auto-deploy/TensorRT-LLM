@@ -66,9 +66,14 @@ if __name__ == "__main__":
         num_warps = 16 if total_rows <= 128 else 4
         return num_warps, 2
 
-    def _get_k2_config():
+    def _get_k2_config(T, H):
         """Get kernel 2 launch config matching the launcher in triton_moe_dense_mlp.py."""
-        return 16, 2
+        if T <= 128:
+            block_h = 1024
+        else:
+            block_h = triton.next_power_of_2(H)
+        num_h_blocks = triton.cdiv(H, block_h)
+        return 16, 2, block_h, num_h_blocks
 
     def bench_activation_kernel(E, T, H, inter):
         """Benchmark _fused_glu_activation_kernel in isolation."""
@@ -102,11 +107,10 @@ if __name__ == "__main__":
         expert_out = torch.randn(E, T, H, device="cuda", dtype=DTYPE).contiguous()
         routing_weights = torch.randn(T, E, device="cuda", dtype=DTYPE).softmax(dim=-1)
         output = torch.empty(T, H, device="cuda", dtype=DTYPE)
-        block_h = triton.next_power_of_2(H)
-        nw, ns = _get_k2_config()
+        nw, ns, block_h, num_h_blocks = _get_k2_config(T, H)
 
         def _run():
-            _weighted_expert_sum_kernel[(T,)](
+            _weighted_expert_sum_kernel[(T, num_h_blocks)](
                 expert_out,
                 routing_weights,
                 output,
@@ -150,7 +154,9 @@ if __name__ == "__main__":
     print(f"PyTorch: {torch.__version__}")
     print(f"Triton: {triton.__version__}")
     print(f"Dtype: {DTYPE}")
-    print(f"K1 config: _get_k1_config (adaptive); K2 config: {_get_k2_config()}")
+    print(
+        "K1 config: _get_k1_config (adaptive 2D grid); K2 config: _get_k2_config (adaptive 2D/1D grid)"
+    )
     print()
 
     header = (

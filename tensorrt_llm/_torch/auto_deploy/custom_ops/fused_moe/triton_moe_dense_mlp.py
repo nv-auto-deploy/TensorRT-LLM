@@ -113,10 +113,11 @@ def _weighted_expert_sum_kernel(
     For each token t and hidden dim h:
         output[t, h] = sum_e(routing_weights[t, e] * expert_out[e, t, h])
 
-    Grid: (num_tokens,) - one program per token.
+    Grid: (num_tokens, cdiv(H_SIZE, BLOCK_H)) — 2D grid over tokens and H-blocks.
     """
     token_idx = tl.program_id(0)
-    col_offsets = tl.arange(0, BLOCK_H)
+    h_block_idx = tl.program_id(1)
+    col_offsets = h_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = col_offsets < H_SIZE
 
     # Accumulate weighted expert outputs in float32
@@ -227,8 +228,15 @@ def _moe_dense_mlp_triton(
         num_tokens, hidden_size, dtype=hidden_states.dtype, device=hidden_states.device
     )
 
-    BLOCK_H = triton.next_power_of_2(hidden_size)
-    grid_sum = (num_tokens,)
+    # 2D grid with smaller BLOCK_H for low T (needs more parallelism);
+    # 1D grid with full BLOCK_H for high T (already enough parallelism).
+    if num_tokens <= 128:
+        BLOCK_H = 1024
+        num_h_blocks = triton.cdiv(hidden_size, BLOCK_H)
+    else:
+        BLOCK_H = triton.next_power_of_2(hidden_size)
+        num_h_blocks = 1
+    grid_sum = (num_tokens, num_h_blocks)
     _weighted_expert_sum_kernel[grid_sum](
         next_states,
         routing_weights,

@@ -173,17 +173,45 @@ ______________________________________________________________________
 - K1 improvement small but consistent at low T.
 - Moving to Phase 2: structural changes.
 
+### Iteration 3 — Kernel 2: adaptive 2D/1D grid over H dimension
+
+**What changed:**
+
+- Kernel 2 now uses a 2D grid `(T, cdiv(H, 1024))` when T\<=128 (more parallelism for decode).
+- Falls back to 1D grid `(T, 1)` with BLOCK_H=next_pow2(H) when T>128 (prefill has enough parallelism).
+- Each H-block processes a slice of the hidden dimension independently.
+
+**Correctness:** PASS (31/31 tests)
+
+| ID | K1 (us) | K2 (us) | Total (us) | Baseline Total (us) | Delta vs baseline |
+|----|---------|---------|------------|---------------------|-------------------|
+| A1 | 6.6 | 54.0 | 60.6 | 116.3 | -47.9% |
+| A2 | 13.8 | 55.6 | 69.4 | 127.3 | -45.5% |
+| A3 | 33.6 | 60.8 | 94.4 | 154.7 | -39.0% |
+| A4 | 107.4 | 69.8 | 177.2 | 238.5 | -25.7% |
+| A5 | 402.3 | 144.9 | 547.2 | 574.4 | -4.7% |
+| B1 | 6.4 | 7.8 | 14.2 | 38.8 | -63.4% |
+| B2 | 13.6 | 9.5 | 23.1 | 47.8 | -51.7% |
+| B3 | 107.3 | 47.3 | 154.6 | 163.1 | -5.2% |
+
+**Analysis:**
+
+- B1/B2 (20B decode) see massive K2 improvement: 7.8/9.5 us vs baseline 31/34 us (-75%/-72%).
+- A1-A4 (120B decode) K2 improved ~10% beyond iter 2, now ~50% better than baseline.
+- A5/B3 (prefill) use 1D grid, same as iter 2 — no regression.
+- The adaptive threshold (T\<=128) works well. Could fine-tune further.
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
 
 - \[x\] **num_warps / num_stages sweep:** Done in iter 1-2. K2 w=16 is a clear win.
+- \[x\] **Kernel 2: 2D grid (T x H_blocks):** Done in iter 3. Adaptive 2D/1D grid.
 - \[ \] **2D tiling for kernel 1:** Current 1D block (BLOCK_I=4096) may be too wide for I=2880. Try tiling rows into multiple blocks.
 - \[ \] **Vectorized loads for kernel 1:** Interleaved access (stride-2) is unfriendly to coalescing. Explore load-then-deinterleave.
-- \[ \] **Kernel 2 parallelization:** For large H, split across multiple programs instead of one per token.
+- \[ \] **Kernel 2: sweep BLOCK_H for 2D path:** Try 512, 1024, 2048 for the 2D grid path.
 - \[ \] **Kernel 2 expert unrolling:** For small E (e.g., 32), unroll the expert loop.
 - \[ \] **Memory layout:** Explore contiguous gate/up layout instead of interleaved.
-- \[ \] **Kernel 2: 2D grid (T x H_blocks):** Parallelize over H dimension.
 - \[ \] **Kernel 2: preload routing weights to SRAM:** routing_weights\[t,:\] is small (E scalars), load once.
 - \[ \] **Kernel 1: persistent kernel:** Process multiple rows per program.
 - \[ \] **Fuse kernel 1 + BMM:** Longer-term, fuse activation into GEMM epilogue.
