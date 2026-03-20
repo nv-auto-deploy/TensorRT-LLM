@@ -294,7 +294,7 @@ This is REQUIRED -- without it the model cannot be tested.
 ```yaml
 model: org/Model-Name
 args:
-  world_size: 2
+  world_size: 4                    # MUST be >= 4 for proper sharding validation
   runtime: trtllm
   compile_backend: torch-cudagraph
   max_seq_len: 512
@@ -504,6 +504,11 @@ ______________________________________________________________________
 After creating the model file and YAML config, you MUST run the model and
 verify it works. Do NOT report success until the test passes.
 
+**IMPORTANT**: The YAML config MUST use `world_size: 4` (or higher). Using
+`world_size: 1` does NOT test sharding -- `apply_sharding_hints` skips entirely
+when `world_size < 2`. Some shape-related errors only appear at higher world
+sizes, so `world_size: 4` is the minimum for proper validation.
+
 ### 11a. Register the model (Step 9) and run
 
 ```bash
@@ -512,7 +517,23 @@ cd examples/auto_deploy
 python build_and_run_ad.py --yaml-extra new_sharding/<family>/<model>_sharding_poc.yaml
 ```
 
-### 11b. Check for success
+### 11b. Update the porting log
+
+After the test completes (success or failure), append a row to
+`models/custom/new_sharding/porting_log.csv`:
+
+```
+model_name,date,porting_mode,status,notes
+```
+
+- `model_name`: the model filename without `modeling_` prefix (e.g., `llama3`)
+- `date`: today's date in YYYY-MM-DD format
+- `porting_mode`: `agent` (if ported by a subagent) or `manual`
+- `status`: `success` or `failure`
+- `notes`: if success, list validated scenarios (e.g., "ws=4 BF16, N nodes processed").
+  If failure, include the error message and whether files were renamed to `broken_*`.
+
+### 11c. Check for success
 
 The run is successful if:
 
@@ -520,7 +541,7 @@ The run is successful if:
 - `apply_sharding_hints` log shows `N nodes processed` (N > 0)
 - The model produces output (even garbage with reduced layers is acceptable)
 
-### 11c. Handle errors
+### 11d. Handle errors
 
 **If the error is in your generated files** (model `.py` or YAML config):
 

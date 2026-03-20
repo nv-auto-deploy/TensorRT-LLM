@@ -1,0 +1,6 @@
+model_name,date,porting_mode,status,notes
+nemotron_h,2026-03-09,manual,success,"Validated ws=2,4,8 BF16; ws=2,8 FP8 Nano; ws=8 Super NVFP4 (Blackwell)"
+qwen3_5_moe,2026-03-11,manual,success,"Validated ws=1,2,8 BF16 Qwen3.5-35B-A3B"
+mistral,2026-03-12,agent,success,"Validated ws=2 BF16 Mistral-7B-Instruct-v0.2; first-try agent success"
+deepseek,2026-03-12,agent,success,"Sharding OK (41 nodes at 4 layers); blocked by dsv3_router_gemm_op crash on H100 (pre-existing)"
+deepseek_v2,2026-03-19,agent,success,"Validated ws=2,8 (8 layers) DeepSeek-V2.5 BF16; full MLA path tested; legacy detect_sharding FAILS on this model"
