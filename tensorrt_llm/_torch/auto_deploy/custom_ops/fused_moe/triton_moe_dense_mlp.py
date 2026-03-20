@@ -265,7 +265,8 @@ def _moe_dense_mlp_triton(
     else:
         BLOCK_I = triton.next_power_of_2(intermediate_size)
     num_i_blocks = triton.cdiv(intermediate_size, BLOCK_I)
-    k1_num_warps = 16
+    # num_warps=8 is optimal for large T (BW-bound); 16 for small T (latency-bound)
+    k1_num_warps = 16 if total_rows <= 1024 else 8
 
     grid = (total_rows, num_i_blocks)
     _fused_glu_activation_kernel[grid](
