@@ -59,10 +59,11 @@ def _fused_glu_activation_kernel(
         glu  = gate * sigmoid(gate * alpha)
         out  = (up + 1) * glu
 
-    Grid: (num_rows,) - one program per row (expert x token combination).
+    Grid: (num_rows, cdiv(I_SIZE, BLOCK_I)) — 2D grid over rows and I-blocks.
     """
     row_idx = tl.program_id(0)
-    col_offsets = tl.arange(0, BLOCK_I)
+    i_block_idx = tl.program_id(1)
+    col_offsets = i_block_idx * BLOCK_I + tl.arange(0, BLOCK_I)
     mask = col_offsets < I_SIZE
 
     # Coalesced loads: gate half [0..I), up half [I..2I)
@@ -84,7 +85,7 @@ def _fused_glu_activation_kernel(
     # Fused multiply: (up + 1) * glu
     result = (up_f + 1.0) * glu
 
-    # Store result
+    # Store result — offset output by I-block
     out_row_ptr = output_ptr + row_idx * stride_out_row
     tl.store(out_row_ptr + col_offsets, result.to(gate_vals.dtype), mask=mask)
 
@@ -205,12 +206,19 @@ def _moe_dense_mlp_triton(
     )
 
     total_rows = num_experts * num_tokens
-    BLOCK_I = triton.next_power_of_2(intermediate_size)
 
-    # Select num_warps for activation kernel based on total rows (small T benefits from more warps)
-    k1_num_warps = 16 if total_rows <= 128 else 4
+    # Adaptive BLOCK_I: use smaller blocks with 2D grid when total_rows is small
+    # (low parallelism) to increase occupancy. For large total_rows, use full-width
+    # blocks to minimize grid overhead.
+    if total_rows <= 128:
+        BLOCK_I = 1024
+        k1_num_warps = 16
+    else:
+        BLOCK_I = triton.next_power_of_2(intermediate_size)
+        k1_num_warps = 4
+    num_i_blocks = triton.cdiv(intermediate_size, BLOCK_I)
 
-    grid = (total_rows,)
+    grid = (total_rows, num_i_blocks)
     _fused_glu_activation_kernel[grid](
         gate_up_contig,
         act_out,

@@ -62,10 +62,16 @@ if __name__ == "__main__":
     WARMUP_MS = 25
     REP_MS = 100
 
-    def _get_k1_config(total_rows):
+    def _get_k1_config(total_rows, inter):
         """Get kernel 1 launch config matching the launcher in triton_moe_dense_mlp.py."""
-        num_warps = 16 if total_rows <= 128 else 4
-        return num_warps, 2
+        if total_rows <= 128:
+            block_i = 1024
+            num_warps = 16
+        else:
+            block_i = triton.next_power_of_2(inter)
+            num_warps = 4
+        num_i_blocks = triton.cdiv(inter, block_i)
+        return num_warps, 2, block_i, num_i_blocks
 
     def _get_k2_config(E, T, H):
         """Get kernel 2 launch config matching the launcher in triton_moe_dense_mlp.py."""
@@ -81,16 +87,14 @@ if __name__ == "__main__":
     def bench_activation_kernel(E, T, H, inter):
         """Benchmark _fused_glu_activation_kernel in isolation with coalesced layout."""
         total_rows = E * T
-        # Create coalesced layout: [gate_half | up_half] instead of interleaved
         gate_up = torch.randn(total_rows, 2 * inter, device="cuda", dtype=DTYPE)
         act_out = torch.empty(total_rows, inter, device="cuda", dtype=DTYPE)
-        block_i = triton.next_power_of_2(inter)
         alpha = 1.702
         limit = 7.0
-        nw, ns = _get_k1_config(total_rows)
+        nw, ns, block_i, num_i_blocks = _get_k1_config(total_rows, inter)
 
         def _run():
-            _fused_glu_activation_kernel[(total_rows,)](
+            _fused_glu_activation_kernel[(total_rows, num_i_blocks)](
                 gate_up,
                 act_out,
                 gate_up.stride(0),
