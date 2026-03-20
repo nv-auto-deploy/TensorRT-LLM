@@ -309,16 +309,18 @@ def _moe_dense_mlp_triton(
         torch.float32: tl.float32,
     }[hidden_states.dtype]
 
-    # Use gather kernel when routing is sparse (has zeros).
-    # Quick check: if any element in the first token's routing is zero, assume sparse.
-    # This avoids the cost of scanning all tokens.
+    # Use gather kernel when routing is sparse and T is large enough.
+    # For small T, the torch.topk extraction overhead outweighs the kernel savings.
+    # For large T, the gather kernel's savings scale with T while topk is O(T*E).
     has_zeros = (routing_weights[0] == 0).any().item()
+    use_gather = has_zeros and num_tokens >= 64
 
-    if has_zeros:
+    if use_gather:
         # Sparse routing: count active experts and extract top-k indices
         max_active = (routing_weights[0] != 0).sum().item()
         topk_weights, topk_indices = torch.topk(routing_weights, k=max_active, dim=1)
         topk_indices = topk_indices.to(torch.int32)
+        # Gather kernel uses BLOCK_H from the same adaptive logic above
         _weighted_expert_gather_kernel[grid_sum](
             next_states,
             topk_indices,
