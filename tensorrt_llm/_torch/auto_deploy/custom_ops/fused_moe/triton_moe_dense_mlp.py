@@ -287,8 +287,7 @@ def _moe_dense_mlp_triton(
     next_states = torch.bmm(act_out, down_w) + down_b[:, None, :]
 
     # Step 7: Routing-weighted summation over experts (Triton kernel)
-    # Ensure next_states is contiguous for the kernel
-    next_states = next_states.contiguous()
+    # BMM output is already contiguous — no copy needed.
     output = torch.empty(
         num_tokens, hidden_size, dtype=hidden_states.dtype, device=hidden_states.device
     )
