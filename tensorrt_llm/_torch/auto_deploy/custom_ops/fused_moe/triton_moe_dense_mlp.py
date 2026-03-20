@@ -47,15 +47,15 @@ def _fused_glu_activation_kernel(
     I_SIZE: tl.constexpr,
     BLOCK_I: tl.constexpr,
 ):
-    """Fused split + clamp + GLU activation kernel with coalesced loads.
+    """Fused interleaved-split + clamp + GLU activation kernel.
 
-    Reads gate_up tensor with contiguous [gate | up] layout of shape [..., 2*I],
-    where the first I elements are gate values and the next I are up values.
+    Reads gate_up tensor with interleaved [g0,u0,g1,u1,...] layout of shape [..., 2*I].
+    Loads a contiguous 2*BLOCK_I chunk and splits gate/up via stride-2 indexing in registers.
     Computes the fused activation and writes output of shape [..., I].
 
     For each element i in [0, I):
-        gate = clamp(gate_up[..., i], max=limit)
-        up   = clamp(gate_up[..., I+i], min=-limit, max=limit)
+        gate = clamp(gate_up[..., 2*i], max=limit)
+        up   = clamp(gate_up[..., 2*i+1], min=-limit, max=limit)
         glu  = gate * sigmoid(gate * alpha)
         out  = (up + 1) * glu
 
@@ -66,10 +66,13 @@ def _fused_glu_activation_kernel(
     col_offsets = i_block_idx * BLOCK_I + tl.arange(0, BLOCK_I)
     mask = col_offsets < I_SIZE
 
-    # Coalesced loads: gate half [0..I), up half [I..2I)
+    # Stride-2 indexing into interleaved layout: gate at even, up at odd
+    gate_offsets = col_offsets * 2
+    up_offsets = col_offsets * 2 + 1
+
     gate_up_row_ptr = gate_up_ptr + row_idx * stride_gate_up_row
-    gate_vals = tl.load(gate_up_row_ptr + col_offsets, mask=mask, other=0.0)
-    up_vals = tl.load(gate_up_row_ptr + I_SIZE + col_offsets, mask=mask, other=0.0)
+    gate_vals = tl.load(gate_up_row_ptr + gate_offsets, mask=mask, other=0.0)
+    up_vals = tl.load(gate_up_row_ptr + up_offsets, mask=mask, other=0.0)
 
     # Upcast to float32 for numerical stability
     gate_f = gate_vals.to(tl.float32)
@@ -187,14 +190,10 @@ def _moe_dense_mlp_triton(
     # gate_up: [E, T, 2I]
     gate_up = torch.bmm(hidden_rep, gate_up_w) + gate_up_b[:, None, :]
 
-    # Step 2-5: Fused split + clamp + GLU activation (Triton kernel)
-    # Deinterleave gate_up from [E, T, g0,u0,g1,u1,...] to [E, T, g0,g1,...,u0,u1,...]
-    # This enables coalesced loads in the Triton kernel.
-    gate_part = gate_up[..., 0::2].contiguous()  # [E, T, I] — gate values
-    up_part = gate_up[..., 1::2].contiguous()  # [E, T, I] — up values
-    gate_up_contig = torch.cat([gate_part, up_part], dim=-1).reshape(
-        -1, 2 * intermediate_size
-    )  # [E*T, 2I] with [gate | up] layout
+    # Step 2-5: Fused interleaved-split + clamp + GLU activation (Triton kernel)
+    # The kernel reads the interleaved layout directly (stride-2 indexing).
+    # No deinterleave needed — saves the slicing+cat+contiguous overhead.
+    gate_up_contig = gate_up.contiguous()
 
     # Output: [E, T, I]
     act_out = torch.empty(
