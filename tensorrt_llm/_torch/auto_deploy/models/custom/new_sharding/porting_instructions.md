@@ -499,7 +499,64 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-## Validation Checklist
+## Step 11: Validate
+
+After creating the model file and YAML config, you MUST run the model and
+verify it works. Do NOT report success until the test passes.
+
+### 11a. Register the model (Step 9) and run
+
+```bash
+export HF_HOME=/path/to/hf/cache
+cd examples/auto_deploy
+python build_and_run_ad.py --yaml-extra new_sharding/<family>/<model>_sharding_poc.yaml
+```
+
+### 11b. Check for success
+
+The run is successful if:
+
+- Exit code is 0
+- `apply_sharding_hints` log shows `N nodes processed` (N > 0)
+- The model produces output (even garbage with reduced layers is acceptable)
+
+### 11c. Handle errors
+
+**If the error is in your generated files** (model `.py` or YAML config):
+
+- Fix the error in your generated files
+- Rerun and repeat until the test passes
+- Common fixable errors: wrong argument order, missing `layer_type`, incorrect
+  `tp_mode`, wrong `output_sizes`, missing `auto_deploy::view` for a reshape
+
+**If the error requires modifying core infrastructure files** (custom op
+definitions, `sharding.py`, `node_utils.py`, `quantization.py`, etc.):
+
+- Do NOT attempt to fix infrastructure files
+- Rename your generated files to indicate they are broken:
+  - `modeling_<model>.py` -> `broken_modeling_<model>.py`
+  - `<model>_sharding_poc.yaml` -> `broken_<model>_sharding_poc.yaml`
+- Create an error report file at `new_sharding/broken_<model>_error.md` with:
+  - **Status**: BLOCKED - requires infrastructure changes
+  - **Steps to reproduce**: The exact command that was run
+  - **Error message**: The full error output
+  - **Root cause analysis**: Which infrastructure file needs changes and why
+  - **Suggested fix**: What changes would resolve the issue
+- Terminate. A human developer will review the error report and make the
+  infrastructure changes.
+
+Examples of infrastructure errors (do NOT fix yourself):
+
+- `"layer_type" not found in op schema` -- a custom op is missing the hint
+- `"Cannot find value for 'tp_mode'"` -- a quantized op variant lacks hints
+- `_apply_hint_X not implemented` -- a new handler is needed in `sharding.py`
+- `ShardableOp.X not recognized` -- a new op type needs enum + classifier
+
+______________________________________________________________________
+
+## Validation Checklist (for human review)
+
+After the agent completes porting, verify these manually:
 
 1. **world_size=1**: Run unsharded. `apply_sharding_hints` skips when `world_size < 2`.
    Verify output matches the original model.
