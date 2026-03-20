@@ -257,10 +257,11 @@ def _moe_dense_mlp_triton(
 
     # Adaptive BLOCK_I: use smaller blocks with 2D grid when total_rows is small
     # (low parallelism) to increase occupancy. For large total_rows, use full-width
-    # blocks to minimize grid overhead. num_warps=16 is best across all configs
-    # with coalesced loads.
+    # blocks to minimize grid overhead. num_warps=16 is best across all configs.
     if total_rows <= 128:
         BLOCK_I = 1024
+    elif total_rows <= 1024:
+        BLOCK_I = 2048  # medium: 2 blocks per row
     else:
         BLOCK_I = triton.next_power_of_2(intermediate_size)
     num_i_blocks = triton.cdiv(intermediate_size, BLOCK_I)
@@ -309,13 +310,13 @@ def _moe_dense_mlp_triton(
     }[hidden_states.dtype]
 
     # Use gather kernel when routing is sparse (has zeros).
-    # Extract top-k indices and weights for the gather kernel.
-    # For dense routing (all non-zero), fall back to the loop-based kernel.
-    nonzero_per_token = (routing_weights != 0).sum(dim=1)
-    max_active = nonzero_per_token.max().item()
+    # Quick check: if any element in the first token's routing is zero, assume sparse.
+    # This avoids the cost of scanning all tokens.
+    has_zeros = (routing_weights[0] == 0).any().item()
 
-    if max_active < num_experts:
-        # Sparse routing: extract top-k indices and weights
+    if has_zeros:
+        # Sparse routing: count active experts and extract top-k indices
+        max_active = (routing_weights[0] != 0).sum().item()
         topk_weights, topk_indices = torch.topk(routing_weights, k=max_active, dim=1)
         topk_indices = topk_indices.to(torch.int32)
         _weighted_expert_gather_kernel[grid_sum](
