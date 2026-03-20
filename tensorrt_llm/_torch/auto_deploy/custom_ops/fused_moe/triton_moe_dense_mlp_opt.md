@@ -93,43 +93,99 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-### Iteration 1 — TBD
+### Iteration 1 — num_warps x num_stages sweep (Phase 1)
 
 **What changed:**
 
-```
-(describe the optimization)
-```
+- Swept all 25 combos of num_warps={1,2,4,8,16} x num_stages={1,2,3,4,5} for both kernels.
+- No code changes to kernels yet — this identifies the best launch parameters per shape.
 
-**Results:**
+**Kernel 1 best configs per shape:**
 
-| ID | Kernel 1 (μs) | Kernel 2 (μs) | Total Triton (μs) | Δ vs baseline |
-|----|--------------|--------------|-------------------|---------------|
-| A1 | | | | |
-| A2 | | | | |
-| A3 | | | | |
-| A4 | | | | |
-| A5 | | | | |
-| B1 | | | | |
-| B2 | | | | |
-| B3 | | | | |
+| ID | Best config | Best (μs) | Baseline (μs) | Δ |
+|----|------------|-----------|---------------|---|
+| A1 | w=16, s=5 | 6.9 | 8.1 | -14.6% |
+| A2 | w=16, s=5 | 13.6 | 13.7 | -0.8% |
+| A3 | w=4, s=2 | 33.3 | 33.6 | -0.9% |
+| A4 | w=4, s=2 | 107.3 | 107.6 | -0.3% |
+| A5 | w=4, s=1 | 402.4 | 402.6 | -0.0% |
+| B1 | w=16, s=4 | 6.3 | 7.4 | -14.5% |
+| B2 | w=8, s=2 | 13.4 | 14.0 | -4.1% |
+| B3 | w=4, s=5 | 107.3 | 107.3 | -0.0% |
+
+**Kernel 2 best configs per shape:**
+
+| ID | Best config | Best (μs) | Baseline (μs) | Δ |
+|----|------------|-----------|---------------|---|
+| A1 | w=16, s=1 | 59.6 | 109.0 | -45.3% |
+| A2 | w=16, s=3 | 62.2 | 113.8 | -45.3% |
+| A3 | w=16, s=2 | 68.5 | 121.3 | -43.5% |
+| A4 | w=16, s=1 | 78.9 | 130.9 | -39.8% |
+| A5 | w=16, s=3 | 145.0 | 172.2 | -15.8% |
+| B1 | w=16, s=4 | 18.8 | 31.3 | -39.9% |
+| B2 | w=16, s=1 | 20.9 | 34.3 | -39.0% |
+| B3 | w=16, s=2 | 47.4 | 56.2 | -15.7% |
+
+**Combined results (using per-shape best for each kernel):**
+
+| ID | K1 (μs) | K2 (μs) | Total (μs) | Baseline Total (μs) | Δ vs baseline |
+|----|---------|---------|------------|---------------------|---------------|
+| A1 | 6.9 | 59.6 | 66.5 | 116.3 | -42.8% |
+| A2 | 13.6 | 62.2 | 75.8 | 127.3 | -40.5% |
+| A3 | 33.3 | 68.5 | 101.8 | 154.7 | -34.2% |
+| A4 | 107.3 | 78.9 | 186.2 | 238.5 | -21.9% |
+| A5 | 402.4 | 145.0 | 547.4 | 574.4 | -4.7% |
+| B1 | 6.3 | 18.8 | 25.1 | 38.8 | -35.3% |
+| B2 | 13.4 | 20.9 | 34.3 | 47.8 | -28.2% |
+| B3 | 107.3 | 47.4 | 154.7 | 163.1 | -5.2% |
 
 **Analysis:**
 
-```
-(what worked, what didn't, next steps)
-```
+- **Kernel 2 is the big win:** w=16 is universally best, giving 15-45% improvement. The baseline w=4 severely underutilized parallelism.
+- **Kernel 1 is already well-tuned:** baseline w=4,s=3 is near-optimal for large T. Only small-T shapes benefit from w=16 (~14%).
+- **Key insight:** Kernel 2 needs more warps because it loops over E experts sequentially — more warps help hide the memory latency of loading expert outputs.
+- **Next:** Apply w=16 to kernel 2 as default. For kernel 1, use w=16 for small T, w=4 for large T. Then move to structural changes.
+
+### Iteration 2 — Apply sweep best configs to launcher
+
+**What changed:**
+
+- Kernel 1: adaptive num_warps (16 if total_rows\<=128 else 4), num_stages=2
+- Kernel 2: num_warps=16, num_stages=2 (was 4, 3)
+- Fixed benchmark script to use launcher-matching params and __main__ guard
+
+**Correctness:** PASS (31/31 tests)
+
+| ID | K1 (us) | K2 (us) | Total (us) | Baseline Total (us) | Delta vs baseline |
+|----|---------|---------|------------|---------------------|-------------------|
+| A1 | 6.7 | 59.8 | 66.5 | 116.3 | -42.8% |
+| A2 | 13.6 | 62.3 | 75.9 | 127.3 | -40.4% |
+| A3 | 33.3 | 68.8 | 102.1 | 154.7 | -34.0% |
+| A4 | 107.2 | 79.0 | 186.2 | 238.5 | -21.9% |
+| A5 | 402.2 | 144.9 | 547.1 | 574.4 | -4.8% |
+| B1 | 6.2 | 19.0 | 25.2 | 38.8 | -35.1% |
+| B2 | 13.7 | 21.0 | 34.7 | 47.8 | -27.4% |
+| B3 | 107.5 | 47.2 | 154.7 | 163.1 | -5.2% |
+
+**Analysis:**
+
+- Confirmed sweep results hold: K2 sees 15-45% improvement from w=16.
+- K1 improvement small but consistent at low T.
+- Moving to Phase 2: structural changes.
 
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
 
+- \[x\] **num_warps / num_stages sweep:** Done in iter 1-2. K2 w=16 is a clear win.
 - \[ \] **2D tiling for kernel 1:** Current 1D block (BLOCK_I=4096) may be too wide for I=2880. Try tiling rows into multiple blocks.
 - \[ \] **Vectorized loads for kernel 1:** Interleaved access (stride-2) is unfriendly to coalescing. Explore load-then-deinterleave.
-- \[ \] **num_warps / num_stages sweep:** Hardcoded 4 warps / 3 stages — autotune across configs.
 - \[ \] **Kernel 2 parallelization:** For large H, split across multiple programs instead of one per token.
 - \[ \] **Kernel 2 expert unrolling:** For small E (e.g., 32), unroll the expert loop.
 - \[ \] **Memory layout:** Explore contiguous gate/up layout instead of interleaved.
+- \[ \] **Kernel 2: 2D grid (T x H_blocks):** Parallelize over H dimension.
+- \[ \] **Kernel 2: preload routing weights to SRAM:** routing_weights\[t,:\] is small (E scalars), load once.
+- \[ \] **Kernel 1: persistent kernel:** Process multiple rows per program.
 - \[ \] **Fuse kernel 1 + BMM:** Longer-term, fuse activation into GEMM epilogue.
 
 ______________________________________________________________________
