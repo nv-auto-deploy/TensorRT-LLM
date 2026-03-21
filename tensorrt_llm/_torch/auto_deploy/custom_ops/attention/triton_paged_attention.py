@@ -884,12 +884,12 @@ def _gather_and_format_kv(
     gathered = gathered.reshape(num_seq, max_pages, 2, n_kv_heads, page_size, head_dim)
     k = (
         gathered[:, :, 0]
-        .permute(0, 3, 1, 2, 4)
+        .permute(0, 2, 1, 3, 4)
         .reshape(num_seq, n_kv_heads, max_pages * page_size, head_dim)
     )
     v = (
         gathered[:, :, 1]
-        .permute(0, 3, 1, 2, 4)
+        .permute(0, 2, 1, 3, 4)
         .reshape(num_seq, n_kv_heads, max_pages * page_size, head_dim)
     )
     return k, v
@@ -1188,12 +1188,12 @@ def triton_paged_context(
         # → [num_seq, n_kv_heads, max_pages * page_size, head_dim] for SDPA
         k_sdpa = (
             gathered[:, :, 0]
-            .permute(0, 3, 1, 2, 4)
+            .permute(0, 2, 1, 3, 4)
             .reshape(num_seq, n_kv_heads, max_pages * page_size, head_dim)
         )
         v_sdpa = (
             gathered[:, :, 1]
-            .permute(0, 3, 1, 2, 4)
+            .permute(0, 2, 1, 3, 4)
             .reshape(num_seq, n_kv_heads, max_pages * page_size, head_dim)
         )
         q_sdpa = q.reshape(num_seq, max_q_len, n_heads, head_dim).transpose(1, 2)
