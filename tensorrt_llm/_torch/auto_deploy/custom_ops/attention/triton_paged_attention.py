@@ -1261,11 +1261,17 @@ def triton_paged_context(
 
     output = out if out is not None else torch.empty_like(q)
 
-    q_lens = qo_indptr[1:] - qo_indptr[:-1]
-    max_q_len = int(q_lens.max().item()) if num_seq > 0 else 0
-
-    if num_seq == 0 or max_q_len == 0:
+    if num_seq == 0 or total_tokens == 0:
         return output
+
+    # Compute max_q_len without GPU sync when possible.
+    # For same-length sequences (common in prefill), total_tokens = num_seq * q_len.
+    # Fall back to .item() only for variable-length batches.
+    if total_tokens % num_seq == 0:
+        max_q_len = total_tokens // num_seq
+    else:
+        q_lens = qo_indptr[1:] - qo_indptr[:-1]
+        max_q_len = int(q_lens.max().item())
 
     # Adaptive dispatch: gather + cuDNN SDPA for seq>=512 (outperforms paged kernel),
     # paged Triton kernel for shorter sequences where gather overhead dominates.
