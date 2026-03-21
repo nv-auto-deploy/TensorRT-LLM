@@ -750,14 +750,14 @@ def _paged_context_kernel(
 def _fast_gather_sdpa_kernel(
     kv_cache_ptr,
     kv_indices_ptr,
-    out_ptr,
+    out_k_ptr,
+    out_v_ptr,
     # Strides
     cache_stride_block: tl.constexpr,
     cache_stride_kv: tl.constexpr,
     cache_stride_head: tl.constexpr,
     cache_stride_token: tl.constexpr,
     out_stride_seq: tl.constexpr,
-    out_stride_kv: tl.constexpr,
     out_stride_head: tl.constexpr,
     out_stride_token: tl.constexpr,
     # Constants
@@ -766,10 +766,11 @@ def _fast_gather_sdpa_kernel(
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    """Gather scattered pages directly into SDPA-ready [num_seq, 2, n_kv_heads, max_kv_len, head_dim].
+    """Gather scattered pages into separate K, V buffers in SDPA layout.
 
     Grid: (total_pages, N_KV_HEADS)
-    Each program copies one page (K and V) for one KV head directly into the output.
+    Each program copies one page for one KV head into contiguous K and V
+    outputs shaped [num_seq, n_kv_heads, max_kv_len, head_dim].
     No precomputed mapping needed — seq_id and local_page computed from global index.
     """
     page_global_idx = tl.program_id(0)
@@ -791,7 +792,7 @@ def _fast_gather_sdpa_kernel(
     k_data = tl.load(kv_cache_ptr + src_base + src_offsets)
     v_data = tl.load(kv_cache_ptr + src_base + cache_stride_kv + src_offsets)
 
-    # Destination: out[seq_id, 0/1, kv_head_id, local_page*PAGE_SIZE + :, :]
+    # Destination: out_k/v[seq_id, kv_head_id, local_page*PAGE_SIZE + :, :]
     local_token_start = local_page * PAGE_SIZE
     dst_base = (
         seq_id * out_stride_seq
@@ -800,8 +801,8 @@ def _fast_gather_sdpa_kernel(
         + head_offsets[None, :]
     )
 
-    tl.store(out_ptr + dst_base, k_data)
-    tl.store(out_ptr + dst_base + out_stride_kv, v_data)
+    tl.store(out_k_ptr + dst_base, k_data)
+    tl.store(out_v_ptr + dst_base, v_data)
 
 
 @triton.jit
@@ -1239,43 +1240,37 @@ def triton_paged_context(
     )
 
     if use_sdpa:
-        # Fast Triton gather: scattered pages → SDPA-ready layout in one kernel
-        # Replaces kv_cache[indices].view().permute().reshape() (3 ops, 2 copies)
+        # Fast Triton gather: scattered pages → separate K, V in SDPA layout
+        # Single kernel replaces kv_cache[indices].view().permute().reshape()
         max_kv_len = max_pages * page_size
-        kv_gathered = torch.empty(
-            num_seq,
-            2,
-            n_kv_heads,
-            max_kv_len,
-            head_dim,
-            dtype=kv_cache.dtype,
-            device=kv_cache.device,
-        )
+        sdpa_shape = (num_seq, n_kv_heads, max_kv_len, head_dim)
+        k_sdpa = torch.empty(sdpa_shape, dtype=kv_cache.dtype, device=kv_cache.device)
+        v_sdpa = torch.empty(sdpa_shape, dtype=kv_cache.dtype, device=kv_cache.device)
         total_pages_count = kv_indices.shape[0]
         if total_pages_count > 0:
             _fast_gather_sdpa_kernel[(total_pages_count, n_kv_heads)](
                 kv_cache,
                 kv_indices,
-                kv_gathered,
+                k_sdpa,
+                v_sdpa,
                 kv_cache.stride(0),
                 kv_cache.stride(1),
                 kv_cache.stride(2),
                 kv_cache.stride(3),
-                kv_gathered.stride(0),
-                kv_gathered.stride(1),
-                kv_gathered.stride(2),
-                kv_gathered.stride(3),
+                k_sdpa.stride(0),
+                k_sdpa.stride(1),
+                k_sdpa.stride(2),
                 MAX_PAGES=max_pages,
                 N_KV_HEADS=n_kv_heads,
                 PAGE_SIZE=page_size,
                 HEAD_DIM=head_dim,
             )
 
-        # SDPA with GQA — fuse Q reshape + attention + output reshape
+        # SDPA with GQA
         o_sdpa = torch.nn.functional.scaled_dot_product_attention(
             q.view(num_seq, max_q_len, n_heads, head_dim).transpose(1, 2),
-            kv_gathered[:, 0],
-            kv_gathered[:, 1],
+            k_sdpa,
+            v_sdpa,
             scale=sm_scale,
             is_causal=True,
             enable_gqa=True,
