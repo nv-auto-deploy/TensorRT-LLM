@@ -665,10 +665,29 @@ def _paged_context_kernel(
 
     for page_idx in range(num_full_pages):
         physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
-        page_base = physical_page * cache_stride_block + kv_head_offset
 
-        k = tl.load(kv_cache_ptr + page_base + local_kv)
-        v = tl.load(kv_cache_ptr + page_base + local_kv + cache_stride_kv)
+        # Use block pointer for potential TMA acceleration on H100
+        k_block_ptr = tl.make_block_ptr(
+            base=kv_cache_ptr + physical_page * cache_stride_block + kv_head_offset,
+            shape=(PAGE_SIZE, HEAD_DIM),
+            strides=(cache_stride_token, 1),
+            offsets=(0, 0),
+            block_shape=(PAGE_SIZE, HEAD_DIM),
+            order=(1, 0),
+        )
+        v_block_ptr = tl.make_block_ptr(
+            base=kv_cache_ptr
+            + physical_page * cache_stride_block
+            + kv_head_offset
+            + cache_stride_kv,
+            shape=(PAGE_SIZE, HEAD_DIM),
+            strides=(cache_stride_token, 1),
+            offsets=(0, 0),
+            block_shape=(PAGE_SIZE, HEAD_DIM),
+            order=(1, 0),
+        )
+        k = tl.load(k_block_ptr)
+        v = tl.load(v_block_ptr)
 
         qk = tl.dot(q, tl.trans(k)) * SM_SCALE
 
@@ -1098,6 +1117,7 @@ def triton_paged_context(
     # Adaptive dispatch: use contiguous kernel for large workloads,
     # paged kernel for small/medium where gather overhead dominates
     total_kv_tokens = num_seq * max_q_len
+    # Use contiguous gather + flash attention for large workloads
     use_contiguous = total_kv_tokens >= 4096 and num_seq <= 16
 
     if use_contiguous:
