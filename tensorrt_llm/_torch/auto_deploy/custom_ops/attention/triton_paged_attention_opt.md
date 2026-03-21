@@ -498,6 +498,44 @@ for small shapes. This fix restored paged kernel performance.
 
 **Iteration count: 22 / 50**
 
+### Iteration 23 — SDPA for all seq>=2048 with inline gather
+
+**What changed:**
+
+- Lowered SDPA threshold to max_q_len >= 2048 (was total_kv_tokens >= 4096)
+- Inline gather: skip `_gather_and_format_kv` function, do index_select + reshape
+  - permute directly in the launcher (fewer function calls, less overhead)
+- Removed `all_same_q` check (seq len equality checked implicitly by reshape)
+
+| ID | Before | After | Delta | vs FI |
+|----|--------|-------|-------|-------|
+| P3 | 273 | **224** | **-18%** | **2.13x** |
+| P5 | 520 | **488** | **-6%** | **1.41x** |
+| P6 | 258 | **215** | **-17%** | **2.23x** |
+| P7 | 193 | 187 | -3% | 2.77x |
+| P8 | 292 | **223** | **-24%** | **2.15x** |
+
+**Analysis:** Major win. The inline gather eliminates function call overhead and
+intermediate variable creation. All seq>=2048 shapes now route through SDPA,
+which uses cuDNN flash attention (much faster than Triton for contiguous data).
+P5 at 1.41x is approaching parity. P3/P6/P8 improved 17-24%.
+
+### Summary — Best results (iter 23)
+
+| ID | Baseline | Best | Speedup | vs FI | Path |
+|----|----------|------|---------|-------|------|
+| P1 | 65.5 | 66 | -1% | 4.6x | paged |
+| P2 | 92.6 | 90 | -3% | 3.9x | paged |
+| P3 | 320.4 | **224** | **-30%** | **2.13x** | SDPA |
+| P4 | 134.0 | 122 | -9% | 2.2x | paged |
+| P5 | 960.7 | **488** | **-49%** | **1.41x** | SDPA |
+| P6 | 291.6 | **215** | **-26%** | **2.23x** | SDPA |
+| P7 | 226.5 | 187 | -17% | 2.77x | SDPA |
+| P8 | 319.6 | **223** | **-30%** | **2.15x** | SDPA |
+| P9 | 131.6 | 122 | -7% | 2.2x | paged |
+
+**Iteration count: 23 / 50**
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog

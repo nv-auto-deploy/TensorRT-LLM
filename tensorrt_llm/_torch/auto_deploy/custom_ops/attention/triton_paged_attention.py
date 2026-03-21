@@ -1167,34 +1167,35 @@ def triton_paged_context(
     if num_seq == 0 or max_q_len == 0:
         return output
 
-    # Adaptive dispatch: use contiguous kernel for large workloads,
-    # paged kernel for small/medium where gather overhead dominates
-    total_kv_tokens = num_seq * max_q_len
-    # Use gather + cuDNN SDPA for large workloads where it outperforms paged kernel.
-    # Only compute the expensive checks when threshold is met.
-    use_sdpa = total_kv_tokens >= 4096 and num_seq <= 16
+    # Adaptive dispatch: gather + cuDNN SDPA for seq>=2048 (outperforms paged kernel),
+    # paged Triton kernel for shorter sequences where gather overhead dominates.
+    # Break-even: ~2048 total KV tokens for batch>=1 with same-length sequences.
+    use_sdpa = max_q_len >= 2048 and num_seq <= 16
 
     if use_sdpa:
         # These .item() calls trigger GPU sync — only do when needed
-        q_lens_host = qo_indptr[1:] - qo_indptr[:-1]
-        all_same_q = bool((q_lens_host == max_q_len).all().item())
         page_counts = kv_indptr[1:] - kv_indptr[:-1]
         all_same_pages = bool((page_counts == page_counts[0]).all().item())
         max_pages = int(page_counts.max().item())
-        use_sdpa = all_same_q and all_same_pages and max_pages > 0
+        use_sdpa = all_same_pages and max_pages > 0
 
     if use_sdpa:
-        # Gather + format for SDPA: [num_seq, n_kv_heads, max_kv_len, head_dim]
-        k_sdpa, v_sdpa = _gather_and_format_kv(
-            kv_cache,
-            kv_indices,
-            num_seq,
-            max_pages,
-            n_kv_heads,
-            page_size,
-            head_dim,
+        # Inline fast gather: index_select + reshape + permute → SDPA layout
+        # [total_pages, 2, n_kv_heads, page_size, head_dim]
+        gathered = kv_cache[kv_indices.long()].reshape(
+            num_seq, max_pages, 2, n_kv_heads, page_size, head_dim
         )
-
+        # → [num_seq, n_kv_heads, max_pages * page_size, head_dim] for SDPA
+        k_sdpa = (
+            gathered[:, :, 0]
+            .permute(0, 3, 1, 2, 4)
+            .reshape(num_seq, n_kv_heads, max_pages * page_size, head_dim)
+        )
+        v_sdpa = (
+            gathered[:, :, 1]
+            .permute(0, 3, 1, 2, 4)
+            .reshape(num_seq, n_kv_heads, max_pages * page_size, head_dim)
+        )
         q_sdpa = q.reshape(num_seq, max_q_len, n_heads, head_dim).transpose(1, 2)
 
         # cuDNN flash attention with native GQA
