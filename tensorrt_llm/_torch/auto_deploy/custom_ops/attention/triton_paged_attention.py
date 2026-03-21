@@ -195,7 +195,7 @@ def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_siz
         triton.Config({}, num_warps=4, num_stages=3),
         triton.Config({}, num_warps=8, num_stages=3),
     ],
-    key=["HEAD_DIM", "PAGE_SIZE", "HEAD_RATIO"],
+    key=["HEAD_DIM", "PAGE_SIZE", "HEAD_RATIO_PADDED"],
 )
 @triton.jit
 def _flash_decode_stage1_kernel(
@@ -233,6 +233,7 @@ def _flash_decode_stage1_kernel(
     HEAD_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     HEAD_RATIO: tl.constexpr,
+    HEAD_RATIO_PADDED: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
 ):
     """
@@ -257,11 +258,14 @@ def _flash_decode_stage1_kernel(
     page_split_end = tl.minimum(page_split_start + pages_per_split, num_pages)
 
     dhead_offsets = tl.arange(0, HEAD_DIM)
-    head_ids = kv_head_id * HEAD_RATIO + tl.arange(0, HEAD_RATIO)
+    # Use padded range for Triton power-of-2 requirement; mask out-of-bounds heads
+    head_local = tl.arange(0, HEAD_RATIO_PADDED)
+    head_ids = kv_head_id * HEAD_RATIO + head_local
+    head_mask = head_local < HEAD_RATIO
 
     # Handle inactive splits (beyond the sequence's pages)
     if page_split_start >= num_pages:
-        # Store zeros + -inf LSE for all HEAD_RATIO Q heads
+        # Store zeros + -inf LSE for valid HEAD_RATIO Q heads only
         po_offsets = (
             batch_id * po_stride_batch
             + head_ids[:, None] * po_stride_head
@@ -270,7 +274,8 @@ def _flash_decode_stage1_kernel(
         )
         tl.store(
             partial_o_ptr + po_offsets,
-            tl.zeros([HEAD_RATIO, HEAD_DIM], dtype=tl.float32),
+            tl.zeros([HEAD_RATIO_PADDED, HEAD_DIM], dtype=tl.float32),
+            mask=head_mask[:, None],
         )
         plse_offsets = (
             batch_id * plse_stride_batch
@@ -279,19 +284,21 @@ def _flash_decode_stage1_kernel(
         )
         tl.store(
             partial_lse_ptr + plse_offsets,
-            tl.zeros([HEAD_RATIO], dtype=tl.float32) + float("-inf"),
+            tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf"),
+            mask=head_mask,
         )
         return
 
-    # Load Q for all HEAD_RATIO heads sharing this KV head: [HEAD_RATIO, HEAD_DIM]
+    # Load Q for HEAD_RATIO heads sharing this KV head: [HEAD_RATIO_PADDED, HEAD_DIM]
+    # Padded rows get zeros, producing zero attention scores (harmless, never stored)
     q_offsets = (
         batch_id * q_stride_batch + head_ids[:, None] * q_stride_head + dhead_offsets[None, :]
     )
-    q_all = tl.load(q_ptr + q_offsets)  # [HEAD_RATIO, HEAD_DIM]
+    q_all = tl.load(q_ptr + q_offsets, mask=head_mask[:, None], other=0.0)
 
-    acc = tl.zeros([HEAD_RATIO, HEAD_DIM], dtype=tl.float32)
-    m_i = tl.zeros([HEAD_RATIO], dtype=tl.float32) + float("-inf")
-    l_i = tl.zeros([HEAD_RATIO], dtype=tl.float32)
+    acc = tl.zeros([HEAD_RATIO_PADDED, HEAD_DIM], dtype=tl.float32)
+    m_i = tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf")
+    l_i = tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32)
 
     num_pages_this_split = page_split_end - page_split_start
     for local_page_idx in range(num_pages_this_split):
@@ -323,39 +330,39 @@ def _flash_decode_stage1_kernel(
             other=0.0,
         )  # [PAGE_SIZE, HEAD_DIM]
 
-        # [HEAD_RATIO, HEAD_DIM] @ [HEAD_DIM, PAGE_SIZE] -> [HEAD_RATIO, PAGE_SIZE]
+        # [HEAD_RATIO_PADDED, HEAD_DIM] @ [HEAD_DIM, PAGE_SIZE] -> [HEAD_RATIO_PADDED, PAGE_SIZE]
         attn = tl.dot(q_all, tl.trans(k)) * SM_SCALE
         attn = tl.where(page_mask[None, :], attn, float("-inf"))
 
-        # Online softmax update (vectorized over HEAD_RATIO)
-        m_ij = tl.max(attn, axis=1)  # [HEAD_RATIO]
+        # Online softmax update (vectorized over HEAD_RATIO_PADDED)
+        m_ij = tl.max(attn, axis=1)  # [HEAD_RATIO_PADDED]
         m_i_new = tl.maximum(m_i, m_ij)
         alpha = tl.exp(m_i - m_i_new)
-        p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO, PAGE_SIZE]
+        p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO_PADDED, PAGE_SIZE]
 
-        # [HEAD_RATIO, PAGE_SIZE] @ [PAGE_SIZE, HEAD_DIM] -> [HEAD_RATIO, HEAD_DIM]
+        # [HEAD_RATIO_PADDED, PAGE_SIZE] @ [PAGE_SIZE, HEAD_DIM] -> [HEAD_RATIO_PADDED, HEAD_DIM]
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_i_new
 
     # Finalize: normalize and compute LSE
     l_i_safe = tl.where(l_i == 0.0, 1.0, l_i)
-    partial_o_val = acc / l_i_safe[:, None]  # [HEAD_RATIO, HEAD_DIM]
-    lse_val = m_i + tl.log(l_i_safe)  # [HEAD_RATIO]
+    partial_o_val = acc / l_i_safe[:, None]  # [HEAD_RATIO_PADDED, HEAD_DIM]
+    lse_val = m_i + tl.log(l_i_safe)  # [HEAD_RATIO_PADDED]
 
-    # Store results for all HEAD_RATIO Q heads at once (2D store)
+    # Store results for valid HEAD_RATIO Q heads only (masked 2D store)
     po_offsets = (
         batch_id * po_stride_batch
         + head_ids[:, None] * po_stride_head
         + split_id * po_stride_split
         + dhead_offsets[None, :]
     )
-    tl.store(partial_o_ptr + po_offsets, partial_o_val)
+    tl.store(partial_o_ptr + po_offsets, partial_o_val, mask=head_mask[:, None])
 
     plse_offsets = (
         batch_id * plse_stride_batch + head_ids * plse_stride_head + split_id * plse_stride_split
     )
-    tl.store(partial_lse_ptr + plse_offsets, lse_val)
+    tl.store(partial_lse_ptr + plse_offsets, lse_val, mask=head_mask)
 
 
 @triton.jit
@@ -452,6 +459,7 @@ def triton_paged_decode(
     batch_size, n_heads, head_dim = q.shape
     _, _, n_kv_heads, page_size, _ = kv_cache.shape
     head_ratio = n_heads // n_kv_heads
+    head_ratio_padded = max(1, 2 ** math.ceil(math.log2(head_ratio))) if head_ratio > 1 else 1
 
     max_pages = kv_indices.shape[0]
     max_seq_len = max_pages * page_size
@@ -512,6 +520,7 @@ def triton_paged_decode(
         HEAD_DIM=head_dim,
         PAGE_SIZE=page_size,
         HEAD_RATIO=head_ratio,
+        HEAD_RATIO_PADDED=head_ratio_padded,
         NUM_SPLITS=num_splits,
     )
 
