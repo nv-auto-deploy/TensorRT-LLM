@@ -1117,7 +1117,8 @@ def triton_paged_context(
     # Adaptive dispatch: use contiguous kernel for large workloads,
     # paged kernel for small/medium where gather overhead dominates
     total_kv_tokens = num_seq * max_q_len
-    # Use contiguous gather + flash attention for large workloads
+    # Use SDPA path (gather + cuDNN flash attention) for large workloads.
+    # Gather + reshape overhead ~200us; only pays off for large batch*seq.
     use_contiguous = total_kv_tokens >= 4096 and num_seq <= 16
 
     if use_contiguous:
