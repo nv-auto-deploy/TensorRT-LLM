@@ -870,6 +870,31 @@ def _gather_paged_kv_sdpa(
     return k_sdpa, v_sdpa, max_kv_len_padded
 
 
+def _gather_and_format_kv(
+    kv_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    num_seq: int,
+    max_pages: int,
+    n_kv_heads: int,
+    page_size: int,
+    head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gather pages and format for SDPA: [num_seq, n_kv_heads, max_kv_len, head_dim]."""
+    gathered = kv_cache[kv_indices.long()]
+    gathered = gathered.reshape(num_seq, max_pages, 2, n_kv_heads, page_size, head_dim)
+    k = (
+        gathered[:, :, 0]
+        .permute(0, 3, 1, 2, 4)
+        .reshape(num_seq, n_kv_heads, max_pages * page_size, head_dim)
+    )
+    v = (
+        gathered[:, :, 1]
+        .permute(0, 3, 1, 2, 4)
+        .reshape(num_seq, n_kv_heads, max_pages * page_size, head_dim)
+    )
+    return k, v
+
+
 def _gather_paged_kv(
     kv_cache: torch.Tensor,
     kv_indices: torch.Tensor,
@@ -1145,73 +1170,43 @@ def triton_paged_context(
     # Adaptive dispatch: use contiguous kernel for large workloads,
     # paged kernel for small/medium where gather overhead dominates
     total_kv_tokens = num_seq * max_q_len
-    # Use SDPA path (gather + cuDNN flash attention) for large workloads.
-    # Gather + reshape overhead ~200us; only pays off for large batch*seq.
-    use_contiguous = total_kv_tokens >= 4096 and num_seq <= 16
+    # Use gather + cuDNN SDPA for large workloads where it outperforms paged kernel.
+    # Only compute the expensive checks when threshold is met.
+    use_sdpa = total_kv_tokens >= 4096 and num_seq <= 16
 
-    if use_contiguous:
-        # Gather paged KV into contiguous buffers
-        k_contig, v_contig, max_kv_len_padded = _gather_paged_kv(
-            kv_cache,
-            kv_indices,
-            kv_indptr,
-            seq_len_with_cache,
-            num_seq,
-        )
-
+    if use_sdpa:
+        # These .item() calls trigger GPU sync — only do when needed
         q_lens_host = qo_indptr[1:] - qo_indptr[:-1]
         all_same_q = bool((q_lens_host == max_q_len).all().item())
+        page_counts = kv_indptr[1:] - kv_indptr[:-1]
+        all_same_pages = bool((page_counts == page_counts[0]).all().item())
+        max_pages = int(page_counts.max().item())
+        use_sdpa = all_same_q and all_same_pages and max_pages > 0
 
-        if all_same_q:
-            # Fast path: reshape + transpose for SDPA
-            q_sdpa = q.reshape(num_seq, max_q_len, n_heads, head_dim).transpose(1, 2)
-            k_sdpa = k_contig.transpose(1, 2)
-            v_sdpa = v_contig.transpose(1, 2)
+    if use_sdpa:
+        # Gather + format for SDPA: [num_seq, n_kv_heads, max_kv_len, head_dim]
+        k_sdpa, v_sdpa = _gather_and_format_kv(
+            kv_cache,
+            kv_indices,
+            num_seq,
+            max_pages,
+            n_kv_heads,
+            page_size,
+            head_dim,
+        )
 
-            # cuDNN flash attention with native GQA support
-            o_sdpa = torch.nn.functional.scaled_dot_product_attention(
-                q_sdpa,
-                k_sdpa,
-                v_sdpa,
-                scale=sm_scale,
-                is_causal=True,
-                enable_gqa=True,
-            )
-            output[:] = o_sdpa.transpose(1, 2).reshape(total_tokens, n_heads, head_dim)
-        else:
-            # Variable-length: use Triton contiguous kernel with legacy gather
-            k_contig, v_contig, _ = _gather_paged_kv(
-                kv_cache,
-                kv_indices,
-                kv_indptr,
-                seq_len_with_cache,
-                num_seq,
-            )
+        q_sdpa = q.reshape(num_seq, max_q_len, n_heads, head_dim).transpose(1, 2)
 
-            def grid_contig(meta):
-                q_block = meta["Q_BLOCK"]
-                num_q_blocks = (max_q_len + q_block - 1) // q_block
-                return (num_seq, n_heads, num_q_blocks)
-
-            _contiguous_context_kernel[grid_contig](
-                q,
-                k_contig,
-                v_contig,
-                qo_indptr,
-                seq_len_with_cache,
-                output,
-                q.stride(0),
-                q.stride(1),
-                k_contig.stride(0),
-                k_contig.stride(1),
-                k_contig.stride(2),
-                output.stride(0),
-                output.stride(1),
-                SM_SCALE=sm_scale,
-                N_HEADS=n_heads,
-                N_KV_HEADS=n_kv_heads,
-                HEAD_DIM=head_dim,
-            )
+        # cuDNN flash attention with native GQA
+        o_sdpa = torch.nn.functional.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            scale=sm_scale,
+            is_causal=True,
+            enable_gqa=True,
+        )
+        output[:] = o_sdpa.transpose(1, 2).reshape(total_tokens, n_heads, head_dim)
     else:
         # Use paged kernel (better for small workloads)
         def grid_paged(meta):
