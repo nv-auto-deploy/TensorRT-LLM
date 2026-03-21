@@ -3590,19 +3590,6 @@ def _apply_hint_ssm(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> 
     return 1 if count > 0 else 0
 
 
-_GDN_ELEMENTWISE_OPS = {
-    torch.ops.aten.mul.Tensor,
-    torch.ops.aten.mul.Scalar,
-    torch.ops.aten.neg.default,
-    torch.ops.aten.exp.default,
-    torch.ops.aten.add.Tensor,
-    torch.ops.aten.to.dtype,
-    torch.ops.aten.sigmoid.default,
-    torch.ops.aten.softplus.default,
-    torch.ops.prims.convert_element_type.default,
-}
-
-
 def _apply_hint_gdn(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> int:
     """Process GatedDeltaNet: shard A_log, dt_bias parameters along head dim.
 
@@ -3615,11 +3602,11 @@ def _apply_hint_gdn(gm: GraphModule, node: Node, tp_rank: int, tp_size: int) -> 
         return 0
 
     count = 0
-    for arg_name in ("g", "beta"):
+    for arg_name in ("A_log", "dt_bias"):
         [arg_node] = extract_op_args(node, arg_name)
         if not isinstance(arg_node, Node):
             continue
-        for attr_node in get_source_nodes(arg_node, allowed_ops=_GDN_ELEMENTWISE_OPS):
+        for attr_node in get_source_nodes(arg_node):
             pk = attr_node.target
             try:
                 w = gm.get_parameter(pk)

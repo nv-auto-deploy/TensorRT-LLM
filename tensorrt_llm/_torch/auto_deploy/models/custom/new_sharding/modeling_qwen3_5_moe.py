@@ -429,26 +429,28 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             layer_type="delta",
         )
 
-        # 3. L2 normalize Q and K
-        query = torch.ops.auto_deploy.torch_l2norm(query)
-        key = torch.ops.auto_deploy.torch_l2norm(key)
+        # # 3. L2 normalize Q and K
+        # query = torch.ops.auto_deploy.torch_l2norm(query)
+        # key = torch.ops.auto_deploy.torch_l2norm(key)
 
-        # 4. Compute beta and gating (A_log, dt_bias sharded by _apply_hint_gdn)
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        # # 4. Compute beta and gating (A_log, dt_bias sharded by _apply_hint_gdn)
+        # beta = b.sigmoid()
+        # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
         # Repeat-interleave Q, K for GQA
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+        # if self.num_v_heads // self.num_k_heads > 1:
+        #     query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+        #     key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         # 5. Gated Delta Rule with shardable hint
         core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
             query,
             key,
             value,
-            g,
-            beta,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
             shardable=True,
             layer_type="delta",
         )
