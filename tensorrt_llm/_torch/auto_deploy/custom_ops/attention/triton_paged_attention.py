@@ -750,7 +750,8 @@ def _paged_context_kernel(
 def _gather_pages_kernel(
     kv_cache_ptr,
     kv_indices_ptr,
-    kv_indptr_ptr,
+    seq_ids_ptr,
+    local_page_ids_ptr,
     out_k_ptr,
     out_v_ptr,
     # Strides
@@ -759,38 +760,32 @@ def _gather_pages_kernel(
     cache_stride_head: tl.constexpr,
     cache_stride_token: tl.constexpr,
     out_stride_seq: tl.constexpr,
-    out_stride_token: tl.constexpr,
     out_stride_head: tl.constexpr,
+    out_stride_token: tl.constexpr,
     # Constants
     N_KV_HEADS: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    """Gather pages into contiguous K, V buffers.
+    """Gather pages into SDPA-ready layout [num_seq, n_kv_heads, max_kv_len, head_dim].
 
     Grid: (total_pages, N_KV_HEADS)
-    Each program copies one page for one KV head.
+    Each program copies one page for one KV head directly into the output
+    at the correct (seq, head, token) position — no post-gather transpose needed.
     """
     page_global_idx = tl.program_id(0)
     kv_head_id = tl.program_id(1)
 
     physical_page = tl.load(kv_indices_ptr + page_global_idx)
-
-    # Determine which sequence this page belongs to and its local position
-    # We encode (seq_idx, local_page_idx) in the flattened page_global_idx
-    # by using the kv_indptr. But for simplicity, pass pre-computed mapping.
-    # Instead, use a simpler approach: pass seq_id and local_page_id as args.
-    # For now, just copy page_global_idx'th page to the output at the right position.
+    seq_id = tl.load(seq_ids_ptr + page_global_idx)
+    local_page_id = tl.load(local_page_ids_ptr + page_global_idx)
 
     token_offsets = tl.arange(0, PAGE_SIZE)
     head_offsets = tl.arange(0, HEAD_DIM)
 
     # Source: kv_cache[physical_page, 0/1, kv_head_id, :, :]
-    src_base_k = (
-        physical_page * cache_stride_block + 0 * cache_stride_kv + kv_head_id * cache_stride_head
-    )
+    src_base_k = physical_page * cache_stride_block + kv_head_id * cache_stride_head
     src_base_v = src_base_k + cache_stride_kv
-
     src_offsets = token_offsets[:, None] * cache_stride_token + head_offsets[None, :]
 
     k_data = tl.load(kv_cache_ptr + src_base_k + src_offsets)
@@ -798,10 +793,81 @@ def _gather_pages_kernel(
 
     # Destination: out[page_global_idx * PAGE_SIZE + token, kv_head_id, :]
     # We flatten all pages across all sequences first, then reshape in Python
-    dst_base = page_global_idx * PAGE_SIZE * out_stride_token + kv_head_id * out_stride_head
+    # Output: [num_seq, n_kv_heads, max_kv_len, head_dim]
+    local_token_start = local_page_id * PAGE_SIZE
+    dst_base = (
+        seq_id * out_stride_seq
+        + kv_head_id * out_stride_head
+        + local_token_start * out_stride_token
+    )
     dst_offsets = token_offsets[:, None] * out_stride_token + head_offsets[None, :]
     tl.store(out_k_ptr + dst_base + dst_offsets, k_data)
     tl.store(out_v_ptr + dst_base + dst_offsets, v_data)
+
+
+def _gather_paged_kv_sdpa(
+    kv_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    seq_len_with_cache: torch.Tensor,
+    num_seq: int,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Gather paged KV directly into SDPA-ready layout [num_seq, n_kv_heads, max_kv_len, head_dim].
+
+    Single Triton kernel — no intermediate allocations, permutes, or reshapes.
+    """
+    _, _, n_kv_heads, page_size, head_dim = kv_cache.shape
+    max_kv_len = int(seq_len_with_cache.max().item())
+    max_kv_len_padded = ((max_kv_len + page_size - 1) // page_size) * page_size
+    total_pages = kv_indices.shape[0]
+
+    if total_pages == 0:
+        shape = (num_seq, n_kv_heads, max_kv_len_padded, head_dim)
+        z = torch.zeros(shape, dtype=kv_cache.dtype, device=kv_cache.device)
+        return z, z.clone(), max_kv_len_padded
+
+    # Precompute per-page mapping: (seq_id, local_page_id) for each global page
+    page_counts = kv_indptr[1:] - kv_indptr[:-1]
+    seq_ids = torch.repeat_interleave(
+        torch.arange(num_seq, device=kv_cache.device, dtype=torch.int32),
+        page_counts.int(),
+    )
+    # local_page_id = global_idx - kv_indptr[seq_id]
+    offsets_within_seq = torch.arange(total_pages, device=kv_cache.device, dtype=torch.int32)
+    seq_starts = kv_indptr[:-1].int()
+    local_page_ids = offsets_within_seq - torch.repeat_interleave(seq_starts, page_counts.int())
+
+    # Output: [num_seq, n_kv_heads, max_kv_len_padded, head_dim] — SDPA-ready
+    k_sdpa = torch.zeros(
+        num_seq,
+        n_kv_heads,
+        max_kv_len_padded,
+        head_dim,
+        dtype=kv_cache.dtype,
+        device=kv_cache.device,
+    )
+    v_sdpa = torch.zeros_like(k_sdpa)
+
+    _gather_pages_kernel[(total_pages, n_kv_heads)](
+        kv_cache,
+        kv_indices,
+        seq_ids,
+        local_page_ids,
+        k_sdpa,
+        v_sdpa,
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        kv_cache.stride(3),
+        k_sdpa.stride(0),
+        k_sdpa.stride(1),
+        k_sdpa.stride(2),
+        N_KV_HEADS=n_kv_heads,
+        PAGE_SIZE=page_size,
+        HEAD_DIM=head_dim,
+    )
+
+    return k_sdpa, v_sdpa, max_kv_len_padded
 
 
 def _gather_paged_kv(
@@ -811,24 +877,12 @@ def _gather_paged_kv(
     seq_len_with_cache: torch.Tensor,
     num_seq: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Gather scattered paged KV into contiguous per-sequence buffers.
-
-    Uses Triton kernel for fast GPU-side gather when all sequences have
-    the same page count, falls back to vectorized torch ops otherwise.
-
-    Returns:
-        k_contig: [num_seq, max_kv_len_padded, n_kv_heads, head_dim]
-        v_contig: same
-        max_kv_len_padded: padded to page_size alignment
-    """
+    """Legacy gather — returns [num_seq, max_kv_len, n_kv_heads, head_dim]."""
     _, _, n_kv_heads, page_size, head_dim = kv_cache.shape
     max_kv_len = int(seq_len_with_cache.max().item())
     max_kv_len_padded = ((max_kv_len + page_size - 1) // page_size) * page_size
     # Gather all referenced pages: [total_pages, 2, n_kv_heads, page_size, head_dim]
     gathered = kv_cache[kv_indices.long()]
-
-    # Reshape to per-sequence: [num_seq, max_pages_per_seq, 2, n_kv_heads, page_size, head_dim]
-    # Pad kv_indices to max_pages_per_seq if sequences have different page counts
     page_counts = kv_indptr[1:] - kv_indptr[:-1]
     max_pages = int(page_counts.max().item())
 
@@ -843,43 +897,17 @@ def _gather_paged_kv(
         )
         return k_contig, k_contig.clone(), max_kv_len_padded
 
-    # Check if all sequences have the same number of pages (common case)
     all_same = bool((page_counts == max_pages).all().item())
-
     if all_same and num_seq > 0:
-        # Fast path: use Triton gather kernel (no intermediate allocation)
-        total_pages = kv_indices.shape[0]
-        # Output as flat [total_pages * page_size, n_kv_heads, head_dim]
-        flat_tokens = total_pages * page_size
-        k_flat = torch.empty(
-            flat_tokens,
-            n_kv_heads,
-            head_dim,
-            dtype=kv_cache.dtype,
-            device=kv_cache.device,
+        gathered = gathered.reshape(num_seq, max_pages, 2, n_kv_heads, page_size, head_dim)
+        k_pages = gathered[:, :, 0]  # [num_seq, max_pages, n_kv_heads, page_size, head_dim]
+        v_pages = gathered[:, :, 1]
+        k_contig = k_pages.permute(0, 1, 3, 2, 4).reshape(
+            num_seq, max_pages * page_size, n_kv_heads, head_dim
         )
-        v_flat = torch.empty_like(k_flat)
-
-        _gather_pages_kernel[(total_pages, n_kv_heads)](
-            kv_cache,
-            kv_indices,
-            kv_indptr,
-            k_flat,
-            v_flat,
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
-            kv_cache.stride(3),
-            0,  # out_stride_seq (unused, flat layout)
-            k_flat.stride(0),
-            k_flat.stride(1),
-            N_KV_HEADS=n_kv_heads,
-            PAGE_SIZE=page_size,
-            HEAD_DIM=head_dim,
+        v_contig = v_pages.permute(0, 1, 3, 2, 4).reshape(
+            num_seq, max_pages * page_size, n_kv_heads, head_dim
         )
-        # Reshape to [num_seq, max_pages * page_size, n_kv_heads, head_dim]
-        k_contig = k_flat.reshape(num_seq, max_pages * page_size, n_kv_heads, head_dim)
-        v_contig = v_flat.reshape(num_seq, max_pages * page_size, n_kv_heads, head_dim)
     else:
         # Fallback: per-sequence gather (variable page counts)
         k_contig = torch.zeros(
@@ -1131,28 +1159,35 @@ def triton_paged_context(
             num_seq,
         )
 
-        # Check if all sequences have the same Q length (common in benchmarks)
         q_lens_host = qo_indptr[1:] - qo_indptr[:-1]
         all_same_q = bool((q_lens_host == max_q_len).all().item())
 
         if all_same_q:
-            # Fast path: zero-copy reshape (no Python loops!)
-            q_4d = q.reshape(num_seq, max_q_len, n_heads, head_dim).transpose(1, 2)
-            k_4d = k_contig.transpose(1, 2)  # [num_seq, n_kv_heads, max_kv, head_dim]
-            v_4d = v_contig.transpose(1, 2)
+            # Fast path: reshape + transpose for SDPA
+            q_sdpa = q.reshape(num_seq, max_q_len, n_heads, head_dim).transpose(1, 2)
+            k_sdpa = k_contig.transpose(1, 2)
+            v_sdpa = v_contig.transpose(1, 2)
 
             # cuDNN flash attention with native GQA support
-            o_4d = torch.nn.functional.scaled_dot_product_attention(
-                q_4d,
-                k_4d,
-                v_4d,
+            o_sdpa = torch.nn.functional.scaled_dot_product_attention(
+                q_sdpa,
+                k_sdpa,
+                v_sdpa,
                 scale=sm_scale,
                 is_causal=True,
                 enable_gqa=True,
             )
-            output[:] = o_4d.transpose(1, 2).reshape(total_tokens, n_heads, head_dim)
+            output[:] = o_sdpa.transpose(1, 2).reshape(total_tokens, n_heads, head_dim)
         else:
-            # Variable-length sequences: use Triton contiguous kernel
+            # Variable-length: use Triton contiguous kernel with legacy gather
+            k_contig, v_contig, _ = _gather_paged_kv(
+                kv_cache,
+                kv_indices,
+                kv_indptr,
+                seq_len_with_cache,
+                num_seq,
+            )
+
             def grid_contig(meta):
                 q_block = meta["Q_BLOCK"]
                 num_q_blocks = (max_q_len + q_block - 1) // q_block
