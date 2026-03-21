@@ -169,6 +169,47 @@ ______________________________________________________________________
 - Nemotron-Nano decode (HEAD_RATIO=16) is ~1-5% slower than FI — the high ratio reduces parallelism per KV head.
 - Qwen decode (HEAD_RATIO=7→padded to 8) has ~11% overhead at batch=1 but is 12% faster at batch=8.
 
+### Iteration 1 — Parameter Sweep (Phase 1)
+
+**What changed:**
+
+- Decode: added warps=2 configs to autotune (sweep winner for most shapes)
+- Prefill: updated autotune configs (Q_BLOCK=64/128, warps=4/8) based on sweep
+- Added sweep script (`sweep_triton_paged_attention.py`)
+
+**Correctness:** PASS (49/49 tests)
+
+**Sweep findings — Decode:**
+
+| Shape | Best config | Latency (us) |
+|-------|-------------|-------------|
+| D1 (1x512, Llama-8B) | warps=4, stages=2 | 12.1 |
+| D2 (1x2048, Llama-8B) | warps=2, stages=2 | 17.1 |
+| D5 (8x2048, Llama-8B) | warps=2, stages=2 | 40.5 |
+| D8 (128x2048, Llama-8B) | warps=2, stages=3 | 364.0 |
+| D13 (1x2048, Nemotron) | warps=4, stages=2 | 15.1 |
+| D14 (8x2048, Nemotron) | warps=2, stages=2 | 22.7 |
+
+Conclusion: fewer warps (2-4) consistently best. Already near-optimal.
+
+**Sweep findings — Prefill:**
+
+| Shape | Best config | Latency (us) | vs FI |
+|-------|-------------|-------------|-------|
+| P1 (1x128, Llama-8B) | Q_BLOCK=64, warps=4, stages=2 | 16.4 | 1.16x |
+| P3 (1x2048, Llama-8B) | Q_BLOCK=128, warps=8, stages=3 | 264.8 | 2.51x |
+| P5 (4x2048, Llama-8B) | Q_BLOCK=128, warps=8, stages=2 | 832.2 | 2.41x |
+| P8 (1x2048, Nemotron) | Q_BLOCK=128, warps=8, stages=3 | 262.9 | 2.51x |
+| P9 (4x512, Nemotron) | Q_BLOCK=128, warps=8, stages=2 | 83.5 | 1.55x |
+
+Conclusion: autotune key `["HEAD_DIM", "PAGE_SIZE"]` picks one config for all seq_lens.
+Short seqs need Q_BLOCK=64, long need Q_BLOCK=128. But single key means compromise.
+Even with perfect config, prefill is still 1.2-2.5x slower than FI. **Structural changes required.**
+
+**Analysis:** Parameter sweep can't close the prefill gap. Moving to Phase 2.
+
+**Iteration count: 1 / 50**
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
