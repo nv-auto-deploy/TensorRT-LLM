@@ -893,9 +893,12 @@ def _gather_paged_kv(
     configs=[
         triton.Config({"Q_BLOCK": 64, "KV_BLOCK": 64}, num_stages=3, num_warps=4),
         triton.Config({"Q_BLOCK": 64, "KV_BLOCK": 128}, num_stages=3, num_warps=4),
+        triton.Config({"Q_BLOCK": 64, "KV_BLOCK": 128}, num_stages=4, num_warps=4),
         triton.Config({"Q_BLOCK": 128, "KV_BLOCK": 64}, num_stages=3, num_warps=8),
         triton.Config({"Q_BLOCK": 128, "KV_BLOCK": 128}, num_stages=3, num_warps=8),
+        triton.Config({"Q_BLOCK": 128, "KV_BLOCK": 128}, num_stages=4, num_warps=4),
         triton.Config({"Q_BLOCK": 128, "KV_BLOCK": 64}, num_stages=2, num_warps=4),
+        triton.Config({"Q_BLOCK": 64, "KV_BLOCK": 64}, num_stages=2, num_warps=8),
     ],
     key=["HEAD_DIM"],
 )
