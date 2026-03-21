@@ -1260,25 +1260,23 @@ def triton_paged_context(
         )
         k_sdpa = kv_buf[0]
         v_sdpa = kv_buf[1]
-        total_pages_count = kv_indices.shape[0]
-        if total_pages_count > 0:
-            _fast_gather_sdpa_kernel[(total_pages_count, n_kv_heads)](
-                kv_cache,
-                kv_indices,
-                k_sdpa,
-                v_sdpa,
-                kv_cache.stride(0),
-                kv_cache.stride(1),
-                kv_cache.stride(2),
-                kv_cache.stride(3),
-                k_sdpa.stride(0),
-                k_sdpa.stride(1),
-                k_sdpa.stride(2),
-                MAX_PAGES=max_pages,
-                N_KV_HEADS=n_kv_heads,
-                PAGE_SIZE=page_size,
-                HEAD_DIM=head_dim,
-            )
+        _fast_gather_sdpa_kernel[(total_expected_pages, n_kv_heads)](
+            kv_cache,
+            kv_indices,
+            k_sdpa,
+            v_sdpa,
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            kv_cache.stride(3),
+            k_sdpa.stride(0),
+            k_sdpa.stride(1),
+            k_sdpa.stride(2),
+            MAX_PAGES=max_pages,
+            N_KV_HEADS=n_kv_heads,
+            PAGE_SIZE=page_size,
+            HEAD_DIM=head_dim,
+        )
 
         # SDPA with GQA
         o_sdpa = torch.nn.functional.scaled_dot_product_attention(
