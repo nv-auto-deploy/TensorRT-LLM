@@ -667,7 +667,7 @@ def _paged_context_kernel(
 
     for page_idx in range(num_full_pages):
         physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
-        page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
+        page_base = physical_page * cache_stride_block + kv_head_offset
 
         k = tl.load(kv_cache_ptr + page_base + local_kv)
         v = tl.load(kv_cache_ptr + page_base + local_kv + cache_stride_kv)
@@ -695,7 +695,7 @@ def _paged_context_kernel(
             valid_tokens = tl.minimum(PAGE_SIZE, total_kv_len - kv_base_pos)
             page_mask = page_offsets < valid_tokens
 
-            page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
+            page_base = physical_page * cache_stride_block + kv_head_offset
             page_mask_2d = page_mask[:, None]
             k = tl.load(kv_cache_ptr + page_base + local_kv, mask=page_mask_2d, other=0.0)
             v = tl.load(
