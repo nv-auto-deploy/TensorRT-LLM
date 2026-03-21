@@ -1103,7 +1103,7 @@ def triton_paged_context(
     use_contiguous = total_kv_tokens >= 4096 and num_seq <= 16
 
     if use_contiguous:
-        # Gather paged KV into contiguous buffers for efficient flash attention
+        # Gather paged KV into contiguous buffers
         k_contig, v_contig, max_kv_len_padded = _gather_paged_kv(
             kv_cache,
             kv_indices,
