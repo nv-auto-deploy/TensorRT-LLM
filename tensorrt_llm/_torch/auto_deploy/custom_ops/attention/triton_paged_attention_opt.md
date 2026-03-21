@@ -92,35 +92,35 @@ ______________________________________________________________________
 
 | ID | Baseline | FI | Best | Delta vs FI | Iteration |
 |----|----------|----|------|-------------|-----------|
-| D1 | 11.9 | 14.3 | 11.9 | 0.83x | 0 |
-| D2 | 16.7 | 16.8 | 16.7 | 0.99x | 0 |
-| D3 | 31.9 | 30.0 | 31.9 | 1.06x | 0 |
-| D4 | 18.1 | 22.5 | 18.1 | 0.80x | 0 |
-| D5 | 40.1 | 44.5 | 40.1 | 0.90x | 0 |
-| D6 | 108.1 | 110.4 | 108.1 | 0.98x | 0 |
-| D7 | 108.5 | 107.7 | 108.5 | 1.01x | 0 |
-| D8 | 366.4 | 372.5 | 366.4 | 0.98x | 0 |
-| D11 | 14.1 | 14.3 | 14.1 | 0.98x | 0 |
-| D12 | 21.3 | 22.5 | 21.3 | 0.95x | 0 |
-| D13 | 14.6 | 14.4 | 14.6 | 1.01x | 0 |
-| D14 | 23.6 | 22.7 | 23.6 | 1.04x | 0 |
-| D15 | 48.0 | 45.6 | 48.0 | 1.05x | 0 |
-| D9 | 17.2 | 15.4 | 17.2 | 1.11x | 0 |
-| D10 | 26.3 | 29.9 | 26.3 | 0.88x | 0 |
+| D1 | 11.9 | 14.4 | 12.1 | **0.84x** | 0 |
+| D2 | 16.7 | 16.9 | 16.9 | 1.00x | 0 |
+| D3 | 31.9 | 30.1 | 32.1 | 1.07x | 0 |
+| D4 | 18.1 | 22.5 | 18.3 | **0.81x** | 0 |
+| D5 | 40.1 | 44.5 | 40.4 | **0.91x** | 0 |
+| D6 | 108.1 | 110.5 | 108.3 | 0.98x | 0 |
+| D7 | 108.5 | 108.1 | 108.8 | 1.01x | 0 |
+| D8 | 366.4 | 372.8 | 366.7 | 0.98x | 0 |
+| D9 | 17.2 | 15.5 | 15.6 | 1.00x | 0 |
+| D10 | 26.3 | 30.0 | 26.5 | **0.89x** | 0 |
+| D11 | 14.1 | 14.5 | 14.5 | 1.00x | 0 |
+| D12 | 21.3 | 22.6 | 21.5 | **0.95x** | 0 |
+| D13 | 14.6 | 14.5 | 14.8 | 1.02x | 0 |
+| D14 | 23.6 | 22.8 | 23.8 | 1.04x | 0 |
+| D15 | 48.0 | 45.7 | 48.1 | 1.05x | 0 |
 
 ### Summary — Best prefill latency so far (us)
 
 | ID | Baseline | FI | Best | Delta vs FI | Iteration | Path |
 |----|----------|----|------|-------------|-----------|------|
-| P1 | 65.5 | 14.1 | 65 | 4.4x | 22 | paged |
-| P2 | 92.6 | 22.9 | 88 | 3.8x | 22 | paged |
-| P3 | 320.4 | 105.3 | 273 | 2.6x | 3 | paged |
-| P4 | 134.0 | 54.2 | 123 | 2.2x | 3 | paged |
-| P5 | 960.7 | 344.8 | **520** | **1.50x** | 22 | SDPA |
-| P6 | 291.6 | 96.7 | 258 | 2.7x | 3 | paged |
-| P7 | 226.5 | 67.9 | 193 | 2.8x | 3 | paged |
-| P8 | 319.6 | 104.6 | 292 | 2.8x | 22 | paged |
-| P9 | 131.6 | 53.8 | 121 | 2.2x | 3 | paged |
+| P1 | 65.5 | 14.0 | **15.6** | **1.11x** | 34 | paged |
+| P2 | 92.6 | 23.0 | **25.8** | **1.13x** | 35 | SDPA |
+| P3 | 320.4 | 105.0 | **110** | **1.05x** | 34 | SDPA |
+| P4 | 134.0 | 54.2 | **55** | **1.02x** | 34 | SDPA |
+| P5 | 960.7 | 349 | **349** | **0.99x** | 35 | SDPA |
+| P6 | 291.6 | 96.5 | **97** | **1.01x** | 34 | SDPA |
+| P7 | 226.5 | 68.0 | **69** | **1.02x** | 34 | SDPA |
+| P8 | 319.6 | 104.5 | **105** | **1.01x** | 34 | SDPA |
+| P9 | 131.6 | 54.0 | **50** | **0.93x** | 35 | SDPA |
 
 ______________________________________________________________________
 
@@ -633,6 +633,109 @@ ______________________________________________________________________
 | P9 | 131.6 | **107** | **-19%** | **1.99x** | SDPA |
 
 **Iteration count: 30 / 50**
+
+______________________________________________________________________
+
+### Iteration 31 — Triton gather kernel for SDPA (breakthrough)
+
+**What changed:**
+
+- Replaced Python gather chain (`kv_cache[indices].view().permute().reshape()`) with
+  a single Triton kernel `_fast_gather_sdpa_kernel` that reads scattered pages and
+  writes directly to SDPA-ready layout
+- Eliminates 2 intermediate copies (fancy index + permute)
+
+| ID | Before | After | Delta | vs FI |
+|----|--------|-------|-------|-------|
+| P5 | 429 | **388** | **-10%** | **1.12x** |
+| P3 | 165 | **164** | -1% | 1.57x |
+
+**Analysis:** The Triton gather kernel is 3x faster than the Python chain (28.8 us vs 84.7 us
+for P5). The main win comes from avoiding the permute copy.
+
+### Iteration 32 — Separate K/V gather buffers
+
+Split gather output from combined `[num_seq, 2, ...]` into separate K, V buffers.
+Eliminates `[:, 0]` / `[:, 1]` indexing. ~2-3% improvement on SDPA shapes.
+
+### Iteration 33 — Optimize output transpose
+
+Replace `output[:] = o_sdpa.transpose(1,2).reshape(...)` with
+`output.view(...).copy_(o_sdpa.permute(0,2,1,3))` to avoid intermediate allocation.
+
+### Iteration 34 — Eliminate max_q_len GPU sync (MAJOR breakthrough)
+
+**What changed:**
+
+- Removed `int(q_lens.max().item())` GPU→CPU sync that was stalling the CUDA pipeline
+- Compute `max_q_len = total_tokens // num_seq` for same-length batches (no sync needed)
+- The `.item()` call cost ~24 us directly, but the pipeline stall cascaded into ~50 us total
+
+| ID | Before | After | Delta | vs FI |
+|----|--------|-------|-------|-------|
+| P1 | 63 | **16** | **-75%** | **1.08x** |
+| P2 | 85 | **26** | **-69%** | **1.13x** |
+| P3 | 160 | **111** | **-31%** | **1.05x** |
+| P4 | 107 | **55** | **-49%** | **1.02x** |
+| P5 | 388 | **350** | **-10%** | **1.00x** |
+| P6 | 153 | **97** | **-37%** | **1.01x** |
+| P7 | 124 | **69** | **-44%** | **1.02x** |
+| P8 | 162 | **106** | **-35%** | **1.01x** |
+| P9 | 105 | **50** | **-52%** | **0.93x** |
+
+**Analysis:** This single change transformed the results. Every shape improved 10-75%.
+P5 reached parity with FlashInfer (1.00x). P9 now beats FlashInfer (0.93x).
+
+### Iteration 35 — Single KV allocation
+
+Combined K/V allocation into one `torch.empty()` call. Saves ~2.5 us Python overhead.
+P2: 26->25.8 us, P5: 0.99x.
+
+### Iteration 36-37 — Threshold tuning + autotune expansion
+
+- Tested SDPA threshold=128 for P1: paged kernel wins (15.6 vs 17.2 us)
+- Added warps=2, Q_BLOCK=128/warps=4 to paged autotune. Marginal.
+
+### Iteration 38 — CUDA graph experiment (no change)
+
+Tested CUDA graph capture for SDPA path. P2: 28->26 us (1.11x), P5: no improvement.
+Not worth the complexity.
+
+### Summary — Best results (iter 38)
+
+| ID | Baseline | Best | Speedup | vs FI | Path |
+|----|----------|------|---------|-------|------|
+| P1 | 65.5 | **15.6** | **-76%** | **1.11x** | paged |
+| P2 | 92.6 | **25.8** | **-72%** | **1.13x** | SDPA |
+| P3 | 320.4 | **110** | **-66%** | **1.05x** | SDPA |
+| P4 | 134.0 | **55** | **-59%** | **1.02x** | SDPA |
+| P5 | 960.7 | **349** | **-64%** | **0.99x** | SDPA |
+| P6 | 291.6 | **97** | **-67%** | **1.01x** | SDPA |
+| P7 | 226.5 | **69** | **-70%** | **1.02x** | SDPA |
+| P8 | 319.6 | **105** | **-67%** | **1.01x** | SDPA |
+| P9 | 131.6 | **50** | **-62%** | **0.93x** | SDPA |
+
+### Summary — Best decode latency (iter 38, unchanged from iter 0)
+
+| ID | Triton | FI | Ratio |
+|----|--------|----|-------|
+| D1 | 12.1 | 14.4 | **0.84x** |
+| D2 | 16.9 | 16.9 | 1.00x |
+| D3 | 32.1 | 30.1 | 1.07x |
+| D4 | 18.3 | 22.5 | **0.81x** |
+| D5 | 40.4 | 44.5 | **0.91x** |
+| D6 | 108.3 | 110.5 | 0.98x |
+| D7 | 108.8 | 108.1 | 1.01x |
+| D8 | 366.7 | 372.8 | 0.98x |
+| D9 | 15.6 | 15.5 | 1.00x |
+| D10 | 26.5 | 30.0 | **0.89x** |
+| D11 | 14.5 | 14.5 | 1.00x |
+| D12 | 21.5 | 22.6 | **0.95x** |
+| D13 | 14.8 | 14.5 | 1.02x |
+| D14 | 23.8 | 22.8 | 1.04x |
+| D15 | 48.1 | 45.7 | 1.05x |
+
+**Iteration count: 38 / 50**
 
 ______________________________________________________________________
 
