@@ -1130,30 +1130,52 @@ def triton_paged_context(
             num_seq,
         )
 
-        def grid_contig(meta):
-            q_block = meta["Q_BLOCK"]
-            num_q_blocks = (max_q_len + q_block - 1) // q_block
-            return (num_seq, n_heads, num_q_blocks)
+        # Check if all sequences have the same Q length (common in benchmarks)
+        q_lens_host = qo_indptr[1:] - qo_indptr[:-1]
+        all_same_q = bool((q_lens_host == max_q_len).all().item())
 
-        _contiguous_context_kernel[grid_contig](
-            q,
-            k_contig,
-            v_contig,
-            qo_indptr,
-            seq_len_with_cache,
-            output,
-            q.stride(0),
-            q.stride(1),
-            k_contig.stride(0),
-            k_contig.stride(1),
-            k_contig.stride(2),
-            output.stride(0),
-            output.stride(1),
-            SM_SCALE=sm_scale,
-            N_HEADS=n_heads,
-            N_KV_HEADS=n_kv_heads,
-            HEAD_DIM=head_dim,
-        )
+        if all_same_q:
+            # Fast path: zero-copy reshape (no Python loops!)
+            q_4d = q.reshape(num_seq, max_q_len, n_heads, head_dim).transpose(1, 2)
+            k_4d = k_contig.transpose(1, 2)  # [num_seq, n_kv_heads, max_kv, head_dim]
+            v_4d = v_contig.transpose(1, 2)
+
+            # cuDNN flash attention with native GQA support
+            o_4d = torch.nn.functional.scaled_dot_product_attention(
+                q_4d,
+                k_4d,
+                v_4d,
+                scale=sm_scale,
+                is_causal=True,
+                enable_gqa=True,
+            )
+            output[:] = o_4d.transpose(1, 2).reshape(total_tokens, n_heads, head_dim)
+        else:
+            # Variable-length sequences: use Triton contiguous kernel
+            def grid_contig(meta):
+                q_block = meta["Q_BLOCK"]
+                num_q_blocks = (max_q_len + q_block - 1) // q_block
+                return (num_seq, n_heads, num_q_blocks)
+
+            _contiguous_context_kernel[grid_contig](
+                q,
+                k_contig,
+                v_contig,
+                qo_indptr,
+                seq_len_with_cache,
+                output,
+                q.stride(0),
+                q.stride(1),
+                k_contig.stride(0),
+                k_contig.stride(1),
+                k_contig.stride(2),
+                output.stride(0),
+                output.stride(1),
+                SM_SCALE=sm_scale,
+                N_HEADS=n_heads,
+                N_KV_HEADS=n_kv_heads,
+                HEAD_DIM=head_dim,
+            )
     else:
         # Use paged kernel (better for small workloads)
         def grid_paged(meta):
