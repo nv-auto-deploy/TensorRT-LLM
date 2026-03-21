@@ -567,6 +567,42 @@ ______________________________________________________________________
 
 **Iteration count: 26 / 50**
 
+### Iteration 27 — Eliminate GPU syncs from SDPA path (breakthrough)
+
+**What changed:**
+
+- Removed 2 `.item()` GPU syncs from `use_sdpa` check (page_counts, all_same_pages)
+- Compute `max_pages` from `max_q_len // page_size` (already on host)
+- Check `kv_indices.shape[0] == num_seq * max_pages` instead of GPU-side comparison
+
+| ID | Before | After | Delta | vs FI |
+|----|--------|-------|-------|-------|
+| P3 | 215 | **168** | **-22%** | **1.61x** |
+| P5 | 475 | **431** | **-9%** | **1.27x** |
+| P6 | 206 | **156** | **-24%** | **1.62x** |
+| P7 | 178 | **128** | **-28%** | **1.90x** |
+| P8 | 214 | **165** | **-23%** | **1.58x** |
+
+**Analysis:** Each `.item()` call forces a GPU→CPU sync (~5-10 us per sync, but more
+importantly it stalls the CUDA pipeline). Removing them lets the gather and SDPA
+overlap with other GPU work. This is the second-biggest win after the SDPA integration itself.
+
+### Summary — Best results (iter 27)
+
+| ID | Baseline | Best | Speedup | vs FI | Path |
+|----|----------|------|---------|-------|------|
+| P1 | 65.5 | 63 | -4% | 4.4x | paged |
+| P2 | 92.6 | 88 | -5% | 3.8x | paged |
+| P3 | 320.4 | **168** | **-48%** | **1.61x** | SDPA |
+| P4 | 134.0 | 121 | -10% | 2.2x | paged |
+| P5 | 960.7 | **431** | **-55%** | **1.27x** | SDPA |
+| P6 | 291.6 | **156** | **-46%** | **1.62x** | SDPA |
+| P7 | 226.5 | **128** | **-43%** | **1.90x** | SDPA |
+| P8 | 319.6 | **165** | **-48%** | **1.58x** | SDPA |
+| P9 | 131.6 | 121 | -8% | 2.2x | paged |
+
+**Iteration count: 27 / 50**
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog

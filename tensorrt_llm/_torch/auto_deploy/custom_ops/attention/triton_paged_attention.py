@@ -1170,14 +1170,16 @@ def triton_paged_context(
     # Adaptive dispatch: gather + cuDNN SDPA for seq>=2048 (outperforms paged kernel),
     # paged Triton kernel for shorter sequences where gather overhead dominates.
     # Break-even: ~2048 total KV tokens for batch>=1 with same-length sequences.
-    use_sdpa = max_q_len >= 2048 and num_seq <= 16
-
-    if use_sdpa:
-        # These .item() calls trigger GPU sync — only do when needed
-        page_counts = kv_indptr[1:] - kv_indptr[:-1]
-        all_same_pages = bool((page_counts == page_counts[0]).all().item())
-        max_pages = int(page_counts.max().item())
-        use_sdpa = all_same_pages and max_pages > 0
+    # Compute max_pages from max_q_len without GPU sync
+    # (assumes pure prefill where q_len == kv_len for each seq)
+    max_pages = (max_q_len + page_size - 1) // page_size
+    total_expected_pages = num_seq * max_pages
+    use_sdpa = (
+        max_q_len >= 2048
+        and num_seq <= 16
+        and max_pages > 0
+        and kv_indices.shape[0] == total_expected_pages  # all seqs same page count
+    )
 
     if use_sdpa:
         # Inline fast gather: index_select + permute once for both K,V
