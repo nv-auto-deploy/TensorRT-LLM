@@ -367,6 +367,58 @@ impractical for GQA ratios > 2. **Reverted.**
 
 **Iteration count: 8 / 50**
 
+### Iteration 9 — Split-K helper (prep, no perf change)
+
+Added `_get_prefill_num_splits` helper for future use. No kernel change.
+
+### Iteration 10 — Persistent kernel with GQA serialization (FAILED)
+
+Persistent kernel (`tl.range(pid, num_tiles, NUM_SMS, flatten=True)`) with
+HEAD_RATIO serialization within each tile. Same failure as iter 4 — HEAD_RATIO
+serialization kills per-tile performance. Reverted.
+
+### Iteration 11 — Persistent kernel, per-head tiles (FAILED)
+
+Persistent per-head kernel: same parallelism as baseline, but tiles ordered for
+L2 reuse (adjacent Q heads sharing KV head go to same SM). Grid: (NUM_SMS,).
+
+| ID | Iter 7 (best) | Iter 11 | Delta |
+|----|---------------|---------|-------|
+| P1 | 63 | 62 | -2% |
+| P3 | 275 | 468 | **+70%** |
+| P5 | 799 | 1166 | **+46%** |
+
+Persistent pattern adds overhead from per-tile metadata loads and prevents
+autotune. The bottleneck is per-page loop body performance (scattered 4KB loads,
+int64 address math, dynamic trip count), not grid scheduling. Reverted.
+
+## Bottleneck Analysis
+
+For P3 (1x2048, Llama-8B): our best = 275 us, FlashInfer = 105 us, gap = 2.6x.
+
+**Theoretical bounds:**
+
+- Compute: 17.2 GFLOP at 990 TFLOP/s = 17 us
+- Memory: 272 MB of KV loads at 3.35 TB/s = 81 us
+- Our kernel: 275 us → only **29% of peak memory bandwidth**
+- FlashInfer: 105 us → **77% of peak bandwidth**
+
+**Root cause of 2.6x gap:** bandwidth utilization (29% vs 77%), caused by:
+
+1. Small scattered loads: each KV page is \[16,128\] = 4KB at a random location
+1. int64 address computation per page (physical_page * stride)
+1. Dynamic loop (`range(num_kv_pages)`) prevents compiler pipelining
+1. Triton can't use TMA for scattered pages or warp-level cooperative loads
+1. FlashInfer uses hand-tuned CUDA with wgmma, shared memory staging, and
+   hardware-specific memory access patterns that Triton doesn't expose
+
+**Conclusion:** The ~2.5x gap is structural to Triton's codegen for paged attention
+with PAGE_SIZE=16. Approaches tried: multi-page tiling, serialized GQA, 3D batched
+GQA, persistent kernel (both variants). None helped due to register pressure,
+parallelism loss, or assembly overhead.
+
+**Iteration count: 11 / 50**
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
