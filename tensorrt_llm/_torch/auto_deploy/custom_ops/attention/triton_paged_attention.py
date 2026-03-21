@@ -747,6 +747,64 @@ def _paged_context_kernel(
 
 
 @triton.jit
+def _fast_gather_sdpa_kernel(
+    kv_cache_ptr,
+    kv_indices_ptr,
+    out_ptr,
+    # Strides
+    cache_stride_block: tl.constexpr,
+    cache_stride_kv: tl.constexpr,
+    cache_stride_head: tl.constexpr,
+    cache_stride_token: tl.constexpr,
+    out_stride_seq: tl.constexpr,
+    out_stride_kv: tl.constexpr,
+    out_stride_head: tl.constexpr,
+    out_stride_token: tl.constexpr,
+    # Constants
+    MAX_PAGES: tl.constexpr,
+    N_KV_HEADS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """Gather scattered pages directly into SDPA-ready [num_seq, 2, n_kv_heads, max_kv_len, head_dim].
+
+    Grid: (total_pages, N_KV_HEADS)
+    Each program copies one page (K and V) for one KV head directly into the output.
+    No precomputed mapping needed — seq_id and local_page computed from global index.
+    """
+    page_global_idx = tl.program_id(0)
+    kv_head_id = tl.program_id(1)
+
+    # Compute seq_id and local_page from global page index
+    seq_id = page_global_idx // MAX_PAGES
+    local_page = page_global_idx % MAX_PAGES
+
+    physical_page = tl.load(kv_indices_ptr + page_global_idx)
+
+    token_offsets = tl.arange(0, PAGE_SIZE)
+    head_offsets = tl.arange(0, HEAD_DIM)
+
+    # Source: kv_cache[physical_page, 0/1, kv_head_id, :, :]
+    src_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_id * cache_stride_head
+    src_offsets = token_offsets[:, None] * cache_stride_token + head_offsets[None, :]
+
+    k_data = tl.load(kv_cache_ptr + src_base + src_offsets)
+    v_data = tl.load(kv_cache_ptr + src_base + cache_stride_kv + src_offsets)
+
+    # Destination: out[seq_id, 0/1, kv_head_id, local_page*PAGE_SIZE + :, :]
+    local_token_start = local_page * PAGE_SIZE
+    dst_base = (
+        seq_id * out_stride_seq
+        + kv_head_id * out_stride_head
+        + (local_token_start + token_offsets[:, None]) * out_stride_token
+        + head_offsets[None, :]
+    )
+
+    tl.store(out_ptr + dst_base, k_data)
+    tl.store(out_ptr + dst_base + out_stride_kv, v_data)
+
+
+@triton.jit
 def _gather_pages_kernel(
     kv_cache_ptr,
     kv_indices_ptr,
@@ -1167,9 +1225,8 @@ def triton_paged_context(
     if num_seq == 0 or max_q_len == 0:
         return output
 
-    # Adaptive dispatch: gather + cuDNN SDPA for seq>=2048 (outperforms paged kernel),
+    # Adaptive dispatch: gather + cuDNN SDPA for seq>=512 (outperforms paged kernel),
     # paged Triton kernel for shorter sequences where gather overhead dominates.
-    # Break-even: ~2048 total KV tokens for batch>=1 with same-length sequences.
     # Compute max_pages from max_q_len without GPU sync
     # (assumes pure prefill where q_len == kv_len for each seq)
     max_pages = (max_q_len + page_size - 1) // page_size
@@ -1182,14 +1239,37 @@ def triton_paged_context(
     )
 
     if use_sdpa:
-        # Gather pages + format for SDPA in minimal ops
+        # Fast Triton gather: scattered pages → SDPA-ready layout in one kernel
+        # Replaces kv_cache[indices].view().permute().reshape() (3 ops, 2 copies)
         max_kv_len = max_pages * page_size
-        kv_gathered = (
-            kv_cache[kv_indices.long()]
-            .view(num_seq, max_pages, 2, n_kv_heads, page_size, head_dim)
-            .permute(0, 2, 3, 1, 4, 5)
-            .reshape(num_seq, 2, n_kv_heads, max_kv_len, head_dim)
+        kv_gathered = torch.empty(
+            num_seq,
+            2,
+            n_kv_heads,
+            max_kv_len,
+            head_dim,
+            dtype=kv_cache.dtype,
+            device=kv_cache.device,
         )
+        total_pages_count = kv_indices.shape[0]
+        if total_pages_count > 0:
+            _fast_gather_sdpa_kernel[(total_pages_count, n_kv_heads)](
+                kv_cache,
+                kv_indices,
+                kv_gathered,
+                kv_cache.stride(0),
+                kv_cache.stride(1),
+                kv_cache.stride(2),
+                kv_cache.stride(3),
+                kv_gathered.stride(0),
+                kv_gathered.stride(1),
+                kv_gathered.stride(2),
+                kv_gathered.stride(3),
+                MAX_PAGES=max_pages,
+                N_KV_HEADS=n_kv_heads,
+                PAGE_SIZE=page_size,
+                HEAD_DIM=head_dim,
+            )
 
         # SDPA with GQA — fuse Q reshape + attention + output reshape
         o_sdpa = torch.nn.functional.scaled_dot_product_attention(
