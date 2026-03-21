@@ -605,6 +605,37 @@ overlap with other GPU work. This is the second-biggest win after the SDPA integ
 
 ______________________________________________________________________
 
+### Iterations 28-30 — Minimized ops + threshold tuning
+
+- Iter 28: Chain gather ops into single expression (-3% P5)
+- Iter 29: Triton gather (reverted, slower than torch)
+- Iter 30: Lower SDPA threshold to seq>=512 → P4/P9 now use SDPA
+
+| ID | Iter 27 | Iter 30 | Delta | vs FI |
+|----|---------|---------|-------|-------|
+| P2 | 88 | **85** | -3% | **3.69x** |
+| P4 | 121 | **107** | **-12%** | **1.98x** |
+| P5 | 431 | **427** | -1% | **1.26x** |
+| P9 | 121 | **107** | **-12%** | **1.99x** |
+
+### Summary — Best results (iter 30)
+
+| ID | Baseline | Best | Speedup | vs FI | Path |
+|----|----------|------|---------|-------|------|
+| P1 | 65.5 | 63 | -4% | 4.4x | paged |
+| P2 | 92.6 | **85** | -8% | 3.7x | SDPA |
+| P3 | 320.4 | **163** | **-49%** | **1.56x** | SDPA |
+| P4 | 134.0 | **107** | **-20%** | **1.98x** | SDPA |
+| P5 | 960.7 | **427** | **-56%** | **1.26x** | SDPA |
+| P6 | 291.6 | **157** | **-46%** | **1.63x** | SDPA |
+| P7 | 226.5 | **126** | **-44%** | **1.87x** | SDPA |
+| P8 | 319.6 | **164** | **-49%** | **1.58x** | SDPA |
+| P9 | 131.6 | **107** | **-19%** | **1.99x** | SDPA |
+
+**Iteration count: 30 / 50**
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Decode Stage 1
