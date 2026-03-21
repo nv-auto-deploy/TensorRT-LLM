@@ -555,8 +555,10 @@ def triton_paged_decode(
 # =============================================================================
 @triton.autotune(
     configs=[
+        triton.Config({"Q_BLOCK": 64}, num_stages=2, num_warps=2),
         triton.Config({"Q_BLOCK": 64}, num_stages=2, num_warps=4),
         triton.Config({"Q_BLOCK": 64}, num_stages=4, num_warps=4),
+        triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=4),
         triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=3, num_warps=8),
     ],
