@@ -660,22 +660,20 @@ def _paged_context_kernel(
     # Check if this is a full Q block (no q_mask needed)
     is_full_q_block = (q_block_start + Q_BLOCK) <= q_len
 
-    # Phase 1: Full pages — no causal mask, no validity mask, block pointer loads
+    # Phase 1: Full pages — no causal mask, no validity mask
+    # Process one page at a time with a clean inner loop
+    kv_head_offset = kv_head_id * cache_stride_head
+    local_kv = page_offsets[:, None] * cache_stride_token + dhead_offsets[None, :]
+
     for page_idx in range(num_full_pages):
         physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+        page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
 
-        cache_base = (
-            physical_page.to(tl.int64) * cache_stride_block
-            + kv_head_id * cache_stride_head
-            + page_offsets[:, None] * cache_stride_token
-            + dhead_offsets[None, :]
-        )
-        k = tl.load(kv_cache_ptr + cache_base)
-        v = tl.load(kv_cache_ptr + cache_base + cache_stride_kv)
+        k = tl.load(kv_cache_ptr + page_base + local_kv)
+        v = tl.load(kv_cache_ptr + page_base + local_kv + cache_stride_kv)
 
         qk = tl.dot(q, tl.trans(k)) * SM_SCALE
 
-        # Skip q_mask for full Q blocks (all rows valid)
         if not is_full_q_block:
             qk = tl.where(q_mask[:, None], qk, float("-inf"))
 
@@ -697,16 +695,11 @@ def _paged_context_kernel(
             valid_tokens = tl.minimum(PAGE_SIZE, total_kv_len - kv_base_pos)
             page_mask = page_offsets < valid_tokens
 
-            cache_base = (
-                physical_page.to(tl.int64) * cache_stride_block
-                + kv_head_id * cache_stride_head
-                + page_offsets[:, None] * cache_stride_token
-                + dhead_offsets[None, :]
-            )
+            page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
             page_mask_2d = page_mask[:, None]
-            k = tl.load(kv_cache_ptr + cache_base, mask=page_mask_2d, other=0.0)
+            k = tl.load(kv_cache_ptr + page_base + local_kv, mask=page_mask_2d, other=0.0)
             v = tl.load(
-                kv_cache_ptr + cache_base + cache_stride_kv,
+                kv_cache_ptr + page_base + local_kv + cache_stride_kv,
                 mask=page_mask_2d,
                 other=0.0,
             )
