@@ -556,10 +556,11 @@ def triton_paged_decode(
 @triton.autotune(
     configs=[
         triton.Config({"Q_BLOCK": 64}, num_stages=2, num_warps=4),
-        triton.Config({"Q_BLOCK": 64}, num_stages=3, num_warps=4),
+        triton.Config({"Q_BLOCK": 64}, num_stages=4, num_warps=4),
         triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=4),
         triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=3, num_warps=8),
+        triton.Config({"Q_BLOCK": 128}, num_stages=5, num_warps=4),
     ],
     key=["HEAD_DIM", "PAGE_SIZE"],
 )
@@ -656,7 +657,10 @@ def _paged_context_kernel(
     # Number of full pages (all tokens in these pages are attended by all Q tokens)
     num_full_pages = first_q_kv_pos // PAGE_SIZE
 
-    # Phase 1: Full pages — no causal mask, no validity mask (all PAGE_SIZE tokens valid)
+    # Check if this is a full Q block (no q_mask needed)
+    is_full_q_block = (q_block_start + Q_BLOCK) <= q_len
+
+    # Phase 1: Full pages — no causal mask, no validity mask, block pointer loads
     for page_idx in range(num_full_pages):
         physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
 
@@ -670,8 +674,10 @@ def _paged_context_kernel(
         v = tl.load(kv_cache_ptr + cache_base + cache_stride_kv)
 
         qk = tl.dot(q, tl.trans(k)) * SM_SCALE
-        # Only need q_mask (for partial Q blocks at end of sequence)
-        qk = tl.where(q_mask[:, None], qk, float("-inf"))
+
+        # Skip q_mask for full Q blocks (all rows valid)
+        if not is_full_q_block:
+            qk = tl.where(q_mask[:, None], qk, float("-inf"))
 
         m_ij = tl.max(qk, axis=1)
         m_i_new = tl.maximum(m_i, m_ij)

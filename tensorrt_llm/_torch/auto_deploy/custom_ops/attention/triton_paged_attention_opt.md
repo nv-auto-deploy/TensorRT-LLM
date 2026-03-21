@@ -299,6 +299,28 @@ memory reuse. **Reverted.**
 
 **Iteration count: 4 / 50**
 
+### Iteration 5 — Skip q_mask for full Q blocks + higher num_stages
+
+**What changed:**
+
+- Added `is_full_q_block` check: skip `tl.where(q_mask)` in Phase 1 for non-boundary Q blocks
+- Added num_stages=4,5 configs to autotune for better pipelining
+
+**Correctness:** PASS (49/49 tests)
+
+| ID | Iter 3 | Iter 5 | Delta | vs FI |
+|----|--------|--------|-------|-------|
+| P3 | 273.3 | 277.7 | +2% | 2.63x |
+| P4 | 123.6 | 122.5 | -1% | 2.24x |
+| P5 | 843.6 | 804.5 | **-5%** | 2.34x |
+| P8 | 273.3 | 276.4 | +1% | 2.63x |
+
+**Analysis:** Marginal. P5 improved 5% (likely from higher num_stages), rest is noise.
+Still 2.2-4.5x vs FlashInfer. The gap is structural — Triton codegen vs hand-tuned CUDA.
+Need to target: (1) reduce int64 overhead, (2) pre-scale Q, (3) persistent kernel.
+
+**Iteration count: 5 / 50**
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
