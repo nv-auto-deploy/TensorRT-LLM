@@ -747,47 +747,6 @@ def _paged_context_kernel(
 
 
 @triton.jit
-def _transpose_sdpa_output_kernel(
-    src_ptr,
-    dst_ptr,
-    # src: [num_seq, n_heads, max_q_len, head_dim] (contiguous)
-    src_stride_seq: tl.constexpr,
-    src_stride_head: tl.constexpr,
-    src_stride_token: tl.constexpr,
-    # dst: [total_tokens, n_heads, head_dim] (contiguous)
-    dst_stride_token: tl.constexpr,
-    dst_stride_head: tl.constexpr,
-    # Constants
-    MAX_Q_LEN: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-):
-    """Transpose SDPA output from [num_seq, n_heads, max_q_len, head_dim]
-    to [total_tokens, n_heads, head_dim] where total_tokens = num_seq * max_q_len.
-
-    Grid: (num_seq * max_q_len, n_heads)
-    Each program copies one (token, head) vector of HEAD_DIM elements.
-    """
-    token_id = tl.program_id(0)
-    head_id = tl.program_id(1)
-
-    seq_id = token_id // MAX_Q_LEN
-    local_token = token_id % MAX_Q_LEN
-
-    head_offsets = tl.arange(0, HEAD_DIM)
-
-    src_offset = (
-        seq_id * src_stride_seq
-        + head_id * src_stride_head
-        + local_token * src_stride_token
-        + head_offsets
-    )
-    dst_offset = token_id * dst_stride_token + head_id * dst_stride_head + head_offsets
-
-    data = tl.load(src_ptr + src_offset)
-    tl.store(dst_ptr + dst_offset, data)
-
-
-@triton.jit
 def _fast_gather_sdpa_kernel(
     kv_cache_ptr,
     kv_indices_ptr,
@@ -1288,11 +1247,19 @@ def triton_paged_context(
 
     if use_sdpa:
         # Fast Triton gather: scattered pages → separate K, V in SDPA layout
-        # Single kernel replaces kv_cache[indices].view().permute().reshape()
+        # Single alloc for both K and V, single kernel to fill
         max_kv_len = max_pages * page_size
-        sdpa_shape = (num_seq, n_kv_heads, max_kv_len, head_dim)
-        k_sdpa = torch.empty(sdpa_shape, dtype=kv_cache.dtype, device=kv_cache.device)
-        v_sdpa = torch.empty(sdpa_shape, dtype=kv_cache.dtype, device=kv_cache.device)
+        kv_buf = torch.empty(
+            2,
+            num_seq,
+            n_kv_heads,
+            max_kv_len,
+            head_dim,
+            dtype=kv_cache.dtype,
+            device=kv_cache.device,
+        )
+        k_sdpa = kv_buf[0]
+        v_sdpa = kv_buf[1]
         total_pages_count = kv_indices.shape[0]
         if total_pages_count > 0:
             _fast_gather_sdpa_kernel[(total_pages_count, n_kv_heads)](
@@ -1322,7 +1289,6 @@ def triton_paged_context(
             is_causal=True,
             enable_gqa=True,
         )
-        # transpose + contiguous + view is often faster than transpose + reshape
         output.view(num_seq, max_q_len, n_heads, head_dim).copy_(o_sdpa.permute(0, 2, 1, 3))
     else:
         # Use paged kernel (better for small workloads)
