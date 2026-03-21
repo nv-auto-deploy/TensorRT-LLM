@@ -343,7 +343,7 @@ def _flash_decode_stage1_kernel(
         p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO_PADDED, PAGE_SIZE]
 
         # [HEAD_RATIO_PADDED, PAGE_SIZE] @ [PAGE_SIZE, HEAD_DIM] -> [HEAD_RATIO_PADDED, HEAD_DIM]
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_i_new
 
@@ -681,7 +681,7 @@ def _paged_context_kernel(
         m_i_new = tl.maximum(m_i, m_ij)
         alpha = tl.exp(m_i - m_i_new)
         p = tl.exp(qk - m_i_new[:, None])
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_i_new
 
@@ -715,7 +715,7 @@ def _paged_context_kernel(
             m_i_new = tl.maximum(m_i, m_ij)
             alpha = tl.exp(m_i - m_i_new)
             p = tl.exp(qk - m_i_new[:, None])
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_i_new
 
@@ -727,6 +727,241 @@ def _paged_context_kernel(
         + dhead_offsets[None, :]
     )
     tl.store(o_ptr + o_store_offsets, o, mask=q_load_mask)
+
+
+def _gather_paged_kv(
+    kv_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    seq_len_with_cache: torch.Tensor,
+    num_seq: int,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Gather scattered paged KV into contiguous per-sequence buffers.
+
+    Uses vectorized torch operations — no Python loops.
+
+    Returns:
+        k_contig: [num_seq, max_kv_len_padded, n_kv_heads, head_dim]
+        v_contig: same
+        max_kv_len_padded: padded to page_size alignment
+    """
+    _, _, n_kv_heads, page_size, head_dim = kv_cache.shape
+    max_kv_len = int(seq_len_with_cache.max().item())
+    max_kv_len_padded = ((max_kv_len + page_size - 1) // page_size) * page_size
+    # Gather all referenced pages: [total_pages, 2, n_kv_heads, page_size, head_dim]
+    gathered = kv_cache[kv_indices.long()]
+
+    # Reshape to per-sequence: [num_seq, max_pages_per_seq, 2, n_kv_heads, page_size, head_dim]
+    # Pad kv_indices to max_pages_per_seq if sequences have different page counts
+    page_counts = kv_indptr[1:] - kv_indptr[:-1]
+    max_pages = int(page_counts.max().item())
+
+    if max_pages == 0:
+        k_contig = torch.zeros(
+            num_seq,
+            max_kv_len_padded,
+            n_kv_heads,
+            head_dim,
+            dtype=kv_cache.dtype,
+            device=kv_cache.device,
+        )
+        return k_contig, k_contig.clone(), max_kv_len_padded
+
+    # Check if all sequences have the same number of pages (common case)
+    all_same = bool((page_counts == max_pages).all().item())
+
+    if all_same and num_seq > 0:
+        # Fully vectorized path: no Python loop
+        # gathered shape: [num_seq * max_pages, 2, n_kv_heads, page_size, head_dim]
+        gathered = gathered.reshape(num_seq, max_pages, 2, n_kv_heads, page_size, head_dim)
+        # → [num_seq, max_pages, n_kv_heads, page_size, head_dim] for K and V
+        k_pages = gathered[:, :, 0]  # [num_seq, max_pages, n_kv_heads, page_size, head_dim]
+        v_pages = gathered[:, :, 1]
+        # → [num_seq, max_pages * page_size, n_kv_heads, head_dim]
+        k_contig = k_pages.permute(0, 1, 3, 2, 4).reshape(
+            num_seq, max_pages * page_size, n_kv_heads, head_dim
+        )
+        v_contig = v_pages.permute(0, 1, 3, 2, 4).reshape(
+            num_seq, max_pages * page_size, n_kv_heads, head_dim
+        )
+    else:
+        # Fallback: per-sequence gather (variable page counts)
+        k_contig = torch.zeros(
+            num_seq,
+            max_kv_len_padded,
+            n_kv_heads,
+            head_dim,
+            dtype=kv_cache.dtype,
+            device=kv_cache.device,
+        )
+        v_contig = torch.zeros_like(k_contig)
+        for seq_idx in range(num_seq):
+            ps = kv_indptr[seq_idx].item()
+            pe = kv_indptr[seq_idx + 1].item()
+            n_pages_seq = pe - ps
+            if n_pages_seq == 0:
+                continue
+            seq_k = gathered[ps:pe, 0].permute(0, 2, 1, 3).reshape(-1, n_kv_heads, head_dim)
+            seq_v = gathered[ps:pe, 1].permute(0, 2, 1, 3).reshape(-1, n_kv_heads, head_dim)
+            n_tok = min(n_pages_seq * page_size, max_kv_len_padded)
+            k_contig[seq_idx, :n_tok] = seq_k[:n_tok]
+            v_contig[seq_idx, :n_tok] = seq_v[:n_tok]
+
+    return k_contig, v_contig, max_kv_len_padded
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"Q_BLOCK": 64, "KV_BLOCK": 64}, num_stages=3, num_warps=4),
+        triton.Config({"Q_BLOCK": 64, "KV_BLOCK": 128}, num_stages=3, num_warps=4),
+        triton.Config({"Q_BLOCK": 128, "KV_BLOCK": 64}, num_stages=3, num_warps=8),
+        triton.Config({"Q_BLOCK": 128, "KV_BLOCK": 128}, num_stages=3, num_warps=8),
+        triton.Config({"Q_BLOCK": 128, "KV_BLOCK": 64}, num_stages=2, num_warps=4),
+    ],
+    key=["HEAD_DIM"],
+)
+@triton.jit
+def _contiguous_context_kernel(
+    # Inputs
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    # Metadata
+    qo_indptr_ptr,
+    seq_len_with_cache_ptr,
+    # Output
+    o_ptr,
+    # Strides
+    q_stride_token: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    k_stride_seq: tl.constexpr,
+    k_stride_token: tl.constexpr,
+    k_stride_head: tl.constexpr,
+    o_stride_token: tl.constexpr,
+    o_stride_head: tl.constexpr,
+    # Autotuned
+    Q_BLOCK: tl.constexpr,
+    KV_BLOCK: tl.constexpr,
+    # Constants
+    SM_SCALE: tl.constexpr,
+    N_HEADS: tl.constexpr,
+    N_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """Flash attention on contiguous KV — no page table, large KV tiles.
+
+    Grid: (num_seq, n_heads, num_q_blocks)
+    K, V layout: [num_seq, max_kv_len, n_kv_heads, head_dim]
+    """
+    batch_id = tl.program_id(axis=0)
+    head_id = tl.program_id(axis=1)
+    q_block_id = tl.program_id(axis=2)
+
+    HEAD_RATIO: tl.constexpr = N_HEADS // N_KV_HEADS
+    kv_head_id = head_id // HEAD_RATIO
+
+    q_start = tl.load(qo_indptr_ptr + batch_id)
+    q_end = tl.load(qo_indptr_ptr + batch_id + 1)
+    q_len = q_end - q_start
+    total_kv_len = tl.load(seq_len_with_cache_ptr + batch_id)
+    cache_len = total_kv_len - q_len
+
+    q_block_start = q_block_id * Q_BLOCK
+    q_offsets = q_block_start + tl.arange(0, Q_BLOCK)
+    q_mask = q_offsets < q_len
+
+    if tl.sum(q_mask.to(tl.int32)) == 0:
+        return
+
+    dhead_offsets = tl.arange(0, HEAD_DIM)
+
+    # Load Q: [Q_BLOCK, HEAD_DIM]
+    q_load_offsets = (
+        (q_start + q_offsets[:, None]) * q_stride_token
+        + head_id * q_stride_head
+        + dhead_offsets[None, :]
+    )
+    q = tl.load(q_ptr + q_load_offsets, mask=q_mask[:, None], other=0.0)
+
+    acc = tl.zeros([Q_BLOCK, HEAD_DIM], dtype=tl.float32)
+    m_i = tl.zeros([Q_BLOCK], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([Q_BLOCK], dtype=tl.float32)
+
+    # Causal boundary
+    max_q_pos = q_block_start + Q_BLOCK - 1 + cache_len
+    max_kv_idx = tl.minimum(max_q_pos + 1, total_kv_len)
+    first_q_kv_pos = q_block_start + cache_len
+    kv_offsets_base = tl.arange(0, KV_BLOCK)
+
+    # K, V base for this sequence and KV head
+    kv_seq_base = batch_id * k_stride_seq + kv_head_id * k_stride_head
+
+    # Number of full KV blocks (no causal mask needed)
+    num_full_kv_iters = first_q_kv_pos // KV_BLOCK
+    is_full_q_block = (q_block_start + Q_BLOCK) <= q_len
+
+    # Phase 1: Full KV blocks — contiguous loads, no masking
+    for kv_iter in range(num_full_kv_iters):
+        kv_start = kv_iter * KV_BLOCK
+        kv_load_offsets = (
+            kv_seq_base
+            + (kv_start + kv_offsets_base[:, None]) * k_stride_token
+            + dhead_offsets[None, :]
+        )
+        k = tl.load(k_ptr + kv_load_offsets)  # [KV_BLOCK, HEAD_DIM] contiguous!
+        v = tl.load(v_ptr + kv_load_offsets)
+
+        qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+        if not is_full_q_block:
+            qk = tl.where(q_mask[:, None], qk, float("-inf"))
+
+        m_ij = tl.max(qk, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_i_new)
+        p = tl.exp(qk - m_i_new[:, None])
+        acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_i_new
+
+    # Phase 2: Remaining KV blocks with causal + validity masking
+    kv_remaining_start = num_full_kv_iters * KV_BLOCK
+    num_remaining_iters = (max_kv_idx - kv_remaining_start + KV_BLOCK - 1) // KV_BLOCK
+
+    for kv_iter_local in range(num_remaining_iters):
+        kv_start = kv_remaining_start + kv_iter_local * KV_BLOCK
+        kv_positions = kv_start + kv_offsets_base
+        kv_valid = kv_positions < total_kv_len
+
+        kv_load_offsets = (
+            kv_seq_base
+            + (kv_start + kv_offsets_base[:, None]) * k_stride_token
+            + dhead_offsets[None, :]
+        )
+        k = tl.load(k_ptr + kv_load_offsets, mask=kv_valid[:, None], other=0.0)
+        v = tl.load(v_ptr + kv_load_offsets, mask=kv_valid[:, None], other=0.0)
+
+        qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+        q_positions = q_offsets[:, None] + cache_len
+        causal_mask = q_positions >= kv_positions[None, :]
+        full_mask = q_mask[:, None] & causal_mask & kv_valid[None, :]
+        qk = tl.where(full_mask, qk, float("-inf"))
+
+        m_ij = tl.max(qk, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_i_new)
+        p = tl.exp(qk - m_i_new[:, None])
+        acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_i_new
+
+    l_i = tl.where(l_i == 0.0, 1.0, l_i)
+    o = acc / l_i[:, None]
+    o_store_offsets = (
+        (q_start + q_offsets[:, None]) * o_stride_token
+        + head_id * o_stride_head
+        + dhead_offsets[None, :]
+    )
+    tl.store(o_ptr + o_store_offsets, o, mask=q_mask[:, None])
 
 
 def _get_prefill_num_splits(
@@ -780,35 +1015,75 @@ def triton_paged_context(
     if num_seq == 0 or max_q_len == 0:
         return output
 
-    # Grid depends on autotuned Q_BLOCK, so use a lambda
-    def grid(meta):
-        q_block = meta["Q_BLOCK"]
-        num_q_blocks = (max_q_len + q_block - 1) // q_block
-        return (num_seq, n_heads, num_q_blocks)
+    # Adaptive dispatch: use contiguous kernel for large workloads,
+    # paged kernel for small/medium where gather overhead dominates
+    total_kv_tokens = num_seq * max_q_len
+    use_contiguous = total_kv_tokens >= 4096 and num_seq <= 16
 
-    _paged_context_kernel[grid](
-        q,
-        kv_cache,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_len,
-        seq_len_with_cache,
-        output,
-        q.stride(0),
-        q.stride(1),
-        output.stride(0),
-        output.stride(1),
-        kv_cache.stride(0),
-        kv_cache.stride(1),
-        kv_cache.stride(2),
-        kv_cache.stride(3),
-        SM_SCALE=sm_scale,
-        N_HEADS=n_heads,
-        N_KV_HEADS=n_kv_heads,
-        HEAD_DIM=head_dim,
-        PAGE_SIZE=page_size,
-    )
+    if use_contiguous:
+        # Gather paged KV into contiguous buffers for efficient flash attention
+        k_contig, v_contig, max_kv_len_padded = _gather_paged_kv(
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+            seq_len_with_cache,
+            num_seq,
+        )
+
+        def grid_contig(meta):
+            q_block = meta["Q_BLOCK"]
+            num_q_blocks = (max_q_len + q_block - 1) // q_block
+            return (num_seq, n_heads, num_q_blocks)
+
+        _contiguous_context_kernel[grid_contig](
+            q,
+            k_contig,
+            v_contig,
+            qo_indptr,
+            seq_len_with_cache,
+            output,
+            q.stride(0),
+            q.stride(1),
+            k_contig.stride(0),
+            k_contig.stride(1),
+            k_contig.stride(2),
+            output.stride(0),
+            output.stride(1),
+            SM_SCALE=sm_scale,
+            N_HEADS=n_heads,
+            N_KV_HEADS=n_kv_heads,
+            HEAD_DIM=head_dim,
+        )
+    else:
+        # Use paged kernel (better for small workloads)
+        def grid_paged(meta):
+            q_block = meta["Q_BLOCK"]
+            num_q_blocks = (max_q_len + q_block - 1) // q_block
+            return (num_seq, n_heads, num_q_blocks)
+
+        _paged_context_kernel[grid_paged](
+            q,
+            kv_cache,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            seq_len_with_cache,
+            output,
+            q.stride(0),
+            q.stride(1),
+            output.stride(0),
+            output.stride(1),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            kv_cache.stride(3),
+            SM_SCALE=sm_scale,
+            N_HEADS=n_heads,
+            N_KV_HEADS=n_kv_heads,
+            HEAD_DIM=head_dim,
+            PAGE_SIZE=page_size,
+        )
 
     return output
 
