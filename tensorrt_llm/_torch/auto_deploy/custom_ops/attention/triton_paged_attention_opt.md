@@ -273,6 +273,32 @@ because Triton generates simpler memory access code without predication. Keeping
 
 **Iteration count: 3 / 50**
 
+### Iteration 4 — Serialized GQA for prefill (FAILED)
+
+**What changed:**
+
+- Changed grid from (num_seq, n_heads, num_q_blocks) to (num_seq, n_kv_heads, num_q_blocks)
+- Each program loops over HEAD_RATIO Q heads, loading KV once per page for L2 reuse
+- Goal: reduce KV memory traffic by HEAD_RATIO via L2 cache reuse
+
+**Correctness:** PASS (49/49 tests)
+
+**Prefill results (us):**
+
+| ID | Iter 3 (best) | Iter 4 | Delta |
+|----|---------------|--------|-------|
+| P3 | 273.3 | 502.5 | **+84% regression** |
+| P5 | 843.6 | 1041.9 | +24% |
+| P8 | 273.3 | 1598.3 | **+485% regression** |
+
+**Analysis:** Catastrophic regression. HEAD_RATIO reduction in grid parallelism
+(512→128 programs for Llama-8B, 512→32 for Nemotron HEAD_RATIO=16) massively
+underutilizes the GPU. The L2 reuse benefit is real but dwarfed by the
+parallelism loss. Need an approach that preserves parallelism while improving
+memory reuse. **Reverted.**
+
+**Iteration count: 4 / 50**
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
