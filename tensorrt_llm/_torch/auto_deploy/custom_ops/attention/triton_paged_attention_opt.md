@@ -538,6 +538,37 @@ P5 at 1.41x is approaching parity. P3/P6/P8 improved 17-24%.
 
 ______________________________________________________________________
 
+### Iterations 24-26 — Threshold tuning + permute fix + combined KV gather
+
+- Iter 24: seq>=512 threshold (reverted, hurt short seq)
+- Iter 25: Fix permute order bug (0,3,1,2,4) → (0,2,1,3,4) for correct token ordering
+- Iter 26: Combined K,V permute (single permute + reshape instead of two separate)
+
+| ID | Iter 23 | Iter 26 | Delta | vs FI |
+|----|---------|---------|-------|-------|
+| P3 | 224 | **215** | -4% | **2.05x** |
+| P5 | 488 | **475** | -3% | **1.40x** |
+| P6 | 215 | **206** | -4% | **2.14x** |
+| P8 | 223 | **214** | -4% | **2.06x** |
+
+### Summary — Best results (iter 26)
+
+| ID | Baseline | Best | Speedup | vs FI | Path |
+|----|----------|------|---------|-------|------|
+| P1 | 65.5 | 63 | -4% | 4.4x | paged |
+| P2 | 92.6 | 88 | -5% | 3.8x | paged |
+| P3 | 320.4 | **215** | **-33%** | **2.05x** | SDPA |
+| P4 | 134.0 | 121 | -10% | 2.2x | paged |
+| P5 | 960.7 | **475** | **-51%** | **1.40x** | SDPA |
+| P6 | 291.6 | **206** | **-29%** | **2.14x** | SDPA |
+| P7 | 226.5 | **178** | **-21%** | **2.64x** | SDPA |
+| P8 | 319.6 | **214** | **-33%** | **2.06x** | SDPA |
+| P9 | 131.6 | 121 | -8% | 2.2x | paged |
+
+**Iteration count: 26 / 50**
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Decode Stage 1
