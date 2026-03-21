@@ -341,6 +341,32 @@ paths. Hoisting offsets didn't help either. **Reverted.**
 
 **Iteration count: 6 / 50**
 
+### Iteration 7 — Hoist KV offsets (kept, marginal)
+
+Hoisted `kv_head_offset` and `local_kv` out of page loop. ~1% improvement.
+
+### Iteration 8 — 3D batched GQA with tl.dot (FAILED)
+
+**What changed:** Rewrote prefill kernel to process HEAD_RATIO Q heads simultaneously
+using 3D batched `tl.dot`. Q shape \[HEAD_RATIO, Q_BLOCK, HEAD_DIM\], KV broadcast
+to \[HEAD_RATIO, PAGE_SIZE, HEAD_DIM\]. Grid changed to (num_seq, n_kv_heads, num_q_blocks).
+
+**Correctness:** PASS (49/49) after fixing tl.trans→tl.permute for 3D tensors.
+
+| ID | Iter 7 | Iter 8 | Delta |
+|----|--------|--------|-------|
+| P3 | 275 | 330 | **+20% regression** |
+| P5 | 799 | 918 | **+15% regression** |
+| P7 (HR=8) | 194 | 763 | **+293% regression** |
+| P8 (HR=16) | 275 | 11134 | **catastrophic** |
+
+**Analysis:** 3D tensors cause massive register spills. HEAD_RATIO=16 needs
+16×Q_BLOCK×HEAD_DIM fp32 accumulators — far exceeds register file.
+Combined with reduced grid parallelism, this approach is fundamentally
+impractical for GQA ratios > 2. **Reverted.**
+
+**Iteration count: 8 / 50**
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
