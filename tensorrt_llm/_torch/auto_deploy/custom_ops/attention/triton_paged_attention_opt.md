@@ -210,6 +210,37 @@ Even with perfect config, prefill is still 1.2-2.5x slower than FI. **Structural
 
 **Iteration count: 1 / 50**
 
+### Iteration 2 — Multi-page KV tiling for prefill (FAILED)
+
+**What changed:**
+
+- Added `PAGES_PER_ITER` constexpr to prefill kernel (1, 4, or 8 pages per loop iteration)
+- Assembles `[KV_BLOCK, HEAD_DIM]` tiles from multiple non-contiguous pages using
+  masked loads + tl.where placement
+- Goal: larger dot products `[Q_BLOCK, KV_BLOCK]` for better tensor core utilization,
+  fewer loop iterations
+
+**Correctness:** PASS (49/49 tests)
+
+**Prefill results (us):**
+
+| ID | Baseline | Iter 2 | Delta | vs FI |
+|----|----------|--------|-------|-------|
+| P1 | 65.5 | 66.2 | +1% | 4.41x |
+| P2 | 92.6 | 94.7 | +2% | 4.08x |
+| P3 | 320.4 | 341.0 | **+6%** | 3.23x |
+| P4 | 134.0 | 146.0 | **+9%** | 2.68x |
+| P5 | 960.7 | 1109.0 | **+15%** | 3.19x |
+| P9 | 131.6 | 139.3 | +6% | 2.58x |
+
+**Analysis:** Multi-page tiling made things WORSE. The overhead of tile assembly
+(per-page row_mask computation, safe_offset clamping, masked loads + tl.where placement)
+exceeds any benefit from larger dot products. The non-contiguous paged layout makes
+it expensive to assemble tiles, unlike dense attention where KV is contiguous.
+**Reverted.** Next: try reducing causal masking overhead with two-phase loop.
+
+**Iteration count: 2 / 50**
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
