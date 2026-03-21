@@ -35,6 +35,7 @@ def _torch_causal_conv1d(
     output_sizes: Optional[List[int]] = None,
     layer_type: str = "unknown",
 ) -> torch.Tensor:
+    """Causal 1D convolution; accepts ``tp_mode`` for sharding-aware AutoDeploy behavior."""
     assert padding_mode == "zeros", "padding_mode must be zeros"
 
     batch_size, seq_len, _ = input.shape

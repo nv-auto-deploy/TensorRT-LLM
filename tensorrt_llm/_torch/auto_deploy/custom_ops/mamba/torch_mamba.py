@@ -193,6 +193,7 @@ def _torch_ssm(
     shardable: bool = False,
     layer_type: str = "unknown",
 ) -> torch.Tensor:
+    """Mamba SSM mixer forward; accepts ``tp_mode`` for sharding-aware AutoDeploy behavior."""
     y, _ = _torch_ssm_prefill(hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size)
     return y
 

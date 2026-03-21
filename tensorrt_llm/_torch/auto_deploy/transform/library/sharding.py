@@ -3850,6 +3850,10 @@ class ApplyShardingHints(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        """Apply node-local sharding based on hint kwargs and runtime DistConfig.
+
+        Skips when world_size < 2. Supports shard_layers filtering and simple_shard_only mode.
+        """
         world_size = shared_config.world_size
 
         if world_size < 2:

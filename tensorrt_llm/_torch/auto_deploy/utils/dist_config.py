@@ -44,25 +44,31 @@ class DistConfig(BaseModel):
 
     @property
     def tp_rank(self) -> int:
+        """Local rank within tensor parallelism (0 .. tp_size - 1)."""
         return self.rank % self.tp_size
 
     @property
     def pp_rank(self) -> int:
+        """Pipeline-parallel stage index for this process."""
         return self.rank // self.tp_size
 
     @property
     def moe_tp_rank(self) -> int:
+        """MoE tensor-parallel rank within the MoE TP subgroup."""
         return self.tp_rank // (self.moe_ep_size * self.moe_cluster_size)
 
     @property
     def moe_ep_rank(self) -> int:
+        """Expert-parallel rank derived from the tensor-parallel rank."""
         return self.tp_rank % self.moe_ep_size
 
     @property
     def moe_cluster_rank(self) -> int:
+        """MoE cluster index derived from the tensor-parallel rank."""
         return self.tp_rank % self.moe_cluster_size
 
     def to_dict(self) -> dict:
+        """Return a plain dict of serializable DistConfig fields."""
         return {
             "world_size": self.world_size,
             "rank": self.rank,
@@ -77,15 +83,18 @@ class DistConfig(BaseModel):
 
     @classmethod
     def from_dict(cls, d: dict) -> "DistConfig":
+        """Construct from a dict, ignoring keys that are not DistConfig fields."""
         known = {f for f in cls.model_fields}
         filtered = {k: v for k, v in d.items() if k in known}
         return cls(**filtered)
 
     def serialize(self) -> str:
+        """JSON string for this config (via ``to_dict``)."""
         return json.dumps(self.to_dict())
 
     @classmethod
     def deserialize(cls, s: str) -> "DistConfig":
+        """Parse a JSON string into a ``DistConfig``."""
         return cls.from_dict(json.loads(s))
 
     @staticmethod

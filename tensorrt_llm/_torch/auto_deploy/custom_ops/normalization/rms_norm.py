@@ -126,6 +126,8 @@ def torch_rmsnorm_gated(
         eps: Small constant for numerical stability.
         group_size: Size of groups for grouped normalization. H must be divisible by group_size.
         norm_before_gate: If True, apply gating after normalization. If False, apply before.
+        tp_mode: Tensor-parallel sharding hint for transforms.
+        layer_type: Layer id hint for selective sharding (e.g. ``shard_layers``).
 
     Returns:
         Normalized and optionally gated tensor of shape like x.
