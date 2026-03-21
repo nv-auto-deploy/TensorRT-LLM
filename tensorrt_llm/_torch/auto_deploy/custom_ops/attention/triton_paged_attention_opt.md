@@ -737,44 +737,138 @@ Not worth the complexity.
 
 **Iteration count: 38 / 50**
 
+### Iteration 39 — Decode autotune expansion
+
+Added `num_warps=8, num_stages=2` config to decode Stage 1 autotune.
+No measurable improvement on D3/D14/D15 gaps.
+
+### Iteration 40 — Cache SM count
+
+Cache `get_device_properties(0).multi_processor_count` to avoid ~0.8 us per call.
+
+### Iteration 41 — Remove dead code
+
+Removed ~400 lines of unused functions: `_gather_pages_kernel`, `_gather_paged_kv_sdpa`,
+`_gather_and_format_kv`, `_gather_paged_kv`, `_contiguous_context_kernel`, `_get_prefill_num_splits`.
+
+### Iteration 42 — SDPA backend comparison (no change)
+
+cuDNN (18 us) > Flash (26 us) > Math (247 us) for P2. cuDNN already auto-selected.
+
+### Iteration 43 — Hoist q_positions out of Phase 2 loop
+
+Pre-compute `q_positions_2d = q_offsets[:, None] + cache_len` outside the Phase 2 page loop.
+
+### Iteration 44 — Raise SDPA batch limit to 64
+
+Allow SDPA path for up to 64 sequences (was 16).
+
+### Iteration 45 — Block pointers in gather (reverted)
+
+Tested block pointers for gather reads. Slower due to `make_block_ptr` overhead.
+TMA doesn't help for scattered pages.
+
+### Iterations 46-48 — Diminishing returns analysis
+
+Tested: block ptrs in Phase 2 (reverted, P1 regression), SDPA threshold=128 (paged better
+for short seq), various gather optimizations (vectorized loads, multi-head loop).
+All reverted — within noise or regressions.
+
+**Root cause of remaining gap:**
+
+- P1 (1.12x): Paged kernel at 15.6 us vs FI 14 us. The 1.6 us gap is pure Triton codegen
+  overhead (scattered 4KB loads, int64 arithmetic, dynamic loop) vs FI's hand-tuned CUDA.
+- P2 (1.11x): SDPA path overhead = gather (7 us) + output copy (8 us) partially pipelined.
+  FI accesses pages natively with no gather or copy.
+- Remaining gaps are architectural (Triton vs CUDA) and cannot be closed without custom CUDA.
+
+### Iterations 49-50 — Final measurement
+
+Final comprehensive benchmark on H100 80GB HBM3:
+
+### Summary — Final prefill results (iter 50)
+
+| ID | Baseline | Best | Speedup | vs FI | Path |
+|----|----------|------|---------|-------|------|
+| P1 | 65.5 | **15.6** | **-76%** | **1.12x** | paged |
+| P2 | 92.6 | **25.4** | **-73%** | **1.11x** | SDPA |
+| P3 | 320.4 | **112** | **-65%** | **1.07x** | SDPA |
+| P4 | 134.0 | **55** | **-59%** | **1.01x** | SDPA |
+| P5 | 960.7 | **349** | **-64%** | **0.99x** | SDPA |
+| P6 | 291.6 | **97** | **-67%** | **1.01x** | SDPA |
+| P7 | 226.5 | **69** | **-70%** | **1.02x** | SDPA |
+| P8 | 319.6 | **105** | **-67%** | **1.01x** | SDPA |
+| P9 | 131.6 | **52** | **-61%** | **0.96x** | SDPA |
+
+### Summary — Final decode results (iter 50)
+
+| ID | Triton | FI | Ratio |
+|----|--------|----|-------|
+| D1 | 11.8 | 14.3 | **0.83x** |
+| D2 | 16.7 | 16.8 | 0.99x |
+| D3 | 31.9 | 29.9 | 1.06x |
+| D4 | 18.0 | 22.4 | **0.81x** |
+| D5 | 40.1 | 44.5 | **0.90x** |
+| D6 | 108.0 | 110.4 | 0.98x |
+| D7 | 108.5 | 107.7 | 1.01x |
+| D8 | 366.7 | 372.4 | 0.98x |
+| D9 | 15.3 | 15.4 | 0.99x |
+| D10 | 26.3 | 29.8 | **0.88x** |
+| D11 | 14.1 | 14.4 | 0.98x |
+| D12 | 21.3 | 22.4 | 0.95x |
+| D13 | 14.5 | 14.4 | 1.01x |
+| D14 | 23.6 | 22.7 | 1.04x |
+| D15 | 48.0 | 45.6 | 1.05x |
+
+**Iteration count: 50 / 50**
+
 ______________________________________________________________________
 
-## 4. Optimization Ideas Backlog
+## 4. Key Optimizations Summary
 
-### Decode Stage 1
+### Breakthroughs (highest impact)
 
-- \[ \] Sweep num_warps {1,2,4,8,16} x num_stages {1,2,3,4,5}
-- \[ \] Vectorized KV loads (load float4 / use tl.load with wider access)
-- \[ \] Process multiple pages per loop iteration to increase arithmetic intensity
-- \[ \] Precompute page indices into shared memory to avoid repeated page-table loads
-- \[ \] Try different HEAD_RATIO tiling (process fewer heads per program but more pages)
-- \[ \] Persistent kernel: assign multiple (batch, kv_head) pairs to one program
-- \[ \] Use tl.dot with tf32 accumulation for higher throughput on H100
+1. **Eliminate GPU sync** (iter 34): `max_q_len = total_tokens // num_seq` instead of
+   `.item()`. Single biggest win: P1 63→16 us, all shapes improved 10-75%.
+1. **SDPA integration** (iter 16-23): Replace Triton contiguous kernel with `torch.nn.functional.scaled_dot_product_attention` using cuDNN backend. P5 960→520 us.
+1. **Triton gather kernel** (iter 31): Replace Python `kv_cache[indices].view().permute().reshape()` with a single Triton kernel. P5 429→388 us.
+1. **Two-phase page loop** (iter 3): Split paged kernel into full-page and boundary phases. 8-15% improvement.
+1. **Eliminate earlier GPU sync** (iter 27): Remove `.item()` calls from SDPA dispatch check. P3 215→168 us.
 
-### Decode Stage 2
+### Approaches that failed
 
-- \[ \] Unroll split loop for common NUM_SPLITS values
-- \[ \] Load all LSE values first, compute global max, then load partial_o (better pipelining)
-- \[ \] Vectorized partial_o loads
+- Multi-page KV tiling (iter 2): assembly overhead > benefit
+- Serialized GQA (iters 4, 10): parallelism loss catastrophic
+- 3D batched GQA (iter 8): register spills at HEAD_RATIO>2
+- Persistent kernel (iter 11): overhead from per-tile metadata
+- Pre-scale Q (iter 6): fp16 precision loss
+- Block pointers for scattered pages (iter 45): TMA not applicable
 
-### Context/Prefill Kernel
+### Architecture
 
-- \[ \] Sweep Q_BLOCK {16,32,64,128,256} x num_warps x num_stages
-- \[ \] Process multiple KV pages per loop iteration
-- \[ \] 2D tiling over Q and KV dimensions
-- \[ \] Skip fully-masked pages more efficiently (precompute boundary)
-- \[ \] Persistent kernel: process multiple sequences per program
+```
+triton_paged_context():
+  if max_q_len >= 512 and same-length batch:
+    → _fast_gather_sdpa_kernel → torch.nn.functional.scaled_dot_product_attention
+  else:
+    → _paged_context_kernel (two-phase: full pages + boundary pages)
 
-### Cache Update Kernel
-
-- \[ \] Vectorized K,V stores
-- \[ \] Fuse cache update into stage1 decode / context kernel
+triton_paged_decode():
+  → _flash_decode_stage1_kernel (GQA-batched split-K)
+  → _flash_decode_stage2_kernel (reduce partial results)
+```
 
 ______________________________________________________________________
 
 ## 5. Final Best Configuration
 
-(to be filled at end)
+| Component | Config |
+|-----------|--------|
+| Decode Stage 1 | warps=2-4, stages=2-3 (autotuned by HEAD_RATIO_PADDED) |
+| Decode Stage 2 | warps=4 (fixed) |
+| Paged Context | Q_BLOCK=64-128, warps=4-8 (autotuned by HEAD_DIM, PAGE_SIZE) |
+| SDPA threshold | max_q_len >= 512, num_seq \<= 64, same-length batch |
+| Gather kernel | Grid: (total_pages, n_kv_heads), direct to SDPA layout |
 
 ______________________________________________________________________
 
