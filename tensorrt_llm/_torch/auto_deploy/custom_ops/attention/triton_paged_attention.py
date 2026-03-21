@@ -557,10 +557,8 @@ def triton_paged_decode(
     configs=[
         triton.Config({"Q_BLOCK": 64}, num_stages=2, num_warps=4),
         triton.Config({"Q_BLOCK": 64}, num_stages=4, num_warps=4),
-        triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=4),
         triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=3, num_warps=8),
-        triton.Config({"Q_BLOCK": 128}, num_stages=5, num_warps=4),
     ],
     key=["HEAD_DIM", "PAGE_SIZE"],
 )
