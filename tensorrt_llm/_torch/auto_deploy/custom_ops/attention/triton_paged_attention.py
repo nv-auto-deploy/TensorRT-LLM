@@ -48,6 +48,17 @@ from ..attention_interface import (
 
 KV_LAYOUT: Literal["HND", "NHD"] = "HND"
 
+# Cache SM count to avoid repeated get_device_properties calls
+_NUM_SMS: Optional[int] = None
+
+
+def _get_num_sms() -> int:
+    """Get the number of SMs on the current GPU (cached)."""
+    global _NUM_SMS
+    if _NUM_SMS is None:
+        _NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
+    return _NUM_SMS
+
 
 def _get_sm_scale(head_dim: int, scale: Optional[float]) -> float:
     """Get softmax scale, computing default if not provided."""
@@ -162,7 +173,7 @@ def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_siz
     if max_seq_len <= 0:
         return 1
 
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    num_sms = _get_num_sms()
     existing_parallelism = batch_size * n_kv_heads
 
     # Already enough parallelism
@@ -1184,7 +1195,7 @@ def _get_prefill_num_splits(
     """Compute split-K factor for prefill to ensure GPU saturation."""
     num_q_blocks = (max_q_len + q_block - 1) // q_block
     base_programs = num_seq * n_heads * num_q_blocks
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    num_sms = _get_num_sms()
 
     # Already enough parallelism — no split needed
     if base_programs >= num_sms * 2:
