@@ -729,6 +729,64 @@ def _paged_context_kernel(
     tl.store(o_ptr + o_store_offsets, o, mask=q_load_mask)
 
 
+@triton.jit
+def _gather_pages_kernel(
+    kv_cache_ptr,
+    kv_indices_ptr,
+    kv_indptr_ptr,
+    out_k_ptr,
+    out_v_ptr,
+    # Strides
+    cache_stride_block: tl.constexpr,
+    cache_stride_kv: tl.constexpr,
+    cache_stride_head: tl.constexpr,
+    cache_stride_token: tl.constexpr,
+    out_stride_seq: tl.constexpr,
+    out_stride_token: tl.constexpr,
+    out_stride_head: tl.constexpr,
+    # Constants
+    N_KV_HEADS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """Gather pages into contiguous K, V buffers.
+
+    Grid: (total_pages, N_KV_HEADS)
+    Each program copies one page for one KV head.
+    """
+    page_global_idx = tl.program_id(0)
+    kv_head_id = tl.program_id(1)
+
+    physical_page = tl.load(kv_indices_ptr + page_global_idx)
+
+    # Determine which sequence this page belongs to and its local position
+    # We encode (seq_idx, local_page_idx) in the flattened page_global_idx
+    # by using the kv_indptr. But for simplicity, pass pre-computed mapping.
+    # Instead, use a simpler approach: pass seq_id and local_page_id as args.
+    # For now, just copy page_global_idx'th page to the output at the right position.
+
+    token_offsets = tl.arange(0, PAGE_SIZE)
+    head_offsets = tl.arange(0, HEAD_DIM)
+
+    # Source: kv_cache[physical_page, 0/1, kv_head_id, :, :]
+    src_base_k = (
+        physical_page * cache_stride_block + 0 * cache_stride_kv + kv_head_id * cache_stride_head
+    )
+    src_base_v = src_base_k + cache_stride_kv
+
+    src_offsets = token_offsets[:, None] * cache_stride_token + head_offsets[None, :]
+
+    k_data = tl.load(kv_cache_ptr + src_base_k + src_offsets)
+    v_data = tl.load(kv_cache_ptr + src_base_v + src_offsets)
+
+    # Destination: out[page_global_idx * PAGE_SIZE + token, kv_head_id, :]
+    # We flatten all pages across all sequences first, then reshape in Python
+    dst_base = page_global_idx * PAGE_SIZE * out_stride_token + kv_head_id * out_stride_head
+    dst_offsets = token_offsets[:, None] * out_stride_token + head_offsets[None, :]
+    tl.store(out_k_ptr + dst_base + dst_offsets, k_data)
+    tl.store(out_v_ptr + dst_base + dst_offsets, v_data)
+
+
 def _gather_paged_kv(
     kv_cache: torch.Tensor,
     kv_indices: torch.Tensor,
@@ -738,7 +796,8 @@ def _gather_paged_kv(
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """Gather scattered paged KV into contiguous per-sequence buffers.
 
-    Uses vectorized torch operations — no Python loops.
+    Uses Triton kernel for fast GPU-side gather when all sequences have
+    the same page count, falls back to vectorized torch ops otherwise.
 
     Returns:
         k_contig: [num_seq, max_kv_len_padded, n_kv_heads, head_dim]
@@ -771,19 +830,39 @@ def _gather_paged_kv(
     all_same = bool((page_counts == max_pages).all().item())
 
     if all_same and num_seq > 0:
-        # Fully vectorized path: no Python loop
-        # gathered shape: [num_seq * max_pages, 2, n_kv_heads, page_size, head_dim]
-        gathered = gathered.reshape(num_seq, max_pages, 2, n_kv_heads, page_size, head_dim)
-        # → [num_seq, max_pages, n_kv_heads, page_size, head_dim] for K and V
-        k_pages = gathered[:, :, 0]  # [num_seq, max_pages, n_kv_heads, page_size, head_dim]
-        v_pages = gathered[:, :, 1]
-        # → [num_seq, max_pages * page_size, n_kv_heads, head_dim]
-        k_contig = k_pages.permute(0, 1, 3, 2, 4).reshape(
-            num_seq, max_pages * page_size, n_kv_heads, head_dim
+        # Fast path: use Triton gather kernel (no intermediate allocation)
+        total_pages = kv_indices.shape[0]
+        # Output as flat [total_pages * page_size, n_kv_heads, head_dim]
+        flat_tokens = total_pages * page_size
+        k_flat = torch.empty(
+            flat_tokens,
+            n_kv_heads,
+            head_dim,
+            dtype=kv_cache.dtype,
+            device=kv_cache.device,
         )
-        v_contig = v_pages.permute(0, 1, 3, 2, 4).reshape(
-            num_seq, max_pages * page_size, n_kv_heads, head_dim
+        v_flat = torch.empty_like(k_flat)
+
+        _gather_pages_kernel[(total_pages, n_kv_heads)](
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+            k_flat,
+            v_flat,
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            kv_cache.stride(3),
+            0,  # out_stride_seq (unused, flat layout)
+            k_flat.stride(0),
+            k_flat.stride(1),
+            N_KV_HEADS=n_kv_heads,
+            PAGE_SIZE=page_size,
+            HEAD_DIM=head_dim,
         )
+        # Reshape to [num_seq, max_pages * page_size, n_kv_heads, head_dim]
+        k_contig = k_flat.reshape(num_seq, max_pages * page_size, n_kv_heads, head_dim)
+        v_contig = v_flat.reshape(num_seq, max_pages * page_size, n_kv_heads, head_dim)
     else:
         # Fallback: per-sequence gather (variable page counts)
         k_contig = torch.zeros(
