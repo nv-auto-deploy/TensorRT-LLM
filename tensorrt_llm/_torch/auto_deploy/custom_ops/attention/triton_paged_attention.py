@@ -195,6 +195,7 @@ def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_siz
         triton.Config({}, num_warps=2, num_stages=3),
         triton.Config({}, num_warps=4, num_stages=2),
         triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=2),
         triton.Config({}, num_warps=8, num_stages=3),
     ],
     key=["HEAD_DIM", "PAGE_SIZE", "HEAD_RATIO_PADDED"],
