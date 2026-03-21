@@ -729,6 +729,33 @@ def _paged_context_kernel(
     tl.store(o_ptr + o_store_offsets, o, mask=q_load_mask)
 
 
+def _get_prefill_num_splits(
+    num_seq: int, n_heads: int, max_q_len: int, q_block: int, page_size: int
+) -> int:
+    """Compute split-K factor for prefill to ensure GPU saturation."""
+    num_q_blocks = (max_q_len + q_block - 1) // q_block
+    base_programs = num_seq * n_heads * num_q_blocks
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+
+    # Already enough parallelism — no split needed
+    if base_programs >= num_sms * 2:
+        return 1
+
+    # Target ~4 waves
+    target = num_sms * 4
+    num_splits = max(1, (target + base_programs - 1) // base_programs)
+
+    # Cap: each split should have at least 2 pages of work
+    max_kv_pages = max_q_len // page_size
+    max_splits = max(1, max_kv_pages // 2)
+    num_splits = min(num_splits, max_splits)
+
+    if num_splits > 1:
+        num_splits = 2 ** math.ceil(math.log2(num_splits))
+
+    return min(num_splits, 32)
+
+
 def triton_paged_context(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
