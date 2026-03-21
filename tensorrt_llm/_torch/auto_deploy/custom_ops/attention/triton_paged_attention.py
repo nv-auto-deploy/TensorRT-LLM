@@ -717,6 +717,9 @@ def _paged_context_kernel(
         m_i = m_i_new
 
     # Phase 2: Boundary pages — need causal mask and validity mask
+    # Pre-compute q_positions outside loop (invariant across pages)
+    q_positions_2d = q_offsets[:, None] + cache_len
+
     for page_idx in range(num_full_pages, num_kv_pages):
         kv_base_pos = page_idx * PAGE_SIZE
 
@@ -736,9 +739,8 @@ def _paged_context_kernel(
             )
 
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
-            q_positions = q_offsets[:, None] + cache_len
             kv_positions = kv_base_pos + page_offsets[None, :]
-            causal_mask = q_positions >= kv_positions
+            causal_mask = q_positions_2d >= kv_positions
             full_mask = q_mask[:, None] & causal_mask & page_mask[None, :]
             qk = tl.where(full_mask, qk, float("-inf"))
 
