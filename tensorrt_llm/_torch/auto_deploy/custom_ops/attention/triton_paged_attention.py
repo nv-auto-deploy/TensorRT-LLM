@@ -645,15 +645,47 @@ def _paged_context_kernel(
 
     page_offsets = tl.arange(0, PAGE_SIZE)
 
-    # Causal skip boundary: last Q position in full sequence coordinates
+    # Two-phase page loop:
+    # Phase 1 (full pages): pages entirely before the first Q position need no causal mask.
+    #   First Q position in KV coords = q_block_start + cache_len.
+    #   A page ending at (page_idx+1)*PAGE_SIZE - 1 is fully attended if that's <= first Q pos.
+    # Phase 2 (boundary pages): remaining pages up to last Q position need causal masking.
+    first_q_kv_pos = q_block_start + cache_len
     max_q_pos = q_block_start + Q_BLOCK - 1 + cache_len
 
-    # Page-aligned iteration: one page per loop iteration
-    for page_idx in range(num_kv_pages):
+    # Number of full pages (all tokens in these pages are attended by all Q tokens)
+    num_full_pages = first_q_kv_pos // PAGE_SIZE
+
+    # Phase 1: Full pages — no causal mask, no validity mask (all PAGE_SIZE tokens valid)
+    for page_idx in range(num_full_pages):
+        physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+
+        cache_base = (
+            physical_page.to(tl.int64) * cache_stride_block
+            + kv_head_id * cache_stride_head
+            + page_offsets[:, None] * cache_stride_token
+            + dhead_offsets[None, :]
+        )
+        k = tl.load(kv_cache_ptr + cache_base)
+        v = tl.load(kv_cache_ptr + cache_base + cache_stride_kv)
+
+        qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+        # Only need q_mask (for partial Q blocks at end of sequence)
+        qk = tl.where(q_mask[:, None], qk, float("-inf"))
+
+        m_ij = tl.max(qk, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_i_new)
+        p = tl.exp(qk - m_i_new[:, None])
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_i_new
+
+    # Phase 2: Boundary pages — need causal mask and validity mask
+    for page_idx in range(num_full_pages, num_kv_pages):
         kv_base_pos = page_idx * PAGE_SIZE
 
         # Causal skip: if entire page is beyond last Q position, skip it.
-        # Triton doesn't support break, so we guard the body instead.
         if kv_base_pos <= max_q_pos:
             physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
             valid_tokens = tl.minimum(PAGE_SIZE, total_kv_len - kv_base_pos)

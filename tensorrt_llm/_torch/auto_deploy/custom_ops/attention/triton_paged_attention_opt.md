@@ -241,6 +241,38 @@ it expensive to assemble tiles, unlike dense attention where KV is contiguous.
 
 **Iteration count: 2 / 50**
 
+### Iteration 3 — Two-phase page loop for prefill
+
+**What changed:**
+
+- Split the KV page loop into two phases:
+  - Phase 1 (full pages): pages entirely before first Q position → no causal mask,
+    no validity mask, no masked loads. Simpler, faster code.
+  - Phase 2 (boundary pages): remaining pages need causal + validity masking (same as before).
+- For seq_len=2048, Q_BLOCK=128: ~87% of pages are in Phase 1 for the first Q block.
+
+**Correctness:** PASS (49/49 tests)
+
+**Prefill results (us):**
+
+| ID | Baseline | Iter 3 | Delta | vs FI |
+|----|----------|--------|-------|-------|
+| P1 | 65.5 | 62.4 | -5% | 4.22x |
+| P2 | 92.6 | 89.4 | -3% | 3.85x |
+| P3 | 320.4 | 273.3 | **-15%** | 2.60x |
+| P4 | 134.0 | 123.6 | **-8%** | 2.27x |
+| P5 | 960.7 | 843.6 | **-12%** | 2.44x |
+| P6 | 291.6 | 253.5 | **-13%** | 2.61x |
+| P7 | 226.5 | 194.2 | **-14%** | 2.85x |
+| P8 | 319.6 | 273.3 | **-14%** | 2.61x |
+| P9 | 131.6 | 121.2 | **-8%** | 2.24x |
+
+**Analysis:** Solid 8-15% improvement on all shapes. Biggest gains on long sequences where
+most pages fall in Phase 1 (no masking). The unmasked `tl.load` in Phase 1 is faster
+because Triton generates simpler memory access code without predication. Keeping this.
+
+**Iteration count: 3 / 50**
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
