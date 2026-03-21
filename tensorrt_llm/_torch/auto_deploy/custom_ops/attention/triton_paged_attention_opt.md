@@ -321,6 +321,26 @@ Need to target: (1) reduce int64 overhead, (2) pre-scale Q, (3) persistent kerne
 
 **Iteration count: 5 / 50**
 
+### Iteration 6 — Pre-scale Q + hoist KV head offset (FAILED)
+
+**What changed:**
+
+- Pre-multiply Q by SM_SCALE at load time to remove per-page `* SM_SCALE`
+- Hoist `kv_head_offset` and `local_offsets` out of page loop
+
+**Correctness:** PASS (49/49)
+
+| ID | Iter 5 | Iter 6 | Delta |
+|----|--------|--------|-------|
+| P3 | 277.7 | 288.2 | **+4% worse** |
+| P5 | 804.5 | 858.7 | **+7% worse** |
+
+**Analysis:** Pre-scaling Q in fp16 reduces magnitude (SM_SCALE ≈ 0.088),
+hurting dot product precision and forcing Triton to use less efficient code
+paths. Hoisting offsets didn't help either. **Reverted.**
+
+**Iteration count: 6 / 50**
+
 ______________________________________________________________________
 
 ## 4. Optimization Ideas Backlog
