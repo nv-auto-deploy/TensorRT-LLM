@@ -1182,25 +1182,20 @@ def triton_paged_context(
     )
 
     if use_sdpa:
-        # Inline fast gather: index_select + permute once for both K,V
-        # gathered: [total_pages, 2, n_kv_heads, page_size, head_dim]
-        gathered = kv_cache[kv_indices.long()].reshape(
-            num_seq, max_pages, 2, n_kv_heads, page_size, head_dim
+        # Gather pages + format for SDPA in minimal ops
+        max_kv_len = max_pages * page_size
+        kv_gathered = (
+            kv_cache[kv_indices.long()]
+            .view(num_seq, max_pages, 2, n_kv_heads, page_size, head_dim)
+            .permute(0, 2, 3, 1, 4, 5)
+            .reshape(num_seq, 2, n_kv_heads, max_kv_len, head_dim)
         )
-        # Permute to [num_seq, 2, n_kv_heads, max_pages, page_size, head_dim]
-        # then reshape to [num_seq, 2, n_kv_heads, max_kv_len, head_dim]
-        gathered = gathered.permute(0, 2, 3, 1, 4, 5).reshape(
-            num_seq, 2, n_kv_heads, max_pages * page_size, head_dim
-        )
-        k_sdpa = gathered[:, 0]  # [num_seq, n_kv_heads, max_kv_len, head_dim]
-        v_sdpa = gathered[:, 1]
-        q_sdpa = q.reshape(num_seq, max_q_len, n_heads, head_dim).transpose(1, 2)
 
-        # cuDNN flash attention with native GQA
+        # SDPA with GQA — fuse Q reshape + attention + output reshape
         o_sdpa = torch.nn.functional.scaled_dot_product_attention(
-            q_sdpa,
-            k_sdpa,
-            v_sdpa,
+            q.view(num_seq, max_q_len, n_heads, head_dim).transpose(1, 2),
+            kv_gathered[:, 0],
+            kv_gathered[:, 1],
             scale=sm_scale,
             is_causal=True,
             enable_gqa=True,
