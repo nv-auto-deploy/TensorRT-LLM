@@ -859,7 +859,7 @@ def triton_paged_context(
     total_expected_pages = num_seq * max_pages
     use_sdpa = (
         max_q_len >= 512
-        and num_seq <= 16
+        and num_seq <= 64
         and max_pages > 0
         and kv_indices.shape[0] == total_expected_pages  # all seqs same page count
     )
