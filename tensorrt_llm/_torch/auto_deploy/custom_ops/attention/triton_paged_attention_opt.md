@@ -110,17 +110,17 @@ ______________________________________________________________________
 
 ### Summary — Best prefill latency so far (us)
 
-| ID | Baseline | FI | Best | Delta vs FI | Iteration |
-|----|----------|----|------|-------------|-----------|
-| P1 | 65.5 | 14.1 | 65.5 | 4.64x | 0 |
-| P2 | 92.6 | 22.9 | 92.6 | 4.04x | 0 |
-| P3 | 320.4 | 105.3 | 320.4 | 3.04x | 0 |
-| P4 | 134.0 | 54.2 | 134.0 | 2.47x | 0 |
-| P5 | 960.7 | 344.8 | 960.7 | 2.79x | 0 |
-| P6 | 291.6 | 96.7 | 291.6 | 3.01x | 0 |
-| P7 | 226.5 | 67.9 | 226.5 | 3.33x | 0 |
-| P8 | 319.6 | 104.6 | 319.6 | 3.06x | 0 |
-| P9 | 131.6 | 53.8 | 131.6 | 2.45x | 0 |
+| ID | Baseline | FI | Best | Delta vs FI | Iteration | Path |
+|----|----------|----|------|-------------|-----------|------|
+| P1 | 65.5 | 14.1 | 65 | 4.4x | 22 | paged |
+| P2 | 92.6 | 22.9 | 88 | 3.8x | 22 | paged |
+| P3 | 320.4 | 105.3 | 273 | 2.6x | 3 | paged |
+| P4 | 134.0 | 54.2 | 123 | 2.2x | 3 | paged |
+| P5 | 960.7 | 344.8 | **520** | **1.50x** | 22 | SDPA |
+| P6 | 291.6 | 96.7 | 258 | 2.7x | 3 | paged |
+| P7 | 226.5 | 67.9 | 193 | 2.8x | 3 | paged |
+| P8 | 319.6 | 104.6 | 292 | 2.8x | 22 | paged |
+| P9 | 131.6 | 53.8 | 121 | 2.2x | 3 | paged |
 
 ______________________________________________________________________
 
@@ -418,6 +418,85 @@ GQA, persistent kernel (both variants). None helped due to register pressure,
 parallelism loss, or assembly overhead.
 
 **Iteration count: 11 / 50**
+
+### Iteration 12 — Remove int64 page addressing (marginal)
+
+Removed `.to(tl.int64)` cast. No measurable change — Triton already optimizes.
+
+### Iteration 13 — Contiguous KV gather + SDPA adaptive dispatch
+
+**What changed:**
+
+- Added `_gather_paged_kv`: vectorized page gather into contiguous KV buffers
+- Added `_contiguous_context_kernel`: Triton flash attention on contiguous KV
+  with large KV_BLOCK (64/128) instead of PAGE_SIZE=16
+- Adaptive dispatch: contiguous path for total_kv_tokens >= 4096, paged otherwise
+
+| ID | Paged (iter 7) | Contiguous | vs FI |
+|----|----------------|------------|-------|
+| P5 | 799 | **700** | **2.05x** |
+| P3 | 275 | 306 (worse) | 2.93x |
+
+Contiguous helps only P5. Gather overhead (~163 us) dominates for smaller shapes.
+
+### Iteration 14-15 — Triton gather kernel + threshold tuning
+
+Added Triton `_gather_pages_kernel`. Tested various thresholds. P5: 692 us (1.99x).
+
+### Iteration 16-19 — SDPA integration (breakthrough)
+
+**What changed:**
+
+- Replaced Triton contiguous kernel with `torch.nn.functional.scaled_dot_product_attention`
+- Uses `enable_gqa=True` for native GQA support (no KV expansion)
+- Fast vectorized reshape for same-length batches
+
+| ID | Before SDPA | With SDPA | vs FI |
+|----|-------------|-----------|-------|
+| P5 | 692 | **538** | **1.56x** |
+
+SDPA (cuDNN flash attention) is 2-3x faster than our Triton contiguous kernel
+on the same data. `enable_gqa=True` eliminates `repeat_interleave` overhead.
+
+### Iteration 20 — SDPA threshold tuning
+
+Tested threshold=1024 (hurt P4/P9 +88%), reverted to 4096.
+
+### Iteration 21 — SDPA gather fix
+
+Fixed k_flat bug in legacy gather. P5: 551 us (1.62x).
+
+### Iteration 22 — Deferred GPU sync (critical fix)
+
+**What changed:**
+
+- Moved `.item()` calls (GPU sync) inside the `use_sdpa` branch
+- Previously synced on EVERY call even when using paged kernel
+
+| ID | Before fix | After fix | vs FI |
+|----|-----------|-----------|-------|
+| P1 | 145 | **65** | 4.43x |
+| P3 | 354 | **273** | 2.60x |
+| P5 | 519 | **520** | **1.50x** |
+
+The spurious GPU syncs were adding 15-30 us to EVERY call, catastrophic
+for small shapes. This fix restored paged kernel performance.
+
+### Summary — Best results so far (iter 22)
+
+| ID | Baseline | Best | Delta | vs FI | Path |
+|----|----------|------|-------|-------|------|
+| P1 | 65.5 | 65 | -1% | 4.4x | paged |
+| P2 | 92.6 | 88 | -5% | 3.8x | paged |
+| P3 | 320.4 | 273 | **-15%** | 2.6x | paged |
+| P4 | 134.0 | 123 | **-8%** | 2.2x | paged |
+| P5 | 960.7 | **520** | **-46%** | **1.50x** | SDPA |
+| P6 | 291.6 | 258 | **-12%** | 2.7x | paged |
+| P7 | 226.5 | 193 | **-15%** | 2.8x | paged |
+| P8 | 319.6 | 292 | **-9%** | 2.8x | paged |
+| P9 | 131.6 | 121 | **-8%** | 2.2x | paged |
+
+**Iteration count: 22 / 50**
 
 ______________________________________________________________________
 
