@@ -57,7 +57,7 @@ def register_all() -> None:
         print("Already registered (imports present).")
         return
     block = "\n".join(_IMPORT_LINES) + "\n"
-    _INIT_FILE.write_text(block + text)
+    _INIT_FILE.write_text(text.rstrip("\n") + "\n\n" + block)
     print(f"Registered: added {len(_IMPORT_LINES)} import lines to {_INIT_FILE}")
 
 

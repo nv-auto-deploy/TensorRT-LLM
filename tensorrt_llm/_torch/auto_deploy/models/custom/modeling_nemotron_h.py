@@ -32,6 +32,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm import gated_rms_norm_ref
+from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
 
 
@@ -636,5 +637,4 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         return NemotronHCausalLMOutput(logits)
 
 
-# Disabled: registration moved to new_sharding/modeling_nemotron_h.py
-# AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
+AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
