@@ -194,14 +194,9 @@ transforms:
   fuse_add_rms_norm:
     stage: post_load_fusion
     enabled: false
-  mlir_fuse_add_rms_norm:
-    stage: post_load_fusion
-    enabled: true
-    codegen_mode: preexisting
-    run_shape_prop: true
   mlir_elementwise_fusion:
     stage: post_load_fusion
-    enabled: false
+    enabled: true
     run_shape_prop: true
     bypass_ops: []
   gather_logits_before_lm_head:
