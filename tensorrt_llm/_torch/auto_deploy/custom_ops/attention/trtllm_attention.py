@@ -210,6 +210,7 @@ class _TrtllmPlanner:
 _GlobalTrtllmPlanner = _TrtllmPlanner()
 _TRTLLM_ATTN_FP8_INPUT_SCALE_KEY = "trtllm_attention_input_scale"
 _TRTLLM_ATTN_OUT_SCALE_KEY = "trtllm_attention_out_scale"
+_TRTLLM_ROPE_INFO_KEY = "_trtllm_rope_info"
 
 
 def set_trtllm_attention_fp8_input_scale(attn_node: Node, input_scale: Node) -> None:
@@ -223,6 +224,11 @@ def get_trtllm_attention_fp8_input_scale(attn_node: Node) -> Optional[Node]:
 
 def clear_trtllm_attention_fp8_input_scale(attn_node: Node) -> None:
     attn_node.meta.pop(_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY, None)
+
+
+def get_trtllm_rope_info(attn_node: Node) -> Optional[dict]:
+    """Retrieve RoPE fusion info stored on an attention node, if any."""
+    return attn_node.meta.get(_TRTLLM_ROPE_INFO_KEY)
 
 
 # =============================================================================
@@ -333,13 +339,9 @@ def trtllm_mha_with_cache(
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
     out_scale: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
     rotary_cos_sin: Optional[torch.Tensor] = None,
     position_embedding_type: int = 0,
     rotary_embedding_dim: int = 0,
-    num_heads_hint: int = 0,
-    num_kv_heads_hint: int = 0,
-    head_dim_hint: int = 0,
 ) -> torch.Tensor:
     """TRT-LLM attention with paged KV cache for Auto-Deploy.
 
@@ -351,16 +353,15 @@ def trtllm_mha_with_cache(
     ``kv_cache_block_offsets`` is computed by the ``prepare_trtllm_metadata`` device-side
     op and flows through the graph to create an explicit data dependency.
 
-    When ``num_heads_hint``, ``num_kv_heads_hint``, and ``head_dim_hint`` are all non-zero,
-    the op operates in **fused QKV mode**: ``q`` is expected to be the flat fused QKV tensor
-    of shape ``(B, S, total_qkv_dim)`` (K and V args are ignored).  This bypasses the
-    zero-copy check and cat fallback, eliminating 2 copy + 1 cat kernel per layer.
-
     Note: layer_idx is always passed as 0 to thop.attention because
     the kv_cache tensor is already a strided view for the correct layer,
     pool_pointers encodes kv_cache.data_ptr() (layer-specific), and
     pool_mapping is all zeros. See module docstring for details.
     """
+    # Infer dimensions from tensor shapes (bsnd layout)
+    num_heads = q.shape[2]
+    num_kv_heads = k.shape[2]
+    head_dim = q.shape[3]
     tokens_per_block = kv_cache.shape[3]  # HND: [blocks, 2, heads, tpb, head_dim]
 
     # Get batch dimensions and model-level constants from host tensors (no device sync)
@@ -382,64 +383,30 @@ def trtllm_mha_with_cache(
         _GlobalTrtllmPlanner.get_layer_tensors(kv_cache, kv_scale_orig_quant, kv_scale_quant_orig)
     )
 
-    # Fused QKV mode: when hints are set, q is already the flat fused QKV tensor
-    # of shape (B, S, total_qkv_dim).  Skip split/copy/cat entirely.
-    if num_heads_hint > 0 and num_kv_heads_hint > 0 and head_dim_hint > 0:
-        num_heads = num_heads_hint
-        num_kv_heads = num_kv_heads_hint
-        head_dim = head_dim_hint
-        q_dim = num_heads * head_dim
-        total_qkv_dim = q_dim + 2 * num_kv_heads * head_dim
-        # q is (B, S, total_qkv_dim) — reshape to (num_tokens, total_qkv_dim)
-        q_shape_og = (q.shape[0], q.shape[1], num_heads, head_dim)
-        qkv_fused = q.reshape(-1, total_qkv_dim)[:num_tokens]
+    # Reshape Q, K, V to [num_tokens, num_heads * head_dim] and fuse.
+    # Input is [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed).
+    # With piecewise CUDA graphs the tensor may be padded to a bucket size
+    # (b*s > num_tokens), so flatten first and slice to the real token count.
+    q_shape_og = q.shape
+    q_flat = q.reshape(-1, num_heads * head_dim)[:num_tokens]
+    k_flat = k.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
+    v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
+
+    # Zero-copy QKV fusion: when Q/K/V are narrow() views of a fused GEMM output
+    # (preserved because RoPE no longer breaks them), detect via stride and avoid copy.
+    total_qkv_dim = (num_heads + 2 * num_kv_heads) * head_dim
+    if q_flat.stride(0) == total_qkv_dim and q_flat.is_contiguous():
+        qkv_fused = torch.as_strided(q_flat, (num_tokens, total_qkv_dim), (total_qkv_dim, 1))
     else:
-        # Standard path: infer dimensions from tensor shapes (bsnd layout)
-        num_heads = q.shape[2]
-        num_kv_heads = k.shape[2]
-        head_dim = q.shape[3]
+        qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
 
-        # Fuse Q, K, V into [num_tokens, total_qkv_dim] for thop.attention.
-        # Input is BSND: [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed).
-        # With piecewise CUDA graphs the tensor may be padded (b*s > num_tokens).
-        q_shape_og = q.shape
-        q_dim = num_heads * head_dim
-        k_dim = num_kv_heads * head_dim
-        total_qkv_dim = q_dim + 2 * k_dim
-        elem_size = q.element_size()
-
-        # Zero-copy QKV fusion: detect if Q, K, V are adjacent views of a fused GEMM
-        # output BEFORE reshaping (reshape on non-contiguous views forces a copy).
-        # When RoPE is fused into thop.attention, Q/K/V remain split-views of the
-        # QKV projection with stride[-2] == head_dim and row-stride == total_qkv_dim.
-        if (
-            q.data_ptr() + q_dim * elem_size == k.data_ptr()
-            and k.data_ptr() + k_dim * elem_size == v.data_ptr()
-            and q.stride(-1) == 1
-            and q.stride(-2) == head_dim
-        ):
-            # Q, K, V share the same fused storage — construct flat view directly.
-            qkv_fused = torch.as_strided(q, (num_tokens, total_qkv_dim), (total_qkv_dim, 1))
-        else:
-            # Fallback: reshape each tensor (may copy) and concatenate.
-            q_flat = q.reshape(-1, q_dim)[:num_tokens]
-            k_flat = k.reshape(-1, k_dim)[:num_tokens]
-            v_flat = v.reshape(-1, k_dim)[:num_tokens]
-            qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
-
-    # Prepare output buffer. thop.attention only writes to [:num_tokens]; padding
-    # positions are never read downstream (they are masked out via batch metadata),
-    # so torch.empty avoids an unnecessary memset kernel.
+    # Prepare output (pre-allocate at full padded size so padding positions are clean zeros)
     total_padded_tokens = q_shape_og[0] * q_shape_og[1]
     # If out_scale is set, attention quantizes output to FP8.
     out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
-    if out is not None:
-        out_flat = out.view(-1, num_heads * head_dim)
-        output = out_flat[:num_tokens]
-    else:
-        output = torch.empty(
-            total_padded_tokens, num_heads * head_dim, dtype=out_dtype, device=q.device
-        )
+    output = torch.zeros(
+        total_padded_tokens, num_heads * head_dim, dtype=out_dtype, device=q.device
+    )
     # Map SequenceInfo fields to thop.attention args
     sequence_length = seq_len_with_cache[:num_seq]  # device
     context_lengths = seq_len[:num_seq]  # device
@@ -486,7 +453,7 @@ def trtllm_mha_with_cache(
         kv_scale_qo,  # kv_scale_quant_orig
         out_scale,  # out_scale
         None,  # rotary_inv_freq
-        None,  # rotary_cos_sin
+        rotary_cos_sin,  # rotary_cos_sin
         None,  # latent_cache (MLA)
         None,  # q_pe (MLA)
         None,  # block_ids_per_seq
@@ -507,8 +474,8 @@ def trtllm_mha_with_cache(
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
         1.0,  # q_scaling
-        0,  # position_embedding_type
-        0,  # rotary_embedding_dim
+        position_embedding_type,  # position_embedding_type
+        rotary_embedding_dim,  # rotary_embedding_dim
         10000.0,  # rotary_embedding_base
         0,  # rotary_embedding_scale_type
         rotary_embedding_scales,  # rotary_embedding_scales
@@ -546,11 +513,6 @@ def trtllm_mha_with_cache(
         None,  # quant_q_buffer
     )
 
-    if out is not None:
-        if total_padded_tokens > num_tokens:
-            out_flat[num_tokens:].zero_()
-        return out.new_empty(0)
-
     return output.view(*q_shape_og)
 
 
@@ -568,28 +530,18 @@ def trtllm_mha_with_cache_fake(
     kv_cache_block_offsets: torch.Tensor,
     # CACHE
     kv_cache: torch.Tensor,
-    # CONSTANTS
+    # CONSTANTS (only truly un-inferable values)
     scale: Optional[float],
     sliding_window: Optional[int] = None,
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
     out_scale: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
     rotary_cos_sin: Optional[torch.Tensor] = None,
     position_embedding_type: int = 0,
     rotary_embedding_dim: int = 0,
-    num_heads_hint: int = 0,
-    num_kv_heads_hint: int = 0,
-    head_dim_hint: int = 0,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
-    if out is not None:
-        return out.new_empty(0)
     out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
-    if num_heads_hint > 0 and head_dim_hint > 0:
-        # Fused QKV mode: q is (B, S, total_qkv_dim), output should be (B, S, num_heads, head_dim)
-        out_shape = (q.shape[0], q.shape[1], num_heads_hint, head_dim_hint)
-        return q.new_empty(out_shape, dtype=out_dtype)
     return torch.empty_like(q.contiguous(), dtype=out_dtype)
 
 
@@ -639,24 +591,15 @@ class TrtllmAttention(AttentionDescriptor):
         cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
         """Return only KV cache handler (no workspace handler, managed like flashinfer)."""
-        # In fused QKV mode, K arg is the same as Q (flat fused tensor), so use hints.
-        if source_attn_node.meta.get("_trtllm_fused_qkv"):
-            num_kv_heads = source_attn_node.meta["_trtllm_num_kv_heads"]
-            head_dim = source_attn_node.meta["_trtllm_head_dim"]
-            # Infer KV dtype from Q (fused QKV) tensor's meta, or default to bfloat16
-            q_meta = source_attn_node.args[0].meta.get("val")
-            kv_dtype = q_meta.dtype if q_meta is not None else torch.bfloat16
-        else:
-            k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
-            num_kv_heads = k_fake.shape[2]
-            head_dim = k_fake.shape[3]
-            kv_dtype = k_fake.dtype
+        k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
+        num_kv_heads = k_fake.shape[2]
+        head_dim = k_fake.shape[3]
 
         return {
             "kv_cache": KVPagedResourceHandler(
                 num_kv_heads,
                 head_dim,
-                dtype=cls.resolve_cache_dtype(cache_config.dtype, kv_dtype),
+                dtype=cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype),
                 kv_factor=2,
                 kv_layout="HND",
             )
@@ -677,60 +620,27 @@ class TrtllmAttention(AttentionDescriptor):
     @classmethod
     def prepare_node_for_cache_insertion(cls, gm: GraphModule, attn_node: Node) -> None:
         """Materialize optional out_scale and rope cos_sin nodes before cache insertion."""
-        # FP8 output scale: thop.attention needs 1/input_scale as out_scale.
-        # When input_scale is a static buffer (get_attr), fold the reciprocal at
-        # graph construction time to avoid a per-step GPU kernel launch.
+        # FP8 output scale
         input_scale = get_trtllm_attention_fp8_input_scale(attn_node)
         if input_scale is not None:
             existing_out_scale = attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
             if not isinstance(existing_out_scale, Node):
-                if input_scale.op == "get_attr":
-                    # Static scale — try to pre-compute reciprocal at graph
-                    # construction time to avoid a per-step GPU kernel.
-                    scale_tensor = None
-                    try:
-                        obj = gm
-                        for atom in input_scale.target.split("."):
-                            obj = getattr(obj, atom)
-                        if not obj.is_meta:
-                            scale_tensor = obj
-                    except AttributeError:
-                        pass
-
-                    if scale_tensor is not None:
-                        recip_tensor = torch.reciprocal(scale_tensor)
-                        recip_attr = "_trtllm_recip_" + input_scale.target.replace(".", "_")
-                        if not hasattr(gm, recip_attr):
-                            gm.register_buffer(recip_attr, recip_tensor, persistent=False)
-                        with gm.graph.inserting_before(attn_node):
-                            out_scale = gm.graph.create_node("get_attr", recip_attr)
-                        out_scale.meta["val"] = recip_tensor
-                    else:
-                        with gm.graph.inserting_before(attn_node):
-                            out_scale = gm.graph.call_function(
-                                torch.ops.aten.reciprocal.default, args=(input_scale,)
-                            )
-                else:
-                    # Dynamic scale — compute reciprocal at runtime.
-                    with gm.graph.inserting_before(attn_node):
-                        out_scale = gm.graph.call_function(
-                            torch.ops.aten.reciprocal.default, args=(input_scale,)
-                        )
+                with gm.graph.inserting_before(attn_node):
+                    out_scale = gm.graph.call_function(
+                        torch.ops.aten.reciprocal.default, args=(input_scale,)
+                    )
                 attn_node.meta[_TRTLLM_ATTN_OUT_SCALE_KEY] = out_scale
         else:
             attn_node.meta.pop(_TRTLLM_ATTN_OUT_SCALE_KEY, None)
 
-        # RoPE cos_sin: materialize tensor as get_attr node right before the
-        # attention node (which is about to be replaced by the cached version).
+        # RoPE cos_sin: materialize tensor as get_attr node
         rope_info = attn_node.meta.get(_TRTLLM_ROPE_INFO_KEY)
         if rope_info is not None and "cos_sin_tensor" in rope_info:
             cos_sin_tensor = rope_info["cos_sin_tensor"]
             attr_name = "_trtllm_rope_cos_sin"
             counter = 0
-            # Find a free attr name, or reuse one that already points to the same tensor.
-            # The else clause runs only when the loop exits without break (no match found),
-            # meaning we need to register a new buffer.
             while hasattr(gm, attr_name):
+                # Reuse existing buffer if tensor matches
                 existing = getattr(gm, attr_name)
                 if existing.data_ptr() == cos_sin_tensor.data_ptr():
                     break
@@ -801,12 +711,6 @@ class TrtllmAttention(AttentionDescriptor):
             pos_emb_type = 0
             rot_emb_dim = 0
 
-        # Fused QKV hints (non-zero when the rope transform traced back to a flat
-        # fused QKV GEMM output, bypassing the zero-copy check + cat fallback).
-        num_heads_hint = source_attn_node.meta.get("_trtllm_num_heads", 0)
-        num_kv_heads_hint = source_attn_node.meta.get("_trtllm_num_kv_heads", 0)
-        head_dim_hint = source_attn_node.meta.get("_trtllm_head_dim", 0)
-
         return [
             scale,
             sliding_window,
@@ -816,7 +720,4 @@ class TrtllmAttention(AttentionDescriptor):
             rope_cos_sin,
             pos_emb_type,
             rot_emb_dim,
-            num_heads_hint,
-            num_kv_heads_hint,
-            head_dim_hint,
         ]
