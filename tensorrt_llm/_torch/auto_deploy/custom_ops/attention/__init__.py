@@ -25,6 +25,7 @@ This module provides various attention implementations and backends:
 - triton_paged_attention: Triton paged attention (two-stage flash-decode) with HND layout
 - triton_paged_attention_one_stage: Triton paged attention (single-stage) with HND layout
 - onnx_attention: Placeholder ops for ONNX export of attention mechanisms
+"""
 
 __all__ = [
     "torch_attention",
