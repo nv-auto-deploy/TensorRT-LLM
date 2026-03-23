@@ -950,7 +950,10 @@ def prepare_triton_paged_metadata(
     seq_len_with_cache: torch.Tensor,
 ) -> List[torch.Tensor]:
     """Prepare metadata for Triton paged attention."""
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
+
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
 
@@ -1009,7 +1012,10 @@ def triton_paged_mha_with_cache(
     k = k.reshape(b * s, -1, head_dim).contiguous()
     v = v.reshape(b * s, -1, head_dim).contiguous()
 
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
+
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 
