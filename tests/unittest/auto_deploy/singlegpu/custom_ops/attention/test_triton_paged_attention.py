@@ -350,6 +350,153 @@ class TestCacheUpdate:
         torch.testing.assert_close(actual_v, expected_v)
 
 
+class TestTritonPagedMHAIntegration:
+    """Integration tests for triton_paged_mha_with_cache and prepare_triton_paged_metadata.
+
+    These test the full integration layer including BatchInfo parsing,
+    metadata preparation, KV cache update, and mixed prefill/decode dispatch.
+    This would have caught the batch_info_host 12-element format change.
+    """
+
+    @staticmethod
+    def _make_batch_info(
+        num_prefill: int,
+        num_prefill_tokens: int,
+        num_decode: int,
+        max_context_length: int = 8192,
+        max_blocks_per_seq: int = 256,
+        max_batch_size: int = 8,
+    ) -> torch.Tensor:
+        """Create a 12-element batch_info_host tensor."""
+        bi = torch.zeros(12, dtype=torch.int, pin_memory=True)
+        bi[0] = num_prefill
+        bi[1] = num_prefill_tokens
+        bi[2] = 0  # num_extend
+        bi[3] = 0  # num_extend_tokens
+        bi[4] = num_decode
+        bi[5] = num_decode  # num_decode_tokens = num_decode (1 token each)
+        bi[6] = max_context_length
+        bi[7] = max_blocks_per_seq
+        bi[8] = 1  # block_offset_multiplier
+        bi[9] = max_batch_size
+        bi[10] = 0  # num_tokens_to_gather
+        bi[11] = 0  # gather_required
+        return bi
+
+    def test_batch_info_12_element_format(self):
+        """Test that triton_paged_mha_with_cache handles 12-element batch_info_host.
+
+        Regression test: batch_info_host changed from 3-element to 12-element tensor.
+        The old code did `num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()`
+        which would crash with ValueError: too many values to unpack.
+        """
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_mha_with_cache,
+        )
+
+        n_heads, n_kv_heads, head_dim, page_size = 32, 8, 128, 16
+        seq_len = 32
+        num_pages = (seq_len + page_size - 1) // page_size
+        num_blocks = num_pages + 16
+
+        # Prefill-only batch: 1 sequence, 32 tokens
+        q = torch.randn(1, seq_len, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(1, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(1, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+
+        batch_info_host = self._make_batch_info(
+            num_prefill=1, num_prefill_tokens=seq_len, num_decode=0
+        )
+        cu_seqlen_host = torch.tensor([0, seq_len], dtype=torch.int32)
+        cu_num_pages = torch.tensor([0, num_pages], dtype=torch.int32, device="cuda")
+        cu_num_pages_host = cu_num_pages.cpu()
+        cache_loc = torch.arange(num_pages, dtype=torch.int32, device="cuda")
+        last_page_len = torch.tensor(
+            [seq_len % page_size or page_size], dtype=torch.int32, device="cuda"
+        )
+        last_page_len_host = last_page_len.cpu()
+        seq_len_with_cache_host = torch.tensor([seq_len], dtype=torch.int32)
+        kv_cache = torch.zeros(
+            num_blocks, 2, n_kv_heads, page_size, head_dim, dtype=torch.float16, device="cuda"
+        )
+
+        # Prepare metadata (this also uses batch_info_host)
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            prepare_triton_paged_metadata,
+        )
+
+        position_ids = torch.arange(seq_len, device="cuda")
+        batch_indices, positions = prepare_triton_paged_metadata(
+            position_ids,
+            batch_info_host,
+            cu_seqlen_host.to("cuda", non_blocking=True),
+            seq_len_with_cache_host.to("cuda", non_blocking=True),
+        )
+
+        # Run the full MHA with cache (should not crash)
+        output = triton_paged_mha_with_cache(
+            q,
+            k,
+            v,
+            batch_info_host,
+            cu_seqlen_host,
+            cu_num_pages,
+            cu_num_pages_host,
+            cache_loc,
+            last_page_len,
+            last_page_len_host,
+            seq_len_with_cache_host,
+            batch_indices,
+            positions,
+            kv_cache,
+            scale=None,
+        )
+
+        assert output.shape == q.shape
+        assert not torch.isnan(output).any(), "Output contains NaN"
+        assert not torch.isinf(output).any(), "Output contains Inf"
+
+    def test_batch_info_with_extend_requests(self):
+        """Test that extend requests are absorbed into prefill counts."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
+
+        bi = torch.zeros(12, dtype=torch.int, pin_memory=True)
+        bi[0] = 1  # num_prefill
+        bi[1] = 32  # num_prefill_tokens
+        bi[2] = 2  # num_extend
+        bi[3] = 64  # num_extend_tokens
+        bi[4] = 3  # num_decode
+
+        batch_info = BatchInfo(bi)
+        num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
+
+        # Extend should be absorbed into prefill
+        assert num_prefill == 3  # 1 + 2
+        assert num_prefill_tokens == 96  # 32 + 64
+        assert num_decode == 3
+
+    def test_prepare_metadata_with_12_element_batch_info(self):
+        """Test prepare_triton_paged_metadata with 12-element batch_info_host."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            prepare_triton_paged_metadata,
+        )
+
+        batch_info_host = self._make_batch_info(num_prefill=1, num_prefill_tokens=7, num_decode=0)
+        position_ids = torch.arange(7, device="cuda")
+        cu_seqlen = torch.tensor([0, 7], dtype=torch.int32, device="cuda")
+        seq_len_with_cache = torch.tensor([7], dtype=torch.int32, device="cuda")
+
+        # Should not raise ValueError
+        batch_indices, positions = prepare_triton_paged_metadata(
+            position_ids, batch_info_host, cu_seqlen, seq_len_with_cache
+        )
+
+        assert batch_indices.shape[0] == 7
+        assert positions.shape[0] == 7
+        assert (batch_indices == 0).all()
+        assert (positions == torch.arange(7, device="cuda")).all()
+
+
 class TestFlashInferComparison:
     """Tests comparing Triton implementation against FlashInfer."""
 
