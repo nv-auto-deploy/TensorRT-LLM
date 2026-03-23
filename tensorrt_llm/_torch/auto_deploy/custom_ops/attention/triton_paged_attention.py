@@ -842,11 +842,12 @@ def triton_paged_context(
     if num_seq == 0 or total_tokens == 0:
         return output
 
-    # Compute max_q_len without GPU sync when possible.
-    # For same-length sequences (common in prefill), total_tokens = num_seq * q_len.
-    # Fall back to .item() only for variable-length batches.
-    if total_tokens % num_seq == 0:
-        max_q_len = total_tokens // num_seq
+    # Compute max_q_len without GPU sync for single-sequence batches (most common
+    # in serving). For multi-sequence batches, we must use .item() because
+    # total_tokens // num_seq gives the average, not the max — variable-length
+    # sequences can produce wrong results (under-launched Q blocks or wrong SDPA reshape).
+    if num_seq == 1:
+        max_q_len = total_tokens
     else:
         q_lens = qo_indptr[1:] - qo_indptr[:-1]
         max_q_len = int(q_lens.max().item())
