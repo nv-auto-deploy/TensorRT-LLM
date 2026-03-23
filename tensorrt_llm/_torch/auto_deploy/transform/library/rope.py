@@ -46,13 +46,16 @@ TODO: Support other variants:
 """
 
 import operator
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any, DefaultDict, Dict, Optional, Sequence, Tuple, Type
 
 import torch
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
+# Reuse the canonical key defined in trtllm_attention. Imported lazily inside
+# methods that need it to avoid circular imports at module level.
+from ...custom_ops.attention.trtllm_attention import _TRTLLM_ROPE_INFO_KEY
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op

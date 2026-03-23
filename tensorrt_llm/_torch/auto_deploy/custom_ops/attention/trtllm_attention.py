@@ -720,6 +720,30 @@ class TrtllmAttention(AttentionDescriptor):
         else:
             attn_node.meta.pop(_TRTLLM_ATTN_OUT_SCALE_KEY, None)
 
+        # RoPE cos_sin: materialize tensor as get_attr node right before the
+        # attention node (which is about to be replaced by the cached version).
+        rope_info = attn_node.meta.get(_TRTLLM_ROPE_INFO_KEY)
+        if rope_info is not None and "cos_sin_tensor" in rope_info:
+            cos_sin_tensor = rope_info["cos_sin_tensor"]
+            attr_name = "_trtllm_rope_cos_sin"
+            counter = 0
+            # Find a free attr name, or reuse one that already points to the same tensor.
+            # The else clause runs only when the loop exits without break (no match found),
+            # meaning we need to register a new buffer.
+            while hasattr(gm, attr_name):
+                existing = getattr(gm, attr_name)
+                if existing.data_ptr() == cos_sin_tensor.data_ptr():
+                    break
+                counter += 1
+                attr_name = f"_trtllm_rope_cos_sin_{counter}"
+            else:
+                gm.register_buffer(attr_name, cos_sin_tensor, persistent=False)
+
+            with gm.graph.inserting_before(attn_node):
+                cos_sin_node = gm.graph.create_node("get_attr", attr_name)
+            cos_sin_node.meta["val"] = cos_sin_tensor
+            rope_info["cos_sin_node"] = cos_sin_node
+
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         """Extract constants from the source attention node.
