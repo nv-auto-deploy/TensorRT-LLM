@@ -568,7 +568,7 @@ def trtllm_mha_with_cache_fake(
     kv_cache_block_offsets: torch.Tensor,
     # CACHE
     kv_cache: torch.Tensor,
-    # CONSTANTS (only truly un-inferable values)
+    # CONSTANTS
     scale: Optional[float],
     sliding_window: Optional[int] = None,
     kv_scale_orig_quant: float = 1.0,
