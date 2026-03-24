@@ -334,6 +334,12 @@ def trtllm_mha_with_cache(
     kv_scale_quant_orig: float = 1.0,
     out_scale: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    rotary_cos_sin: Optional[torch.Tensor] = None,
+    position_embedding_type: int = 0,
+    rotary_embedding_dim: int = 0,
+    num_heads_hint: int = 0,
+    num_kv_heads_hint: int = 0,
+    head_dim_hint: int = 0,
 ) -> torch.Tensor:
     """TRT-LLM attention with paged KV cache for Auto-Deploy.
 
@@ -345,15 +351,16 @@ def trtllm_mha_with_cache(
     ``kv_cache_block_offsets`` is computed by the ``prepare_trtllm_metadata`` device-side
     op and flows through the graph to create an explicit data dependency.
 
+    When ``num_heads_hint``, ``num_kv_heads_hint``, and ``head_dim_hint`` are all non-zero,
+    the op operates in **fused QKV mode**: ``q`` is expected to be the flat fused QKV tensor
+    of shape ``(B, S, total_qkv_dim)`` (K and V args are ignored).  This bypasses the
+    zero-copy check and cat fallback, eliminating 2 copy + 1 cat kernel per layer.
+
     Note: layer_idx is always passed as 0 to thop.attention because
     the kv_cache tensor is already a strided view for the correct layer,
     pool_pointers encodes kv_cache.data_ptr() (layer-specific), and
     pool_mapping is all zeros. See module docstring for details.
     """
-    # Infer dimensions from tensor shapes (bsnd layout)
-    num_heads = q.shape[2]
-    num_kv_heads = k.shape[2]
-    head_dim = q.shape[3]
     tokens_per_block = kv_cache.shape[3]  # HND: [blocks, 2, heads, tpb, head_dim]
 
     # Get batch dimensions and model-level constants from host tensors (no device sync)
@@ -375,17 +382,54 @@ def trtllm_mha_with_cache(
         _GlobalTrtllmPlanner.get_layer_tensors(kv_cache, kv_scale_orig_quant, kv_scale_quant_orig)
     )
 
-    # Reshape Q, K, V to [num_tokens, num_heads * head_dim] and fuse.
-    # Input is [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed).
-    # With piecewise CUDA graphs the tensor may be padded to a bucket size
-    # (b*s > num_tokens), so flatten first and slice to the real token count.
-    q_shape_og = q.shape
-    q_flat = q.reshape(-1, num_heads * head_dim)[:num_tokens]
-    k_flat = k.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
-    v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
-    qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
+    # Fused QKV mode: when hints are set, q is already the flat fused QKV tensor
+    # of shape (B, S, total_qkv_dim).  Skip split/copy/cat entirely.
+    if num_heads_hint > 0 and num_kv_heads_hint > 0 and head_dim_hint > 0:
+        num_heads = num_heads_hint
+        num_kv_heads = num_kv_heads_hint
+        head_dim = head_dim_hint
+        q_dim = num_heads * head_dim
+        total_qkv_dim = q_dim + 2 * num_kv_heads * head_dim
+        # q is (B, S, total_qkv_dim) — reshape to (num_tokens, total_qkv_dim)
+        q_shape_og = (q.shape[0], q.shape[1], num_heads, head_dim)
+        qkv_fused = q.reshape(-1, total_qkv_dim)[:num_tokens]
+    else:
+        # Standard path: infer dimensions from tensor shapes (bsnd layout)
+        num_heads = q.shape[2]
+        num_kv_heads = k.shape[2]
+        head_dim = q.shape[3]
 
-    # Prepare output: if caller provided an `out` buffer, write directly into it
+        # Fuse Q, K, V into [num_tokens, total_qkv_dim] for thop.attention.
+        # Input is BSND: [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed).
+        # With piecewise CUDA graphs the tensor may be padded (b*s > num_tokens).
+        q_shape_og = q.shape
+        q_dim = num_heads * head_dim
+        k_dim = num_kv_heads * head_dim
+        total_qkv_dim = q_dim + 2 * k_dim
+        elem_size = q.element_size()
+
+        # Zero-copy QKV fusion: detect if Q, K, V are adjacent views of a fused GEMM
+        # output BEFORE reshaping (reshape on non-contiguous views forces a copy).
+        # When RoPE is fused into thop.attention, Q/K/V remain split-views of the
+        # QKV projection with stride[-2] == head_dim and row-stride == total_qkv_dim.
+        if (
+            q.data_ptr() + q_dim * elem_size == k.data_ptr()
+            and k.data_ptr() + k_dim * elem_size == v.data_ptr()
+            and q.stride(-1) == 1
+            and q.stride(-2) == head_dim
+        ):
+            # Q, K, V share the same fused storage — construct flat view directly.
+            qkv_fused = torch.as_strided(q, (num_tokens, total_qkv_dim), (total_qkv_dim, 1))
+        else:
+            # Fallback: reshape each tensor (may copy) and concatenate.
+            q_flat = q.reshape(-1, q_dim)[:num_tokens]
+            k_flat = k.reshape(-1, k_dim)[:num_tokens]
+            v_flat = v.reshape(-1, k_dim)[:num_tokens]
+            qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
+
+    # Prepare output buffer. thop.attention only writes to [:num_tokens]; padding
+    # positions are never read downstream (they are masked out via batch metadata),
+    # so torch.empty avoids an unnecessary memset kernel.
     total_padded_tokens = q_shape_og[0] * q_shape_og[1]
     # If out_scale is set, attention quantizes output to FP8.
     out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
@@ -531,11 +575,21 @@ def trtllm_mha_with_cache_fake(
     kv_scale_quant_orig: float = 1.0,
     out_scale: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    rotary_cos_sin: Optional[torch.Tensor] = None,
+    position_embedding_type: int = 0,
+    rotary_embedding_dim: int = 0,
+    num_heads_hint: int = 0,
+    num_kv_heads_hint: int = 0,
+    head_dim_hint: int = 0,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
     if out is not None:
         return out.new_empty(0)
     out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
+    if num_heads_hint > 0 and head_dim_hint > 0:
+        # Fused QKV mode: q is (B, S, total_qkv_dim), output should be (B, S, num_heads, head_dim)
+        out_shape = (q.shape[0], q.shape[1], num_heads_hint, head_dim_hint)
+        return q.new_empty(out_shape, dtype=out_dtype)
     return torch.empty_like(q.contiguous(), dtype=out_dtype)
 
 
@@ -585,15 +639,24 @@ class TrtllmAttention(AttentionDescriptor):
         cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
         """Return only KV cache handler (no workspace handler, managed like flashinfer)."""
-        k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
-        num_kv_heads = k_fake.shape[2]
-        head_dim = k_fake.shape[3]
+        # In fused QKV mode, K arg is the same as Q (flat fused tensor), so use hints.
+        if source_attn_node.meta.get("_trtllm_fused_qkv"):
+            num_kv_heads = source_attn_node.meta["_trtllm_num_kv_heads"]
+            head_dim = source_attn_node.meta["_trtllm_head_dim"]
+            # Infer KV dtype from Q (fused QKV) tensor's meta, or default to bfloat16
+            q_meta = source_attn_node.args[0].meta.get("val")
+            kv_dtype = q_meta.dtype if q_meta is not None else torch.bfloat16
+        else:
+            k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
+            num_kv_heads = k_fake.shape[2]
+            head_dim = k_fake.shape[3]
+            kv_dtype = k_fake.dtype
 
         return {
             "kv_cache": KVPagedResourceHandler(
                 num_kv_heads,
                 head_dim,
-                dtype=cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype),
+                dtype=cls.resolve_cache_dtype(cache_config.dtype, kv_dtype),
                 kv_factor=2,
                 kv_layout="HND",
             )
@@ -675,10 +738,33 @@ class TrtllmAttention(AttentionDescriptor):
         if not isinstance(out_scale, Node):
             out_scale = None
 
+        # RoPE fusion info (set by FuseRopeIntoTrtllmAttention transform)
+        rope_info = get_trtllm_rope_info(source_attn_node)
+        if rope_info is not None:
+            rope_cos_sin = rope_info["cos_sin_node"]
+            pos_emb_type = rope_info["position_embedding_type"]
+            rot_emb_dim = rope_info["rotary_embedding_dim"]
+        else:
+            rope_cos_sin = None
+            pos_emb_type = 0
+            rot_emb_dim = 0
+
+        # Fused QKV hints (non-zero when the rope transform traced back to a flat
+        # fused QKV GEMM output, bypassing the zero-copy check + cat fallback).
+        num_heads_hint = source_attn_node.meta.get("_trtllm_num_heads", 0)
+        num_kv_heads_hint = source_attn_node.meta.get("_trtllm_num_kv_heads", 0)
+        head_dim_hint = source_attn_node.meta.get("_trtllm_head_dim", 0)
+
         return [
             scale,
             sliding_window,
             1.0,  # kv_scale_orig_quant (hard-coded, same as FlashInfer)
             1.0,  # kv_scale_quant_orig (hard-coded, same as FlashInfer)
             out_scale,
+            rope_cos_sin,
+            pos_emb_type,
+            rot_emb_dim,
+            num_heads_hint,
+            num_kv_heads_hint,
+            head_dim_hint,
         ]
