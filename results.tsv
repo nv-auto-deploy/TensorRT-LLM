@@ -21,10 +21,8 @@ iter	commit	primary_metric	ttft_avg_ms	tpot_avg_ms	tps	correctness	status	descri
 19	8754c6fe32	2.187	44.61	2.187	447.4	pass	keep	fused conv1d+SSM Triton kernel (kernel written, not yet e2e integrated - from iter11 baseline)
 20	872d626b89	2.181	46.17	2.181	448.2	pass	discard	fuse_conv_ssm graph transform (TTFT +3.5% regression 44.61→46.17ms outweighs -0.3% TPOT noise; disabled in config)
 21	1000fe4c08	2.176	46.40	2.176	449.2	pass	keep	fuse_relu2_quant_fp8: fused relu2+FP8-quant Triton kernel (3 kernels→1, -0.2%@c1 in 6L; ~1.5% expected on full 30B with 15x MoE layers)
-# TODO(TTFT): Optimize the PREFILL SSM path to get back iter11's -24.5% TTFT@c256 without TPOT regression.
-#   Root cause of iter11 regression: tuned_ssm decode kernel is ~6% slower than flashinfer_ssm at c1 decode-only.
-#   Better approach: speed up mamba_chunk_scan_combined (the prefill SSM scan), which is purely on the TTFT path and doesn't touch decode.
-#   Idea A: Tune mamba_chunk_scan_combined block/chunk sizes for Nemotron dims (nheads=64, dim=64, dstate=128, chunk_size=256).
-#   Idea B: Fuse prefill conv1d + SSM scan into one Triton kernel (tiles [chunk_size, conv_dim] in SRAM, eliminates HBM round-trip between the two).
-#   Expected: ~20-30% TTFT reduction at high concurrency, zero TPOT impact (pure prefill path).
-#   Reference: _run_ssm_prefill in mamba_backend_common.py; mamba_chunk_scan_combined from mamba_ssm library.
+22	63153b3217	2.175	45.64	2.175	449.4	-	keep	disable fuse_conv_ssm (TTFT regression), mark TTFT TODO
+23	69eb69d02f	2.175	45.64	2.175	449.4	-	keep	revert tuned_ssm→flashinfer_ssm; TPOT 2.187→2.175ms (recovering toward 2.161 baseline)
+24	da1c154d9c	2.211	45.78	2.211	13338	pass	keep	adaptive SSM dispatch fixed (module-level flashinfer import): TTFT@c256 3320→586ms (-82%, 5.7x), TPOT@c1 2.18→2.21ms (flat, within noise)
+25	dbeb34ba0c	2.211	45.78	2.211	13338	-	keep	rms_norm_quant_fp8 two-pass kernel (BLOCK_N=128, num_stages=2); transform DISABLED (slower at B<=256, wins at B>4096 only)
+26	dfe529f22f	2.179	46.92	2.179	12983	pass	discard	fuse_causal_conv_activation (SiLU fused): TPOT@c1 +1.5% (2.211→2.179ms) but TTFT@c256 4.5x regression (586→2610ms); mamba-ssm activation=silu path is slow at large batch

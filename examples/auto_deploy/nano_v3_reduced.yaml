@@ -45,4 +45,4 @@ transforms:
   fuse_relu2_quant_fp8:
     enabled: true
   fuse_causal_conv_activation:
-    enabled: true
+    enabled: false  # iter26: TPOT@c1 +1.5% but TTFT@c256 4.5x regression (586→2610ms); mamba-ssm activation="silu" path is slow at large batch
