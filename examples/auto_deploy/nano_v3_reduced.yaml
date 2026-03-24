@@ -45,6 +45,6 @@ transforms:
   fuse_relu2_quant_fp8:
     enabled: true
   fuse_rmsnorm_quant_fp8:
-    enabled: true  # iter31: re-enabled with single-pass B≤4 kernel (load all 2688 elems into registers, no L2 re-read)
+    enabled: false  # iter31 single-pass kernel REGRESSED TPOT (still slower than FlashInfer+FP8-quant at B=1); TODO: profile to find root cause
   fuse_causal_conv_activation:
     enabled: true  # iter29: decode-only fusion — prefill uses activation=None + inline silu (avoids large-batch regression), decode uses fused silu (saves kernel launch per Mamba layer)
