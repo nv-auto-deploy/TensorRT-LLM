@@ -27,6 +27,7 @@ This gives best of both worlds: baseline TPOT at low concurrency,
 
 from typing import List
 
+import flashinfer
 import torch
 
 from ..attention_interface import AttentionRegistry, BatchInfo, MHACallable
@@ -146,8 +147,6 @@ def _tuned_cached_ssm(
 
         if num_decode <= _FLASHINFER_DECODE_THRESHOLD:
             # Small batch: flashinfer CUDA kernel is faster (better for TPOT at c1)
-            import flashinfer
-
             y_decode = flashinfer.mamba.selective_state_update(
                 ssm_state_cache,
                 x_decode,
