@@ -22,6 +22,7 @@ into the SSM state update without going through HBM.
 Target: Nemotron Nano v3 (nheads=64, dim=64, dstate=128, ngroups=8, conv_dim=6144)
 """
 
+import torch
 import triton
 import triton.language as tl
 
@@ -233,6 +234,65 @@ def _fused_conv_ssm_kernel(
     c_bias = tl.load(conv_bias_ptr + C_channels, mask=mask_bc, other=0.0).to(tl.float32)
     C_vals += c_in * c_w_last + c_bias
 
+    # Update conv state for B and C channels (shift left, append new input).
+    # Only the first head in each group (pid_h % nheads_per_group == 0) performs the
+    # write to avoid write-write races: multiple heads in the same group share the
+    # same B/C channels, so concurrent state-shift stores from all group heads corrupt
+    # the state (a later head's shift-read at position k+1 sees the new x_in already
+    # stored there by an earlier head, propagating x_in into the wrong slot).
+    if pid_h % nheads_per_group == 0:
+        for k in range(kernel_width - 2):
+            old_b = tl.load(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + B_channels * stride_cs_d
+                + (k + 1) * stride_cs_w,
+                mask=mask_bc,
+                other=0.0,
+            )
+            tl.store(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + B_channels * stride_cs_d
+                + k * stride_cs_w,
+                old_b,
+                mask=mask_bc,
+            )
+        tl.store(
+            conv_state_ptr
+            + conv_slot * stride_cs_b
+            + B_channels * stride_cs_d
+            + (kernel_width - 2) * stride_cs_w,
+            b_in.to(conv_state_ptr.dtype.element_ty),
+            mask=mask_bc,
+        )
+
+        for k in range(kernel_width - 2):
+            old_c = tl.load(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + C_channels * stride_cs_d
+                + (k + 1) * stride_cs_w,
+                mask=mask_bc,
+                other=0.0,
+            )
+            tl.store(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + C_channels * stride_cs_d
+                + k * stride_cs_w,
+                old_c,
+                mask=mask_bc,
+            )
+        tl.store(
+            conv_state_ptr
+            + conv_slot * stride_cs_b
+            + C_channels * stride_cs_d
+            + (kernel_width - 2) * stride_cs_w,
+            c_in.to(conv_state_ptr.dtype.element_ty),
+            mask=mask_bc,
+        )
+
     # Apply SiLU to B and C
     B_vals = B_vals * (1.0 / (1.0 + tl.exp(-B_vals)))
     C_vals = C_vals * (1.0 / (1.0 + tl.exp(-C_vals)))
@@ -277,3 +337,93 @@ def _fused_conv_ssm_kernel(
         mask=mask_d,
     )
     tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask_dn)
+
+
+def fused_conv_ssm_decode(
+    conv_input: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    A: torch.Tensor,
+    D: torch.Tensor,
+    ssm_state: torch.Tensor,
+    conv_slot_idx: torch.Tensor,
+    ssm_slot_idx: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Launch _fused_conv_ssm_kernel for decode (T=1) tokens.
+
+    Args:
+        conv_input:   [batch, conv_dim]  raw conv input (before split), bf16
+        conv_state:   [max_batch, conv_dim, kernel_width-1]  slot-indexed
+        conv_weight:  [conv_dim, kernel_width]
+        conv_bias:    [conv_dim]
+        dt:           [batch, nheads]
+        dt_bias:      [nheads]
+        A:            [nheads]
+        D:            [nheads]
+        ssm_state:    [max_batch, nheads, dim, dstate]  slot-indexed
+        conv_slot_idx:[batch] int32
+        ssm_slot_idx: [batch] int32
+        out:          [batch, nheads, dim] preallocated output (written in bf16)
+    """
+    batch, conv_dim = conv_input.shape
+    _, nheads, dim, dstate = ssm_state.shape
+    kernel_width = conv_state.shape[-1] + 1
+    intermediate_size = nheads * dim
+    ngroups = (conv_dim - intermediate_size) // (2 * dstate)
+    nheads_per_group = nheads // ngroups
+
+    BLOCK_DIM = max(triton.next_power_of_2(dim), 16)
+    BLOCK_DSTATE = triton.next_power_of_2(dstate)
+    num_warps = 4
+
+    def grid(META):
+        return (triton.cdiv(dim, META["BLOCK_DIM"]), batch, nheads)
+
+    conv_input = conv_input.contiguous()
+    conv_state = conv_state.contiguous()
+    conv_weight = conv_weight.contiguous()
+
+    _fused_conv_ssm_kernel[grid](
+        conv_input,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        dt,
+        dt_bias,
+        A,
+        D,
+        ssm_state,
+        conv_slot_idx,
+        ssm_slot_idx,
+        out,
+        batch,
+        conv_dim,
+        intermediate_size,
+        nheads,
+        dim,
+        dstate,
+        ngroups,
+        nheads_per_group,
+        kernel_width,
+        conv_input.stride(0),
+        conv_input.stride(1),
+        conv_state.stride(0),
+        conv_state.stride(1),
+        conv_state.stride(2),
+        conv_weight.stride(0),
+        conv_weight.stride(1),
+        ssm_state.stride(0),
+        ssm_state.stride(1),
+        ssm_state.stride(2),
+        ssm_state.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        BLOCK_DIM=BLOCK_DIM,
+        BLOCK_DSTATE=BLOCK_DSTATE,
+        num_warps=num_warps,
+    )

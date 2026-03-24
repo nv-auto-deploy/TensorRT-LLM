@@ -1,0 +1,22 @@
+iter	commit	primary_metric	ttft_avg_ms	tpot_avg_ms	tps	correctness	status	description
+0	b095c625e7	2.161	45.87	2.161	452.3	-	keep	baseline (reduced 6-layer)
+1	f016d7d7c5	2.209	48.12	2.209	442.8	-	discard	fuse_gemms_mixed_children enabled (tpot regressed)
+2	97871ebaba	2.160	45.13	2.160	452.8	-	discard	multi_stream_gemm enabled (within noise)
+3	be2f2b327c	0.000	0.00	0.000	0.0	-	crash	attn_backend flashinfer (segfault in TVM module load)
+4	52c6ed7e55	0.000	0.00	0.000	0.0	-	crash	attn_backend triton (CompilationError in triton kernel)
+5	75cfdbc892	2.160	45.59	2.160	452.6	-	discard	SSM triton_ssm (tpot +12% at conc=16, ttft 4.8x worse)
+6	6330fe2be6	2.280	46.36	2.280	429.1	-	discard	fuse_rmsnorm_quant_fp8 (tpot +5.5% regressed)
+7	803ec7f829	2.180	47.85	2.180	448.0	-	discard	rmsnorm triton backend (no improvement)
+8	a6b50f4d9a	2.251	45.11	2.251	434.8	-	discard	MoE triton backend (tpot +4.2% regressed)
+9	2511bfba33	2.187	45.66	2.187	447.2	-	discard	optimized fused rmsnorm+fp8 kernel (still regressed, conc=16 +13.7%)
+10	295c59d8e9	2.275	45.58	2.275	430.2	-	discard	fuse_trtllm_attn_quant_fp8 (tpot +5.3% regressed)
+11	65a422360f	2.187	44.61	2.187	447.4	pass	keep	tuned_ssm kernel (BLOCK_SIZE_M=16) - TTFT -24.5%@c256, TPS +2.8%@c256, correctness verified
+12	7a410f103a	0.000	0.00	0.000	0.0	-	crash	piecewise CUDA graph + multi_stream_gemm (OOM during warmup)
+13	13b6f318b8	0.000	0.00	0.000	0.0	-	crash	torch_dtype float16 (FP8 checkpoint incompatible)
+14	2127c5f794	2.171	46.59	2.171	449.8	-	discard	fuse_gemms + fuse_fp8_gemms (TTFT/TPS regressed at high conc)
+15	969b7c2d46	2.181	45.46	2.181	448.5	-	discard	fine-grained CUDA graph batch sizes (more graphs = less KV cache = worse)
+16	4b0dad9abd	2.198	47.30	2.198	444.7	-	discard	piecewise CUDA graph (free_mem=0.70) - request errors at conc=16/256
+17	984665b52d	2.181	46.04	2.181	448.1	-	discard	SSM BLOCK_M=8 warps=1 (microbench 4% faster but e2e TTFT/TPS regressed)
+18	80fdcdac82	2.300	46.16	2.300	425.7	-	discard	mamba_ssm_cache_dtype bf16 (tpot +5.2% - dtype conversion overhead)
+19	8754c6fe32	2.187	44.61	2.187	447.4	pass	keep	fused conv1d+SSM Triton kernel (kernel written, not yet e2e integrated - from iter11 baseline)
+20	TBD	2.181	46.17	2.181	448.2	pass	keep	fuse_conv_ssm graph transform (TPOT -0.3%@c1, within noise but not negative; correctness verified 3 decode steps)

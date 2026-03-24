@@ -40,3 +40,5 @@ transforms:
     enabled: true
   insert_cached_ssm_attention:
     backend: tuned_ssm
+  fuse_conv_ssm:
+    enabled: true

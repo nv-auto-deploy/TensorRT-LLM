@@ -266,6 +266,9 @@ transforms:
   ############################################################################################
   fuse_causal_conv_activation:
     stage: compile
+  fuse_conv_ssm:
+    stage: compile
+    enabled: false
   multi_stream_moe:
     stage: compile
     enabled: false
