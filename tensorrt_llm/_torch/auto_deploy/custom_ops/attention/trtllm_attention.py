@@ -437,7 +437,7 @@ def trtllm_mha_with_cache(
         out_flat = out.view(-1, num_heads * head_dim)
         output = out_flat[:num_tokens]
     else:
-        output = torch.zeros(
+        output = torch.empty(
             total_padded_tokens, num_heads * head_dim, dtype=out_dtype, device=q.device
         )
     # Map SequenceInfo fields to thop.attention args
@@ -676,21 +676,49 @@ class TrtllmAttention(AttentionDescriptor):
 
     @classmethod
     def prepare_node_for_cache_insertion(cls, gm: GraphModule, attn_node: Node) -> None:
-        """Materialize optional out_scale node for FP8 output path if contract exists."""
+        """Materialize optional out_scale and rope cos_sin nodes before cache insertion."""
+        # FP8 output scale: thop.attention needs 1/input_scale as out_scale.
+        # When input_scale is a static buffer (get_attr), fold the reciprocal at
+        # graph construction time to avoid a per-step GPU kernel launch.
         input_scale = get_trtllm_attention_fp8_input_scale(attn_node)
-        if input_scale is None:
+        if input_scale is not None:
+            existing_out_scale = attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
+            if not isinstance(existing_out_scale, Node):
+                if input_scale.op == "get_attr":
+                    # Static scale — try to pre-compute reciprocal at graph
+                    # construction time to avoid a per-step GPU kernel.
+                    scale_tensor = None
+                    try:
+                        obj = gm
+                        for atom in input_scale.target.split("."):
+                            obj = getattr(obj, atom)
+                        if not obj.is_meta:
+                            scale_tensor = obj
+                    except AttributeError:
+                        pass
+
+                    if scale_tensor is not None:
+                        recip_tensor = torch.reciprocal(scale_tensor)
+                        recip_attr = "_trtllm_recip_" + input_scale.target.replace(".", "_")
+                        if not hasattr(gm, recip_attr):
+                            gm.register_buffer(recip_attr, recip_tensor, persistent=False)
+                        with gm.graph.inserting_before(attn_node):
+                            out_scale = gm.graph.create_node("get_attr", recip_attr)
+                        out_scale.meta["val"] = recip_tensor
+                    else:
+                        with gm.graph.inserting_before(attn_node):
+                            out_scale = gm.graph.call_function(
+                                torch.ops.aten.reciprocal.default, args=(input_scale,)
+                            )
+                else:
+                    # Dynamic scale — compute reciprocal at runtime.
+                    with gm.graph.inserting_before(attn_node):
+                        out_scale = gm.graph.call_function(
+                            torch.ops.aten.reciprocal.default, args=(input_scale,)
+                        )
+                attn_node.meta[_TRTLLM_ATTN_OUT_SCALE_KEY] = out_scale
+        else:
             attn_node.meta.pop(_TRTLLM_ATTN_OUT_SCALE_KEY, None)
-            return
-
-        existing_out_scale = attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
-        if isinstance(existing_out_scale, Node):
-            return
-
-        with gm.graph.inserting_before(attn_node):
-            out_scale = gm.graph.call_function(
-                torch.ops.aten.reciprocal.default, args=(input_scale,)
-            )
-        attn_node.meta[_TRTLLM_ATTN_OUT_SCALE_KEY] = out_scale
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
