@@ -15,6 +15,7 @@
 
 from typing import List, Optional
 
+import flashinfer
 import torch
 from torch.fx import Node
 
@@ -26,6 +27,11 @@ from .mamba_backend_common import (
     _prepare_ssm_decode_inputs,
     _run_ssm_prefill,
 )
+from .tuned_ssm_kernel import tuned_selective_state_update
+
+# Use flashinfer for small decode batches (better TPOT at c1),
+# tuned Triton for large batches (better TTFT at c256 — 5.7x gain).
+_TUNED_DECODE_THRESHOLD = 32
 
 
 @torch.library.custom_op("auto_deploy::flashinfer_cached_ssm", mutates_args=("ssm_state_cache",))
@@ -124,23 +130,40 @@ def _flashinfer_cached_ssm(
             D_full,
         ) = decode_inputs
 
-        import flashinfer
-
         slot_idx_decode_i32 = slot_idx_decode.to(torch.int32)
-        y_decode = flashinfer.mamba.selective_state_update(
-            ssm_state_cache,
-            x_decode,
-            dt_hp,
-            A_full,
-            B_decode,
-            C_decode,
-            D=D_full,
-            z=None,
-            dt_bias=dt_bias_hp,
-            dt_softplus=True,
-            state_batch_indices=slot_idx_decode_i32,
-        )
-        preallocated_ssm_out[num_prefill_tokens:num_total_tokens].copy_(y_decode)
+        preallocated_ssm_out_d = preallocated_ssm_out[num_prefill_tokens:num_total_tokens]
+
+        if num_decode <= _TUNED_DECODE_THRESHOLD:
+            # Small batch: flashinfer CUDA kernel (best TPOT at c1)
+            y_decode = flashinfer.mamba.selective_state_update(
+                ssm_state_cache,
+                x_decode,
+                dt_hp,
+                A_full,
+                B_decode,
+                C_decode,
+                D=D_full,
+                z=None,
+                dt_bias=dt_bias_hp,
+                dt_softplus=True,
+                state_batch_indices=slot_idx_decode_i32,
+            )
+            preallocated_ssm_out_d.copy_(y_decode)
+        else:
+            # Large batch: tuned Triton kernel (BLOCK_SIZE_M=16, 4x fewer blocks — best TTFT at c256)
+            tuned_selective_state_update(
+                ssm_state_cache,
+                x_decode,
+                dt_hp,
+                A_full,
+                B_decode,
+                C_decode,
+                D=D_full,
+                dt_bias=dt_bias_hp,
+                dt_softplus=True,
+                state_batch_indices=slot_idx_decode_i32,
+                out=preallocated_ssm_out_d,
+            )
 
     if out is not None:
         # out is reused across CUDA graph replays with varying num_total_tokens,
