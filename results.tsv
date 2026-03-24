@@ -19,4 +19,5 @@ iter	commit	primary_metric	ttft_avg_ms	tpot_avg_ms	tps	correctness	status	descri
 17	984665b52d	2.181	46.04	2.181	448.1	-	discard	SSM BLOCK_M=8 warps=1 (microbench 4% faster but e2e TTFT/TPS regressed)
 18	80fdcdac82	2.300	46.16	2.300	425.7	-	discard	mamba_ssm_cache_dtype bf16 (tpot +5.2% - dtype conversion overhead)
 19	8754c6fe32	2.187	44.61	2.187	447.4	pass	keep	fused conv1d+SSM Triton kernel (kernel written, not yet e2e integrated - from iter11 baseline)
-20	TBD	2.181	46.17	2.181	448.2	pass	keep	fuse_conv_ssm graph transform (TPOT -0.3%@c1, within noise but not negative; correctness verified 3 decode steps)
+20	872d626b89	2.181	46.17	2.181	448.2	pass	keep	fuse_conv_ssm graph transform (TPOT -0.3%@c1, within noise but not negative; correctness verified 3 decode steps)
+21	TBD	2.176	46.40	2.176	449.2	pass	keep	fuse_relu2_quant_fp8: fused relu2+FP8-quant Triton kernel (3 kernels→1, -0.2%@c1 in 6L; ~1.5% expected on full 30B with 15x MoE layers)

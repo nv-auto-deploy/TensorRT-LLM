@@ -42,3 +42,5 @@ transforms:
     backend: tuned_ssm
   fuse_conv_ssm:
     enabled: true
+  fuse_relu2_quant_fp8:
+    enabled: true

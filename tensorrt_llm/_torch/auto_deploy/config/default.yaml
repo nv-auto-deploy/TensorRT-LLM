@@ -157,6 +157,9 @@ transforms:
     stage: post_load_fusion
     backend: trtllm
     requires_shape_prop: true
+  fuse_relu2_quant_fp8:
+    stage: post_load_fusion
+    enabled: false
   fuse_trtllm_attn_quant_fp8:
     stage: post_load_fusion
     enabled: false

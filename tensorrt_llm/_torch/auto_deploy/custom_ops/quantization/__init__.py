@@ -18,9 +18,13 @@
 This module provides quantization utilities and operations:
 - quant: Quantization operations (FP8, FP4, INT4, INT8)
 - torch_quant: PyTorch-based quantization implementations
+- relu2_quant_fp8: Fused ReLU² + FP8 per-tensor quantization (Triton)
 """
+
+from . import relu2_quant_fp8  # noqa: F401 — registers auto_deploy::relu2_quant_fp8
 
 __all__ = [
     "quant",
     "torch_quant",
+    "relu2_quant_fp8",
 ]
