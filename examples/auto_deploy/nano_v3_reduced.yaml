@@ -45,4 +45,4 @@ transforms:
   fuse_relu2_quant_fp8:
     enabled: true
   fuse_causal_conv_activation:
-    enabled: false  # iter26: TPOT@c1 +1.5% but TTFT@c256 4.5x regression (586→2610ms); mamba-ssm activation="silu" path is slow at large batch
+    enabled: true  # iter29: decode-only fusion — prefill uses activation=None + inline silu (avoids large-batch regression), decode uses fused silu (saves kernel launch per Mamba layer)

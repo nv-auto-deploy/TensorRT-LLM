@@ -94,7 +94,8 @@ def _cuda_cached_causal_conv1d(
         # x_varlen: (dim, cu_seq_len)
         x_varlen = inp_flat[:num_prefill_tokens].transpose(0, 1).contiguous()
 
-        # Run varlen conv; updates conv_state_cache in-place per cache_indices
+        # Run varlen conv with activation=None — causal_conv1d_fwd with fused activation is
+        # slow at large batch (mamba-ssm kernel limitation), so we apply activation inline.
         y_varlen = causal_conv1d_fn(
             x_varlen,
             w2d,
@@ -103,13 +104,16 @@ def _cuda_cached_causal_conv1d(
             cache_indices=slot_idx[:num_prefill].to(torch.int32),
             has_initial_state=use_initial_states[:num_prefill],
             conv_states=conv_state_cache,
-            activation=activation,
+            activation=None,
             pad_slot_id=PAD_SLOT_ID,
         )  # (dim, total_prefill_tokens)
         # Scatter outputs back to input buffer
         inp_flat[:num_prefill_tokens] = y_varlen.transpose(0, 1)
+        # Apply activation inline for prefill (avoids slow large-batch fused path)
+        if activation is not None:
+            torch.nn.functional.silu(inp_flat[:num_prefill_tokens], inplace=True)
 
-    # DECODE: batch update for single-token sequences
+    # DECODE: batch update for single-token sequences — activation fused here saves a kernel launch
     if num_decode > 0:
         x_decode = inp_flat[num_prefill_tokens:num_total_tokens]  # [num_decode, C_in]
 
