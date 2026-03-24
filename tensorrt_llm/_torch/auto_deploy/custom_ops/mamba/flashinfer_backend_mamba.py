@@ -15,7 +15,6 @@
 
 from typing import List, Optional
 
-import flashinfer
 import torch
 from torch.fx import Node
 
@@ -27,10 +26,10 @@ from .mamba_backend_common import (
     _prepare_ssm_decode_inputs,
     _run_ssm_prefill,
 )
-from .tuned_ssm_kernel import tuned_selective_state_update
 
 # Use flashinfer for small decode batches (better TPOT at c1),
 # tuned Triton for large batches (better TTFT at c256 — 5.7x gain).
+# Imports are lazy (inside op body) to avoid affecting CUDA context initialization order.
 _TUNED_DECODE_THRESHOLD = 32
 
 
@@ -134,7 +133,10 @@ def _flashinfer_cached_ssm(
         preallocated_ssm_out_d = preallocated_ssm_out[num_prefill_tokens:num_total_tokens]
 
         if num_decode <= _TUNED_DECODE_THRESHOLD:
-            # Small batch: flashinfer CUDA kernel (best TPOT at c1)
+            # Small batch: flashinfer CUDA kernel (best TPOT at c1).
+            # Lazy import — keeps flashinfer out of module-level init to avoid CUDA context effects.
+            import flashinfer
+
             y_decode = flashinfer.mamba.selective_state_update(
                 ssm_state_cache,
                 x_decode,
@@ -150,7 +152,10 @@ def _flashinfer_cached_ssm(
             )
             preallocated_ssm_out_d.copy_(y_decode)
         else:
-            # Large batch: tuned Triton kernel (BLOCK_SIZE_M=16, 4x fewer blocks — best TTFT at c256)
+            # Large batch: tuned Triton kernel (BLOCK_SIZE_M=16, 4x fewer blocks — best TTFT at c256).
+            # Lazy import — Triton JIT only compiles for batch>32, not for batch=1 TPOT path.
+            from .tuned_ssm_kernel import tuned_selective_state_update
+
             tuned_selective_state_update(
                 ssm_state_cache,
                 x_decode,
