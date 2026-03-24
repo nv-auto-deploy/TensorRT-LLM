@@ -28,6 +28,13 @@ v3 (iter31): single-pass kernel for small batch (seq_len <= _SINGLE_PASS_THRESHO
   - No L2 re-read in pass2 — norm factor computed in-register, normalize inline.
   - Saves one HBM read per row vs two-pass; fewer loop iterations (1 vs 21).
   - Dispatched when seq_len <= 4 (decode path); two-pass used for larger batches.
+
+v4 (iter33): adaptive FlashInfer dispatch for small/medium batch:
+  - For seq_len <= _RMN_ADAPTIVE_THRESHOLD (32): use FlashInfer CUDA kernels.
+    FlashInfer rmsnorm + rmsnorm_quant (non-fused) or fused_add_rmsnorm_quant +
+    rmsnorm (fused) — avoids Triton's overhead at B=1 (decode) where it regressed.
+  - For seq_len > 32: use Triton two-pass fused kernel (fewer launches at large batch).
+  - Imports are lazy to avoid CUDA context init ordering issues.
 """
 
 from typing import Tuple
@@ -50,6 +57,11 @@ _NUM_WARPS = 4
 _BLOCK_N_B1 = 4096
 _NUM_WARPS_B1 = 32
 _SINGLE_PASS_THRESHOLD = 4  # use single-pass for seq_len in {1,2,3,4}
+
+# Adaptive threshold: for seq_len <= this value use FlashInfer CUDA kernels instead of Triton.
+# FlashInfer is faster than Triton at small batch (decode path); Triton fused wins at large batch
+# (fewer kernel launches than 2x FlashInfer). Matches the adaptive SSM dispatch pattern (iter28b).
+_RMN_ADAPTIVE_THRESHOLD = 32
 
 
 @triton.jit
@@ -191,6 +203,22 @@ def rms_norm_quant_fp8(
     hidden_states_flat = hidden_states.reshape(-1, feat_size)
     seq_len = hidden_states_flat.shape[0]
 
+    if seq_len <= _RMN_ADAPTIVE_THRESHOLD:
+        # Small/medium batch: FlashInfer CUDA kernels (faster than Triton at decode-time B=1).
+        # Two calls to avoid Triton's overhead; both are pre-compiled CUDA kernels captured in graph.
+        # Lazy import to avoid CUDA context init ordering issues (same pattern as adaptive SSM).
+        import flashinfer.norm
+
+        scale_f = scale.item()
+        out_fp8 = torch.empty(
+            hidden_states_flat.shape, dtype=torch.float8_e4m3fn, device=hidden_states.device
+        )
+        # Call 1: FP8 quantized norm
+        flashinfer.norm.rmsnorm_quant(out_fp8, hidden_states_flat, weight, scale_f, eps)
+        # Call 2: BF16 norm (needed for residual consumers; computed separately)
+        out_bf16 = flashinfer.norm.rmsnorm(hidden_states_flat, weight, eps)
+        return out_bf16.reshape(orig_shape), out_fp8.reshape(orig_shape)
+
     out_bf16 = torch.empty_like(hidden_states_flat)
     out_fp8 = torch.empty(
         hidden_states_flat.shape,
@@ -309,6 +337,25 @@ def fused_add_rms_norm_quant_fp8(
     x_flat = x.reshape(-1, feat_size)
     residual_flat = residual.reshape(-1, feat_size)
     seq_len = x_flat.shape[0]
+
+    if seq_len <= _RMN_ADAPTIVE_THRESHOLD:
+        # Small/medium batch: FlashInfer CUDA kernels. Lazy import for CUDA ctx ordering safety.
+        # fused_add_rmsnorm_quant mutates its residual arg to (x + residual) = out_add; we clone
+        # to avoid corrupting the original residual tensor before the mutation.
+        import flashinfer.norm
+
+        scale_f = scale.item()
+        out_fp8 = torch.empty(x_flat.shape, dtype=torch.float8_e4m3fn, device=x.device)
+        out_add_flat = residual_flat.clone()  # will be mutated to x + residual
+        # Call 1: residual add + norm + FP8 quant; out_add_flat → x + old_residual
+        flashinfer.norm.fused_add_rmsnorm_quant(out_fp8, x_flat, out_add_flat, weight, scale_f, eps)
+        # Call 2: BF16 norm of (x + residual) for residual consumers
+        out_bf16 = flashinfer.norm.rmsnorm(out_add_flat, weight, eps)
+        return (
+            out_bf16.reshape(orig_shape),
+            out_fp8.reshape(orig_shape),
+            out_add_flat.reshape(orig_shape),
+        )
 
     out_bf16 = torch.empty_like(x_flat)
     out_fp8 = torch.empty(x_flat.shape, dtype=torch.float8_e4m3fn, device=x.device)
