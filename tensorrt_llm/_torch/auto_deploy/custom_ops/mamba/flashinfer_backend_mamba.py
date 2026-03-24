@@ -132,11 +132,12 @@ def _flashinfer_cached_ssm(
         slot_idx_decode_i32 = slot_idx_decode.to(torch.int32)
         preallocated_ssm_out_d = preallocated_ssm_out[num_prefill_tokens:num_total_tokens]
 
-        if num_decode <= _TUNED_DECODE_THRESHOLD:
-            # Small batch: flashinfer CUDA kernel (best TPOT at c1).
-            # Lazy import — keeps flashinfer out of module-level init to avoid CUDA context effects.
-            import flashinfer
+        # iter28c diagnostic: use flashinfer for ALL batch sizes (no Triton) to isolate
+        # whether the conditional branch itself causes TPOT regression vs Triton import.
+        import flashinfer
 
+        if num_decode <= _TUNED_DECODE_THRESHOLD:
+            # Small batch: flashinfer CUDA kernel (best TPOT at c1)
             y_decode = flashinfer.mamba.selective_state_update(
                 ssm_state_cache,
                 x_decode,
@@ -152,11 +153,8 @@ def _flashinfer_cached_ssm(
             )
             preallocated_ssm_out_d.copy_(y_decode)
         else:
-            # Large batch: tuned Triton kernel (BLOCK_SIZE_M=16, 4x fewer blocks — best TTFT at c256).
-            # Lazy import — Triton JIT only compiles for batch>32, not for batch=1 TPOT path.
-            from .tuned_ssm_kernel import tuned_selective_state_update
-
-            tuned_selective_state_update(
+            # Large batch: ALSO flashinfer (diagnostic — no Triton to isolate branch overhead)
+            y_decode = flashinfer.mamba.selective_state_update(
                 ssm_state_cache,
                 x_decode,
                 dt_hp,
@@ -164,11 +162,12 @@ def _flashinfer_cached_ssm(
                 B_decode,
                 C_decode,
                 D=D_full,
+                z=None,
                 dt_bias=dt_bias_hp,
                 dt_softplus=True,
                 state_batch_indices=slot_idx_decode_i32,
-                out=preallocated_ssm_out_d,
             )
+            preallocated_ssm_out_d.copy_(y_decode)
 
     if out is not None:
         # out is reused across CUDA graph replays with varying num_total_tokens,
