@@ -29,10 +29,12 @@ v3 (iter31): single-pass kernel for small batch (seq_len <= _SINGLE_PASS_THRESHO
   - Saves one HBM read per row vs two-pass; fewer loop iterations (1 vs 21).
   - Dispatched when seq_len <= 4 (decode path); two-pass used for larger batches.
 
-v4 (iter33): adaptive FlashInfer dispatch for small/medium batch:
+v4 (iter33b): adaptive FlashInfer dispatch for small/medium batch:
   - For seq_len <= _RMN_ADAPTIVE_THRESHOLD (32): use FlashInfer CUDA kernels.
-    FlashInfer rmsnorm + rmsnorm_quant (non-fused) or fused_add_rmsnorm_quant +
-    rmsnorm (fused) — avoids Triton's overhead at B=1 (decode) where it regressed.
+    Key insight: out_bf16 is ALWAYS dead code after fuse_rmsnorm_quant_fp8 transform
+    (transform only fires when ALL terminal consumers are FP8 linears → bf16_node has
+    zero users → eliminated by DCE). So only FP8 output and out_add need to be correct.
+    Non-fused: rmsnorm_quant (1 call). Fused: elementwise add + rmsnorm_quant (2 ops).
   - For seq_len > 32: use Triton two-pass fused kernel (fewer launches at large batch).
   - Imports are lazy to avoid CUDA context init ordering issues.
 """
@@ -204,8 +206,11 @@ def rms_norm_quant_fp8(
     seq_len = hidden_states_flat.shape[0]
 
     if seq_len <= _RMN_ADAPTIVE_THRESHOLD:
-        # Small/medium batch: FlashInfer CUDA kernels (faster than Triton at decode-time B=1).
-        # Two calls to avoid Triton's overhead; both are pre-compiled CUDA kernels captured in graph.
+        # Small/medium batch: FlashInfer CUDA kernel (single call — fastest at decode B=1).
+        # NOTE: out_bf16 is always dead code here. The fuse_rmsnorm_quant_fp8 transform only fires
+        # when ALL terminal consumers of the norm output are FP8 linears (transform line 251-256),
+        # so bf16_node has zero users after rewiring and is eliminated by eliminate_dead_code().
+        # We allocate an empty (uninitialized) tensor for the bf16 output slot — never read.
         # Lazy import to avoid CUDA context init ordering issues (same pattern as adaptive SSM).
         import flashinfer.norm
 
@@ -213,10 +218,8 @@ def rms_norm_quant_fp8(
         out_fp8 = torch.empty(
             hidden_states_flat.shape, dtype=torch.float8_e4m3fn, device=hidden_states.device
         )
-        # Call 1: FP8 quantized norm
         flashinfer.norm.rmsnorm_quant(out_fp8, hidden_states_flat, weight, scale_f, eps)
-        # Call 2: BF16 norm (needed for residual consumers; computed separately)
-        out_bf16 = flashinfer.norm.rmsnorm(hidden_states_flat, weight, eps)
+        out_bf16 = torch.empty_like(hidden_states_flat)  # dead code — uninitialized, never read
         return out_bf16.reshape(orig_shape), out_fp8.reshape(orig_shape)
 
     out_bf16 = torch.empty_like(hidden_states_flat)
@@ -339,18 +342,20 @@ def fused_add_rms_norm_quant_fp8(
     seq_len = x_flat.shape[0]
 
     if seq_len <= _RMN_ADAPTIVE_THRESHOLD:
-        # Small/medium batch: FlashInfer CUDA kernels. Lazy import for CUDA ctx ordering safety.
-        # fused_add_rmsnorm_quant mutates its residual arg to (x + residual) = out_add; we clone
-        # to avoid corrupting the original residual tensor before the mutation.
+        # Small/medium batch: FlashInfer CUDA kernel (single call — fastest at decode B=1).
+        # NOTE: out_bf16 is always dead code (same reasoning as non-fused case above — the
+        # fuse_rmsnorm_quant_fp8 transform only fires when ALL consumers are FP8 linears, so
+        # bf16_node has zero users after rewiring and is eliminated by eliminate_dead_code()).
+        # out_add IS used (wired to next layer's residual input) so must be correct.
+        # We compute out_add = x + residual via elementwise add (1 kernel), then rmsnorm_quant
+        # (1 kernel) — same 2 ops as baseline, but rmsnorm_quant fuses norm+quant in one pass.
         import flashinfer.norm
 
         scale_f = scale.item()
+        out_add_flat = x_flat + residual_flat  # elementwise add → out_add = x + residual
         out_fp8 = torch.empty(x_flat.shape, dtype=torch.float8_e4m3fn, device=x.device)
-        out_add_flat = residual_flat.clone()  # will be mutated to x + residual
-        # Call 1: residual add + norm + FP8 quant; out_add_flat → x + old_residual
-        flashinfer.norm.fused_add_rmsnorm_quant(out_fp8, x_flat, out_add_flat, weight, scale_f, eps)
-        # Call 2: BF16 norm of (x + residual) for residual consumers
-        out_bf16 = flashinfer.norm.rmsnorm(out_add_flat, weight, eps)
+        flashinfer.norm.rmsnorm_quant(out_fp8, out_add_flat, weight, scale_f, eps)
+        out_bf16 = torch.empty_like(x_flat)  # dead code — uninitialized, never read
         return (
             out_bf16.reshape(orig_shape),
             out_fp8.reshape(orig_shape),
