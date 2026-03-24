@@ -39,7 +39,7 @@ transforms:
     stage: post_load_fusion
     enabled: true
   insert_cached_ssm_attention:
-    backend: tuned_ssm
+    backend: flashinfer_ssm  # reverted from tuned_ssm (iter11): +1.2% TPOT regression not worth the TTFT gain
   fuse_conv_ssm:
     enabled: false  # iter20 regressed TTFT +3.5% (44.61→46.17ms) with only -0.3% TPOT gain (noise)
   fuse_relu2_quant_fp8:

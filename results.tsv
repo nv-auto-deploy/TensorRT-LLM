@@ -10,7 +10,7 @@ iter	commit	primary_metric	ttft_avg_ms	tpot_avg_ms	tps	correctness	status	descri
 8	a6b50f4d9a	2.251	45.11	2.251	434.8	-	discard	MoE triton backend (tpot +4.2% regressed)
 9	2511bfba33	2.187	45.66	2.187	447.2	-	discard	optimized fused rmsnorm+fp8 kernel (still regressed, conc=16 +13.7%)
 10	295c59d8e9	2.275	45.58	2.275	430.2	-	discard	fuse_trtllm_attn_quant_fp8 (tpot +5.3% regressed)
-11	65a422360f	2.187	44.61	2.187	447.4	pass	keep	tuned_ssm kernel (BLOCK_SIZE_M=16) - TTFT -24.5%@c256, TPS +2.8%@c256, correctness verified
+11	65a422360f	2.187	44.61	2.187	447.4	pass	discard	tuned_ssm kernel (BLOCK_SIZE_M=16) - TTFT -24.5%@c256 but TPOT +1.2% vs flashinfer_ssm baseline (2.187 vs 2.161ms); reverted to flashinfer_ssm backend
 12	7a410f103a	0.000	0.00	0.000	0.0	-	crash	piecewise CUDA graph + multi_stream_gemm (OOM during warmup)
 13	13b6f318b8	0.000	0.00	0.000	0.0	-	crash	torch_dtype float16 (FP8 checkpoint incompatible)
 14	2127c5f794	2.171	46.59	2.171	449.8	-	discard	fuse_gemms + fuse_fp8_gemms (TTFT/TPS regressed at high conc)
@@ -21,9 +21,10 @@ iter	commit	primary_metric	ttft_avg_ms	tpot_avg_ms	tps	correctness	status	descri
 19	8754c6fe32	2.187	44.61	2.187	447.4	pass	keep	fused conv1d+SSM Triton kernel (kernel written, not yet e2e integrated - from iter11 baseline)
 20	872d626b89	2.181	46.17	2.181	448.2	pass	discard	fuse_conv_ssm graph transform (TTFT +3.5% regression 44.61→46.17ms outweighs -0.3% TPOT noise; disabled in config)
 21	1000fe4c08	2.176	46.40	2.176	449.2	pass	keep	fuse_relu2_quant_fp8: fused relu2+FP8-quant Triton kernel (3 kernels→1, -0.2%@c1 in 6L; ~1.5% expected on full 30B with 15x MoE layers)
-# TODO(TTFT): Large TTFT opportunity — fuse prefill conv1d+SSM scan into a single block-tiled Triton kernel.
-#   Current prefill path: causal_conv1d_fn (CUDA) + mamba_chunk_scan_combined (CUDA) = two separate HBM round-trips per Mamba layer.
-#   Idea: custom Triton kernel that tiles over [chunk_size, conv_dim] blocks, fusing conv1d sliding window + SiLU + SSM state update in SRAM.
-#   Expected gain: ~15-25% TTFT reduction (similar magnitude to iter11's decode SSM tuning), especially at high concurrency where SSM prefill is significant.
-#   Reference: _run_ssm_prefill in mamba_backend_common.py; fused_mamba_decode.py as decode-side template.
-#   Constraint: must handle variable-length prefill sequences (cu_seqlen) and initial-state loading (use_initial_states).
+# TODO(TTFT): Optimize the PREFILL SSM path to get back iter11's -24.5% TTFT@c256 without TPOT regression.
+#   Root cause of iter11 regression: tuned_ssm decode kernel is ~6% slower than flashinfer_ssm at c1 decode-only.
+#   Better approach: speed up mamba_chunk_scan_combined (the prefill SSM scan), which is purely on the TTFT path and doesn't touch decode.
+#   Idea A: Tune mamba_chunk_scan_combined block/chunk sizes for Nemotron dims (nheads=64, dim=64, dstate=128, chunk_size=256).
+#   Idea B: Fuse prefill conv1d + SSM scan into one Triton kernel (tiles [chunk_size, conv_dim] in SRAM, eliminates HBM round-trip between the two).
+#   Expected: ~20-30% TTFT reduction at high concurrency, zero TPOT impact (pure prefill path).
+#   Reference: _run_ssm_prefill in mamba_backend_common.py; mamba_chunk_scan_combined from mamba_ssm library.
