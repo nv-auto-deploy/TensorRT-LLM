@@ -44,5 +44,7 @@ transforms:
     enabled: false  # iter20 regressed TTFT +3.5% (44.61→46.17ms) with only -0.3% TPOT gain (noise)
   fuse_relu2_quant_fp8:
     enabled: true
+  fuse_rmsnorm_quant_fp8:
+    enabled: true  # iter31: re-enabled with single-pass B≤4 kernel (load all 2688 elems into registers, no L2 re-read)
   fuse_causal_conv_activation:
     enabled: true  # iter29: decode-only fusion — prefill uses activation=None + inline silu (avoids large-batch regression), decode uses fused silu (saves kernel launch per Mamba layer)
