@@ -26,4 +26,6 @@ iter	commit	primary_metric	ttft_avg_ms	tpot_avg_ms	tps	correctness	status	descri
 24	da1c154d9c	2.211	45.78	2.211	13338	pass	keep	adaptive SSM dispatch fixed (module-level flashinfer import): TTFT@c256 3320→586ms (-82%, 5.7x), TPOT@c1 2.18→2.21ms (flat, within noise)
 25	dbeb34ba0c	2.211	45.78	2.211	13338	-	keep	rms_norm_quant_fp8 two-pass kernel (BLOCK_N=128, num_stages=2); transform DISABLED (slower at B<=256, wins at B>4096 only)
 26	dfe529f22f	2.179	46.92	2.179	12983	pass	discard	fuse_causal_conv_activation (SiLU fused): TPOT@c1 +1.5% (2.211→2.179ms) but TTFT@c256 4.5x regression (586→2610ms); mamba-ssm activation=silu path is slow at large batch
-27	ead784b0d6	2.154	45.79	2.154	13335	-	keep	revert tuned_ssm→flashinfer_ssm: TPOT@c1 2.211→2.154ms (below 2.161ms baseline!); iter21 noise confirmed; TTFT@c256 regressed 586→3291ms (TODO: fix via iter28 adaptive dispatch in flashinfer_ssm)
+27	ead784b0d6	2.154	45.79	2.154	13335	-	keep	revert tuned_ssm→flashinfer_ssm: TPOT@c1 2.211→2.154ms (below 2.161ms baseline!); iter21 noise confirmed; TTFT@c256 regressed 586→3291ms
+28	288dcba0d3	2.243	44.63	2.243	13366	-	discard	adaptive SSM inside flashinfer_ssm (module-level imports): TPOT@c1 2.154→2.243ms regression! module-level import flashinfer+tuned_ssm_kernel likely causes CUDA ctx init ordering issue; iter28b tests lazy imports
+28b	e2cf64d874	TBD	TBD	TBD	TBD	-	pending	adaptive SSM inside flashinfer_ssm (lazy imports): bench running on GPU 2
