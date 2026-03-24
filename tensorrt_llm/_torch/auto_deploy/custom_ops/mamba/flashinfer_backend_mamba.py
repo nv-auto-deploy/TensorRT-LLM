@@ -65,9 +65,98 @@ def _flashinfer_cached_ssm(
     )
     ssm_state_size = B.shape[3]
     batch_info = BatchInfo(batch_info_host)
-    num_prefill, _, num_decode = batch_info.get_num_sequences()
-    num_prefill_tokens, _, num_decode_tokens = batch_info.get_num_tokens()
-    num_total_tokens = num_prefill_tokens + num_decode_tokens
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
+    num_seq = num_prefill + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode
+
+    # Fast path: pure decode (no prefill) — skip torch.zeros (cudaMemset) and copy_
+    # (cudaMemcpy) entirely. At c1 this saves ~2 GPU ops per Mamba layer per decode step.
+    if num_prefill == 0:
+        if num_total_tokens == 0:
+            if out is not None:
+                return out.new_empty(0)
+            return torch.zeros_like(hidden_states)
+        decode_inputs = _prepare_ssm_decode_inputs(
+            hs_flat,
+            B_flat,
+            C_flat,
+            dt_flat,
+            A,
+            D,
+            dt_bias,
+            slot_idx,
+            0,
+            0,
+            num_seq,
+            num_total_tokens,
+            num_heads,
+            head_dim,
+            ssm_state_size,
+        )
+        # guaranteed non-None since num_total_tokens > 0
+        (
+            slot_idx_decode,
+            x_decode,
+            B_decode,
+            C_decode,
+            dt_hp,
+            dt_bias_hp,
+            A_full,
+            D_full,
+        ) = decode_inputs
+        slot_idx_decode_i32 = slot_idx_decode.to(torch.int32)
+
+        if num_decode <= _TUNED_DECODE_THRESHOLD:
+            # Small batch: flashinfer (best TPOT at c1)
+            import flashinfer
+
+            y = flashinfer.mamba.selective_state_update(
+                ssm_state_cache,
+                x_decode,
+                dt_hp,
+                A_full,
+                B_decode,
+                C_decode,
+                D=D_full,
+                z=None,
+                dt_bias=dt_bias_hp,
+                dt_softplus=True,
+                state_batch_indices=slot_idx_decode_i32,
+            )  # [num_decode, num_heads, head_dim]
+        else:
+            # Large batch: tuned Triton kernel (5.7x better TTFT@c256)
+            from .tuned_ssm_kernel import tuned_selective_state_update
+
+            y = torch.empty(
+                [num_decode, num_heads, head_dim],
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            tuned_selective_state_update(
+                ssm_state_cache,
+                x_decode,
+                dt_hp,
+                A_full,
+                B_decode,
+                C_decode,
+                D=D_full,
+                dt_bias=dt_bias_hp,
+                dt_softplus=True,
+                state_batch_indices=slot_idx_decode_i32,
+                out=y,
+            )
+
+        if out is not None:
+            out_view = out.view(bs, num_heads, head_dim)
+            out_view[:num_total_tokens].copy_(y)
+            if num_total_tokens < bs:
+                out_view[num_total_tokens:].zero_()
+            return out.new_empty(0)
+        if y.dtype != hidden_states.dtype:
+            y = y.to(hidden_states.dtype)
+        return y.view(b, s, num_heads, head_dim)
+
+    # Slow path: prefill or mixed prefill+decode — use preallocated buffer
     if out is not None:
         preallocated_ssm_out = out.view(bs, num_heads, head_dim)
     else:
@@ -111,7 +200,7 @@ def _flashinfer_cached_ssm(
         num_prefill,
         num_prefill_tokens,
         num_decode,
-        num_decode_tokens,
+        num_decode,
         num_heads,
         head_dim,
         ssm_state_size,
@@ -132,12 +221,10 @@ def _flashinfer_cached_ssm(
         slot_idx_decode_i32 = slot_idx_decode.to(torch.int32)
         preallocated_ssm_out_d = preallocated_ssm_out[num_prefill_tokens:num_total_tokens]
 
-        # iter28c diagnostic: use flashinfer for ALL batch sizes (no Triton) to isolate
-        # whether the conditional branch itself causes TPOT regression vs Triton import.
-        import flashinfer
-
         if num_decode <= _TUNED_DECODE_THRESHOLD:
-            # Small batch: flashinfer CUDA kernel (best TPOT at c1)
+            # Small batch: flashinfer
+            import flashinfer
+
             y_decode = flashinfer.mamba.selective_state_update(
                 ssm_state_cache,
                 x_decode,
@@ -153,8 +240,10 @@ def _flashinfer_cached_ssm(
             )
             preallocated_ssm_out_d.copy_(y_decode)
         else:
-            # Large batch: ALSO flashinfer (diagnostic — no Triton to isolate branch overhead)
-            y_decode = flashinfer.mamba.selective_state_update(
+            # Large batch: tuned Triton (writes directly to buffer, no copy_)
+            from .tuned_ssm_kernel import tuned_selective_state_update
+
+            tuned_selective_state_update(
                 ssm_state_cache,
                 x_decode,
                 dt_hp,
@@ -162,12 +251,11 @@ def _flashinfer_cached_ssm(
                 B_decode,
                 C_decode,
                 D=D_full,
-                z=None,
                 dt_bias=dt_bias_hp,
                 dt_softplus=True,
                 state_batch_indices=slot_idx_decode_i32,
+                out=preallocated_ssm_out_d,
             )
-            preallocated_ssm_out_d.copy_(y_decode)
 
     if out is not None:
         # out is reused across CUDA graph replays with varying num_total_tokens,

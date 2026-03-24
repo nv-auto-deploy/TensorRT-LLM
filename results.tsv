@@ -29,3 +29,4 @@ iter	commit	primary_metric	ttft_avg_ms	tpot_avg_ms	tps	correctness	status	descri
 27	ead784b0d6	2.154	45.79	2.154	13335	-	keep	revert tuned_ssm→flashinfer_ssm: TPOT@c1 2.211→2.154ms (below 2.161ms baseline!); iter21 noise confirmed; TTFT@c256 regressed 586→3291ms
 28	288dcba0d3	2.243	44.63	2.243	13366	-	discard	adaptive SSM inside flashinfer_ssm (module-level imports): TPOT@c1 2.154→2.243ms regression! module-level import flashinfer+tuned_ssm_kernel likely causes CUDA ctx init ordering issue; iter28b tests lazy imports
 28b	e2cf64d874	TBD	TBD	TBD	TBD	-	pending	adaptive SSM inside flashinfer_ssm (lazy imports): bench running on GPU 2
+29	28d45cd7a3	2.209	46.73	2.209	13216	-	pending	decode-only causal_conv_activation (fuse silu for decode): TPOT avg=2.209ms on iter28b base; confounded — need iter28b baseline to evaluate; TTFT@c256 p50=2135ms (intermediate, partial adaptive dispatch improvement)
