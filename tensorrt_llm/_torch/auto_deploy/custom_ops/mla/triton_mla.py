@@ -530,9 +530,14 @@ def _triton_mla_decode(
     # Split-K: for b≤4 with kv≥512, partition kv blocks across 8 parts.
     # T=1, HB=4 gives grid=(1,8)=8 programs (6% SM utilization).
     # With NUM_PARTS=8: grid=(1,8,8)=64 programs (~48% SM utilization).
-    # Python-side log-sum-exp reduction combines 8 partial (acc, m, l) tensors.
+    # Adaptive SEQ_BLOCK for split-K (iter 28): choose SB to maximize partition fill.
+    #   SB=64 → total_blocks = kv/64. For kv≤1536: ≤24 blocks, each of 8 parts gets ≤3 blocks.
+    #   SB=128 → for kv>1536: ≥12 blocks → each of 8 parts gets ≥2 blocks (good fill).
+    #   Benchmark: kv=512 SB=64→11.2µs, SB=128→12.2µs (+9%); kv=2048 SB=128→14.3µs, SB=64→15.5µs (+8%).
     use_splitk = b <= 4 and max_kv_len >= 512
     num_parts = 8 if use_splitk else 1
+    if use_splitk:
+        seq_block = 64 if max_kv_len <= 1536 else 128
 
     if use_splitk:
         kv_block = triton.next_power_of_2(kv_lora_rank)

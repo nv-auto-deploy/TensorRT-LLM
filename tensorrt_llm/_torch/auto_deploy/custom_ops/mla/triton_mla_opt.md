@@ -144,9 +144,9 @@ ______________________________________________________________________
 | --- | -------------- | ---------------------------------------------------- | ---- | ----------- |
 | A1  | 8.5            | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3       | 18   | **2.5×**    |
 | A2  | 10.8           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **6.2×**    |
-| A3  | 11.2           | split-K NP=8, HB=4, SEQ_BLOCK=64, warps=8, stgs=3  | 27   | **11.3×**   |
-| A4  | 12.7           | split-K NP=8, HB=4, SEQ_BLOCK=64, warps=8, stgs=3  | 27   | **19.6×**   |
-| A5  | 15.5           | split-K NP=8, HB=4, SEQ_BLOCK=64, warps=8, stgs=3  | 27   | **31.7×**   |
+| A3  | 10.8           | split-K NP=8, HB=4, SB=64, warps=8, stgs=3         | 28   | **11.8×**   |
+| A4  | 12.2           | split-K NP=8, HB=4, SB=64, warps=8, stgs=3         | 28   | **20.4×**   |
+| A5  | 13.9           | split-K NP=8, HB=4, SB=128, warps=8, stgs=3        | 28   | **35.3×**   |
 | A6  | 11.9           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **5.8×**    |
 | A7  | 15.4           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **8.5×**    |
 | A8  | 16.0           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **9.3×**    |
@@ -937,6 +937,33 @@ blocks/part (also all busy). SB=128 wins here due to better pipeline fill.
 Optimal: SB=64 for kv=\[512, 1536\], SB=128 for kv>1536.
 
 **Commit:** iter 27 — split-K SB tuning analysis \[doc only\]
+
+______________________________________________________________________
+
+### Iteration 28 — Adaptive SB=64/128 in split-K dispatch (kv threshold 1536)
+
+**Change:** Updated `_triton_mla_decode` split-K path to use adaptive `seq_block`:
+
+```python
+if use_splitk:
+    seq_block = 64 if max_kv_len <= 1536 else 128
+```
+
+Also updated `sweep_triton_mla.py` `run_benchmark` to use the same adaptive logic when
+benchmarking split-K shapes.
+
+**Benchmark:**
+
+| ID  | Prev split-K µs | Adaptive µs | Delta  |
+| --- | --------------- | ----------- | ------ |
+| A3  | 11.2 (SB=64)    | **10.8**    | +3.6%  |
+| A4  | 12.7 (SB=64)    | **12.2**    | +3.9%  |
+| A5  | 15.5 (SB=64)    | **13.9**    | +10.3% |
+
+Updated Current Best Summary: A3=10.8µs, A4=12.2µs, A5=13.9µs.
+Correctness: PASS (all 14 shapes).
+
+**Commit:** iter 28 — adaptive SB in split-K dispatch (+4-10% A3-A5)
 
 ______________________________________________________________________
 

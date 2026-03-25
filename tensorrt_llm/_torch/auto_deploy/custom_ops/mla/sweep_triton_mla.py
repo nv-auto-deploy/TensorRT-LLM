@@ -454,11 +454,14 @@ def run_benchmark(
         use_splitk = not is_prefill and num_tokens <= 4 and kv_len >= 512
         try:
             if use_splitk:
+                # Adaptive SB for split-K: SB=64 maximizes partition fill for kv≤1536,
+                # SB=128 better for kv>1536 (more computation per block amortizes overhead).
+                sb_sk = 64 if kv_len <= 1536 else 128
                 kernel_us = bench_splitk_kernel(
                     num_tokens,
                     kv_len,
                     HEAD_BLOCK=hb,
-                    SEQ_BLOCK=sb,
+                    SEQ_BLOCK=sb_sk,
                     num_warps=params["num_warps"],
                     num_stages=params["num_stages"],
                     warmup=warmup,
