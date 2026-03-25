@@ -812,7 +812,7 @@ def _triton_mla_prefill(
     # =====================================================================
     # Step 4: Value projection (fp32 to minimize bf16 reduction error over kv_lora_rank)
     # =====================================================================
-    attn_out = torch.einsum("tnk,nvk->tnv", weighted_kv, w_v.float()).to(
+    attn_out = torch.einsum("tnk,nvk->tnv", weighted_kv.float(), w_v.float()).to(
         q_nope.dtype
     )  # [total_tokens, N, v_head_dim]
 

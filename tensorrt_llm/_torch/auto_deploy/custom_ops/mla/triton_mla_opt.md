@@ -1669,6 +1669,33 @@ more partitions than strictly necessary, but extra partitions are masked and fas
 
 ______________________________________________________________________
 
+### Iteration 53 — Fix dtype mismatch in prefill value projection (weighted_kv.float())
+
+**Change:** Add `.float()` to `weighted_kv` in the prefill value projection einsum to
+match the `w_v.float()` operand:
+
+```python
+# Before (crashes: BFloat16 × Float32):
+attn_out = torch.einsum("tnk,nvk->tnv", weighted_kv, w_v.float()).to(q_nope.dtype)
+
+# After (both operands in fp32):
+attn_out = torch.einsum("tnk,nvk->tnv", weighted_kv.float(), w_v.float()).to(q_nope.dtype)
+```
+
+**Root cause:** `weighted_kv` is allocated as `q_nope.dtype` (BFloat16) in the prefill
+path. `w_v.float()` upcasts to Float32. PyTorch's `einsum` requires matching dtypes,
+so mixing BF16 × F32 raises `RuntimeError: expected scalar type BFloat16 but found Float`.
+
+The decode path at `torch.einsum("bnk,nvk->bnv", weighted_kv, w_v)` uses both operands
+as-is (BF16) — that path was already consistent.
+
+**Performance impact:** Negligible; the `.float()` cast adds a small BF16→FP32 elementwise
+conversion before the einsum, but the einsum itself dominates.
+
+**Commit:** iter 53 — fix prefill dtype mismatch: weighted_kv.float() in value projection
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK
@@ -1713,7 +1740,7 @@ ______________________________________________________________________
 
 ## Final Best Configuration
 
-**Total iterations: 52** | **GPU: NVIDIA H100 80GB HBM3**
+**Total iterations: 53** | **GPU: NVIDIA H100 80GB HBM3**
 
 ### Dispatch logic summary
 
