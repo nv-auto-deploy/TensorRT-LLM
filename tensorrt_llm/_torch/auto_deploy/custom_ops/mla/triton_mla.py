@@ -93,6 +93,210 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool, max_kv_len: int
 
 
 @triton.jit
+def _mla_attention_kernel_splitk(
+    # Tensor pointers
+    q_absorbed_ptr,  # [num_tokens, N, kv_lora_rank]
+    q_pe_ptr,  # [num_tokens, N, qk_rope_head_dim]
+    mla_cache_ptr,  # [max_batch, max_seq, cache_dim]
+    token_slot_ptr,  # [num_tokens]
+    token_kv_len_ptr,  # [num_tokens]
+    workspace_acc_ptr,  # [num_tokens, N, num_parts, KV_BLOCK] fp32
+    workspace_ml_ptr,  # [num_tokens, N, num_parts, 2] fp32 (m, l per head)
+    # Constexpr parameters
+    SCALE: tl.constexpr,
+    MAX_SEQ_LEN: tl.constexpr,
+    N_HEADS: tl.constexpr,
+    KV_LORA_RANK: tl.constexpr,
+    QK_ROPE_HEAD_DIM: tl.constexpr,
+    CACHE_DIM: tl.constexpr,
+    KV_BLOCK: tl.constexpr,
+    PE_BLOCK: tl.constexpr,
+    SEQ_BLOCK: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    NUM_PARTS: tl.constexpr,
+):
+    """Split-K variant of multihead MLA kernel.
+
+    Grid: (num_tokens, N_HEADS // HEAD_BLOCK, NUM_PARTS)
+
+    Each program computes a partial attention over kv blocks
+    [part_start, part_end) without normalizing. Stores (acc, m, l) to workspace
+    for Python-side reduction across NUM_PARTS partitions.
+    """
+    token_id = tl.program_id(0)
+    head_group = tl.program_id(1)
+    part_id = tl.program_id(2)
+    head_start = head_group * HEAD_BLOCK
+
+    slot_idx = tl.load(token_slot_ptr + token_id)
+    kv_len = tl.load(token_kv_len_ptr + token_id)
+
+    kv_offsets = tl.arange(0, KV_BLOCK)
+    kv_mask = kv_offsets < KV_LORA_RANK
+    pe_offsets = tl.arange(0, PE_BLOCK)
+    pe_mask = pe_offsets < QK_ROPE_HEAD_DIM
+    head_offsets = tl.arange(0, HEAD_BLOCK)
+
+    # Load q_absorbed and q_pe for all HEAD_BLOCK heads
+    q_abs_ptrs = (
+        q_absorbed_ptr
+        + token_id * N_HEADS * KV_LORA_RANK
+        + (head_start + head_offsets[:, None]) * KV_LORA_RANK
+        + kv_offsets[None, :]
+    )
+    q_abs_all = tl.load(q_abs_ptrs, mask=kv_mask[None, :], other=0.0).to(tl.bfloat16)
+
+    q_pe_ptrs = (
+        q_pe_ptr
+        + token_id * N_HEADS * QK_ROPE_HEAD_DIM
+        + (head_start + head_offsets[:, None]) * QK_ROPE_HEAD_DIM
+        + pe_offsets[None, :]
+    )
+    q_pe_all = tl.load(q_pe_ptrs, mask=pe_mask[None, :], other=0.0).to(tl.bfloat16)
+
+    # Per-head online softmax state (partial)
+    m_i = tl.full([HEAD_BLOCK], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([HEAD_BLOCK], dtype=tl.float32)
+    acc = tl.zeros([HEAD_BLOCK, KV_BLOCK], dtype=tl.float32)
+
+    cache_batch_base = tl.multiple_of(slot_idx * MAX_SEQ_LEN * CACHE_DIM, CACHE_DIM)
+    total_blocks = tl.cdiv(kv_len, SEQ_BLOCK)
+    # Partition blocks across NUM_PARTS: part_id handles [part_start, part_end)
+    blocks_per_part = tl.cdiv(total_blocks, NUM_PARTS)
+    part_start_block = part_id * blocks_per_part
+    part_end_block = tl.minimum(part_start_block + blocks_per_part, total_blocks)
+
+    for block_id in range(part_start_block, part_end_block):
+        block_start = tl.multiple_of(block_id * SEQ_BLOCK, SEQ_BLOCK)
+        seq_offsets = block_start + tl.arange(0, SEQ_BLOCK)
+        seq_mask = seq_offsets < kv_len
+
+        ckv_ptrs = (
+            mla_cache_ptr
+            + cache_batch_base
+            + seq_offsets[:, None] * CACHE_DIM
+            + kv_offsets[None, :]
+        )
+        ckv_bf16 = tl.load(
+            ckv_ptrs,
+            mask=seq_mask[:, None] & kv_mask[None, :],
+            other=0.0,
+            eviction_policy="evict_first",
+        )
+
+        kpe_ptrs = (
+            mla_cache_ptr
+            + cache_batch_base
+            + seq_offsets[:, None] * CACHE_DIM
+            + KV_LORA_RANK
+            + pe_offsets[None, :]
+        )
+        kpe_bf16 = tl.load(
+            kpe_ptrs,
+            mask=seq_mask[:, None] & pe_mask[None, :],
+            other=0.0,
+            eviction_policy="evict_first",
+        )
+
+        scores_nope = tl.dot(q_abs_all, tl.trans(ckv_bf16)).to(tl.float32)
+        scores_pe = tl.dot(q_pe_all, tl.trans(kpe_bf16)).to(tl.float32)
+        scores = (scores_nope + scores_pe) * (SCALE * 1.44269504)
+
+        seq_mask_2d = seq_mask[None, :]
+        scores = tl.where(seq_mask_2d, scores, float("-inf"))
+
+        m_ij = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.math.exp2(m_i - m_new)
+        p = tl.math.exp2(scores - m_new[:, None])
+        p = tl.where(seq_mask_2d, p, 0.0)
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), ckv_bf16).to(tl.float32)
+        m_i = m_new
+
+    # Store partial (acc, m, l) to workspace — NO normalization
+    # workspace_acc: [T, N_HEADS, NUM_PARTS, KV_BLOCK]
+    # workspace_ml:  [T, N_HEADS, NUM_PARTS, 2]
+    #
+    # Use vectorized 2-D stores (same style as multihead kernel) to avoid
+    # constexpr integer indexing into 2-D tensors, which Triton 3.x rejects.
+    acc_ptrs = (
+        workspace_acc_ptr
+        + (token_id * N_HEADS + head_start + head_offsets[:, None]) * NUM_PARTS * KV_BLOCK
+        + part_id * KV_BLOCK
+        + kv_offsets[None, :]
+    )
+    tl.store(acc_ptrs, acc, mask=kv_mask[None, :])
+
+    ml_base = (
+        workspace_ml_ptr
+        + (token_id * N_HEADS + head_start + head_offsets) * NUM_PARTS * 2
+        + part_id * 2
+    )
+    tl.store(ml_base, m_i)
+    tl.store(ml_base + 1, l_i)
+
+
+@triton.jit
+def _mla_splitk_reduce(
+    workspace_acc_ptr,  # [num_tokens, N_HEADS, NUM_PARTS, KV_BLOCK] fp32
+    workspace_ml_ptr,  # [num_tokens, N_HEADS, NUM_PARTS, 2] fp32 (m, l)
+    out_ptr,  # [num_tokens, N_HEADS, KV_BLOCK] bf16
+    N_HEADS: tl.constexpr,
+    KV_LORA_RANK: tl.constexpr,
+    KV_BLOCK: tl.constexpr,
+    NUM_PARTS: tl.constexpr,
+):
+    """Reduce split-K partial (acc, m, l) tensors into normalized output.
+
+    Grid: (num_tokens, N_HEADS)
+
+    Loads NUM_PARTS partial results, combines them with numerically stable
+    log-sum-exp, normalizes, and writes bf16 output.
+    """
+    token_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+
+    kv_offsets = tl.arange(0, KV_BLOCK)
+    kv_mask = kv_offsets < KV_LORA_RANK
+
+    base = token_id * N_HEADS + head_id  # flat (token, head) index
+
+    # Initialize with partition 0
+    ml0_ptr = workspace_ml_ptr + base * NUM_PARTS * 2
+    m_cur = tl.load(ml0_ptr)
+    l_cur = tl.load(ml0_ptr + 1)
+    acc_cur = tl.load(
+        workspace_acc_ptr + base * NUM_PARTS * KV_BLOCK + kv_offsets,
+        mask=kv_mask,
+    )  # [KV_BLOCK]
+
+    for p in tl.static_range(1, NUM_PARTS):
+        ml_p_ptr = workspace_ml_ptr + base * NUM_PARTS * 2 + p * 2
+        m_p = tl.load(ml_p_ptr)
+        l_p = tl.load(ml_p_ptr + 1)
+        acc_p = tl.load(
+            workspace_acc_ptr + base * NUM_PARTS * KV_BLOCK + p * KV_BLOCK + kv_offsets,
+            mask=kv_mask,
+        )
+        m_new = tl.maximum(m_cur, m_p)
+        alpha = tl.math.exp2(m_cur - m_new)
+        beta = tl.math.exp2(m_p - m_new)
+        l_cur = l_cur * alpha + l_p * beta
+        acc_cur = acc_cur * alpha + acc_p * beta
+        m_cur = m_new
+
+    # Normalize and store as bf16
+    out = acc_cur / tl.maximum(l_cur, 1e-38)
+    tl.store(
+        out_ptr + base * KV_BLOCK + kv_offsets,
+        out.to(tl.bfloat16),
+        mask=kv_mask,
+    )
+
+
+@triton.jit
 def _mla_attention_kernel_multihead(
     # Tensor pointers
     q_absorbed_ptr,  # [num_tokens, N, kv_lora_rank]
@@ -316,37 +520,97 @@ def _triton_mla_decode(
     # Per-token KV length: decode attends to positions [0, input_pos]
     kv_len = (input_pos + 1).to(torch.int32)
 
-    # Always use multihead kernel for decode: HEAD_BLOCK=8 amortizes cache load across 8 heads,
-    # reducing HBM traffic 8×. Benchmark (H100, HB=8 SB=64 w=8 s=3) vs original best:
-    #   A1 (B=1, kv=64):   8.6µs vs  9.4µs (+9%)
-    #   A2 (B=1, kv=256): 12.4µs vs 17.0µs (+27%)
-    #   A6 (B=8, kv=256): 13.7µs vs 26.4µs (+48%)
-    # Multihead is strictly better across all batch/context combinations.
+    # Dispatch: split-K for small-batch long-context (fills more H100 SMs),
+    # standard multihead otherwise.
     max_kv_len = int(kv_len.max().item())
     seq_block, head_block, nw, ns = _get_mla_multihead_config(
         b, is_prefill=False, max_kv_len=max_kv_len
     )
-    grid = (b, num_heads // head_block)
-    _mla_attention_kernel_multihead[grid](
-        q_absorbed,
-        q_pe_2d,
-        mla_cache,
-        slot_idx,
-        kv_len,
-        weighted_kv,
-        SCALE=scale,
-        MAX_SEQ_LEN=max_seq_len,
-        N_HEADS=num_heads,
-        KV_LORA_RANK=kv_lora_rank,
-        QK_ROPE_HEAD_DIM=qk_rope_head_dim,
-        CACHE_DIM=cache_dim,
-        KV_BLOCK=kv_block,
-        PE_BLOCK=pe_block,
-        SEQ_BLOCK=seq_block,
-        HEAD_BLOCK=head_block,
-        num_warps=nw,
-        num_stages=ns,
-    )
+
+    # Split-K: for b≤4 with kv≥512, partition kv blocks across 8 parts.
+    # T=1, HB=4 gives grid=(1,8)=8 programs (6% SM utilization).
+    # With NUM_PARTS=8: grid=(1,8,8)=64 programs (~48% SM utilization).
+    # Python-side log-sum-exp reduction combines 8 partial (acc, m, l) tensors.
+    use_splitk = b <= 4 and max_kv_len >= 512
+    num_parts = 8 if use_splitk else 1
+
+    if use_splitk:
+        kv_block = triton.next_power_of_2(kv_lora_rank)
+        # workspace_acc: [b, num_heads, num_parts, kv_block] fp32
+        # workspace_ml:  [b, num_heads, num_parts, 2] fp32 (m, l per head per part)
+        workspace_acc = torch.empty(
+            b,
+            num_heads,
+            num_parts,
+            kv_block,
+            device=q_nope.device,
+            dtype=torch.float32,
+        )
+        workspace_ml = torch.empty(
+            b,
+            num_heads,
+            num_parts,
+            2,
+            device=q_nope.device,
+            dtype=torch.float32,
+        )
+        grid_sk = (b, num_heads // head_block, num_parts)
+        _mla_attention_kernel_splitk[grid_sk](
+            q_absorbed,
+            q_pe_2d,
+            mla_cache,
+            slot_idx,
+            kv_len,
+            workspace_acc,
+            workspace_ml,
+            SCALE=scale,
+            MAX_SEQ_LEN=max_seq_len,
+            N_HEADS=num_heads,
+            KV_LORA_RANK=kv_lora_rank,
+            QK_ROPE_HEAD_DIM=qk_rope_head_dim,
+            CACHE_DIM=cache_dim,
+            KV_BLOCK=kv_block,
+            PE_BLOCK=pe_block,
+            SEQ_BLOCK=seq_block,
+            HEAD_BLOCK=head_block,
+            NUM_PARTS=num_parts,
+            num_warps=nw,
+            num_stages=ns,
+        )
+        # Reduce partial results via Triton kernel (avoids CPU-GPU sync overhead).
+        # Grid: (b, num_heads) — each program combines NUM_PARTS partial (acc,m,l).
+        _mla_splitk_reduce[(b, num_heads)](
+            workspace_acc,
+            workspace_ml,
+            weighted_kv,
+            N_HEADS=num_heads,
+            KV_LORA_RANK=kv_lora_rank,
+            KV_BLOCK=kv_block,
+            NUM_PARTS=num_parts,
+            num_warps=4,
+        )
+    else:
+        grid = (b, num_heads // head_block)
+        _mla_attention_kernel_multihead[grid](
+            q_absorbed,
+            q_pe_2d,
+            mla_cache,
+            slot_idx,
+            kv_len,
+            weighted_kv,
+            SCALE=scale,
+            MAX_SEQ_LEN=max_seq_len,
+            N_HEADS=num_heads,
+            KV_LORA_RANK=kv_lora_rank,
+            QK_ROPE_HEAD_DIM=qk_rope_head_dim,
+            CACHE_DIM=cache_dim,
+            KV_BLOCK=kv_block,
+            PE_BLOCK=pe_block,
+            SEQ_BLOCK=seq_block,
+            HEAD_BLOCK=head_block,
+            num_warps=nw,
+            num_stages=ns,
+        )
 
     # Step 4: Value projection (weighted_kv already in q_nope.dtype from kernel store)
     attn_out = torch.einsum("bnk,nvk->bnv", weighted_kv, w_v)  # [B, N, v_head_dim]

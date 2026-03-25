@@ -140,22 +140,22 @@ ______________________________________________________________________
 
 *Updated after every iteration.*
 
-| ID  | Best kernel µs | Config                                           | Iter | vs Baseline |
-| --- | -------------- | ------------------------------------------------ | ---- | ----------- |
-| A1  | 8.5            | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **2.5×**    |
-| A2  | 10.8           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **6.2×**    |
-| A3  | 14.3           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **8.9×**    |
-| A4  | 21.5           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **11.6×**   |
-| A5  | 35.4           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **13.9×**   |
-| A6  | 11.9           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **5.8×**    |
-| A7  | 15.4           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **8.5×**    |
-| A8  | 16.0           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **9.3×**    |
-| A9  | 14.0           | multihead HB=8, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **9.3×**    |
-| A10 | 18.0           | multihead HB=8, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **14.0×**   |
-| B1  | 19.6           | multihead HB=16, SEQ_BLOCK=64, warps=8, stgs=2  | 19   | **20.2×**   |
-| B2  | 96.9           | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2 | 15   | **63.0×**   |
-| B3  | 289.1          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2 | 15   | **83.6×**   |
-| B4  | 980.7          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2 | 15   | **98.1×**   |
+| ID  | Best kernel µs | Config                                               | Iter | vs Baseline |
+| --- | -------------- | ---------------------------------------------------- | ---- | ----------- |
+| A1  | 8.5            | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3       | 18   | **2.5×**    |
+| A2  | 10.8           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **6.2×**    |
+| A3  | 11.2           | split-K NP=8, HB=4, SEQ_BLOCK=64, warps=8, stgs=3  | 27   | **11.3×**   |
+| A4  | 12.7           | split-K NP=8, HB=4, SEQ_BLOCK=64, warps=8, stgs=3  | 27   | **19.6×**   |
+| A5  | 15.5           | split-K NP=8, HB=4, SEQ_BLOCK=64, warps=8, stgs=3  | 27   | **31.7×**   |
+| A6  | 11.9           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **5.8×**    |
+| A7  | 15.4           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **8.5×**    |
+| A8  | 16.0           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **9.3×**    |
+| A9  | 14.0           | multihead HB=8, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **9.3×**    |
+| A10 | 18.0           | multihead HB=8, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **14.0×**   |
+| B1  | 19.6           | multihead HB=16, SEQ_BLOCK=64, warps=8, stgs=2      | 19   | **20.2×**   |
+| B2  | 96.9           | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2     | 15   | **63.0×**   |
+| B3  | 289.1          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2     | 15   | **83.6×**   |
+| B4  | 980.7          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2     | 15   | **98.1×**   |
 
 ______________________________________________________________________
 
@@ -869,6 +869,74 @@ warps=4 reduces occupancy without compensating benefit.
 | SB=64 w=4 s=3   | 9.7   | 14.2  | 20.9  | 16.4  |
 
 **Commit:** iter 25 — SB=64 stages/warps variants \[NO IMPROVEMENT\]
+
+______________________________________________________________________
+
+### Iteration 26 — Split-K kernel + Triton reduction for small-batch long-context
+
+**Change:** Added two new Triton kernels:
+
+1. **`_mla_attention_kernel_splitk`** — 3-D grid `(T, N//HB, NUM_PARTS)`. Each program
+   handles one `(token, head_group, kv_partition)` and processes blocks
+   `[part_start, part_end)` of the kv sequence. Stores partial `(acc, m_i, l_i)` to
+   workspace buffers — no normalization.
+1. **`_mla_splitk_reduce`** — 2-D grid `(T, N_HEADS)`. Loads `NUM_PARTS` partial results,
+   combines them with numerically stable log-sum-exp, normalizes, stores bf16 output.
+
+Updated `_triton_mla_decode` to dispatch split-K when `b <= 4` and `max_kv_len >= 512`
+with `NUM_PARTS=8`. Updated `sweep_triton_mla.py` to add `bench_splitk_kernel` and use
+it for eligible shapes in `run_benchmark`.
+
+**Why split-K helps for small batch:**
+T=1 decode with HB=4 creates grid=(1,8)=8 programs — only 6% SM utilization on H100
+(132 SMs). Split-K with NP=8 gives grid=(1,8,8)=64 programs → 48% utilization. Each
+partition loads `kv_len/NP` cache blocks, so the parallelism hides HBM latency.
+
+**Initial Python reduction** had ~490µs overhead (CPU-GPU sync barrier after kernel).
+Replaced immediately with Triton reduction kernel (`_mla_splitk_reduce`) that runs
+back-to-back with the main kernel on GPU, adding only ~1µs overhead.
+
+**Benchmark:**
+
+| ID  | Prev best µs | Split-K µs | Delta  |
+| --- | ------------ | ---------- | ------ |
+| A3  | 14.3         | **11.2**   | +21.7% |
+| A4  | 21.5         | **12.7**   | +40.9% |
+| A5  | 35.4         | **15.5**   | +56.2% |
+
+A1/A2 unaffected (kv≤256, not eligible for split-K).
+A6-A10 unaffected (T>4, not eligible).
+Correctness: PASS (all 14 shapes, max_abs_err \< 0.005 vs multihead reference).
+
+**Commit:** iter 26 — split-K kernel + Triton reduction (+22-56% for A3-A5)
+
+______________________________________________________________________
+
+### Iteration 27 — Split-K NUM_PARTS and SB tuning
+
+**Change:** Benchmark-only; identified that SB=64 outperforms SB=128 for the split-K path.
+
+With kv=512, SB=128: `total_blocks=4`, split into NP=8 → half partitions are empty,
+wasting 4 of 8 SM slots. With SB=64: `total_blocks=8`, split into NP=8 → all 8
+partitions have exactly 1 block — 100% partition utilization.
+
+This explains the benchmark results: the sweep script's DEFAULT_DECODE_PARAMS uses
+SB=64 and produces the best split-K numbers (A3=11.2µs). SB=128 would give 12.2µs.
+
+The `_triton_mla_decode` dispatch uses SB from `_get_mla_multihead_config` which returns
+SB=128 for kv>64. The actual dispatch is therefore suboptimal. Fix deferred to iter 28.
+
+| ID  | SK SB=64 µs | SK SB=128 µs | Winner |
+| --- | ----------- | ------------ | ------ |
+| A3  | **11.2**    | 12.2         | SB=64  |
+| A4  | **12.7**    | 12.5         | ≈ tie  |
+| A5  | **15.5**    | 14.3         | SB=128 |
+
+For A5 (kv=2048, 16 blocks): SB=128 → 16/8=2 blocks/part (all busy). SB=64 → 32/8=4
+blocks/part (also all busy). SB=128 wins here due to better pipeline fill.
+Optimal: SB=64 for kv=\[512, 1536\], SB=128 for kv>1536.
+
+**Commit:** iter 27 — split-K SB tuning analysis \[doc only\]
 
 ______________________________________________________________________
 

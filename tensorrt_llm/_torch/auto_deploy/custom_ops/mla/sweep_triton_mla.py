@@ -56,6 +56,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.mla.triton_mla import (  # noqa: E402
     _mla_attention_kernel_multihead,
+    _mla_attention_kernel_splitk,
+    _mla_splitk_reduce,
 )
 
 # ---------------------------------------------------------------------------
@@ -356,6 +358,73 @@ def bench_multihead_kernel(
     return ms * 1e3
 
 
+def bench_splitk_kernel(
+    num_tokens: int,
+    kv_len: int,
+    HEAD_BLOCK: int,
+    SEQ_BLOCK: int,
+    num_warps: int,
+    num_stages: int,
+    num_parts: int = 8,
+    warmup: int = 25,
+    rep: int = 100,
+) -> float:
+    """Benchmark _mla_attention_kernel_splitk + _mla_splitk_reduce. Returns µs.
+
+    Used for small-batch long-context shapes (num_tokens <= 4, kv_len >= 512).
+    """
+    assert NUM_HEADS % HEAD_BLOCK == 0
+    assert SEQ_BLOCK >= 16
+    q_absorbed, q_pe, mla_cache, token_slot, token_kv_len, _out, max_seq_len = make_kernel_inputs(
+        num_tokens, kv_len
+    )
+    ws_acc = torch.empty(
+        num_tokens, NUM_HEADS, num_parts, KV_BLOCK, device=DEVICE, dtype=torch.float32
+    )
+    ws_ml = torch.empty(num_tokens, NUM_HEADS, num_parts, 2, device=DEVICE, dtype=torch.float32)
+    out = torch.empty(num_tokens, NUM_HEADS, KV_BLOCK, dtype=MODEL_DTYPE, device=DEVICE)
+    num_hg = NUM_HEADS // HEAD_BLOCK
+    grid_sk = (num_tokens, num_hg, num_parts)
+    grid_r = (num_tokens, NUM_HEADS)
+
+    def fn():
+        _mla_attention_kernel_splitk[grid_sk](
+            q_absorbed,
+            q_pe,
+            mla_cache,
+            token_slot,
+            token_kv_len,
+            ws_acc,
+            ws_ml,
+            SCALE=SCALE,
+            MAX_SEQ_LEN=max_seq_len,
+            N_HEADS=NUM_HEADS,
+            KV_LORA_RANK=KV_LORA_RANK,
+            QK_ROPE_HEAD_DIM=QK_ROPE_HEAD_DIM,
+            CACHE_DIM=CACHE_DIM,
+            KV_BLOCK=KV_BLOCK,
+            PE_BLOCK=PE_BLOCK,
+            SEQ_BLOCK=SEQ_BLOCK,
+            HEAD_BLOCK=HEAD_BLOCK,
+            NUM_PARTS=num_parts,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        _mla_splitk_reduce[grid_r](
+            ws_acc,
+            ws_ml,
+            out,
+            N_HEADS=NUM_HEADS,
+            KV_LORA_RANK=KV_LORA_RANK,
+            KV_BLOCK=KV_BLOCK,
+            NUM_PARTS=num_parts,
+            num_warps=4,
+        )
+
+    ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    return ms * 1e3
+
+
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
@@ -381,17 +450,31 @@ def run_benchmark(
         params = prefill_params if is_prefill else decode_params
         hb = params.get("HEAD_BLOCK", 8)
         sb = max(params["SEQ_BLOCK"], 16)  # tl.dot requires SEQ_BLOCK >= 16
+        # Use split-K for small-batch long-context decode (mirrors _triton_mla_decode dispatch)
+        use_splitk = not is_prefill and num_tokens <= 4 and kv_len >= 512
         try:
-            kernel_us = bench_multihead_kernel(
-                num_tokens,
-                kv_len,
-                HEAD_BLOCK=hb,
-                SEQ_BLOCK=sb,
-                num_warps=params["num_warps"],
-                num_stages=params["num_stages"],
-                warmup=warmup,
-                rep=rep,
-            )
+            if use_splitk:
+                kernel_us = bench_splitk_kernel(
+                    num_tokens,
+                    kv_len,
+                    HEAD_BLOCK=hb,
+                    SEQ_BLOCK=sb,
+                    num_warps=params["num_warps"],
+                    num_stages=params["num_stages"],
+                    warmup=warmup,
+                    rep=rep,
+                )
+            else:
+                kernel_us = bench_multihead_kernel(
+                    num_tokens,
+                    kv_len,
+                    HEAD_BLOCK=hb,
+                    SEQ_BLOCK=sb,
+                    num_warps=params["num_warps"],
+                    num_stages=params["num_stages"],
+                    warmup=warmup,
+                    rep=rep,
+                )
         except Exception as e:
             kernel_us = float("nan")
             print(f"  {shape_id} ERROR: {e}")
