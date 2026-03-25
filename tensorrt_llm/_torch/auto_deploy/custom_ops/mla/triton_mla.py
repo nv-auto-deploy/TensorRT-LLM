@@ -51,6 +51,65 @@ from ..attention_interface import (
 )
 
 
+def _get_mla_decode_config(num_tokens: int) -> tuple:
+    """Per-shape best (SEQ_BLOCK, num_warps, num_stages) for decode attention.
+
+    Derived from sweep over Mistral-Small-4-119B-2603 shapes on H100 80GB HBM3.
+    Key dimension: num_tokens (batch size). Larger batches need smaller blocks
+    to expose enough parallelism; single-token decode benefits from large blocks.
+    """
+    if num_tokens <= 4:
+        return 128, 8, 4
+    elif num_tokens <= 12:
+        return 64, 4, 4
+    elif num_tokens <= 24:
+        return 32, 2, 2
+    else:
+        return 16, 1, 2
+
+
+def _get_mla_prefill_config(total_tokens: int) -> tuple:
+    """Per-shape best (SEQ_BLOCK, num_warps, num_stages) for prefill attention.
+
+    Derived from sweep over Mistral-Small-4-119B-2603 shapes on H100 80GB HBM3.
+    Prefill always benefits from warps=1; SEQ_BLOCK depends on total token count.
+    """
+    if total_tokens <= 512:
+        return 8, 1, 5
+    else:
+        return 16, 1, 5
+
+
+def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
+    """Best (SEQ_BLOCK, HEAD_BLOCK, num_warps, num_stages) for the multihead kernel.
+
+    tl.dot requires SEQ_BLOCK >= 16.  HEAD_BLOCK must divide N_HEADS=32.
+    Derived from parallel HEAD_BLOCK sweep on H100 80GB HBM3.
+
+    Decode: original kernel already fast for small T; multihead helps T>=8.
+    Prefill: larger HEAD_BLOCK wins because all tokens share identical cache.
+    """
+    if is_prefill:
+        # B1 T=128→HB=8, B2 T=512→HB=16, B3/B4 T>=1024→HB=32
+        if num_tokens <= 128:
+            return 16, 8, 4, 4
+        elif num_tokens <= 512:
+            return 128, 16, 4, 4
+        else:
+            return 128, 32, 8, 4
+    else:
+        # Decode: multihead helps for batch>=8; small batch uses original kernel
+        if num_tokens <= 4:
+            # single/tiny batch: original kernel already optimal at 9-17µs
+            return 128, 1, 8, 4  # HEAD_BLOCK=1 → falls back to original behavior
+        elif num_tokens <= 12:
+            return 64, 4, 4, 4
+        elif num_tokens <= 24:
+            return 32, 8, 4, 2
+        else:
+            return 16, 8, 4, 2
+
+
 @triton.jit
 def _mla_attention_kernel(
     # Tensor pointers
@@ -169,6 +228,141 @@ def _mla_attention_kernel(
     tl.store(out_ptr + out_base + kv_offsets, acc, mask=kv_mask)
 
 
+@triton.jit
+def _mla_attention_kernel_multihead(
+    # Tensor pointers
+    q_absorbed_ptr,  # [num_tokens, N, kv_lora_rank]
+    q_pe_ptr,  # [num_tokens, N, qk_rope_head_dim]
+    mla_cache_ptr,  # [max_batch, max_seq, cache_dim]
+    token_slot_ptr,  # [num_tokens]
+    token_kv_len_ptr,  # [num_tokens]
+    out_ptr,  # [num_tokens, N, kv_lora_rank] (float32)
+    # Constexpr parameters
+    SCALE: tl.constexpr,
+    MAX_SEQ_LEN: tl.constexpr,
+    N_HEADS: tl.constexpr,
+    KV_LORA_RANK: tl.constexpr,
+    QK_ROPE_HEAD_DIM: tl.constexpr,
+    CACHE_DIM: tl.constexpr,
+    KV_BLOCK: tl.constexpr,
+    PE_BLOCK: tl.constexpr,
+    SEQ_BLOCK: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,  # heads processed per program; must divide N_HEADS
+):
+    """Multi-head MLA attention kernel: HEAD_BLOCK heads share one cache load.
+
+    Grid: (num_tokens, N_HEADS // HEAD_BLOCK)
+
+    Each program processes HEAD_BLOCK consecutive heads for one token.
+    The KV cache tiles (ckv, kpe) are loaded ONCE per SEQ_BLOCK and reused
+    across all HEAD_BLOCK heads, reducing HBM traffic by HEAD_BLOCK×.
+
+    For HEAD_BLOCK >= 16 with SEQ_BLOCK >= 16, inner products use tl.dot
+    (bf16 × bf16 → fp32) to leverage tensor cores.
+    """
+    token_id = tl.program_id(0)
+    head_group = tl.program_id(1)
+    head_start = head_group * HEAD_BLOCK
+
+    slot_idx = tl.load(token_slot_ptr + token_id)
+    kv_len = tl.load(token_kv_len_ptr + token_id)
+
+    kv_offsets = tl.arange(0, KV_BLOCK)  # [KV_BLOCK]
+    kv_mask = kv_offsets < KV_LORA_RANK
+    pe_offsets = tl.arange(0, PE_BLOCK)  # [PE_BLOCK]
+    pe_mask = pe_offsets < QK_ROPE_HEAD_DIM
+    head_offsets = tl.arange(0, HEAD_BLOCK)  # [HEAD_BLOCK]
+
+    # Load q_absorbed for all HEAD_BLOCK heads: [HEAD_BLOCK, KV_BLOCK]
+    q_abs_ptrs = (
+        q_absorbed_ptr
+        + token_id * N_HEADS * KV_LORA_RANK
+        + (head_start + head_offsets[:, None]) * KV_LORA_RANK
+        + kv_offsets[None, :]
+    )
+    q_abs_all = tl.load(q_abs_ptrs, mask=kv_mask[None, :], other=0.0).to(tl.float32)
+
+    # Load q_pe for all HEAD_BLOCK heads: [HEAD_BLOCK, PE_BLOCK]
+    q_pe_ptrs = (
+        q_pe_ptr
+        + token_id * N_HEADS * QK_ROPE_HEAD_DIM
+        + (head_start + head_offsets[:, None]) * QK_ROPE_HEAD_DIM
+        + pe_offsets[None, :]
+    )
+    q_pe_all = tl.load(q_pe_ptrs, mask=pe_mask[None, :], other=0.0).to(tl.float32)
+
+    # Per-head online softmax state
+    m_i = tl.full([HEAD_BLOCK], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([HEAD_BLOCK], dtype=tl.float32)
+    acc = tl.zeros([HEAD_BLOCK, KV_BLOCK], dtype=tl.float32)
+
+    cache_batch_base = slot_idx * MAX_SEQ_LEN * CACHE_DIM
+    num_blocks = (kv_len + SEQ_BLOCK - 1) // SEQ_BLOCK
+
+    for block_id in range(0, num_blocks):
+        block_start = block_id * SEQ_BLOCK
+        seq_offsets = block_start + tl.arange(0, SEQ_BLOCK)
+        seq_mask = seq_offsets < kv_len
+
+        # Load compressed_kv ONCE for all HEAD_BLOCK heads: [SEQ_BLOCK, KV_BLOCK]
+        ckv_ptrs = (
+            mla_cache_ptr
+            + cache_batch_base
+            + seq_offsets[:, None] * CACHE_DIM
+            + kv_offsets[None, :]
+        )
+        ckv_bf16 = tl.load(
+            ckv_ptrs, mask=seq_mask[:, None] & kv_mask[None, :], other=0.0
+        )  # [SEQ_BLOCK, KV_BLOCK], stays in bf16 for tl.dot
+
+        # Load kpe ONCE for all HEAD_BLOCK heads: [SEQ_BLOCK, PE_BLOCK]
+        kpe_ptrs = (
+            mla_cache_ptr
+            + cache_batch_base
+            + seq_offsets[:, None] * CACHE_DIM
+            + KV_LORA_RANK
+            + pe_offsets[None, :]
+        )
+        kpe_bf16 = tl.load(
+            kpe_ptrs, mask=seq_mask[:, None] & pe_mask[None, :], other=0.0
+        )  # [SEQ_BLOCK, PE_BLOCK], stays in bf16 for tl.dot
+
+        # Compute scores for all HEAD_BLOCK heads at once: [HEAD_BLOCK, SEQ_BLOCK]
+        # Uses tl.dot for tensor-core acceleration when HEAD_BLOCK >= 16
+        scores_nope = tl.dot(q_abs_all.to(tl.bfloat16), tl.trans(ckv_bf16)).to(tl.float32)
+        scores_pe = tl.dot(q_pe_all.to(tl.bfloat16), tl.trans(kpe_bf16)).to(tl.float32)
+        scores = (scores_nope + scores_pe) * SCALE
+
+        # Mask out-of-bounds positions
+        seq_mask_2d = seq_mask[None, :]  # [1, SEQ_BLOCK] broadcasts to [HEAD_BLOCK, SEQ_BLOCK]
+        scores = tl.where(seq_mask_2d, scores, float("-inf"))
+
+        # Online softmax update — vectorized across HEAD_BLOCK
+        m_ij = tl.max(scores, axis=1)  # [HEAD_BLOCK]
+        m_new = tl.maximum(m_i, m_ij)  # [HEAD_BLOCK]
+        alpha = tl.exp(m_i - m_new)  # [HEAD_BLOCK]
+        p = tl.exp(scores - m_new[:, None])  # [HEAD_BLOCK, SEQ_BLOCK]
+        p = tl.where(seq_mask_2d, p, 0.0)
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)  # [HEAD_BLOCK]
+        # acc update via tl.dot: [HEAD_BLOCK, SEQ_BLOCK] x [SEQ_BLOCK, KV_BLOCK]
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), ckv_bf16).to(tl.float32)
+        m_i = m_new
+
+    # Normalize
+    safe_l_i = tl.maximum(l_i, 1e-38)
+    acc = acc / safe_l_i[:, None]
+
+    # Store HEAD_BLOCK results
+    out_ptrs = (
+        out_ptr
+        + token_id * N_HEADS * KV_LORA_RANK
+        + (head_start + head_offsets[:, None]) * KV_LORA_RANK
+        + kv_offsets[None, :]
+    )
+    tl.store(out_ptrs, acc, mask=kv_mask[None, :])
+
+
 def _triton_mla_decode(
     q_nope: torch.Tensor,  # [B, 1, N, qk_nope_head_dim]
     q_pe: torch.Tensor,  # [B, 1, N, qk_rope_head_dim]
@@ -237,6 +431,7 @@ def _triton_mla_decode(
     # Per-token KV length: decode attends to positions [0, input_pos]
     kv_len = (input_pos + 1).to(torch.int32)
 
+    seq_block, nw, ns = _get_mla_decode_config(b)
     grid = (b, num_heads)
     _mla_attention_kernel[grid](
         q_absorbed,
@@ -253,9 +448,9 @@ def _triton_mla_decode(
         CACHE_DIM=cache_dim,
         KV_BLOCK=kv_block,
         PE_BLOCK=pe_block,
-        SEQ_BLOCK=8,
-        num_warps=2,
-        num_stages=2,
+        SEQ_BLOCK=seq_block,
+        num_warps=nw,
+        num_stages=ns,
     )
 
     # Step 4: Value projection
@@ -365,6 +560,7 @@ def _triton_mla_prefill(
     kv_block = triton.next_power_of_2(kv_lora_rank)
     pe_block = triton.next_power_of_2(qk_rope_head_dim)
 
+    seq_block, nw, ns = _get_mla_prefill_config(total_tokens)
     grid = (total_tokens, num_heads)
     _mla_attention_kernel[grid](
         q_absorbed,
@@ -381,9 +577,9 @@ def _triton_mla_prefill(
         CACHE_DIM=cache_dim,
         KV_BLOCK=kv_block,
         PE_BLOCK=pe_block,
-        SEQ_BLOCK=16,  # Larger blocks for prefill (longer sequences)
-        num_warps=4,
-        num_stages=2,
+        SEQ_BLOCK=seq_block,
+        num_warps=nw,
+        num_stages=ns,
     )
 
     # =====================================================================

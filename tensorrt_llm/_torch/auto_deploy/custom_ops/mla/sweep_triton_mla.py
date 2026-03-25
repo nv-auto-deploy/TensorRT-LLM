@@ -56,6 +56,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.mla.triton_mla import (  # noqa: E402
     _mla_attention_kernel,
+    _mla_attention_kernel_multihead,
 )
 
 # ---------------------------------------------------------------------------
@@ -364,6 +365,54 @@ def bench_kernel(
     )
     ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
     return ms * 1e3  # ms → µs
+
+
+def bench_multihead_kernel(
+    num_tokens: int,
+    kv_len: int,
+    HEAD_BLOCK: int,
+    SEQ_BLOCK: int,
+    num_warps: int,
+    num_stages: int,
+    warmup: int = 25,
+    rep: int = 100,
+) -> float:
+    """Benchmark _mla_attention_kernel_multihead in isolation. Returns µs.
+
+    tl.dot requires SEQ_BLOCK >= 16; callers must enforce this constraint.
+    """
+    assert NUM_HEADS % HEAD_BLOCK == 0, (
+        f"N_HEADS={NUM_HEADS} must be divisible by HEAD_BLOCK={HEAD_BLOCK}"
+    )
+    assert SEQ_BLOCK >= 16, f"SEQ_BLOCK={SEQ_BLOCK} must be >= 16 for tl.dot in multihead kernel"
+    q_absorbed, q_pe, mla_cache, token_slot, token_kv_len, out, max_seq_len = make_kernel_inputs(
+        num_tokens, kv_len
+    )
+    num_head_groups = NUM_HEADS // HEAD_BLOCK
+    grid = (num_tokens, num_head_groups)
+
+    fn = lambda: _mla_attention_kernel_multihead[grid](  # noqa: E731
+        q_absorbed,
+        q_pe,
+        mla_cache,
+        token_slot,
+        token_kv_len,
+        out,
+        SCALE=SCALE,
+        MAX_SEQ_LEN=max_seq_len,
+        N_HEADS=NUM_HEADS,
+        KV_LORA_RANK=KV_LORA_RANK,
+        QK_ROPE_HEAD_DIM=QK_ROPE_HEAD_DIM,
+        CACHE_DIM=CACHE_DIM,
+        KV_BLOCK=KV_BLOCK,
+        PE_BLOCK=PE_BLOCK,
+        SEQ_BLOCK=SEQ_BLOCK,
+        HEAD_BLOCK=HEAD_BLOCK,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    return ms * 1e3
 
 
 def bench_decode_e2e(
@@ -688,7 +737,28 @@ def main():
     parser.add_argument("--sweep-num-stages", type=str, default=None)
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--rep", type=int, default=100)
+    # Multi-GPU: select which GPU to use (sets CUDA_VISIBLE_DEVICES before torch init)
+    parser.add_argument(
+        "--gpu-id",
+        type=int,
+        default=None,
+        help="GPU index to use (sets CUDA device; for multi-GPU parallel launches)",
+    )
+    # HEAD_BLOCK structural experiment
+    parser.add_argument(
+        "--head-block",
+        type=int,
+        default=None,
+        help="If set, benchmark _mla_attention_kernel_multihead with this HEAD_BLOCK value",
+    )
     args = parser.parse_args()
+
+    if args.gpu_id is not None:
+        import os
+
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+        # Re-set DEVICE global after setting visibility
+        globals()["DEVICE"] = "cuda"
 
     print(f"GPU:    {torch.cuda.get_device_name(0)}")
     print(f"torch:  {torch.__version__}")
@@ -744,6 +814,59 @@ def main():
             warmup=args.warmup,
             rep=args.rep,
         )
+        return
+
+    if args.head_block is not None:
+        # Structural experiment: benchmark multihead kernel at given HEAD_BLOCK
+        hb = args.head_block
+        print(f"\n--- HEAD_BLOCK={hb} structural benchmark ---")
+        baseline = {
+            "A1": 20.9,
+            "A2": 66.6,
+            "A3": 127.1,
+            "A4": 249.0,
+            "A5": 491.1,
+            "A6": 68.5,
+            "A7": 130.2,
+            "A8": 149.2,
+            "A9": 130.3,
+            "A10": 252.6,
+            "B1": 396.4,
+            "B2": 6107.9,
+            "B3": 24183.3,
+            "B4": 96220.1,
+        }
+        cols = f"{'ID':>4}  {'T':>5}  {'kv_len':>6}  {'HB':>4}  {'SB':>5}"
+        header = cols + f"  {'kernel µs':>10}  {'vs orig':>9}"
+        print(header)
+        print("-" * len(header))
+        for shape_id, num_tokens, kv_len, desc in SHAPES:
+            is_prefill = shape_id.startswith("B")
+            params = prefill_params if is_prefill else decode_params
+            # multihead kernel requires SEQ_BLOCK >= 16 for tl.dot
+            sb = max(params["SEQ_BLOCK"], 16)
+            nw = params["num_warps"]
+            ns = params["num_stages"]
+            try:
+                us = bench_multihead_kernel(
+                    num_tokens,
+                    kv_len,
+                    hb,
+                    sb,
+                    nw,
+                    ns,
+                    warmup=args.warmup,
+                    rep=args.rep,
+                )
+                base = baseline.get(shape_id, None)
+                delta = f"{100.0 * (us - base) / base:+.1f}%" if base else ""
+            except Exception as e:
+                us, delta = float("nan"), f"ERR: {e}"
+            print(
+                f"{shape_id:>4}  {num_tokens:>5}  {kv_len:>6}  {hb:>4}  {sb:>5}"
+                f"  {us:>10.1f}  {delta:>9}"
+            )
+        print()
         return
 
     # Default: run benchmark on all shapes

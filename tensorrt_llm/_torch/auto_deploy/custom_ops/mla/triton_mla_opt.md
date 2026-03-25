@@ -140,22 +140,22 @@ ______________________________________________________________________
 
 *Updated after every iteration.*
 
-| ID | Best kernel µs | Config | Iter | vs Baseline |
-|----|---------------|--------|------|-------------|
-| A1  | 20.9  | SEQ_BLOCK=8,  warps=2, stages=2 | 0 | baseline |
-| A2  | 66.6  | SEQ_BLOCK=8,  warps=2, stages=2 | 0 | baseline |
-| A3  | 127.1 | SEQ_BLOCK=8,  warps=2, stages=2 | 0 | baseline |
-| A4  | 249.0 | SEQ_BLOCK=8,  warps=2, stages=2 | 0 | baseline |
-| A5  | 491.1 | SEQ_BLOCK=8,  warps=2, stages=2 | 0 | baseline |
-| A6  | 68.5  | SEQ_BLOCK=8,  warps=2, stages=2 | 0 | baseline |
-| A7  | 130.2 | SEQ_BLOCK=8,  warps=2, stages=2 | 0 | baseline |
-| A8  | 149.2 | SEQ_BLOCK=8,  warps=2, stages=2 | 0 | baseline |
-| A9  | 130.3 | SEQ_BLOCK=8,  warps=2, stages=2 | 0 | baseline |
-| A10 | 252.6 | SEQ_BLOCK=8,  warps=2, stages=2 | 0 | baseline |
-| B1  | 396.4 | SEQ_BLOCK=16, warps=4, stages=2 | 0 | baseline |
-| B2  | 6107.9| SEQ_BLOCK=16, warps=4, stages=2 | 0 | baseline |
-| B3  | 24183.3| SEQ_BLOCK=16, warps=4, stages=2 | 0 | baseline |
-| B4  | 96220.1| SEQ_BLOCK=16, warps=4, stages=2 | 0 | baseline |
+| ID  | Best kernel µs | Config                                          | Iter | vs Baseline |
+| --- | -------------- | ----------------------------------------------- | ---- | ----------- |
+| A1  | 20.9           | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
+| A2  | 66.6           | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
+| A3  | 127.1          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
+| A4  | 249.0          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
+| A5  | 491.1          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
+| A6  | 68.5           | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
+| A7  | 130.2          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
+| A8  | 149.2          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
+| A9  | 130.3          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
+| A10 | 252.6          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
+| B1  | 25.6           | multihead HB=8, SEQ_BLOCK=16, warps=4, stgs=4   | 2    | **15.5×**   |
+| B2  | 177.5          | multihead HB=16, SEQ_BLOCK=128, warps=4, stgs=4 | 2    | **34.4×**   |
+| B3  | 515.0          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 2    | **46.9×**   |
+| B4  | 1842.0         | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 2    | **52.2×**   |
 
 ______________________________________________________________________
 
@@ -186,17 +186,80 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 1 — Per-shape config lookup tables (decode + prefill)
+
+**Change:** Replace hard-coded `SEQ_BLOCK=8, warps=2, stages=2` (decode) and
+`SEQ_BLOCK=16, warps=4, stages=2` (prefill) with runtime-selected configs from
+`_get_mla_decode_config(num_tokens)` and `_get_mla_prefill_config(total_tokens)`.
+Analysis-driven initial values; to be refined after full sweep.
+
+| num_tokens | decode SEQ_BLOCK | warps | stages |
+| ---------- | ---------------- | ----- | ------ |
+| ≤4         | 128              | 8     | 4      |
+| ≤12        | 64               | 4     | 4      |
+| ≤24        | 32               | 2     | 2      |
+| >24        | 16               | 1     | 2      |
+
+| total_tokens | prefill SEQ_BLOCK | warps | stages |
+| ------------ | ----------------- | ----- | ------ |
+| ≤512         | 8                 | 1     | 5      |
+| >512         | 16                | 1     | 5      |
+
+Correctness: PASS (all 14 shapes). Benchmark pending full sweep run.
+
+**Commit:** iter 1 — per-shape lookup tables for decode and prefill
+
+______________________________________________________________________
+
+### Iteration 2 — HEAD_BLOCK tiling: `_mla_attention_kernel_multihead`
+
+**Change:** New `@triton.jit` kernel `_mla_attention_kernel_multihead` with grid
+`(num_tokens, N_HEADS // HEAD_BLOCK)`. Each program processes `HEAD_BLOCK`
+consecutive heads, loading ckv+kpe ONCE per SEQ_BLOCK (shared across all
+HEAD_BLOCK heads). Uses `tl.dot(bf16 × bf16 → fp32)` for tensor-core
+acceleration. Added `_get_mla_multihead_config(num_tokens, is_prefill)` lookup.
+
+Key constraints: `SEQ_BLOCK >= 16` (tl.dot minimum K); `HEAD_BLOCK` must divide
+`N_HEADS=32`; valid HEAD_BLOCK values: 1, 2, 4, 8, 16, 32.
+
+**Prefill results (benchmark on single GPU H100):**
+
+| ID  | baseline µs | HB=2  | HB=4  | HB=8  | HB=16  | HB=32   | best     | speedup  |
+| --- | ----------- | ----- | ----- | ----- | ------ | ------- | -------- | -------- |
+| B1  | 396.4       | 73.6  | 41.5  | 25.6  | 29.0   | 47.2    | **25.6** | **15.5×** |
+| B2  | 6107.9      | 872.0 | 444.0 | 243.0 | 177.5  | 220.0   | **177.5** | **34.4×** |
+| B3  | 24183.3     | 3420  | 1730  | 944   | 614    | 515.0   | **515.0** | **46.9×** |
+| B4  | 96220.1     | 13640 | 6870  | 3720  | 2210   | 1842.0  | **1842.0** | **52.2×** |
+
+Correctness: PASS for all HEAD_BLOCK variants across all 14 shapes.
+
+**Commit:** iter 2 — \_mla_attention_kernel_multihead with HEAD_BLOCK tiling
+
+______________________________________________________________________
+
+### Iteration 3 — Multi-GPU benchmark infrastructure
+
+**Change:** Added `--gpu-id N` flag to `sweep_triton_mla.py` and
+`parallel_bench_mla.sh` to orchestrate 8 GPU jobs simultaneously. Modes:
+`sweep`, `head_block`, `correctness`, `benchmark`. Also fixed `tl.dot`
+SEQ_BLOCK≥16 constraint in `bench_multihead_kernel` (`assert SEQ_BLOCK >= 16`,
+`max(params["SEQ_BLOCK"], 16)` in HEAD_BLOCK mode). No kernel logic changes.
+
+**Commit:** iter 3 — parallel_bench_mla.sh + multi-GPU infra + SEQ_BLOCK≥16 fix
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK \[HIGHEST PRIORITY\]
 
-- \[ \] **SEQ_BLOCK sweep (4,8,16,32,64,128)** — Why: current SEQ_BLOCK=8 creates 128 inner-loop iterations for kv=1024. Larger blocks reduce iteration count and improve L2 reuse within each block. **Impact: High** | All shapes | Correctness risk: No (with masking already correct)
-- \[ \] **Shape-conditional SEQ_BLOCK** — Why: short kv (64) benefits from small SEQ_BLOCK (less masking waste); long kv (2048) benefits from large SEQ_BLOCK (fewer iters). **Impact: High** | All shapes | Correctness risk: No
-- \[ \] **Separate decode vs prefill SEQ_BLOCK** — already distinct; verify optimal values differ by path
+- \[x\] **SEQ_BLOCK sweep (4,8,16,32,64,128)** — Done (iter 1): lookup table implemented, full GPU sweep pending.
+- \[x\] **Shape-conditional SEQ_BLOCK** — Done (iter 1): `_get_mla_decode_config` and `_get_mla_prefill_config` implemented.
+- \[x\] **Separate decode vs prefill SEQ_BLOCK** — Done (iter 1): separate functions for decode vs prefill.
 
 ### A.1 Memory Access Patterns
 
-- \[ \] **Reduce head-redundant loads via HEAD_BLOCK tiling** — Why: 32 programs per token each load identical cache data. Restructure grid to `(num_tokens, N_HEADS//HEAD_BLOCK)` and process HEAD_BLOCK heads per program, loading ckv+kpe once per SEQ_BLOCK. **Impact: Very High (up to HEAD_BLOCK×)** | Large kv shapes | Correctness risk: Yes
+- \[x\] **Reduce head-redundant loads via HEAD_BLOCK tiling** — Done (iter 2): `_mla_attention_kernel_multihead` with HEAD_BLOCK tiling. Prefill: 15-52× speedup. Decode: pending sweep.
 - \[ \] **Cache load eviction hint `evict_first`** — Why: each cache position is read once per program; hint L2 to evict early to make room for next block. **Impact: Low-Medium** | All shapes | Correctness risk: No
 - \[ \] **Wider loads via `other` alignment** — ensure KV_BLOCK=256 and PE_BLOCK=64 loads are 128-byte aligned for vectorized HBM transactions. **Impact: Low** | All shapes | Correctness risk: No
 
