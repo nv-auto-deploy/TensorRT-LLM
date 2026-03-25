@@ -571,12 +571,18 @@ def _triton_mla_decode(
                         num_parts = _np
                         break
         else:
-            # Moderate batch (b=5-8): NP = total_blocks // 2 (2 blocks/part), capped at 8.
-            # kv=512 (total_blocks=8): NP=4 — 2 blocks/part, ~2 waves with b=8 (+13% vs MH)
-            # kv=1024 (total_blocks=16): NP=8 — 2 blocks/part, ~4 waves (+11% vs MH, iter 44)
-            # Cap at 8: NP=16 for kv=1024 gives 1 blk/part but 8 waves — diminishing returns.
+            # Moderate batch (b=5-8): NP depends on seq_block (iter 51).
+            # SB=64 (kv≤1536): NP = total_blocks // 2, capped at 8 (2 blk/part optimal):
+            #   kv=512 (total_blocks=8): NP=4 — 2 waves with b=8, +13% vs MH
+            #   kv=1024 (total_blocks=16): NP=8 — 4 waves, +25% vs MH
+            # SB=128 (kv>1536): each block is 128 positions (2× larger than SB=64).
+            #   4 blk/part already provides ample work; NP=4 beats NP=8 by 6.7% at kv=2048.
+            #   Use NP = total_blocks // 4, capped at 4.
             total_blocks = max_kv_len // seq_block
-            num_parts = min(max(total_blocks // 2, 1), 8)
+            if seq_block == 64:
+                num_parts = min(max(total_blocks // 2, 1), 8)
+            else:
+                num_parts = min(max(total_blocks // 4, 1), 4)
         # warps=4 for long-context SB=128 path (A5): fewer threads reduces register
         # pressure; 1.5% gain vs w=8. warps=8 better for shorter kv (A2-A4).
         nw = 4 if max_kv_len > 1024 else 8
