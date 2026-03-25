@@ -457,13 +457,17 @@ def _triton_mla_decode(
 
     max_kv_len = int(kv_len.max().item())
 
-    # For batches B>=8, the multihead kernel reduces HBM redundancy.
+    # Use multihead kernel when either:
+    #   (a) batch B >= 8: shared cache load across heads dominates at higher parallelism
+    #   (b) single-token decode with long context (max_kv_len >= 512): 32x cache redundancy
+    #       is large enough that HEAD_BLOCK sharing beats more programs on SMs
     # Benchmark data (H100, HB=8 SB=64 vs original sweep best):
-    #   A6 (B=8,  kv=256): 18.7µs vs 26.4µs (+41%)
-    #   A7 (B=8,  kv=512): 28.4µs vs 45.7µs (+61%)
-    #   A8 (B=16, kv=512): 29.4µs vs 62.0µs (+111%)
-    # For B<8 (T=1 single decode), original kernel with large SEQ_BLOCK is faster.
-    if b >= 8:
+    #   A3 (B=1, kv=512):  27.8µs vs 28.1µs (+1%)
+    #   A4 (B=1, kv=1024): 47.5µs vs 50.4µs (+6%)
+    #   A5 (B=1, kv=2048): 85.8µs vs 94.6µs (+10%)
+    #   A6 (B=8, kv=256):  18.7µs vs 26.4µs (+41%)
+    # For B=1 with kv<512, original kernel with large SEQ_BLOCK remains faster.
+    if b >= 8 or max_kv_len >= 512:
         seq_block, head_block, nw, ns = _get_mla_multihead_config(b, is_prefill=False)
         grid = (b, num_heads // head_block)
         _mla_attention_kernel_multihead[grid](

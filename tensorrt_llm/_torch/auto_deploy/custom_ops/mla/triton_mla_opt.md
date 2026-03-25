@@ -144,9 +144,9 @@ ______________________________________________________________________
 | --- | -------------- | ----------------------------------------------- | ---- | ----------- |
 | A1  | 9.4            | SEQ_BLOCK=64, warps=4, stages=4                 | 4    | **2.2×**    |
 | A2  | 17.0           | SEQ_BLOCK=128, warps=8, stages=2                | 4    | **3.9×**    |
-| A3  | 28.1           | SEQ_BLOCK=128, warps=8, stages=4                | 4    | **4.5×**    |
-| A4  | 50.4           | SEQ_BLOCK=128, warps=8, stages=4                | 4    | **4.9×**    |
-| A5  | 94.6           | SEQ_BLOCK=128, warps=8, stages=5                | 4    | **5.2×**    |
+| A3  | 27.8           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 12   | **4.6×**    |
+| A4  | 47.5           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 12   | **5.2×**    |
+| A5  | 85.8           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 12   | **5.7×**    |
 | A6  | 18.7           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 11   | **3.7×**    |
 | A7  | 28.4           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 11   | **4.6×**    |
 | A8  | 29.4           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **5.1×**    |
@@ -444,6 +444,31 @@ still wins (A1=9.4µs, A2=17.0µs vs multihead 11.0/18.1µs).
 Correctness: PASS (HB=8, SB=64 was tested across all 14 shapes in iter 8 sweep).
 
 **Commit:** iter 11 — decode multihead dispatch threshold B>=16 -> B>=8 (+41-61% A6-A7)
+
+______________________________________________________________________
+
+### Iteration 12 — Multihead for T=1 long-context decode (kv_len ≥ 512)
+
+**Change:** Updated `_triton_mla_decode` dispatch condition from `if b >= 8` to
+`if b >= 8 or max_kv_len >= 512`.
+
+For single-token decode with long context, the 32× cache redundancy is large
+enough that HEAD_BLOCK sharing outweighs the SM underutilisation cost.
+Breakeven is at kv_len ≈ 512; below that the original kernel wins.
+
+**Benchmark (H100, HB=8 SB=64 vs original sweep best):**
+
+| ID  | Original best µs | Multihead µs | Speedup |
+| --- | ---------------- | ------------ | ------- |
+| A1  | 9.4 (kv=64)      | 11.0         | −14% (no change — still uses original) |
+| A2  | 17.0 (kv=256)    | 18.1         | −6% (no change — still uses original)  |
+| A3  | 28.1 (kv=512)    | 27.8         | +1%                                     |
+| A4  | 50.4 (kv=1024)   | 47.5         | +6%                                     |
+| A5  | 94.6 (kv=2048)   | 85.8         | +10%                                    |
+
+Correctness: PASS (HB=8 SB=64 tested for all 14 shapes in iter 8 sweep).
+
+**Commit:** iter 12 — decode multihead for T=1 kv_len>=512 (+1-10% A3-A5)
 
 ______________________________________________________________________
 
