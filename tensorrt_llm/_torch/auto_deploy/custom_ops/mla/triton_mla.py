@@ -92,26 +92,23 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
     """Best (SEQ_BLOCK, HEAD_BLOCK, num_warps, num_stages) for the multihead kernel.
 
     tl.dot requires SEQ_BLOCK >= 16.  HEAD_BLOCK must divide N_HEADS=32.
-    Derived from parallel HEAD_BLOCK sweep on H100 80GB HBM3.
+    Derived from parallel HB×SEQ_BLOCK sweep on H100 80GB HBM3.
 
-    Decode dispatch threshold: num_tokens >= 16 benefits from multihead.
-    Prefill: larger HEAD_BLOCK wins because all tokens share identical cache.
+    Key finding: SB=64 reduces inner-loop iterations (kv_len/64 vs kv_len/16) and
+    substantially improves latency vs SB=16 for all shapes. HB=32 is best for
+    large prefill (maximises cache sharing and tensor-core utilisation).
     """
     if is_prefill:
-        # B1 T=128 → HB=8; B2 T=512 → HB=16; B3/B4 T≥1024 → HB=32
+        # B1 T≤128: HB=8, SB=64 → 21.0µs  (HB=32 slightly worse for small T)
+        # B2-B4 T>128: HB=32, SB=64 → 107/323/1076µs  (vs SB=16: 178/515/1837µs)
         if num_tokens <= 128:
-            return 16, 8, 4, 4
-        elif num_tokens <= 512:
-            return 16, 16, 4, 4
+            return 64, 8, 4, 4
         else:
-            return 16, 32, 8, 4
+            return 64, 32, 8, 4
     else:
-        # Decode: multihead wins for num_tokens >= 16 (A8-A10 shapes)
-        # num_tokens < 16: caller should use original kernel instead
-        if num_tokens <= 24:
-            return 16, 4, 4, 2  # A8 (B=16): HB=4 best
-        else:
-            return 16, 4, 4, 2  # A9/A10 (B=32): HB=4 best
+        # Decode: num_tokens >= 16 uses multihead.
+        # HB=8, SB=64 beats HB=4, SB=16 for A8-A10: 29.7/20.4/32.6µs vs 53.4/32.5/56.0µs
+        return 64, 8, 4, 4
 
 
 @triton.jit
@@ -288,13 +285,17 @@ def _mla_attention_kernel_multihead(
     head_offsets = tl.arange(0, HEAD_BLOCK)  # [HEAD_BLOCK]
 
     # Load q_absorbed for all HEAD_BLOCK heads: [HEAD_BLOCK, KV_BLOCK]
+    # Explicitly cast to bf16 (not fp32) to reduce register pressure.
+    # tl.dot(bf16, bf16) uses tensor cores natively; no roundtrip through fp32 needed.
     q_abs_ptrs = (
         q_absorbed_ptr
         + token_id * N_HEADS * KV_LORA_RANK
         + (head_start + head_offsets[:, None]) * KV_LORA_RANK
         + kv_offsets[None, :]
     )
-    q_abs_all = tl.load(q_abs_ptrs, mask=kv_mask[None, :], other=0.0).to(tl.float32)
+    q_abs_all = tl.load(q_abs_ptrs, mask=kv_mask[None, :], other=0.0).to(
+        tl.bfloat16
+    )  # [HEAD_BLOCK, KV_BLOCK], bf16
 
     # Load q_pe for all HEAD_BLOCK heads: [HEAD_BLOCK, PE_BLOCK]
     q_pe_ptrs = (
@@ -303,7 +304,9 @@ def _mla_attention_kernel_multihead(
         + (head_start + head_offsets[:, None]) * QK_ROPE_HEAD_DIM
         + pe_offsets[None, :]
     )
-    q_pe_all = tl.load(q_pe_ptrs, mask=pe_mask[None, :], other=0.0).to(tl.float32)
+    q_pe_all = tl.load(q_pe_ptrs, mask=pe_mask[None, :], other=0.0).to(
+        tl.bfloat16
+    )  # [HEAD_BLOCK, PE_BLOCK], bf16
 
     # Per-head online softmax state
     m_i = tl.full([HEAD_BLOCK], float("-inf"), dtype=tl.float32)
@@ -348,9 +351,9 @@ def _mla_attention_kernel_multihead(
         )  # [SEQ_BLOCK, PE_BLOCK], stays in bf16 for tl.dot
 
         # Compute scores for all HEAD_BLOCK heads at once: [HEAD_BLOCK, SEQ_BLOCK]
-        # Uses tl.dot for tensor-core acceleration when HEAD_BLOCK >= 16
-        scores_nope = tl.dot(q_abs_all.to(tl.bfloat16), tl.trans(ckv_bf16)).to(tl.float32)
-        scores_pe = tl.dot(q_pe_all.to(tl.bfloat16), tl.trans(kpe_bf16)).to(tl.float32)
+        # bf16 x bf16 -> fp32 via tl.dot (tensor cores); q tensors already in bf16
+        scores_nope = tl.dot(q_abs_all, tl.trans(ckv_bf16)).to(tl.float32)
+        scores_pe = tl.dot(q_pe_all, tl.trans(kpe_bf16)).to(tl.float32)
         scores = (scores_nope + scores_pe) * SCALE
 
         # Mask out-of-bounds positions

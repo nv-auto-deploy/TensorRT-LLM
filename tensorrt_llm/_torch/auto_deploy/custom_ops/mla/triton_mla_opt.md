@@ -149,13 +149,13 @@ ______________________________________________________________________
 | A5  | 94.6           | SEQ_BLOCK=128, warps=8, stages=5                | 4    | **5.2×**    |
 | A6  | 26.4           | SEQ_BLOCK=64, warps=4, stages=2                 | 4    | **2.6×**    |
 | A7  | 45.7           | SEQ_BLOCK=64, warps=4, stages=4                 | 4    | **2.9×**    |
-| A8  | 53.4           | multihead HB=4, SEQ_BLOCK=16, warps=4, stgs=2   | 5    | **2.8×**    |
-| A9  | 32.5           | multihead HB=4, SEQ_BLOCK=16, warps=4, stgs=2   | 5    | **4.0×**    |
-| A10 | 56.0           | multihead HB=4, SEQ_BLOCK=16, warps=4, stgs=2   | 5    | **4.5×**    |
-| B1  | 25.6           | multihead HB=8, SEQ_BLOCK=16, warps=4, stgs=4   | 6    | **15.5×**   |
-| B2  | 177.5          | multihead HB=16, SEQ_BLOCK=16, warps=4, stgs=4  | 6    | **34.4×**   |
-| B3  | 515.3          | multihead HB=32, SEQ_BLOCK=16, warps=8, stgs=4  | 6    | **46.9×**   |
-| B4  | 1836.7         | multihead HB=32, SEQ_BLOCK=16, warps=8, stgs=4  | 6    | **52.3×**   |
+| A8  | 29.4           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **5.1×**    |
+| A9  | 20.2           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **6.5×**    |
+| A10 | 32.3           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **7.8×**    |
+| B1  | 20.8           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **19.1×**   |
+| B2  | 106.7          | multihead HB=32, SEQ_BLOCK=64, warps=8, stgs=4  | 8    | **57.2×**   |
+| B3  | 322.8          | multihead HB=32, SEQ_BLOCK=64, warps=8, stgs=4  | 8    | **74.9×**   |
+| B4  | 1075.8         | multihead HB=32, SEQ_BLOCK=64, warps=8, stgs=4  | 8    | **89.4×**   |
 
 ______________________________________________________________________
 
@@ -353,6 +353,50 @@ Correctness: PASS all 14 shapes. Effect on original kernel (SB=128, warps=8): ne
 not isolated (SB=64 results from iter8 sweep are with evict_first).
 
 **Commit:** iter 7 — evict_first hints on all cache loads
+
+______________________________________________________________________
+
+### Iteration 8 — Update multihead SEQ_BLOCK lookup: SB=64 across the board
+
+**Change:** Updated `_get_mla_multihead_config` from SB=16 to SB=64 for all paths,
+based on HB×SEQ_BLOCK sweep data.
+
+Key finding: increasing SEQ_BLOCK from 16 to 64 reduces inner-loop iterations by 4×
+and dramatically improves performance for all shapes:
+
+| Config            | A8    | A9    | A10   | B1   | B2    | B3    | B4     |
+| ----------------- | ----- | ----- | ----- | ---- | ----- | ----- | ------ |
+| HB=4, SB=16 (old) | 53.4  | 32.5  | 56.0  | 25.6 | 177.5 | 515   | 1837   |
+| HB=8, SB=64 (new) | 29.7  | 20.4  | 32.6  | 21.0 | 268   | 972   | 3642   |
+| HB=32, SB=64 (new)| —     | —     | —     | 22.2 | 107   | 323   | 1076   |
+
+Updated configs: prefill T≤128 → HB=8,SB=64; prefill T>128 → HB=32,SB=64;
+decode B≥16 → HB=8,SB=64. Correctness: PASS all 14 shapes.
+
+**Commit:** iter 8 — multihead SEQ_BLOCK → 64 for all paths (HB=8 decode, HB=8/32 prefill)
+
+______________________________________________________________________
+
+### Iteration 9 — q_abs/q_pe in bfloat16 (remove float32 roundtrip)
+
+**Change:** In `_mla_attention_kernel_multihead`, q_absorbed and q_pe are now
+explicitly cast to bfloat16 on load (`.to(tl.bfloat16)` instead of `.to(tl.float32)`).
+This eliminates the per-program fp32 roundtrip: old path stored \[HEAD_BLOCK, KV_BLOCK\]
+as fp32 then cast back to bf16 for each tl.dot; new path stores them directly in bf16.
+Register savings: HEAD_BLOCK×KV_BLOCK = 8×256 = 2048 elements halved from 4→2 bytes.
+
+The `.to(tl.bfloat16)` casts in the inner loop tl.dot calls are removed (no-ops now).
+The softmax state (m_i, l_i, acc) and all arithmetic remain in float32.
+
+Bug fixed: first attempt used bare `tl.load(...)` without explicit cast; this broke when
+the input tensor (from standalone benchmark) was float32. Explicit `.to(tl.bfloat16)`
+handles both float32 and bfloat16 input tensors correctly.
+
+Correctness: PASS (comprehensive HB×SB sweep). Benchmark confirmed (same session, H100):
+A8=29.4µs, A9=20.2µs, A10=32.3µs; B1=20.8µs, B2=268.2µs (HB=8).
+B shapes use HB=32: B2=106.7µs, B3=322.8µs, B4=1075.8µs (HB=32 SB=64, warps=8).
+
+**Commit:** iter 9 — q_abs/q_pe cast to bf16 on load (register pressure reduction)
 
 ______________________________________________________________________
 
