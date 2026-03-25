@@ -31,7 +31,6 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm import gated_rms_norm_ref
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
 
@@ -44,11 +43,10 @@ class MambaRMSNormGated(torch.nn.Module):
         self.group_size = group_size
 
     def forward(self, hidden_states, gate=None):
-        return gated_rms_norm_ref(
-            x=hidden_states,
+        return torch.ops.auto_deploy.triton_rmsnorm_gated(
+            hidden_states,
             weight=self.weight,
-            bias=None,
-            z=gate,
+            gate=gate,
             eps=self.variance_epsilon,
             group_size=self.group_size,
             norm_before_gate=False,
