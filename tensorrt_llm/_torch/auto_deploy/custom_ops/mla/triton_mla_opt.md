@@ -1385,6 +1385,125 @@ Correctness: PASS (all 14 shapes). A6-A10, B1-B4 unchanged.
 
 ______________________________________________________________________
 
+### Iteration 43 — Fine-grained NP formula based on total_blocks divisibility
+
+**Change:** Replaced the fixed-threshold NP lookup (`kv≤256→4, kv≤512→8, else 16`) with a
+formula: `NP = total_blocks` if `total_blocks ≤ 16`, else the largest divisor of `total_blocks`
+that is `≤ 16`. This ensures each partition gets exactly 1 (or an even number of) blocks, with
+no wasted/idle partitions.
+
+**Why divisor-snapping matters:**
+The split-K kernel uses `tl.cdiv(total_blocks, NUM_PARTS)` blocks per partition. If
+`total_blocks % NUM_PARTS != 0`, some partitions receive `⌈total_blocks/NUM_PARTS⌉` blocks
+and others `⌊total_blocks/NUM_PARTS⌋` — uneven work causes the slowest partitions to
+bottleneck the final reduction. Aligning NP to a divisor of `total_blocks` eliminates this.
+
+**Lookup produced by the formula:**
+
+| kv   | sb  | total_blocks | NP_old | NP_new | Notes               |
+| ---- | --- | ------------ | ------- | ------- | ------------------- |
+| 256  | 64  | 4            | 4       | 4       | unchanged           |
+| 384  | 64  | 6            | 8       | **6**   | 1 blk/part ideal    |
+| 512  | 64  | 8            | 8       | 8       | unchanged           |
+| 768  | 64  | 12           | 8       | **12**  | 1 blk/part ideal    |
+| 1024 | 64  | 16           | 16      | 16      | unchanged           |
+| 1536 | 64  | 24           | 16      | **12**  | 2 blk/part evenly   |
+| 2048 | 128 | 16           | 16      | 16      | unchanged           |
+
+**Benchmark (b=1 per-kernel, H100):**
+
+| kv   | NP_old | NP_new | old µs | new µs | Delta   |
+| ---- | ------- | ------- | ------ | ------ | ------- |
+| 384  | 8       | 6       | 10.47  | **10.15** | +3.1%  |
+| 768  | 8       | 12      | 12.66  | **10.79** | +14.8% |
+| 1536 | 16      | 12      | 13.94  | **13.93** | ≈ 0%   |
+
+Standard benchmark shapes A1-A10 are unaffected (their kv values align to existing NP choices).
+Correctness: PASS (all 14 shapes). Benefits in production for kv=384 and kv=768 workloads.
+
+**Commit:** iter 43 — fine-grained NP = total_blocks divisor formula (+3-15% for kv=384/768)
+
+______________________________________________________________________
+
+### Iteration 44 — Adaptive NP for moderate-batch split-K (b=5-8): total_blocks//2
+
+**Change:** Updated moderate-batch (b=5-8) NP selection from fixed `NP=4` to:
+
+```python
+total_blocks = max_kv_len // seq_block
+num_parts = min(max(total_blocks // 2, 1), 8)
+```
+
+This gives `NP=4` for `kv=512` (total_blocks=8, NP=4→2 blk/part, unchanged from iter 41),
+and `NP=8` for `kv=1024` (total_blocks=16, NP=8→2 blk/part, **new improvement**).
+
+**Why NP=8 for b=5-8, kv=1024:**
+Multihead (HB=4) with b=8, kv=1024 has grid=(8, 8)=64 programs → 0.5 waves.
+Split-K NP=8 gives grid=(8, 8, 8)=512 programs → ~4 waves → 8× more SM work in flight.
+The 4-wave overhead is worth it because the kv=1024 work per partition (2×64=128 positions)
+fully hides HBM latency. NP=16 would give 8 waves with 1 blk/part — tried separately,
++11% vs MH but NP=8 gives +24-31% → 2 blk/part packs better instruction-level parallelism.
+
+**Benchmark (H100, kernel-only, b=5-8, kv=1024):**
+
+| b | MH µs | SK NP=8 µs | Delta   |
+| - | ------ | ---------- | ------- |
+| 5 | 24.40  | **16.69**  | +31.6%  |
+| 6 | 24.64  | **16.94**  | +31.2%  |
+| 7 | 24.70  | **18.64**  | +24.5%  |
+| 8 | 24.90  | **18.70**  | +24.9%  |
+
+Standard benchmark A-shapes (A1-A10, kv ≤ 512 for all decode shapes) are unaffected.
+Correctness: PASS (all 14 shapes). NP cap at 8 prevents over-partitioning for kv > 1024.
+
+**Commit:** iter 44 — adaptive NP for moderate-batch split-K (+24-31% at kv=1024 b=5-8)
+
+______________________________________________________________________
+
+### Iteration 45 — B1 HB=32 vs HB=16 sweep \[HB=16 confirmed optimal\]
+
+**Change:** Benchmark-only; no code change.
+
+Tested HB=8, HB=16, HB=32 with stages=2,3 for B1 (T=128, kv=128):
+
+| HB | stages | µs     | Notes                              |
+| -- | ------ | ------ | ---------------------------------- |
+| 8  | 2      | 21.01  | current non-optimal                |
+| 8  | 3      | 23.75  | worse — stages=3 adds SMEM for HB=8|
+| 16 | 2      | 19.69  | tied best                          |
+| 16 | 3      | **19.69** | ← current code (stages=3 from iter 35) |
+| 32 | 2      | 20.29  | HB=32 slightly worse than HB=16    |
+| 32 | 3      | 19.94  | HB=32 stages=3 close but still ≥19.69|
+
+HB=16 with 2 programs per token (grid=(128,2)=256 for B1) fills ~2 waves on H100.
+HB=32 with 1 program per token (grid=(128,1)=128 = ~1 wave) slightly underutilizes.
+HB=16 remains optimal. No code change.
+
+**Commit:** iter 45 — B1 HB=32 vs HB=16 sweep \[HB=16 confirmed at 19.69µs\]
+
+______________________________________________________________________
+
+### Iteration 46 — A8 split-K test \[multihead wins, b=16 threshold confirmed\]
+
+**Change:** Benchmark-only; no code change.
+
+Tested split-K vs multihead for A8 (b=16, kv=512):
+
+| Variant | µs    | vs MH    |
+| ------- | ------ | -------- |
+| MH      | 18.38 | —        |
+| SK NP=2 | 20.68 | −12.5%   |
+| SK NP=4 | 19.56 | −6.4%    |
+| SK NP=8 | 21.62 | −17.6%   |
+
+At b=16 the SM grid with multihead is (16, 8)=128 programs → fills H100 in ~1 wave.
+Split-K adds reduction overhead without commensurate parallelism benefit.
+The `b <= 8` threshold in `use_splitk` correctly excludes A8. No code change.
+
+**Commit:** iter 46 — A8 split-K test \[MH confirmed, b\<=8 threshold correct\]
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK

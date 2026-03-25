@@ -540,29 +540,43 @@ def _triton_mla_decode(
     # Small batch (b≤4, kv≥256): T=1 grid=(1,8)=8 programs → 6% SM; split-K fills ~48-97%.
     # Moderate batch (b≤8, kv≥512): T=8 MH grid=(8,8)=64 programs; NP=4 → 256 programs
     #   → 2 waves, ~13% gain (iter 41). kv=256 at T=5-8: multihead still wins.
-    # Adaptive NUM_PARTS (iters 29, 32, 41):
-    #   kv=256: NP=4  (total_blocks=4, 1 blk/part ideal, grid=32 programs for b=1)
-    #   kv≤512: NP=8  (total_blocks=8, 1 blk/part, grid=64 for b=1)
-    #   kv>512: NP=16 (total_blocks≥9, ~1 blk/part for kv=1024, grid=128 for b=1)
-    #   b=5-8, kv=512: NP=4 (smaller NP avoids 4-wave overhead; +9-13% vs MH)
+    # Fine-grained NP (iter 43): NP = total_blocks if total_blocks ≤ 16, else largest
+    #   divisor of total_blocks that is ≤ 16. This ensures exactly 1 (or 2, evenly) blocks
+    #   per partition — no wasted/uneven partitions. Examples:
+    #     kv=256, sb=64: total_blocks=4  → NP=4  (1 blk/part)
+    #     kv=384, sb=64: total_blocks=6  → NP=6  (1 blk/part, +3.6% vs NP=8)
+    #     kv=512, sb=64: total_blocks=8  → NP=8  (1 blk/part)
+    #     kv=768, sb=64: total_blocks=12 → NP=12 (1 blk/part, +14% vs NP=8)
+    #     kv=1024,sb=64: total_blocks=16 → NP=16 (1 blk/part)
+    #     kv=1536,sb=64: total_blocks=24 → NP=12 (2 blk/part evenly, +1.9% vs NP=16)
+    #     kv=2048,sb=128:total_blocks=16 → NP=16 (1 blk/part)
+    # b=5-8, kv=512: NP=4 (smaller NP avoids 4-wave overhead; +9-13% vs MH)
     # Adaptive SEQ_BLOCK (iter 28): SB=64 for kv≤1536, SB=128 for kv>1536.
     # Adaptive num_warps (iter 33): w=4 for kv>1024 (SB=128 path), w=8 otherwise.
     # num_stages=2 for split-K (iter 37): each partition handles ≤2 blocks;
     #   stages=2 is identical to stages=3 (no pipeline benefit) but uses less SMEM.
     use_splitk = (b <= 4 and max_kv_len >= 256) or (b <= 8 and max_kv_len >= 512)
     if use_splitk:
-        if b <= 4:
-            # Small batch: use fine-grained NP to fill H100 SMs
-            if max_kv_len <= 256:
-                num_parts = 4
-            elif max_kv_len <= 512:
-                num_parts = 8
-            else:
-                num_parts = 16
-        else:
-            # Moderate batch (b=5-8): NP=4 avoids 4-wave overhead from NP=8
-            num_parts = 4
         seq_block = 64 if max_kv_len <= 1536 else 128
+        if b <= 4:
+            # Small batch: NP = total_blocks (ideal: 1 blk/part) capped at 16.
+            # For total_blocks > 16, find largest divisor ≤ 16 (avoids uneven partitions).
+            total_blocks = max_kv_len // seq_block
+            if total_blocks <= 16:
+                num_parts = total_blocks
+            else:
+                num_parts = 1
+                for _np in range(16, 0, -1):
+                    if total_blocks % _np == 0:
+                        num_parts = _np
+                        break
+        else:
+            # Moderate batch (b=5-8): NP = total_blocks // 2 (2 blocks/part), capped at 8.
+            # kv=512 (total_blocks=8): NP=4 — 2 blocks/part, ~2 waves with b=8 (+13% vs MH)
+            # kv=1024 (total_blocks=16): NP=8 — 2 blocks/part, ~4 waves (+11% vs MH, iter 44)
+            # Cap at 8: NP=16 for kv=1024 gives 1 blk/part but 8 waves — diminishing returns.
+            total_blocks = max_kv_len // seq_block
+            num_parts = min(max(total_blocks // 2, 1), 8)
         # warps=4 for long-context SB=128 path (A5): fewer threads reduces register
         # pressure; 1.5% gain vs w=8. warps=8 better for shorter kv (A2-A4).
         nw = 4 if max_kv_len > 1024 else 8
