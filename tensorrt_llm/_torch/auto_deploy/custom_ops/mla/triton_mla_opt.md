@@ -798,6 +798,30 @@ pipeline latency hiding; more stages exceed SMEM budget. No code change needed.
 
 ______________________________________________________________________
 
+### Iteration 23 — warps sweep for SB=128 path \[NO IMPROVEMENT\]
+
+**Change:** Benchmark-only experiment; no code change.
+
+Tested `num_warps=4` and `num_warps=16` with SEQ_BLOCK=128, stages=3,
+compared against current best `num_warps=8`:
+
+| ID  | warps=4 µs | warps=8 (cur best) | warps=16 µs |
+| --- | ---------- | ------------------ | ----------- |
+| A2  | 11.5       | **10.8**           | 11.7        |
+| A3  | 15.1       | **14.3**           | 16.4        |
+| A4  | 21.5       | **21.5**           | 24.2        |
+| A5  | 34.8       | **35.4**           | 41.0        |
+| A6  | 12.7       | **11.9**           | 12.4        |
+| A7  | 16.0       | **15.4**           | 17.1        |
+| A8  | 16.5       | **16.0**           | 17.6        |
+
+warps=8 wins on 6/7 shapes. warps=4 ties A4 and is 1.7% faster on A5 (34.8 vs
+35.4µs) but loses elsewhere. warps=16 is uniformly worse. No change to config.
+
+**Commit:** iter 23 — warps sweep SB=128 \[NO IMPROVEMENT: warps=8 remains best\]
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK \[HIGHEST PRIORITY\]
