@@ -536,24 +536,32 @@ def _triton_mla_decode(
         b, is_prefill=False, max_kv_len=max_kv_len
     )
 
-    # Split-K: for b≤4 with kv≥256, partition kv blocks to fill more H100 SMs.
-    # T=1, HB=4 (no split-K): grid=(1,8)=8 programs → 6% SM utilization.
-    # Adaptive NUM_PARTS (iters 29, 32):
-    #   kv=256: NP=4  (grid=32 programs, 24% SM) — 4.7% gain vs multihead
-    #   kv≤512: NP=8  (grid=64 programs, 48% SM)
-    #   kv>512: NP=16 (grid=128 programs, ~97% SM)
+    # Split-K: partition kv blocks across NUM_PARTS to increase SM utilization.
+    # Small batch (b≤4, kv≥256): T=1 grid=(1,8)=8 programs → 6% SM; split-K fills ~48-97%.
+    # Moderate batch (b≤8, kv≥512): T=8 MH grid=(8,8)=64 programs; NP=4 → 256 programs
+    #   → 2 waves, ~13% gain (iter 41). kv=256 at T=5-8: multihead still wins.
+    # Adaptive NUM_PARTS (iters 29, 32, 41):
+    #   kv=256: NP=4  (total_blocks=4, 1 blk/part ideal, grid=32 programs for b=1)
+    #   kv≤512: NP=8  (total_blocks=8, 1 blk/part, grid=64 for b=1)
+    #   kv>512: NP=16 (total_blocks≥9, ~1 blk/part for kv=1024, grid=128 for b=1)
+    #   b=5-8, kv=512: NP=4 (smaller NP avoids 4-wave overhead; +9-13% vs MH)
     # Adaptive SEQ_BLOCK (iter 28): SB=64 for kv≤1536, SB=128 for kv>1536.
     # Adaptive num_warps (iter 33): w=4 for kv>1024 (SB=128 path), w=8 otherwise.
     # num_stages=2 for split-K (iter 37): each partition handles ≤2 blocks;
     #   stages=2 is identical to stages=3 (no pipeline benefit) but uses less SMEM.
-    use_splitk = b <= 4 and max_kv_len >= 256
+    use_splitk = (b <= 4 and max_kv_len >= 256) or (b <= 8 and max_kv_len >= 512)
     if use_splitk:
-        if max_kv_len <= 256:
-            num_parts = 4
-        elif max_kv_len <= 512:
-            num_parts = 8
+        if b <= 4:
+            # Small batch: use fine-grained NP to fill H100 SMs
+            if max_kv_len <= 256:
+                num_parts = 4
+            elif max_kv_len <= 512:
+                num_parts = 8
+            else:
+                num_parts = 16
         else:
-            num_parts = 16
+            # Moderate batch (b=5-8): NP=4 avoids 4-wave overhead from NP=8
+            num_parts = 4
         seq_block = 64 if max_kv_len <= 1536 else 128
         # warps=4 for long-context SB=128 path (A5): fewer threads reduces register
         # pressure; 1.5% gain vs w=8. warps=8 better for shorter kv (A2-A4).
@@ -607,6 +615,8 @@ def _triton_mla_decode(
         )
         # Reduce partial results via Triton kernel (avoids CPU-GPU sync overhead).
         # Grid: (b, num_heads) — each program combines NUM_PARTS partial (acc,m,l).
+        # num_warps=8 (iter 42): +2.5-3.1% vs num_warps=4 across A3-A5; more warps
+        #   improve throughput of the NUM_PARTS-loop memory accesses.
         _mla_splitk_reduce[(b, num_heads)](
             workspace_acc,
             workspace_ml,
@@ -615,7 +625,7 @@ def _triton_mla_decode(
             KV_LORA_RANK=kv_lora_rank,
             KV_BLOCK=kv_block,
             NUM_PARTS=num_parts,
-            num_warps=4,
+            num_warps=8,
         )
     else:
         grid = (b, num_heads // head_block)

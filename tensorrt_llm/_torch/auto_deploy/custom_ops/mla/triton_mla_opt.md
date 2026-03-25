@@ -144,11 +144,11 @@ ______________________________________________________________________
 | --- | -------------- | ---------------------------------------------------- | ---- | ----------- |
 | A1  | 8.5            | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3       | 18   | **2.5×**    |
 | A2  | 10.66          | split-K NP=4, HB=4, SB=64, warps=8, stgs=2         | 37   | **6.5×**    |
-| A3  | 10.80          | split-K NP=8, HB=4, SB=64, warps=8, stgs=2         | 37   | **11.8×**   |
-| A4  | 11.42          | split-K NP=16, HB=4, SB=64, warps=8, stgs=2        | 37   | **21.8×**   |
-| A5  | 12.43          | split-K NP=16, HB=4, SB=128, warps=4, stgs=2       | 37   | **39.5×**   |
+| A3  | 10.56          | split-K NP=8, HB=4, SB=64, w=8, ns=2, rw=8        | 42   | **12.0×**   |
+| A4  | 11.31          | split-K NP=16, HB=4, SB=64, w=8, ns=2, rw=8       | 42   | **22.0×**   |
+| A5  | 12.12          | split-K NP=16, HB=4, SB=128, w=4, ns=2, rw=8      | 42   | **40.5×**   |
 | A6  | 11.9           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **5.8×**    |
-| A7  | 15.4           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **8.5×**    |
+| A7  | 15.21          | split-K NP=4, HB=4, SB=64, w=8, ns=2, rw=8        | 41   | **8.6×**    |
 | A8  | 16.0           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **9.3×**    |
 | A9  | 13.84          | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3       | 36   | **9.5×**    |
 | A10 | 18.0           | multihead HB=8, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **14.0×**   |
@@ -1313,6 +1313,75 @@ SB=64 loses heavily (2× for B3) due to more loop overhead per token. SB=128 is 
 optimal. No code change.
 
 **Commit:** iter 40 — prefill SB sweep B3-B4 \[SB=128 confirmed optimal\]
+
+______________________________________________________________________
+
+### Iteration 41 — Extend split-K to T≤8 for kv≥512 (+9-13% A7-style shapes)
+
+**Change:** Extended `use_splitk` condition from `b <= 4 and kv >= 256` to also cover
+`b <= 8 and kv >= 512`. For b=5-8, use `num_parts = 4` (avoids 4-wave overhead from NP=8).
+
+**Why NP=4 for moderate batch (b=5-8, kv=512):**
+
+- Current MH (b=8, kv=512): grid = (8, 8) = 64 programs → 0.5 waves on H100 (132 SMs)
+- Split-K NP=4: grid = (8, 8, 4) = 256 programs → ~2 waves
+- NP=4 with SB=64: total_blocks=8, NP=4 → 2 blocks/part (all busy), no wasted partitions
+- NP=8 (1 block/part) would give 512 programs (4 waves) — too many waves, diminishing returns
+
+**Benchmark (H100, kernel-only via `bench_splitk_kernel`):**
+
+| Shape       | MH µs | SK NP=4 µs | Delta  |
+| ----------- | ------ | ---------- | ------ |
+| T=5, kv=512 | 16.16  | **14.01**  | +13.3% |
+| T=6, kv=512 | 16.36  | **14.32**  | +12.5% |
+| T=7, kv=512 | 16.38  | **15.14**  | +7.6%  |
+| T=8 (A7)   | 16.87  | **15.21**  | +9.8%  |
+
+A6 (T=8, kv=256): multihead still wins (12.17µs vs SK 12.48µs) — threshold kv≥512 correct.
+A1-A5, A8-A10, B1-B4: unchanged. Correctness: PASS (all 14 shapes, max_abs_err \< 0.007).
+
+**Updated Current Best:**
+
+| ID | Best µs | Config                                  | Iter | vs Baseline |
+| -- | ------- | --------------------------------------- | ---- | ----------- |
+| A7 | 15.21   | split-K NP=4, HB=4, SB=64, w=8, ns=2 | 41   | **8.6×**    |
+
+**Commit:** iter 41 — extend split-K to b≤8 for kv≥512 (+9-13% A7-style shapes)
+
+______________________________________________________________________
+
+### Iteration 42 — Reduce kernel warps 4→8 (+2.5-3.1% A3-A5)
+
+**Change:** Changed `num_warps=4` to `num_warps=8` in the `_mla_splitk_reduce` kernel call.
+
+**Why warps=8 helps:**
+The reduce kernel loads `NUM_PARTS` partial (acc, m, l) entries and performs sequential
+log-sum-exp reduction. With NUM_PARTS=8 or 16, the loop body does 2 separate loads
+(workspace_acc + workspace_ml) per partition — 32 or 64 HBM fetches total.
+warps=8 (256 threads) provides more warp-level parallelism to hide HBM latency:
+each thread in a warp handles 1 KV_BLOCK element, so 256 threads cover the full
+KV_BLOCK=256 in one instruction issue. warps=4 has the same coverage but half the
+memory bandwidth.
+
+**Benchmark (from Experiment 3 with direct reduce-warps sweep):**
+
+| Shape | reduce w=2 µs | reduce w=4 µs (old) | reduce w=8 µs (new) | Delta |
+| ----- | ------------- | ------------------- | ------------------- | ----- |
+| A3    | 11.01         | 10.83               | **10.56**           | +2.5% |
+| A4    | 12.25         | 11.67               | **11.31**           | +3.1% |
+| A5    | 13.07         | 12.46               | **12.12**           | +2.7% |
+
+Correctness: PASS (all 14 shapes). A6-A10, B1-B4 unchanged.
+
+**Updated Current Best:**
+
+| ID | Best µs | Config                                          | Iter | vs Baseline |
+| -- | ------- | ----------------------------------------------- | ---- | ----------- |
+| A3 | 10.56   | split-K NP=8, HB=4, SB=64, w=8, ns=2, rw=8   | 42   | **12.0×**   |
+| A4 | 11.31   | split-K NP=16, HB=4, SB=64, w=8, ns=2, rw=8  | 42   | **22.0×**   |
+| A5 | 12.12   | split-K NP=16, HB=4, SB=128, w=4, ns=2, rw=8 | 42   | **40.5×**   |
+
+**Commit:** iter 42 — reduce kernel warps 4→8 (+2.5-3.1% A3-A5)
 
 ______________________________________________________________________
 
