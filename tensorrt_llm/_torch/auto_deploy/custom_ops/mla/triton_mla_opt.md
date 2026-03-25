@@ -147,8 +147,8 @@ ______________________________________________________________________
 | A3  | 28.1           | SEQ_BLOCK=128, warps=8, stages=4                | 4    | **4.5×**    |
 | A4  | 50.4           | SEQ_BLOCK=128, warps=8, stages=4                | 4    | **4.9×**    |
 | A5  | 94.6           | SEQ_BLOCK=128, warps=8, stages=5                | 4    | **5.2×**    |
-| A6  | 26.4           | SEQ_BLOCK=64, warps=4, stages=2                 | 4    | **2.6×**    |
-| A7  | 45.7           | SEQ_BLOCK=64, warps=4, stages=4                 | 4    | **2.9×**    |
+| A6  | 18.7           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 11   | **3.7×**    |
+| A7  | 28.4           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 11   | **4.6×**    |
 | A8  | 29.4           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **5.1×**    |
 | A9  | 20.2           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **6.5×**    |
 | A10 | 32.3           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **7.8×**    |
@@ -421,6 +421,29 @@ Correctness: PASS (inherited from iter 8 sweep — SB change only affects SEQ_BL
 boundary masking which was already tested at SB=128 in the HB sweep).
 
 **Commit:** iter 10 — prefill HB=32 SEQ_BLOCK 64→128 (+3-8% for B2-B4)
+
+______________________________________________________________________
+
+### Iteration 11 — Lower decode multihead dispatch threshold: B≥16 → B≥8
+
+**Change:** Updated `_triton_mla_decode` dispatch from `if b >= 16` to `if b >= 8`.
+
+A6 (B=8, kv=256) and A7 (B=8, kv=512) now use `_mla_attention_kernel_multihead`
+(HB=8, SB=64) instead of the original kernel with sweep-optimal config.
+
+**Benchmark data (H100, HB=8 SB=64 vs original sweep best):**
+
+| ID  | Original best µs | Multihead HB=8 SB=64 µs | Speedup |
+| --- | ---------------- | ----------------------- | ------- |
+| A6  | 26.4             | 18.7                    | +41%    |
+| A7  | 45.7             | 28.4                    | +61%    |
+
+For B\<8 (T=1 single-token decode), the original kernel with large SEQ_BLOCK
+still wins (A1=9.4µs, A2=17.0µs vs multihead 11.0/18.1µs).
+
+Correctness: PASS (HB=8, SB=64 was tested across all 14 shapes in iter 8 sweep).
+
+**Commit:** iter 11 — decode multihead dispatch threshold B>=16 -> B>=8 (+41-61% A6-A7)
 
 ______________________________________________________________________
 

@@ -457,9 +457,13 @@ def _triton_mla_decode(
 
     max_kv_len = int(kv_len.max().item())
 
-    # For large batches (B>=16), the multihead kernel reduces HBM redundancy.
-    # For small/single-token batches, the original kernel with large SEQ_BLOCK is faster.
-    if b >= 16:
+    # For batches B>=8, the multihead kernel reduces HBM redundancy.
+    # Benchmark data (H100, HB=8 SB=64 vs original sweep best):
+    #   A6 (B=8,  kv=256): 18.7µs vs 26.4µs (+41%)
+    #   A7 (B=8,  kv=512): 28.4µs vs 45.7µs (+61%)
+    #   A8 (B=16, kv=512): 29.4µs vs 62.0µs (+111%)
+    # For B<8 (T=1 single decode), original kernel with large SEQ_BLOCK is faster.
+    if b >= 8:
         seq_block, head_block, nw, ns = _get_mla_multihead_config(b, is_prefill=False)
         grid = (b, num_heads // head_block)
         _mla_attention_kernel_multihead[grid](
