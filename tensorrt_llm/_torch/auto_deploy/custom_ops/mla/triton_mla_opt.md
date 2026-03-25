@@ -1853,6 +1853,65 @@ max_kv_len = mla_cache.shape[1]  # static: max_seq_len from allocation
 
 ______________________________________________________________________
 
+### Iter 58 — Diagnostic: disable split-K to isolate NaN source
+
+**Change:** Disabled `use_splitk` entirely (`use_splitk = False`) to determine whether
+NaN in logits originated from the split-K kernel path or the multihead path.
+
+**Motivation:** After iter 57 fixed the `.item()` D2H sync crash, inference with
+`torch-cudagraph` produced NaN in logits. The NaN also fired in eager mode
+(`torch-simple`), confirming it was a kernel correctness bug unrelated to CUDA graph
+capture. Split-K was a natural first suspect (partial accumulation + reduce step).
+
+**Result (diagnostic):** NaN **still fires** with split-K disabled. Conclusion: split-K
+is NOT the source of NaN. The multihead kernel itself produces garbage output under
+certain conditions.
+
+**Root cause identified:** With TP=8 (`world_size=8`), `num_heads = 32 / 8 = 4` per GPU.
+`_get_mla_multihead_config` returns `head_block=16` for prefill T≤128. The grid becomes
+`(T, num_heads // head_block) = (T, 4 // 16) = (T, 0)` — a **zero-size grid**. Triton
+launches zero programs → `weighted_kv` is never written → stays uninitialized
+(garbage/NaN). The same bug can fire in decode: when b>16, `head_block=8 > num_heads=4`
+→ `grid = (b, 0)`.
+
+**Commit:** iter 58 — diagnostic: disable split-K (NaN still fires → not split-K cause)
+
+______________________________________________________________________
+
+### Iter 59 — Fix: cap head_block at num_heads (TP zero-grid bug)
+
+**Change:** Added `head_block = min(head_block, num_heads)` after each
+`_get_mla_multihead_config()` call in both decode and prefill dispatch paths.
+Also restored split-K (`use_splitk = (b <= 4 and max_kv_len >= 256) or ...`).
+
+**Root cause fixed:** With TP=8 and `num_heads=4` per rank, `_get_mla_multihead_config`
+returned `head_block=16` (prefill T≤128) or `head_block=8` (decode b>16) — both larger
+than `num_heads=4`. This caused `num_heads // head_block = 0`, launching zero programs
+and leaving `weighted_kv` uninitialized (NaN).
+
+**Fix locations:**
+
+- Decode path (after `_get_mla_multihead_config` call, before `use_splitk` check):
+  `head_block = min(head_block, num_heads)`
+- Prefill path (after `_get_mla_multihead_config` call, before grid construction):
+  `head_block = min(head_block, num_heads)`
+
+**Effect on grid:** With cap applied, `num_heads // head_block >= 1` always holds when
+`num_heads >= 1`. Example: `num_heads=4, head_block=16 → capped to 4 → grid=(T, 1)`.
+Each program now processes all 4 heads (instead of 16), which is less efficient than the
+optimal `head_block=4` but produces correct output.
+
+**Performance note:** When `num_heads=4` and `head_block` is capped from 16 → 4, the
+kernel runs with `grid=(T, 1)` vs `grid=(T, 2)` for `head_block=8` — fewer SM programs.
+For the TP=8 case, performance is secondary to correctness. For the non-TP case
+(num_heads=32), the cap has no effect since `head_block ≤ num_heads` already.
+
+**Result:** TBD — running `build_and_run_ad.py` with `torch-cudagraph`.
+
+**Commit:** iter 59 — fix: cap head_block at num_heads to prevent zero-size grid (TP bug)
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK

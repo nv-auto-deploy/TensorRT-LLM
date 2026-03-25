@@ -561,6 +561,12 @@ def _triton_mla_decode(
     # Adaptive num_warps (iter 33): w=4 for kv>1024 (SB=128 path), w=8 otherwise.
     # num_stages=2 for split-K (iter 37): each partition handles ≤2 blocks;
     #   stages=2 is identical to stages=3 (no pipeline benefit) but uses less SMEM.
+    # iter 59: cap head_block at num_heads to prevent zero-size grid when TP reduces
+    # num_heads below head_block threshold (e.g., TP=8 → num_heads=4 < head_block=8).
+    # A zero-size grid (num_heads // head_block == 0) launches no kernel programs,
+    # leaving weighted_kv uninitialized (garbage/NaN) → NaN in logits.
+    head_block = min(head_block, num_heads)
+
     use_splitk = (b <= 4 and max_kv_len >= 256) or (b <= 8 and max_kv_len >= 512)
     if use_splitk:
         seq_block = 64 if max_kv_len <= 1536 else 128
@@ -787,6 +793,9 @@ def _triton_mla_prefill(
 
     # Multihead kernel is always faster for prefill: shares cache loads across HEAD_BLOCK heads.
     seq_block, head_block, nw, ns = _get_mla_multihead_config(total_tokens, is_prefill=True)
+    # iter 59: cap head_block at num_heads to prevent zero-size grid when TP reduces
+    # num_heads below head_block threshold (e.g., TP=8 → num_heads=4 < head_block=16).
+    head_block = min(head_block, num_heads)
     grid = (total_tokens, num_heads // head_block)
     _mla_attention_kernel_multihead[grid](
         q_absorbed,
