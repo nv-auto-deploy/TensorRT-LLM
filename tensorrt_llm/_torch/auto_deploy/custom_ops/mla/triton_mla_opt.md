@@ -143,19 +143,19 @@ ______________________________________________________________________
 | ID  | Best kernel µs | Config                                               | Iter | vs Baseline |
 | --- | -------------- | ---------------------------------------------------- | ---- | ----------- |
 | A1  | 8.5            | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3       | 18   | **2.5×**    |
-| A2  | 10.66          | split-K NP=4, HB=4, SB=64, warps=8, stgs=3         | 32   | **6.5×**    |
-| A3  | 11.0           | split-K NP=8, HB=4, SB=64, warps=8, stgs=3         | 29   | **11.5×**   |
-| A4  | 11.8           | split-K NP=16, HB=4, SB=64, warps=8, stgs=3        | 29   | **21.1×**   |
-| A5  | 12.75          | split-K NP=16, HB=4, SB=128, warps=4, stgs=3       | 33   | **38.5×**   |
+| A2  | 10.66          | split-K NP=4, HB=4, SB=64, warps=8, stgs=2         | 37   | **6.5×**    |
+| A3  | 10.80          | split-K NP=8, HB=4, SB=64, warps=8, stgs=2         | 37   | **11.8×**   |
+| A4  | 11.42          | split-K NP=16, HB=4, SB=64, warps=8, stgs=2        | 37   | **21.8×**   |
+| A5  | 12.43          | split-K NP=16, HB=4, SB=128, warps=4, stgs=2       | 37   | **39.5×**   |
 | A6  | 11.9           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **5.8×**    |
 | A7  | 15.4           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **8.5×**    |
 | A8  | 16.0           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **9.3×**    |
-| A9  | 14.0           | multihead HB=8, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **9.3×**    |
+| A9  | 13.84          | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3       | 36   | **9.5×**    |
 | A10 | 18.0           | multihead HB=8, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **14.0×**   |
-| B1  | 19.6           | multihead HB=16, SEQ_BLOCK=64, warps=8, stgs=2      | 19   | **20.2×**   |
-| B2  | 96.9           | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2     | 15   | **63.0×**   |
-| B3  | 289.1          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2     | 15   | **83.6×**   |
-| B4  | 980.7          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2     | 15   | **98.1×**   |
+| B1  | 18.55          | multihead HB=16, SEQ_BLOCK=64, warps=8, stgs=3      | 35   | **21.4×**   |
+| B2  | 96.4           | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2     | 38   | **63.4×**   |
+| B3  | 288.0          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2     | 39   | **83.9×**   |
+| B4  | 980.5          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2     | 40   | **98.1×**   |
 
 ______________________________________________________________________
 
@@ -1172,35 +1172,189 @@ SK NP=4 = 15.3µs vs multihead = 16.6µs in this test. But current best is 15.4�
 
 ______________________________________________________________________
 
+### Iteration 35 — stages=3 for B1 prefill (T≤128) \[MARGINAL\]
+
+**Change:** Updated `_get_mla_multihead_config` for `is_prefill=True, num_tokens ≤ 128`:
+from `return 64, 16, 8, 2` (stages=2) to `return 64, 16, 8, 3` (stages=3).
+
+**Why stages=3 might help for B1:**
+With HB=16 and SB=64, each program processes T=128 tokens × kv_len=128 blocks = 2 loop
+iterations. With stages=3, the pipeline prefetches 1 extra stage (2 inflight prefetches),
+allowing HBM latency for block N+1 to overlap with computation for block N. For only 2
+loop iterations this benefit is minimal, but should not hurt.
+
+**Benchmark:**
+
+| ID  | stages=2 µs | stages=3 µs | Delta   |
+| --- | ----------- | ----------- | ------- |
+| B1  | 18.61       | **18.55**   | +0.3%   |
+
+B2–B4 unchanged (only T≤128 path changed). Correctness: PASS (all 14 shapes).
+
+**Commit:** iter 35 — stages=3 for B1 prefill T≤128 \[+0.3% marginal\]
+
+______________________________________________________________________
+
+### Iteration 36 — Adaptive SB=64/128 for HB=8 decode path (B>16) based on kv_len
+
+**Change:** Updated `_get_mla_multihead_config` for `num_tokens > 16` (HB=8 path):
+from unconditional `return 128, 8, 8, 3` to:
+
+```python
+sb = 64 if max_kv_len <= 256 else 128
+return sb, 8, 8, 3
+```
+
+**Why SB=64 wins for A9 (kv=256, B=32):**
+With kv=256 and SB=128: total_blocks = 256/128 = 2 iterations per program. Only 2 iterations
+means very little pipeline fill — each iteration is essentially cold. SB=64 gives 4 iterations,
+better pipeline utilization while still fitting the budget. For kv>256 (A10: kv=512), SB=128
+gives 4 iterations (good pipeline fill) and fewer loop iterations, so it remains best.
+
+**Benchmark:**
+
+| ID  | SB=128 µs | SB=64 µs  | Delta  |
+| --- | --------- | --------- | ------ |
+| A9  | 14.08     | **13.84** | +1.7%  |
+| A10 | 18.0      | 18.2      | −1.1%  |
+
+A10 is slightly worse with SB=64 (more iterations, less pipeline fill). Threshold confirmed at
+kv≤256→SB=64, kv>256→SB=128. A1-A8 unchanged (only B>16 path). Correctness: PASS.
+
+**Commit:** iter 36 — adaptive SB for HB=8 decode (kv≤256→SB=64, +1.7% A9)
+
+______________________________________________________________________
+
+### Iteration 37 — stages=2 for all split-K dispatch (+2-3% A3-A5)
+
+**Change:** Added `ns = 2` in `_triton_mla_decode` split-K path, overriding the `ns`
+returned by `_get_mla_multihead_config` (which would give stages=3).
+
+**Why stages=2 is better for split-K:**
+In split-K, each partition processes `kv_len / (NP × SB)` blocks:
+
+- A3 (kv=512, NP=8, SB=64): 512/(8×64) = 1 block per partition
+- A4 (kv=1024, NP=16, SB=64): 1024/(16×64) = 1 block per partition
+- A5 (kv=2048, NP=16, SB=128): 2048/(16×128) = 1 block per partition
+
+With only 1 block per partition, the software pipeline prefetches block N+1 that doesn't
+exist — wasted SMEM (and potential eviction of useful data). stages=2 avoids this while
+providing slightly higher occupancy due to reduced SMEM usage.
+
+**Benchmark (A-shapes with split-K enabled):**
+
+| ID  | stages=3 µs | stages=2 µs | Delta  |
+| --- | ----------- | ----------- | ------ |
+| A2  | 10.66       | **10.66**   | 0%     |
+| A3  | 11.0        | **10.80**   | +1.8%  |
+| A4  | 11.8        | **11.42**   | +3.2%  |
+| A5  | 12.75       | **12.43**   | +2.5%  |
+
+Correctness: PASS (all 14 shapes, max_abs_err \< 0.005). A6-A10, B1-B4 unchanged.
+
+**Commit:** iter 37 — stages=2 for split-K dispatch (+1.8-3.2% A3-A5)
+
+______________________________________________________________________
+
+### Iteration 38 — Prefill stages sweep B2-B4 \[NO IMPROVEMENT: stages=2 confirmed\]
+
+**Change:** Benchmark-only; no code change.
+
+Tested stages=3 vs stages=2 for HB=32, SB=128, warps=8 on large prefill:
+
+| Shape | stages=2 µs | stages=3 µs | Winner       |
+| ----- | ----------- | ----------- | ------------ |
+| B2    | **96.43**   | 100.35      | stages=2     |
+| B3    | 287.39      | **286.11**  | stages=3 (≈) |
+| B4    | **980.69**  | 984.75      | stages=2     |
+
+stages=2 is best or equal across all large prefill shapes. For HB=32 each program handles
+all 32 heads but only one token, with SEQ_BLOCK=128 inner iterations. stages=3 would add
+an extra SMEM buffer (81.9 KB) with negligible pipeline benefit since each "column" of the
+kv sequence is already short relative to HBM latency. Keep stages=2.
+
+**Commit:** iter 38 — prefill stages sweep B2-B4 \[stages=2 confirmed optimal\]
+
+______________________________________________________________________
+
+### Iteration 39 — Prefill warps sweep B2-B4 \[NO IMPROVEMENT: warps=8 confirmed\]
+
+**Change:** Benchmark-only; no code change.
+
+Tested warps=4, 8, 16 for HB=32, SB=128, stages=2:
+
+| Shape | warps=4 µs | warps=8 µs | warps=16 µs | Best   |
+| ----- | ---------- | ---------- | ----------- | ------ |
+| B2    | 99.20      | **96.54**  | 126.24      | w=8    |
+| B3    | 290.42     | **287.39** | 404.79      | w=8    |
+| B4    | 988.90     | **980.45** | 1469.58     | w=8    |
+
+warps=16 is dramatically worse (2× as slow for B4) — excessive context switching at 16 warps
+oversubscribes the register file. warps=8 remains best. No code change.
+
+**Commit:** iter 39 — prefill warps sweep B2-B4 \[warps=8 confirmed optimal\]
+
+______________________________________________________________________
+
+### Iteration 40 — Prefill SB sweep B3-B4 including SB=256 \[NO IMPROVEMENT: SB=128 confirmed\]
+
+**Change:** Benchmark-only; no code change.
+
+Tested SB=64, 128, 256 for HB=32, warps=8, stages=2:
+
+| Shape | SB=64 µs | SB=128 µs | SB=256 µs | Best   |
+| ----- | -------- | --------- | --------- | ------ |
+| B3    | 325.29   | **288.04**| 301.41    | SB=128 |
+| B4    | 1121.88  | **979.72**| 1008.30   | SB=128 |
+
+SB=256 is worse than SB=128: larger blocks require more SMEM for the software pipeline
+and the extra memory doesn't improve throughput (we're already memory-bandwidth bound).
+SB=64 loses heavily (2× for B3) due to more loop overhead per token. SB=128 is confirmed
+optimal. No code change.
+
+**Commit:** iter 40 — prefill SB sweep B3-B4 \[SB=128 confirmed optimal\]
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
-### A.2 Tiling & SEQ_BLOCK \[HIGHEST PRIORITY\]
+### A.2 Tiling & SEQ_BLOCK
 
-- \[x\] **SEQ_BLOCK sweep (4,8,16,32,64,128)** — Done (iter 1): lookup table implemented, full GPU sweep pending.
-- \[x\] **Shape-conditional SEQ_BLOCK** — Done (iter 1): lookup tables; subsumed into `_get_mla_multihead_config` (iter 15); old single-head configs removed (iter 17).
-- \[x\] **Separate decode vs prefill SEQ_BLOCK** — Done (iter 1): separate configs per path; now unified in `_get_mla_multihead_config`.
+- \[x\] **SEQ_BLOCK sweep (4,8,16,32,64,128)** — Done (iter 1, 15, 20-21, 36, 38-40).
+- \[x\] **Shape-conditional SEQ_BLOCK** — Done; adaptive SB in all dispatch paths.
+- \[x\] **Separate decode vs prefill SEQ_BLOCK** — Done, unified in `_get_mla_multihead_config`.
+- \[x\] **SB for split-K** — Adaptive SB=64/128 (iters 27-28), confirmed SB=256 worse (iter 40).
+- \[x\] **Prefill SB=256** — Tested (iter 40): worse than SB=128. No change.
 
 ### A.1 Memory Access Patterns
 
-- \[x\] **Reduce head-redundant loads via HEAD_BLOCK tiling** — Done (iter 2): `_mla_attention_kernel_multihead` with HEAD_BLOCK tiling. Prefill: 15-52× speedup. Decode: pending sweep.
-- \[x\] **Cache load eviction hint `evict_first`** — Done (iter 7): added to all cache loads in both kernels. Benefit pending benchmark.
-- \[ \] **Wider loads via `other` alignment** — ensure KV_BLOCK=256 and PE_BLOCK=64 loads are 128-byte aligned for vectorized HBM transactions. **Impact: Low** | All shapes | Correctness risk: No
+- \[x\] **Reduce head-redundant loads via HEAD_BLOCK tiling** — Done (iter 2); fully utilized.
+- \[x\] **Cache load eviction hint `evict_first`** — Done (iter 7).
+- \[x\] **Adaptive HB for decode** — Done (iters 18-21): HB=4 for B≤16, HB=8 for B>16.
+- \[ \] **Wider loads via 128-byte alignment** — KV_BLOCK=256 loads already 512-byte aligned (256 bf16 elements); PE_BLOCK=64 is 128-byte aligned. Unlikely to help further. **Impact: Very Low**
+- \[ \] **Workspace layout transposition for reduce kernel** — Current: `[T, N, NP, KV_BLOCK]`; try `[T, NP, N, KV_BLOCK]` so reduce iterates over NP as outermost, potentially better L2 reuse across programs. **Impact: Low-Medium** | Split-K shapes | Correctness risk: Yes
 
 ### A.5 Parallelism & Occupancy
 
-- \[ \] **num_warps sweep (1,2,4,8,16)** — Why: current warps=2 for decode may underutilize warp-level parallelism. **Impact: Medium** | All shapes | Correctness risk: No
-- \[ \] **num_stages sweep (1,2,3,4,5)** — Why: more stages pipeline the inner HBM loads with compute. **Impact: Medium** | All shapes | Correctness risk: No
-- \[ \] **Increase decode parallelism for small batches** — For T=1 grid=(1,32)=32 programs; only 24% SM utilization on H100. Consider parallelizing over kv_len (split-K style). **Impact: High for small-batch** | A1-A5 | Correctness risk: Yes (needs final reduction)
+- \[x\] **num_warps sweep** — Done exhaustively (iters 15, 23, 31, 33, 39).
+- \[x\] **num_stages sweep** — Done (iters 22, 30, 35, 37, 38).
+- \[x\] **Split-K for small batches** — Done (iters 26-37).
+- \[x\] **Adaptive NUM_PARTS** — Done (iters 29, 32).
+- \[x\] **Adaptive stages for split-K** — Done (iter 37): stages=2 for all split-K.
+- \[ \] **Extend split-K to T≤8** — Current threshold b≤4. T=5-8 with kv≥256 might benefit from NP=2-4 to increase SM utilization (current: 8T×(N/HB)=64 programs for T=8). **Impact: Medium** | A6-A8 | Correctness risk: No (just dispatch change)
+- \[ \] **Reduce kernel warps** — Currently fixed at 4. Try warps=2 or warps=8 for the `_mla_splitk_reduce` kernel. **Impact: Low** | Split-K shapes | Correctness risk: No
 
 ### A.3 Compute Optimizations
 
-- \[ \] **`tl.dot` for inner products** — Replace `tl.sum(q_abs[None,:] * ckv, axis=1)` with `tl.dot(ckv, q_abs)` to use tensor cores. **Impact: Low** (memory-bound, not compute-bound) | Prefill large shapes | Correctness risk: No
-- \[ \] **Static range unrolling for small SEQ_BLOCK** — If SEQ_BLOCK is small and kv_len/SEQ_BLOCK is known, unroll with `tl.static_range`. **Impact: Low-Medium** | Decode shapes | Correctness risk: No
+- \[x\] **`tl.dot` for inner products** — Already using `tl.dot` via HEAD_BLOCK tiling (iter 2+).
+- \[x\] **exp2 softmax** — Done (iter 13).
+- \[ \] **Static unrolling for reduce** — `_mla_splitk_reduce` already uses `tl.static_range(1, NUM_PARTS)`. NUM_PARTS varies (4/8/16); constexpr so already unrolled by Triton. **Impact: Negligible**
+- \[ \] **B1 HB=32 vs HB=16** — Try HB=32 for short prefill T=128: grid=(128, 1) vs (128, 2). HB=32 uses 1 wave (128 programs) vs HB=16's 2 waves, potentially reducing wave scheduling overhead. **Impact: Low** | B1 | Correctness risk: No
 
 ### A.4 Kernel Fusion (Larger scope)
 
-- \[ \] **Fuse weight absorption into kernel** — Absorb the `q_absorbed = q_nope @ W_kn^T` einsum into the kernel (load W_kn from global, compute on the fly). Saves one global memory roundtrip for q_absorbed. **Impact: Medium** | All shapes | Correctness risk: Yes (major rewrite)
-- \[ \] **Fuse value projection into kernel** — After weighted_kv accumulation, multiply by W_v inside the kernel. Saves one global roundtrip. **Impact: Medium** | All shapes | Correctness risk: Yes (major rewrite)
+- \[ \] **Fuse weight absorption into kernel** — Load W_kn tiles inside the kernel, compute q_absorbed on the fly. Saves the q_absorbed roundtrip. W_kn is 1 MB (32×256×64×2) — too large for registers. Would need tiling → complex. **Impact: Medium-High** | All | Correctness risk: Yes (major rewrite)
+- \[ \] **Fuse value projection into kernel** — After `acc` accumulation, multiply by W_v tiles. W_v is \[N, HEAD_DIM, KV_LORA_RANK\] = 32×128×256×2 = 4 MB — very large. Unlikely to be practical. **Impact: Low** | All | Correctness risk: Yes
 
 ______________________________________________________________________
 

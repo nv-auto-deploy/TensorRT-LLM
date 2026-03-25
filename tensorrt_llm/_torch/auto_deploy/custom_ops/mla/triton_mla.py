@@ -66,32 +66,39 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool, max_kv_len: int
       SB=128 when max_kv_len > 64: A2-A7 gain 5-13% (fewer loop iterations, better
       pipeline fill); A1 only shape with kv≤64, where SB=128 wastes 50% of threads.
       SB=64 when max_kv_len ≤ 64: avoids wasted threads from masked-out blocks.
+    Decode SEQ_BLOCK for HB=8 path (iter 36):
+      SB=64 when max_kv_len ≤ 256 (A9): avoids half-empty blocks (kv=256/SB=128=2 iters
+      → 13.84µs vs SB=128: 14.08µs, +1.7%). SB=128 for longer kv (A10) as before.
+    Prefill B1 stages (iter 35):
+      stages=3 for T≤128: 18.55µs vs stages=2: 18.61µs (tie/marginal); consistent
+      1-pipeline improvement vs iter 19 baseline.
     For HB=32 prefill, num_stages=2 avoids SMEM pressure (stages=5 OOM):
       B2=96.4µs, B3=288.5µs, B4=982.5µs.
 
     Note: split-K path overrides nw based on max_kv_len in the dispatch function.
     """
     if is_prefill:
-        # B1 T≤128: HB=16, SB=64, w=8, s=2 → 19.6µs (vs HB=8: 21.3µs, +8%)
+        # B1 T≤128: HB=16, SB=64, w=8, s=3 → 18.55µs (stages=3 marginally better)
         #   HB=16 doubles cache sharing vs HB=8: grid=(T, 2) uses 2 programs per token.
         # B2-B4 T>128: HB=32, SB=128, w=8, s=2 → 96.4/288.5/982.5µs
         # stages=5 OOM for HB=32 SB=128 (SMEM overflow); stages=2 best.
         if num_tokens <= 128:
-            return 64, 16, 8, 2
+            return 64, 16, 8, 3
         else:
             return 128, 32, 8, 2
     else:
         # HB=4 for B≤16: more SM programs without sacrificing cache sharing (A1-A8)
         # HB=8 for B>16: ~1 full H100 wave, better cache sharing vs HB=4
-        # SB=128 for B>16: fewer loop iterations → less loop overhead, better pipeline;
-        #   A10: 18.3µs vs 20.0µs (+8.5%) with SB=128 vs SB=64 (HB=8 w=8 s=3)
+        # Adaptive SB for B>16 (iter 36): SB=64 for kv≤256 (A9: 13.84µs, +1.7% vs
+        #   SB=128). SB=128 for longer kv (A10: 18.0µs, +8.5% vs SB=64).
         if num_tokens <= 16:
             # SB=128 when context > SB: A2-A7 gain 5-13%; A1 (kv≤64) uses SB=64
             # to avoid wasted threads (2 blocks of 64 vs 1 block of 128 half-empty).
             sb = 64 if max_kv_len <= 64 else 128
             return sb, 4, 8, 3
         else:
-            return 128, 8, 8, 3
+            sb = 64 if max_kv_len <= 256 else 128
+            return sb, 8, 8, 3
 
 
 @triton.jit
@@ -537,6 +544,8 @@ def _triton_mla_decode(
     #   kv>512: NP=16 (grid=128 programs, ~97% SM)
     # Adaptive SEQ_BLOCK (iter 28): SB=64 for kv≤1536, SB=128 for kv>1536.
     # Adaptive num_warps (iter 33): w=4 for kv>1024 (SB=128 path), w=8 otherwise.
+    # num_stages=2 for split-K (iter 37): each partition handles ≤2 blocks;
+    #   stages=2 is identical to stages=3 (no pipeline benefit) but uses less SMEM.
     use_splitk = b <= 4 and max_kv_len >= 256
     if use_splitk:
         if max_kv_len <= 256:
@@ -549,6 +558,7 @@ def _triton_mla_decode(
         # warps=4 for long-context SB=128 path (A5): fewer threads reduces register
         # pressure; 1.5% gain vs w=8. warps=8 better for shorter kv (A2-A4).
         nw = 4 if max_kv_len > 1024 else 8
+        ns = 2  # each partition has ≤2 blocks; extra pipeline stages add no benefit
     else:
         num_parts = 1
 
