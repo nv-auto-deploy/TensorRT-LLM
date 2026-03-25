@@ -142,14 +142,14 @@ ______________________________________________________________________
 
 | ID  | Best kernel µs | Config                                          | Iter | vs Baseline |
 | --- | -------------- | ----------------------------------------------- | ---- | ----------- |
-| A1  | 8.6            | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 16   | **2.4×**    |
-| A2  | 12.4           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 16   | **5.4×**    |
-| A3  | 17.7           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **7.2×**    |
-| A4  | 28.5           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **8.7×**    |
-| A5  | 49.5           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **9.9×**    |
-| A6  | 13.7           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **5.0×**    |
-| A7  | 18.7           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **7.0×**    |
-| A8  | 19.2           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **7.8×**    |
+| A1  | 8.5            | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **2.5×**    |
+| A2  | 12.3           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **5.4×**    |
+| A3  | 17.3           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **7.4×**    |
+| A4  | 27.1           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **9.2×**    |
+| A5  | 47.1           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **10.4×**   |
+| A6  | 12.6           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **5.4×**    |
+| A7  | 17.7           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **7.4×**    |
+| A8  | 18.8           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **7.9×**    |
 | A9  | 14.4           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **9.0×**    |
 | A10 | 20.0           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **12.6×**   |
 | B1  | 21.3           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=2   | 15   | **18.6×**   |
@@ -630,6 +630,46 @@ compiler hints. Correctness: PASS (all 14 shapes, max_abs_err \< 0.002).
 | A9  | 14.4       | 14.3       | ±noise |
 
 **Commit:** iter 17 — tl.multiple_of hints + remove dead single-head kernel (no perf change)
+
+______________________________________________________________________
+
+### Iteration 18 — Adaptive HEAD_BLOCK: HB=4 for B≤16, HB=8 for B>16 (decode)
+
+**Change:** Updated `_get_mla_multihead_config` decode path to use HEAD_BLOCK=4 for `num_tokens ≤ 16`
+and HEAD_BLOCK=8 for `num_tokens > 16`.
+
+**Why HEAD_BLOCK=4 wins for small batch (A1-A8):**
+With HB=4 the decode grid for B=8 is (8, 32//4=8) = 64 programs vs (8, 32//8=4) = 32 programs
+with HB=8. The extra programs improve SM utilization without significantly hurting cache sharing
+(4 heads still share each cache load vs 8). For very small batch (B=1), the gain is in
+register/pipeline efficiency as each program handles a smaller register footprint per head-group.
+
+**Why HEAD_BLOCK=8 wins for B=32 (A9-A10):**
+Grid=(32, 4)=128 programs with HB=8 fills H100 (132 SMs) in ≈1 wave.
+Grid=(32, 8)=256 programs with HB=4 spills into 2 waves (+launch overhead) while reading
+the cache 2× more per total — a double penalty.
+
+**Benchmark (H100, HB=4 with SB=64, w=8, s=3):**
+
+| ID  | Iter 17 µs | Iter 18 µs | Delta  |
+| --- | ---------- | ---------- | ------ |
+| A1  | 8.6        | 8.5        | +1.2%  |
+| A2  | 12.4       | 12.3       | +0.8%  |
+| A3  | 17.7       | 17.3       | +2.3%  |
+| A4  | 28.5       | 27.1       | +4.9%  |
+| A5  | 49.5       | 47.1       | +4.9%  |
+| A6  | 13.7       | 12.6       | +8.0%  |
+| A7  | 18.7       | 17.7       | +5.3%  |
+| A8  | 19.2       | 18.8       | +2.1%  |
+| A9  | 14.4       | 14.4       | —      |
+| A10 | 20.0       | 20.0       | —      |
+
+Also includes sweep script cleanup: fixed `run_correctness()` to use `_mla_attention_kernel_multihead`
+(the only active kernel since iter 16), removed dead `_launch_kernel` and `bench_kernel` functions.
+
+Correctness: PASS (all 14 shapes, max_abs_err \< 0.002).
+
+**Commit:** iter 18 — adaptive HEAD_BLOCK=4/8 in decode dispatch (+1-8% A1-A8)
 
 ______________________________________________________________________
 

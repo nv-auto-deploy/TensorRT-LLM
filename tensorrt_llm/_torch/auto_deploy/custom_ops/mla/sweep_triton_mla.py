@@ -55,7 +55,6 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.mla.triton_mla import (  # noqa: E402
-    _mla_attention_kernel,
     _mla_attention_kernel_multihead,
 )
 
@@ -247,55 +246,17 @@ def reference_mla_attention(
 
 
 # ---------------------------------------------------------------------------
-# Kernel launcher wrappers (for benchmark timing isolation)
-# ---------------------------------------------------------------------------
-
-
-def _launch_kernel(
-    q_absorbed,
-    q_pe,
-    mla_cache,
-    token_slot,
-    token_kv_len,
-    out,
-    max_seq_len,
-    SEQ_BLOCK,
-    num_warps,
-    num_stages,
-):
-    """Launch _mla_attention_kernel directly with given params."""
-    num_tokens = q_absorbed.shape[0]
-    grid = (num_tokens, NUM_HEADS)
-    _mla_attention_kernel[grid](
-        q_absorbed,
-        q_pe,
-        mla_cache,
-        token_slot,
-        token_kv_len,
-        out,
-        SCALE=SCALE,
-        MAX_SEQ_LEN=max_seq_len,
-        N_HEADS=NUM_HEADS,
-        KV_LORA_RANK=KV_LORA_RANK,
-        QK_ROPE_HEAD_DIM=QK_ROPE_HEAD_DIM,
-        CACHE_DIM=CACHE_DIM,
-        KV_BLOCK=KV_BLOCK,
-        PE_BLOCK=PE_BLOCK,
-        SEQ_BLOCK=SEQ_BLOCK,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-
-
-# ---------------------------------------------------------------------------
 # Correctness check
 # ---------------------------------------------------------------------------
 
 
-def run_correctness(shapes=SHAPES, SEQ_BLOCK=8, num_warps=2, num_stages=2):
-    """Compare _mla_attention_kernel output against pure-torch reference."""
+def run_correctness(shapes=SHAPES, HEAD_BLOCK=8, SEQ_BLOCK=64, num_warps=8, num_stages=3):
+    """Compare _mla_attention_kernel_multihead output against pure-torch reference."""
     print("\n=== Correctness Check ===")
-    print(f"Config: SEQ_BLOCK={SEQ_BLOCK}, num_warps={num_warps}, num_stages={num_stages}")
+    print(
+        f"Config: HEAD_BLOCK={HEAD_BLOCK}, SEQ_BLOCK={SEQ_BLOCK}, "
+        f"num_warps={num_warps}, num_stages={num_stages}"
+    )
     header = f"{'ID':>4}  {'shape':>24}  {'max_abs_err':>12}  {'max_rel_err':>12}  {'status':>6}"
     print(header)
     print("-" * len(header))
@@ -304,18 +265,28 @@ def run_correctness(shapes=SHAPES, SEQ_BLOCK=8, num_warps=2, num_stages=2):
         q_absorbed, q_pe, mla_cache, token_slot, token_kv_len, out, max_seq_len = (
             make_kernel_inputs(num_tokens, kv_len)
         )
-
-        _launch_kernel(
+        # Use multihead kernel (the only active kernel since iter 16)
+        num_head_groups = NUM_HEADS // HEAD_BLOCK
+        grid = (num_tokens, num_head_groups)
+        _mla_attention_kernel_multihead[grid](
             q_absorbed,
             q_pe,
             mla_cache,
             token_slot,
             token_kv_len,
             out,
-            max_seq_len,
-            SEQ_BLOCK,
-            num_warps,
-            num_stages,
+            SCALE=SCALE,
+            MAX_SEQ_LEN=max_seq_len,
+            N_HEADS=NUM_HEADS,
+            KV_LORA_RANK=KV_LORA_RANK,
+            QK_ROPE_HEAD_DIM=QK_ROPE_HEAD_DIM,
+            CACHE_DIM=CACHE_DIM,
+            KV_BLOCK=KV_BLOCK,
+            PE_BLOCK=PE_BLOCK,
+            SEQ_BLOCK=SEQ_BLOCK,
+            HEAD_BLOCK=HEAD_BLOCK,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
         torch.cuda.synchronize()
 
@@ -335,36 +306,6 @@ def run_correctness(shapes=SHAPES, SEQ_BLOCK=8, num_warps=2, num_stages=2):
 # ---------------------------------------------------------------------------
 # Benchmark helpers
 # ---------------------------------------------------------------------------
-
-
-def bench_kernel(
-    num_tokens: int,
-    kv_len: int,
-    SEQ_BLOCK: int,
-    num_warps: int,
-    num_stages: int,
-    warmup: int = 25,
-    rep: int = 100,
-) -> float:
-    """Benchmark _mla_attention_kernel in isolation. Returns µs."""
-    q_absorbed, q_pe, mla_cache, token_slot, token_kv_len, out, max_seq_len = make_kernel_inputs(
-        num_tokens, kv_len
-    )
-
-    fn = lambda: _launch_kernel(  # noqa: E731
-        q_absorbed,
-        q_pe,
-        mla_cache,
-        token_slot,
-        token_kv_len,
-        out,
-        max_seq_len,
-        SEQ_BLOCK,
-        num_warps,
-        num_stages,
-    )
-    ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
-    return ms * 1e3  # ms → µs
 
 
 def bench_multihead_kernel(
@@ -415,122 +356,6 @@ def bench_multihead_kernel(
     return ms * 1e3
 
 
-def bench_decode_e2e(
-    batch_size: int,
-    kv_len: int,
-    SEQ_BLOCK: int,
-    num_warps: int,
-    num_stages: int,
-    warmup: int = 25,
-    rep: int = 100,
-) -> float:
-    """Benchmark _triton_mla_decode end-to-end. Returns µs."""
-    (q_nope, q_pe, compressed_kv, kpe, kv_b_proj, mla_cache, slot_idx, input_pos, out) = (
-        make_decode_launcher_inputs(batch_size, kv_len)
-    )
-
-    # Monkey-patch SEQ_BLOCK into the launcher by calling kernel directly
-    # (The launcher hardcodes SEQ_BLOCK=8; we override for sweep)
-    import tensorrt_llm._torch.auto_deploy.custom_ops.mla.triton_mla as _mod
-
-    _orig = _mod._mla_attention_kernel
-
-    q_nope_2d = q_nope.squeeze(1)
-    weight_reshaped = kv_b_proj.view(NUM_HEADS, QK_NOPE_HEAD_DIM + V_HEAD_DIM, KV_LORA_RANK)
-    w_k_nope = weight_reshaped[:, :QK_NOPE_HEAD_DIM, :]
-    q_absorbed = torch.einsum("bnd,ndk->bnk", q_nope_2d.float(), w_k_nope.float()).contiguous()
-    q_pe_2d = q_pe.squeeze(1).contiguous()
-    weighted_kv = torch.empty(
-        batch_size, NUM_HEADS, KV_LORA_RANK, device=DEVICE, dtype=torch.float32
-    )
-    kv_len_tensor = (input_pos + 1).to(torch.int32)
-    max_seq = mla_cache.shape[1]
-    grid = (batch_size, NUM_HEADS)
-
-    fn = lambda: _mla_attention_kernel[grid](  # noqa: E731
-        q_absorbed,
-        q_pe_2d,
-        mla_cache,
-        slot_idx,
-        kv_len_tensor,
-        weighted_kv,
-        SCALE=SCALE,
-        MAX_SEQ_LEN=max_seq,
-        N_HEADS=NUM_HEADS,
-        KV_LORA_RANK=KV_LORA_RANK,
-        QK_ROPE_HEAD_DIM=QK_ROPE_HEAD_DIM,
-        CACHE_DIM=CACHE_DIM,
-        KV_BLOCK=KV_BLOCK,
-        PE_BLOCK=PE_BLOCK,
-        SEQ_BLOCK=SEQ_BLOCK,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-    ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
-    return ms * 1e3
-
-
-def bench_prefill_e2e(
-    total_tokens: int,
-    kv_len: int,
-    SEQ_BLOCK: int,
-    num_warps: int,
-    num_stages: int,
-    warmup: int = 25,
-    rep: int = 100,
-) -> float:
-    """Benchmark the attention kernel portion of prefill. Returns µs."""
-    (
-        q_nope,
-        q_pe,
-        compressed_kv,
-        kpe,
-        kv_b_proj,
-        mla_cache,
-        input_pos,
-        slot_idx,
-        seq_len,
-        seq_start,
-        out,
-    ) = make_prefill_launcher_inputs(total_tokens, kv_len)
-
-    weight_reshaped = kv_b_proj.view(NUM_HEADS, QK_NOPE_HEAD_DIM + V_HEAD_DIM, KV_LORA_RANK)
-    w_k_nope = weight_reshaped[:, :QK_NOPE_HEAD_DIM, :]
-    q_absorbed = torch.einsum("tnd,ndk->tnk", q_nope.float(), w_k_nope.float()).contiguous()
-    q_pe_c = q_pe.contiguous()
-    weighted_kv = torch.empty(
-        total_tokens, NUM_HEADS, KV_LORA_RANK, device=DEVICE, dtype=torch.float32
-    )
-
-    # Simulate cache filled for first total_tokens positions
-    token_slots = torch.zeros(total_tokens, device=DEVICE, dtype=torch.int32)
-    token_kv_len = torch.arange(1, total_tokens + 1, device=DEVICE, dtype=torch.int32)
-    max_seq = mla_cache.shape[1]
-    grid = (total_tokens, NUM_HEADS)
-
-    fn = lambda: _mla_attention_kernel[grid](  # noqa: E731
-        q_absorbed,
-        q_pe_c,
-        mla_cache,
-        token_slots,
-        token_kv_len,
-        weighted_kv,
-        SCALE=SCALE,
-        MAX_SEQ_LEN=max_seq,
-        N_HEADS=NUM_HEADS,
-        KV_LORA_RANK=KV_LORA_RANK,
-        QK_ROPE_HEAD_DIM=QK_ROPE_HEAD_DIM,
-        CACHE_DIM=CACHE_DIM,
-        KV_BLOCK=KV_BLOCK,
-        PE_BLOCK=PE_BLOCK,
-        SEQ_BLOCK=SEQ_BLOCK,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-    ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
-    return ms * 1e3
-
-
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
@@ -544,7 +369,7 @@ def run_benchmark(
     warmup: int = 25,
     rep: int = 100,
 ) -> list:
-    """Run kernel-only benchmark for all shapes. Returns list of result dicts."""
+    """Run kernel-only benchmark for all shapes using multihead kernel. Returns list of result dicts."""
     if decode_params is None:
         decode_params = DEFAULT_DECODE_PARAMS
     if prefill_params is None:
@@ -554,11 +379,14 @@ def run_benchmark(
     for shape_id, num_tokens, kv_len, desc in shapes:
         is_prefill = shape_id.startswith("B")
         params = prefill_params if is_prefill else decode_params
+        hb = params.get("HEAD_BLOCK", 8)
+        sb = max(params["SEQ_BLOCK"], 16)  # tl.dot requires SEQ_BLOCK >= 16
         try:
-            kernel_us = bench_kernel(
+            kernel_us = bench_multihead_kernel(
                 num_tokens,
                 kv_len,
-                SEQ_BLOCK=params["SEQ_BLOCK"],
+                HEAD_BLOCK=hb,
+                SEQ_BLOCK=sb,
                 num_warps=params["num_warps"],
                 num_stages=params["num_stages"],
                 warmup=warmup,
@@ -621,10 +449,11 @@ def run_sweep(
     seq_blocks=None,
     num_warps_list=None,
     num_stages_list=None,
+    head_block: int = 8,
     warmup: int = 25,
     rep: int = 50,
 ):
-    """Sweep SEQ_BLOCK × num_warps × num_stages for all shapes."""
+    """Sweep SEQ_BLOCK × num_warps × num_stages for all shapes using multihead kernel."""
     sb_vals = seq_blocks or SWEEP_GRID["seq_block"]
     nw_vals = num_warps_list or SWEEP_GRID["num_warps"]
     ns_vals = num_stages_list or SWEEP_GRID["num_stages"]
@@ -637,9 +466,13 @@ def run_sweep(
     for i, (sb, nw, ns) in enumerate(combos):
         for shape_id, num_tokens, kv_len, desc in shapes:
             try:
-                kernel_us = bench_kernel(
+                # tl.dot requires SEQ_BLOCK >= 16
+                if sb < 16:
+                    raise ValueError(f"SEQ_BLOCK={sb} < 16 required by tl.dot")
+                kernel_us = bench_multihead_kernel(
                     num_tokens,
                     kv_len,
+                    HEAD_BLOCK=head_block,
                     SEQ_BLOCK=sb,
                     num_warps=nw,
                     num_stages=ns,
@@ -786,8 +619,10 @@ def main():
         prefill_params["num_stages"] = args.num_stages
 
     if args.correctness:
+        hb = args.head_block if args.head_block is not None else 8
         ok = run_correctness(
             SHAPES,
+            HEAD_BLOCK=hb,
             SEQ_BLOCK=decode_params["SEQ_BLOCK"],
             num_warps=decode_params["num_warps"],
             num_stages=decode_params["num_stages"],

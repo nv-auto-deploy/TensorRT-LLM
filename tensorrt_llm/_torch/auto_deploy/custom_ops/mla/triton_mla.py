@@ -55,10 +55,13 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
     """Best (SEQ_BLOCK, HEAD_BLOCK, num_warps, num_stages) for the multihead kernel.
 
     tl.dot requires SEQ_BLOCK >= 16.  HEAD_BLOCK must divide N_HEADS=32.
-    Derived from parallel warps × stages sweep on H100 80GB HBM3.
+    Derived from parallel warps × stages sweep + HEAD_BLOCK sweep on H100 80GB HBM3.
 
-    Key tuning: num_warps=8, num_stages=3 is optimal for HB=8 (decode):
-      A9: 14.2µs (vs warps=4,stages=4: 20.1µs) — +42%.
+    Decode HEAD_BLOCK selection (iter 18):
+      HB=4 wins for B≤16 (A1-A8): 1-5% faster — more programs on H100 (32×B vs 8×B
+      head-groups) without hurting cache-sharing efficiency at low batch sizes.
+      HB=8 wins for B>16 (A9-A10): 22-29% faster — at B=32, HB=4 doubles program count
+      to 256 (2 waves) while HB=8 fills H100 (132 SMs) in 1 wave.
     For HB=32 prefill, num_stages=2 avoids SMEM pressure (stages=5 OOM):
       B2=96.4µs, B3=288.5µs, B4=982.5µs.
     """
@@ -71,9 +74,12 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
         else:
             return 128, 32, 8, 2
     else:
-        # Decode (num_tokens >= 8 or max_kv_len >= 512): HB=8, SB=64, w=8, s=3
-        # num_stages=3 optimal for A9/A10: 14.2/19.9µs vs warps=4,stages=4: 20.1/32.0µs
-        return 64, 8, 8, 3
+        # HB=4 for B≤16: more SM programs without sacrificing cache sharing (A1-A8)
+        # HB=8 for B>16: ~1 full H100 wave, better cache sharing vs HB=4 (A9-A10)
+        if num_tokens <= 16:
+            return 64, 4, 8, 3
+        else:
+            return 64, 8, 8, 3
 
 
 @triton.jit
