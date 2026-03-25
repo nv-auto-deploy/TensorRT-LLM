@@ -144,18 +144,18 @@ ______________________________________________________________________
 | --- | -------------- | ----------------------------------------------- | ---- | ----------- |
 | A1  | 9.4            | SEQ_BLOCK=64, warps=4, stages=4                 | 4    | **2.2×**    |
 | A2  | 17.0           | SEQ_BLOCK=128, warps=8, stages=2                | 4    | **3.9×**    |
-| A3  | 27.8           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 12   | **4.6×**    |
-| A4  | 47.5           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 12   | **5.2×**    |
-| A5  | 85.8           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 12   | **5.7×**    |
-| A6  | 18.7           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 11   | **3.7×**    |
-| A7  | 28.4           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 11   | **4.6×**    |
-| A8  | 28.7           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 14   | **5.2×**    |
-| A9  | 20.1           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 14   | **6.5×**    |
-| A10 | 32.0           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 14   | **7.9×**    |
-| B1  | 21.4           | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 14   | **18.5×**   |
-| B2  | 101.2          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 14   | **60.4×**   |
-| B3  | 290.8          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 14   | **83.1×**   |
-| B4  | 989.9          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 14   | **97.2×**   |
+| A3  | 17.7           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **7.2×**    |
+| A4  | 28.5           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **8.7×**    |
+| A5  | 49.5           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **9.9×**    |
+| A6  | 13.7           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **5.0×**    |
+| A7  | 18.7           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **7.0×**    |
+| A8  | 19.2           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **7.8×**    |
+| A9  | 14.4           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **9.0×**    |
+| A10 | 20.0           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **12.6×**   |
+| B1  | 21.3           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=2   | 15   | **18.6×**   |
+| B2  | 96.9           | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2 | 15   | **63.0×**   |
+| B3  | 289.1          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2 | 15   | **83.6×**   |
+| B4  | 980.7          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2 | 15   | **98.1×**   |
 
 ______________________________________________________________________
 
@@ -532,6 +532,53 @@ precision is unchanged. The redundant `.to(q_nope.dtype)` call was removed from 
 Correctness: PASS (max_abs_err \< 0.002 across all 14 shapes).
 
 **Commit:** iter 14 — weighted_kv as bf16 (halve write BW, +0.4-2.4% across shapes)
+
+______________________________________________________________________
+
+### Iteration 15 — Warps=8, stages=3/2 from comprehensive parallel sweep
+
+**Change:** Updated `_get_mla_multihead_config` based on an 8-GPU parallel sweep over all
+`(SEQ_BLOCK, num_warps, num_stages)` combinations for both HEAD_BLOCK=8 and HEAD_BLOCK=32.
+
+Key findings from the sweep (150 configs × 14 shapes):
+
+- `num_warps=8` universally best for both HB=8 and HB=32 (more warp-level parallelism fills pipeline)
+- Decode HB=8: `stages=3` optimal (A9: 14.2µs vs warps=4,stages=4: 20.1µs — **+42%**)
+- Prefill HB=32 SB=128: `stages=2` safest and best (stages=5 OOMs: needs 356 KB > H100's 232 KB SMEM limit)
+- Prefill HB=8 SB=64 T≤128: `stages=2` (simpler; minor SMEM reduction)
+
+Updated config function:
+
+```python
+if is_prefill:
+    if num_tokens <= 128:
+        return 64, 8, 8, 2   # HB=8, SB=64, w=8, s=2
+    else:
+        return 128, 32, 8, 2  # HB=32, SB=128, w=8, s=2  (stages=5 would OOM)
+else:
+    return 64, 8, 8, 3        # HB=8, SB=64, w=8, s=3  (stages=3 > stages=4)
+```
+
+**Benchmark (H100, with iter 14 as base):**
+
+| ID  | Iter 14 µs | Iter 15 µs | Delta   |
+| --- | ---------- | ---------- | ------- |
+| A3  | 26.5       | 17.7       | +33%    |
+| A4  | 42.8       | 28.5       | +33%    |
+| A5  | 72.6       | 49.5       | +32%    |
+| A6  | 19.2       | 13.7       | +29%    |
+| A7  | 28.1       | 18.7       | +33%    |
+| A8  | 28.7       | 19.2       | +33%    |
+| A9  | 20.1       | 14.4       | +28%    |
+| A10 | 32.0       | 20.0       | +38%    |
+| B1  | 25.6       | 21.3       | +17%    |
+| B2  | 101.2      | 96.9       | +4.3%   |
+| B3  | 290.8      | 289.1      | +0.6%   |
+| B4  | 989.9      | 980.7      | +0.9%   |
+
+Correctness: PASS (max_abs_err \< 0.002 across all 14 shapes).
+
+**Commit:** iter 15 — warps=8, stages=3(decode)/2(prefill) from comprehensive sweep (+28-42% A-shapes)
 
 ______________________________________________________________________
 

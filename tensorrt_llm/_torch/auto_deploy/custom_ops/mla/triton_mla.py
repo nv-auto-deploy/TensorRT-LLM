@@ -92,24 +92,25 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
     """Best (SEQ_BLOCK, HEAD_BLOCK, num_warps, num_stages) for the multihead kernel.
 
     tl.dot requires SEQ_BLOCK >= 16.  HEAD_BLOCK must divide N_HEADS=32.
-    Derived from parallel HB×SEQ_BLOCK sweep on H100 80GB HBM3.
+    Derived from parallel warps × stages sweep on H100 80GB HBM3.
 
-    Key finding: SB=64 reduces inner-loop iterations (kv_len/64 vs kv_len/16) and
-    substantially improves latency vs SB=16 for all shapes. HB=32 is best for
-    large prefill (maximises cache sharing and tensor-core utilisation).
+    Key tuning: num_warps=8, num_stages=3 is optimal for HB=8 (decode):
+      A9: 14.2µs (vs warps=4,stages=4: 20.1µs) — +42%.
+    For HB=32 prefill, num_stages=2 avoids SMEM pressure (stages=5 OOM):
+      B2=96.4µs, B3=288.5µs, B4=982.5µs.
     """
     if is_prefill:
-        # B1 T≤128: HB=8, SB=64 → 20.8µs
-        # B2-B4 T>128: HB=32, SB=128 → 103.5/296.5/993.9µs (vs SB=64: 107/323/1076µs)
-        # SB=128 gains grow with sequence length: B2=+3%, B3=+8%, B4=+8%.
+        # B1 T≤128: HB=8, SB=64, w=8, s=2 → 21.3µs
+        # B2-B4 T>128: HB=32, SB=128, w=8, s=2 → 96.4/288.5/982.5µs
+        # stages=5 OOM for HB=32 SB=128 (SMEM overflow); stages=2 best.
         if num_tokens <= 128:
-            return 64, 8, 4, 4
+            return 64, 8, 8, 2
         else:
-            return 128, 32, 8, 4
+            return 128, 32, 8, 2
     else:
-        # Decode: num_tokens >= 16 uses multihead.
-        # HB=8, SB=64 beats HB=4, SB=16 for A8-A10: 29.7/20.4/32.6µs vs 53.4/32.5/56.0µs
-        return 64, 8, 4, 4
+        # Decode (num_tokens >= 8 or max_kv_len >= 512): HB=8, SB=64, w=8, s=3
+        # num_stages=3 optimal for A9/A10: 14.2/19.9µs vs warps=4,stages=4: 20.1/32.0µs
+        return 64, 8, 8, 3
 
 
 @triton.jit
