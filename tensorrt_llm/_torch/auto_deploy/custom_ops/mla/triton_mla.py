@@ -531,7 +531,13 @@ def _triton_mla_decode(
 
     # Dispatch: split-K for small-batch long-context (fills more H100 SMs),
     # standard multihead otherwise.
-    max_kv_len = int(kv_len.max().item())
+    # Use mla_cache.shape[1] (max_seq_len) as a static upper bound for dispatch
+    # decisions — avoids the illegal D2H sync (kv_len.max().item()) inside a
+    # torch.cuda.graph capture context (iter 52: CUDA graph compatibility fix).
+    # Correctness is unaffected: per-token kv_len passed to the kernel handles
+    # causal masking; extra partitions with all-masked positions produce l_i=0
+    # which the reduce kernel absorbs correctly.
+    max_kv_len = mla_cache.shape[1]
     seq_block, head_block, nw, ns = _get_mla_multihead_config(
         b, is_prefill=False, max_kv_len=max_kv_len
     )

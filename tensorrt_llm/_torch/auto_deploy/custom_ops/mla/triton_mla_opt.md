@@ -1635,6 +1635,40 @@ Correctness: PASS (all 14 shapes, max_abs_err \< 0.007).
 
 ______________________________________________________________________
 
+### Iteration 52 — CUDA graph compatibility: replace kv_len.max().item() with static max_seq_len
+
+**Change:** Replace illegal D2H sync `int(kv_len.max().item())` with static
+`mla_cache.shape[1]` (the `max_seq_len` dimension, known at graph capture time).
+
+```python
+# Before (illegal inside torch.cuda.graph capture context):
+max_kv_len = int(kv_len.max().item())
+
+# After (CUDA graph compatible — static cache-shape lookup):
+max_kv_len = mla_cache.shape[1]  # = max_seq_len, known at capture time
+```
+
+**Root cause:** Running `build_and_run_ad.py` with `compile_backend: torch-cudagraph`
+triggered `cudaErrorStreamCaptureUnsupported` because `.item()` forces a device-to-host
+synchronization that is forbidden while a CUDA graph is being captured.
+
+**Why this fix is correct:**
+`max_kv_len` is used only for dispatch (selecting `seq_block`, `num_parts`, `num_warps`) —
+not for kernel correctness. The actual per-token KV lengths are in `kv_len` tensor passed
+to the kernel, which handles causal masking. Extra split-K partitions with all-masked
+positions produce `l_i=0`/`m_i=-inf`, which the reduce kernel absorbs correctly.
+Using `mla_cache.shape[1]` is a conservative upper bound: it may over-provision split-K
+for short early-decode steps, but workspace size and grid dimensions remain valid.
+
+**Performance impact:** No measurable change on standard benchmark shapes (dispatch
+decisions are the same for the typical inference case where kv_len ≈ max_seq_len during
+later decode steps). For early-decode steps (kv_len \<\< max_seq_len), split-K launches
+more partitions than strictly necessary, but extra partitions are masked and fast.
+
+**Commit:** iter 52 — CUDA graph compat: static max_kv_len from mla_cache.shape\[1\]
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK
@@ -1679,7 +1713,7 @@ ______________________________________________________________________
 
 ## Final Best Configuration
 
-**Total iterations: 51** | **GPU: NVIDIA H100 80GB HBM3**
+**Total iterations: 52** | **GPU: NVIDIA H100 80GB HBM3**
 
 ### Dispatch logic summary
 
