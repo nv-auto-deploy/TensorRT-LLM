@@ -1003,6 +1003,34 @@ Correctness: PASS (all 14 shapes).
 
 ______________________________________________________________________
 
+### Iteration 30 — Split-K stages=4 for SB=64 path \[NO IMPROVEMENT / OOM\]
+
+**Change:** Benchmark-only; no code change.
+
+Hypothesis: With SB=64, SMEM usage = (stages-1) × (64×256 + 64×64) × 2 bytes.
+For stages=4: SMEM = 3 × (16384 + 4096) × 2 = 122 880 bytes — well within H100's
+232 448-byte limit. Might improve pipeline fill for split-K partitions.
+
+**Results:**
+
+| ID  | kv   | NP | SB  | stages=3 µs | stages=4 µs | Winner   |
+| --- | ---- | -- | --- | ----------- | ----------- | -------- |
+| A3  | 512  | 8  | 64  | **10.8**    | 10.8        | tie      |
+| A4  | 1024 | 16 | 64  | **11.4**    | 11.4        | tie      |
+| A5  | 2048 | 16 | 128 | **12.7**    | OOM         | stages=3 |
+
+- A3/A4 (SB=64): stages=4 ties stages=3 exactly — no pipeline benefit from the extra
+  prefetch stage. Each partition already only processes a handful of blocks; the inner
+  loop is short enough that extra pipelining adds no latency hiding.
+- A5 (SB=128, NP=16): stages=4 triggers `OutOfResources` —
+  SMEM required = 3 × (128×256 + 128×64) × 2 = 245 760 bytes > 232 448 limit.
+
+**Conclusion:** Keep `num_stages=3` for all split-K shapes. No code change.
+
+**Commit:** iter 30 — split-K stages=4 sweep \[NO IMPROVEMENT / OOM\]
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK \[HIGHEST PRIORITY\]
