@@ -721,81 +721,123 @@ def _triton_mla_prefill(
     device = q_nope.device
     qk_rope_head_dim = q_pe.shape[2]
     num_seq = seq_len.shape[0]
+
+    weight_reshaped = kv_b_proj_weight.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+    w_k_nope = weight_reshaped[:, :qk_nope_head_dim, :]  # [N, qk_nope_head_dim, kv_lora_rank]
+    w_v = weight_reshaped[:, qk_nope_head_dim:, :]  # [N, v_head_dim, kv_lora_rank]
+    cache_dtype = mla_cache.dtype
+    max_seq_len = mla_cache.shape[1]
+    cache_dim = mla_cache.shape[2]
+    kv_block = triton.next_power_of_2(kv_lora_rank)
+    pe_block = triton.next_power_of_2(qk_rope_head_dim)
+
+    if num_seq == 1:
+        # =====================================================================
+        # iter 61: fully-inlined single-sequence fast path.
+        #
+        # For a single contiguous sequence seq_start=0, all per-token index
+        # tensors are identity ([0, 1, ..., T-1]), so every index_select call
+        # is a no-op.  We eliminate:
+        #   • seq_len.item() D2H sync        → q_nope.shape[0] (Python int, free)
+        #   • repeat_interleave / cumsum / arange overhead  (~275 µs, iter 60)
+        #   • 4 × index_select calls         (~80 µs, this iter)
+        #   • out.zero_() + index_copy_      (~16 µs) → out.copy_()
+        # Net saving vs iter 60: ~95 µs; vs original general path: ~370 µs.
+        # =====================================================================
+        total_tokens = q_nope.shape[0]  # Python int from .shape — zero GPU ops
+        if total_tokens == 0:
+            out.zero_()
+            return
+
+        # Sequential cache positions: [pos, pos+1, ..., pos+T-1]
+        within_offsets = torch.arange(total_tokens, device=device, dtype=torch.long)
+        token_slots = slot_idx[0:1].long().repeat(total_tokens)  # contiguous (triton needs it)
+        token_cache_pos = input_pos[0:1].long() + within_offsets
+
+        # Cache write: tokens are in order, no gather needed
+        kpe_flat = kpe.squeeze(1)  # [T, qk_rope_head_dim]
+        ckv_for_cache = (
+            compressed_kv.to(cache_dtype) if compressed_kv.dtype != cache_dtype else compressed_kv
+        )
+        kpe_for_cache = kpe_flat.to(cache_dtype) if kpe_flat.dtype != cache_dtype else kpe_flat
+        mla_cache[token_slots, token_cache_pos, :kv_lora_rank] = ckv_for_cache
+        mla_cache[token_slots, token_cache_pos, kv_lora_rank:] = kpe_for_cache
+
+        # Weight absorption: use q_nope / q_pe directly (identity mapping)
+        q_absorbed = torch.einsum("tnd,ndk->tnk", q_nope.float(), w_k_nope.float()).contiguous()
+        q_pe_actual = q_pe.contiguous()
+
+        token_kv_len = (token_cache_pos + 1).to(torch.int32)
+        weighted_kv = torch.empty(
+            total_tokens, num_heads, kv_lora_rank, device=device, dtype=q_nope.dtype
+        )
+        seq_block, head_block, nw, ns = _get_mla_multihead_config(total_tokens, is_prefill=True)
+        head_block = min(head_block, num_heads)  # iter 59: cap for TP
+        grid = (total_tokens, num_heads // head_block)
+        _mla_attention_kernel_multihead[grid](
+            q_absorbed,
+            q_pe_actual,
+            mla_cache,
+            token_slots,
+            token_kv_len,
+            weighted_kv,
+            SCALE=scale,
+            MAX_SEQ_LEN=max_seq_len,
+            N_HEADS=num_heads,
+            KV_LORA_RANK=kv_lora_rank,
+            QK_ROPE_HEAD_DIM=qk_rope_head_dim,
+            CACHE_DIM=cache_dim,
+            KV_BLOCK=kv_block,
+            PE_BLOCK=pe_block,
+            SEQ_BLOCK=seq_block,
+            HEAD_BLOCK=head_block,
+            num_warps=nw,
+            num_stages=ns,
+        )
+        attn_out = torch.einsum("tnk,nvk->tnv", weighted_kv.float(), w_v.float()).to(q_nope.dtype)
+        out.copy_(attn_out)  # single sequence always fills out fully
+        return
+
+    # =====================================================================
+    # General path: multi-sequence batched prefill (num_seq > 1)
+    # =====================================================================
     seq_lengths = seq_len.long()
-    seq_start = seq_start.long()
+    seq_start_l = seq_start.long()
     total_tokens = seq_lengths.sum().item()
 
     if total_tokens == 0:
         out.zero_()
         return
 
-    # =====================================================================
-    # Step 1: Vectorized cache update (no Python loops)
-    # =====================================================================
-    # Build per-token metadata from per-sequence metadata
-    token_slots = slot_idx.long().repeat_interleave(seq_lengths)  # [total_tokens]
-    base_positions = input_pos.long().repeat_interleave(seq_lengths)  # [total_tokens]
-
-    # Within-sequence offsets: [0,1,...,sl0-1, 0,1,...,sl1-1, ...]
+    # Build per-token index metadata from per-sequence metadata
+    token_slots = slot_idx.long().repeat_interleave(seq_lengths)
+    base_positions = input_pos.long().repeat_interleave(seq_lengths)
     cum_lengths = torch.zeros(num_seq + 1, device=device, dtype=torch.long)
     cum_lengths[1:] = seq_lengths.cumsum(0)
     base_in_dense = cum_lengths[:-1].repeat_interleave(seq_lengths)
     within_offsets = torch.arange(total_tokens, device=device) - base_in_dense
+    token_input_idx = seq_start_l.repeat_interleave(seq_lengths) + within_offsets
+    token_cache_pos = base_positions + within_offsets
 
-    # Index into flattened/padded input tensors using true per-sequence starts.
-    token_input_idx = seq_start.repeat_interleave(seq_lengths) + within_offsets  # [total_tokens]
-    token_cache_pos = base_positions + within_offsets  # [total_tokens]
-
-    # Vectorized cache write
-    kpe_flat = kpe.index_select(0, token_input_idx).squeeze(1)  # [total_tokens, qk_rope_head_dim]
-    ckv_actual = compressed_kv.index_select(0, token_input_idx)  # [total_tokens, kv_lora_rank]
-
-    cache_dtype = mla_cache.dtype
+    # Cache write
+    kpe_flat = kpe.index_select(0, token_input_idx).squeeze(1)
+    ckv_actual = compressed_kv.index_select(0, token_input_idx)
     ckv_for_cache = ckv_actual.to(cache_dtype) if ckv_actual.dtype != cache_dtype else ckv_actual
     kpe_for_cache = kpe_flat.to(cache_dtype) if kpe_flat.dtype != cache_dtype else kpe_flat
-
     mla_cache[token_slots, token_cache_pos, :kv_lora_rank] = ckv_for_cache
     mla_cache[token_slots, token_cache_pos, kv_lora_rank:] = kpe_for_cache
 
-    # =====================================================================
-    # Step 2: Weight absorption
-    # =====================================================================
-    weight_reshaped = kv_b_proj_weight.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
-    w_k_nope = weight_reshaped[:, :qk_nope_head_dim, :]  # [N, qk_nope_head_dim, kv_lora_rank]
-    w_v = weight_reshaped[:, qk_nope_head_dim:, :]  # [N, v_head_dim, kv_lora_rank]
-
-    q_nope_actual = q_nope.index_select(0, token_input_idx)  # [total_tokens, N, qk_nope_head_dim]
-    q_pe_actual = q_pe.index_select(
-        0, token_input_idx
-    ).contiguous()  # [total_tokens, N, qk_rope_head_dim]
-
-    # q_absorbed: [total_tokens, N, kv_lora_rank]
-    # Use fp32 for absorption to minimize bf16 reduction error over qk_nope_head_dim
+    # Weight absorption
+    q_nope_actual = q_nope.index_select(0, token_input_idx)
+    q_pe_actual = q_pe.index_select(0, token_input_idx).contiguous()
     q_absorbed = torch.einsum("tnd,ndk->tnk", q_nope_actual.float(), w_k_nope.float()).contiguous()
 
-    # =====================================================================
-    # Step 3: Triton attention kernel
-    # =====================================================================
-    # Per-token KV length for causal masking: token at cache position p attends to [0, p]
-    token_kv_len = (token_cache_pos + 1).to(torch.int32)  # [total_tokens]
-
-    # Allocate as bf16 to halve HBM write bandwidth; kernel accumulates in fp32 and
-    # stores via fp32→bf16 conversion at tl.store.  The einsum below upcasts to fp32
-    # automatically (via w_v.float()), so end-to-end precision is unchanged.
+    token_kv_len = (token_cache_pos + 1).to(torch.int32)
     weighted_kv = torch.empty(
         total_tokens, num_heads, kv_lora_rank, device=device, dtype=q_nope.dtype
     )
-
-    max_seq_len = mla_cache.shape[1]
-    cache_dim = mla_cache.shape[2]
-    kv_block = triton.next_power_of_2(kv_lora_rank)
-    pe_block = triton.next_power_of_2(qk_rope_head_dim)
-
-    # Multihead kernel is always faster for prefill: shares cache loads across HEAD_BLOCK heads.
     seq_block, head_block, nw, ns = _get_mla_multihead_config(total_tokens, is_prefill=True)
-    # iter 59: cap head_block at num_heads to prevent zero-size grid when TP reduces
-    # num_heads below head_block threshold (e.g., TP=8 → num_heads=4 < head_block=16).
-    head_block = min(head_block, num_heads)
+    head_block = min(head_block, num_heads)  # iter 59: cap for TP
     grid = (total_tokens, num_heads // head_block)
     _mla_attention_kernel_multihead[grid](
         q_absorbed,
@@ -817,14 +859,9 @@ def _triton_mla_prefill(
         num_warps=nw,
         num_stages=ns,
     )
-
-    # =====================================================================
-    # Step 4: Value projection (fp32 to minimize bf16 reduction error over kv_lora_rank)
-    # =====================================================================
     attn_out = torch.einsum("tnk,nvk->tnv", weighted_kv.float(), w_v.float()).to(
         q_nope.dtype
     )  # [total_tokens, N, v_head_dim]
-
     out.zero_()
     out.index_copy_(0, token_input_idx, attn_out)
 

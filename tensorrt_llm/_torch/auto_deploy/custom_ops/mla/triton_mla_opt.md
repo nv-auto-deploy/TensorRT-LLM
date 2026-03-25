@@ -1912,6 +1912,67 @@ For the TP=8 case, performance is secondary to correctness. For the non-TP case
 
 ______________________________________________________________________
 
+### Iter 60 — Single-sequence prefill fast path (eliminate repeat_interleave overhead)
+
+**Change:** Added `if num_seq == 1` fast path in `_triton_mla_prefill` that replaces the
+general-purpose `repeat_interleave` / `cumsum` / `arange` index-building code with a
+direct `torch.arange(total_tokens)` call.
+
+**Root cause of overhead:** The general path launches ~15 tiny GPU kernels
+(`repeat_interleave x4`, `cumsum`, `zeros`, `arange`, arithmetic ops) to build per-token
+index tensors for multi-sequence batching. For a single sequence, all of these reduce to
+a trivial identity mapping. This overhead was ~275 µs flat regardless of T — the dominant
+cost for T ≤ 512 prefill, where it exceeded the actual attention kernel time by ~10×.
+
+**Result (vs original general path):**
+
+| ID | T | before µs | after µs | saving |
+| --- | --- | --- | --- | --- |
+| B1 | 128 | 568 | 313 | −255 µs |
+| B2 | 512 | 573 | 329 | −244 µs |
+
+Still slightly slower than torch_backend (277/327 µs) due to remaining index_select calls.
+
+**Commit:** iter 60 — prefill single-seq fast path: replace repeat_interleave with arange
+
+______________________________________________________________________
+
+### Iter 61 — Eliminate identity index_select in single-sequence fast path
+
+**Change:** Fully inlined the `num_seq == 1` fast path to also skip the 4 `index_select`
+calls (kpe, ckv, q_nope, q_pe), the `out.zero_()` + `out.index_copy_()` output scatter,
+and the `seq_len[0].item()` D2H sync. Used `q_nope.shape[0]` (Python int, free) for
+`total_tokens` and `out.copy_(attn_out)` for the output write.
+
+**Why index_select is a no-op for single-sequence:** With `num_seq=1` and `seq_start=0`,
+`token_input_idx = [0, 1, ..., T-1]` — a perfect identity permutation. Every
+`tensor.index_select(0, token_input_idx)` is equivalent to the tensor itself.
+
+**Additional savings:**
+
+| Op eliminated | Saving |
+| --- | --- |
+| `seq_len[0].item()` D2H sync | ~20 µs |
+| 4 × `index_select` | ~80 µs |
+| `out.zero_()` + `index_copy_()` → `out.copy_()` | ~16 µs |
+| Total additional | ~116 µs |
+
+**Result (triton iter61 vs torch_backend):**
+
+| ID | T | triton µs | torch µs | speedup |
+| --- | --- | --- | --- | --- |
+| B1 | 128 | 146 | 277 | **1.89×** |
+| B2 | 512 | 163 | 328 | **2.01×** |
+| B3 | 1024 | 303 | 708 | **2.34×** |
+| B4 | 2048 | 690 | 2140 | **3.10×** |
+
+Triton now beats torch_backend at ALL prefill sizes (previously lost at T ≤ 512).
+Correctness: PASS (T=1 through T=2048, cache_err=0.0).
+
+**Commit:** iter 61 — prefill fast path: eliminate identity index_select + D2H sync
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK
