@@ -1133,6 +1133,45 @@ A3/A4 unaffected (warps=8 used for kv≤1024). Updated `sweep_triton_mla.py`.
 
 ______________________________________________________________________
 
+### Iteration 34 — Batch-size threshold + NP sweep analysis \[NO CODE CHANGE\]
+
+**Change:** Benchmark-only; verifies existing thresholds and explores new ones.
+
+**Exp A — Split-K vs multihead across batch sizes (kv=512):**
+
+| T  | multihead µs | split-K NP=8 µs | Winner | Delta  |
+| -- | ------------ | --------------- | ------ | ------ |
+| 1  | 15.4         | **11.4**        | SK     | +25.7% |
+| 2  | 15.5         | **11.2**        | SK     | +27.8% |
+| 4  | 16.0         | **12.6**        | SK     | +21.3% |
+| 8  | 16.6         | 16.9            | MH     | −1.7%  |
+
+T=1,2,4 all benefit — current `b <= 4` threshold correctly covers these.
+T=8 is a tie; split-K overhead marginally harms. Threshold confirmed correct.
+
+**Exp B — NP sweep for A3 (T=1, kv=512, SB=64):**
+
+| NP | µs        |
+| -- | --------- |
+| 4  | 12.43     |
+| 6  | 12.36     |
+| 8  | **11.43** |
+| 12 | 11.66     |
+| 16 | 11.55     |
+
+NP=8 is optimal: kv/SB = 512/64 = 8 blocks, NP=8 → 1 block/partition (100%
+utilization). Over/under-partitioning both lose. Current NP=8 confirmed optimal.
+
+**Exp C — Split-K for A7 (T=8, kv=512) NP=4:**
+SK NP=4 = 15.3µs vs multihead = 16.6µs in this test. But current best is 15.4µs
+(multihead HB=4 SB=128, iter 21) — within measurement variance. No reliable gain.
+
+**Conclusion:** All existing thresholds confirmed optimal. No code change.
+
+**Commit:** iter 34 — batch-size threshold + NP sweep analysis \[confirmed optimal\]
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK \[HIGHEST PRIORITY\]
