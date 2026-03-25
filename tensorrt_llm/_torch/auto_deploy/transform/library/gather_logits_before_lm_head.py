@@ -27,8 +27,20 @@ from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.utils._graph import get_lm_head_node
 
-from ...utils.node_utils import is_linear_op
+from ...utils.node_utils import is_linear_op, is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+
+
+def _is_all_gather_op(node) -> bool:
+    """Return True if node is a dist AllGather op wrapping a sharded LM head."""
+    if not hasattr(node, "target"):
+        return False
+    ns = getattr(torch.ops, "auto_deploy", None)
+    for name in ("trtllm_dist_all_gather", "torch_dist_all_gather"):
+        op_packet = getattr(ns, name, None) if ns is not None else None
+        if op_packet is not None and is_op(node, op_packet):
+            return True
+    return False
 
 
 @TransformRegistry.register("gather_logits_before_lm_head")
@@ -44,6 +56,15 @@ class GatherLogitsBeforeLmHeadTransform(BaseTransform):
     - Eliminates Python loop overhead
     - Enables CUDA graph capture of the gather
     - Moves gather into the graph for better optimization
+
+    When detect_sharding adds a dist AllGather after the LM head (e.g., column-parallel
+    vocab sharding via simple_shard_filter), get_lm_head_node returns the AllGather node
+    instead of the GEMM. This transform looks through that AllGather to find the actual
+    LM head GEMM so that gather is placed on the hidden-state input rather than on the
+    already-gathered logits. Gathering before the GEMM means:
+      - Mixed batches only run the LM head on the tokens that actually need logits
+        (e.g., last prefill token + all decode tokens) instead of all context tokens.
+      - The subsequent AllGather operates on the reduced set of tokens.
     """
 
     def _apply(
@@ -57,6 +78,16 @@ class GatherLogitsBeforeLmHeadTransform(BaseTransform):
 
         # assume lm head node is the input to the output node
         lm_head_node = get_lm_head_node(gm)
+
+        # When detect_sharding wraps the LM head with a column-parallel AllGather
+        # (simple_shard_filter: "lm_head"), get_lm_head_node returns the AllGather op.
+        # Look through it to find the actual LM head GEMM so we gather before the GEMM.
+        if _is_all_gather_op(lm_head_node):
+            self._log_info(
+                f"LM head node is AllGather ({lm_head_node.name}); "
+                "looking through it to find the actual LM head GEMM."
+            )
+            lm_head_node = lm_head_node.all_input_nodes[0]
 
         if is_linear_op(lm_head_node):
             node_to_gather = lm_head_node.all_input_nodes[0]
