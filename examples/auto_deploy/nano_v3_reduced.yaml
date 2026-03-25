@@ -32,7 +32,7 @@ transforms:
         "fc2_latent_proj": "gather"
   multi_stream_moe:
     stage: compile
-    enabled: true
+    enabled: true  # iter36: disabling regressed TPOT +3.5% (2.154→2.229ms); shared+routed expert overlap at c=1 is genuine
   gather_logits_before_lm_head:
     enabled: true
   fuse_mamba_a_log:
