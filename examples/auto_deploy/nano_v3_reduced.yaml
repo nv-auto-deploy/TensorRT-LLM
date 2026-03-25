@@ -3,7 +3,7 @@ compile_backend: torch-cudagraph
 max_batch_size: 384
 max_seq_len: 65536 # tunable
 enable_chunked_prefill: true
-attn_backend: trtllm
+attn_backend: trtllm  # iter34: FlashInfer decode attention regressed TPOT +4% and TTFT@c256 +31%; trtllm is faster
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
 cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]

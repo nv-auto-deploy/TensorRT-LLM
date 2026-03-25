@@ -36,3 +36,4 @@ iter	commit	primary_metric	ttft_avg_ms	tpot_avg_ms	tps	correctness	status	descri
 33	c30bf03a89	0.000	0.00	0.000	0.0	-	crash	fuse_rmsnorm_quant_fp8 FlashInfer adaptive (rmsnorm_quant): CUDA graph capture crash — scale.item() inside rmsnorm_quant path triggers D2H sync (cudaMemcpy) which is forbidden during stream capture
 33b	c30bf03a89	0.000	0.00	0.000	0.0	-	crash	same commit as iter33 — simplified out_bf16 to empty (dead code); still crashes on scale.item() during CUDA graph capture (same root cause)
 33c	26c9320cb1	2.245	46.9	2.245	11700	760	discard	fix CUDA graph crash (tl.load scale_ptr); 3-kernel FlashInfer path regresses TPOT avg +4.2% (2.154→2.245ms), TTFT p5 2x worse (353→760ms); separate quant+GEMM slower than fused; disabled fuse_rmsnorm_quant_fp8
+34	-	2.263	46.19	2.263	-	-	discard	attn_backend flashinfer: TPOT +4.0% (2.154→2.263ms), TTFT@c256 +30.8% (4235ms vs trtllm 3238ms); FlashInfer decode attention slower than trtllm kernel_mha; reverted to trtllm
