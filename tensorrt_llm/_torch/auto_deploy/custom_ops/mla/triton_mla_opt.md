@@ -143,10 +143,10 @@ ______________________________________________________________________
 | ID  | Best kernel µs | Config                                               | Iter | vs Baseline |
 | --- | -------------- | ---------------------------------------------------- | ---- | ----------- |
 | A1  | 8.5            | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3       | 18   | **2.5×**    |
-| A2  | 10.8           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **6.2×**    |
+| A2  | 10.66          | split-K NP=4, HB=4, SB=64, warps=8, stgs=3         | 32   | **6.5×**    |
 | A3  | 11.0           | split-K NP=8, HB=4, SB=64, warps=8, stgs=3         | 29   | **11.5×**   |
 | A4  | 11.8           | split-K NP=16, HB=4, SB=64, warps=8, stgs=3        | 29   | **21.1×**   |
-| A5  | 13.2           | split-K NP=16, HB=4, SB=128, warps=8, stgs=3       | 29   | **37.2×**   |
+| A5  | 12.75          | split-K NP=16, HB=4, SB=128, warps=4, stgs=3       | 33   | **38.5×**   |
 | A6  | 11.9           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **5.8×**    |
 | A7  | 15.4           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **8.5×**    |
 | A8  | 16.0           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **9.3×**    |
@@ -1060,6 +1060,76 @@ Also discovered: A2 (kv=256, T=1) with split-K NP=4 SB=64 = **10.3µs**
 vs current best 10.8µs (multihead) — 4.7% improvement. Deferred to iter 32.
 
 **Commit:** iter 31 — split-K warps/HB sweep \[MIXED: warps adaptive + A2 split-K planned\]
+
+______________________________________________________________________
+
+### Iteration 32 — Enable split-K for A2 (kv=256, NP=4): +8-9% improvement
+
+**Change:** Extended split-K dispatch threshold from `max_kv_len >= 512` to
+`max_kv_len >= 256`. Added `NP=4` case:
+
+```python
+use_splitk = b <= 4 and max_kv_len >= 256
+if use_splitk:
+    if max_kv_len <= 256:
+        num_parts = 4
+    elif max_kv_len <= 512:
+        num_parts = 8
+    else:
+        num_parts = 16
+```
+
+**Why NP=4 helps for kv=256:** kv=256 with SB=64 gives `total_blocks=4`. NP=4
+assigns 1 block per partition — 100% utilization. Grid=(1,8,4)=32 programs → 24%
+SM utilization vs HB=4 multihead's 8 programs (6%). 4× more SM parallelism fills
+idle HBM latency slots.
+
+**Benchmark (3 runs each):**
+
+| ID  | multihead µs | split-K NP=4 µs | Delta  |
+| --- | ------------ | --------------- | ------ |
+| A2  | 11.65        | **10.66**       | +8.5%  |
+
+Correctness: PASS (max_abs_err \< 0.004). Updated `sweep_triton_mla.py`.
+
+**Current Best Update:**
+
+| ID  | Best µs | Config                                          | Iter | vs Baseline |
+| --- | ------- | ----------------------------------------------- | ---- | ----------- |
+| A2  | 10.66   | split-K NP=4, HB=4, SB=64, warps=8, stgs=3     | 32   | **6.5×**    |
+
+**Commit:** iter 32 — enable split-K for A2 (kv=256, NP=4, +8-9%)
+
+______________________________________________________________________
+
+### Iteration 33 — Adaptive warps=4 for long-context split-K (kv>1024): +2% A5
+
+**Change:** Added `nw` selection in `_triton_mla_decode` split-K path:
+
+```python
+nw = 4 if max_kv_len > 1024 else 8
+```
+
+**Why warps=4 wins at kv=2048:** With SB=128, NP=16, each partition handles 1 block
+of 128 positions. Working set = \[HB=4, SB=128\] = 512 elements. Fewer warps (128
+threads vs 256) reduces register pressure — better occupancy hides HBM latency.
+warps=8 remains optimal for shorter kv (A2-A4) where pipeline fill is the bottleneck.
+
+**Benchmark (3 runs each):**
+
+| ID  | warps=8 µs | warps=4 µs | Delta |
+| --- | ---------- | ---------- | ----- |
+| A5  | 13.0       | **12.75**  | +2.0% |
+
+A3/A4 unaffected (warps=8 used for kv≤1024). Updated `sweep_triton_mla.py`.
+
+**Current Best Update:**
+
+| ID  | Best µs | Config                                           | Iter | vs Baseline |
+| --- | ------- | ------------------------------------------------ | ---- | ----------- |
+| A5  | 12.75   | split-K NP=16, HB=4, SB=128, warps=4, stgs=3    | 33   | **38.5×**   |
+
+**Commit:** iter 33 — adaptive warps=4 for long-context split-K (+2% A5)
 
 ______________________________________________________________________
 

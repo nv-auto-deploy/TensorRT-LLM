@@ -68,6 +68,8 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool, max_kv_len: int
       SB=64 when max_kv_len ≤ 64: avoids wasted threads from masked-out blocks.
     For HB=32 prefill, num_stages=2 avoids SMEM pressure (stages=5 OOM):
       B2=96.4µs, B3=288.5µs, B4=982.5µs.
+
+    Note: split-K path overrides nw based on max_kv_len in the dispatch function.
     """
     if is_prefill:
         # B1 T≤128: HB=16, SB=64, w=8, s=2 → 19.6µs (vs HB=8: 21.3µs, +8%)
@@ -527,16 +529,26 @@ def _triton_mla_decode(
         b, is_prefill=False, max_kv_len=max_kv_len
     )
 
-    # Split-K: for b≤4 with kv≥512, partition kv blocks to fill more H100 SMs.
-    # T=1, HB=4: grid=(1,8)=8 programs (6% SM utilization).
-    # Adaptive NUM_PARTS (iter 29): NP=8 for kv≤512 (grid=64 programs, 48% SM),
-    #   NP=16 for kv>512 (grid=128 programs, ~97% SM, +5-8% improvement on A4-A5).
-    # Adaptive SEQ_BLOCK (iter 28): SB=64 for kv≤1536 maximizes partition fill;
-    #   SB=128 for kv>1536 (better pipeline fill per block).
-    use_splitk = b <= 4 and max_kv_len >= 512
+    # Split-K: for b≤4 with kv≥256, partition kv blocks to fill more H100 SMs.
+    # T=1, HB=4 (no split-K): grid=(1,8)=8 programs → 6% SM utilization.
+    # Adaptive NUM_PARTS (iters 29, 32):
+    #   kv=256: NP=4  (grid=32 programs, 24% SM) — 4.7% gain vs multihead
+    #   kv≤512: NP=8  (grid=64 programs, 48% SM)
+    #   kv>512: NP=16 (grid=128 programs, ~97% SM)
+    # Adaptive SEQ_BLOCK (iter 28): SB=64 for kv≤1536, SB=128 for kv>1536.
+    # Adaptive num_warps (iter 33): w=4 for kv>1024 (SB=128 path), w=8 otherwise.
+    use_splitk = b <= 4 and max_kv_len >= 256
     if use_splitk:
-        num_parts = 8 if max_kv_len <= 512 else 16
+        if max_kv_len <= 256:
+            num_parts = 4
+        elif max_kv_len <= 512:
+            num_parts = 8
+        else:
+            num_parts = 16
         seq_block = 64 if max_kv_len <= 1536 else 128
+        # warps=4 for long-context SB=128 path (A5): fewer threads reduces register
+        # pressure; 1.5% gain vs w=8. warps=8 better for shorter kv (A2-A4).
+        nw = 4 if max_kv_len > 1024 else 8
     else:
         num_parts = 1
 

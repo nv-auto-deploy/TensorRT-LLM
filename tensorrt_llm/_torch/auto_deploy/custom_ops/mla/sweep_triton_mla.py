@@ -450,19 +450,27 @@ def run_benchmark(
         params = prefill_params if is_prefill else decode_params
         hb = params.get("HEAD_BLOCK", 8)
         sb = max(params["SEQ_BLOCK"], 16)  # tl.dot requires SEQ_BLOCK >= 16
-        # Use split-K for small-batch long-context decode (mirrors _triton_mla_decode dispatch)
-        use_splitk = not is_prefill and num_tokens <= 4 and kv_len >= 512
+        # Use split-K for small-batch decode (mirrors _triton_mla_decode dispatch).
+        # Iter 32: extended threshold from kv>=512 to kv>=256 (NP=4 for kv=256: +4.7%).
+        use_splitk = not is_prefill and num_tokens <= 4 and kv_len >= 256
         try:
             if use_splitk:
-                # Adaptive SB and NUM_PARTS mirroring _triton_mla_decode dispatch.
+                # Adaptive SB, NUM_PARTS, num_warps mirroring _triton_mla_decode dispatch.
                 sb_sk = 64 if kv_len <= 1536 else 128
-                np_sk = 8 if kv_len <= 512 else 16
+                if kv_len <= 256:
+                    np_sk = 4
+                elif kv_len <= 512:
+                    np_sk = 8
+                else:
+                    np_sk = 16
+                # Adaptive warps: w=4 for long-context SB=128 path (iter 33)
+                nw_sk = 4 if kv_len > 1024 else 8
                 kernel_us = bench_splitk_kernel(
                     num_tokens,
                     kv_len,
                     HEAD_BLOCK=hb,
                     SEQ_BLOCK=sb_sk,
-                    num_warps=params["num_warps"],
+                    num_warps=nw_sk,
                     num_stages=params["num_stages"],
                     num_parts=np_sk,
                     warmup=warmup,
