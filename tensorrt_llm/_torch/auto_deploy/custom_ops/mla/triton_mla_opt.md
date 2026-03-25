@@ -772,6 +772,32 @@ Correctness: PASS (all 14 shapes, max_abs_err \< 0.002).
 
 ______________________________________________________________________
 
+### Iteration 22 — stages sweep for SB=128 path \[FAILED/NO IMPROVEMENT\]
+
+**Change:** Benchmark-only experiment; no code change.
+
+Tested `num_stages=2` and `num_stages=4` with SEQ_BLOCK=128, num_warps=8, HB=4/8:
+
+- **stages=4**: OOM on all shapes. SMEM required: 3 × (128×256 + 128×64) × 2 bytes =
+  245 760 bytes > H100 limit of 232 448 bytes. Not viable at SB=128, warps=8.
+- **stages=2**: Worse than stages=3 across A2–A8.
+
+| ID  | stages=2 µs | stages=3 µs (cur best) | stages=4 |
+| --- | ----------- | ---------------------- | -------- |
+| A2  | 11.7        | **10.8**               | OOM      |
+| A3  | 17.1        | **14.3**               | OOM      |
+| A4  | 27.0        | **21.5**               | OOM      |
+| A5  | 47.4        | **35.4**               | OOM      |
+| A7  | 18.1        | **15.4**               | OOM      |
+| A8  | 19.5        | **16.0**               | OOM      |
+
+**Conclusion:** stages=3 is optimal for SB=128 path. Fewer stages reduce
+pipeline latency hiding; more stages exceed SMEM budget. No code change needed.
+
+**Commit:** iter 22 — stages sweep SB=128 \[FAILED: stages=4 OOM, stages=2 worse\]
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK \[HIGHEST PRIORITY\]
