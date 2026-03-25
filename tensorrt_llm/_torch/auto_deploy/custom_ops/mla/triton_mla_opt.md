@@ -142,8 +142,8 @@ ______________________________________________________________________
 
 | ID  | Best kernel µs | Config                                          | Iter | vs Baseline |
 | --- | -------------- | ----------------------------------------------- | ---- | ----------- |
-| A1  | 9.4            | SEQ_BLOCK=64, warps=4, stages=4                 | 4    | **2.2×**    |
-| A2  | 17.0           | SEQ_BLOCK=128, warps=8, stages=2                | 4    | **3.9×**    |
+| A1  | 8.6            | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 16   | **2.4×**    |
+| A2  | 12.4           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 16   | **5.4×**    |
 | A3  | 17.7           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **7.2×**    |
 | A4  | 28.5           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **8.7×**    |
 | A5  | 49.5           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **9.9×**    |
@@ -579,6 +579,29 @@ else:
 Correctness: PASS (max_abs_err \< 0.002 across all 14 shapes).
 
 **Commit:** iter 15 — warps=8, stages=3(decode)/2(prefill) from comprehensive sweep (+28-42% A-shapes)
+
+______________________________________________________________________
+
+### Iteration 16 — Multihead dispatch for ALL decode shapes
+
+**Change:** Removed the conditional `if b >= 8 or max_kv_len >= 512` guard in `_triton_mla_decode`.
+Previously, small-batch / short-context shapes A1 (B=1, kv=64) and A2 (B=1, kv=256) still fell
+through to the original single-head `_mla_attention_kernel`. With iter 15's warps=8 config, the
+multihead kernel (HB=8 SB=64 w=8 s=3) now beats the single-head best on every shape, so the
+conditional is dead weight — replaced with unconditional multihead dispatch.
+
+**Benchmark (HB=8, SB=64, w=8, s=3 for all decode shapes):**
+
+| ID  | Iter 15 µs | Iter 16 µs | Delta |
+| --- | ---------- | ---------- | ----- |
+| A1  | 9.4        | 8.6        | +9%   |
+| A2  | 17.0       | 12.4       | +27%  |
+
+A3–A10, B1–B4: unchanged (already used multihead from iter 11/12).
+
+Correctness: PASS (all 14 shapes, max_abs_err \< 0.002).
+
+**Commit:** iter 16 — unconditional multihead dispatch for all decode shapes (+9-27% A1-A2)
 
 ______________________________________________________________________
 
