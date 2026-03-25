@@ -140,18 +140,18 @@ ______________________________________________________________________
 
 *Updated after every iteration.*
 
-| ID  | Best kernel µs | Config                                          | Iter | vs Baseline |
-| --- | -------------- | ----------------------------------------------- | ---- | ----------- |
+| ID  | Best kernel µs | Config                                           | Iter | vs Baseline |
+| --- | -------------- | ------------------------------------------------ | ---- | ----------- |
 | A1  | 8.5            | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **2.5×**    |
-| A2  | 12.3           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **5.4×**    |
-| A3  | 17.3           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **7.4×**    |
-| A4  | 27.1           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **9.2×**    |
-| A5  | 47.1           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **10.4×**   |
-| A6  | 12.6           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **5.4×**    |
-| A7  | 17.7           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **7.4×**    |
-| A8  | 18.8           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **7.9×**    |
-| A9  | 14.3           | multihead HB=8, SEQ_BLOCK=128, warps=8, stgs=3  | 20   | **9.1×**    |
-| A10 | 18.3           | multihead HB=8, SEQ_BLOCK=128, warps=8, stgs=3  | 20   | **13.8×**   |
+| A2  | 10.8           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **6.2×**    |
+| A3  | 14.3           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **8.9×**    |
+| A4  | 21.5           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **11.6×**   |
+| A5  | 35.4           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **13.9×**   |
+| A6  | 11.9           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **5.8×**    |
+| A7  | 15.4           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **8.5×**    |
+| A8  | 16.0           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **9.3×**    |
+| A9  | 14.0           | multihead HB=8, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **9.3×**    |
+| A10 | 18.0           | multihead HB=8, SEQ_BLOCK=128, warps=8, stgs=3  | 21   | **14.0×**   |
 | B1  | 19.6           | multihead HB=16, SEQ_BLOCK=64, warps=8, stgs=2  | 19   | **20.2×**   |
 | B2  | 96.9           | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2 | 15   | **63.0×**   |
 | B3  | 289.1          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2 | 15   | **83.6×**   |
@@ -724,6 +724,51 @@ A1-A8 unchanged (only `num_tokens > 16` path changed).
 Correctness: PASS (all 14 shapes, max_abs_err \< 0.002).
 
 **Commit:** iter 20 — SB=128 for large-batch decode B>16 (+8.5% A10)
+
+______________________________________________________________________
+
+### Iteration 21 — Adaptive SEQ_BLOCK for HB=4 decode path (B≤16) based on max_kv_len
+
+**Change:** Updated `_get_mla_multihead_config` to accept `max_kv_len` parameter.
+In the `num_tokens <= 16` (HB=4) branch:
+
+```python
+sb = 64 if max_kv_len <= 64 else 128
+return sb, 4, 8, 3
+```
+
+Updated `_triton_mla_decode` to compute `max_kv_len = int(kv_len.max().item())` and
+pass it to `_get_mla_multihead_config`. Also fixed pre-existing bug in
+`DEFAULT_DECODE_PARAMS` (was `SEQ_BLOCK=8`, violating `tl.dot` K≥16 constraint;
+updated to `SEQ_BLOCK=64, num_warps=8, num_stages=3`).
+
+**Why SB=128 wins for kv_len > 64:**
+HB=4 decode (B≤16) iterates `kv_len/SEQ_BLOCK` times:
+
+- A2 (kv=256): SB=64→4 iters, SB=128→2 iters — 2× fewer iterations, less loop overhead
+- A5 (kv=2048): SB=64→32 iters, SB=128→16 iters — pipeline fills more efficiently
+
+A1 (kv=64) is the only shape where kv_len ≤ SB=128 — a single half-empty block wastes
+50% of thread work. Using SB=64 keeps 2 full blocks, maintaining 8.5µs.
+
+**Benchmark:**
+
+| ID  | Prev best µs | Iter 21 µs | Delta   | Config           |
+| --- | ------------ | ---------- | ------- | ---------------- |
+| A1  | 8.5          | 8.5        | 0%      | SB=64 (adaptive) |
+| A2  | 12.3         | **10.8**   | +12.2%  | SB=128 adaptive  |
+| A3  | 17.3         | **14.3**   | +17.3%  | SB=128 adaptive  |
+| A4  | 27.1         | **21.5**   | +20.7%  | SB=128 adaptive  |
+| A5  | 47.1         | **35.4**   | +24.8%  | SB=128 adaptive  |
+| A6  | 12.6         | **11.9**   | +5.6%   | SB=128 adaptive  |
+| A7  | 17.7         | **15.4**   | +13.0%  | SB=128 adaptive  |
+| A8  | 18.8         | **16.0**   | +14.9%  | SB=128 adaptive  |
+| A9  | 14.3         | 14.0       | +2.1%   | unchanged path   |
+| A10 | 18.3         | 18.0       | +1.6%   | unchanged path   |
+
+Correctness: PASS (all 14 shapes, max_abs_err \< 0.002).
+
+**Commit:** iter 21 — adaptive SB=64/128 for HB=4 decode path (+12-25% on A2-A8)
 
 ______________________________________________________________________
 

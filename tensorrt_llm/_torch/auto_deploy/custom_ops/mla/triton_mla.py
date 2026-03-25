@@ -51,7 +51,7 @@ from ..attention_interface import (
 )
 
 
-def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
+def _get_mla_multihead_config(num_tokens: int, is_prefill: bool, max_kv_len: int = 512) -> tuple:
     """Best (SEQ_BLOCK, HEAD_BLOCK, num_warps, num_stages) for the multihead kernel.
 
     tl.dot requires SEQ_BLOCK >= 16.  HEAD_BLOCK must divide N_HEADS=32.
@@ -62,6 +62,10 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
       head-groups) without hurting cache-sharing efficiency at low batch sizes.
       HB=8 wins for B>16 (A9-A10): 22-29% faster — at B=32, HB=4 doubles program count
       to 256 (2 waves) while HB=8 fills H100 (132 SMs) in 1 wave.
+    Decode SEQ_BLOCK selection for HB=4 path (iter 21):
+      SB=128 when max_kv_len > 64: A2-A7 gain 5-13% (fewer loop iterations, better
+      pipeline fill); A1 only shape with kv≤64, where SB=128 wastes 50% of threads.
+      SB=64 when max_kv_len ≤ 64: avoids wasted threads from masked-out blocks.
     For HB=32 prefill, num_stages=2 avoids SMEM pressure (stages=5 OOM):
       B2=96.4µs, B3=288.5µs, B4=982.5µs.
     """
@@ -80,7 +84,10 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
         # SB=128 for B>16: fewer loop iterations → less loop overhead, better pipeline;
         #   A10: 18.3µs vs 20.0µs (+8.5%) with SB=128 vs SB=64 (HB=8 w=8 s=3)
         if num_tokens <= 16:
-            return 64, 4, 8, 3
+            # SB=128 when context > SB: A2-A7 gain 5-13%; A1 (kv≤64) uses SB=64
+            # to avoid wasted threads (2 blocks of 64 vs 1 block of 128 half-empty).
+            sb = 64 if max_kv_len <= 64 else 128
+            return sb, 4, 8, 3
         else:
             return 128, 8, 8, 3
 
@@ -315,7 +322,10 @@ def _triton_mla_decode(
     #   A2 (B=1, kv=256): 12.4µs vs 17.0µs (+27%)
     #   A6 (B=8, kv=256): 13.7µs vs 26.4µs (+48%)
     # Multihead is strictly better across all batch/context combinations.
-    seq_block, head_block, nw, ns = _get_mla_multihead_config(b, is_prefill=False)
+    max_kv_len = int(kv_len.max().item())
+    seq_block, head_block, nw, ns = _get_mla_multihead_config(
+        b, is_prefill=False, max_kv_len=max_kv_len
+    )
     grid = (b, num_heads // head_block)
     _mla_attention_kernel_multihead[grid](
         q_absorbed,

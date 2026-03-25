@@ -112,7 +112,7 @@ SWEEP_GRID = {
 }
 
 # Default params (baseline)
-DEFAULT_DECODE_PARAMS = dict(SEQ_BLOCK=8, num_warps=2, num_stages=2)
+DEFAULT_DECODE_PARAMS = dict(SEQ_BLOCK=64, num_warps=8, num_stages=3)
 DEFAULT_PREFILL_PARAMS = dict(SEQ_BLOCK=16, num_warps=4, num_stages=2)
 
 
