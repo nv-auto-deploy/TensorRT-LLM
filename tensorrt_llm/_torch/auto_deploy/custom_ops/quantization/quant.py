@@ -19,8 +19,6 @@ import warnings
 from typing import Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
 from flashinfer import bmm_fp8
 from torch import nn
 
@@ -82,111 +80,6 @@ def _to_fp8(x, scale):
     return (x / scale).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
 
 
-_GEMV_BLOCK_N = 128  # output-elements per block
-_GEMV_BLOCK_K = 256  # K-elements per inner iteration
-
-
-@triton.jit
-def _fp8_gemv_kernel(
-    x_ptr,  # [M, K] float8_e4m3fn (contiguous)
-    w_ptr,  # [N, K] float8_e4m3fn (row-major)
-    out_ptr,  # [M, N] target dtype
-    scale_ptr,  # float32* — combined input_scale * weight_scale (tl.load, CUDA-graph safe)
-    M,
-    N,
-    K,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    IS_BF16: tl.constexpr,
-):
-    """FP8 × FP8 GEMV: out[m, n] = sum_k(x[m,k] * w[n,k]) * scale.
-
-    One block handles BLOCK_N contiguous output elements for one input row.
-    Invoked only at M≤4 (decode) to improve HBM bandwidth over cuBLAS on sm_90+.
-    Scale is loaded via tl.load (not .item()) to stay CUDA-graph capture safe.
-    """
-    pid_n = tl.program_id(0)
-    pid_m = tl.program_id(1)
-
-    n_off = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    n_mask = n_off < N
-
-    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
-
-    for k_start in tl.range(0, tl.cdiv(K, BLOCK_K)):
-        k_off = k_start * BLOCK_K + tl.arange(0, BLOCK_K)
-        k_mask = k_off < K
-
-        # Broadcast input across the N dimension.
-        x = tl.load(x_ptr + pid_m * K + k_off, mask=k_mask, other=0.0)
-        x_f32 = x.to(tl.float32)
-
-        # Load weight tile [BLOCK_N, BLOCK_K].
-        w_ptrs = w_ptr + n_off[:, None] * K + k_off[None, :]
-        w = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-        w_f32 = w.to(tl.float32)
-
-        acc += tl.sum(w_f32 * x_f32[None, :], axis=1)
-
-    scale = tl.load(scale_ptr)
-    result = acc * scale
-    if IS_BF16:
-        tl.store(out_ptr + pid_m * N + n_off, result.to(tl.bfloat16), mask=n_mask)
-    else:
-        tl.store(out_ptr + pid_m * N + n_off, result.to(tl.float32), mask=n_mask)
-
-
-def _triton_fp8_gemv(
-    x_fp8: torch.Tensor,
-    w_fp8: torch.Tensor,
-    input_scale: torch.Tensor,
-    weight_scale: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    """Triton GEMV fast path for small-M FP8 matmul.
-
-    Uses tl.load for the combined scale (not .item()) to stay CUDA-graph safe.
-
-    Args:
-        x_fp8: [M, K] float8_e4m3fn.
-        w_fp8: [N, K] float8_e4m3fn row-major.
-        input_scale / weight_scale: per-tensor scalar tensors (device tensors).
-        out_dtype: bfloat16 or float32.
-
-    Returns:
-        [M, N] tensor of out_dtype.
-    """
-    M, K = x_fp8.shape
-    N = w_fp8.shape[0]
-    assert w_fp8.shape[1] == K
-
-    # Ensure row-major layout so ptr arithmetic in kernel is correct.
-    if not x_fp8.is_contiguous():
-        x_fp8 = x_fp8.contiguous()
-
-    # Combined scale kept as a device tensor — no D2H sync (CUDA graph safe).
-    combined_scale = input_scale.float() * weight_scale.float()
-    is_bf16 = out_dtype == torch.bfloat16
-
-    out = torch.empty((M, N), dtype=out_dtype, device=x_fp8.device)
-
-    grid = (triton.cdiv(N, _GEMV_BLOCK_N), M)
-    _fp8_gemv_kernel[grid](
-        x_fp8,
-        w_fp8,
-        out,
-        combined_scale,
-        M,
-        N,
-        K,
-        BLOCK_N=_GEMV_BLOCK_N,
-        BLOCK_K=_GEMV_BLOCK_K,
-        IS_BF16=is_bf16,
-        num_warps=4,
-    )
-    return out
-
-
 def _trtllm_fp8_prequant_linear_core(
     input_fp8: torch.Tensor,
     weight_fp8: torch.Tensor,
@@ -200,28 +93,6 @@ def _trtllm_fp8_prequant_linear_core(
     assert input_shape[-1] == k, f"Input last dim {input_shape[-1]} must match weight last dim {k}"
 
     x = input_fp8.reshape(-1, k)
-    m = x.shape[0]
-
-    # iter35: Triton GEMV fast path for small M on sm_90+ (H100/H200).
-    # cuBLAS GEMV on H100 at M=1 achieves ~13% HBM bandwidth; Triton GEMV targets 50%+.
-    # Only active for bfloat16/float32 outputs (covers all current AD use cases).
-    if torch.cuda.is_available():
-        sm = torch.cuda.get_device_capability(0)
-        _sm_version = sm[0] * 10 + sm[1]
-    else:
-        _sm_version = 0
-    _enable_triton_gemv = (
-        _sm_version >= 90
-        and m <= 4
-        and out_dtype in (torch.bfloat16, torch.float32)
-        and input_scale is not None
-        and weight_scale is not None
-    )
-
-    if _enable_triton_gemv:
-        output = _triton_fp8_gemv(x, weight_fp8, input_scale, weight_scale, out_dtype)
-        return output.reshape(*input_shape[:-1], n)
-
     k_pad = (16 - k % 16) % 16
     n_pad = (16 - n % 16) % 16
 
