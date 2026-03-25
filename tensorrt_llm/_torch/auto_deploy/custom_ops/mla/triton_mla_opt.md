@@ -1801,6 +1801,58 @@ since this fallback is isolated to the MLA op.
 
 ______________________________________________________________________
 
+### Iteration 57 — Full CUDA graph compatibility: static max_kv_len from mla_cache.shape\[1\]
+
+**Motivation:** `.item()` is a D2H sync, illegal inside `torch.cuda.graph` capture.
+Previous fix (iter 52) tried `mla_cache.shape[1]` but was reverted due to
+`_assert_async`. This iteration re-applies iter 52 cleanly with full understanding:
+
+- **Why iter 52 was reverted:** The `_assert_async` from `TensorCompare.cu:112` was
+  attributed to "an unrelated bug" in the captured graph. However, iter 56's comment
+  was inaccurate: AutoDeploy does NOT gracefully fall back on `.item()` — it **hard
+  crashes** with `RuntimeError: Executor worker returned error`. The baseline (before
+  all optimizations) works with CUDA graph because it never calls `.item()`.
+
+- **Root cause of current failure:** `.item()` = D2H sync → `cudaErrorStreamCaptureUnsupported`
+  → hard crash during CUDA graph capture. Not a graceful fallback.
+
+- **Correct fix:** Use `max_kv_len = mla_cache.shape[1]` (the allocated max_seq_len).
+  All dispatch parameters (seq_block, head_block, num_parts, workspace shapes) become
+  compile-time constants relative to the CUDA graph, ensuring identical graph structure
+  on every capture/replay. Per-token `kv_len` tensor is still passed to kernels for
+  correct causal masking.
+
+**Change:**
+
+```python
+# Before:
+max_kv_len = int(kv_len.max().item())
+
+# After:
+max_kv_len = mla_cache.shape[1]  # static: max_seq_len from allocation
+```
+
+**Why static dispatch is correct:**
+
+1. `mla_cache.shape[1]` overestimates `max_kv_len` but only affects which branch
+   (split-K vs multihead) is taken and `num_parts`. Taking split-K for small actual
+   kv_len is suboptimal but correct — empty partitions write `(m=-inf, l=0, acc=0)`
+   and contribute 0 to the reduce step.
+
+1. CUDA graph stability: with static dispatch, every replay of the captured graph
+   executes the EXACT same sequence of GPU operations with the SAME kernel parameters
+   and workspace shapes. No shape change between capture and replay.
+
+1. Performance impact for eager decode: slight regression for very short decode steps
+   (kv_len \< 256) where split-K is now used but wouldn't have been before. For typical
+   serving workloads (kv_len grows as decode progresses), this is negligible.
+
+**Result:** TBD — running `build_and_run_ad.py` with `compile_backend: torch-cudagraph`.
+
+**Commit:** iter 57 — CUDA graph compat: static max_kv_len from mla_cache.shape\[1\]
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK

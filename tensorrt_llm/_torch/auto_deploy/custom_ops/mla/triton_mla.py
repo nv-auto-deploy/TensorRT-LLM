@@ -531,13 +531,13 @@ def _triton_mla_decode(
 
     # Dispatch: split-K for small-batch long-context (fills more H100 SMs),
     # standard multihead otherwise.
-    # Note: .item() is a D2H sync. During CUDA graph capture it raises
-    # cudaErrorStreamCaptureUnsupported, which AutoDeploy catches and handles
-    # by falling back to eager execution mode. In eager mode .item() is legal
-    # and split-K dispatch works correctly. Do NOT guard with
-    # is_current_stream_capturing(): that would make capture succeed and expose
-    # an unrelated bug in the captured graph replay (iter 55 revert, iter 56).
-    max_kv_len = int(kv_len.max().item())
+    # Use mla_cache.shape[1] (max_seq_len) as a static upper bound for dispatch.
+    # This avoids the D2H sync (.item()) which is illegal inside torch.cuda.graph
+    # capture (iter 57: full CUDA graph compatibility fix).
+    # All dispatch parameters (seq_block, head_block, num_parts, workspace shapes)
+    # are now compile-time constants w.r.t. the capture → stable graph every replay.
+    # Per-token kv_len tensor is still passed to each kernel for correct causal masking.
+    max_kv_len = mla_cache.shape[1]
     seq_block, head_block, nw, ns = _get_mla_multihead_config(
         b, is_prefill=False, max_kv_len=max_kv_len
     )
