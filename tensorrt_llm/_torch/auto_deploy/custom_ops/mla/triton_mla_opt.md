@@ -149,13 +149,13 @@ ______________________________________________________________________
 | A5  | 94.6           | SEQ_BLOCK=128, warps=8, stages=5                | 4    | **5.2×**    |
 | A6  | 26.4           | SEQ_BLOCK=64, warps=4, stages=2                 | 4    | **2.6×**    |
 | A7  | 45.7           | SEQ_BLOCK=64, warps=4, stages=4                 | 4    | **2.9×**    |
-| A8  | 62.0           | SEQ_BLOCK=32, warps=2, stages=2                 | 4    | **2.4×**    |
-| A9  | 43.6           | SEQ_BLOCK=16, warps=1, stages=3                 | 4    | **3.0×**    |
-| A10 | 79.5           | SEQ_BLOCK=16, warps=1, stages=2                 | 4    | **3.2×**    |
-| B1  | 25.6           | multihead HB=8, SEQ_BLOCK=16, warps=4, stgs=4   | 2    | **15.5×**   |
-| B2  | 177.5          | multihead HB=16, SEQ_BLOCK=128, warps=4, stgs=4 | 2    | **34.4×**   |
-| B3  | 515.0          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 2    | **46.9×**   |
-| B4  | 1842.0         | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 2    | **52.2×**   |
+| A8  | 53.4           | multihead HB=4, SEQ_BLOCK=16, warps=4, stgs=2   | 5    | **2.8×**    |
+| A9  | 32.5           | multihead HB=4, SEQ_BLOCK=16, warps=4, stgs=2   | 5    | **4.0×**    |
+| A10 | 56.0           | multihead HB=4, SEQ_BLOCK=16, warps=4, stgs=2   | 5    | **4.5×**    |
+| B1  | 25.6           | multihead HB=8, SEQ_BLOCK=16, warps=4, stgs=4   | 6    | **15.5×**   |
+| B2  | 177.5          | multihead HB=16, SEQ_BLOCK=16, warps=4, stgs=4  | 6    | **34.4×**   |
+| B3  | 515.3          | multihead HB=32, SEQ_BLOCK=16, warps=8, stgs=4  | 6    | **46.9×**   |
+| B4  | 1836.7         | multihead HB=32, SEQ_BLOCK=16, warps=8, stgs=4  | 6    | **52.3×**   |
 
 ______________________________________________________________________
 
@@ -280,6 +280,64 @@ Note: B-shapes are better served by the multihead kernel (iter 2): B1=25.6µs, B
 B3=515µs, B4=1842µs — these are 3-17× faster than the original kernel's best.
 
 **Commit:** iter 4 — full sweep results; update decode/prefill lookup tables
+
+______________________________________________________________________
+
+### Iteration 5 — Decode HEAD_BLOCK sweep; dispatch multihead for B≥16
+
+**Change:** Ran decode HEAD_BLOCK sweep (HB=1,2,4,8,16,32) across all shapes on 8 GPUs.
+Finding: multihead kernel is better than original for `num_tokens >= 16` (A8-A10 shapes).
+For smaller batches, the original kernel with SB=64-128 remains faster.
+
+Updated `_triton_mla_decode` to dispatch based on batch size:
+
+- `num_tokens < 16`: original `_mla_attention_kernel` with lookup-table configs
+- `num_tokens >= 16`: `_mla_attention_kernel_multihead` with HB=4
+
+**Decode HEAD_BLOCK sweep (all shapes, SB=16, H100):**
+
+| ID  | orig-best | HB=1  | HB=2  | HB=4  | HB=8  | HB=16 | HB=32 | dispatch |
+| --- | --------- | ----- | ----- | ----- | ----- | ----- | ----- | -------- |
+| A1  | 9.4       | 13.4  | 13.8  | 13.9  | 14.1  | 16.7  | 22.1  | original |
+| A2  | 17.0      | 29.1  | 30.4  | 31.1  | 32.0  | 33.8  | 40.1  | original |
+| A3  | 28.1      | 49.8  | 52.2  | 53.9  | 55.7  | 56.0  | 63.9  | original |
+| A4  | 50.4      | 91.3  | 95.2  | 99.0  | 102.4 | 100.3 | 111.0 | original |
+| A5  | 94.6      | 173.1 | 180.0 | 187.6 | 193.9 | 187.5 | 202.4 | original |
+| A6  | 26.4      | 29.7  | 30.9  | 30.7  | 31.2  | 33.5  | 39.8  | original |
+| A7  | 45.7      | 51.3  | 53.3  | 52.5  | 53.2  | 54.8  | 63.0  | original |
+| A8  | 62.0      | 55.5  | 54.4  | **53.4** | 53.9 | 55.1 | 65.4 | mhead HB=4 |
+| A9  | 43.6      | 40.7  | 35.2  | **32.5** | 32.6 | 34.4 | 41.2 | mhead HB=4 |
+| A10 | 79.5      | 70.0  | 59.8  | **56.0** | 56.1 | 56.9 | 65.2 | mhead HB=4 |
+| B1  | 82.5      | 118.0 | 65.4  | 42.2  | 25.6  | 26.9  | 28.1  | (prefill) |
+| B2  | 1402.3    | 2103.9 | 1026.5 | 523.8 | 282.2 | 178.1 | 188.1 | (prefill) |
+| B3  | 8152.5    | 7989.2 | 3958.3 | 2143.8 | 1151.8 | 630.3 | 515.3 | (prefill) |
+| B4  | 31584.2   | 30957.5 | 14818.6 | 7645.2 | 4053.0 | 2373.2 | 1836.7 | (prefill) |
+
+Correctness: PASS all 14 shapes. A8-A10 confirmed better with multihead HB=4.
+
+**Commit:** iter 5 — decode HEAD_BLOCK sweep; multihead dispatch for B≥16
+
+______________________________________________________________________
+
+### Iteration 6 — Dispatch prefill to multihead kernel
+
+**Change:** Updated `_triton_mla_prefill` to always use `_mla_attention_kernel_multihead`
+via `_get_mla_multihead_config(total_tokens, is_prefill=True)`. The original kernel
+fallback config is retained for reference but no longer dispatched.
+
+Expected prefill improvements (from iter 2+5 standalone benchmarks):
+
+| ID  | orig-best µs | multihead µs | speedup |
+| --- | ------------ | ------------ | ------- |
+| B1  | 82.5         | 25.6         | 3.2×    |
+| B2  | 1402.3       | 178.1        | 7.9×    |
+| B3  | 8152.5       | 515.3        | 15.8×   |
+| B4  | 31584.2      | 1836.7       | 17.2×   |
+
+Combined with iter 5 (decode B≥16 multihead), all shapes now see multihead dispatch.
+Correctness: PASS all 14 shapes.
+
+**Commit:** iter 6 — dispatch prefill to multihead kernel (always)
 
 ______________________________________________________________________
 

@@ -94,28 +94,24 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
     tl.dot requires SEQ_BLOCK >= 16.  HEAD_BLOCK must divide N_HEADS=32.
     Derived from parallel HEAD_BLOCK sweep on H100 80GB HBM3.
 
-    Decode: original kernel already fast for small T; multihead helps T>=8.
+    Decode dispatch threshold: num_tokens >= 16 benefits from multihead.
     Prefill: larger HEAD_BLOCK wins because all tokens share identical cache.
     """
     if is_prefill:
-        # B1 T=128→HB=8, B2 T=512→HB=16, B3/B4 T>=1024→HB=32
+        # B1 T=128 → HB=8; B2 T=512 → HB=16; B3/B4 T≥1024 → HB=32
         if num_tokens <= 128:
             return 16, 8, 4, 4
         elif num_tokens <= 512:
-            return 128, 16, 4, 4
+            return 16, 16, 4, 4
         else:
-            return 128, 32, 8, 4
+            return 16, 32, 8, 4
     else:
-        # Decode: multihead helps for batch>=8; small batch uses original kernel
-        if num_tokens <= 4:
-            # single/tiny batch: original kernel already optimal at 9-17µs
-            return 128, 1, 8, 4  # HEAD_BLOCK=1 → falls back to original behavior
-        elif num_tokens <= 12:
-            return 64, 4, 4, 4
-        elif num_tokens <= 24:
-            return 32, 8, 4, 2
+        # Decode: multihead wins for num_tokens >= 16 (A8-A10 shapes)
+        # num_tokens < 16: caller should use original kernel instead
+        if num_tokens <= 24:
+            return 16, 4, 4, 2  # A8 (B=16): HB=4 best
         else:
-            return 16, 8, 4, 2
+            return 16, 4, 4, 2  # A9/A10 (B=32): HB=4 best
 
 
 @triton.jit
@@ -440,27 +436,54 @@ def _triton_mla_decode(
     kv_len = (input_pos + 1).to(torch.int32)
 
     max_kv_len = int(kv_len.max().item())
-    seq_block, nw, ns = _get_mla_decode_config(b, max_kv_len)
-    grid = (b, num_heads)
-    _mla_attention_kernel[grid](
-        q_absorbed,
-        q_pe_2d,
-        mla_cache,
-        slot_idx,
-        kv_len,
-        weighted_kv,
-        SCALE=scale,
-        MAX_SEQ_LEN=max_seq_len,
-        N_HEADS=num_heads,
-        KV_LORA_RANK=kv_lora_rank,
-        QK_ROPE_HEAD_DIM=qk_rope_head_dim,
-        CACHE_DIM=cache_dim,
-        KV_BLOCK=kv_block,
-        PE_BLOCK=pe_block,
-        SEQ_BLOCK=seq_block,
-        num_warps=nw,
-        num_stages=ns,
-    )
+
+    # For large batches (B>=16), the multihead kernel reduces HBM redundancy.
+    # For small/single-token batches, the original kernel with large SEQ_BLOCK is faster.
+    if b >= 16:
+        seq_block, head_block, nw, ns = _get_mla_multihead_config(b, is_prefill=False)
+        grid = (b, num_heads // head_block)
+        _mla_attention_kernel_multihead[grid](
+            q_absorbed,
+            q_pe_2d,
+            mla_cache,
+            slot_idx,
+            kv_len,
+            weighted_kv,
+            SCALE=scale,
+            MAX_SEQ_LEN=max_seq_len,
+            N_HEADS=num_heads,
+            KV_LORA_RANK=kv_lora_rank,
+            QK_ROPE_HEAD_DIM=qk_rope_head_dim,
+            CACHE_DIM=cache_dim,
+            KV_BLOCK=kv_block,
+            PE_BLOCK=pe_block,
+            SEQ_BLOCK=seq_block,
+            HEAD_BLOCK=head_block,
+            num_warps=nw,
+            num_stages=ns,
+        )
+    else:
+        seq_block, nw, ns = _get_mla_decode_config(b, max_kv_len)
+        grid = (b, num_heads)
+        _mla_attention_kernel[grid](
+            q_absorbed,
+            q_pe_2d,
+            mla_cache,
+            slot_idx,
+            kv_len,
+            weighted_kv,
+            SCALE=scale,
+            MAX_SEQ_LEN=max_seq_len,
+            N_HEADS=num_heads,
+            KV_LORA_RANK=kv_lora_rank,
+            QK_ROPE_HEAD_DIM=qk_rope_head_dim,
+            CACHE_DIM=cache_dim,
+            KV_BLOCK=kv_block,
+            PE_BLOCK=pe_block,
+            SEQ_BLOCK=seq_block,
+            num_warps=nw,
+            num_stages=ns,
+        )
 
     # Step 4: Value projection
     weighted_kv = weighted_kv.to(q_nope.dtype)
@@ -569,9 +592,10 @@ def _triton_mla_prefill(
     kv_block = triton.next_power_of_2(kv_lora_rank)
     pe_block = triton.next_power_of_2(qk_rope_head_dim)
 
-    seq_block, nw, ns = _get_mla_prefill_config(total_tokens)
-    grid = (total_tokens, num_heads)
-    _mla_attention_kernel[grid](
+    # Multihead kernel is always faster for prefill: shares cache loads across HEAD_BLOCK heads.
+    seq_block, head_block, nw, ns = _get_mla_multihead_config(total_tokens, is_prefill=True)
+    grid = (total_tokens, num_heads // head_block)
+    _mla_attention_kernel_multihead[grid](
         q_absorbed,
         q_pe_actual,
         mla_cache,
@@ -587,6 +611,7 @@ def _triton_mla_prefill(
         KV_BLOCK=kv_block,
         PE_BLOCK=pe_block,
         SEQ_BLOCK=seq_block,
+        HEAD_BLOCK=head_block,
         num_warps=nw,
         num_stages=ns,
     )
