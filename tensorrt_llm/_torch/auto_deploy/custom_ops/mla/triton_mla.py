@@ -531,7 +531,16 @@ def _triton_mla_decode(
 
     # Dispatch: split-K for small-batch long-context (fills more H100 SMs),
     # standard multihead otherwise.
-    max_kv_len = int(kv_len.max().item())
+    # CUDA graph compatibility (iter 55): .item() is a D2H sync — illegal during
+    # CUDA graph capture. When capturing, skip split-K (use multihead) and derive
+    # max_kv_len from the static cache shape. In eager execution, use .item() to
+    # get the exact max_kv_len for optimal split-K dispatch.
+    # Split-K runs in eager mode; multihead runs inside CUDA graphs.
+    _capturing = torch.cuda.is_current_stream_capturing()
+    if _capturing:
+        max_kv_len = mla_cache.shape[1]
+    else:
+        max_kv_len = int(kv_len.max().item())
     seq_block, head_block, nw, ns = _get_mla_multihead_config(
         b, is_prefill=False, max_kv_len=max_kv_len
     )
@@ -555,7 +564,9 @@ def _triton_mla_decode(
     # Adaptive num_warps (iter 33): w=4 for kv>1024 (SB=128 path), w=8 otherwise.
     # num_stages=2 for split-K (iter 37): each partition handles ≤2 blocks;
     #   stages=2 is identical to stages=3 (no pipeline benefit) but uses less SMEM.
-    use_splitk = (b <= 4 and max_kv_len >= 256) or (b <= 8 and max_kv_len >= 512)
+    use_splitk = (not _capturing) and (
+        (b <= 4 and max_kv_len >= 256) or (b <= 8 and max_kv_len >= 512)
+    )
     if use_splitk:
         seq_block = 64 if max_kv_len <= 1536 else 128
         if b <= 4:

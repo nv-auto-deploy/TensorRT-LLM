@@ -1721,6 +1721,47 @@ issue outside the scope of `triton_mla.py` optimization.
 
 ______________________________________________________________________
 
+### Iteration 55 — CUDA graph compat: is_current_stream_capturing() + split-K in eager only
+
+**Change:** Replace unconditional `.item()` with a capture-aware dispatch. During CUDA
+graph capture, skip split-K (use multihead with static `mla_cache.shape[1]`); in
+eager execution, use split-K with the exact `.item()` value.
+
+```python
+_capturing = torch.cuda.is_current_stream_capturing()
+if _capturing:
+    max_kv_len = mla_cache.shape[1]   # static — no D2H sync
+else:
+    max_kv_len = int(kv_len.max().item())  # exact — only legal in eager mode
+
+use_splitk = (not _capturing) and (
+    (b <= 4 and max_kv_len >= 256) or (b <= 8 and max_kv_len >= 512)
+)
+```
+
+**Why this is correct:**
+
+- **CUDA graph capture**: `is_current_stream_capturing()` returns True → `use_splitk=False`
+  → multihead kernel captured (no workspace tensors, no `.item()`). Static `max_kv_len`
+  from cache shape selects a valid (conservative) multihead config.
+- **CUDA graph replay**: Python dispatch code does NOT re-execute; the captured multihead
+  kernel replays identically.
+- **Eager execution**: `is_current_stream_capturing()` returns False → original split-K
+  dispatch logic is unchanged; `.item()` is legal.
+
+**Root cause analysis:** Iter 52 made graph capture succeed by using `mla_cache.shape[1]`,
+but this caused `use_splitk=True` during capture, allocating workspace tensors inside the
+graph. This workspace memory corrupted the CUDA graph's memory pool or conflicted with
+other operators (`fused_gather_scatter`), causing a device-side assert on replay.
+The present fix avoids workspace allocation entirely during capture.
+
+**Performance:** Split-K benefits are preserved in eager mode. CUDA graph mode uses
+multihead (same as baseline before split-K was added) — no regression vs. original.
+
+**Commit:** iter 55 — CUDA graph compat: split-K eager-only via is_current_stream_capturing
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK
@@ -1765,7 +1806,7 @@ ______________________________________________________________________
 
 ## Final Best Configuration
 
-**Total iterations: 54** | **GPU: NVIDIA H100 80GB HBM3**
+**Total iterations: 55** | **GPU: NVIDIA H100 80GB HBM3**
 
 ### Dispatch logic summary
 
