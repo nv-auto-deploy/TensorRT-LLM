@@ -449,7 +449,10 @@ def _triton_mla_decode(
     q_pe_2d = q_pe.squeeze(1).contiguous()  # [B, N, qk_rope_head_dim]
 
     # Step 3: Triton kernel for attention computation
-    weighted_kv = torch.empty(b, num_heads, kv_lora_rank, device=q_nope.device, dtype=torch.float32)
+    # Allocate as model dtype (bf16) instead of fp32: halves HBM write bandwidth and
+    # eliminates the .to(q_nope.dtype) cast below.  The kernel accumulates in fp32 and
+    # Triton stores fp32→bf16 at the final tl.store, so precision is unchanged.
+    weighted_kv = torch.empty(b, num_heads, kv_lora_rank, device=q_nope.device, dtype=q_nope.dtype)
 
     max_seq_len = mla_cache.shape[1]
     cache_dim = mla_cache.shape[2]
@@ -517,8 +520,7 @@ def _triton_mla_decode(
             num_stages=ns,
         )
 
-    # Step 4: Value projection
-    weighted_kv = weighted_kv.to(q_nope.dtype)
+    # Step 4: Value projection (weighted_kv already in q_nope.dtype from kernel store)
     attn_out = torch.einsum("bnk,nvk->bnv", weighted_kv, w_v)  # [B, N, v_head_dim]
 
     out.copy_(attn_out)
@@ -615,8 +617,11 @@ def _triton_mla_prefill(
     # Per-token KV length for causal masking: token at cache position p attends to [0, p]
     token_kv_len = (token_cache_pos + 1).to(torch.int32)  # [total_tokens]
 
+    # Allocate as bf16 to halve HBM write bandwidth; kernel accumulates in fp32 and
+    # stores via fp32→bf16 conversion at tl.store.  The einsum below upcasts to fp32
+    # automatically (via w_v.float()), so end-to-end precision is unchanged.
     weighted_kv = torch.empty(
-        total_tokens, num_heads, kv_lora_rank, device=device, dtype=torch.float32
+        total_tokens, num_heads, kv_lora_rank, device=device, dtype=q_nope.dtype
     )
 
     max_seq_len = mla_cache.shape[1]

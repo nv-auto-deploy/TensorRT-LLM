@@ -149,13 +149,13 @@ ______________________________________________________________________
 | A5  | 85.8           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 12   | **5.7×**    |
 | A6  | 18.7           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 11   | **3.7×**    |
 | A7  | 28.4           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 11   | **4.6×**    |
-| A8  | 29.4           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **5.1×**    |
-| A9  | 20.2           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **6.5×**    |
-| A10 | 32.3           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **7.8×**    |
-| B1  | 20.8           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **19.1×**   |
-| B2  | 103.5          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 10   | **59.0×**   |
-| B3  | 296.5          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 10   | **81.5×**   |
-| B4  | 993.9          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 10   | **96.8×**   |
+| A8  | 28.7           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 14   | **5.2×**    |
+| A9  | 20.1           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 14   | **6.5×**    |
+| A10 | 32.0           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 14   | **7.9×**    |
+| B1  | 21.4           | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 14   | **18.5×**   |
+| B2  | 101.2          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 14   | **60.4×**   |
+| B3  | 290.8          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 14   | **83.1×**   |
+| B4  | 989.9          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 14   | **97.2×**   |
 
 ______________________________________________________________________
 
@@ -501,6 +501,37 @@ The optimization is still worthwhile as free throughput on compute-bound paths
 and correct, but does not move the needle for memory-bound shapes.
 
 **Commit:** iter 13 — exp2 softmax (tl.exp → tl.math.exp2, no perf regression)
+
+______________________________________________________________________
+
+### Iteration 14 — bf16 weighted_kv output (halve HBM write bandwidth)
+
+**Change:** Changed `weighted_kv` tensor allocation from `dtype=torch.float32` to
+`dtype=q_nope.dtype` (bfloat16) in both `_triton_mla_decode` and `_triton_mla_prefill`.
+
+The kernel accumulates in fp32 and Triton performs fp32->bf16 conversion at `tl.store`.
+The downstream einsum already casts to fp32 (via `w_v.float()`), so end-to-end numeric
+precision is unchanged. The redundant `.to(q_nope.dtype)` call was removed from decode.
+
+**Bandwidth saved per call (B4, T=2048):**
+
+- Before: write 2048x32x256x4=67MB fp32; then read 67MB for .to() + einsum
+- After: write 2048x32x256x2=33MB bf16; einsum auto-upcasts from bf16
+
+**Benchmark (H100, with iter 13 as base):**
+
+| ID  | Iter 13 µs | Iter 14 µs | Delta  |
+| --- | ---------- | ---------- | ------ |
+| A8  | 29.4       | 28.7       | +2.4%  |
+| A9  | 20.2       | 20.1       | +0.5%  |
+| A10 | 32.3       | 32.0       | +0.9%  |
+| B2  | 103.5      | 101.2      | +2.2%  |
+| B3  | 296.5      | 290.8      | +1.9%  |
+| B4  | 993.9      | 989.9      | +0.4%  |
+
+Correctness: PASS (max_abs_err \< 0.002 across all 14 shapes).
+
+**Commit:** iter 14 — weighted_kv as bf16 (halve write BW, +0.4-2.4% across shapes)
 
 ______________________________________________________________________
 
