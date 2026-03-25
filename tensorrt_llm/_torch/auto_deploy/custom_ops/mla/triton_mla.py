@@ -51,43 +51,6 @@ from ..attention_interface import (
 )
 
 
-def _get_mla_decode_config(num_tokens: int, max_kv_len: int = 1024) -> tuple:
-    """Per-shape best (SEQ_BLOCK, num_warps, num_stages) for decode attention.
-
-    Derived from full 150-config sweep on H100 80GB HBM3 (Mistral-Small-4-119B-2603).
-    Key dimensions: num_tokens (batch) and max_kv_len (context length).
-
-    Single-token decode: SEQ_BLOCK scales with kv_len (larger blocks amortise loop overhead).
-    Batched decode: smaller SEQ_BLOCK exposes more SM-level parallelism.
-    """
-    if num_tokens <= 1:
-        if max_kv_len <= 64:
-            return 64, 4, 4
-        elif max_kv_len <= 1024:
-            return 128, 8, 4
-        else:
-            return 128, 8, 5
-    elif num_tokens <= 8:
-        return 64, 4, 4
-    elif num_tokens <= 16:
-        return 32, 2, 2
-    else:
-        return 16, 1, 2
-
-
-def _get_mla_prefill_config(total_tokens: int) -> tuple:
-    """Per-shape best (SEQ_BLOCK, num_warps, num_stages) for prefill attention.
-
-    Derived from full 150-config sweep on H100 80GB HBM3 (Mistral-Small-4-119B-2603).
-    Note: _mla_attention_kernel_multihead gives much larger speedup for prefill.
-    These configs serve as the fallback for the original scalar kernel path.
-    """
-    if total_tokens <= 128:
-        return 16, 1, 1
-    else:
-        return 16, 1, 5
-
-
 def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
     """Best (SEQ_BLOCK, HEAD_BLOCK, num_warps, num_stages) for the multihead kernel.
 
@@ -111,136 +74,6 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
         # Decode (num_tokens >= 8 or max_kv_len >= 512): HB=8, SB=64, w=8, s=3
         # num_stages=3 optimal for A9/A10: 14.2/19.9µs vs warps=4,stages=4: 20.1/32.0µs
         return 64, 8, 8, 3
-
-
-@triton.jit
-def _mla_attention_kernel(
-    # Tensor pointers
-    q_absorbed_ptr,  # [num_tokens, N, kv_lora_rank]
-    q_pe_ptr,  # [num_tokens, N, qk_rope_head_dim]
-    mla_cache_ptr,  # [max_batch, max_seq, cache_dim]
-    token_slot_ptr,  # [num_tokens] - cache slot per token
-    token_kv_len_ptr,  # [num_tokens] - KV length per token (causal boundary)
-    out_ptr,  # [num_tokens, N, kv_lora_rank] (float32)
-    # Constexpr parameters
-    SCALE: tl.constexpr,
-    MAX_SEQ_LEN: tl.constexpr,
-    N_HEADS: tl.constexpr,
-    KV_LORA_RANK: tl.constexpr,
-    QK_ROPE_HEAD_DIM: tl.constexpr,
-    CACHE_DIM: tl.constexpr,
-    KV_BLOCK: tl.constexpr,  # next_power_of_2(kv_lora_rank)
-    PE_BLOCK: tl.constexpr,  # next_power_of_2(qk_rope_head_dim)
-    SEQ_BLOCK: tl.constexpr,  # sequence tile size
-):
-    """MLA attention kernel with online softmax (shared by prefill and decode).
-
-    Each program processes one (token, head) pair. Iterates over the cached
-    KV sequence using online softmax to compute the softmax-weighted
-    sum of compressed_kv values.
-
-    Grid: (num_tokens, N_HEADS)
-
-    This kernel implements the core MLA attention in compressed space:
-        score[t] = (q_absorbed . compressed_kv[t] + q_pe . kpe[t]) * scale
-        attn_weights = softmax(scores[:kv_len])
-        weighted_kv = sum(attn_weights[t] * compressed_kv[t])
-
-    The weight absorption (q_absorbed = q_nope @ w_k_nope^T) and the final
-    value projection (out = weighted_kv @ w_v^T) are done outside this kernel.
-    Per-token kv_len provides causal masking for prefill tokens.
-    """
-    token_id = tl.program_id(0)
-    head_id = tl.program_id(1)
-
-    slot_idx = tl.load(token_slot_ptr + token_id)
-    kv_len = tl.load(token_kv_len_ptr + token_id)
-
-    # Load absorbed query for this head: [KV_BLOCK]
-    q_abs_base = token_id * N_HEADS * KV_LORA_RANK + head_id * KV_LORA_RANK
-    kv_offsets = tl.arange(0, KV_BLOCK)
-    kv_mask = kv_offsets < KV_LORA_RANK
-    q_abs = tl.load(q_absorbed_ptr + q_abs_base + kv_offsets, mask=kv_mask, other=0.0).to(
-        tl.float32
-    )
-
-    # Load q_pe for this head: [PE_BLOCK]
-    q_pe_base = token_id * N_HEADS * QK_ROPE_HEAD_DIM + head_id * QK_ROPE_HEAD_DIM
-    pe_offsets = tl.arange(0, PE_BLOCK)
-    pe_mask = pe_offsets < QK_ROPE_HEAD_DIM
-    q_pe = tl.load(q_pe_ptr + q_pe_base + pe_offsets, mask=pe_mask, other=0.0).to(tl.float32)
-
-    # Initialize online softmax accumulators
-    m_i = float("-inf")  # running max score
-    l_i = 0.0  # running sum of exp(score - max)
-    acc = tl.zeros([KV_BLOCK], dtype=tl.float32)  # running weighted sum of compressed_kv
-
-    cache_batch_base = slot_idx * MAX_SEQ_LEN * CACHE_DIM
-    num_blocks = (kv_len + SEQ_BLOCK - 1) // SEQ_BLOCK
-
-    for block_id in range(0, num_blocks):
-        block_start = block_id * SEQ_BLOCK
-        seq_offsets = block_start + tl.arange(0, SEQ_BLOCK)
-        seq_mask = seq_offsets < kv_len
-
-        # Load compressed_kv for this block: [SEQ_BLOCK, KV_BLOCK]
-        ckv_ptrs = (
-            mla_cache_ptr
-            + cache_batch_base
-            + seq_offsets[:, None] * CACHE_DIM
-            + kv_offsets[None, :]
-        )
-        ckv = tl.load(
-            ckv_ptrs,
-            mask=seq_mask[:, None] & kv_mask[None, :],
-            other=0.0,
-            eviction_policy="evict_first",
-        ).to(tl.float32)
-
-        # Load kpe for this block: [SEQ_BLOCK, PE_BLOCK]
-        kpe_ptrs = (
-            mla_cache_ptr
-            + cache_batch_base
-            + seq_offsets[:, None] * CACHE_DIM
-            + KV_LORA_RANK
-            + pe_offsets[None, :]
-        )
-        kpe = tl.load(
-            kpe_ptrs,
-            mask=seq_mask[:, None] & pe_mask[None, :],
-            other=0.0,
-            eviction_policy="evict_first",
-        ).to(tl.float32)
-
-        # Compute attention scores: [SEQ_BLOCK]
-        # score_nope = q_absorbed . compressed_kv  (dot product over kv_lora_rank)
-        # score_pe = q_pe . kpe  (dot product over qk_rope_head_dim)
-        scores_nope = tl.sum(q_abs[None, :] * ckv, axis=1)
-        scores_pe = tl.sum(q_pe[None, :] * kpe, axis=1)
-        # Multiply by SCALE * log2e to use exp2 (native H100 instruction) for softmax.
-        # exp2(x * log2e) == exp(x); exp2 maps to ex2.approx.f32 which is ~4x faster.
-        scores = (scores_nope + scores_pe) * (SCALE * 1.44269504)
-        scores = tl.where(seq_mask, scores, float("-inf"))
-
-        # Online softmax update (in log2 space)
-        m_ij = tl.max(scores)
-        m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.math.exp2(m_i - m_new)
-        p = tl.math.exp2(scores - m_new)
-        # Ensure masked positions contribute 0 (guards against -inf - (-inf) = nan)
-        p = tl.where(seq_mask, p, 0.0)
-
-        l_i = l_i * alpha + tl.sum(p)
-        acc = acc * alpha + tl.sum(p[:, None] * ckv, axis=0)
-        m_i = m_new
-
-    # Normalize by softmax denominator
-    safe_l_i = tl.maximum(l_i, 1e-38)
-    acc = acc / safe_l_i
-
-    # Store weighted_kv result
-    out_base = token_id * N_HEADS * KV_LORA_RANK + head_id * KV_LORA_RANK
-    tl.store(out_ptr + out_base + kv_offsets, acc, mask=kv_mask)
 
 
 @triton.jit
@@ -317,11 +150,15 @@ def _mla_attention_kernel_multihead(
     l_i = tl.zeros([HEAD_BLOCK], dtype=tl.float32)
     acc = tl.zeros([HEAD_BLOCK, KV_BLOCK], dtype=tl.float32)
 
-    cache_batch_base = slot_idx * MAX_SEQ_LEN * CACHE_DIM
-    num_blocks = (kv_len + SEQ_BLOCK - 1) // SEQ_BLOCK
+    # tl.multiple_of hints: cache_batch_base is a multiple of CACHE_DIM (row stride),
+    # allowing the compiler to prove alignment for vectorized memory operations.
+    cache_batch_base = tl.multiple_of(slot_idx * MAX_SEQ_LEN * CACHE_DIM, CACHE_DIM)
+    num_blocks = tl.cdiv(kv_len, SEQ_BLOCK)
 
     for block_id in range(0, num_blocks):
-        block_start = block_id * SEQ_BLOCK
+        # block_start is a multiple of SEQ_BLOCK — hint helps compiler prove alignment
+        # of seq_offsets and optimize address computation in the inner loop.
+        block_start = tl.multiple_of(block_id * SEQ_BLOCK, SEQ_BLOCK)
         seq_offsets = block_start + tl.arange(0, SEQ_BLOCK)
         seq_mask = seq_offsets < kv_len
 

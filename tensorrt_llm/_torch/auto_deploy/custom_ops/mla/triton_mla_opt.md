@@ -605,13 +605,41 @@ Correctness: PASS (all 14 shapes, max_abs_err \< 0.002).
 
 ______________________________________________________________________
 
+### Iteration 17 — tl.multiple_of hints + tl.cdiv; remove dead single-head kernel
+
+**Change:**
+
+1. Added `tl.multiple_of(block_id * SEQ_BLOCK, SEQ_BLOCK)` and
+   `tl.multiple_of(slot_idx * MAX_SEQ_LEN * CACHE_DIM, CACHE_DIM)` hints in
+   `_mla_attention_kernel_multihead`. These tell Triton that `block_start` is aligned
+   to SEQ_BLOCK and the cache row pointer is aligned to CACHE_DIM, allowing the compiler
+   to generate tighter address arithmetic and potentially vectorized memory ops.
+   Also replaced `(kv_len + SEQ_BLOCK - 1) // SEQ_BLOCK` with `tl.cdiv(kv_len, SEQ_BLOCK)`.
+
+1. Removed dead code: `_get_mla_decode_config`, `_get_mla_prefill_config`, and
+   `_mla_attention_kernel` (the original single-head kernel). All three have been
+   completely superseded by `_mla_attention_kernel_multihead` since iter 16.
+
+**Performance impact:** No measurable change — within benchmark noise (±2%) as expected for
+compiler hints. Correctness: PASS (all 14 shapes, max_abs_err \< 0.002).
+
+| ID  | Iter 16 µs | Iter 17 µs | Delta |
+| --- | ---------- | ---------- | ----- |
+| A1  | 8.6        | 8.7        | ±noise |
+| A2  | 12.4       | 12.7       | ±noise |
+| A9  | 14.4       | 14.3       | ±noise |
+
+**Commit:** iter 17 — tl.multiple_of hints + remove dead single-head kernel (no perf change)
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK \[HIGHEST PRIORITY\]
 
 - \[x\] **SEQ_BLOCK sweep (4,8,16,32,64,128)** — Done (iter 1): lookup table implemented, full GPU sweep pending.
-- \[x\] **Shape-conditional SEQ_BLOCK** — Done (iter 1): `_get_mla_decode_config` and `_get_mla_prefill_config` implemented.
-- \[x\] **Separate decode vs prefill SEQ_BLOCK** — Done (iter 1): separate functions for decode vs prefill.
+- \[x\] **Shape-conditional SEQ_BLOCK** — Done (iter 1): lookup tables; subsumed into `_get_mla_multihead_config` (iter 15); old single-head configs removed (iter 17).
+- \[x\] **Separate decode vs prefill SEQ_BLOCK** — Done (iter 1): separate configs per path; now unified in `_get_mla_multihead_config`.
 
 ### A.1 Memory Access Patterns
 
