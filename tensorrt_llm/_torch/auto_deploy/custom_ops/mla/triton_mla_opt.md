@@ -152,7 +152,7 @@ ______________________________________________________________________
 | A8  | 18.8           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **7.9×**    |
 | A9  | 14.4           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **9.0×**    |
 | A10 | 20.0           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **12.6×**   |
-| B1  | 21.3           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=2   | 15   | **18.6×**   |
+| B1  | 19.6           | multihead HB=16, SEQ_BLOCK=64, warps=8, stgs=2  | 19   | **20.2×**   |
 | B2  | 96.9           | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2 | 15   | **63.0×**   |
 | B3  | 289.1          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2 | 15   | **83.6×**   |
 | B4  | 980.7          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2 | 15   | **98.1×**   |
@@ -670,6 +670,30 @@ Also includes sweep script cleanup: fixed `run_correctness()` to use `_mla_atten
 Correctness: PASS (all 14 shapes, max_abs_err \< 0.002).
 
 **Commit:** iter 18 — adaptive HEAD_BLOCK=4/8 in decode dispatch (+1-8% A1-A8)
+
+______________________________________________________________________
+
+### Iteration 19 — HB=16 for prefill T≤128 (+8% B1)
+
+**Change:** Updated `_get_mla_multihead_config` for `is_prefill=True, num_tokens ≤ 128`:
+from `return 64, 8, 8, 2` (HB=8) to `return 64, 16, 8, 2` (HB=16).
+
+HB=16 doubles cache sharing (16 heads share one cache load vs 8), halving HBM traffic for this path.
+Grid=(T, 32//16=2)=2T programs — for B1 (T=128): grid=256 programs on H100 (132 SMs), ~2 waves.
+The extra pipeline occupancy from 2 waves outweighs the small dispatch overhead.
+
+SMEM usage with s=2: 1 prefetch buffer × (64×256 + 64×64) × 2 bytes = 80 KB — well within H100 limits.
+
+**Benchmark:**
+
+| ID  | Iter 18 µs | Iter 19 µs | Delta  |
+| --- | ---------- | ---------- | ------ |
+| B1  | 21.3       | 19.6       | +8.0%  |
+
+A-shapes unchanged (only `is_prefill=True, T≤128` path changed).
+Correctness: PASS (all 14 shapes, max_abs_err \< 0.002).
+
+**Commit:** iter 19 — HB=16 for prefill T≤128 (+8% B1)
 
 ______________________________________________________________________
 

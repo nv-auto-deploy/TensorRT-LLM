@@ -66,11 +66,12 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
       B2=96.4µs, B3=288.5µs, B4=982.5µs.
     """
     if is_prefill:
-        # B1 T≤128: HB=8, SB=64, w=8, s=2 → 21.3µs
+        # B1 T≤128: HB=16, SB=64, w=8, s=2 → 19.6µs (vs HB=8: 21.3µs, +8%)
+        #   HB=16 doubles cache sharing vs HB=8: grid=(T, 2) uses 2 programs per token.
         # B2-B4 T>128: HB=32, SB=128, w=8, s=2 → 96.4/288.5/982.5µs
         # stages=5 OOM for HB=32 SB=128 (SMEM overflow); stages=2 best.
         if num_tokens <= 128:
-            return 64, 8, 8, 2
+            return 64, 16, 8, 2
         else:
             return 128, 32, 8, 2
     else:
