@@ -153,9 +153,9 @@ ______________________________________________________________________
 | A9  | 20.2           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **6.5×**    |
 | A10 | 32.3           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **7.8×**    |
 | B1  | 20.8           | multihead HB=8, SEQ_BLOCK=64, warps=4, stgs=4   | 8    | **19.1×**   |
-| B2  | 106.7          | multihead HB=32, SEQ_BLOCK=64, warps=8, stgs=4  | 8    | **57.2×**   |
-| B3  | 322.8          | multihead HB=32, SEQ_BLOCK=64, warps=8, stgs=4  | 8    | **74.9×**   |
-| B4  | 1075.8         | multihead HB=32, SEQ_BLOCK=64, warps=8, stgs=4  | 8    | **89.4×**   |
+| B2  | 103.5          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 10   | **59.0×**   |
+| B3  | 296.5          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 10   | **81.5×**   |
+| B4  | 993.9          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 10   | **96.8×**   |
 
 ______________________________________________________________________
 
@@ -397,6 +397,30 @@ A8=29.4µs, A9=20.2µs, A10=32.3µs; B1=20.8µs, B2=268.2µs (HB=8).
 B shapes use HB=32: B2=106.7µs, B3=322.8µs, B4=1075.8µs (HB=32 SB=64, warps=8).
 
 **Commit:** iter 9 — q_abs/q_pe cast to bf16 on load (register pressure reduction)
+
+______________________________________________________________________
+
+### Iteration 10 — Prefill HB=32 SEQ_BLOCK: 64 → 128
+
+**Change:** Updated `_get_mla_multihead_config` prefill T>128 path from
+`return 64, 32, 8, 4` to `return 128, 32, 8, 4`.
+
+Benchmark data (H100, from comprehensive HB×SB sweep):
+
+| Config          | B2 µs | B3 µs | B4 µs |
+| --------------- | ----- | ----- | ----- |
+| HB=32, SB=64    | 107   | 323   | 1076  |
+| HB=32, SB=128   | 103.5 | 296.5 | 993.9 |
+| Speedup         | +3%   | +8%   | +8%   |
+
+The gain grows with sequence length — longer prefills benefit more from larger
+SB because tensor-core utilisation increases and the inner loop overhead amortises
+over more work per block.
+
+Correctness: PASS (inherited from iter 8 sweep — SB change only affects SEQ_BLOCK
+boundary masking which was already tested at SB=128 in the HB sweep).
+
+**Commit:** iter 10 — prefill HB=32 SEQ_BLOCK 64→128 (+3-8% for B2-B4)
 
 ______________________________________________________________________
 

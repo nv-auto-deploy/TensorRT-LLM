@@ -99,12 +99,13 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
     large prefill (maximises cache sharing and tensor-core utilisation).
     """
     if is_prefill:
-        # B1 T≤128: HB=8, SB=64 → 21.0µs  (HB=32 slightly worse for small T)
-        # B2-B4 T>128: HB=32, SB=64 → 107/323/1076µs  (vs SB=16: 178/515/1837µs)
+        # B1 T≤128: HB=8, SB=64 → 20.8µs
+        # B2-B4 T>128: HB=32, SB=128 → 103.5/296.5/993.9µs (vs SB=64: 107/323/1076µs)
+        # SB=128 gains grow with sequence length: B2=+3%, B3=+8%, B4=+8%.
         if num_tokens <= 128:
             return 64, 8, 4, 4
         else:
-            return 64, 32, 8, 4
+            return 128, 32, 8, 4
     else:
         # Decode: num_tokens >= 16 uses multihead.
         # HB=8, SB=64 beats HB=4, SB=16 for A8-A10: 29.7/20.4/32.6µs vs 53.4/32.5/56.0µs
