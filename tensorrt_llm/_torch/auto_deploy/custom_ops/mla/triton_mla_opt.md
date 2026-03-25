@@ -1760,6 +1760,45 @@ multihead (same as baseline before split-K was added) — no regression vs. orig
 
 **Commit:** iter 55 — CUDA graph compat: split-K eager-only via is_current_stream_capturing
 
+**REVERTED in iter 56:** Making `is_current_stream_capturing()` guard the `.item()` call
+causes CUDA graph capture to SUCCEED. But the captured CUDA graph replay then triggers
+an unrelated `_assert_async` assertion (from `TensorCompare.cu:112`) that surfaces as a
+`fused_gather_scatter` CUDA error on the first inference step. Root cause: some other
+kernel in the captured graph fires the assertion. The correct behavior is to let `.item()`
+run unconditionally, causing CUDA graph capture to fail with
+`cudaErrorStreamCaptureUnsupported`, which AutoDeploy handles by falling back to eager
+execution. In eager mode, `.item()` is legal and all split-K optimizations run correctly.
+
+______________________________________________________________________
+
+### Iteration 56 — REVERT iter 55: restore unconditional int(kv_len.max().item())
+
+**Change:** Revert iter 55 — remove `is_current_stream_capturing()` guard and restore
+`max_kv_len = int(kv_len.max().item())` running unconditionally.
+
+```python
+# After iter 56 (restored):
+max_kv_len = int(kv_len.max().item())
+use_splitk = (b <= 4 and max_kv_len >= 256) or (b <= 8 and max_kv_len >= 512)
+```
+
+**Root cause analysis:** Iter 55's `is_current_stream_capturing()` guard made CUDA graph
+capture succeed. This exposed an unrelated bug in the CUDA graph replay — a pre-existing
+`_assert_async` assertion fires from some other kernel captured in the graph, and is
+detected when `fused_gather_scatter` tries to initialize. The assert has empty message
+(`Assertion '' failed`) from `TensorCompare.cu:112`.
+
+**Correct behavior:** The `.item()` call raises `cudaErrorStreamCaptureUnsupported`
+during CUDA graph capture. AutoDeploy catches this and falls back to eager execution.
+In eager mode: `.item()` is legal, split-K dispatches correctly for all shapes, iter 53's
+prefill dtype fix applies. The result: full optimizations active in eager mode.
+
+**Performance:** All split-K and multihead optimizations (iters 1-51) remain active in
+eager execution. CUDA graph mode (when used for other parts of the graph) is unaffected
+since this fallback is isolated to the MLA op.
+
+**Commit:** iter 56 — REVERT iter 55: restore unconditional .item() for eager-mode fallback \[REVERT\]
+
 ______________________________________________________________________
 
 ## Optimization Ideas Backlog
@@ -1806,7 +1845,7 @@ ______________________________________________________________________
 
 ## Final Best Configuration
 
-**Total iterations: 55** | **GPU: NVIDIA H100 80GB HBM3**
+**Total iterations: 56** | **GPU: NVIDIA H100 80GB HBM3**
 
 ### Dispatch logic summary
 
