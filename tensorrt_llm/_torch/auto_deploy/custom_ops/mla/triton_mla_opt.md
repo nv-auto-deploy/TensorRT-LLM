@@ -150,8 +150,8 @@ ______________________________________________________________________
 | A6  | 12.6           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **5.4×**    |
 | A7  | 17.7           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **7.4×**    |
 | A8  | 18.8           | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3   | 18   | **7.9×**    |
-| A9  | 14.4           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **9.0×**    |
-| A10 | 20.0           | multihead HB=8, SEQ_BLOCK=64, warps=8, stgs=3   | 15   | **12.6×**   |
+| A9  | 14.3           | multihead HB=8, SEQ_BLOCK=128, warps=8, stgs=3  | 20   | **9.1×**    |
+| A10 | 18.3           | multihead HB=8, SEQ_BLOCK=128, warps=8, stgs=3  | 20   | **13.8×**   |
 | B1  | 19.6           | multihead HB=16, SEQ_BLOCK=64, warps=8, stgs=2  | 19   | **20.2×**   |
 | B2  | 96.9           | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2 | 15   | **63.0×**   |
 | B3  | 289.1          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=2 | 15   | **83.6×**   |
@@ -694,6 +694,36 @@ A-shapes unchanged (only `is_prefill=True, T≤128` path changed).
 Correctness: PASS (all 14 shapes, max_abs_err \< 0.002).
 
 **Commit:** iter 19 — HB=16 for prefill T≤128 (+8% B1)
+
+______________________________________________________________________
+
+### Iteration 20 — SB=128 for large-batch decode (B>16, A9-A10)
+
+**Change:** Updated `_get_mla_multihead_config` decode path for `num_tokens > 16`:
+from `return 64, 8, 8, 3` (SB=64) to `return 128, 8, 8, 3` (SB=128).
+
+**Why SB=128 wins for large-batch:**
+With B=32 and kv_len=512 (A10), the kernel iterates over `kv_len/SEQ_BLOCK` blocks:
+
+- SB=64: 512/64 = 8 iterations per program
+- SB=128: 512/128 = 4 iterations per program
+
+Larger SEQ_BLOCK reduces loop overhead and improves the ratio of useful computation
+to loop-control overhead. The pipeline depth (stages=3) prefetches more data per
+iteration. SMEM usage: (128×256 + 128×64) × 2 bytes × (stages-1) stages =
+2 × 40960 × 2 = 163 KB — within H100 limits.
+
+**Benchmark:**
+
+| ID  | Iter 19 µs | Iter 20 µs | Delta  |
+| --- | ---------- | ---------- | ------ |
+| A9  | 14.4       | 14.3       | +0.7%  |
+| A10 | 20.0       | 18.3       | +8.5%  |
+
+A1-A8 unchanged (only `num_tokens > 16` path changed).
+Correctness: PASS (all 14 shapes, max_abs_err \< 0.002).
+
+**Commit:** iter 20 — SB=128 for large-batch decode B>16 (+8.5% A10)
 
 ______________________________________________________________________
 

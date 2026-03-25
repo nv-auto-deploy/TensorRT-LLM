@@ -76,11 +76,13 @@ def _get_mla_multihead_config(num_tokens: int, is_prefill: bool) -> tuple:
             return 128, 32, 8, 2
     else:
         # HB=4 for B≤16: more SM programs without sacrificing cache sharing (A1-A8)
-        # HB=8 for B>16: ~1 full H100 wave, better cache sharing vs HB=4 (A9-A10)
+        # HB=8 for B>16: ~1 full H100 wave, better cache sharing vs HB=4
+        # SB=128 for B>16: fewer loop iterations → less loop overhead, better pipeline;
+        #   A10: 18.3µs vs 20.0µs (+8.5%) with SB=128 vs SB=64 (HB=8 w=8 s=3)
         if num_tokens <= 16:
             return 64, 4, 8, 3
         else:
-            return 64, 8, 8, 3
+            return 128, 8, 8, 3
 
 
 @triton.jit
