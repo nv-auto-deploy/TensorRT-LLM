@@ -216,14 +216,16 @@ def _mla_attention_kernel(
         # score_pe = q_pe . kpe  (dot product over qk_rope_head_dim)
         scores_nope = tl.sum(q_abs[None, :] * ckv, axis=1)
         scores_pe = tl.sum(q_pe[None, :] * kpe, axis=1)
-        scores = (scores_nope + scores_pe) * SCALE
+        # Multiply by SCALE * log2e to use exp2 (native H100 instruction) for softmax.
+        # exp2(x * log2e) == exp(x); exp2 maps to ex2.approx.f32 which is ~4x faster.
+        scores = (scores_nope + scores_pe) * (SCALE * 1.44269504)
         scores = tl.where(seq_mask, scores, float("-inf"))
 
-        # Online softmax update
+        # Online softmax update (in log2 space)
         m_ij = tl.max(scores)
         m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(scores - m_new)
+        alpha = tl.math.exp2(m_i - m_new)
+        p = tl.math.exp2(scores - m_new)
         # Ensure masked positions contribute 0 (guards against -inf - (-inf) = nan)
         p = tl.where(seq_mask, p, 0.0)
 
@@ -355,17 +357,19 @@ def _mla_attention_kernel_multihead(
         # bf16 x bf16 -> fp32 via tl.dot (tensor cores); q tensors already in bf16
         scores_nope = tl.dot(q_abs_all, tl.trans(ckv_bf16)).to(tl.float32)
         scores_pe = tl.dot(q_pe_all, tl.trans(kpe_bf16)).to(tl.float32)
-        scores = (scores_nope + scores_pe) * SCALE
+        # Multiply by SCALE * log2e so exp2 can be used: exp2(x*log2e) == exp(x).
+        # tl.math.exp2 maps to ex2.approx.f32 (native H100 instruction, ~4x faster).
+        scores = (scores_nope + scores_pe) * (SCALE * 1.44269504)
 
         # Mask out-of-bounds positions
         seq_mask_2d = seq_mask[None, :]  # [1, SEQ_BLOCK] broadcasts to [HEAD_BLOCK, SEQ_BLOCK]
         scores = tl.where(seq_mask_2d, scores, float("-inf"))
 
-        # Online softmax update — vectorized across HEAD_BLOCK
+        # Online softmax update in log2 space — vectorized across HEAD_BLOCK
         m_ij = tl.max(scores, axis=1)  # [HEAD_BLOCK]
         m_new = tl.maximum(m_i, m_ij)  # [HEAD_BLOCK]
-        alpha = tl.exp(m_i - m_new)  # [HEAD_BLOCK]
-        p = tl.exp(scores - m_new[:, None])  # [HEAD_BLOCK, SEQ_BLOCK]
+        alpha = tl.math.exp2(m_i - m_new)  # [HEAD_BLOCK]
+        p = tl.math.exp2(scores - m_new[:, None])  # [HEAD_BLOCK, SEQ_BLOCK]
         p = tl.where(seq_mask_2d, p, 0.0)
 
         l_i = l_i * alpha + tl.sum(p, axis=1)  # [HEAD_BLOCK]

@@ -472,6 +472,38 @@ Correctness: PASS (HB=8 SB=64 tested for all 14 shapes in iter 8 sweep).
 
 ______________________________________________________________________
 
+### Iteration 13 — exp2 softmax: tl.exp → tl.math.exp2
+
+**Change:** In both `_mla_attention_kernel` and `_mla_attention_kernel_multihead`,
+replaced `tl.exp` with `tl.math.exp2` for the online softmax:
+
+```python
+# Before:
+scores = (scores_nope + scores_pe) * SCALE
+alpha = tl.exp(m_i - m_new)
+p = tl.exp(scores - m_new)
+
+# After:
+scores = (scores_nope + scores_pe) * (SCALE * 1.44269504)  # SCALE * log2e
+alpha = tl.math.exp2(m_i - m_new)  # m values in log2 space
+p = tl.math.exp2(scores - m_new)
+```
+
+`tl.math.exp2` compiles to `ex2.approx.f32` (native H100 instruction, ~4× faster
+than `exp` in isolation). Math is unchanged: `exp2(x * log2e) == exp(x)`.
+
+**Result:** Correctness PASS (all 14 shapes). Performance: negligible change.
+A9=20.2µs (unchanged), B3=972µs (HB=8 baseline, unchanged).
+
+**Analysis:** The kernel is HBM bandwidth-bound; the softmax exp operations
+represent a tiny fraction of total cycles compared to tl.load bandwidth waits.
+The optimization is still worthwhile as free throughput on compute-bound paths
+and correct, but does not move the needle for memory-bound shapes.
+
+**Commit:** iter 13 — exp2 softmax (tl.exp → tl.math.exp2, no perf regression)
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK \[HIGHEST PRIORITY\]
