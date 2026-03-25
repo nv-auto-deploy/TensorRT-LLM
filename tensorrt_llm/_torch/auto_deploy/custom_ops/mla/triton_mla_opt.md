@@ -1667,6 +1667,12 @@ more partitions than strictly necessary, but extra partitions are masked and fas
 
 **Commit:** iter 52 — CUDA graph compat: static max_kv_len from mla_cache.shape\[1\]
 
+**REVERTED in iter 54:** The static `mla_cache.shape[1]` change caused CUDA graph
+capture to succeed, which exposed a pre-existing bug in `fused_gather_scatter` during
+CUDA graph replay. Before this change, the `.item()` call caused CUDA graph capture to
+fail gracefully, falling back to eager mode — where `build_and_run_ad.py` worked
+correctly. The revert restores the working eager-mode behavior.
+
 ______________________________________________________________________
 
 ### Iteration 53 — Fix dtype mismatch in prefill value projection (weighted_kv.float())
@@ -1693,6 +1699,25 @@ as-is (BF16) — that path was already consistent.
 conversion before the einsum, but the einsum itself dominates.
 
 **Commit:** iter 53 — fix prefill dtype mismatch: weighted_kv.float() in value projection
+
+______________________________________________________________________
+
+### Iteration 54 — REVERT iter 52 (restore int(kv_len.max().item()))
+
+**Change:** Revert iter 52 — restore `max_kv_len = int(kv_len.max().item())`.
+
+**Reason:** Iter 52 made CUDA graph capture succeed for the triton_mla decode path.
+However, this exposed a pre-existing bug in `fused_gather_scatter` (a different utility
+kernel in `triton_utils.py`) during CUDA graph replay — an out-of-bounds index assert
+that fires on the first inference step. Before iter 52, `.item()` caused CUDA graph
+capture to fail gracefully (system fell back to eager mode), and `build_and_run_ad.py`
+worked correctly in eager mode.
+
+**Decision:** Keep the original `.item()` behavior to preserve the working eager-mode
+fallback. The `fused_gather_scatter` CUDA graph replay bug is a separate pre-existing
+issue outside the scope of `triton_mla.py` optimization.
+
+**Commit:** iter 54 — REVERT iter 52: restore int(kv_len.max().item()) \[REVERT\]
 
 ______________________________________________________________________
 
@@ -1740,7 +1765,7 @@ ______________________________________________________________________
 
 ## Final Best Configuration
 
-**Total iterations: 53** | **GPU: NVIDIA H100 80GB HBM3**
+**Total iterations: 54** | **GPU: NVIDIA H100 80GB HBM3**
 
 ### Dispatch logic summary
 
