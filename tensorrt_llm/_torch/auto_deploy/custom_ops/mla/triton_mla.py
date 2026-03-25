@@ -51,18 +51,25 @@ from ..attention_interface import (
 )
 
 
-def _get_mla_decode_config(num_tokens: int) -> tuple:
+def _get_mla_decode_config(num_tokens: int, max_kv_len: int = 1024) -> tuple:
     """Per-shape best (SEQ_BLOCK, num_warps, num_stages) for decode attention.
 
-    Derived from sweep over Mistral-Small-4-119B-2603 shapes on H100 80GB HBM3.
-    Key dimension: num_tokens (batch size). Larger batches need smaller blocks
-    to expose enough parallelism; single-token decode benefits from large blocks.
+    Derived from full 150-config sweep on H100 80GB HBM3 (Mistral-Small-4-119B-2603).
+    Key dimensions: num_tokens (batch) and max_kv_len (context length).
+
+    Single-token decode: SEQ_BLOCK scales with kv_len (larger blocks amortise loop overhead).
+    Batched decode: smaller SEQ_BLOCK exposes more SM-level parallelism.
     """
-    if num_tokens <= 4:
-        return 128, 8, 4
-    elif num_tokens <= 12:
+    if num_tokens <= 1:
+        if max_kv_len <= 64:
+            return 64, 4, 4
+        elif max_kv_len <= 1024:
+            return 128, 8, 4
+        else:
+            return 128, 8, 5
+    elif num_tokens <= 8:
         return 64, 4, 4
-    elif num_tokens <= 24:
+    elif num_tokens <= 16:
         return 32, 2, 2
     else:
         return 16, 1, 2
@@ -71,11 +78,12 @@ def _get_mla_decode_config(num_tokens: int) -> tuple:
 def _get_mla_prefill_config(total_tokens: int) -> tuple:
     """Per-shape best (SEQ_BLOCK, num_warps, num_stages) for prefill attention.
 
-    Derived from sweep over Mistral-Small-4-119B-2603 shapes on H100 80GB HBM3.
-    Prefill always benefits from warps=1; SEQ_BLOCK depends on total token count.
+    Derived from full 150-config sweep on H100 80GB HBM3 (Mistral-Small-4-119B-2603).
+    Note: _mla_attention_kernel_multihead gives much larger speedup for prefill.
+    These configs serve as the fallback for the original scalar kernel path.
     """
-    if total_tokens <= 512:
-        return 8, 1, 5
+    if total_tokens <= 128:
+        return 16, 1, 1
     else:
         return 16, 1, 5
 
@@ -431,7 +439,8 @@ def _triton_mla_decode(
     # Per-token KV length: decode attends to positions [0, input_pos]
     kv_len = (input_pos + 1).to(torch.int32)
 
-    seq_block, nw, ns = _get_mla_decode_config(b)
+    max_kv_len = int(kv_len.max().item())
+    seq_block, nw, ns = _get_mla_decode_config(b, max_kv_len)
     grid = (b, num_heads)
     _mla_attention_kernel[grid](
         q_absorbed,

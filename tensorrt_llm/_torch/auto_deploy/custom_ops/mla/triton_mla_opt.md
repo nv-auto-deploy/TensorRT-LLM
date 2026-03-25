@@ -142,16 +142,16 @@ ______________________________________________________________________
 
 | ID  | Best kernel µs | Config                                          | Iter | vs Baseline |
 | --- | -------------- | ----------------------------------------------- | ---- | ----------- |
-| A1  | 20.9           | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
-| A2  | 66.6           | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
-| A3  | 127.1          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
-| A4  | 249.0          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
-| A5  | 491.1          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
-| A6  | 68.5           | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
-| A7  | 130.2          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
-| A8  | 149.2          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
-| A9  | 130.3          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
-| A10 | 252.6          | SEQ_BLOCK=8, warps=2, stages=2                  | 0    | baseline    |
+| A1  | 9.4            | SEQ_BLOCK=64, warps=4, stages=4                 | 4    | **2.2×**    |
+| A2  | 17.0           | SEQ_BLOCK=128, warps=8, stages=2                | 4    | **3.9×**    |
+| A3  | 28.1           | SEQ_BLOCK=128, warps=8, stages=4                | 4    | **4.5×**    |
+| A4  | 50.4           | SEQ_BLOCK=128, warps=8, stages=4                | 4    | **4.9×**    |
+| A5  | 94.6           | SEQ_BLOCK=128, warps=8, stages=5                | 4    | **5.2×**    |
+| A6  | 26.4           | SEQ_BLOCK=64, warps=4, stages=2                 | 4    | **2.6×**    |
+| A7  | 45.7           | SEQ_BLOCK=64, warps=4, stages=4                 | 4    | **2.9×**    |
+| A8  | 62.0           | SEQ_BLOCK=32, warps=2, stages=2                 | 4    | **2.4×**    |
+| A9  | 43.6           | SEQ_BLOCK=16, warps=1, stages=3                 | 4    | **3.0×**    |
+| A10 | 79.5           | SEQ_BLOCK=16, warps=1, stages=2                 | 4    | **3.2×**    |
 | B1  | 25.6           | multihead HB=8, SEQ_BLOCK=16, warps=4, stgs=4   | 2    | **15.5×**   |
 | B2  | 177.5          | multihead HB=16, SEQ_BLOCK=128, warps=4, stgs=4 | 2    | **34.4×**   |
 | B3  | 515.0          | multihead HB=32, SEQ_BLOCK=128, warps=8, stgs=4 | 2    | **46.9×**   |
@@ -246,6 +246,40 @@ SEQ_BLOCK≥16 constraint in `bench_multihead_kernel` (`assert SEQ_BLOCK >= 16`,
 `max(params["SEQ_BLOCK"], 16)` in HEAD_BLOCK mode). No kernel logic changes.
 
 **Commit:** iter 3 — parallel_bench_mla.sh + multi-GPU infra + SEQ_BLOCK≥16 fix
+
+______________________________________________________________________
+
+### Iteration 4 — Full 150-config parameter sweep; update decode/prefill lookup tables
+
+**Change:** Ran full `--sweep` (SEQ_BLOCK×warps×stages grid, 150 configs × 14 shapes).
+Updated `_get_mla_decode_config` to take `max_kv_len` as second parameter — for
+single-token decode, context length is the key sweep dimension. Updated
+`_get_mla_prefill_config` with sweep-optimal defaults (fallback path; multihead
+kernel preferred for prefill).
+
+**Sweep results (best original kernel per shape):**
+
+| ID  | baseline µs | best µs | speedup | Config                         |
+| --- | ----------- | ------- | ------- | ------------------------------ |
+| A1  | 20.9        | 9.4     | 2.2×    | SEQ_BLOCK=64,  warps=4, stgs=4 |
+| A2  | 66.6        | 17.0    | 3.9×    | SEQ_BLOCK=128, warps=8, stgs=2 |
+| A3  | 127.1       | 28.1    | 4.5×    | SEQ_BLOCK=128, warps=8, stgs=4 |
+| A4  | 249.0       | 50.4    | 4.9×    | SEQ_BLOCK=128, warps=8, stgs=4 |
+| A5  | 491.1       | 94.6    | 5.2×    | SEQ_BLOCK=128, warps=8, stgs=5 |
+| A6  | 68.5        | 26.4    | 2.6×    | SEQ_BLOCK=64,  warps=4, stgs=2 |
+| A7  | 130.2       | 45.7    | 2.9×    | SEQ_BLOCK=64,  warps=4, stgs=4 |
+| A8  | 149.2       | 62.0    | 2.4×    | SEQ_BLOCK=32,  warps=2, stgs=2 |
+| A9  | 130.3       | 43.6    | 3.0×    | SEQ_BLOCK=16,  warps=1, stgs=3 |
+| A10 | 252.6       | 79.5    | 3.2×    | SEQ_BLOCK=16,  warps=1, stgs=2 |
+| B1  | 396.4       | 82.5    | 4.8×    | SEQ_BLOCK=16,  warps=1, stgs=1 |
+| B2  | 6107.9      | 1402.3  | 4.4×    | SEQ_BLOCK=8,   warps=1, stgs=5 |
+| B3  | 24183.3     | 8152.5  | 3.0×    | SEQ_BLOCK=16,  warps=1, stgs=5 |
+| B4  | 96220.1     | 31584.2 | 3.0×    | SEQ_BLOCK=16,  warps=1, stgs=1 |
+
+Note: B-shapes are better served by the multihead kernel (iter 2): B1=25.6µs, B2=177.5µs,
+B3=515µs, B4=1842µs — these are 3-17× faster than the original kernel's best.
+
+**Commit:** iter 4 — full sweep results; update decode/prefill lookup tables
 
 ______________________________________________________________________
 
