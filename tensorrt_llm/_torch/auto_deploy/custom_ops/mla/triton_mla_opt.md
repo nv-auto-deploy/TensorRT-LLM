@@ -144,9 +144,9 @@ ______________________________________________________________________
 | --- | -------------- | ---------------------------------------------------- | ---- | ----------- |
 | A1  | 8.5            | multihead HB=4, SEQ_BLOCK=64, warps=8, stgs=3       | 18   | **2.5×**    |
 | A2  | 10.8           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **6.2×**    |
-| A3  | 10.8           | split-K NP=8, HB=4, SB=64, warps=8, stgs=3         | 28   | **11.8×**   |
-| A4  | 12.2           | split-K NP=8, HB=4, SB=64, warps=8, stgs=3         | 28   | **20.4×**   |
-| A5  | 13.9           | split-K NP=8, HB=4, SB=128, warps=8, stgs=3        | 28   | **35.3×**   |
+| A3  | 11.0           | split-K NP=8, HB=4, SB=64, warps=8, stgs=3         | 29   | **11.5×**   |
+| A4  | 11.8           | split-K NP=16, HB=4, SB=64, warps=8, stgs=3        | 29   | **21.1×**   |
+| A5  | 13.2           | split-K NP=16, HB=4, SB=128, warps=8, stgs=3       | 29   | **37.2×**   |
 | A6  | 11.9           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **5.8×**    |
 | A7  | 15.4           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **8.5×**    |
 | A8  | 16.0           | multihead HB=4, SEQ_BLOCK=128, warps=8, stgs=3      | 21   | **9.3×**    |
@@ -964,6 +964,42 @@ Updated Current Best Summary: A3=10.8µs, A4=12.2µs, A5=13.9µs.
 Correctness: PASS (all 14 shapes).
 
 **Commit:** iter 28 — adaptive SB in split-K dispatch (+4-10% A3-A5)
+
+______________________________________________________________________
+
+### Iteration 29 — Adaptive NUM_PARTS: NP=8 for kv≤512, NP=16 for kv>512
+
+**Change:** Updated `_triton_mla_decode` and `sweep_triton_mla.py` to use:
+
+```python
+num_parts = 8 if max_kv_len <= 512 else 16
+```
+
+**Why NP=16 helps for longer context:**
+With NP=16 and HB=4: grid = (T=1, 8, 16) = 128 programs → ~97% SM utilization on H100
+(132 SMs), vs NP=8's 64 programs (~48% utilization). Near-full SM fill hides HBM
+latency of longer kv sequences.
+
+NP sweep results (on GPU 0):
+
+| ID  | kv  | NP=4 | NP=8  | NP=16 | NP=32 | Best |
+| --- | --- | ---- | ----- | ----- | ----- | ---- |
+| A3  | 512 | 12.0 | **11.0** | 11.6 | 13.0 | NP=8  |
+| A4  | 1024 | 14.6 | 12.5 | **11.8** | 13.0 | NP=16 |
+| A5  | 2048 | 17.1 | 14.4 | **13.2** | 15.7 | NP=16 |
+
+NP=32 regresses (over-partitioning: too many small blocks, launcher overhead dominates).
+
+**Improvement vs iter 28:**
+
+| ID  | Iter 28 µs | Iter 29 µs | Delta |
+| --- | ---------- | ---------- | ----- |
+| A4  | 12.2       | **11.8**   | +3.4% |
+| A5  | 13.9       | **13.2**   | +5.0% |
+
+Correctness: PASS (all 14 shapes).
+
+**Commit:** iter 29 — adaptive NP=8/16 for split-K (+3-5% A4-A5)
 
 ______________________________________________________________________
 

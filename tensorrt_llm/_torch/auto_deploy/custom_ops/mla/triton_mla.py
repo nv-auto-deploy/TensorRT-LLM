@@ -527,17 +527,18 @@ def _triton_mla_decode(
         b, is_prefill=False, max_kv_len=max_kv_len
     )
 
-    # Split-K: for b≤4 with kv≥512, partition kv blocks across 8 parts.
-    # T=1, HB=4 gives grid=(1,8)=8 programs (6% SM utilization).
-    # With NUM_PARTS=8: grid=(1,8,8)=64 programs (~48% SM utilization).
-    # Adaptive SEQ_BLOCK for split-K (iter 28): choose SB to maximize partition fill.
-    #   SB=64 → total_blocks = kv/64. For kv≤1536: ≤24 blocks, each of 8 parts gets ≤3 blocks.
-    #   SB=128 → for kv>1536: ≥12 blocks → each of 8 parts gets ≥2 blocks (good fill).
-    #   Benchmark: kv=512 SB=64→11.2µs, SB=128→12.2µs (+9%); kv=2048 SB=128→14.3µs, SB=64→15.5µs (+8%).
+    # Split-K: for b≤4 with kv≥512, partition kv blocks to fill more H100 SMs.
+    # T=1, HB=4: grid=(1,8)=8 programs (6% SM utilization).
+    # Adaptive NUM_PARTS (iter 29): NP=8 for kv≤512 (grid=64 programs, 48% SM),
+    #   NP=16 for kv>512 (grid=128 programs, ~97% SM, +5-8% improvement on A4-A5).
+    # Adaptive SEQ_BLOCK (iter 28): SB=64 for kv≤1536 maximizes partition fill;
+    #   SB=128 for kv>1536 (better pipeline fill per block).
     use_splitk = b <= 4 and max_kv_len >= 512
-    num_parts = 8 if use_splitk else 1
     if use_splitk:
+        num_parts = 8 if max_kv_len <= 512 else 16
         seq_block = 64 if max_kv_len <= 1536 else 128
+    else:
+        num_parts = 1
 
     if use_splitk:
         kv_block = triton.next_power_of_2(kv_lora_rank)
