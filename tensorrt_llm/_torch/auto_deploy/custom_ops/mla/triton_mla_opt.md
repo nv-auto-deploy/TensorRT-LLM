@@ -822,6 +822,56 @@ warps=8 wins on 6/7 shapes. warps=4 ties A4 and is 1.7% faster on A5 (34.8 vs
 
 ______________________________________________________________________
 
+### Iteration 24 — HEAD_BLOCK sweep: HB=1 and HB=2 for decode \[NO IMPROVEMENT\]
+
+**Change:** Benchmark-only; no code change.
+
+Hypothesis: HB=1 (grid=(T, 32)) gives 4× more SM programs than HB=4 (grid=(T, 8))
+for T=1 shapes, potentially hiding more latency via more active SMs.
+
+Results (SB=128, warps=8, stages=3) vs current best:
+
+| ID  | HB=2 µs | HB=1 µs | HB=4 cur best | Winner    |
+| --- | ------- | ------- | ------------- | --------- |
+| A1  | 9.6     | 9.3     | **8.5**       | HB=4      |
+| A2  | 11.1    | 10.8    | **10.8**      | tie HB=4  |
+| A3  | 14.8    | 14.3    | **14.3**      | tie HB=4  |
+| A4  | 21.6    | 21.3    | **21.5**      | HB=1 ≈HB=4 |
+| A5  | 35.9    | 35.5    | **35.4**      | HB=4      |
+| A6  | 12.8    | 20.2    | **11.9**      | HB=4      |
+| A7  | 16.8    | 27.5    | **15.4**      | HB=4      |
+| A8  | 29.2    | 48.3    | **16.0**      | HB=4      |
+
+HB=2 and HB=1 lose for all T>1 shapes (A6-A10) because they expose
+more parallelism but sacrifice cache amortization. HB=4 remains optimal.
+
+**Commit:** iter 24 — HB sweep HB=1,HB=2 \[NO IMPROVEMENT: HB=4 wins\]
+
+______________________________________________________________________
+
+### Iteration 25 — SB=64 stages=5 and warps=4 sweep \[NO IMPROVEMENT\]
+
+**Change:** Benchmark-only; no code change.
+
+Tested alternative configs for the SB=64 path (A1 shape, kv=64) and compared
+broadly:
+
+- `SB=64 warps=8 stages=5`: A1 = 8.8µs vs **8.5µs** (current best, stages=3) — worse
+- `SB=64 warps=4 stages=3`: A1 = 9.7µs — worse; also worse for all other shapes
+
+stages=5 adds more SMEM pipeline overhead than it hides for this small kv_len.
+warps=4 reduces occupancy without compensating benefit.
+
+| Config           | A1 µs | A2 µs | A3 µs | A9 µs |
+| ---------------- | ----- | ----- | ----- | ----- |
+| SB=64 w=8 s=3 ✓ | **8.5** | 12.5  | 17.7  | 14.5  |
+| SB=64 w=8 s=5   | 8.8   | 12.6  | 17.7  | 15.6  |
+| SB=64 w=4 s=3   | 9.7   | 14.2  | 20.9  | 16.4  |
+
+**Commit:** iter 25 — SB=64 stages/warps variants \[NO IMPROVEMENT\]
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK \[HIGHEST PRIORITY\]
