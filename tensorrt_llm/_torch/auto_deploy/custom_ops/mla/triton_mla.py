@@ -191,7 +191,12 @@ def _mla_attention_kernel(
             + seq_offsets[:, None] * CACHE_DIM
             + kv_offsets[None, :]
         )
-        ckv = tl.load(ckv_ptrs, mask=seq_mask[:, None] & kv_mask[None, :], other=0.0).to(tl.float32)
+        ckv = tl.load(
+            ckv_ptrs,
+            mask=seq_mask[:, None] & kv_mask[None, :],
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
 
         # Load kpe for this block: [SEQ_BLOCK, PE_BLOCK]
         kpe_ptrs = (
@@ -201,7 +206,12 @@ def _mla_attention_kernel(
             + KV_LORA_RANK
             + pe_offsets[None, :]
         )
-        kpe = tl.load(kpe_ptrs, mask=seq_mask[:, None] & pe_mask[None, :], other=0.0).to(tl.float32)
+        kpe = tl.load(
+            kpe_ptrs,
+            mask=seq_mask[:, None] & pe_mask[None, :],
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
 
         # Compute attention scores: [SEQ_BLOCK]
         # score_nope = q_absorbed . compressed_kv  (dot product over kv_lora_rank)
@@ -316,7 +326,10 @@ def _mla_attention_kernel_multihead(
             + kv_offsets[None, :]
         )
         ckv_bf16 = tl.load(
-            ckv_ptrs, mask=seq_mask[:, None] & kv_mask[None, :], other=0.0
+            ckv_ptrs,
+            mask=seq_mask[:, None] & kv_mask[None, :],
+            other=0.0,
+            eviction_policy="evict_first",
         )  # [SEQ_BLOCK, KV_BLOCK], stays in bf16 for tl.dot
 
         # Load kpe ONCE for all HEAD_BLOCK heads: [SEQ_BLOCK, PE_BLOCK]
@@ -328,7 +341,10 @@ def _mla_attention_kernel_multihead(
             + pe_offsets[None, :]
         )
         kpe_bf16 = tl.load(
-            kpe_ptrs, mask=seq_mask[:, None] & pe_mask[None, :], other=0.0
+            kpe_ptrs,
+            mask=seq_mask[:, None] & pe_mask[None, :],
+            other=0.0,
+            eviction_policy="evict_first",
         )  # [SEQ_BLOCK, PE_BLOCK], stays in bf16 for tl.dot
 
         # Compute scores for all HEAD_BLOCK heads at once: [HEAD_BLOCK, SEQ_BLOCK]

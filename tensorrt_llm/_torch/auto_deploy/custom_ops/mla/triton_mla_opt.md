@@ -341,6 +341,21 @@ Correctness: PASS all 14 shapes.
 
 ______________________________________________________________________
 
+### Iteration 7 — `evict_first` hints on cache loads (both kernels)
+
+**Change:** Added `eviction_policy="evict_first"` to all `tl.load` calls that read
+from `mla_cache` in both `_mla_attention_kernel` and `_mla_attention_kernel_multihead`.
+Each cache position is read exactly once per program; hinting L2 to evict early frees
+capacity for subsequent blocks. No kernel logic change.
+
+Correctness: PASS all 14 shapes. Effect on original kernel (SB=128, warps=8): negligible
+(A2=17.0µs, A4=50.7µs — within noise of iter4 sweep). Effect on multihead kernel
+not isolated (SB=64 results from iter8 sweep are with evict_first).
+
+**Commit:** iter 7 — evict_first hints on all cache loads
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK \[HIGHEST PRIORITY\]
@@ -352,7 +367,7 @@ ______________________________________________________________________
 ### A.1 Memory Access Patterns
 
 - \[x\] **Reduce head-redundant loads via HEAD_BLOCK tiling** — Done (iter 2): `_mla_attention_kernel_multihead` with HEAD_BLOCK tiling. Prefill: 15-52× speedup. Decode: pending sweep.
-- \[ \] **Cache load eviction hint `evict_first`** — Why: each cache position is read once per program; hint L2 to evict early to make room for next block. **Impact: Low-Medium** | All shapes | Correctness risk: No
+- \[x\] **Cache load eviction hint `evict_first`** — Done (iter 7): added to all cache loads in both kernels. Benefit pending benchmark.
 - \[ \] **Wider loads via `other` alignment** — ensure KV_BLOCK=256 and PE_BLOCK=64 loads are 128-byte aligned for vectorized HBM transactions. **Impact: Low** | All shapes | Correctness risk: No
 
 ### A.5 Parallelism & Occupancy
