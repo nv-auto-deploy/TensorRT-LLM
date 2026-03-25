@@ -35,6 +35,7 @@ and avoids writing/reading the intermediate BF16 tensor between norm and quantiz
 Run after fuse_fp8_linear (post_load_fusion stage).
 """
 
+import operator
 from typing import Tuple, Type
 
 import torch
@@ -74,6 +75,8 @@ _VIEW_OPS = frozenset(
         # torch.export normalizes dtype casts to prims.convert_element_type or aten._to_copy
         torch.ops.prims.convert_element_type.default,
         torch.ops.aten._to_copy.default,
+        # TP shard slice (operator.getitem) may appear when the rmsnorm output is sharded
+        operator.getitem,
     ]
 )
 
