@@ -1031,6 +1031,38 @@ For stages=4: SMEM = 3 × (16384 + 4096) × 2 = 122 880 bytes — well within H1
 
 ______________________________________________________________________
 
+### Iteration 31 — Split-K warps sweep + HEAD_BLOCK=8 sweep \[MIXED\]
+
+**Change:** Benchmark-only; no code change.
+
+**Exp A — warps=4 vs warps=8 for split-K:**
+
+| ID  | kv   | NP | SB  | warps=4 µs | warps=8 µs | Winner |
+| --- | ---- | -- | --- | ---------- | ---------- | ------ |
+| A3  | 512  | 8  | 64  | 11.1       | **10.8**   | w=8    |
+| A4  | 1024 | 16 | 64  | 11.8       | **11.5**   | w=8    |
+| A5  | 2048 | 16 | 128 | **12.7**   | 12.9       | w=4    |
+
+warps=8 wins for A3/A4. warps=4 gives a slight edge on A5 (~1.5%).
+Motivates adaptive warps: w=8 for kv≤1024, w=4 for kv>1024 (deferred to iter 33).
+
+**Exp B — HEAD_BLOCK=8 vs HB=4 for split-K:**
+
+| ID  | HB=4 µs  | HB=8 µs | Winner |
+| --- | -------- | ------- | ------ |
+| A3  | **10.8** | 10.9    | HB=4   |
+| A4  | **11.5** | 11.6    | HB=4   |
+| A5  | 12.9     | 12.8    | ≈ tie  |
+
+HB=4 is uniformly better; HB=8 gives \<1% on A5 only. Keep HB=4.
+
+Also discovered: A2 (kv=256, T=1) with split-K NP=4 SB=64 = **10.3µs**
+vs current best 10.8µs (multihead) — 4.7% improvement. Deferred to iter 32.
+
+**Commit:** iter 31 — split-K warps/HB sweep \[MIXED: warps adaptive + A2 split-K planned\]
+
+______________________________________________________________________
+
 ## Optimization Ideas Backlog
 
 ### A.2 Tiling & SEQ_BLOCK \[HIGHEST PRIORITY\]
