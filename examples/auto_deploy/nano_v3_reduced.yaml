@@ -50,3 +50,5 @@ transforms:
     enabled: false  # iter33c showed regression: TPOT avg +4.2% (2.154→2.245ms), TTFT p5 2x worse (353→760ms). Root cause: 3-kernel FlashInfer path vs 1-kernel Triton b1; trtllm_fp8_prequant_linear slower at large batch than trtllm_quant_fp8_linear
   fuse_causal_conv_activation:
     enabled: true  # iter29: decode-only fusion — prefill uses activation=None + inline silu (avoids large-batch regression), decode uses fused silu (saves kernel launch per Mamba layer)
+  shard_lm_head_vocab_parallel:
+    enabled: false  # iter39: REGRESSED +8.7% TPOT at c=1 (AllGather overhead > GEMV savings at small batch)

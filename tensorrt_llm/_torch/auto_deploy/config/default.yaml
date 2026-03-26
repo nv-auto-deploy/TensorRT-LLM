@@ -223,6 +223,9 @@ transforms:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
     enabled: false
+  shard_lm_head_vocab_parallel:
+    stage: post_load_fusion
+    enabled: false
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
