@@ -40,6 +40,15 @@ v4 (iter33c): adaptive FlashInfer+Triton dispatch for small/medium batch:
     Non-fused: rmsnorm + fp8_quant_only (2 calls). Fused: add + rmsnorm + fp8_quant_only (3 ops).
   - For seq_len > 32: use Triton two-pass fused kernel (fewer launches at large batch).
   - Imports are lazy to avoid CUDA context init ordering issues.
+
+v5 (iter40): fix dispatch ordering bug in fused_add_rms_norm_quant_fp8:
+  - The _SINGLE_PASS_THRESHOLD check (seq_len<=4 → 1 Triton kernel) was dead code because
+    _RMN_ADAPTIVE_THRESHOLD=32 fired first for ALL seq_len<=32 (including seq_len=1).
+    Result: decode c=1 used 3 kernels (add+flashinfer_rmsnorm+fp8_quant) instead of 1.
+  - Fix: check _SINGLE_PASS_THRESHOLD first so seq_len in {1,2,3,4} uses the single-pass
+    Triton kernel (1 kernel). Combined with fuse_rmsnorm_quant_fp8 transform enabled, this
+    replaces 2 kernels (flashinfer_fused_add_rms_norm + scaleMatrixPerTensorVec) with 1
+    Triton kernel per matched FP8 linear, saving ~2.6μs per match at decode c=1.
 """
 
 from typing import Tuple
@@ -390,33 +399,18 @@ def fused_add_rms_norm_quant_fp8(
     residual_flat = residual.reshape(-1, feat_size)
     seq_len = x_flat.shape[0]
 
-    if seq_len <= _RMN_ADAPTIVE_THRESHOLD:
-        # Small/medium batch: add + FlashInfer rmsnorm + _fp8_quant_only_kernel (3 ops).
-        # NOTE: out_bf16 is always dead code (same reasoning as non-fused case above — the
-        # fuse_rmsnorm_quant_fp8 transform only fires when ALL consumers are FP8 linears, so
-        # bf16_node has zero users after rewiring and is eliminated by eliminate_dead_code()).
-        # out_add IS used (wired to next layer's residual input) so must be correct.
-        # Split to avoid scale.item() CUDA graph crash (same fix as non-fused path above):
-        # elementwise add (1 kernel) + flashinfer.norm.rmsnorm (no scale, CUDA graph OK) +
-        # _fp8_quant_only_kernel (reads scale via tl.load, CUDA graph OK) = 3 kernels total.
-        import flashinfer.norm
-
-        out_add_flat = x_flat + residual_flat  # elementwise add → out_add = x + residual
-        normed_flat = flashinfer.norm.rmsnorm(out_add_flat, weight, eps)
-        out_fp8 = _fp8_quant_tensor(normed_flat, scale)
-        out_bf16 = torch.empty_like(x_flat)  # dead code — uninitialized, never read
-        return (
-            out_bf16.reshape(orig_shape),
-            out_fp8.reshape(orig_shape),
-            out_add_flat.reshape(orig_shape),
-        )
-
     out_bf16 = torch.empty_like(x_flat)
     out_fp8 = torch.empty(x_flat.shape, dtype=torch.float8_e4m3fn, device=x.device)
     out_add = torch.empty_like(x_flat)
 
     grid = (seq_len,)
     if seq_len <= _SINGLE_PASS_THRESHOLD:
+        # Very small batch (seq_len in {1,2,3,4}): single-pass Triton kernel (1 kernel total).
+        # All hidden_size elements loaded into registers once; add + norm + quant in one pass.
+        # This path is fastest for decode (c=1) — replaces the old 3-kernel adaptive path that
+        # was unreachable here (it ran for seq_len <= 32 before this check, making this dead).
+        # Fix (iter40): moved _SINGLE_PASS_THRESHOLD check before _RMN_ADAPTIVE_THRESHOLD so
+        # seq_len=1 uses 1 Triton kernel instead of 3 kernels (add + flashinfer_rmsnorm + quant).
         fused_add_rms_norm_quant_fp8_kernel_b1[grid](
             x_flat,
             residual_flat,
@@ -432,7 +426,27 @@ def fused_add_rms_norm_quant_fp8(
             BLOCK_N=_BLOCK_N_B1,
             num_warps=_NUM_WARPS_B1,
         )
+    elif seq_len <= _RMN_ADAPTIVE_THRESHOLD:
+        # Medium batch (5 <= seq_len <= 32): add + FlashInfer rmsnorm + fp8_quant (3 kernels).
+        # NOTE: out_bf16 is always dead code (same reasoning as non-fused case above — the
+        # fuse_rmsnorm_quant_fp8 transform only fires when ALL consumers are FP8 linears, so
+        # bf16_node has zero users after rewiring and is eliminated by eliminate_dead_code()).
+        # out_add IS used (wired to next layer's residual input) so must be correct.
+        # Split to avoid scale.item() CUDA graph crash (same fix as non-fused path above):
+        # elementwise add (1 kernel) + flashinfer.norm.rmsnorm (no scale, CUDA graph OK) +
+        # _fp8_quant_only_kernel (reads scale via tl.load, CUDA graph OK) = 3 kernels total.
+        import flashinfer.norm
+
+        out_add_flat = x_flat + residual_flat  # elementwise add → out_add = x + residual
+        normed_flat = flashinfer.norm.rmsnorm(out_add_flat, weight, eps)
+        out_fp8_med = _fp8_quant_tensor(normed_flat, scale)
+        return (
+            out_bf16.reshape(orig_shape),  # dead code — uninitialized, never read
+            out_fp8_med.reshape(orig_shape),
+            out_add_flat.reshape(orig_shape),
+        )
     else:
+        # Large batch (seq_len > 32): 2-pass Triton kernel (1 kernel total).
         fused_add_rms_norm_quant_fp8_kernel[grid](
             x_flat,
             residual_flat,

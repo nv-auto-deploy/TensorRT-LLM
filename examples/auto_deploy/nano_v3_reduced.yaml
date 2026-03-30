@@ -47,7 +47,7 @@ transforms:
   fuse_gated_rmsnorm_quant_fp8:
     enabled: true  # iter37: fuse triton_rmsnorm_gated + FP8_quant for Mamba out_proj (2/2 FP8 Mamba layers; neutral result at c=1)
   fuse_rmsnorm_quant_fp8:
-    enabled: false  # iter33c showed regression: TPOT avg +4.2% (2.154→2.245ms), TTFT p5 2x worse (353→760ms). Root cause: 3-kernel FlashInfer path vs 1-kernel Triton b1; trtllm_fp8_prequant_linear slower at large batch than trtllm_quant_fp8_linear
+    enabled: true  # iter40: fix dispatch ordering bug (v5): _SINGLE_PASS_THRESHOLD check was dead code; now seq_len=1 uses 1 Triton kernel instead of 3 (add+flashinfer+quant); expect ~2.6μs savings per matched FP8 linear
   fuse_causal_conv_activation:
     enabled: true  # iter29: decode-only fusion — prefill uses activation=None + inline silu (avoids large-batch regression), decode uses fused silu (saves kernel launch per Mamba layer)
   shard_lm_head_vocab_parallel:
