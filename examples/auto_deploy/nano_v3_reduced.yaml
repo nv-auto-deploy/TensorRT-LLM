@@ -46,6 +46,8 @@ transforms:
     enabled: true
   fuse_gated_rmsnorm_quant_fp8:
     enabled: true  # iter37: fuse triton_rmsnorm_gated + FP8_quant for Mamba out_proj (2/2 FP8 Mamba layers; neutral result at c=1)
+  fuse_allreduce_residual_rmsnorm:
+    enabled: false  # iter45 discard: 0 matches — AllReduce→view→add→to.dtype→norm doesn't match pattern; MoE has view+cast between AllReduce and norm, Mamba has gate_mult, Attention AllReduce is inside TRT-LLM attn kernel
   fuse_rmsnorm_quant_fp8:
     enabled: true  # iter40: fix dispatch ordering bug (v5): _SINGLE_PASS_THRESHOLD check was dead code; now seq_len=1 uses 1 Triton kernel instead of 3 (add+flashinfer+quant); expect ~2.6μs savings per matched FP8 linear
   fuse_trtllm_attn_quant_fp8:
