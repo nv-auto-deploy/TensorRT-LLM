@@ -299,9 +299,9 @@ class SimpleMoEForExport(nn.Module):
             x,
             selected_experts,
             routing_weights,
-            w1_weight=[e["gate_proj"].weight for e in experts],
-            w2_weight=[e["down_proj"].weight for e in experts],
-            w3_weight=[e["up_proj"].weight for e in experts],
+            w1_weight=torch.stack([e["gate_proj"].weight for e in experts], dim=0),
+            w2_weight=torch.stack([e["down_proj"].weight for e in experts], dim=0),
+            w3_weight=torch.stack([e["up_proj"].weight for e in experts], dim=0),
         )
 
 
@@ -331,7 +331,17 @@ def test_moe_export_with_reduced_experts(
     def _count_moe_experts(gm):
         for node in gm.graph.nodes:
             if node.op == "call_function" and "torch_moe" in str(node.target):
-                return len(node.args[3])  # w1_weight list length
+                w1 = node.args[3]
+                if isinstance(w1, (list, tuple)):
+                    return len(w1)  # legacy per-expert list
+                # stacked tensor: count stack inputs from aten.stack node
+                if (
+                    isinstance(w1, torch.fx.Node)
+                    and w1.op == "call_function"
+                    and w1.args
+                    and isinstance(w1.args[0], (list, tuple))
+                ):
+                    return len(w1.args[0])
         return 0
 
     assert _count_moe_experts(gm_full) == num_experts
@@ -395,7 +405,17 @@ def _count_moe_experts_in_graph(gm: GraphModule) -> int:
     """Return the number of experts in the first ``torch_moe`` call in *gm*."""
     for node in gm.graph.nodes:
         if node.op == "call_function" and "torch_moe" in str(node.target):
-            return len(node.args[3])  # w1_weight list length
+            w1 = node.args[3]
+            if isinstance(w1, (list, tuple)):
+                return len(w1)  # legacy per-expert list
+            # stacked tensor: count stack inputs from aten.stack node
+            if (
+                isinstance(w1, torch.fx.Node)
+                and w1.op == "call_function"
+                and w1.args
+                and isinstance(w1.args[0], (list, tuple))
+            ):
+                return len(w1.args[0])
     return 0
 
 

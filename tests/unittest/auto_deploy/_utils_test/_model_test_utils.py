@@ -192,12 +192,12 @@ class MoEOpModel(nn.Module):
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(x.dtype)
 
-        w1_list = [expert.w1 for expert in self.experts]
-        w2_list = [expert.w2 for expert in self.experts]
-        w3_list = [expert.w3 for expert in self.experts]
+        w1_weight = torch.stack([expert.w1 for expert in self.experts], dim=0)
+        w2_weight = torch.stack([expert.w2 for expert in self.experts], dim=0)
+        w3_weight = torch.stack([expert.w3 for expert in self.experts], dim=0)
 
         out = torch.ops.auto_deploy.torch_moe(
-            x, selected_experts, routing_weights, w1_list, w2_list, w3_list
+            x, selected_experts, routing_weights, w1_weight, w2_weight, w3_weight
         )
         return out
 

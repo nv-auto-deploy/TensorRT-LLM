@@ -538,9 +538,9 @@ class MoEOpModelNVFP4(nn.Module):
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(x.dtype)
 
-        w1_list = list(self.w1_weight)
-        w2_list = list(self.w2_weight)
-        w3_list = list(self.w3_weight) if self.is_gated_mlp else []
+        w1_weight = torch.stack(list(self.w1_weight), dim=0)
+        w2_weight = torch.stack(list(self.w2_weight), dim=0)
+        w3_weight = torch.stack(list(self.w3_weight), dim=0) if self.is_gated_mlp else None
 
         w1_input_scale = [getattr(self, f"w1_input_scale_{i}") for i in range(self.num_experts)]
         w2_input_scale = [getattr(self, f"w2_input_scale_{i}") for i in range(self.num_experts)]
@@ -568,9 +568,9 @@ class MoEOpModelNVFP4(nn.Module):
             x,
             selected_experts,
             routing_weights,
-            w1_list,
-            w2_list,
-            w3_list,
+            w1_weight,
+            w2_weight,
+            w3_weight,
             w1_input_scale,
             w2_input_scale,
             w3_input_scale,
@@ -683,9 +683,9 @@ class FP8MoEModuleForInputScaleTest(nn.Module):
         self.is_gated_mlp = is_gated_mlp
         self.act_fn = act_fn
 
+        self.register_buffer("w1_weight", torch.stack(w1_weight, dim=0))
+        self.register_buffer("w2_weight", torch.stack(w2_weight, dim=0))
         for i in range(num_experts):
-            self.register_buffer(f"w1_{i}", w1_weight[i])
-            self.register_buffer(f"w2_{i}", w2_weight[i])
             self.register_buffer(f"w1_iscale_{i}", w1_input_scale[i])
             self.register_buffer(f"w2_iscale_{i}", w2_input_scale[i])
             self.register_buffer(f"w1_wscale_{i}", w1_weight_scale[i])
@@ -696,9 +696,9 @@ class FP8MoEModuleForInputScaleTest(nn.Module):
             x,
             selected_experts,
             routing_weights,
-            [getattr(self, f"w1_{i}") for i in range(self.num_experts)],
-            [getattr(self, f"w2_{i}") for i in range(self.num_experts)],
-            [],  # w3 is empty for non-gated MLP
+            self.w1_weight,
+            self.w2_weight,
+            None,  # w3 is None for non-gated MLP
             [getattr(self, f"w1_iscale_{i}") for i in range(self.num_experts)],
             [getattr(self, f"w2_iscale_{i}") for i in range(self.num_experts)],
             [],  # w3 input scale is empty for non-gated MLP
@@ -861,9 +861,10 @@ class NVFP4MoEModuleForInputScaleTest(nn.Module):
         self.is_gated_mlp = is_gated_mlp
         self.act_fn = act_fn
 
+        self.register_buffer("w1_weight", torch.stack(w1_weight, dim=0))
+        self.register_buffer("w2_weight", torch.stack(w2_weight, dim=0))
+        self.register_buffer("w3_weight", torch.stack(w3_weight, dim=0) if is_gated_mlp else None)
         for i in range(num_experts):
-            self.register_buffer(f"w1_{i}", w1_weight[i])
-            self.register_buffer(f"w2_{i}", w2_weight[i])
             self.register_buffer(f"w1_iscale_{i}", w1_input_scale[i])
             self.register_buffer(f"w2_iscale_{i}", w2_input_scale[i])
             self.register_buffer(f"w1_wscale_{i}", w1_weight_scale[i])
@@ -871,7 +872,6 @@ class NVFP4MoEModuleForInputScaleTest(nn.Module):
             self.register_buffer(f"w1_alpha_{i}", w1_alpha[i])
             self.register_buffer(f"w2_alpha_{i}", w2_alpha[i])
             if is_gated_mlp:
-                self.register_buffer(f"w3_{i}", w3_weight[i])
                 self.register_buffer(f"w3_iscale_{i}", w3_input_scale[i])
                 self.register_buffer(f"w3_wscale_{i}", w3_weight_scale[i])
                 self.register_buffer(f"w3_alpha_{i}", w3_alpha[i])
@@ -881,11 +881,9 @@ class NVFP4MoEModuleForInputScaleTest(nn.Module):
             x,
             selected_experts,
             routing_weights,
-            [getattr(self, f"w1_{i}") for i in range(self.num_experts)],
-            [getattr(self, f"w2_{i}") for i in range(self.num_experts)],
-            [getattr(self, f"w3_{i}") for i in range(self.num_experts)]
-            if self.is_gated_mlp
-            else [],
+            self.w1_weight,
+            self.w2_weight,
+            self.w3_weight if self.is_gated_mlp else None,
             [getattr(self, f"w1_iscale_{i}") for i in range(self.num_experts)],
             [getattr(self, f"w2_iscale_{i}") for i in range(self.num_experts)],
             [getattr(self, f"w3_iscale_{i}") for i in range(self.num_experts)]
@@ -1232,9 +1230,10 @@ def test_split_moe_fused_for_sharding_load_hook():
     expected_w1 = source_gate_up[0, I:, :]
     expected_w2 = model.down_proj.detach()[0]
 
-    actual_w1 = gm_transformed.get_parameter("w1_expert_0")
-    actual_w2 = gm_transformed.get_parameter("w2_expert_0")
-    actual_w3 = gm_transformed.get_parameter("w3_expert_0")
+    # After stacking migration, weights are stored as (E, I, H) tensors; index [0] for expert 0.
+    actual_w1 = gm_transformed.get_parameter("w1_stacked")[0]
+    actual_w2 = gm_transformed.get_parameter("w2_stacked")[0]
+    actual_w3 = gm_transformed.get_parameter("w3_stacked")[0]
 
     torch.testing.assert_close(actual_w1, expected_w1)
     torch.testing.assert_close(actual_w2, expected_w2)
@@ -1365,9 +1364,9 @@ class FineGrainedFP8MoEOpModel(nn.Module):
         routing_weights = routing_weights.to(torch.float32)
 
         # Collect per-expert weights and scales
-        w1_list = [expert.w1_fp8 for expert in self.experts]
-        w2_list = [expert.w2_fp8 for expert in self.experts]
-        w3_list = [expert.w3_fp8 for expert in self.experts]
+        w1_weight = torch.stack([expert.w1_fp8 for expert in self.experts], dim=0)
+        w2_weight = torch.stack([expert.w2_fp8 for expert in self.experts], dim=0)
+        w3_weight = torch.stack([expert.w3_fp8 for expert in self.experts], dim=0)
         w1_scale_list = [expert.w1_scale_inv for expert in self.experts]
         w2_scale_list = [expert.w2_scale_inv for expert in self.experts]
         w3_scale_list = [expert.w3_scale_inv for expert in self.experts]
@@ -1376,9 +1375,9 @@ class FineGrainedFP8MoEOpModel(nn.Module):
             x,
             selected_experts,
             routing_weights,
-            w1_list,
-            w2_list,
-            w3_list,
+            w1_weight,
+            w2_weight,
+            w3_weight,
             w1_scale_list,
             w2_scale_list,
             w3_scale_list,

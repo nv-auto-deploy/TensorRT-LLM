@@ -39,114 +39,131 @@ from ..interface import (
 )
 
 
-def _bmm_moe_gate_up_split_hook(
+def _moe_stack_load_hook(
     state_dict,
     prefix,
     *args,
-    source_key: str,
-    intermediate_size: int,
-    w1_keys: List[str],
-    w3_keys: List[str],
+    stacked_key: str,
+    per_expert_keys: List[str],
+    dim: int = 0,
 ):
-    """Hook to split gate_up_weight into all per-expert w1 and w3 weights.
+    """Load hook that stacks per-expert checkpoint weights into a single stacked parameter.
+
+    Handles two checkpoint formats:
+    - Case 1: stacked key already present -> no-op.
+    - Case 2: per-expert keys present -> stack into the stacked key and remove per-expert keys.
+    - Case 3: neither present -> no-op (pre-normalization hooks handle model-specific layouts).
 
     Args:
-        source_key: Original stacked weight key (e.g., "gate_up_weight")
-        intermediate_size: Intermediate dimension size
-        w1_keys: List of target parameter keys for w1 weights
-        w3_keys: List of target parameter keys for w3 weights
+        stacked_key: Target parameter key for the stacked weight (relative to prefix).
+        per_expert_keys: Per-expert source keys (relative to prefix).
+        dim: Stacking dimension (always 0 for expert dimension).
     """
-    source_full_key = prefix + source_key
+    full_stacked = prefix + stacked_key
+    if full_stacked in state_dict:
+        return  # already in stacked format
 
-    if source_full_key in state_dict:
-        stacked_tensor = state_dict[source_full_key]
-        # Split on last dim: (E, H, 2I) -> 2x (E, H, I)
-        w1_stacked, w3_stacked = stacked_tensor.split(intermediate_size, dim=2)
-        # Transpose and contiguous in batch, then unbind into views
-        w1_experts = w1_stacked.transpose(1, 2).contiguous().unbind(0)
-        w3_experts = w3_stacked.transpose(1, 2).contiguous().unbind(0)
-        for w1_key, w3_key, w1, w3 in zip(w1_keys, w3_keys, w1_experts, w3_experts):
-            state_dict[prefix + w1_key] = w1
-            state_dict[prefix + w3_key] = w3
+    per_expert_full = [prefix + k for k in per_expert_keys]
+    if all(k in state_dict for k in per_expert_full):
+        state_dict[full_stacked] = torch.stack(
+            [state_dict.pop(k) for k in per_expert_full], dim=dim
+        )
 
 
-def _bmm_moe_down_split_hook(
+def _fused_w3_w1_to_stacked_hook(
     state_dict,
     prefix,
     *args,
     source_key: str,
-    w2_keys: List[str],
-):
-    """Hook to split down_weight into all per-expert w2 weights.
-
-    Args:
-        source_key: Original stacked weight key (e.g., "down_weight")
-        w2_keys: List of target parameter keys for w2 weights
-    """
-    source_full_key = prefix + source_key
-
-    if source_full_key in state_dict:
-        stacked_tensor = state_dict[source_full_key]
-        # Transpose and contiguous in batch, then unbind into views
-        w2_experts = stacked_tensor.transpose(1, 2).contiguous().unbind(0)
-        for w2_key, w2 in zip(w2_keys, w2_experts):
-            state_dict[prefix + w2_key] = w2
-
-
-def _fused_moe_gate_up_split_hook(
-    state_dict,
-    prefix,
-    *args,
-    source_key: str,
+    w1_stacked_key: str,
+    w3_stacked_key: str,
     intermediate_size: int,
-    w1_keys: List[str],
-    w3_keys: List[str],
 ):
-    """Fallback hook to split fused gate_up tensor into per-expert w1/w3 tensors.
+    """Load hook: splits fused (E, 2I, H) w3_w1 tensor into w1_stacked and w3_stacked.
 
-    This hook is intentionally ordering-agnostic w.r.t. checkpoint families:
-    it assumes `source_key` has already been normalized to runtime/operator layout
-    by model-specific hooks (if needed), then performs structural splitting only.
+    Handles the TRT-LLM runtime layout where [w3, w1] are concatenated along dim 1.
+    Source: (E, 2I, H); targets: w1_stacked (E, I, H), w3_stacked (E, I, H).
     """
-    source_full_key = prefix + source_key
-    if source_full_key not in state_dict:
+    source_full = prefix + source_key
+    w1_full = prefix + w1_stacked_key
+    w3_full = prefix + w3_stacked_key
+
+    if w1_full in state_dict and w3_full in state_dict:
+        return  # already split
+    if source_full not in state_dict:
         return
 
-    stacked_tensor = state_dict[source_full_key]
-    # Runtime/operator layout: [w3, w1] along dim=1 for shape (E, 2I, H)
-    w3_stacked, w1_stacked = stacked_tensor.split(intermediate_size, dim=1)
-    w3_experts = w3_stacked.contiguous().unbind(0)
-    w1_experts = w1_stacked.contiguous().unbind(0)
-
-    # Don't overwrite keys already populated by model-owned hooks.
-    for w1_key, w1 in zip(w1_keys, w1_experts):
-        dst = prefix + w1_key
-        if dst not in state_dict:
-            state_dict[dst] = w1
-    for w3_key, w3 in zip(w3_keys, w3_experts):
-        dst = prefix + w3_key
-        if dst not in state_dict:
-            state_dict[dst] = w3
+    fused = state_dict[source_full]  # (E, 2I, H), runtime layout: [w3, w1]
+    w3_part, w1_part = fused.split(intermediate_size, dim=1)
+    if w1_full not in state_dict:
+        state_dict[w1_full] = w1_part.contiguous()
+    if w3_full not in state_dict:
+        state_dict[w3_full] = w3_part.contiguous()
 
 
-def _fused_moe_down_split_hook(
+def _bmm_gate_up_to_stacked_hook(
     state_dict,
     prefix,
     *args,
     source_key: str,
-    w2_keys: List[str],
+    w1_stacked_key: str,
+    w3_stacked_key: str,
+    intermediate_size: int,
 ):
-    """Fallback hook to split fused down tensor into per-expert w2 tensors."""
-    source_full_key = prefix + source_key
-    if source_full_key not in state_dict:
+    """Load hook: splits Llama4-style (E, H, 2I) gate_up tensor into w1_stacked and w3_stacked.
+
+    Llama4 checkpoint layout: (E, H, 2I) where [:, :, :I] = gate (w1), [:, :, I:] = up (w3).
+    Targets: w1_stacked (E, I, H), w3_stacked (E, I, H).
+    """
+    source_full = prefix + source_key
+    w1_full = prefix + w1_stacked_key
+    w3_full = prefix + w3_stacked_key
+
+    if w1_full in state_dict and w3_full in state_dict:
+        return  # already split
+    if source_full not in state_dict:
         return
 
-    stacked_tensor = state_dict[source_full_key]
-    w2_experts = stacked_tensor.contiguous().unbind(0)
-    for w2_key, w2 in zip(w2_keys, w2_experts):
-        dst = prefix + w2_key
-        if dst not in state_dict:
-            state_dict[dst] = w2
+    gate_up = state_dict[source_full]  # (E, H, 2I)
+    w1_part = gate_up[:, :, :intermediate_size].transpose(1, 2).contiguous()  # (E, I, H)
+    w3_part = gate_up[:, :, intermediate_size:].transpose(1, 2).contiguous()  # (E, I, H)
+    if w1_full not in state_dict:
+        state_dict[w1_full] = w1_part
+    if w3_full not in state_dict:
+        state_dict[w3_full] = w3_part
+
+
+def _bmm_down_to_stacked_hook(
+    state_dict,
+    prefix,
+    *args,
+    source_key: str,
+    w2_stacked_key: str,
+):
+    """Load hook: transposes Llama4-style (E, I, H) down weight to w2_stacked (E, H, I)."""
+    source_full = prefix + source_key
+    w2_full = prefix + w2_stacked_key
+
+    if w2_full in state_dict:
+        return
+    if source_full not in state_dict:
+        return
+
+    state_dict[w2_full] = state_dict[source_full].transpose(1, 2).contiguous()  # (E, H, I)
+
+
+def _rename_param_hook(
+    state_dict,
+    prefix,
+    *args,
+    source_key: str,
+    target_key: str,
+):
+    """Load hook: renames source_key → target_key without any shape change."""
+    full_source = prefix + source_key
+    full_target = prefix + target_key
+    if full_target not in state_dict and full_source in state_dict:
+        state_dict[full_target] = state_dict.pop(full_source)
 
 
 def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
@@ -188,6 +205,13 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "t
             # but for large models we'll run out of memory during the transformation itself.
             eliminate_dead_code(gm)
             delete_all_unused_submodules(gm)
+            # Also delete top-level parameters that are no longer referenced in the graph.
+            # delete_all_unused_submodules only handles submodules; top-level flat params
+            # registered via gm.register_parameter (e.g. EP-sliced stacked weights) are missed.
+            live_targets = {str(n.target) for n in gm.graph.nodes if n.op == "get_attr"}
+            for k in list(gm._parameters.keys()):
+                if k not in live_targets:
+                    del gm._parameters[k]
 
     return fused_key_counter
 
@@ -269,76 +293,78 @@ def _split_torch_moe_fused_to_expert_lists(gm: GraphModule) -> int:
         if owner_module is not owner_module_w2 or owner_path != owner_path_w2:
             continue
 
-        # Materialize per-expert params under the owner module.
-        w1_full_keys: list[str] = []
-        w2_full_keys: list[str] = []
-        w3_full_keys: list[str] = []
-        w1_local_names: list[str] = []
-        w2_local_names: list[str] = []
-        w3_local_names: list[str] = []
+        # Split fused (E, 2I, H) into w1_stacked (E, I, H) and w3_stacked (E, I, H).
+        # TRT-LLM runtime layout: [w3, w1] concatenated along dim 1.
+        w1_stacked_tensor = w3_w1_tensor[:, intermediate_size:, :].contiguous()
+        w3_stacked_tensor = w3_w1_tensor[:, :intermediate_size, :].contiguous()
+        w2_stacked_tensor = w2_tensor  # already (E, H, I)
 
-        for expert_idx in range(num_experts):
-            # Keep stable names so model-side hooks can target them.
-            w1_name = f"w1_expert_{expert_idx}"
-            w2_name = f"w2_expert_{expert_idx}"
-            w3_name = f"w3_expert_{expert_idx}"
+        w1_local = "w1_stacked"
+        w2_local = "w2_stacked"
+        w3_local = "w3_stacked"
 
-            if not hasattr(owner_module, w1_name):
-                owner_module.register_parameter(
-                    w1_name,
-                    torch.nn.Parameter(w3_w1_tensor[expert_idx, intermediate_size:, :]),
-                )
-            if not hasattr(owner_module, w2_name):
-                owner_module.register_parameter(
-                    w2_name,
-                    torch.nn.Parameter(w2_tensor[expert_idx, :, :]),
-                )
-            if not hasattr(owner_module, w3_name):
-                owner_module.register_parameter(
-                    w3_name,
-                    torch.nn.Parameter(w3_w1_tensor[expert_idx, :intermediate_size, :]),
-                )
+        if not hasattr(owner_module, w1_local):
+            owner_module.register_parameter(w1_local, torch.nn.Parameter(w1_stacked_tensor))
+        if not hasattr(owner_module, w2_local):
+            owner_module.register_parameter(w2_local, torch.nn.Parameter(w2_stacked_tensor))
+        if not hasattr(owner_module, w3_local):
+            owner_module.register_parameter(w3_local, torch.nn.Parameter(w3_stacked_tensor))
 
-            w1_local_names.append(w1_name)
-            w2_local_names.append(w2_name)
-            w3_local_names.append(w3_name)
+        attr_prefix = f"{owner_path}." if owner_path else ""
+        w1_full = attr_prefix + w1_local
+        w2_full = attr_prefix + w2_local
+        w3_full = attr_prefix + w3_local
 
-            prefix = f"{owner_path}." if owner_path else ""
-            w1_full_keys.append(prefix + w1_name)
-            w2_full_keys.append(prefix + w2_name)
-            w3_full_keys.append(prefix + w3_name)
-
-        # Fallback structural split hooks (model hooks can pre-normalize layout).
+        # Hook: fused format (E, 2I, H) → split into w1_stacked + w3_stacked.
         owner_module._register_load_state_dict_pre_hook(
             partial(
-                _fused_moe_gate_up_split_hook,
+                _fused_w3_w1_to_stacked_hook,
                 source_key=source_name,
+                w1_stacked_key=w1_local,
+                w3_stacked_key=w3_local,
                 intermediate_size=intermediate_size,
-                w1_keys=w1_local_names,
-                w3_keys=w3_local_names,
+            )
+        )
+        # Hook: w2 may be stored under its original key name in the checkpoint.
+        owner_module._register_load_state_dict_pre_hook(
+            partial(_rename_param_hook, source_key=source_name_w2, target_key=w2_local)
+        )
+        # Hook: per-expert format → stack (for older checkpoints).
+        owner_module._register_load_state_dict_pre_hook(
+            partial(
+                _moe_stack_load_hook,
+                stacked_key=w1_local,
+                per_expert_keys=[f"w1_expert_{i}" for i in range(num_experts)],
             )
         )
         owner_module._register_load_state_dict_pre_hook(
             partial(
-                _fused_moe_down_split_hook,
-                source_key=source_name_w2,
-                w2_keys=w2_local_names,
+                _moe_stack_load_hook,
+                stacked_key=w2_local,
+                per_expert_keys=[f"w2_expert_{i}" for i in range(num_experts)],
+            )
+        )
+        owner_module._register_load_state_dict_pre_hook(
+            partial(
+                _moe_stack_load_hook,
+                stacked_key=w3_local,
+                per_expert_keys=[f"w3_expert_{i}" for i in range(num_experts)],
             )
         )
 
         with graph.inserting_before(node):
-            w1_nodes = [graph.get_attr(k) for k in w1_full_keys]
-            w2_nodes = [graph.get_attr(k) for k in w2_full_keys]
-            w3_nodes = [graph.get_attr(k) for k in w3_full_keys]
+            w1_node = graph.get_attr(w1_full)
+            w2_node = graph.get_attr(w2_full)
+            w3_node = graph.get_attr(w3_full)
             new_node = graph.call_function(
                 torch.ops.auto_deploy.torch_moe,
                 args=(
                     hidden_states,
                     selected_experts,
                     routing_weights,
-                    w1_nodes,
-                    w2_nodes,
-                    w3_nodes,
+                    w1_node,
+                    w2_node,
+                    w3_node,
                 ),
                 kwargs={"is_gated_mlp": True, "act_fn": int(ActivationType.Silu)},
             )
@@ -364,6 +390,45 @@ def _split_torch_moe_fused_to_expert_lists(gm: GraphModule) -> int:
     return converted
 
 
+def _get_stacked_tensor(gm: GraphModule, node: Node) -> torch.Tensor:
+    """Resolve a node to its stacked tensor value.
+
+    Handles:
+    - ``get_attr`` nodes: directly fetch registered parameter.
+    - ``aten.stack`` nodes: eagerly stack inputs (build-time materialisation).
+    """
+    if node.op == "get_attr":
+        return gm.get_parameter(str(node.target))
+    if is_op(node, torch.ops.aten.stack):
+        tensor_list = node.args[0]
+        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+        return torch.stack([_get_stacked_tensor(gm, n) for n in tensor_list], dim=int(dim))
+    raise ValueError(
+        f"Cannot resolve node op='{node.op}' target='{node.target}' to a stacked tensor"
+    )
+
+
+def _ensure_get_attr(
+    gm: GraphModule,
+    graph: torch.fx.Graph,
+    node: Node,
+    fallback_key: str,
+    insert_before: Node,
+) -> Tuple[Node, torch.Tensor]:
+    """Return ``(get_attr_node, tensor)`` for *node*.
+
+    If *node* is already a ``get_attr``, reuse it directly.
+    Otherwise materialise the tensor and register a new parameter.
+    """
+    tensor = _get_stacked_tensor(gm, node)
+    if node.op == "get_attr":
+        return node, tensor
+    gm.register_parameter(fallback_key, torch.nn.Parameter(tensor))
+    with graph.inserting_before(insert_before):
+        new_node = graph.get_attr(fallback_key)
+    return new_node, tensor
+
+
 def _process_moe_node(
     gm: GraphModule,
     graph: torch.fx.Graph,
@@ -373,18 +438,18 @@ def _process_moe_node(
     act_fn: ActivationType,
     fused_key_counter: int,
 ) -> None:
-    """Process a single torch_moe node with per-expert weight lists.
+    """Process a single torch_moe node with stacked weight tensors.
 
-    Stacks weight parameters and creates a fused MoE node.
+    For gated MLP, concatenates w3 and w1 into the fused (E, 2I, H) format.
     The kernel applies routing weights to the output.
     """
     (
         hidden_states,
         selected_experts,
         routing_weights,
-        w1_list,
-        w2_list,
-        w3_list,
+        w1_node,
+        w2_node,
+        w3_node,
         apply_routing_on_input,
         mapping_config,
         max_num_tokens,
@@ -401,53 +466,45 @@ def _process_moe_node(
         "max_num_tokens",
     )
 
-    # Stack weights based on MLP style
-    if is_gated_mlp:
-        # For gated MLP, concatenate w3 and w1 then stack across experts
-        fused_w_up_experts = torch.stack(
-            [
-                torch.cat(
-                    [gm.get_parameter(w3_node.target), gm.get_parameter(w1_node.target)],
-                    dim=-2,
-                )
-                for w1_node, w3_node in zip(w1_list, w3_list)
-            ],
-            dim=0,
-        )
-        new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
-    else:
-        # For regular MLP, just stack w1
-        fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
-        new_key_w_up = f"fused_moe_w1_stacked_{fused_key_counter}"
-
-    # Stack w2/down weights
-    fused_w_down_experts = torch.stack([gm.get_parameter(n.target) for n in w2_list], dim=0)
-    new_key_w_down = f"fused_moe_w2_stacked_{fused_key_counter}"
-
-    # Register the stacked weights as parameters and free intermediate tensors
-    param_w_up = torch.nn.Parameter(fused_w_up_experts)
-    del fused_w_up_experts
-    gm.register_parameter(new_key_w_up, param_w_up)
-
-    param_w_down = torch.nn.Parameter(fused_w_down_experts)
-    del fused_w_down_experts
-    gm.register_parameter(new_key_w_down, param_w_down)
-
-    # Create fused MoE node - kernel applies routing to output
+    # Build fused up-projection weight and resolve dtype.
+    # Nodes may be get_attr (from pattern matcher) or aten.stack (from direct torch_moe calls).
     with graph.inserting_before(node):
-        w_up_arg = graph.get_attr(new_key_w_up)
-        w_down_arg = graph.get_attr(new_key_w_down)
-        # Get weight dtype for casting - fused kernel requires activation dtype to match weight dtype
-        weight_dtype = param_w_up.dtype
+        if is_gated_mlp:
+            # Concatenate w3 and w1: (E, I, H) + (E, I, H) → (E, 2I, H)
+            w1_tensor = _get_stacked_tensor(gm, w1_node)
+            w3_tensor = _get_stacked_tensor(gm, w3_node)
+            fused_w_up = torch.cat([w3_tensor, w1_tensor], dim=1)
+            new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
+            param_w_up = torch.nn.Parameter(fused_w_up)
+            del fused_w_up
+            gm.register_parameter(new_key_w_up, param_w_up)
+            w_up_arg = graph.get_attr(new_key_w_up)
+            weight_dtype = param_w_up.dtype
+        else:
+            # Non-gated MLP: w1 is (E, I, H). Reuse if already a get_attr, else materialise.
+            w_up_arg, w1_tensor = _ensure_get_attr(
+                gm,
+                graph,
+                w1_node,
+                fallback_key=f"fused_moe_w1_stacked_{fused_key_counter}",
+                insert_before=node,
+            )
+            weight_dtype = w1_tensor.dtype
+
+        # w2 is (E, H, I). Reuse if already a get_attr, else materialise.
+        w_down_arg, _ = _ensure_get_attr(
+            gm,
+            graph,
+            w2_node,
+            fallback_key=f"fused_moe_w2_stacked_{fused_key_counter}",
+            insert_before=node,
+        )
 
         if apply_routing_on_input:
-            # Scale input: hidden_states = hidden_states * routing_weights
             hidden_states = graph.call_function(
                 torch.ops.aten.mul.Tensor,
                 args=(hidden_states, routing_weights),
             )
-
-            # Pass ones to kernel to prevent it from multiplying routing again (already applied)
             routing_weights = graph.call_function(
                 torch.ops.aten.ones_like.default,
                 args=(routing_weights,),
@@ -460,7 +517,6 @@ def _process_moe_node(
         )
 
         # Build kwargs for new node - preserve all kwargs from original node
-        # and override with known values
         fused_kwargs = dict(node.kwargs) if node.kwargs else {}
         fused_kwargs.update(
             {
@@ -866,19 +922,65 @@ class MatchMoePattern(BaseTransform):
             if final_hidden_state_node is None:
                 continue
 
-            # Step 5: Insert the MoE op into the graph.
+            # Step 5: Materialize stacked params and insert the MoE op into the graph.
+            w1_list = expert_weights["w1"]
+            w2_list = expert_weights["w2"]
+            w3_list = expert_weights["w3"]
+
+            # Stack per-expert weight tensors into (E, I, H) / (E, H, I) tensors.
+            w1_stacked = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
+            w2_stacked = torch.stack([gm.get_parameter(n.target) for n in w2_list], dim=0)
+            w3_stacked = (
+                torch.stack([gm.get_parameter(n.target) for n in w3_list], dim=0)
+                if w3_list
+                else None
+            )
+
+            # Register stacked params on gm with globally unique names.
+            w1_key = f"match_moe_w1_stacked_{num_moe_patterns}"
+            w2_key = f"match_moe_w2_stacked_{num_moe_patterns}"
+            w3_key = f"match_moe_w3_stacked_{num_moe_patterns}" if w3_stacked is not None else None
+            gm.register_parameter(w1_key, torch.nn.Parameter(w1_stacked))
+            gm.register_parameter(w2_key, torch.nn.Parameter(w2_stacked))
+            if w3_key is not None:
+                gm.register_parameter(w3_key, torch.nn.Parameter(w3_stacked))
+
+            # Register checkpoint-compat hooks: per-expert → stacked.
+            gm._register_load_state_dict_pre_hook(
+                partial(
+                    _moe_stack_load_hook,
+                    stacked_key=w1_key,
+                    per_expert_keys=[str(n.target) for n in w1_list],
+                )
+            )
+            gm._register_load_state_dict_pre_hook(
+                partial(
+                    _moe_stack_load_hook,
+                    stacked_key=w2_key,
+                    per_expert_keys=[str(n.target) for n in w2_list],
+                )
+            )
+            if w3_key is not None:
+                gm._register_load_state_dict_pre_hook(
+                    partial(
+                        _moe_stack_load_hook,
+                        stacked_key=w3_key,
+                        per_expert_keys=[str(n.target) for n in w3_list],
+                    )
+                )
+
             with graph.inserting_before(final_hidden_state_node):
-                w1_list = expert_weights["w1"]
-                w2_list = expert_weights["w2"]
-                w3_list = expert_weights["w3"]
+                w1_node = graph.get_attr(w1_key)
+                w2_node = graph.get_attr(w2_key)
+                w3_node = graph.get_attr(w3_key) if w3_key is not None else None
 
                 fused_args = [
                     hidden_states,
                     selected_experts,
                     normalized_routing_weights,
-                    w1_list,
-                    w2_list,
-                    w3_list,
+                    w1_node,
+                    w2_node,
+                    w3_node,
                 ]
 
                 # Append scales as: for each key -> (w1_key_list, w2_key_list, w3_key_list)
@@ -898,6 +1000,18 @@ class MatchMoePattern(BaseTransform):
 
             while _remove_dead_inplace_nodes_in_region(gm.graph, start_boundary, end_boundary):
                 eliminate_dead_code(gm)
+
+            # Remove the now-dead per-expert weight params and empty submodules.
+            eliminate_dead_code(gm)
+            all_weight_nodes = w1_list + w2_list + (w3_list if w3_list else [])
+            live_targets = {str(n.target) for n in gm.graph.nodes if n.op == "get_attr"}
+            for wn in all_weight_nodes:
+                if str(wn.target) not in live_targets:
+                    try:
+                        del_attr_by_name(gm, str(wn.target))
+                    except AttributeError:
+                        pass
+            delete_all_unused_submodules(gm)
 
             num_moe_patterns += 1
 
@@ -1455,62 +1569,51 @@ class MatchBmmMoePattern(BaseTransform):
                 gate_up_checkpoint_key = str(gate_up_weight.target)
                 down_checkpoint_key = str(down_weight.target)
 
-                # Split each stacked tensor into per-expert tensors and register as parameters
-                # This creates get_attr nodes that sharding expects
-                w1_keys = []
-                w2_keys = []
-                w3_keys = []
+                # Create stacked params from Llama4-style gate_up (E, H, 2I) and down (E, I, H).
+                w1_stacked_key = f"bmm_moe_w1_stacked_{num_moe_patterns}"
+                w2_stacked_key = f"bmm_moe_w2_stacked_{num_moe_patterns}"
+                w3_stacked_key = f"bmm_moe_w3_stacked_{num_moe_patterns}"
 
-                for expert_idx in range(num_experts):
-                    # Register each expert's weight as a separate parameter
-                    w1_key = f"bmm_moe_w1_expert_{num_moe_patterns}_{expert_idx}"
-                    w2_key = f"bmm_moe_w2_expert_{num_moe_patterns}_{expert_idx}"
-                    w3_key = f"bmm_moe_w3_expert_{num_moe_patterns}_{expert_idx}"
+                gm.register_parameter(
+                    w1_stacked_key,
+                    torch.nn.Parameter(
+                        gate_up_tensor[:, :, :intermediate_size].transpose(1, 2).contiguous()
+                    ),  # (E, I, H)
+                )
+                gm.register_parameter(
+                    w2_stacked_key,
+                    torch.nn.Parameter(down_tensor.transpose(1, 2).contiguous()),  # (E, H, I)
+                )
+                gm.register_parameter(
+                    w3_stacked_key,
+                    torch.nn.Parameter(
+                        gate_up_tensor[:, :, intermediate_size:].transpose(1, 2).contiguous()
+                    ),  # (E, I, H)
+                )
 
-                    w1_keys.append(w1_key)
-                    w2_keys.append(w2_key)
-                    w3_keys.append(w3_key)
-
-                    w1_param = torch.nn.Parameter(
-                        gate_up_tensor[expert_idx, :, :intermediate_size].transpose(0, 1)
-                    )
-                    w2_param = torch.nn.Parameter(down_tensor[expert_idx].transpose(0, 1))
-                    w3_param = torch.nn.Parameter(
-                        gate_up_tensor[expert_idx, :, intermediate_size:].transpose(0, 1)
-                    )
-
-                    gm.register_parameter(w1_key, w1_param)
-                    gm.register_parameter(w2_key, w2_param)
-                    gm.register_parameter(w3_key, w3_param)
-
-                # Register checkpoint loading hooks - ONE per stacked weight
-                # Hook for gate_up_weight: splits into all w1 and w3 expert weights
+                # Register checkpoint loading hooks.
                 gm._register_load_state_dict_pre_hook(
                     partial(
-                        _bmm_moe_gate_up_split_hook,
+                        _bmm_gate_up_to_stacked_hook,
                         source_key=gate_up_checkpoint_key,
+                        w1_stacked_key=w1_stacked_key,
+                        w3_stacked_key=w3_stacked_key,
                         intermediate_size=intermediate_size,
-                        w1_keys=w1_keys,
-                        w3_keys=w3_keys,
                     )
                 )
-
-                # Hook for down_weight: splits into all w2 expert weights
                 gm._register_load_state_dict_pre_hook(
                     partial(
-                        _bmm_moe_down_split_hook,
+                        _bmm_down_to_stacked_hook,
                         source_key=down_checkpoint_key,
-                        w2_keys=w2_keys,
+                        w2_stacked_key=w2_stacked_key,
                     )
                 )
 
-                # Now create get_attr nodes for each expert weight
-                # These must be created within the insertion context for proper graph ordering
                 insertion_point = graph.find_nodes(op="get_attr")[0]
                 with graph.inserting_before(insertion_point):
-                    w1_nodes = [graph.get_attr(key) for key in w1_keys]
-                    w2_nodes = [graph.get_attr(key) for key in w2_keys]
-                    w3_nodes = [graph.get_attr(key) for key in w3_keys]
+                    w1_node = graph.get_attr(w1_stacked_key)
+                    w2_node = graph.get_attr(w2_stacked_key)
+                    w3_node = graph.get_attr(w3_stacked_key)
 
                 with graph.inserting_before(output_node):
                     fused_moe_node = graph.call_function(
@@ -1519,9 +1622,9 @@ class MatchBmmMoePattern(BaseTransform):
                             input_hidden_states,
                             selected_experts,
                             routing_weights_node,
-                            w1_nodes,
-                            w2_nodes,
-                            w3_nodes,
+                            w1_node,
+                            w2_node,
+                            w3_node,
                         ),
                         kwargs={
                             "is_gated_mlp": True,
@@ -1631,9 +1734,14 @@ def _stack_fp8_moe_weights(
         )
 
     def _stack(param_list, dim=0):
-        return torch.stack(
-            [get_param_or_buffer(element.target) for element in param_list], dim=dim
-        ).contiguous()
+        """Stack per-expert node list or return an already-stacked single node's tensor."""
+        if isinstance(param_list, (list, tuple)):
+            return torch.stack(
+                [get_param_or_buffer(element.target) for element in param_list], dim=dim
+            ).contiguous()
+        else:
+            # Already a single stacked-tensor node
+            return get_param_or_buffer(param_list.target).contiguous()
 
     def _prepare_args_cutlass_format():
         if is_gated_mlp:
@@ -1846,7 +1954,8 @@ def _stack_fp8_moe_weights(
         for input_node in input_nodes:
             if input_node.op == "get_attr" and len(input_node.users) == 0:
                 graph.erase_node(input_node)
-        remove_original_experts(gm, [w1_list, w2_list, w3_list])
+        # Per-expert expert submodules were already eliminated when MatchFP8MoePattern
+        # registered stacked params; no per-expert nodes remain to remove here.
 
     return fused_key_counter
 
@@ -2016,12 +2125,16 @@ def _stack_nvfp4_cutlass_moe_weights(
         )
 
     def _stack(param_list, dim=0, device=None, dtype=None):
-        if param_list:
+        if param_list is None:
+            return torch.empty(0, device=device, dtype=dtype)
+        if isinstance(param_list, (list, tuple)):
+            if not param_list:
+                return torch.empty(0, device=device, dtype=dtype)
             return torch.stack(
                 [get_param_or_buffer(element.target) for element in param_list], dim=dim
             ).contiguous()
-        else:
-            return torch.empty(0, device=device, dtype=dtype)
+        # Single stacked node
+        return get_param_or_buffer(param_list.target).contiguous()
 
     def _prepare_args_cutlass_format_nvfp4():
         if is_gated_mlp:
@@ -2316,11 +2429,16 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
         )
 
     def _stack(param_list, dim=0, device=None, dtype=None):
-        if param_list:
+        if param_list is None:
+            return torch.empty(0, device=device, dtype=dtype)
+        if isinstance(param_list, (list, tuple)):
+            if not param_list:
+                return torch.empty(0, device=device, dtype=dtype)
             return torch.stack(
                 [get_param_or_buffer(element.target) for element in param_list], dim=dim
             ).contiguous()
-        return torch.empty(0, device=device, dtype=dtype)
+        # Single stacked node
+        return get_param_or_buffer(param_list.target).contiguous()
 
     def _round_up(x, alignment):
         return (x + alignment - 1) // alignment * alignment
@@ -2763,10 +2881,23 @@ def _stack_finegrained_fp8_moe_weights(gm: GraphModule) -> int:
             "is_gated_mlp",
         )
 
-    def _stack(param_list, dim=0, device=None, dtype=None):
-        if param_list:
+    def _stack(param_or_list, dim=0, device=None, dtype=None):
+        # Single node: either a get_attr (already stacked) or an aten.stack (needs materializing)
+        if isinstance(param_or_list, Node):
+            if (
+                param_or_list.op == "call_function"
+                and param_or_list.target is torch.ops.aten.stack.default
+            ):
+                # aten.stack node from model patches: stack its per-expert get_attr inputs
+                return torch.stack(
+                    [get_param_or_buffer(inp.target) for inp in param_or_list.args[0]], dim=dim
+                ).contiguous()
+            # get_attr node: weight is already stacked, return directly
+            return get_param_or_buffer(param_or_list.target).contiguous()
+        # List/tuple of per-expert nodes (scale args remain as lists)
+        if param_or_list:
             return torch.stack(
-                [get_param_or_buffer(element.target) for element in param_list], dim=dim
+                [get_param_or_buffer(element.target) for element in param_or_list], dim=dim
             ).contiguous()
         else:
             return torch.empty(0, device=device, dtype=dtype)
