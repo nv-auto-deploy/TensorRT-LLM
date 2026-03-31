@@ -30,7 +30,6 @@ from ...utils.node_utils import (
     extract_op_args,
     extract_output_tuple,
     is_op,
-    is_trivial_passthrough_user,
 )
 from ..interface import (
     BaseTransform,
@@ -245,37 +244,38 @@ class FuseRMSNormQuantFP8(BaseTransform):
             )
             if not fp8_linear_users:
                 continue
-            # Safety: only fuse when all terminal consumers on the norm data path
-            # are FP8 linears in this group. Mixed-consumer patterns can otherwise
-            # split one logical norm into mismatched producer paths.
-            terminal_users, traversal_ok = collect_terminal_users_through_passthrough(norm_node)
-            if not traversal_ok:
-                continue
-            fp8_user_set = set(fp8_linear_users)
-            if any(user not in fp8_user_set for user in terminal_users):
-                continue
 
             out_dtype_str = _get_out_dtype_str(norm_node)
             if out_dtype_str is None:
                 continue
             earliest_fp8_user = min(fp8_linear_users, key=lambda n: node_order.get(n, float("inf")))
-            earliest_fp8_user_idx = node_order.get(earliest_fp8_user)
-            if earliest_fp8_user_idx is None:
+            if node_order.get(earliest_fp8_user) is None:
                 continue
             _, _, _, earliest_scale, _ = _extract_fp8_linear_args(earliest_fp8_user)
 
-            has_other_consumer_before_fp8 = any(
-                u not in fp8_user_set
-                and not is_trivial_passthrough_user(u)
-                and node_order.get(u, float("inf")) < earliest_fp8_user_idx
-                for u in norm_node.users
+            # Insert the fused kernel before the EARLIEST of all norm consumers
+            # (FP8 or non-FP8). Non-FP8 consumers (e.g. MoE router) will use the
+            # BF16 output of the fused op, which is semantically identical to the
+            # original norm output.
+            all_norm_direct_users = list(norm_node.users.keys())
+            earliest_any_user = min(
+                all_norm_direct_users, key=lambda n: node_order.get(n, float("inf"))
             )
-            if has_other_consumer_before_fp8:
-                continue
+
+            # If the scale get_attr appears after the insertion point in the graph
+            # ordering, move it to just before the insertion point. get_attr nodes
+            # have no data dependencies so this is always safe.
+            # Note: node.prepend(x) moves x to just before node.
+            if (
+                isinstance(earliest_scale, Node)
+                and earliest_scale.op == "get_attr"
+                and node_order.get(earliest_scale, 0) > node_order.get(earliest_any_user, 0)
+            ):
+                earliest_any_user.prepend(earliest_scale)
 
             if source_type == "direct":
                 norm_args = norm_info
-                with graph.inserting_before(earliest_fp8_user):
+                with graph.inserting_before(earliest_any_user):
                     fused_quant_node = graph.call_function(
                         torch.ops.auto_deploy.triton_rms_norm_quant_fp8.default,
                         args=(*norm_args, earliest_scale),
@@ -283,13 +283,9 @@ class FuseRMSNormQuantFP8(BaseTransform):
                     bf16_node = graph.call_function(operator.getitem, args=(fused_quant_node, 0))
                     fp8_node = graph.call_function(operator.getitem, args=(fused_quant_node, 1))
 
-                remaining_users = list(norm_node.users.keys())
-                users_to_rewire = [
-                    u
-                    for u in remaining_users
-                    if node_order.get(u, float("inf")) >= earliest_fp8_user_idx
-                ]
-                for user in users_to_rewire:
+                # Rewire ALL consumers: non-FP8 get bf16_node, FP8 linears will be
+                # further rewired to fp8_node below.
+                for user in list(norm_node.users.keys()):
                     user.replace_input_with(norm_node, bf16_node)
                 if len(norm_node.users) == 0:
                     graph.erase_node(norm_node)
@@ -298,7 +294,7 @@ class FuseRMSNormQuantFP8(BaseTransform):
                 if fused_node is not None:
                     processed_fused_nodes.add(id(fused_node))
 
-                with graph.inserting_before(earliest_fp8_user):
+                with graph.inserting_before(earliest_any_user):
                     fused_all_node = graph.call_function(
                         torch.ops.auto_deploy.triton_fused_add_rms_norm_quant_fp8.default,
                         args=(add_rhs, add_lhs, weight, eps, earliest_scale),
@@ -307,23 +303,13 @@ class FuseRMSNormQuantFP8(BaseTransform):
                     fp8_node = graph.call_function(operator.getitem, args=(fused_all_node, 1))
                     add_node = graph.call_function(operator.getitem, args=(fused_all_node, 2))
 
-                remaining_users = list(norm_node.users.keys())
-                users_to_rewire = [
-                    u
-                    for u in remaining_users
-                    if node_order.get(u, float("inf")) >= earliest_fp8_user_idx
-                ]
-                for user in users_to_rewire:
+                # Rewire ALL consumers of norm_node to bf16_node.
+                for user in list(norm_node.users.keys()):
                     user.replace_input_with(norm_node, bf16_node)
 
                 if add_out_node is not None:
-                    add_out_users = list(add_out_node.users.keys())
-                    add_users_to_rewire = [
-                        u
-                        for u in add_out_users
-                        if node_order.get(u, float("inf")) >= earliest_fp8_user_idx
-                    ]
-                    for user in add_users_to_rewire:
+                    # Rewire ALL consumers of add_out_node to add_node.
+                    for user in list(add_out_node.users.keys()):
                         user.replace_input_with(add_out_node, add_node)
 
                 if len(norm_node.users) == 0:
