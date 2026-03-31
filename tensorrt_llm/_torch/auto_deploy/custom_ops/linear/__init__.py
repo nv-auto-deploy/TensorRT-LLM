@@ -25,4 +25,5 @@ __all__ = [
     "linear",
     "torch_router",
     "swiglu",
+    "bf16_gemv",
 ]

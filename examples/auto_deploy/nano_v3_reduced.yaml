@@ -52,5 +52,7 @@ transforms:
     enabled: true  # iter41: fuse attention output FP8 quant — eliminate scaleMatrixPerTensorVec before o_proj
   fuse_causal_conv_activation:
     enabled: true  # iter29: decode-only fusion — prefill uses activation=None + inline silu (avoids large-batch regression), decode uses fused silu (saves kernel launch per Mamba layer)
+  fuse_lm_head_gemv:
+    enabled: false  # iter44 discard: nvjet already ~85% BW for TP-sharded weight [2688,32768]; Triton neutral
   shard_lm_head_vocab_parallel:
     enabled: false  # iter39: REGRESSED +8.7% TPOT at c=1 (AllGather overhead > GEMV savings at small batch)
