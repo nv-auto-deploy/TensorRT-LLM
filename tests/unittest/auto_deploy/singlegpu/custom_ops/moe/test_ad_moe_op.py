@@ -26,7 +26,7 @@ def setup_moe_test(dtype, num_experts):
     final_scales = final_scales / final_scales.sum(dim=-1, keepdim=True)
     final_scales = final_scales.to(x.dtype)
 
-    w1_weight, w2_weight, w3_weight = [], [], []
+    w1_list, w2_list, w3_list = [], [], []
     weights = {}
     fused_w3_w1_stacked_weight = torch.empty(
         (NUM_EXPERTS, INTERMEDIATE_SIZE * 2, HIDDEN_SIZE), dtype=dtype
@@ -42,9 +42,9 @@ def setup_moe_test(dtype, num_experts):
         weights[f"{expert_id}.w2.weight"] = w2
         weights[f"{expert_id}.w3.weight"] = w3
 
-        w1_weight.append(w1)
-        w2_weight.append(w2)
-        w3_weight.append(w3)
+        w1_list.append(w1)
+        w2_list.append(w2)
+        w3_list.append(w3)
 
         fused_w3_w1_stacked_weight.data[expert_id].copy_(torch.cat([w3, w1], dim=-2))
         fused_w2_weight.data[expert_id].copy_(w2)
@@ -53,9 +53,9 @@ def setup_moe_test(dtype, num_experts):
         x,
         selected_experts,
         final_scales,
-        w1_weight,
-        w2_weight,
-        w3_weight,
+        torch.stack(w1_list, dim=0),
+        torch.stack(w2_list, dim=0),
+        torch.stack(w3_list, dim=0),
         weights,
         fused_w3_w1_stacked_weight,
         fused_w2_weight,
@@ -177,22 +177,38 @@ def test_fp8_moe_op_run(dtype):
             w3_weight,
         )
 
-    w1_input_scale, w2_input_scale, w3_input_scale = [], [], []
-    w1_weight_scale, w2_weight_scale, w3_weight_scale = [], [], []
+    wt_scale_factor = 448 if dtype == torch.bfloat16 else 432  # float16 overflow with 448
+    inp_scale_val = torch.tensor(1.0).float().cuda()
+    w1_input_scale = [inp_scale_val] * num_experts
+    w2_input_scale = [inp_scale_val] * num_experts
+    w3_input_scale = [inp_scale_val] * num_experts
+    w1_weight_scale = [
+        (torch.max(torch.abs(w1_weight[i])) / wt_scale_factor).float().cuda()
+        for i in range(num_experts)
+    ]
+    w2_weight_scale = [
+        (torch.max(torch.abs(w2_weight[i])) / wt_scale_factor).float().cuda()
+        for i in range(num_experts)
+    ]
+    w3_weight_scale = [
+        (torch.max(torch.abs(w3_weight[i])) / wt_scale_factor).float().cuda()
+        for i in range(num_experts)
+    ]
+
+    # Quantize weights to FP8 — build new stacked tensors (can't change dtype in-place)
+    w1_fp8 = torch.stack(
+        [(w1_weight[i] / w1_weight_scale[i]).to(torch.float8_e4m3fn) for i in range(num_experts)],
+        dim=0,
+    )
+    w2_fp8 = torch.stack(
+        [(w2_weight[i] / w2_weight_scale[i]).to(torch.float8_e4m3fn) for i in range(num_experts)],
+        dim=0,
+    )
+    w3_fp8 = torch.stack(
+        [(w3_weight[i] / w3_weight_scale[i]).to(torch.float8_e4m3fn) for i in range(num_experts)],
+        dim=0,
+    )
     for i in range(num_experts):
-        inp_scale_val = torch.tensor(1.0).float().cuda()
-        wt_scale_factor = 448 if dtype == torch.bfloat16 else 432  # float16 overflow with 448
-        wt_scale_val = (torch.max(torch.abs(w1_weight[i])) / wt_scale_factor).float().to("cuda")
-        w1_input_scale.append(inp_scale_val)
-        w2_input_scale.append(inp_scale_val)
-        w3_input_scale.append(inp_scale_val)
-        w1_weight_scale.append(wt_scale_val)
-        w2_weight_scale.append(wt_scale_val)
-        w3_weight_scale.append(wt_scale_val)
-        # Cast the expert weight tensors and fused weights to FP8.
-        w1_weight[i] = (w1_weight[i] / w1_weight_scale[i]).to(torch.float8_e4m3fn)
-        w2_weight[i] = (w2_weight[i] / w2_weight_scale[i]).to(torch.float8_e4m3fn)
-        w3_weight[i] = (w3_weight[i] / w3_weight_scale[i]).to(torch.float8_e4m3fn)
         fused_w3_w1_stacked_weight[i] = (fused_w3_w1_stacked_weight[i] / w1_weight_scale[i]).to(
             torch.float8_e4m3fn
         )
@@ -203,9 +219,9 @@ def test_fp8_moe_op_run(dtype):
             x,
             selected_experts,
             final_scales,
-            w1_weight,
-            w2_weight,
-            w3_weight,
+            w1_fp8,
+            w2_fp8,
+            w3_fp8,
             w1_input_scale,
             w2_input_scale,
             w3_input_scale,
@@ -255,6 +271,7 @@ def test_fp4_moe_op_run(dtype):
     w1_input_scale, w2_input_scale, w3_input_scale = [], [], []
     w1_weight_scale, w2_weight_scale, w3_weight_scale = [], [], []
     w1_alpha, w2_alpha, w3_alpha = [], [], []
+    w1_fp4_list, w2_fp4_list, w3_fp4_list = [], [], []
     scaling_vector_size = 16
 
     for i in range(num_experts):
@@ -263,7 +280,7 @@ def test_fp4_moe_op_run(dtype):
         wt_scale_2_w2 = fp4_global_scale(w2_weight[i])
         wt_scale_2_w3 = fp4_global_scale(w3_weight[i])
 
-        # quantize weights
+        # quantize weights — build lists, stack below
         w1_fp4, w1_scale = torch.ops.trtllm.fp4_quantize(
             w1_weight[i], wt_scale_2_w1, scaling_vector_size, False
         )
@@ -273,9 +290,9 @@ def test_fp4_moe_op_run(dtype):
         w3_fp4, w3_scale = torch.ops.trtllm.fp4_quantize(
             w3_weight[i], wt_scale_2_w3, scaling_vector_size, False
         )
-        w1_weight[i] = w1_fp4
-        w2_weight[i] = w2_fp4
-        w3_weight[i] = w3_fp4
+        w1_fp4_list.append(w1_fp4)
+        w2_fp4_list.append(w2_fp4)
+        w3_fp4_list.append(w3_fp4)
 
         # record scales and alpha
         w1_input_scale.append(inp_scale)
@@ -294,9 +311,9 @@ def test_fp4_moe_op_run(dtype):
             x,
             selected_experts,
             final_scales,
-            w1_weight,
-            w2_weight,
-            w3_weight,
+            torch.stack(w1_fp4_list, dim=0),
+            torch.stack(w2_fp4_list, dim=0),
+            torch.stack(w3_fp4_list, dim=0),
             w1_input_scale,
             w2_input_scale,
             w3_input_scale,

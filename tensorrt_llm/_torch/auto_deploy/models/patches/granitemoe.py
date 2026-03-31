@@ -58,16 +58,15 @@ def _forward_moe(self, layer_input: torch.Tensor):
 
     w2_stacked = self.output_linear.weight  # [E, H, I]
 
-    # Use torch_moe with stacked tensor format (single-element list)
+    # Use torch_moe with stacked tensor format; w3_w1_stacked is (E, 2*I, H) and will be
+    # detected by MatchBmmMoePattern during graph transformation.
     layer_output = torch.ops.auto_deploy.torch_moe(
         layer_input_flat,
         selected_experts,
         routing_weights,
-        w1_weight=[w3_w1_stacked],  # Stacked format: single tensor [E, 2*I, H]
-        w2_weight=[w2_stacked],  # Stacked format: single tensor [E, H, I]
-        w3_weight=[],  # Empty for stacked format
-        mlp_style="gated_mlp",
-        act_fn="silu",
+        w1_weight=w3_w1_stacked,  # Stacked format: (E, 2*I, H) — gate+up combined
+        w2_weight=w2_stacked,  # Stacked format: (E, H, I)
+        w3_weight=None,  # Not used; gate+up are fused into w1_weight
     )
 
     layer_output = layer_output.view(bsz, length, self.input_size)

@@ -319,9 +319,8 @@ class NemotronHMOE(nn.Module):
             x_flat,
             topk_indices,
             topk_weights,
-            w1_weight=[e.up_proj.weight for e in self.experts],
-            w2_weight=[e.down_proj.weight for e in self.experts],
-            w3_weight=[],
+            w1_weight=torch.stack([e.up_proj.weight for e in self.experts], dim=0),
+            w2_weight=torch.stack([e.down_proj.weight for e in self.experts], dim=0),
             act_fn=ActivationType.Relu2,
             is_gated_mlp=False,
         )

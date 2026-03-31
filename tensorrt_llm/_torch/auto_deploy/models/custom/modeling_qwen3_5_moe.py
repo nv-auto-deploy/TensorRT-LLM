@@ -607,12 +607,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         # Router
         routing_weights, selected_experts = self.gate(hidden_states_flat)
 
-        # Routed experts via torch_moe op with expert list weights
-        # Extract weight tensors from expert modules
-        w1_weights = [self.experts[i].gate_proj.weight for i in range(len(self.experts))]
-        w2_weights = [self.experts[i].down_proj.weight for i in range(len(self.experts))]
-        w3_weights = [self.experts[i].up_proj.weight for i in range(len(self.experts))]
-
         # Shared expert with sigmoid gating
         shared_expert_output = self.shared_expert(hidden_states_flat)
         shared_expert_output = (
@@ -623,9 +617,15 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             hidden_states_flat,
             selected_experts,
             routing_weights,
-            w1_weights,
-            w2_weights,
-            w3_weights,
+            w1_weight=torch.stack(
+                [self.experts[i].gate_proj.weight for i in range(len(self.experts))], dim=0
+            ),
+            w2_weight=torch.stack(
+                [self.experts[i].down_proj.weight for i in range(len(self.experts))], dim=0
+            ),
+            w3_weight=torch.stack(
+                [self.experts[i].up_proj.weight for i in range(len(self.experts))], dim=0
+            ),
             is_gated_mlp=True,
         )
 

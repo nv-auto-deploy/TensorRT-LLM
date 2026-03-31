@@ -51,9 +51,15 @@ def minimax_m2_moe(self, hidden_states: torch.Tensor):
         hidden_states,
         selected_experts,
         top_k_weights,
-        w1_weight=[expert.w1.weight for expert in self.experts],  # gate projection
-        w2_weight=[expert.w2.weight for expert in self.experts],  # down projection
-        w3_weight=[expert.w3.weight for expert in self.experts],  # up projection
+        w1_weight=torch.stack(
+            [expert.w1.weight for expert in self.experts], dim=0
+        ),  # gate projection
+        w2_weight=torch.stack(
+            [expert.w2.weight for expert in self.experts], dim=0
+        ),  # down projection
+        w3_weight=torch.stack(
+            [expert.w3.weight for expert in self.experts], dim=0
+        ),  # up projection
     )
     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
     return final_hidden_states, router_logits

@@ -140,9 +140,9 @@ def test_triton_moe_matches_torch_moe_mlp_relu2(early_exit):
         x,
         selected_experts,
         routing_weights,
-        w1_weight=w_up_list,
-        w2_weight=w_down_list,
-        w3_weight=[],
+        w1_weight=w_up_stacked,
+        w2_weight=w_down_stacked,
+        w3_weight=None,
         is_gated_mlp=False,
         act_fn=ActivationType.Relu2,
     )
@@ -371,14 +371,14 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
         act_fn=ActivationType.Relu2,
     )
 
-    # Reference: Torch quantized FP8 MoE (uses lists of tensors and scales)
+    # Reference: Torch quantized FP8 MoE (uses stacked tensors for weights, lists for scales)
     out_torch = torch.ops.auto_deploy.torch_quant_fp8_moe(
         x,
         selected_experts,
         routing_weights,
-        w1_weight=w1_fp8_list,
-        w2_weight=w2_fp8_list,
-        w3_weight=w3_fp8_list,
+        w1_weight=w1_fp8_stacked,
+        w2_weight=w2_fp8_stacked,
+        w3_weight=None,
         w1_input_scale=w1_input_scale_list,
         w2_input_scale=w2_input_scale_list,
         w3_input_scale=w3_input_scale_list,

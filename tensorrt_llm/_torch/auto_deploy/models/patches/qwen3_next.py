@@ -49,9 +49,9 @@ def _forward_moe(self: Qwen3NextSparseMoeBlock, hidden_states: torch.Tensor):
         hidden_states,
         selected_experts,
         routing_weights,
-        w1_weight=[expert.gate_proj.weight for expert in self.experts],
-        w2_weight=[expert.down_proj.weight for expert in self.experts],
-        w3_weight=[expert.up_proj.weight for expert in self.experts],
+        w1_weight=torch.stack([expert.gate_proj.weight for expert in self.experts], dim=0),
+        w2_weight=torch.stack([expert.down_proj.weight for expert in self.experts], dim=0),
+        w3_weight=torch.stack([expert.up_proj.weight for expert in self.experts], dim=0),
     )
 
     # Shared expert path (unique to Qwen3Next vs Qwen3MoE)

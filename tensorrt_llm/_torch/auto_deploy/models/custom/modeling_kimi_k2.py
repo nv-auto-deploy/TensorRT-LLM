@@ -499,9 +499,9 @@ class KimiK2MoE(nn.Module):
             hidden_states.view(-1, hidden_states.shape[-1]),
             selected_experts,
             routing_weights,
-            w1_weight=[expert.gate_proj.weight for expert in self.experts],
-            w2_weight=[expert.down_proj.weight for expert in self.experts],
-            w3_weight=[expert.up_proj.weight for expert in self.experts],
+            w1_weight=torch.stack([expert.gate_proj.weight for expert in self.experts], dim=0),
+            w2_weight=torch.stack([expert.down_proj.weight for expert in self.experts], dim=0),
+            w3_weight=torch.stack([expert.up_proj.weight for expert in self.experts], dim=0),
             is_gated_mlp=True,
             act_fn=int(ActivationType.Silu),
         )

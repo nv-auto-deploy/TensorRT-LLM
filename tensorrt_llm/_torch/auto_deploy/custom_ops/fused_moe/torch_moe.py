@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -271,9 +271,9 @@ def torch_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: List[torch.Tensor],
-    w2_weight: List[torch.Tensor],
-    w3_weight: List[torch.Tensor],
+    w1_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w3_weight: Optional[torch.Tensor] = None,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     mapping_config: str = "",
@@ -291,9 +291,10 @@ def torch_moe(
             of the selected experts for each token. Only experts within range [0,num_experts) is processed
         routing_weights (torch.Tensor): A tensor of shape (B, TOP_K) or (B*S, TOP_K) containing the normalized
             routing weights for the selected experts.
-        w1_weight: List of per-expert weight tensors of up projection.
-        w2_weight: List of per-expert weight tensors of down projection.
-        w3_weight: List of per-expert weight tensors of gate projection.
+        w1_weight: Stacked weight tensor of shape (E, I, H) for gate/up projection across all experts.
+        w2_weight: Stacked weight tensor of shape (E, H, I) for down projection across all experts.
+        w3_weight: Stacked weight tensor of shape (E, I, H) for up projection (gated MLP only).
+            Pass None for non-gated MLP.
         is_gated_mlp: If True, use a gated MLP. If False, use a simple MLP.
         act_fn: Activation function applied inside the expert MLP.
             Supported: ActivationType.Silu (default), ActivationType.Relu2 (ReLU then square).
@@ -308,7 +309,7 @@ def torch_moe(
 
     mlps = []
     if is_gated_mlp:
-        # Standard per-expert list format with gated MLP
+        # Stacked tensor format with gated MLP
         def make_mlp(i: int):
             W1 = w1_weight[i]  # (I, H)
             W2 = w2_weight[i]  # (H, I)
@@ -317,16 +318,16 @@ def torch_moe(
                 torch_act_fn(F.linear(inp.to(W1.dtype), W1)) * F.linear(inp.to(W3.dtype), W3), W2
             )
 
-        mlps = [make_mlp(i) for i in range(len(w1_weight))]
+        mlps = [make_mlp(i) for i in range(w1_weight.shape[0])]
 
     else:
-        # Standard per-expert list format with simple MLP
+        # Stacked tensor format with simple MLP
         def make_mlp(i: int):
             W_up = w1_weight[i]  # (I, H)
             W_down = w2_weight[i]  # (H, I)
             return lambda inp: F.linear(torch_act_fn(F.linear(inp, W_up)), W_down)
 
-        mlps = [make_mlp(i) for i in range(len(w1_weight))]
+        mlps = [make_mlp(i) for i in range(w1_weight.shape[0])]
 
     return _template_moe(
         x,
@@ -344,9 +345,9 @@ def torch_moe_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: List[torch.Tensor],
-    w2_weight: List[torch.Tensor],
-    w3_weight: List[torch.Tensor],
+    w1_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w3_weight: Optional[torch.Tensor] = None,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     mapping_config: str = "",
@@ -427,9 +428,9 @@ def torch_quant_fp8_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: List[torch.Tensor],
-    w2_weight: List[torch.Tensor],
-    w3_weight: List[torch.Tensor],
+    w1_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w3_weight: Optional[torch.Tensor],
     w1_input_scale: List[torch.Tensor],
     w2_input_scale: List[torch.Tensor],
     w3_input_scale: List[torch.Tensor],
@@ -505,7 +506,7 @@ def torch_quant_fp8_moe(
 
             return mlp
 
-        mlps = [make_fp8_mlp(i) for i in range(len(w1_weight))]
+        mlps = [make_fp8_mlp(i) for i in range(w1_weight.shape[0])]
 
     else:
 
@@ -528,7 +529,7 @@ def torch_quant_fp8_moe(
 
             return mlp
 
-        mlps = [make_fp8_mlp(i) for i in range(len(w1_weight))]
+        mlps = [make_fp8_mlp(i) for i in range(w1_weight.shape[0])]
 
     return _template_moe(
         x,
@@ -546,9 +547,9 @@ def torch_quant_fp8_moe_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: List[torch.Tensor],
-    w2_weight: List[torch.Tensor],
-    w3_weight: List[torch.Tensor],
+    w1_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w3_weight: Optional[torch.Tensor],
     w1_input_scale: List[torch.Tensor],
     w2_input_scale: List[torch.Tensor],
     w3_input_scale: List[torch.Tensor],
@@ -569,9 +570,9 @@ def torch_quant_nvfp4_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: List[torch.Tensor],
-    w2_weight: List[torch.Tensor],
-    w3_weight: List[torch.Tensor],
+    w1_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w3_weight: Optional[torch.Tensor],
     w1_input_scale: List[torch.Tensor],
     w2_input_scale: List[torch.Tensor],
     w3_input_scale: List[torch.Tensor],
@@ -659,7 +660,7 @@ def torch_quant_nvfp4_moe(
 
             return mlp
 
-        mlps = [make_fp4_mlp(i) for i in range(len(w1_weight))]
+        mlps = [make_fp4_mlp(i) for i in range(w1_weight.shape[0])]
 
     else:
 
@@ -686,7 +687,7 @@ def torch_quant_nvfp4_moe(
 
             return mlp
 
-        mlps = [make_fp4_mlp(i) for i in range(len(w1_weight))]
+        mlps = [make_fp4_mlp(i) for i in range(w1_weight.shape[0])]
 
     return _template_moe(
         x,
@@ -704,9 +705,9 @@ def torch_quant_nvfp4_moe_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: List[torch.Tensor],
-    w2_weight: List[torch.Tensor],
-    w3_weight: List[torch.Tensor],
+    w1_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w3_weight: Optional[torch.Tensor],
     w1_input_scale: List[torch.Tensor],
     w2_input_scale: List[torch.Tensor],
     w3_input_scale: List[torch.Tensor],
@@ -780,9 +781,9 @@ def torch_quant_finegrained_fp8_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: List[torch.Tensor],
-    w2_weight: List[torch.Tensor],
-    w3_weight: List[torch.Tensor],
+    w1_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w3_weight: torch.Tensor,
     w1_weight_scale_inv: List[torch.Tensor],
     w2_weight_scale_inv: List[torch.Tensor],
     w3_weight_scale_inv: List[torch.Tensor],
@@ -802,9 +803,9 @@ def torch_quant_finegrained_fp8_moe(
         x: Input tensor of shape (B, H) or (B, S, H).
         selected_experts: Tensor (B, TOP_K) or (B*S, TOP_K) containing expert indices.
         routing_weights: Tensor of normalized routing weights.
-        w1_weight: List of per-expert FP8 weight tensors for gate/up projection.
-        w2_weight: List of per-expert FP8 weight tensors for down projection.
-        w3_weight: List of per-expert FP8 weight tensors for up projection (gated MLP).
+        w1_weight: Stacked FP8 weight tensor of shape (E, I, H) for gate/up projection.
+        w2_weight: Stacked FP8 weight tensor of shape (E, H, I) for down projection.
+        w3_weight: Stacked FP8 weight tensor of shape (E, I, H) for up projection (gated MLP).
         w1_weight_scale_inv: List of per-block weight scales for w1.
         w2_weight_scale_inv: List of per-block weight scales for w2.
         w3_weight_scale_inv: List of per-block weight scales for w3.
@@ -848,7 +849,7 @@ def torch_quant_finegrained_fp8_moe(
 
             return mlp
 
-        mlps = [make_finegrained_fp8_mlp(i) for i in range(len(w1_weight))]
+        mlps = [make_finegrained_fp8_mlp(i) for i in range(w1_weight.shape[0])]
 
     else:
 
@@ -875,7 +876,7 @@ def torch_quant_finegrained_fp8_moe(
 
             return mlp
 
-        mlps = [make_finegrained_fp8_mlp(i) for i in range(len(w1_weight))]
+        mlps = [make_finegrained_fp8_mlp(i) for i in range(w1_weight.shape[0])]
 
     return _template_moe(
         x,
@@ -893,9 +894,9 @@ def torch_quant_finegrained_fp8_moe_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: List[torch.Tensor],
-    w2_weight: List[torch.Tensor],
-    w3_weight: List[torch.Tensor],
+    w1_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w3_weight: torch.Tensor,
     w1_weight_scale_inv: List[torch.Tensor],
     w2_weight_scale_inv: List[torch.Tensor],
     w3_weight_scale_inv: List[torch.Tensor],
