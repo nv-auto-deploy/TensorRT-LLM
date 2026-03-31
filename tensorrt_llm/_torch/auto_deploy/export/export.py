@@ -99,6 +99,12 @@ class _MoeExpertProbe(TorchDispatchMode):
 
     Used by :func:`_find_moe_module_lists` to discover which ``nn.ModuleList``
     instances provide expert weights without relying on attribute naming conventions.
+
+    Supports both the legacy per-expert list calling convention (``List[Tensor]`` args)
+    and the current stacked-tensor convention (single ``Tensor`` of shape ``(E, I, H)``
+    produced by ``torch.stack`` from a ``ModuleList``).  In the stacked case the probe
+    intercepts ``aten.stack`` calls and records a mapping from the stacked-tensor id
+    back to its component ids so that the subsequent MoE op dispatch can resolve them.
     """
 
     # MOE custom ops whose list arguments represent per-expert weight tensors.
@@ -108,6 +114,8 @@ class _MoeExpertProbe(TorchDispatchMode):
         super().__init__()
         self.captured_param_ids: set = set()
         self._moe_ops = self._collect_moe_ops()
+        # id(stacked_tensor) → frozenset of id(component_tensor)
+        self._stack_components: Dict[int, set] = {}
 
     @classmethod
     def _collect_moe_ops(cls) -> set:
@@ -121,12 +129,28 @@ class _MoeExpertProbe(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
+
+        # Track torch.stack so that stacked expert tensors can be traced back to
+        # individual expert parameter IDs when the MoE op is dispatched.
+        if func is torch.ops.aten.stack.default:
+            result = func(*args, **kwargs)
+            tensor_list = args[0] if args else []
+            if isinstance(tensor_list, (list, tuple)) and isinstance(result, torch.Tensor):
+                self._stack_components[id(result)] = {
+                    id(t) for t in tensor_list if isinstance(t, torch.Tensor)
+                }
+            return result
+
         if func in self._moe_ops:
             for arg in list(args) + list(kwargs.values()):
                 if isinstance(arg, (list, tuple)):
                     for item in arg:
                         if isinstance(item, torch.Tensor):
                             self.captured_param_ids.add(id(item))
+                elif isinstance(arg, torch.Tensor):
+                    # Stacked tensor: resolve back to per-expert component IDs
+                    if id(arg) in self._stack_components:
+                        self.captured_param_ids.update(self._stack_components[id(arg)])
         return func(*args, **kwargs)
 
 
@@ -244,22 +268,24 @@ def _expand_moe_experts_in_graph(
 
     After exporting with a reduced number of experts this function:
 
-    1. Finds every ``torch_moe``-family node whose weight-list arguments are
-       shorter than the original expert count.
+    1. Finds every ``torch_moe``-family node whose weight arguments are shorter
+       than the original expert count.  Two calling conventions are supported:
+
+       * **List[Tensor]** (scales in quantized ops): each element is a
+         ``get_attr`` node for a single expert's weight.  Missing experts are
+         appended to the list.
+       * **Stacked Tensor** (weight args in current ops): a single
+         ``aten.stack`` node whose inputs are per-expert ``get_attr`` nodes.
+         Missing experts are added to the ``aten.stack`` input list.
+
     2. Registers the missing expert parameters on *gm* (copied from the
        already-restored *model*).
     3. Creates the corresponding ``get_attr`` nodes and extends the weight
-       lists in the call node so the graph is equivalent to a full export.
+       arguments in the call node so the graph is equivalent to a full export.
     """
     if not reductions:
         return
 
-    # MOE ops whose arguments include per-expert weight lists.
-    # All these ops share the same first 3 positional args (x, selected_experts,
-    # routing_weights) which are plain Tensors, followed by one or more
-    # List[Tensor] args that hold per-expert weights/scales.  We use the op
-    # schema to discover which arguments are Tensor[] rather than hard-coding
-    # the starting index.
     moe_ops = {
         torch.ops.auto_deploy.torch_moe,
         torch.ops.auto_deploy.torch_quant_fp8_moe,
@@ -273,8 +299,13 @@ def _expand_moe_experts_in_graph(
         if not is_op(node, moe_ops):
             continue
 
-        # Collect indices of List[Tensor] arguments from the op schema – these
-        # are the per-expert weight / scale lists.
+        # ------------------------------------------------------------------ #
+        # Determine which arguments need expansion.                           #
+        # ------------------------------------------------------------------ #
+
+        # Case A: List[Tensor] args (e.g. scale lists in quantized ops).
+        # Use the op schema to find which positional args are declared as
+        # Tensor[] / List[Tensor] and are currently shorter than original.
         op = node.target
         schema = op._schema if hasattr(op, "_schema") else next(iter(op._schemas.values()))
         _tensor_list_types = ("Tensor[]", "List[Tensor]")
@@ -286,14 +317,40 @@ def _expand_moe_experts_in_graph(
             and isinstance(node.args[i], (list, tuple))
             and len(node.args[i]) > 0
         ]
-        if not list_arg_indices:
+
+        # Case B: Stacked Tensor args (weight args at positions 3-5).
+        # These are FX Nodes produced by aten.stack whose inputs are per-expert
+        # get_attr nodes.
+        stacked_arg_indices = [
+            i
+            for i in range(3, min(6, len(node.args)))
+            if isinstance(node.args[i], fx.Node)
+            and node.args[i].op == "call_function"
+            and node.args[i].target is torch.ops.aten.stack.default
+            and isinstance(node.args[i].args[0], (list, tuple))
+            and len(node.args[i].args[0]) > 0
+            and isinstance(node.args[i].args[0][0], fx.Node)
+        ]
+
+        if not list_arg_indices and not stacked_arg_indices:
             continue
 
-        first_list = node.args[list_arg_indices[0]]
-        current_num = len(first_list)
-        first_target = first_list[0].target
-        original_num = _find_original_num_experts(first_target, reductions)
+        # ------------------------------------------------------------------ #
+        # Determine current/original expert counts from the first expandable  #
+        # argument (list or stacked).                                          #
+        # ------------------------------------------------------------------ #
 
+        if list_arg_indices:
+            first_list = node.args[list_arg_indices[0]]
+            current_num = len(first_list)
+            first_target = first_list[0].target
+        else:
+            stack_node = node.args[stacked_arg_indices[0]]
+            stack_inputs = list(stack_node.args[0])
+            current_num = len(stack_inputs)
+            first_target = stack_inputs[0].target
+
+        original_num = _find_original_num_experts(first_target, reductions)
         if original_num is None or original_num <= current_num:
             continue
 
@@ -304,36 +361,47 @@ def _expand_moe_experts_in_graph(
         # Insert new get_attr nodes at the very beginning of the graph
         first_graph_node = next(iter(graph.nodes))
 
-        new_args = list(node.args)
-        for li in list_arg_indices:
-            weight_list = list(node.args[li])
-
-            # Determine the naming pattern: prefix + <expert_idx> + suffix
-            if len(weight_list) >= 2:
-                prefix, suffix = _infer_target_pattern(weight_list[0].target, weight_list[1].target)
+        def _add_missing_get_attr_nodes(
+            existing_inputs: List[fx.Node],
+        ) -> List[fx.Node]:
+            """Register missing expert params and return new get_attr nodes."""
+            inp0, inp1 = (
+                existing_inputs[0],
+                (existing_inputs[1] if len(existing_inputs) >= 2 else None),
+            )
+            if inp1 is not None:
+                prefix, suffix = _infer_target_pattern(inp0.target, inp1.target)
             else:
-                ep = _find_expert_prefix(weight_list[0].target, reductions)
-                assert ep is not None, (
-                    f"Could not find expert prefix for target '{weight_list[0].target}'"
-                )
-                prefix, suffix = _infer_single_target_pattern(weight_list[0].target, ep)
+                ep = _find_expert_prefix(inp0.target, reductions)
+                assert ep is not None, f"Could not find expert prefix for target '{inp0.target}'"
+                prefix, suffix = _infer_single_target_pattern(inp0.target, ep)
 
-            # Add the missing expert weights
+            new_nodes: List[fx.Node] = []
             for expert_idx in range(current_num, original_num):
                 new_target = f"{prefix}{expert_idx}{suffix}"
-
-                # Copy the parameter from the restored model
                 orig_param = model.get_parameter(new_target)
                 _register_nested_parameter(gm, new_target, nn.Parameter(orig_param.data))
-
-                # Create a get_attr node
                 with graph.inserting_before(first_graph_node):
-                    new_node = graph.get_attr(new_target)
-                    new_node.meta["val"] = gm.get_parameter(new_target)
+                    new_attr_node = graph.get_attr(new_target)
+                    new_attr_node.meta["val"] = gm.get_parameter(new_target)
+                new_nodes.append(new_attr_node)
+            return new_nodes
 
-                weight_list.append(new_node)
+        new_args = list(node.args)
 
+        # Expand List[Tensor] args (scales, legacy per-expert weight lists)
+        for li in list_arg_indices:
+            weight_list = list(node.args[li])
+            weight_list.extend(_add_missing_get_attr_nodes(weight_list))
             new_args[li] = weight_list
+
+        # Expand stacked Tensor args (current per-expert weight args)
+        for si in stacked_arg_indices:
+            stack_node = node.args[si]
+            stack_inputs = list(stack_node.args[0])
+            new_expert_nodes = _add_missing_get_attr_nodes(stack_inputs)
+            # Extend the aten.stack input list in-place
+            stack_node.args = (stack_inputs + new_expert_nodes, *stack_node.args[1:])
 
         node.args = tuple(new_args)
         num_expanded += 1

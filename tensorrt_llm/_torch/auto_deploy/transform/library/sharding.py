@@ -35,7 +35,7 @@ from .....functional import AllReduceStrategy
 from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import del_attr_by_name, eliminate_dead_code
+from ...utils._graph import del_attr_by_name, delete_all_unused_submodules, eliminate_dead_code
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     LayerSubgraph,
@@ -72,6 +72,7 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
+from .fused_moe import _moe_stack_load_hook
 
 ########################################################
 #  Helper functions
@@ -1724,6 +1725,25 @@ def _update_node_args(node: Node, args: tuple) -> None:
     ad_logger.debug(f"Updated node {node}: sharded arguments are now {node.args}.")
 
 
+def _moe_ep_shard_load_hook(
+    state_dict,
+    prefix,
+    *args,
+    orig_key: str,
+    new_key: str,
+    lo: int,
+    hi: int,
+):
+    """Load hook: slices the full stacked expert weight to this rank's local shard.
+
+    Maps ``prefix + orig_key`` (shape (E, ...)) → ``prefix + new_key`` (shape (hi-lo, ...)).
+    """
+    full_orig = prefix + orig_key
+    full_new = prefix + new_key
+    if full_new not in state_dict and full_orig in state_dict:
+        state_dict[full_new] = state_dict[full_orig][lo:hi].contiguous()
+
+
 def _insert_sharded_moe(
     gm: GraphModule,
     node: Node,
@@ -1759,57 +1779,122 @@ def _insert_sharded_moe(
     # -- Handle selected_experts and final_scales sharding --
     selected_experts = args[1]
     final_scales = args[2]
-    num_experts = len(args[3])
 
-    experts_per_rank = num_experts // ep_size
-
-    # =====================================================================================
-    # Shard expert weights
-    # =====================================================================================
     def get_partition(lst, world_size, rank):
+        """Slice a list of per-expert items to the local rank's shard."""
         num_experts = len(lst)
         expert_size_per_partition = num_experts // world_size
         expert_start = rank * expert_size_per_partition
-        # For num_experts % world_size != 0 case,
-        # assign the last (num_experts % world_size) experts to the last rank
         expert_end = (
             num_experts if (rank == world_size - 1) else expert_start + expert_size_per_partition
         )
-
         return lst[expert_start:expert_end], lst[:expert_start] + lst[expert_end:]
 
-    w_up_list_sharded, w_up_list_to_remove = get_partition(args[3], ep_size, ep_rank)
-    w_down_list_sharded, w_down_list_to_remove = get_partition(args[4], ep_size, ep_rank)
-    w_gate_list_sharded, w_gate_list_to_remove = get_partition(args[5], ep_size, ep_rank)
+    # args[3] is a single stacked (E, I, H) get_attr node; get E from the actual parameter.
+    # In the pre-pattern-match case (aten.stack still present), materialize into a param first.
+    def _materialize_stack_node(weight_node: Node) -> Node:
+        """If weight_node is an aten.stack, stack per-expert tensors into a new param."""
+        if not (
+            weight_node.op == "call_function" and weight_node.target is torch.ops.aten.stack.default
+        ):
+            return weight_node
+        stack_inputs = list(weight_node.args[0])
+        stacked = torch.stack(
+            [gm.get_parameter(n.target) for n in stack_inputs], dim=0
+        ).contiguous()
+        # Use a flat underscore-based key so gm.register_parameter (no dots) works.
+        new_key = stack_inputs[0].target.replace(".", "_") + "_stacked"
+        gm.register_parameter(new_key, nn.Parameter(stacked, requires_grad=False))
+        # Register a checkpoint-compat hook: per-expert dotted keys → new flat stacked key.
+        gm._register_load_state_dict_pre_hook(
+            partial(
+                _moe_stack_load_hook,
+                stacked_key=new_key,
+                per_expert_keys=[str(n.target) for n in stack_inputs],
+            )
+        )
+        with gm.graph.inserting_before(node):
+            new_node = gm.graph.get_attr(new_key)
+        weight_node.replace_all_uses_with(new_node)
+        per_expert_inputs = list(weight_node.args[0])
+        gm.graph.erase_node(weight_node)
+        for inp in per_expert_inputs:
+            if isinstance(inp, Node) and not inp.users:
+                gm.graph.erase_node(inp)
+        return new_node
 
-    # if tp_size > 1, we do 2D EP+TP sharding.
+    w1_node = _materialize_stack_node(args[3])
+    w2_node = _materialize_stack_node(args[4])
+    w3_node = _materialize_stack_node(args[5]) if args[5] is not None else None
+    args[3], args[4], args[5] = w1_node, w2_node, w3_node
+    # Free per-expert weight submodules that are no longer referenced in the graph.
+    # Without this, both per-expert tensors and stacked copies live in GPU memory simultaneously.
+    eliminate_dead_code(gm)
+    delete_all_unused_submodules(gm)
+    num_experts = gm.get_parameter(str(w1_node.target)).shape[0]
+
+    experts_per_rank = num_experts // ep_size
+    lo = experts_per_rank * ep_rank
+    hi = num_experts if ep_rank == ep_size - 1 else lo + experts_per_rank
+
+    # =====================================================================================
+    # Shard expert weights (stacked tensors: slice dim-0 to local experts)
+    # =====================================================================================
+    stacked_keys_to_remove = []
+
+    def _ep_shard_weight(weight_node):
+        """Slice stacked weight to this rank's experts and register as a new parameter."""
+        orig_key = str(weight_node.target)
+        tensor = gm.get_parameter(orig_key)
+        sliced = tensor[lo:hi].contiguous()
+        new_key = orig_key + "_ep"
+        gm.register_parameter(new_key, nn.Parameter(sliced, requires_grad=False))
+        # Register a load hook so checkpoint loading maps orig_key → new_key[lo:hi]
+        gm._register_load_state_dict_pre_hook(
+            partial(
+                _moe_ep_shard_load_hook,
+                orig_key=orig_key,
+                new_key=new_key,
+                lo=lo,
+                hi=hi,
+            )
+        )
+        with gm.graph.inserting_before(node):
+            new_node = gm.graph.get_attr(new_key)
+        stacked_keys_to_remove.append(orig_key)
+        return new_node
+
+    w1_sharded = _ep_shard_weight(w1_node)
+    w2_sharded = _ep_shard_weight(w2_node)
+    w3_sharded = _ep_shard_weight(w3_node) if w3_node is not None else None
+
+    # if tp_size > 1, we do 2D EP+TP sharding on the already-EP-sliced stacked tensors.
+    # For stacked (local_E, I, H): column sharding splits dim 1 (I), row splits dim 2 (H).
     if tp_size > 1:
-        # we add TP sharding of all expert weights.
-        for w_up in w_up_list_sharded + w_gate_list_sharded:
+        for w_node in [w1_sharded, w3_sharded] if w3_sharded is not None else [w1_sharded]:
             shard_weight_tensor(
                 gm=gm,
-                weight_tensor=gm.get_parameter(w_up.target),
-                param_key=w_up.target,
-                dim=SplitDimension.COLUMN,
+                weight_tensor=gm.get_parameter(str(w_node.target)),
+                param_key=str(w_node.target),
+                dim=1,  # column: split I (intermediate) dimension
                 rank=tp_rank,
                 world_size=tp_size,
             )
         # here we don't need to add all-reduce: it's enough to have
         # just one all-reduce after the whole EP+TP sharded MoE node.
-        for w_down in w_down_list_sharded:
-            shard_weight_tensor(
-                gm=gm,
-                weight_tensor=gm.get_parameter(w_down.target),
-                param_key=w_down.target,
-                dim=SplitDimension.ROW,
-                rank=tp_rank,
-                world_size=tp_size,
-            )
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=gm.get_parameter(str(w2_sharded.target)),
+            param_key=str(w2_sharded.target),
+            dim=2,  # row: split H (hidden) dimension
+            rank=tp_rank,
+            world_size=tp_size,
+        )
 
     # -- Update args --
-    args[3] = w_up_list_sharded
-    args[4] = w_down_list_sharded
-    args[5] = w_gate_list_sharded
+    args[3] = w1_sharded
+    args[4] = w2_sharded
+    args[5] = w3_sharded
 
     # =====================================================================================
     # Shard scales for quantized ops
@@ -1901,17 +1986,20 @@ def _insert_sharded_moe(
     # Cleanup unused expert weights and scales
     # =====================================================================================
     eliminate_dead_code(gm)
-    # Expert weights registered via gm.register_parameter() are top-level attributes.
-    # Unlike submodules, these aren't cleaned up by eliminate_dead_code() or
-    # delete_all_unused_submodules() - must delete manually after removing their get_attr nodes.
-    for expert in (
-        w_up_list_to_remove + w_down_list_to_remove + w_gate_list_to_remove + scales_to_remove
-    ):
+    # The original full stacked weight parameters are no longer referenced after EP slicing.
+    # delete_all_unused_submodules() won't catch top-level params — delete manually.
+    for key in stacked_keys_to_remove:
         try:
-            del_attr_by_name(gm, expert.target)
+            del_attr_by_name(gm, key)
+        except AttributeError:
+            ad_logger.warning(f"Failed to delete unused stacked parameter {key} from GraphModule.")
+    # Per-expert scale params are still lists; delete the non-local ones.
+    for scale_node in scales_to_remove:
+        try:
+            del_attr_by_name(gm, scale_node.target)
         except AttributeError:
             ad_logger.warning(
-                f"Failed to delete unused parameter {expert.target} from GraphModule."
+                f"Failed to delete unused scale parameter {scale_node.target} from GraphModule."
             )
 
 
