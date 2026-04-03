@@ -334,7 +334,12 @@ class FuseRMSNormQuantFP8(BaseTransform):
                     fp8_input = fp8_node
                     if isinstance(input_arg, Node):
                         source_arg, post_nodes = _unwrap_post_norm_nodes(input_arg)
-                        if source_arg is norm_node:
+                        # After the first rewiring loop, all view nodes that were
+                        # norm_node → view → fp8_user now point to bf16_node instead
+                        # of norm_node (replace_input_with updated their inputs).
+                        # So _unwrap_post_norm_nodes returns bf16_node as source,
+                        # not norm_node. Check both to handle any ordering edge cases.
+                        if source_arg is norm_node or source_arg is bf16_node:
                             fp8_input = _reapply_post_norm_nodes(graph, fp8_node, post_nodes)
                     gemm_node = graph.call_function(
                         torch.ops.auto_deploy.trtllm_fp8_prequant_linear.default,
