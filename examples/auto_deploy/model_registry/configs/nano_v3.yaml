@@ -51,3 +51,13 @@ transforms:
     enabled: true
   insert_cached_ssm_attention:
     backend: flashinfer_ssm
+  fuse_causal_conv_activation:
+    enabled: true
+  fuse_relu2_quant_fp8:
+    enabled: true
+  fuse_gated_rmsnorm_quant_fp8:
+    enabled: true
+  fuse_rmsnorm_quant_fp8:
+    enabled: true
+  fuse_trtllm_attn_quant_fp8:
+    enabled: true

@@ -266,9 +266,8 @@ def rms_norm_quant_fp8(
 
     if seq_len <= _RMN_ADAPTIVE_THRESHOLD:
         # Small/medium batch: FlashInfer rmsnorm + _fp8_quant_only_kernel.
-        # NOTE: out_bf16 is always dead code here. The fuse_rmsnorm_quant_fp8 transform only fires
-        # when ALL terminal consumers of the norm output are FP8 linears (transform line 251-256),
-        # so bf16_node has zero users after rewiring and is eliminated by eliminate_dead_code().
+        # NOTE: iter43 added mixed-consumer support, so bf16_node may have non-FP8 users
+        # (e.g. MoE router). Return normed_flat as out_bf16 — already computed, zero extra cost.
         # We split into 2 kernels to avoid scale.item() (which triggers a D2H sync forbidden during
         # CUDA graph capture): flashinfer.norm.rmsnorm needs no scale (CUDA graph OK), then
         # _fp8_quant_only_kernel reads scale via tl.load(scale_ptr) with no .item() call.
@@ -277,8 +276,7 @@ def rms_norm_quant_fp8(
 
         normed_flat = flashinfer.norm.rmsnorm(hidden_states_flat, weight, eps)
         out_fp8 = _fp8_quant_tensor(normed_flat, scale)
-        out_bf16 = torch.empty_like(hidden_states_flat)  # dead code — uninitialized, never read
-        return out_bf16.reshape(orig_shape), out_fp8.reshape(orig_shape)
+        return normed_flat.reshape(orig_shape), out_fp8.reshape(orig_shape)
 
     out_bf16 = torch.empty_like(hidden_states_flat)
     out_fp8 = torch.empty(
@@ -428,9 +426,8 @@ def fused_add_rms_norm_quant_fp8(
         )
     elif seq_len <= _RMN_ADAPTIVE_THRESHOLD:
         # Medium batch (5 <= seq_len <= 32): add + FlashInfer rmsnorm + fp8_quant (3 kernels).
-        # NOTE: out_bf16 is always dead code (same reasoning as non-fused case above — the
-        # fuse_rmsnorm_quant_fp8 transform only fires when ALL consumers are FP8 linears, so
-        # bf16_node has zero users after rewiring and is eliminated by eliminate_dead_code()).
+        # NOTE: iter43 added mixed-consumer support, so bf16_node may have non-FP8 users
+        # (e.g. MoE router). Return normed_flat as out_bf16 — already computed, zero extra cost.
         # out_add IS used (wired to next layer's residual input) so must be correct.
         # Split to avoid scale.item() CUDA graph crash (same fix as non-fused path above):
         # elementwise add (1 kernel) + flashinfer.norm.rmsnorm (no scale, CUDA graph OK) +
@@ -441,7 +438,9 @@ def fused_add_rms_norm_quant_fp8(
         normed_flat = flashinfer.norm.rmsnorm(out_add_flat, weight, eps)
         out_fp8_med = _fp8_quant_tensor(normed_flat, scale)
         return (
-            out_bf16.reshape(orig_shape),  # dead code — uninitialized, never read
+            normed_flat.reshape(
+                orig_shape
+            ),  # iter46 fix: was out_bf16 (uninitialized) — MoE router needs correct bf16
             out_fp8_med.reshape(orig_shape),
             out_add_flat.reshape(orig_shape),
         )
