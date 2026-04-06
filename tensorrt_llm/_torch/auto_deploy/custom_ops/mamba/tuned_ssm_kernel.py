@@ -113,19 +113,12 @@ def _tuned_ssm_update_kernel(
     out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
-    mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
+    mask_m = offs_m < dim
 
-    # Load state [BLOCK_SIZE_M, BLOCK_SIZE_DSTATE]
-    state_ptrs = state_ptr + (
-        offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
-    )
-    state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
-
-    # Load x, dt, dt_bias for this block's dim slice
-    x = tl.load(x_ptr + offs_m * stride_x_dim, mask=offs_m < dim, other=0.0).to(tl.float32)
-    dt = tl.load(dt_ptr + offs_m * stride_dt_dim, mask=offs_m < dim, other=0.0).to(tl.float32)
-    dt_bias = tl.load(dt_bias_ptr + offs_m * stride_dt_bias_dim, mask=offs_m < dim, other=0.0).to(
+    # Load x, dt, dt_bias for this block's dim slice (scalar per dim lane)
+    x = tl.load(x_ptr + offs_m * stride_x_dim, mask=mask_m, other=0.0).to(tl.float32)
+    dt = tl.load(dt_ptr + offs_m * stride_dt_dim, mask=mask_m, other=0.0).to(tl.float32)
+    dt_bias = tl.load(dt_bias_ptr + offs_m * stride_dt_bias_dim, mask=mask_m, other=0.0).to(
         tl.float32
     )
 
@@ -133,31 +126,52 @@ def _tuned_ssm_update_kernel(
     dt = softplus(dt + dt_bias)
     dt = tl.clamp(dt, DT_CLAMP_MIN, DT_CLAMP_MAX)
 
-    # Load A [BLOCK_SIZE_M, BLOCK_SIZE_DSTATE]
-    A_ptrs = A_ptr + offs_m[:, None] * stride_A_dim + offs_n[None, :] * stride_A_dstate
-    A = tl.load(A_ptrs, mask=mask, other=0.0).to(tl.float32)
+    # Accumulate output over dstate in BLOCK_SIZE_DSTATE chunks
+    out_acc = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
 
-    # dA = exp(A * dt)
-    dA = tl.exp(A * dt[:, None])
+    for dstate_start in range(0, dstate, BLOCK_SIZE_DSTATE):
+        offs_n = dstate_start + tl.arange(0, BLOCK_SIZE_DSTATE)
+        mask = mask_m[:, None] & (offs_n[None, :] < dstate)
 
-    # Load B, C [BLOCK_SIZE_DSTATE]
-    B = tl.load(B_ptr + offs_n * stride_B_dstate, mask=offs_n < dstate, other=0.0).to(tl.float32)
-    C = tl.load(C_ptr + offs_n * stride_C_dstate, mask=offs_n < dstate, other=0.0).to(tl.float32)
+        # Load state [BLOCK_SIZE_M, BLOCK_SIZE_DSTATE]
+        state_ptrs = state_ptr + (
+            offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
+        )
+        state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-    # dB = B * dt
-    dB = B[None, :] * dt[:, None]
+        # Load A [BLOCK_SIZE_M, BLOCK_SIZE_DSTATE]
+        A_ptrs = A_ptr + offs_m[:, None] * stride_A_dim + offs_n[None, :] * stride_A_dstate
+        A = tl.load(A_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-    # state = state * dA + dB * x
-    state = state * dA + dB * x[:, None]
+        # dA = exp(A * dt)
+        dA = tl.exp(A * dt[:, None])
 
-    # out = sum(state * C, axis=1) + x * D
-    out = tl.sum(state * C[None, :], axis=1)
-    D = tl.load(D_ptr + offs_m * stride_D_dim, mask=offs_m < dim, other=0.0).to(tl.float32)
-    out += x * D
+        # Load B, C [BLOCK_SIZE_DSTATE]
+        B = tl.load(B_ptr + offs_n * stride_B_dstate, mask=offs_n < dstate, other=0.0).to(
+            tl.float32
+        )
+        C = tl.load(C_ptr + offs_n * stride_C_dstate, mask=offs_n < dstate, other=0.0).to(
+            tl.float32
+        )
 
-    # Store output and updated state
-    tl.store(out_ptr + offs_m * stride_out_dim, out, mask=offs_m < dim)
-    tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
+        # dB = B * dt
+        dB = B[None, :] * dt[:, None]
+
+        # state = state * dA + dB * x
+        state = state * dA + dB * x[:, None]
+
+        # Accumulate output contribution from this dstate chunk
+        out_acc += tl.sum(state * C[None, :], axis=1)
+
+        # Store updated state for this dstate chunk
+        tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
+
+    # out = accumulated state*C + x * D
+    D = tl.load(D_ptr + offs_m * stride_D_dim, mask=mask_m, other=0.0).to(tl.float32)
+    out_acc += x * D
+
+    # Store output
+    tl.store(out_ptr + offs_m * stride_out_dim, out_acc, mask=mask_m)
 
 
 DT_CLAMP_MIN = 0.001
@@ -224,7 +238,8 @@ def tuned_selective_state_update(
         out = torch.empty(batch, 1, nheads, dim, device=x.device, dtype=x.dtype)
 
     # Tuned block sizes for our target dimensions
-    # BLOCK_SIZE_M=32 reduces grid by 2x vs M=16, improving SM scheduler efficiency
+    # BLOCK_SIZE_M=32: reduces grid by 2x vs M=16, less scheduler overhead
+    # BLOCK_SIZE_DSTATE=128: full dstate in one pass is optimal (no loop overhead)
     BLOCK_SIZE_DSTATE = triton.next_power_of_2(dstate)
     if dim <= 64:
         BLOCK_SIZE_M = 32

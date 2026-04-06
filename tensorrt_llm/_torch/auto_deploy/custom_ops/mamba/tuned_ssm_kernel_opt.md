@@ -38,6 +38,9 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 13   | num_stages=2 sweep (M=32,W=4)       | 56.9     | 104.3    | 201.6     | 399.0     | 586.5     | essentially same                |
 | 14   | num_stages=4 sweep (M=32,W=4)       | 56.8     | 104.3    | 202.0     | 398.7     | 586.7     | essentially same                |
 | 15   | num_stages: stages insensitive      | 57.1     | 104.7    | 201.8     | 399.2     | 586.7     | keep S=3; no meaningful diff    |
+| 16   | DS=32 sweep (old 1-pass, WRONG)     | 19.9     | 33.2     | 60.4      | 114.7     | 170.8     | INCORRECT: only 32/128 processed|
+| 17   | DS=64 sweep (old 1-pass, WRONG)     | 32.9     | 57.0     | 108.9     | 213.2     | 321.8     | INCORRECT: only 64/128 processed|
+| 18   | dstate loop DS=32 (correct)         | 63.5     | 116.7    | 223.9     | 443.9     | 661.3     | loop overhead > DS=128 1-pass   |
 
 ## Key findings
 
@@ -48,6 +51,8 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 - BLOCK_SIZE_M=32 slightly better than 16 (reduces grid size by 2x, less scheduler overhead)
 - BLOCK_SIZE_M=64 worse (all dim in one program causes register pressure / serialization)
 - num_warps=4 is optimal for M=32, DS=128; W=1 is 40% worse, W=2 is ~4% worse, W=8/16 are ~5-10% worse
+- dstate loop overhead with DS=32 is 11% SLOWER than 1-pass DS=128; DS=128 is optimal for dstate=128
+- Dstate loop restructuring retained for correctness/flexibility (kernel now handles any BLOCK_SIZE_DSTATE)
 
 ## Best configs per shape
 
