@@ -51,6 +51,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 26   | load B/C before state/A (REVERT)    | 65.0     | 118.1    | 226.9     | 445.4     | 667.2     | WORSE: more regs live in loop   |
 | 27   | tl.math.fma for state update        | 59.7     | 108.7    | 210.7     | 410.1     | 609.6     | marginal; FMA hints for backend |
 | 28   | early state\*dA + FMA reorder (REV)  | 62.2     | 113.7    | 220.5     | 432.1     | 646.0     | WORSE: extra temp adds reg press|
+| 29   | fast_expf vs exp2 (reverted)        | 59.7     | 108.7    | 210.6     | 410.1     | 609.5     | same as exp2; kernel mem-bound  |
 
 ## Key findings
 
