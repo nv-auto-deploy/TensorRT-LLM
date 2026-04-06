@@ -225,6 +225,24 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iterations 42-44 — Grid strategies (DISCARDED)
+
+**Sweep:** All tested at BLOCK=4096, W=8, stages=2. Baseline P1K=9.61µs.
+
+| Variant | Description | D1 (µs) | P1K (µs) | vs baseline |
+|---|---|---|---|---|
+| stride_loop_x2 | Grid-stride, each program processes 2 tiles | 5.54 | 9.74 | +0.13 ❌ |
+| two_tiles_per_program | 2 contiguous tiles per program | 5.34 | 9.94 | +0.33 ❌ |
+| persistent | Persistent kernel, grid=SM_count=132 | 5.44 | 11.90 | +2.29 ❌❌ |
+
+**iter 42 (stride_loop_x2):** Each program processes tile pid and tile pid+N (stride by grid size). Halves grid size. P1K: 9.74µs — slightly worse. The overhead of the secondary tile load+store breaks the pipeline. Discarded.
+
+**iter 43 (two_tiles_per_program):** Each program handles tiles 2*pid and 2*pid+1 (contiguous). P1K: 9.94µs — worse. Contiguous access should amortize launch cost but the extra work per SM increases latency. Discarded.
+
+**iter 44 (persistent):** Grid=132 SMs (H100 SM count), each SM loops over its tiles. P1K: 11.90µs — much worse. The loop-based dispatch adds significant overhead and reduces SM utilization efficiency for this workload. Discarded.
+
+______________________________________________________________________
+
 ### Iterations 37-41 — Scale and compute variants (DISCARDED)
 
 **Sweep:** All tested at BLOCK=4096, W=8, stages=2. Baseline P1K=9.61µs.
