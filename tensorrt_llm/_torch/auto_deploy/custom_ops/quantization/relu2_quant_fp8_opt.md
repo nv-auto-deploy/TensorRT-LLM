@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 10 — BLOCK=64, num_warps=2 (DISCARDED)
+
+**Config:** BLOCK=64, num_warps=2
+
+| ID | div (µs) | vs best | Verdict |
+|---|---|---|---|
+| D1 | 5.52 | +0.33 | ❌ worse |
+| D4 | 5.70 | +0.20 | ❌ worse |
+| D16 | 5.93 | +0.31 | ❌ worse |
+| P1K | 41.07 | +31.28 | ❌ much worse |
+
+**Analysis:** BLOCK=64 creates 59392 blocks for P1K — extreme grid overhead. Reverted to BLOCK=1024, W=4.
+
+______________________________________________________________________
+
 ## Final Best Configuration
 
 ```python
