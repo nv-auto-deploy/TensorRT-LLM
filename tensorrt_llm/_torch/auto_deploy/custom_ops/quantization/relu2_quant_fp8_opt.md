@@ -225,6 +225,17 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 49 — Final noise floor measurement (5 runs)
+
+**Purpose:** Establish reproducible P1K baseline for the final best config (BLOCK=4096, W=8, stages=2).
+
+Five consecutive P1K measurements: 9.54, 9.78, 9.43, 9.61, 9.54 µs → mean≈9.58µs, σ≈0.13µs
+
+**Conclusion:** The measurement noise floor at P1K is ±0.15µs (~1.6%). All differences \<0.2µs
+are within noise and not actionable. The optimization loop has converged.
+
+______________________________________________________________________
+
 ### Iteration 47 — Skip contiguous check in launcher (DISCARDED)
 
 **Idea:** Remove `if not x.is_contiguous(): x = x.contiguous()` check in the launcher to save a Python-side branch.
