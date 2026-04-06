@@ -48,6 +48,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 23   | re-verify W=4 at new kernel state   | 59.9     | 108.6    | 210.8     | 410.4     | 609.8     | W=4 still best; W=2,8 +12-15%  |
 | 24   | precompute 2D offs_m\*stride (REVERT)| 66.1     | 120.6    | 233.2     | 458.4     | 686.0     | WORSE: 2D tensors add reg press |
 | 25   | batch-adaptive M/W heuristic doc     | 59.8     | 108.5    | 210.5     | 410.0     | 609.4     | no benefit; M=32/W=4 universal  |
+| 26   | load B/C before state/A (REVERT)    | 65.0     | 118.1    | 226.9     | 445.4     | 667.2     | WORSE: more regs live in loop   |
 
 ## Key findings
 
