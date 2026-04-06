@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 15 — BLOCK=256, num_warps=4 (DISCARDED)
+
+**Config:** BLOCK=256, num_warps=4
+
+| ID | div (µs) | vs best | Verdict |
+|---|---|---|---|
+| D1 | 5.29 | +0.10 | noise |
+| D4 | 5.26 | -0.24 | slight improvement |
+| D16 | 5.69 | +0.07 | noise |
+| P1K | 14.23 | +4.44 | ❌ worse |
+
+**Analysis:** D4 slightly better but P1K significantly worse (14.23 vs 9.79µs). Reverted.
+
+______________________________________________________________________
+
 ### Iteration 14 — BLOCK=256, num_warps=2 (DISCARDED)
 
 **Config:** BLOCK=256, num_warps=2
