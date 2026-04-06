@@ -6,6 +6,10 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
+from .....quantization.utils.fp8_utils import (
+    resmooth_to_fp8_e8m0,
+    transform_sf_into_required_layout,
+)
 from ...custom_ops.quantization.quant import (
     FP4_GLOBAL_SCALE_MAX,
     FP8_MAX,
@@ -865,6 +869,71 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 # Rename to match our buffer name
                 mod_prefix = weight_name.rsplit(".", 1)[0]
                 state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
+
+    def post_load_hook(self, module, incompatible_keys, weight_name):
+        """Post-hook: Convert FP8 weight scales to UE8M0 format for DeepGEMM on Blackwell.
+
+        Mirrors the PyTorch backend's FineGrainedFP8LinearMethod.post_load_weights
+        (tensorrt_llm/_torch/modules/linear.py). Without this, fp8_swap_ab_gemm would
+        receive raw FP32 weight scales while activation scales are already UE8M0,
+        causing double-conversion and NaN output.
+        """
+        from tensorrt_llm._utils import is_sm_100f
+
+        if not is_sm_100f():
+            return
+
+        # Navigate to the weight parameter
+        *path, attr_name = weight_name.split(".")
+        target_module = module
+        for p in path:
+            target_module = getattr(target_module, p)
+
+        weight_param = getattr(target_module, attr_name, None)
+        if weight_param is None or weight_param.dtype != torch.float8_e4m3fn:
+            return
+
+        # Find the corresponding scale parameter
+        mod_prefix = attr_name.rsplit("weight", 1)[0]
+        scale_attr = mod_prefix + "weight_scale_inv"
+        scale_param = getattr(target_module, scale_attr, None)
+        if scale_param is None:
+            return
+
+        # Only convert scales for 128x128 block projections. Small projections
+        # (e.g. q_a_proj N=24, kv_a_proj N=9 after TP sharding) use the BF16
+        # dequant+cuBLAS fallback and need raw FP32 scales.
+        N, K = weight_param.shape[-2], weight_param.shape[-1]
+        if N < 128 or K < 128:
+            return
+
+        with torch.no_grad():
+            # Step 1: Re-quantize weights + scales to UE8M0 format
+            weight_new, scale_new = resmooth_to_fp8_e8m0(
+                weight_param.data, scale_param.data.float()
+            )
+
+            # Step 2: Transform scale layout for DeepGEMM TMA
+            N, K = weight_new.shape[-2], weight_new.shape[-1]
+            transformed_scale = transform_sf_into_required_layout(
+                scale_new,
+                mn=N,
+                k=K,
+                recipe=(1, 128, 128),
+                is_sfa=False,
+            )
+
+            # Replace parameters in-place
+            setattr(
+                target_module,
+                attr_name,
+                nn.Parameter(weight_new, requires_grad=False),
+            )
+            setattr(
+                target_module,
+                scale_attr,
+                nn.Parameter(transformed_scale, requires_grad=False),
+            )
 
     def _apply(
         self,
