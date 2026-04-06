@@ -67,6 +67,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 42   | correctness re-verify all batches   | 56.8     | 104.6    | 202.3     | 399.3     | 587.3     | all PASS; max_diff\<0.13 (bf16)  |
 | 43   | final e2e benchmark all batches     | 56.8     | 104.6    | 202.3     | 385.3     | 576.7     | B256/B384 BEAT pre-clamp base!  |
 | 44   | explicit num_stages=1 in launcher   | 56.7     | 104.7    | 202.1     | 399.6     | 587.1     | marginally better; S insens     |
+| 45   | tuned_backend comment update        | 56.7     | 104.7    | 202.1     | 399.6     | 587.1     | doc: add kernel params comment  |
 
 ## Key findings
 

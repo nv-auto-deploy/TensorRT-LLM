@@ -162,7 +162,9 @@ def _tuned_cached_ssm(
             )
             preallocated_ssm_out_d.copy_(y_decode)
         else:
-            # Large batch: tuned Triton kernel is faster (better for TTFT at c256)
+            # Large batch: tuned Triton kernel is faster (better throughput at batch>=33)
+            # Kernel params: BLOCK_SIZE_M=32, BLOCK_SIZE_DSTATE=128, num_warps=4, num_stages=1
+            # dt_clamp=[0.001, 0.1] applied automatically (correctness fix)
             tuned_selective_state_update(
                 ssm_state_cache,
                 x_decode,
