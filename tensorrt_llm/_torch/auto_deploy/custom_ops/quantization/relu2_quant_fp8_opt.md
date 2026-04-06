@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 12 — BLOCK=128, num_warps=2 (DISCARDED)
+
+**Config:** BLOCK=128, num_warps=2
+
+| ID | div (µs) | vs best | Verdict |
+|---|---|---|---|
+| D1 | 5.42 | +0.23 | ❌ worse |
+| D4 | 5.60 | +0.10 | ❌ worse |
+| D16 | 5.55 | -0.07 | noise |
+| P1K | 23.23 | +13.44 | ❌ much worse |
+
+**Analysis:** BLOCK=128 still creates 29696 blocks at P1K — grid overhead. Reverted.
+
+______________________________________________________________________
+
 ### Iteration 11 — BLOCK=64, num_warps=4 (DISCARDED)
 
 **Config:** BLOCK=64, num_warps=4
