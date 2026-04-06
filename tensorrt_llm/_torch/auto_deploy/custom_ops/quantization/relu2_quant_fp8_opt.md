@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 26 — BLOCK=4096, num_warps=8 (APPLIED — new best P1K)
+
+**Config:** BLOCK=4096, num_warps=8
+
+| ID | div (µs) | vs best (2048, W=8) | Verdict |
+|---|---|---|---|
+| D1 | 5.41 | +0.08 | noise |
+| D4 | 5.30 | -0.11 | noise |
+| D16 | 5.48 | -0.14 | noise |
+| P1K | **9.43** | **-0.17 (-1.8%)** | ✅ new best |
+
+**Analysis:** P1K improved to 9.43µs. BLOCK=4096 with W=8 reduces grid to 928 blocks; each block processes more data, better instruction throughput. APPLIED.
+
+______________________________________________________________________
+
 ### Iteration 25 — BLOCK=2048, num_warps=16 (DISCARDED)
 
 **Config:** BLOCK=2048, num_warps=16
@@ -468,17 +483,17 @@ ______________________________________________________________________
 ## Final Best Configuration
 
 ```python
-BLOCK = 2048
+BLOCK = 4096
 num_warps = 8
 # relu in bf16 space, tl.clamp for quantize (v5_combined)
 ```
 
-| ID | Original (µs) | After iter 9 (µs) | After iter 24 (µs) | Total delta |
+| ID | Original (µs) | After iter 9 (µs) | After iter 26 (µs) | Total delta |
 |---|---|---|---|---|
-| D1 (c=1) | 5.33 | 5.27 | 5.33 | 0% (noise) |
-| D4 (c=4) | 5.31 | 5.20 | 5.41 | +1.9% (noise) |
-| D16 (c=16) | 5.44 | 5.57 | 5.62 | +3.3% (noise) |
-| P1K | 10.18 | 9.75 | **9.60** | **−5.7%** |
+| D1 (c=1) | 5.33 | 5.27 | 5.41 | +1.5% (noise) |
+| D4 (c=4) | 5.31 | 5.20 | 5.30 | -0.2% (noise) |
+| D16 (c=16) | 5.44 | 5.57 | 5.48 | +0.7% (noise) |
+| P1K | 10.18 | 9.75 | **9.43** | **−7.4%** |
 
 **Conclusion:** The kernel is fundamentally launch-overhead-limited for decode sizes
 (D1–D16). At these sizes (3712–59392 elements), the memory transfer is \< 0.1 µs;
