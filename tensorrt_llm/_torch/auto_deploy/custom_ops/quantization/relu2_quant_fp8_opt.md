@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 21 — BLOCK=4096, num_warps=4 (DISCARDED)
+
+**Config:** BLOCK=4096, num_warps=4
+
+| ID | div (µs) | vs best (2048) | Verdict |
+|---|---|---|---|
+| D1 | 5.30 | -0.07 | noise |
+| D4 | 5.40 | -0.07 | noise |
+| D16 | 5.77 | +0.11 | noise |
+| P1K | 9.72 | +0.05 | ≈ noise |
+
+**Analysis:** P1K: 9.72µs vs 9.67µs for BLOCK=2048 — essentially the same (within noise). BLOCK=2048 remains best. Reverted.
+
+______________________________________________________________________
+
 ### Iteration 20 — BLOCK=4096, num_warps=2 (DISCARDED)
 
 **Config:** BLOCK=4096, num_warps=2
