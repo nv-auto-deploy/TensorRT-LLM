@@ -248,7 +248,10 @@ optimization; adding explicit scalar recip adds scheduling overhead. Discarded.
 expected. P1K: 9.80µs. The Triton compiler generates the same PTX either way for float32 division.
 Discarded.
 
-**iter 40 (square_then_max):** Reordering: `x^2 * (x>0)`. P1K: 9.59µs — essentially tied with 9.61µs, within noise. The reordering avoids the bf16→fp32→relu→fp32 sequence but requires a fp32 comparison. No clear winner.
+**iter 40 (square_then_max):** Reordering: compute `x^2` first then gate with `(x>0)`. This is
+mathematically equivalent but reorders operations. P1K: 9.59µs — essentially tied with 9.61µs
+baseline (within noise). The reordering avoids the bf16→fp32→relu→fp32 sequence by doing fp32
+upcast first then square then gate. No measurable improvement within noise bounds.
 
 **iter 41 (scale_first_inv):** Combined scale_first + inv_scale — P1K: 9.78µs. Worse than base. Discarded.
 
