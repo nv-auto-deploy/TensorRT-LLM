@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 13 — BLOCK=128, num_warps=4 (DISCARDED)
+
+**Config:** BLOCK=128, num_warps=4
+
+| ID | div (µs) | vs best | Verdict |
+|---|---|---|---|
+| D1 | 5.43 | +0.24 | ❌ worse |
+| D4 | 5.40 | -0.10 | noise |
+| D16 | 5.67 | +0.05 | noise |
+| P1K | 22.94 | +13.15 | ❌ much worse |
+
+**Analysis:** P1K still 22.94µs due to 29696 grid blocks. Reverted.
+
+______________________________________________________________________
+
 ### Iteration 12 — BLOCK=128, num_warps=2 (DISCARDED)
 
 **Config:** BLOCK=128, num_warps=2
