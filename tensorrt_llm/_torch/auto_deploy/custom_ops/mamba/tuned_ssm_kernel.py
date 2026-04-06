@@ -126,6 +126,9 @@ def _tuned_ssm_update_kernel(
     dt = softplus(dt + dt_bias)
     dt = tl.clamp(dt, DT_CLAMP_MIN, DT_CLAMP_MAX)
 
+    # Load D early to overlap memory latency with dt computation
+    D = tl.load(D_ptr + offs_m * stride_D_dim, mask=mask_m, other=0.0).to(tl.float32)
+
     # Accumulate output over dstate in BLOCK_SIZE_DSTATE chunks
     out_acc = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
 
@@ -167,8 +170,7 @@ def _tuned_ssm_update_kernel(
         # Store updated state for this dstate chunk
         tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
 
-    # out = accumulated state*C + x * D
-    D = tl.load(D_ptr + offs_m * stride_D_dim, mask=mask_m, other=0.0).to(tl.float32)
+    # out = accumulated state*C + x * D (D loaded early above)
     out_acc += x * D
 
     # Store output
