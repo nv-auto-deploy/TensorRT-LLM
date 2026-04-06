@@ -41,7 +41,7 @@ transforms:
   insert_cached_ssm_attention:
     backend: flashinfer_ssm  # iter30: adaptive dispatch (flashinfer≤32, Triton>32) + pure-decode fast path (skip torch.zeros+copy_)
   fuse_conv_ssm:
-    enabled: false  # iter20 regressed TTFT +3.5% (44.61→46.17ms) with only -0.3% TPOT gain (noise)
+    enabled: true  # re-enabled: prefill activation="silu"→None+inline fixes TTFT regression
   fuse_relu2_quant_fp8:
     enabled: true
   fuse_gated_rmsnorm_quant_fp8:
