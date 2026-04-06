@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 14 — BLOCK=256, num_warps=2 (DISCARDED)
+
+**Config:** BLOCK=256, num_warps=2
+
+| ID | div (µs) | vs best | Verdict |
+|---|---|---|---|
+| D1 | 5.36 | +0.17 | noise |
+| D4 | 5.52 | +0.02 | noise |
+| D16 | 5.76 | +0.14 | noise |
+| P1K | 14.38 | +4.59 | ❌ worse |
+
+**Analysis:** BLOCK=256 still creates 14848 blocks at P1K. Reverted.
+
+______________________________________________________________________
+
 ### Iteration 13 — BLOCK=128, num_warps=4 (DISCARDED)
 
 **Config:** BLOCK=128, num_warps=4
