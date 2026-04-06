@@ -226,8 +226,13 @@ def tuned_selective_state_update(
 ):
     """Drop-in replacement for flashinfer.mamba.selective_state_update.
 
-    Tuned for Nemotron Nano v3: nheads=64, dim=64, dstate=128.
-    Uses BLOCK_SIZE_M=16 (vs 4 in stock) to reduce grid by 4x.
+    Tuned for Nemotron Nano v3: nheads=64, dim=64, dstate=128, ngroups=8.
+    Key changes vs stock kernel:
+    - BLOCK_SIZE_M=32: reduces grid 8x vs stock (vs 4x in original tuned version)
+    - DSTATE_CONSTEXPR + DIM_CONSTEXPR + NHEADS_NGROUPS_RATIO: compile-time opts
+    - dt_clamp=[0.001, 0.1]: correctness fix (iter 1)
+    - num_stages=1: optimal for this memory-bound kernel
+    Performance (H100): B33=56.9us B64=104.5us B128=202us B256=386us B384=577us
     """
     # Normalize dimensions to 4D: (batch, T=1, nheads, dim)
     if state.dim() == 3:
