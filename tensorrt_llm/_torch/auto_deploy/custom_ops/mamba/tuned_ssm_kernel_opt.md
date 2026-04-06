@@ -41,6 +41,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 16   | DS=32 sweep (old 1-pass, WRONG)     | 19.9     | 33.2     | 60.4      | 114.7     | 170.8     | INCORRECT: only 32/128 processed|
 | 17   | DS=64 sweep (old 1-pass, WRONG)     | 32.9     | 57.0     | 108.9     | 213.2     | 321.8     | INCORRECT: only 64/128 processed|
 | 18   | dstate loop DS=32 (correct)         | 63.5     | 116.7    | 223.9     | 443.9     | 661.3     | loop overhead > DS=128 1-pass   |
+| 19   | exp2 instead of exp for dA          | 61.7     | 111.5    | 214.7     | 416.4     | 617.7     | marginal improvement ~0.3%      |
 
 ## Key findings
 

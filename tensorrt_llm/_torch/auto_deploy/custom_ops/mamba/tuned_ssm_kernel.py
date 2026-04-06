@@ -143,8 +143,9 @@ def _tuned_ssm_update_kernel(
         A_ptrs = A_ptr + offs_m[:, None] * stride_A_dim + offs_n[None, :] * stride_A_dstate
         A = tl.load(A_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-        # dA = exp(A * dt)
-        dA = tl.exp(A * dt[:, None])
+        # dA = exp(A * dt) via exp2 for potential hardware speedup
+        # exp(x) = exp2(x * log2(e)); tl.math.log2e = log2(e) ~ 1.4427
+        dA = tl.math.exp2(A * dt[:, None] * 1.4426950408889634)
 
         # Load B, C [BLOCK_SIZE_DSTATE]
         B = tl.load(B_ptr + offs_n * stride_B_dstate, mask=offs_n < dstate, other=0.0).to(
