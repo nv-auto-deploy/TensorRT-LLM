@@ -83,6 +83,7 @@ def _tuned_ssm_update_kernel(
     DT_CLAMP_MAX: tl.constexpr,
     DSTATE_CONSTEXPR: tl.constexpr,  # compile-time dstate for loop unrolling
     DIM_CONSTEXPR: tl.constexpr,  # compile-time dim for mask elimination
+    NHEADS_NGROUPS_RATIO: tl.constexpr,  # compile-time head/group ratio (8 for NanoV3)
 ):
     """Optimized SSM state update for decode (T=1).
 
@@ -109,8 +110,8 @@ def _tuned_ssm_update_kernel(
     dt_ptr += pid_b * stride_dt_batch + pid_h * stride_dt_head
     dt_bias_ptr += pid_h * stride_dt_bias_head
     A_ptr += pid_h * stride_A_head
-    B_ptr += pid_b * stride_B_batch + (pid_h // nheads_ngroups_ratio) * stride_B_group
-    C_ptr += pid_b * stride_C_batch + (pid_h // nheads_ngroups_ratio) * stride_C_group
+    B_ptr += pid_b * stride_B_batch + (pid_h // NHEADS_NGROUPS_RATIO) * stride_B_group
+    C_ptr += pid_b * stride_C_batch + (pid_h // NHEADS_NGROUPS_RATIO) * stride_C_group
     D_ptr += pid_h * stride_D_head
     out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
 
@@ -331,5 +332,6 @@ def tuned_selective_state_update(
             DT_CLAMP_MAX=dt_clamp_max,
             DSTATE_CONSTEXPR=dstate,
             DIM_CONSTEXPR=dim,
+            NHEADS_NGROUPS_RATIO=nheads // ngroups,
             num_warps=num_warps,
         )

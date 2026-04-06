@@ -241,6 +241,7 @@ def bench_kernel(
             DT_CLAMP_MAX=DT_CLAMP_MAX,
             DSTATE_CONSTEXPR=DSTATE,
             DIM_CONSTEXPR=DIM,
+            NHEADS_NGROUPS_RATIO=NHEADS // NGROUPS,
             num_warps=warps,
             num_stages=stages,
         )

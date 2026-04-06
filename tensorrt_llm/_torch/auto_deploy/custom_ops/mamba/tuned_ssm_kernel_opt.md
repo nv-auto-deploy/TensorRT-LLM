@@ -55,6 +55,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 30   | .cg cache modifier for loads (REV)  | 59.8     | 108.5    | 211.0     | 410.9     | 611.1     | no benefit; .cg unhelpful here  |
 | 31   | DSTATE_CONSTEXPR: compile-time loop | 57.3     | 105.1    | 203.2     | 398.7     | 586.3     | **+3-5% WIN** loop unrolled!    |
 | 32   | DIM_CONSTEXPR: eliminate dim mask   | 57.2     | 104.9    | 203.0     | 398.5     | 586.2     | marginal; mask cmp eliminated   |
+| 33   | NHEADS_NGROUPS_RATIO constexpr      | 56.5     | 104.4    | 202.0     | 399.5     | 587.0     | +0.5-1% div becomes shift/mask  |
 
 ## Key findings
 
