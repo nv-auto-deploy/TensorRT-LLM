@@ -43,6 +43,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 18   | dstate loop DS=32 (correct)         | 63.5     | 116.7    | 223.9     | 443.9     | 661.3     | loop overhead > DS=128 1-pass   |
 | 19   | exp2 instead of exp for dA          | 61.7     | 111.5    | 214.7     | 416.4     | 617.7     | marginal improvement ~0.3%      |
 | 20   | hoist D load before dstate loop     | 60.0     | 108.7    | 210.9     | 410.2     | 609.4     | 1-2% gain; hide D load latency  |
+| 21   | precompute dt_col,x_col,dt_log2e    | 59.9     | 108.3    | 210.8     | 410.3     | 609.8     | marginal; eliminates broadcasts |
 
 ## Key findings
 

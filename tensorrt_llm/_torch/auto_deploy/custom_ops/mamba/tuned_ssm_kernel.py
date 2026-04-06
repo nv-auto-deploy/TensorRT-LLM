@@ -129,6 +129,14 @@ def _tuned_ssm_update_kernel(
     # Load D early to overlap memory latency with dt computation
     D = tl.load(D_ptr + offs_m * stride_D_dim, mask=mask_m, other=0.0).to(tl.float32)
 
+    # Precompute column broadcasts once to avoid repeated reshape in loop
+    dt_col = dt[:, None]  # [BLOCK_SIZE_M, 1]
+    x_col = x[:, None]  # [BLOCK_SIZE_M, 1]
+
+    # Precompute log2(e) * dt for exp2 conversion
+    LOG2E = 1.4426950408889634
+    dt_log2e = dt_col * LOG2E  # [BLOCK_SIZE_M, 1]
+
     # Accumulate output over dstate in BLOCK_SIZE_DSTATE chunks
     out_acc = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
 
@@ -146,9 +154,8 @@ def _tuned_ssm_update_kernel(
         A_ptrs = A_ptr + offs_m[:, None] * stride_A_dim + offs_n[None, :] * stride_A_dstate
         A = tl.load(A_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-        # dA = exp(A * dt) via exp2 for potential hardware speedup
-        # exp(x) = exp2(x * log2(e)); tl.math.log2e = log2(e) ~ 1.4427
-        dA = tl.math.exp2(A * dt[:, None] * 1.4426950408889634)
+        # dA = exp(A * dt) via exp2: exp(x) = exp2(x * log2(e))
+        dA = tl.math.exp2(A * dt_log2e)
 
         # Load B, C [BLOCK_SIZE_DSTATE]
         B = tl.load(B_ptr + offs_n * stride_B_dstate, mask=offs_n < dstate, other=0.0).to(
@@ -158,11 +165,11 @@ def _tuned_ssm_update_kernel(
             tl.float32
         )
 
-        # dB = B * dt
-        dB = B[None, :] * dt[:, None]
+        # dB = B * dt; use precomputed dt_col
+        dB = B[None, :] * dt_col
 
-        # state = state * dA + dB * x
-        state = state * dA + dB * x[:, None]
+        # state = state * dA + dB * x; use precomputed x_col
+        state = state * dA + dB * x_col
 
         # Accumulate output contribution from this dstate chunk
         out_acc += tl.sum(state * C[None, :], axis=1)
