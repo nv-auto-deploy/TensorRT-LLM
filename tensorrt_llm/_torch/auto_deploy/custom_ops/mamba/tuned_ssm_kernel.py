@@ -79,6 +79,8 @@ def _tuned_ssm_update_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     HAS_STATE_BATCH_INDICES: tl.constexpr,
+    DT_CLAMP_MIN: tl.constexpr,
+    DT_CLAMP_MAX: tl.constexpr,
 ):
     """Optimized SSM state update for decode (T=1).
 
@@ -127,8 +129,9 @@ def _tuned_ssm_update_kernel(
         tl.float32
     )
 
-    # dt = softplus(dt + dt_bias)
+    # dt = softplus(dt + dt_bias), then clamp to [DT_CLAMP_MIN, DT_CLAMP_MAX]
     dt = softplus(dt + dt_bias)
+    dt = tl.clamp(dt, DT_CLAMP_MIN, DT_CLAMP_MAX)
 
     # Load A [BLOCK_SIZE_M, BLOCK_SIZE_DSTATE]
     A_ptrs = A_ptr + offs_m[:, None] * stride_A_dim + offs_n[None, :] * stride_A_dstate
@@ -157,6 +160,10 @@ def _tuned_ssm_update_kernel(
     tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
 
 
+DT_CLAMP_MIN = 0.001
+DT_CLAMP_MAX = 0.1
+
+
 def tuned_selective_state_update(
     state,
     x,
@@ -170,6 +177,8 @@ def tuned_selective_state_update(
     state_batch_indices=None,
     pad_slot_id=PAD_SLOT_ID,
     out=None,
+    dt_clamp_min=DT_CLAMP_MIN,
+    dt_clamp_max=DT_CLAMP_MAX,
 ):
     """Drop-in replacement for flashinfer.mamba.selective_state_update.
 
@@ -285,5 +294,7 @@ def tuned_selective_state_update(
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_DSTATE=BLOCK_SIZE_DSTATE,
             HAS_STATE_BATCH_INDICES=has_sbi,
+            DT_CLAMP_MIN=dt_clamp_min,
+            DT_CLAMP_MAX=dt_clamp_max,
             num_warps=num_warps,
         )
