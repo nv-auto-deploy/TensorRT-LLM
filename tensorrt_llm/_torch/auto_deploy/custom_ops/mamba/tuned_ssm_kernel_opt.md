@@ -68,6 +68,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 43   | final e2e benchmark all batches     | 56.8     | 104.6    | 202.3     | 385.3     | 576.7     | B256/B384 BEAT pre-clamp base!  |
 | 44   | explicit num_stages=1 in launcher   | 56.7     | 104.7    | 202.1     | 399.6     | 587.1     | marginally better; S insens     |
 | 45   | tuned_backend comment update        | 56.7     | 104.7    | 202.1     | 399.6     | 587.1     | doc: add kernel params comment  |
+| 46   | final benchmark M=32,DS=128,W=4,S=1 | 56.9     | 104.5    | 202.5     | 385.6     | 577.2     | confirmed best; e2e also fast   |
 
 ## Key findings
 
