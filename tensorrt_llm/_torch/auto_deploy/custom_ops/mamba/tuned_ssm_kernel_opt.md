@@ -44,6 +44,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 19   | exp2 instead of exp for dA          | 61.7     | 111.5    | 214.7     | 416.4     | 617.7     | marginal improvement ~0.3%      |
 | 20   | hoist D load before dstate loop     | 60.0     | 108.7    | 210.9     | 410.2     | 609.4     | 1-2% gain; hide D load latency  |
 | 21   | precompute dt_col,x_col,dt_log2e    | 59.9     | 108.3    | 210.8     | 410.3     | 609.8     | marginal; eliminates broadcasts |
+| 22   | fuse dB*x: state+=B*(dt\*x)          | 59.8     | 108.5    | 210.5     | 410.0     | 609.4     | marginal; saves 1 mul in loop   |
 
 ## Key findings
 

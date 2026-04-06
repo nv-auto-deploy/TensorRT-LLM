@@ -131,11 +131,13 @@ def _tuned_ssm_update_kernel(
 
     # Precompute column broadcasts once to avoid repeated reshape in loop
     dt_col = dt[:, None]  # [BLOCK_SIZE_M, 1]
-    x_col = x[:, None]  # [BLOCK_SIZE_M, 1]
 
     # Precompute log2(e) * dt for exp2 conversion
     LOG2E = 1.4426950408889634
     dt_log2e = dt_col * LOG2E  # [BLOCK_SIZE_M, 1]
+
+    # Precompute dt*x for dB*x fusion: state += B[None,:] * (dt*x)[:,None]
+    dt_x_col = (dt * x)[:, None]  # [BLOCK_SIZE_M, 1]
 
     # Accumulate output over dstate in BLOCK_SIZE_DSTATE chunks
     out_acc = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
@@ -165,11 +167,8 @@ def _tuned_ssm_update_kernel(
             tl.float32
         )
 
-        # dB = B * dt; use precomputed dt_col
-        dB = B[None, :] * dt_col
-
-        # state = state * dA + dB * x; use precomputed x_col
-        state = state * dA + dB * x_col
+        # state = state * dA + B * (dt*x); fused dB*x using precomputed dt_x_col
+        state = state * dA + B[None, :] * dt_x_col
 
         # Accumulate output contribution from this dstate chunk
         out_acc += tl.sum(state * C[None, :], axis=1)
