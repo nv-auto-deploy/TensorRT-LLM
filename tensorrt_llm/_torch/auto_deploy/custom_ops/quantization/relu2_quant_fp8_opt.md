@@ -225,6 +225,30 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iterations 37-41 — Scale and compute variants (DISCARDED)
+
+**Sweep:** All tested at BLOCK=4096, W=8, stages=2. Baseline P1K=9.61µs.
+
+| Variant | Description | D1 (µs) | P1K (µs) | vs baseline |
+|---|---|---|---|---|
+| scale_first | Load scale before x | 5.21 | 9.76 | +0.15 ❌ |
+| inv_scale_kernel | `inv_scale=1/scale` inside kernel, multiply | 5.17 | 9.78 | +0.17 ❌ |
+| tl_fdiv | `tl.fdiv(relu2, scale)` | 5.45 | 9.80 | +0.19 ❌ |
+| square_then_max | `x^2 * (x>0)` reordering | 5.42 | 9.59 | −0.02 noise |
+| scale_first_inv | scale_first + inv_scale | 5.38 | 9.78 | +0.17 ❌ |
+
+**iter 37 (scale_first):** Loading scale before x allows scale reciprocal to be computed while x is in-flight. P1K: 9.76µs — slightly worse. The scale load is likely not on the critical path. Discarded.
+
+**iter 38 (inv_scale_kernel):** Compute `inv_scale = 1.0/scale` inside kernel to replace per-element division with multiply. P1K: 9.78µs — slightly worse. The vector division is likely fused well by the compiler; extra scalar division overhead adds latency. Discarded.
+
+**iter 39 (tl_fdiv):** tl.fdiv is identical to / at PTX level — no difference expected. P1K: 9.80µs. Discarded.
+
+**iter 40 (square_then_max):** Reordering: `x^2 * (x>0)`. P1K: 9.59µs — essentially tied with 9.61µs, within noise. The reordering avoids the bf16→fp32→relu→fp32 sequence but requires a fp32 comparison. No clear winner.
+
+**iter 41 (scale_first_inv):** Combined scale_first + inv_scale — P1K: 9.78µs. Worse than base. Discarded.
+
+______________________________________________________________________
+
 ### Iterations 33-36 — Alternative relu implementations (DISCARDED)
 
 **Sweep:** All tested at BLOCK=4096, W=8, stages=2.
