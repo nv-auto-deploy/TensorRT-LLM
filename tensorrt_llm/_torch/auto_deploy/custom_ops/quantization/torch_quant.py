@@ -562,7 +562,7 @@ def trtllm_finegrained_fp8_linear(
     - Input is dynamically quantized using fp8_quantize_1x128
     - Assumes 128x128 block size (standard for DeepSeek/MiniMax style FP8)
     """
-    from tensorrt_llm._utils import get_sm_version
+    from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
     # Ensure input is bfloat16 for the optimized kernel
     if input.dtype == torch.float8_e4m3fn:
@@ -601,13 +601,30 @@ def trtllm_finegrained_fp8_linear(
     # Flatten input for GEMM: [..., K] -> [M, K]
     input_2d = input.reshape(-1, input_shape[-1])
 
-    # SM version-specific activation quantization
+    # On Blackwell (SM100f): use fused quantize + DeepGEMM via fp8_swap_ab_gemm.
+    # This eliminates separate fp8_quantize_1x128 kernel launches and uses
+    # DeepGEMM which handles UE8M0 scale conversion internally.
+    if is_sm_100f():
+        output = torch.ops.trtllm.fp8_swap_ab_gemm(
+            input_2d,
+            weight,
+            weight_scale,
+            output_dtype=input.dtype,
+            # AD weight scales are raw FP32 (not pre-converted to UE8M0),
+            # so let DeepGEMM handle the UE8M0 conversion internally.
+            disable_ue8m0_cast=False,
+        )
+        if bias is not None:
+            output = output + bias
+        return output.reshape(*input_shape[:-1], N)
+
+    # SM version-specific activation quantization for non-Blackwell paths
     if get_sm_version() == 120:
         from tensorrt_llm._torch.modules.linear import per_token_quant_and_transform
 
         act_fp8, act_sf = per_token_quant_and_transform(input_2d)
     else:
-        # Hopper (SM90) and Blackwell (SM100+) share the same path
+        # Hopper (SM90) path
         act_fp8, act_sf = torch.ops.trtllm.fp8_quantize_1x128(input_2d)
     output = torch.ops.trtllm.fp8_block_scaling_gemm(act_fp8, weight, act_sf, weight_scale)
 
