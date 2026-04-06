@@ -245,7 +245,9 @@ comparison and cast-to-float32 before multiply. Discarded.
 **iter 35 (abs_trick):** `(x + abs(x)) * 0.5` — two ops (add + abs) instead of one max instruction.
 PTX does not fuse this into a single MAX. P1K: 9.72µs. Discarded.
 
-**iter 36 (where_bf16_output):** tl.where with explicit bf16 comparison — essentially same as iter33. P1K: 9.72µs. Discarded.
+**iter 36 (where_bf16_output):** tl.where with explicit bf16 comparison and bf16 zero constant.
+Same as iter33 semantically — tl.where is equivalent to select, no difference from tl.maximum
+at the PTX level. P1K: 9.72µs. Discarded. tl.maximum remains the best relu implementation.
 
 **Conclusion:** `tl.maximum(x, 0.0)` in bf16 space is already optimal for ReLU on H100. All alternatives are slightly worse.
 
