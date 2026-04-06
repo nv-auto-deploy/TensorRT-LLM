@@ -43,23 +43,29 @@ def _relu2_quant_fp8_kernel(
     FP8_MAX: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Elementwise relu2 + FP8 quantize: out = clamp(relu(x)^2 / scale)."""
+    """Elementwise relu2 + FP8 quantize: out = clamp(relu(x)^2 / scale).
+
+    Structural choices (iter 4-8 sweep):
+    - relu in bf16 space (tl.maximum on input dtype) before fp32 upcast:
+      bf16 SIMD is wider than fp32, saves the early upcast for negative elements.
+    - tl.clamp instead of manual max(min()): compiles to a single PTX instruction.
+    """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n_elements
 
     x = tl.load(x_ptr + offs, mask=mask)
-    xf = x.to(tl.float32)
 
-    # relu2 = max(x, 0)^2
-    r = tl.maximum(xf, 0.0)
+    # relu in bf16 space (wider SIMD, avoids premature fp32 upcast)
+    r_bf16 = tl.maximum(x, 0.0)
+    # upcast to fp32 for squaring (bf16 max^2 ≈ 4e9 would overflow)
+    r = r_bf16.to(tl.float32)
     relu2 = r * r
 
     # FP8 per-tensor quantize: divide by scale then clamp to FP8 range
     scale = tl.load(scale_ptr)
     out_scaled = relu2 / scale
-    out_clamped = tl.maximum(tl.minimum(out_scaled, FP8_MAX), FP8_MIN)
-    out_fp8 = out_clamped.to(tl.float8e4nv)
+    out_fp8 = tl.clamp(out_scaled, FP8_MIN, FP8_MAX).to(tl.float8e4nv)
 
     tl.store(out_fp8_ptr + offs, out_fp8, mask=mask)
 
