@@ -225,6 +225,34 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 47 — Skip contiguous check in launcher (DISCARDED)
+
+**Idea:** Remove `if not x.is_contiguous(): x = x.contiguous()` check in the launcher to save a Python-side branch.
+
+| T | baseline (µs) | no_check (µs) | prealloc (µs) |
+|---|---|---|---|
+| 1 | 5.39 | 5.34 | 5.56 |
+| 4 | 5.39 | 5.65 | 5.40 |
+| 16 | 5.79 | 5.80 | 5.80 |
+| 1024 | 9.97 | 9.96 | 9.74 |
+
+**Analysis:** Python-side `is_contiguous()` check costs ~0 µs (C extension call). Results are all within noise. The check provides a safety net for non-contiguous inputs. Keeping the check. Discarded.
+
+______________________________________________________________________
+
+### Iteration 48 — Pre-allocated output buffer (DISCARDED)
+
+**Idea:** Pre-allocate output buffer outside the hot path to avoid `torch.empty()` allocation cost.
+
+**Results (from same \_test_launcher_opts.py run):**
+
+- prealloc P1K: 9.74µs vs baseline 9.97µs — slight improvement but within noise.
+- This is a measurement artifact; in production the allocation is part of each call.
+- No structural change made. The Python overhead of `torch.empty()` is ~0.5µs but varies.
+- In production with CUDA graphs, allocations are avoided at the graph level. Discarded.
+
+______________________________________________________________________
+
 ### Iterations 45-46 — Large BLOCK sizes (DISCARDED)
 
 **Sweep:** BLOCK ∈ {8192, 16384} with W=8, stages=2.
