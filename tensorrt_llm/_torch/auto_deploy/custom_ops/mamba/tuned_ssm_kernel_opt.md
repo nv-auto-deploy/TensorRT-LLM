@@ -46,6 +46,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 21   | precompute dt_col,x_col,dt_log2e    | 59.9     | 108.3    | 210.8     | 410.3     | 609.8     | marginal; eliminates broadcasts |
 | 22   | fuse dB*x: state+=B*(dt\*x)          | 59.8     | 108.5    | 210.5     | 410.0     | 609.4     | marginal; saves 1 mul in loop   |
 | 23   | re-verify W=4 at new kernel state   | 59.9     | 108.6    | 210.8     | 410.4     | 609.8     | W=4 still best; W=2,8 +12-15%  |
+| 24   | precompute 2D offs_m\*stride (REVERT)| 66.1     | 120.6    | 233.2     | 458.4     | 686.0     | WORSE: 2D tensors add reg press |
 
 ## Key findings
 
