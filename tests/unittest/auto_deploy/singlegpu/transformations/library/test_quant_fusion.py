@@ -599,7 +599,7 @@ def test_fuse_rmsnorm_quant_fp8_rewrites_fused_add_rmsnorm_graph():
 
 
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
-def test_fuse_rmsnorm_quant_fp8_rewrites_torch_rmsnorm_add_graph():
+def test_fuse_rmsnorm_quant_fp8_skips_torch_rmsnorm_add_graph():
     model = TinyFusedAddRMSNormQuantFP8().cuda()
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
@@ -631,12 +631,12 @@ def test_fuse_rmsnorm_quant_fp8_rewrites_torch_rmsnorm_add_graph():
     transform = FuseRMSNormQuantFP8(TransformConfig(stage="post_load_fusion"))
     gm, info = transform._apply(gm, None, None, None)
 
-    assert info.num_matches == 1
-    assert any(
+    assert info.num_matches == 0
+    assert any(is_op(n, torch.ops.auto_deploy.torch_rmsnorm) for n in gm.graph.nodes)
+    assert any(is_op(n, torch.ops.auto_deploy.trtllm_quant_fp8_linear) for n in gm.graph.nodes)
+    assert not any(
         is_op(n, torch.ops.auto_deploy.triton_fused_add_rms_norm_quant_fp8) for n in gm.graph.nodes
     )
-    assert any(is_op(n, torch.ops.auto_deploy.trtllm_fp8_prequant_linear) for n in gm.graph.nodes)
-    assert not any(is_op(n, torch.ops.auto_deploy.torch_rmsnorm) for n in gm.graph.nodes)
 
 
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")

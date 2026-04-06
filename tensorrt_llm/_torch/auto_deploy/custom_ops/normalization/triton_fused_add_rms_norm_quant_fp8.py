@@ -82,6 +82,22 @@ _RMN_ADAPTIVE_THRESHOLD = 32
 _FP8_QUANT_ONLY_BLOCK = 256
 _FP8_QUANT_ONLY_WARPS = 8
 
+_OUTPUT_DTYPE_FP16 = 0
+_OUTPUT_DTYPE_BF16 = 1
+_OUTPUT_DTYPE_FP32 = 2
+
+
+def _get_output_dtype_code(tensor: Tensor) -> int:
+    if tensor.dtype == torch.float16:
+        return _OUTPUT_DTYPE_FP16
+    if tensor.dtype == torch.bfloat16:
+        return _OUTPUT_DTYPE_BF16
+    if tensor.dtype == torch.float32:
+        return _OUTPUT_DTYPE_FP32
+    raise RuntimeError(
+        f"Unsupported normalized output dtype {tensor.dtype}; expected float16/bfloat16/float32."
+    )
+
 
 @triton.jit
 def rms_norm_quant_fp8_kernel(
@@ -95,6 +111,7 @@ def rms_norm_quant_fp8_kernel(
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
 ):
     """Two-pass streaming RMSNorm + FP8 quant.
 
@@ -124,10 +141,14 @@ def rms_norm_quant_fp8_kernel(
         x = tl.load(x_ptr + row_off + cols, mask=mask)  # L2 hit from pass1
         w = tl.load(w_ptr + cols, mask=mask)
         normed = x.to(tl.float32) * rrms * w.to(tl.float32)
-        # BF16 output for the residual connection
-        tl.store(out_bf16_ptr + row_off + cols, normed.to(tl.bfloat16), mask=mask)
-        # FP8 output for the downstream linear layer
-        q = tl.clamp(normed * inv_scale, FP8_MIN, FP8_MAX).to(tl.float8e4nv)
+        if OUT_DTYPE == 0:
+            normed_out = normed.to(tl.float16)
+        elif OUT_DTYPE == 1:
+            normed_out = normed.to(tl.bfloat16)
+        else:
+            normed_out = normed
+        tl.store(out_bf16_ptr + row_off + cols, normed_out, mask=mask)
+        q = tl.clamp(normed_out.to(tl.float32) * inv_scale, FP8_MIN, FP8_MAX).to(tl.float8e4nv)
         tl.store(out_fp8_ptr + row_off + cols, q, mask=mask)
 
 
@@ -143,6 +164,7 @@ def rms_norm_quant_fp8_kernel_b1(
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
 ):
     """Single-pass RMSNorm + FP8 quant for small batch (seq_len <= 4).
 
@@ -166,8 +188,14 @@ def rms_norm_quant_fp8_kernel_b1(
 
     # Normalize + quantize in one shot (data already in registers)
     normed = x_f32 * rrms * w.to(tl.float32)
-    tl.store(out_bf16_ptr + row_off + cols, normed.to(tl.bfloat16), mask=mask)
-    q = tl.clamp(normed * inv_scale, FP8_MIN, FP8_MAX).to(tl.float8e4nv)
+    if OUT_DTYPE == 0:
+        normed_out = normed.to(tl.float16)
+    elif OUT_DTYPE == 1:
+        normed_out = normed.to(tl.bfloat16)
+    else:
+        normed_out = normed
+    tl.store(out_bf16_ptr + row_off + cols, normed_out, mask=mask)
+    q = tl.clamp(normed_out.to(tl.float32) * inv_scale, FP8_MIN, FP8_MAX).to(tl.float8e4nv)
     tl.store(out_fp8_ptr + row_off + cols, q, mask=mask)
 
 
@@ -185,6 +213,7 @@ def fused_add_rms_norm_quant_fp8_kernel_b1(
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
 ):
     """Single-pass residual-add + RMSNorm + FP8 quant for small batch (seq_len <= 4).
 
@@ -207,8 +236,14 @@ def fused_add_rms_norm_quant_fp8_kernel_b1(
     inv_scale = 1.0 / tl.load(scale_ptr)
 
     normed = add_f32 * rrms * w.to(tl.float32)
-    tl.store(out_bf16_ptr + row_off + cols, normed.to(tl.bfloat16), mask=mask)
-    q = tl.clamp(normed * inv_scale, FP8_MIN, FP8_MAX).to(tl.float8e4nv)
+    if OUT_DTYPE == 0:
+        normed_out = normed.to(tl.float16)
+    elif OUT_DTYPE == 1:
+        normed_out = normed.to(tl.bfloat16)
+    else:
+        normed_out = normed
+    tl.store(out_bf16_ptr + row_off + cols, normed_out, mask=mask)
+    q = tl.clamp(normed_out.to(tl.float32) * inv_scale, FP8_MIN, FP8_MAX).to(tl.float8e4nv)
     tl.store(out_fp8_ptr + row_off + cols, q, mask=mask)
 
 
@@ -237,7 +272,7 @@ def _fp8_quant_only_kernel(
 
 
 def _fp8_quant_tensor(normed_flat: Tensor, scale: Tensor) -> Tensor:
-    """Quantize a BF16 flat tensor to FP8 using a tensor scale (CUDA graph compatible)."""
+    """Quantize a normalized flat tensor to FP8 using a tensor scale."""
     n_elems = normed_flat.numel()
     out_fp8 = torch.empty(normed_flat.shape, dtype=torch.float8_e4m3fn, device=normed_flat.device)
     grid = (triton.cdiv(n_elems, _FP8_QUANT_ONLY_BLOCK),)
@@ -263,6 +298,7 @@ def rms_norm_quant_fp8(
     feat_size = weight.shape[0]
     hidden_states_flat = hidden_states.reshape(-1, feat_size)
     seq_len = hidden_states_flat.shape[0]
+    out_dtype_code = _get_output_dtype_code(hidden_states)
 
     if seq_len <= _RMN_ADAPTIVE_THRESHOLD:
         # Small/medium batch: FlashInfer rmsnorm + _fp8_quant_only_kernel.
@@ -299,6 +335,7 @@ def rms_norm_quant_fp8(
             FP8_MIN=_FP8_MIN,
             FP8_MAX=_FP8_MAX,
             BLOCK_N=_BLOCK_N_B1,
+            OUT_DTYPE=out_dtype_code,
             num_warps=_NUM_WARPS_B1,
         )
     else:
@@ -313,6 +350,7 @@ def rms_norm_quant_fp8(
             FP8_MIN=_FP8_MIN,
             FP8_MAX=_FP8_MAX,
             BLOCK_N=_BLOCK_N,
+            OUT_DTYPE=out_dtype_code,
             num_warps=_NUM_WARPS,
         )
 
@@ -349,6 +387,7 @@ def fused_add_rms_norm_quant_fp8_kernel(
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
 ):
     """Two-pass: residual add → variance → normalize+gamma+quant.
 
@@ -380,8 +419,14 @@ def fused_add_rms_norm_quant_fp8_kernel(
         add = tl.load(out_add_ptr + row_off + cols, mask=mask)  # L2 hit
         w = tl.load(w_ptr + cols, mask=mask)
         normed = add.to(tl.float32) * rrms * w.to(tl.float32)
-        tl.store(out_bf16_ptr + row_off + cols, normed.to(tl.bfloat16), mask=mask)
-        q = tl.clamp(normed * inv_scale, FP8_MIN, FP8_MAX).to(tl.float8e4nv)
+        if OUT_DTYPE == 0:
+            normed_out = normed.to(tl.float16)
+        elif OUT_DTYPE == 1:
+            normed_out = normed.to(tl.bfloat16)
+        else:
+            normed_out = normed
+        tl.store(out_bf16_ptr + row_off + cols, normed_out, mask=mask)
+        q = tl.clamp(normed_out.to(tl.float32) * inv_scale, FP8_MIN, FP8_MAX).to(tl.float8e4nv)
         tl.store(out_fp8_ptr + row_off + cols, q, mask=mask)
 
 
@@ -396,6 +441,7 @@ def fused_add_rms_norm_quant_fp8(
     x_flat = x.reshape(-1, feat_size)
     residual_flat = residual.reshape(-1, feat_size)
     seq_len = x_flat.shape[0]
+    out_dtype_code = _get_output_dtype_code(x)
 
     out_bf16 = torch.empty_like(x_flat)
     out_fp8 = torch.empty(x_flat.shape, dtype=torch.float8_e4m3fn, device=x.device)
@@ -422,6 +468,7 @@ def fused_add_rms_norm_quant_fp8(
             FP8_MIN=_FP8_MIN,
             FP8_MAX=_FP8_MAX,
             BLOCK_N=_BLOCK_N_B1,
+            OUT_DTYPE=out_dtype_code,
             num_warps=_NUM_WARPS_B1,
         )
     elif seq_len <= _RMN_ADAPTIVE_THRESHOLD:
@@ -459,6 +506,7 @@ def fused_add_rms_norm_quant_fp8(
             FP8_MIN=_FP8_MIN,
             FP8_MAX=_FP8_MAX,
             BLOCK_N=_BLOCK_N,
+            OUT_DTYPE=out_dtype_code,
             num_warps=_NUM_WARPS,
         )
 

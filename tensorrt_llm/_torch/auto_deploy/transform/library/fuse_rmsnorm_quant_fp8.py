@@ -65,6 +65,8 @@ def _collect_grouped_fp8_linear_users(
     terminal_users, traversal_ok = collect_terminal_users_through_passthrough(source_node)
     if not traversal_ok:
         return []
+    if any(not _is_supported_fp8_linear(user) for user in terminal_users):
+        return []
 
     grouped_users: List[Node] = []
     for user in terminal_users:
@@ -238,6 +240,11 @@ class FuseRMSNormQuantFP8(BaseTransform):
                 continue
             if fused_node is not None and id(fused_node) in processed_fused_nodes:
                 continue
+            if source_type == "raw_add":
+                # Preserve the explicit add -> cast -> torch_rmsnorm semantics.
+                # Fusing this pattern would drop the cast and change the tensor
+                # that is fed into quantization.
+                continue
 
             fp8_linear_users = _collect_grouped_fp8_linear_users(
                 norm_node, node, input_scale, processed_fp8_users
@@ -253,10 +260,8 @@ class FuseRMSNormQuantFP8(BaseTransform):
                 continue
             _, _, _, earliest_scale, _ = _extract_fp8_linear_args(earliest_fp8_user)
 
-            # Insert the fused kernel before the EARLIEST of all norm consumers
-            # (FP8 or non-FP8). Non-FP8 consumers (e.g. MoE router) will use the
-            # BF16 output of the fused op, which is semantically identical to the
-            # original norm output.
+            # Mixed-consumer graphs are skipped above, so it is safe to insert the
+            # fused kernel before the earliest remaining direct consumer here.
             all_norm_direct_users = list(norm_node.users.keys())
             earliest_any_user = min(
                 all_norm_direct_users, key=lambda n: node_order.get(n, float("inf"))

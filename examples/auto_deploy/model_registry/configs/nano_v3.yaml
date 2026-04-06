@@ -61,3 +61,5 @@ transforms:
     enabled: true
   fuse_trtllm_attn_quant_fp8:
     enabled: true
+  fuse_conv_ssm:
+    enabled: true
