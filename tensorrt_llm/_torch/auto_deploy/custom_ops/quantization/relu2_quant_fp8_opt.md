@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 22 — BLOCK=2048, num_warps=1 (DISCARDED)
+
+**Config:** BLOCK=2048, num_warps=1
+
+| ID | div (µs) | vs best (W=4) | Verdict |
+|---|---|---|---|
+| D1 | 5.77 | +0.40 | ❌ worse |
+| D4 | 5.90 | +0.43 | ❌ worse |
+| D16 | 5.86 | +0.20 | ❌ worse |
+| P1K | 10.25 | +0.58 | ❌ worse |
+
+**Analysis:** W=1 underutilizes the SM. All shapes worse. Reverted.
+
+______________________________________________________________________
+
 ### Iteration 21 — BLOCK=4096, num_warps=4 (DISCARDED)
 
 **Config:** BLOCK=4096, num_warps=4
