@@ -183,12 +183,19 @@ def _tuned_ssm_update_kernel(
         dA = tl.math.exp2(A * dt_log2e)
 
         # Load B, C [BLOCK_SIZE_DSTATE]
-        B = tl.load(B_ptr + offs_n * stride_B_dstate, mask=offs_n < dstate, other=0.0).to(
-            tl.float32
-        )
-        C = tl.load(C_ptr + offs_n * stride_C_dstate, mask=offs_n < dstate, other=0.0).to(
-            tl.float32
-        )
+        # evict_last: B/C shared across heads in same group — hint L2 retention
+        B = tl.load(
+            B_ptr + offs_n * stride_B_dstate,
+            mask=offs_n < dstate,
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+        C = tl.load(
+            C_ptr + offs_n * stride_C_dstate,
+            mask=offs_n < dstate,
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
 
         # state = state * dA + B * dt_x (use libdevice fma for potential speedup)
         # fma(a, b, c) = a * b + c; split into two FMA calls

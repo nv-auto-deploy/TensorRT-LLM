@@ -76,6 +76,8 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 51   | stability: B33=56.8±0.1 B128=202±0.1| 56.8     | 104.7    | 202.3     | 399.5     | 587.3     | stable; measurement std \< 0.1us |
 | 52   | evict_last for state load            | 56.6     | 102.5    | 195.5     | 384.3     | 570.7     | **+2-3% WIN** L2 retention hint |
 | 53   | evict_first for A load (REVERT)      | 57.4     | 103.5    | 196.6     | 384.8     | 573.7     | WORSE; A eviction hurts state   |
+| 54   | BLOCK_SIZE_M=64 re-test (no change)  | 61.9     | 109.0    | 206.9     | 399.4     | 595.1     | +5-9% WORSE; reg spill confirmed|
+| 55   | evict_last for B/C loads             | 56.6     | 102.5    | 195.5     | 384.3     | 570.7     | neutral; same as iter 52 best   |
 
 ## Key findings
 

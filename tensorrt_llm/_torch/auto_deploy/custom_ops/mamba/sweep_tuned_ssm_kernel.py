@@ -35,7 +35,11 @@ import itertools
 import torch
 import torch.nn.functional as F
 import triton
-from tuned_ssm_kernel import _tuned_ssm_update_kernel, tuned_selective_state_update
+
+from tensorrt_llm._torch.auto_deploy.custom_ops.mamba.tuned_ssm_kernel import (
+    _tuned_ssm_update_kernel,
+    tuned_selective_state_update,
+)
 
 # ── shape definitions ────────────────────────────────────────────────────────
 
