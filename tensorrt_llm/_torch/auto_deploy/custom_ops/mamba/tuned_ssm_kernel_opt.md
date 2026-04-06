@@ -49,6 +49,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 24   | precompute 2D offs_m\*stride (REVERT)| 66.1     | 120.6    | 233.2     | 458.4     | 686.0     | WORSE: 2D tensors add reg press |
 | 25   | batch-adaptive M/W heuristic doc     | 59.8     | 108.5    | 210.5     | 410.0     | 609.4     | no benefit; M=32/W=4 universal  |
 | 26   | load B/C before state/A (REVERT)    | 65.0     | 118.1    | 226.9     | 445.4     | 667.2     | WORSE: more regs live in loop   |
+| 27   | tl.math.fma for state update        | 59.7     | 108.7    | 210.7     | 410.1     | 609.6     | marginal; FMA hints for backend |
 
 ## Key findings
 

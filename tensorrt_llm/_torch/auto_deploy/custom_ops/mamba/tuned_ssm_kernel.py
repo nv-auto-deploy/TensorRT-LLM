@@ -167,8 +167,9 @@ def _tuned_ssm_update_kernel(
             tl.float32
         )
 
-        # state = state * dA + B * (dt*x); fused dB*x using precomputed dt_x_col
-        state = state * dA + B[None, :] * dt_x_col
+        # state = state * dA + B * dt_x (use libdevice fma for potential speedup)
+        # fma(a, b, c) = a * b + c; split into two FMA calls
+        state = tl.math.fma(state, dA, B[None, :] * dt_x_col)
 
         # Accumulate output contribution from this dstate chunk
         out_acc += tl.sum(state * C[None, :], axis=1)
