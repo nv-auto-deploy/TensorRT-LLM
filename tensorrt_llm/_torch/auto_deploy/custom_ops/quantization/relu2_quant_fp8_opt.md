@@ -239,7 +239,9 @@ ______________________________________________________________________
 
 **iter 45 (BLOCK=8192):** P1K: 9.72µs — worse. At BLOCK=8192 each tile requires 8192 bf16 loads + 8192 fp8 stores = 24KB. This exceeds shared memory efficiency thresholds. Discarded.
 
-**iter 46 (BLOCK=16384):** P1K: 10.02µs — significantly worse. Only 232 tiles at P1K, not enough to fill all SMs efficiently. BLOCK=4096 with 928 tiles provides the optimal granularity. Discarded.
+**iter 46 (BLOCK=16384):** P1K: 10.02µs — significantly worse. Only 232 tiles at P1K, not enough
+to fill all 132 SMs of H100 efficiently (each SM would only see ~1-2 tiles). BLOCK=4096 with 928
+tiles (7 waves) provides the optimal granularity for this shape. Discarded.
 
 ______________________________________________________________________
 
