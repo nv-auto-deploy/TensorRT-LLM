@@ -227,7 +227,13 @@ ______________________________________________________________________
 
 ### Iteration 29 — num_stages=4 (DISCARDED)
 
-**Config:** BLOCK=4096, W=8, stages=4 — P1K=9.84µs vs stages=2: 9.61µs. Worse. Too much register pressure and memory overhead with 4 stages for this elementwise kernel. Reverted to stages=2.
+**Config:** BLOCK=4096, W=8, stages=4
+
+| stages | D1 (µs) | P1K (µs) | vs stages=2 |
+|---|---|---|---|
+| 4 | 5.25 | 9.84 | +0.23 ❌ |
+
+Too much register pressure and memory overhead with 4 stages for this elementwise kernel. stages=2 remains best. Reverted.
 
 ______________________________________________________________________
 
