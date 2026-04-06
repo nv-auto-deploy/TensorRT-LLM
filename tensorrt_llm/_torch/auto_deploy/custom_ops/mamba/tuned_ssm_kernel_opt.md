@@ -69,6 +69,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 44   | explicit num_stages=1 in launcher   | 56.7     | 104.7    | 202.1     | 399.6     | 587.1     | marginally better; S insens     |
 | 45   | tuned_backend comment update        | 56.7     | 104.7    | 202.1     | 399.6     | 587.1     | doc: add kernel params comment  |
 | 46   | final benchmark M=32,DS=128,W=4,S=1 | 56.9     | 104.5    | 202.5     | 385.6     | 577.2     | confirmed best; e2e also fast   |
+| 47   | update module/kernel docstrings     | 56.9     | 104.5    | 202.5     | 385.6     | 577.2     | doc: all optimizations listed   |
 
 ## Key findings
 

@@ -16,8 +16,19 @@
 """Tuned Triton SSM decode kernel for Nemotron Nano v3 dimensions.
 
 Optimized for: nheads=64, dim=64, dstate=128, n_groups=8.
-Key difference from stock selective_state_update: uses BLOCK_SIZE_M=16 (vs 4)
-to reduce grid size by 4x, improving GPU scheduler efficiency at small batch.
+Fires when num_decode > 32 (tuned_backend_mamba dispatch threshold).
+
+Key optimizations over stock selective_state_update:
+- BLOCK_SIZE_M=32 (vs 4): reduces grid by 8x, improves SM scheduler efficiency
+- dt_clamp=[0.001, 0.1]: correctness fix, matches mamba2 time_step_limit
+- DSTATE_CONSTEXPR: compile-time loop bound enables full unrolling (+3-5%)
+- DIM_CONSTEXPR/NHEADS_NGROUPS_RATIO: compile-time mask/div optimization
+- Dstate loop structure: handles any BLOCK_SIZE_DSTATE correctly
+- D load hoisted before dstate loop: hides memory latency
+- exp2(A*dt*log2e): faster than tl.exp on NVIDIA hardware
+- dt_x_col = (dt*x): fuses dB*x multiplication, saves 1 mul per dstate chunk
+- FMA for state update: explicit tl.math.fma hint
+- num_stages=1: stages insensitive; 1 minimizes register overhead
 """
 
 import torch
@@ -84,13 +95,16 @@ def _tuned_ssm_update_kernel(
     DIM_CONSTEXPR: tl.constexpr,  # compile-time dim for mask elimination
     NHEADS_NGROUPS_RATIO: tl.constexpr,  # compile-time head/group ratio (8 for NanoV3)
 ):
-    """Optimized SSM state update for decode (T=1).
+    """Optimized SSM state update for decode (T=1) with all iter43+ optimizations.
 
     Compared to the generic kernel, this:
     - Removes T loop (single token only)
     - Removes z/intermediate_states/spec_decoding branches
-    - Uses larger BLOCK_SIZE_M for our target dim=64
-    - Hardcodes DT_SOFTPLUS=True, HAS_DT_BIAS=True, HAS_D=True
+    - BLOCK_SIZE_M=32: reduces grid 8x vs stock (4x vs earlier tuned version)
+    - DSTATE_CONSTEXPR: compile-time loop unrolling (+3-5% speedup)
+    - DIM_CONSTEXPR, NHEADS_NGROUPS_RATIO: compile-time mask/div optimization
+    - dt_clamp: correctness fix for SSM state stability
+    - D load hoisted, exp2, dt_x fusion, FMA: all marginal improvements
     """
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
