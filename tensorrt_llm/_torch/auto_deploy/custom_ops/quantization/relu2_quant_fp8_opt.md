@@ -253,7 +253,10 @@ mathematically equivalent but reorders operations. P1K: 9.59µs — essentially 
 baseline (within noise). The reordering avoids the bf16→fp32→relu→fp32 sequence by doing fp32
 upcast first then square then gate. No measurable improvement within noise bounds.
 
-**iter 41 (scale_first_inv):** Combined scale_first + inv_scale — P1K: 9.78µs. Worse than base. Discarded.
+**iter 41 (scale_first_inv):** Combined scale_first + inv_scale inside kernel — load scale early
+then compute reciprocal while x data is loading. P1K: 9.78µs — worse than baseline. The latency
+of scalar division (1/scale) adds overhead before the multiply; the / operator on the vector is
+the same cost and the compiler pipelines it better. Discarded.
 
 ______________________________________________________________________
 
