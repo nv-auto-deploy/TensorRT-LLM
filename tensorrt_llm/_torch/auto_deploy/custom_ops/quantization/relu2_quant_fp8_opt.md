@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 16 — BLOCK=512, num_warps=2 (DISCARDED)
+
+**Config:** BLOCK=512, num_warps=2
+
+| ID | div (µs) | vs best | Verdict |
+|---|---|---|---|
+| D1 | 5.42 | +0.23 | noise |
+| D4 | 5.34 | -0.16 | noise |
+| D16 | 5.52 | -0.10 | noise |
+| P1K | 10.23 | +0.44 | ❌ slightly worse |
+
+**Analysis:** P1K: 10.23µs vs 9.79µs best. W=2 slightly worse than W=4 at BLOCK=512. Reverted.
+
+______________________________________________________________________
+
 ### Iteration 15 — BLOCK=256, num_warps=4 (DISCARDED)
 
 **Config:** BLOCK=256, num_warps=4
