@@ -241,7 +241,9 @@ ______________________________________________________________________
 P1K: 9.61µs — essentially tied. On H100, streaming prefetch is handled by hardware well for this
 access pattern. HBM3 already feeds data at peak bandwidth for this elementwise workload. Discarded.
 
-**iter 32 (evict_both):** Combined hints — no improvement. P1K: 9.63µs. Discarded.
+**iter 32 (evict_both):** Combined evict_first on x + evict_last on scale — no improvement.
+P1K: 9.63µs (noise above 9.61µs baseline). The eviction hints are likely already handled
+optimally by the H100 hardware prefetcher for this simple sequential access pattern. Discarded.
 
 ______________________________________________________________________
 
