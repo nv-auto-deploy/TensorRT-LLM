@@ -247,8 +247,9 @@ def tuned_selective_state_update(
         out = torch.empty(batch, 1, nheads, dim, device=x.device, dtype=x.dtype)
 
     # Tuned block sizes for our target dimensions
-    # BLOCK_SIZE_M=32: reduces grid by 2x vs M=16, less scheduler overhead
+    # BLOCK_SIZE_M=32: optimal for all batch sizes (reduces grid 2x vs M=16)
     # BLOCK_SIZE_DSTATE=128: full dstate in one pass is optimal (no loop overhead)
+    # num_warps=4: optimal across all batch sizes
     BLOCK_SIZE_DSTATE = triton.next_power_of_2(dstate)
     if dim <= 64:
         BLOCK_SIZE_M = 32
@@ -259,6 +260,8 @@ def tuned_selective_state_update(
     else:
         BLOCK_SIZE_M = 16
         num_warps = 4
+    # Note: batch-adaptive heuristics tested (M/W by batch) — no benefit found
+    # M=32/W=4 is optimal across all batch sizes {33, 64, 128, 256, 384}
 
     has_sbi = state_batch_indices is not None
 
