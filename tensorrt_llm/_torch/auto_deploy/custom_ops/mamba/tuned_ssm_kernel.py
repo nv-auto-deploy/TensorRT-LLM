@@ -47,7 +47,6 @@ def _tuned_ssm_update_kernel(
     nheads,
     dim,
     dstate,
-    nheads_ngroups_ratio,
     # Strides
     stride_state_batch,
     stride_state_head,
@@ -298,7 +297,6 @@ def tuned_selective_state_update(
             nheads,
             dim,
             dstate,
-            nheads // ngroups,
             state.stride(0),
             state.stride(1),
             state.stride(2),

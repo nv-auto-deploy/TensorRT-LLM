@@ -185,8 +185,6 @@ def bench_kernel(
     """Benchmark _tuned_ssm_update_kernel directly (no launcher overhead)."""
     state, x, dt, dt_bias, A, B, C, D, out_buf = make_tensors(batch, device)
 
-    nheads_ngroups_ratio = NHEADS // NGROUPS
-
     def grid(META):
         return (triton.cdiv(DIM, META["BLOCK_SIZE_M"]), batch, NHEADS)
 
@@ -207,7 +205,6 @@ def bench_kernel(
             NHEADS,
             DIM,
             DSTATE,
-            nheads_ngroups_ratio,
             state.stride(0),
             state.stride(1),
             state.stride(2),
