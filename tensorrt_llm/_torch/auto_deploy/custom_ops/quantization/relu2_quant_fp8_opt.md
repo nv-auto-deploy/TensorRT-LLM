@@ -238,7 +238,9 @@ ______________________________________________________________________
 
 **iter 33 (tl_where):** tl.where generates a select instruction — same as max but slightly higher latency in practice. P1K: 9.72µs. Discarded.
 
-**iter 34 (mask_multiply):** relu as mask multiply. Requires fp32 upcast before relu (loses bf16 SIMD benefit). P1K: 9.75µs. Discarded.
+**iter 34 (mask_multiply):** relu as mask multiply `x * (x > 0)`. Requires fp32 upcast before relu
+(loses bf16 SIMD benefit). P1K: 9.75µs. The mask_multiply approach has higher latency due to the
+comparison and cast-to-float32 before multiply. Discarded.
 
 **iter 35 (abs_trick):** `(x + abs(x)) * 0.5` — two ops instead of one max. PTX may not fuse this as efficiently. P1K: 9.72µs. Discarded.
 
