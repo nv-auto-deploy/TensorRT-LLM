@@ -333,4 +333,5 @@ def tuned_selective_state_update(
             DIM_CONSTEXPR=dim,
             NHEADS_NGROUPS_RATIO=nheads // ngroups,
             num_warps=num_warps,
+            num_stages=1,  # stages insensitive; 1 minimizes register overhead
         )

@@ -66,6 +66,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 41   | final M=16 vs M=32 at small batch   | 56.8     | 104.6    | 202.3     | 399.3     | 587.3     | M=32 best across all; no change |
 | 42   | correctness re-verify all batches   | 56.8     | 104.6    | 202.3     | 399.3     | 587.3     | all PASS; max_diff\<0.13 (bf16)  |
 | 43   | final e2e benchmark all batches     | 56.8     | 104.6    | 202.3     | 385.3     | 576.7     | B256/B384 BEAT pre-clamp base!  |
+| 44   | explicit num_stages=1 in launcher   | 56.7     | 104.7    | 202.1     | 399.6     | 587.1     | marginally better; S insens     |
 
 ## Key findings
 
