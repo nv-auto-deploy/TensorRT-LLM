@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 11 — BLOCK=64, num_warps=4 (DISCARDED)
+
+**Config:** BLOCK=64, num_warps=4
+
+| ID | div (µs) | vs best | Verdict |
+|---|---|---|---|
+| D1 | 5.50 | +0.31 | ❌ worse |
+| D4 | 5.66 | +0.16 | ❌ worse |
+| D16 | 5.62 | +0.00 | ≈ same |
+| P1K | 40.82 | +31.03 | ❌ much worse |
+
+**Analysis:** Same as W=2: BLOCK=64 creates 59392 blocks for P1K. Reverted to BLOCK=1024, W=4.
+
+______________________________________________________________________
+
 ### Iteration 10 — BLOCK=64, num_warps=2 (DISCARDED)
 
 **Config:** BLOCK=64, num_warps=2
