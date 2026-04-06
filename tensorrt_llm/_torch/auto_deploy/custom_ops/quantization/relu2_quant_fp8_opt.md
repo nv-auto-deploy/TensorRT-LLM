@@ -237,7 +237,9 @@ ______________________________________________________________________
 
 **iter 30 (evict_last_scale):** Scalar scale load with evict_last hint — preserves scale in L1 for reuse. P1K: 9.73µs vs 9.61µs baseline — slightly worse. The scale is a single float32; Triton already handles scalar broadcasts well. Discarded.
 
-**iter 31 (evict_first_x):** Streaming hint for x — signal to evict from cache after first use. P1K: 9.61µs — essentially tied. On H100, streaming prefetch is handled by hardware well for this access pattern. Discarded.
+**iter 31 (evict_first_x):** Streaming hint for x — signal to evict from cache after first use.
+P1K: 9.61µs — essentially tied. On H100, streaming prefetch is handled by hardware well for this
+access pattern. HBM3 already feeds data at peak bandwidth for this elementwise workload. Discarded.
 
 **iter 32 (evict_both):** Combined hints — no improvement. P1K: 9.63µs. Discarded.
 
