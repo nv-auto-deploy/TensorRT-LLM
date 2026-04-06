@@ -72,6 +72,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 47   | update module/kernel docstrings     | 56.9     | 104.5    | 202.5     | 385.6     | 577.2     | doc: all optimizations listed   |
 | 48   | update launcher docstring + perf    | 56.9     | 104.5    | 202.5     | 385.6     | 577.2     | doc: perf numbers in docstring  |
 | 49   | complete key findings + best table  | 56.9     | 104.5    | 202.5     | 385.6     | 577.2     | doc: complete optimization log  |
+| 50   | final validation: all PASS, complete| 56.6     | 104.4    | 202.3     | 399.4     | 587.3     | DONE: 50 iters, correctness OK  |
 
 ## Key findings
 
