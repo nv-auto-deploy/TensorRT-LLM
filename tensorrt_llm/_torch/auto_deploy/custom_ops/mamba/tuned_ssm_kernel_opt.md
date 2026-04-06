@@ -60,6 +60,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 35   | num_stages re-sweep (1-5) at final  | 56.7     | 104.5    | 202.1     | 399.4     | 587.2     | all within noise; keep S=3      |
 | 36   | tl.dot for out accumulation (REV)   | 102.4    | 164.9    | 308.2     | 599.1     | 892.9     | WORSE: tl.dot overhead on \[32,128\]x\[128,1\] |
 | 37   | int32 offs_n (within noise)         | 56.7     | 104.7    | 202.1     | 399.6     | 587.1     | no benefit; int64 fine          |
+| 38   | DS=64 loop (2 iters vs 1 at DS=128) | 59.4     | 108.0    | 208.3     | 407.7     | 603.9     | worse; loop overhead > reg save |
 
 ## Key findings
 
