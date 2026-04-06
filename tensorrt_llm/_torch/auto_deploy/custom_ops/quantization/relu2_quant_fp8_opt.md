@@ -225,6 +225,24 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iterations 30-32 — Load eviction policy hints (DISCARDED)
+
+**Test:** Three variants at BLOCK=4096, W=8, stages=2:
+
+| Variant | Description | D1 (µs) | P1K (µs) | vs baseline |
+|---|---|---|---|---|
+| evict_last_scale | `scale = tl.load(scale_ptr, eviction_policy='evict_last')` | 5.55 | 9.73 | +0.12 ❌ |
+| evict_first_x | `x = tl.load(x_ptr + offs, eviction_policy='evict_first')` | 5.50 | 9.61 | 0.00 = |
+| evict_both | Both hints combined | 5.32 | 9.63 | +0.02 noise |
+
+**iter 30 (evict_last_scale):** Scalar scale load with evict_last hint — preserves scale in L1 for reuse. P1K: 9.73µs vs 9.61µs baseline — slightly worse. The scale is a single float32; Triton already handles scalar broadcasts well. Discarded.
+
+**iter 31 (evict_first_x):** Streaming hint for x — signal to evict from cache after first use. P1K: 9.61µs — essentially tied. On H100, streaming prefetch is handled by hardware well for this access pattern. Discarded.
+
+**iter 32 (evict_both):** Combined hints — no improvement. P1K: 9.63µs. Discarded.
+
+______________________________________________________________________
+
 ### Iteration 29 — num_stages=4 (DISCARDED)
 
 **Config:** BLOCK=4096, W=8, stages=4
