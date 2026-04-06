@@ -242,7 +242,11 @@ P1K: 9.94µs — worse. Each SM does twice the work; while grid launch cost is h
 execution of 2 tiles increases SM latency. At P1K, we have 928 tiles for 132 SMs — already ~7 waves,
 not launch-overhead-dominated. Discarded.
 
-**iter 44 (persistent):** Grid=132 SMs (H100 SM count), each SM loops over its tiles. P1K: 11.90µs — much worse. The loop-based dispatch adds significant overhead and reduces SM utilization efficiency for this workload. Discarded.
+**iter 44 (persistent):** Grid=132 SMs (H100 SM count), each SM loops over all its tiles using a
+while-loop. P1K: 11.90µs — much worse. The while-loop adds branch overhead and disrupts the
+hardware scheduler. For P1K we only have 928 tiles (7 waves), which already runs at near-peak.
+The persistent kernel pattern is beneficial for kernels with irregular work distribution;
+for this uniform elementwise kernel it adds overhead. Discarded.
 
 ______________________________________________________________________
 
