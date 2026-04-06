@@ -63,6 +63,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 38   | DS=64 loop (2 iters vs 1 at DS=128) | 59.4     | 108.0    | 208.3     | 407.7     | 603.9     | worse; loop overhead > reg save |
 | 39   | group_id precompute for B/C ptr     | 56.9     | 104.7    | 202.2     | 399.7     | 587.3     | neutral; cleaner code           |
 | 40   | inline softplus (reverted)          | 56.8     | 104.6    | 202.3     | 399.3     | 587.3     | no benefit; Triton inlines it   |
+| 41   | final M=16 vs M=32 at small batch   | 56.8     | 104.6    | 202.3     | 399.3     | 587.3     | M=32 best across all; no change |
 
 ## Key findings
 
