@@ -242,7 +242,8 @@ ______________________________________________________________________
 (loses bf16 SIMD benefit). P1K: 9.75µs. The mask_multiply approach has higher latency due to the
 comparison and cast-to-float32 before multiply. Discarded.
 
-**iter 35 (abs_trick):** `(x + abs(x)) * 0.5` — two ops instead of one max. PTX may not fuse this as efficiently. P1K: 9.72µs. Discarded.
+**iter 35 (abs_trick):** `(x + abs(x)) * 0.5` — two ops (add + abs) instead of one max instruction.
+PTX does not fuse this into a single MAX. P1K: 9.72µs. Discarded.
 
 **iter 36 (where_bf16_output):** tl.where with explicit bf16 comparison — essentially same as iter33. P1K: 9.72µs. Discarded.
 
