@@ -225,6 +225,24 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iterations 45-46 — Large BLOCK sizes (DISCARDED)
+
+**Sweep:** BLOCK ∈ {8192, 16384} with W=8, stages=2.
+
+| Config | D1 (µs) | P1K (µs) | tiles at P1K | vs baseline |
+|---|---|---|---|---|
+| BLOCK=8192, W=8, s=2 | 5.67 | 9.72 | 464 | +0.11 ❌ |
+| BLOCK=8192, W=16, s=2 | 5.49 | 9.75 | 464 | +0.14 ❌ |
+| BLOCK=8192, W=8, s=3 | 5.50 | 9.74 | 464 | +0.13 ❌ |
+| BLOCK=16384, W=8, s=2 | 6.07 | 10.02 | 232 | +0.41 ❌ |
+| BLOCK=16384, W=16, s=2 | 5.81 | 9.98 | 232 | +0.37 ❌ |
+
+**iter 45 (BLOCK=8192):** P1K: 9.72µs — worse. At BLOCK=8192 each tile requires 8192 bf16 loads + 8192 fp8 stores = 24KB. This exceeds shared memory efficiency thresholds. Discarded.
+
+**iter 46 (BLOCK=16384):** P1K: 10.02µs — significantly worse. Only 232 tiles at P1K, not enough to fill all SMs efficiently. BLOCK=4096 with 928 tiles provides the optimal granularity. Discarded.
+
+______________________________________________________________________
+
 ### Iterations 42-44 — Grid strategies (DISCARDED)
 
 **Sweep:** All tested at BLOCK=4096, W=8, stages=2. Baseline P1K=9.61µs.
