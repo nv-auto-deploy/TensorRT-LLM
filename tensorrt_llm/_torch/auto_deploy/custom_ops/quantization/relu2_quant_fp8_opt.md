@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 17 — BLOCK=512, num_warps=4 (DISCARDED)
+
+**Config:** BLOCK=512, num_warps=4
+
+| ID | div (µs) | vs best | Verdict |
+|---|---|---|---|
+| D1 | 5.12 | -0.07 | slight improvement |
+| D4 | 5.22 | -0.28 | slight improvement |
+| D16 | 5.65 | +0.03 | noise |
+| P1K | 10.06 | +0.27 | slightly worse |
+
+**Analysis:** D1/D4 slightly better, but P1K 10.06 vs 9.79µs — BLOCK=1024 still wins for P1K. Mixed results. Keeping BLOCK=1024 as the best single overall config.
+
+______________________________________________________________________
+
 ### Iteration 16 — BLOCK=512, num_warps=2 (DISCARDED)
 
 **Config:** BLOCK=512, num_warps=2
