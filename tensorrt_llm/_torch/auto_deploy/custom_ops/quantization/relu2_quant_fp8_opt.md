@@ -225,6 +225,29 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iterations 33-36 — Alternative relu implementations (DISCARDED)
+
+**Sweep:** All tested at BLOCK=4096, W=8, stages=2.
+
+| Variant | relu impl | D1 (µs) | P1K (µs) | vs baseline (9.61µs) |
+|---|---|---|---|---|
+| tl_where | `tl.where(x > 0, x, zeros)` | 5.55 | 9.72 | +0.11 ❌ |
+| mask_multiply | `xf * (xf > 0).to(f32)` (fp32 relu) | 5.39 | 9.75 | +0.14 ❌ |
+| abs_trick | `(x + abs(x)) * 0.5` | 5.63 | 9.72 | +0.11 ❌ |
+| where_bf16_output | `tl.where(x > 0, x, 0)` (bf16) | 5.36 | 9.72 | +0.11 ❌ |
+
+**iter 33 (tl_where):** tl.where generates a select instruction — same as max but slightly higher latency in practice. P1K: 9.72µs. Discarded.
+
+**iter 34 (mask_multiply):** relu as mask multiply. Requires fp32 upcast before relu (loses bf16 SIMD benefit). P1K: 9.75µs. Discarded.
+
+**iter 35 (abs_trick):** `(x + abs(x)) * 0.5` — two ops instead of one max. PTX may not fuse this as efficiently. P1K: 9.72µs. Discarded.
+
+**iter 36 (where_bf16_output):** tl.where with explicit bf16 comparison — essentially same as iter33. P1K: 9.72µs. Discarded.
+
+**Conclusion:** `tl.maximum(x, 0.0)` in bf16 space is already optimal for ReLU on H100. All alternatives are slightly worse.
+
+______________________________________________________________________
+
 ### Iterations 30-32 — Load eviction policy hints (DISCARDED)
 
 **Test:** Three variants at BLOCK=4096, W=8, stages=2:
