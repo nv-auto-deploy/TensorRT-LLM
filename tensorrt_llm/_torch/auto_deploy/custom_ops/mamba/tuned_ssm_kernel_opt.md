@@ -64,6 +64,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 39   | group_id precompute for B/C ptr     | 56.9     | 104.7    | 202.2     | 399.7     | 587.3     | neutral; cleaner code           |
 | 40   | inline softplus (reverted)          | 56.8     | 104.6    | 202.3     | 399.3     | 587.3     | no benefit; Triton inlines it   |
 | 41   | final M=16 vs M=32 at small batch   | 56.8     | 104.6    | 202.3     | 399.3     | 587.3     | M=32 best across all; no change |
+| 42   | correctness re-verify all batches   | 56.8     | 104.6    | 202.3     | 399.3     | 587.3     | all PASS; max_diff\<0.13 (bf16)  |
 
 ## Key findings
 
