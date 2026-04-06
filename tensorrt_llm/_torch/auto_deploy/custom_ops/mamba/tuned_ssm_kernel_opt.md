@@ -34,6 +34,10 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 9    | num_warps=8 sweep (M=32)            | 62.0     | 113.4    | 220.3     | 431.6     | 645.7     | worse -- too much resource use  |
 | 10   | num_warps=16 sweep (M=32)           | 60.7     | 111.4    | 216.2     | 423.6     | 632.0     | worse than W=4                  |
 | 11   | W=4 confirmed best; keep launcher   | 57.1     | 104.7    | 201.8     | 399.2     | 586.7     | W=4 optimal for M=32,DS=128     |
+| 12   | num_stages=1 sweep (M=32,W=4)       | 56.9     | 104.6    | 201.9     | 398.7     | 586.7     | marginal improvement            |
+| 13   | num_stages=2 sweep (M=32,W=4)       | 56.9     | 104.3    | 201.6     | 399.0     | 586.5     | essentially same                |
+| 14   | num_stages=4 sweep (M=32,W=4)       | 56.8     | 104.3    | 202.0     | 398.7     | 586.7     | essentially same                |
+| 15   | num_stages: stages insensitive      | 57.1     | 104.7    | 201.8     | 399.2     | 586.7     | keep S=3; no meaningful diff    |
 
 ## Key findings
 
