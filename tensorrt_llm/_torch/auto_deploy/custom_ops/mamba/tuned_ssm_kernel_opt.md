@@ -28,6 +28,12 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 3    | BLOCK_SIZE_M=8 sweep                | 57.6     | 105.9    | 205.0     | 401.5     | 591.1     | marginally worse                |
 | 4    | BLOCK_SIZE_M=32 sweep               | 57.1     | 104.7    | 201.8     | 399.2     | 586.7     | best so far -- smaller grid     |
 | 5    | BLOCK_SIZE_M=64 sweep               | 64.5     | 113.7    | 217.0     | 421.6     | 627.7     | worse -- grid_m=1, reg pressure |
+| 6    | Best M=32 confirmed in launcher     | 57.1     | 104.7    | 201.8     | 399.2     | 586.7     | adopted into launcher           |
+| 7    | num_warps=1 sweep (M=32)            | 79.8     | 143.2    | 272.9     | 531.8     | 797.0     | much worse -- memory bandwidth  |
+| 8    | num_warps=2 sweep (M=32)            | 61.1     | 108.9    | 208.0     | 404.6     | 596.4     | slightly worse than W=4         |
+| 9    | num_warps=8 sweep (M=32)            | 62.0     | 113.4    | 220.3     | 431.6     | 645.7     | worse -- too much resource use  |
+| 10   | num_warps=16 sweep (M=32)           | 60.7     | 111.4    | 216.2     | 423.6     | 632.0     | worse than W=4                  |
+| 11   | W=4 confirmed best; keep launcher   | 57.1     | 104.7    | 201.8     | 399.2     | 586.7     | W=4 optimal for M=32,DS=128     |
 
 ## Key findings
 
@@ -37,6 +43,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
   kernel and reference use clamp
 - BLOCK_SIZE_M=32 slightly better than 16 (reduces grid size by 2x, less scheduler overhead)
 - BLOCK_SIZE_M=64 worse (all dim in one program causes register pressure / serialization)
+- num_warps=4 is optimal for M=32, DS=128; W=1 is 40% worse, W=2 is ~4% worse, W=8/16 are ~5-10% worse
 
 ## Best configs per shape
 
