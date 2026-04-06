@@ -224,15 +224,16 @@ def tuned_selective_state_update(
         out = torch.empty(batch, 1, nheads, dim, device=x.device, dtype=x.dtype)
 
     # Tuned block sizes for our target dimensions
+    # BLOCK_SIZE_M=32 reduces grid by 2x vs M=16, improving SM scheduler efficiency
     BLOCK_SIZE_DSTATE = triton.next_power_of_2(dstate)
     if dim <= 64:
-        BLOCK_SIZE_M = 16
+        BLOCK_SIZE_M = 32
         num_warps = 4
     elif dim <= 128:
-        BLOCK_SIZE_M = 16
+        BLOCK_SIZE_M = 32
         num_warps = 4
     else:
-        BLOCK_SIZE_M = 8
+        BLOCK_SIZE_M = 16
         num_warps = 4
 
     has_sbi = state_batch_indices is not None
