@@ -33,3 +33,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 ## Best configs per shape
 
 - (to be filled after iter 50)
+  | 2    | BLOCK_SIZE_M=4  (sweep)              | 58.5     | 106.9    | 207.4     | 404.6     | 598.7     | worse than baseline              |
+  | 3    | BLOCK_SIZE_M=8  (sweep)              | 57.6     | 105.9    | 205.0     | 401.5     | 591.1     | marginally worse                 |
+  | 4    | BLOCK_SIZE_M=32 (sweep)              | 57.1     | 104.7    | 201.8     | 399.2     | 586.7     | best so far — smaller grid       |
+  | 5    | BLOCK_SIZE_M=64 (sweep)              | 64.5     | 113.7    | 217.0     | 421.6     | 627.7     | worse — grid_m=1, reg pressure   |
