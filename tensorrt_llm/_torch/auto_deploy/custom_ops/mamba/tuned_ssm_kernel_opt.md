@@ -75,6 +75,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 50   | final validation: all PASS, complete| 56.6     | 104.4    | 202.3     | 399.4     | 587.3     | DONE: 50 iters, correctness OK  |
 | 51   | stability: B33=56.8±0.1 B128=202±0.1| 56.8     | 104.7    | 202.3     | 399.5     | 587.3     | stable; measurement std \< 0.1us |
 | 52   | evict_last for state load            | 56.6     | 102.5    | 195.5     | 384.3     | 570.7     | **+2-3% WIN** L2 retention hint |
+| 53   | evict_first for A load (REVERT)      | 57.4     | 103.5    | 196.6     | 384.8     | 573.7     | WORSE; A eviction hurts state   |
 
 ## Key findings
 
