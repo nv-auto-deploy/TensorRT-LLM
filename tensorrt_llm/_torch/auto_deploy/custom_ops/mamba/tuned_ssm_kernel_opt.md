@@ -57,6 +57,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 32   | DIM_CONSTEXPR: eliminate dim mask   | 57.2     | 104.9    | 203.0     | 398.5     | 586.2     | marginal; mask cmp eliminated   |
 | 33   | NHEADS_NGROUPS_RATIO constexpr      | 56.5     | 104.4    | 202.0     | 399.5     | 587.0     | +0.5-1% div becomes shift/mask  |
 | 34   | remove runtime nheads_ngroups_ratio | 56.8     | 104.4    | 202.3     | 399.3     | 587.2     | cleanup; within noise           |
+| 35   | num_stages re-sweep (1-5) at final  | 56.7     | 104.5    | 202.1     | 399.4     | 587.2     | all within noise; keep S=3      |
 
 ## Key findings
 
