@@ -77,7 +77,7 @@ def _run_relu2_quant_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     x_flat = x.reshape(-1)
     n = x_flat.numel()
     out_fp8 = torch.empty(orig_shape, dtype=torch.float8_e4m3fn, device=x.device)
-    # BLOCK=2048, W=4 slightly better at P1K (9.67 vs 9.79µs) in iter 19 re-sweep.
+    # BLOCK=2048, W=8: new best at P1K (9.60µs) in iter 24 num_warps sweep.
     # Decode shapes are launch-overhead-dominated (all within noise ±0.3µs).
     BLOCK = 2048
     grid = (triton.cdiv(n, BLOCK),)
@@ -89,7 +89,7 @@ def _run_relu2_quant_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         FP8_MIN=_FP8_MIN,
         FP8_MAX=_FP8_MAX,
         BLOCK=BLOCK,
-        num_warps=4,
+        num_warps=8,
     )
     return out_fp8
 

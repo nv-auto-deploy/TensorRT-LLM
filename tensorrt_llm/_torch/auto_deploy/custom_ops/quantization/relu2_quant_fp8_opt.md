@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 24 — BLOCK=2048, num_warps=8 (APPLIED — new best P1K)
+
+**Config:** BLOCK=2048, num_warps=8
+
+| ID | div (µs) | vs best (W=4) | Verdict |
+|---|---|---|---|
+| D1 | 5.33 | -0.04 | noise |
+| D4 | 5.41 | -0.06 | noise |
+| D16 | 5.62 | -0.04 | noise |
+| P1K | **9.60** | **-0.07 (-0.7%)** | ✅ new best |
+
+**Analysis:** P1K improved to 9.60µs (from 9.67µs). W=8 allows better instruction-level parallelism for the compute-light but memory-bound computation. APPLIED.
+
+______________________________________________________________________
+
 ### Iteration 23 — BLOCK=2048, num_warps=2 (DISCARDED)
 
 **Config:** BLOCK=2048, num_warps=2
@@ -439,16 +454,16 @@ ______________________________________________________________________
 
 ```python
 BLOCK = 2048
-num_warps = 4
+num_warps = 8
 # relu in bf16 space, tl.clamp for quantize (v5_combined)
 ```
 
-| ID | Original (µs) | After iter 9 (µs) | After iter 19 (µs) | Total delta |
+| ID | Original (µs) | After iter 9 (µs) | After iter 24 (µs) | Total delta |
 |---|---|---|---|---|
-| D1 (c=1) | 5.33 | 5.27 | 5.37 | +0.7% (noise) |
-| D4 (c=4) | 5.31 | 5.20 | 5.47 | +3.0% (noise) |
-| D16 (c=16) | 5.44 | 5.57 | 5.66 | +4.0% (noise) |
-| P1K | 10.18 | 9.75 | **9.67** | **−5.0%** |
+| D1 (c=1) | 5.33 | 5.27 | 5.33 | 0% (noise) |
+| D4 (c=4) | 5.31 | 5.20 | 5.41 | +1.9% (noise) |
+| D16 (c=16) | 5.44 | 5.57 | 5.62 | +3.3% (noise) |
+| P1K | 10.18 | 9.75 | **9.60** | **−5.7%** |
 
 **Conclusion:** The kernel is fundamentally launch-overhead-limited for decode sizes
 (D1–D16). At these sizes (3712–59392 elements), the memory transfer is \< 0.1 µs;
