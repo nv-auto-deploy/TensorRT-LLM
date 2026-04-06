@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 20 — BLOCK=4096, num_warps=2 (DISCARDED)
+
+**Config:** BLOCK=4096, num_warps=2
+
+| ID | div (µs) | vs best | Verdict |
+|---|---|---|---|
+| D1 | 5.83 | +0.46 | ❌ worse |
+| D4 | 5.89 | +0.42 | ❌ worse |
+| D16 | 6.10 | +0.44 | ❌ worse |
+| P1K | 10.08 | +0.41 | ❌ worse |
+
+**Analysis:** BLOCK=4096 is worse everywhere. Grid becomes too small (928 blocks), not enough parallelism. W=2 also suboptimal. Reverted.
+
+______________________________________________________________________
+
 ### Iteration 19 — BLOCK=2048, num_warps=4 (APPLIED — new best P1K)
 
 **Config:** BLOCK=2048, num_warps=4
