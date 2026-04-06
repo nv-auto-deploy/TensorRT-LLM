@@ -77,10 +77,9 @@ def _run_relu2_quant_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     x_flat = x.reshape(-1)
     n = x_flat.numel()
     out_fp8 = torch.empty(orig_shape, dtype=torch.float8_e4m3fn, device=x.device)
-    # BLOCK=1024 chosen from sweep over Nemotron-3-Nano-30B-A3B shapes:
-    # - Best for prefill (P1K: −1.1% vs BLOCK=512)
-    # - No regression for decode (D1/D4/D16 are launch-overhead-dominated)
-    BLOCK = 1024
+    # BLOCK=2048, W=4 slightly better at P1K (9.67 vs 9.79µs) in iter 19 re-sweep.
+    # Decode shapes are launch-overhead-dominated (all within noise ±0.3µs).
+    BLOCK = 2048
     grid = (triton.cdiv(n, BLOCK),)
     _relu2_quant_fp8_kernel[grid](
         x_flat,
