@@ -82,6 +82,7 @@ def _tuned_ssm_update_kernel(
     DT_CLAMP_MIN: tl.constexpr,
     DT_CLAMP_MAX: tl.constexpr,
     DSTATE_CONSTEXPR: tl.constexpr,  # compile-time dstate for loop unrolling
+    DIM_CONSTEXPR: tl.constexpr,  # compile-time dim for mask elimination
 ):
     """Optimized SSM state update for decode (T=1).
 
@@ -114,7 +115,8 @@ def _tuned_ssm_update_kernel(
     out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    mask_m = offs_m < dim
+    # Use compile-time dim to eliminate mask when BLOCK_SIZE_M divides DIM_CONSTEXPR evenly
+    mask_m = offs_m < DIM_CONSTEXPR
 
     # Load x, dt, dt_bias for this block's dim slice (scalar per dim lane)
     x = tl.load(x_ptr + offs_m * stride_x_dim, mask=mask_m, other=0.0).to(tl.float32)
@@ -328,5 +330,6 @@ def tuned_selective_state_update(
             DT_CLAMP_MIN=dt_clamp_min,
             DT_CLAMP_MAX=dt_clamp_max,
             DSTATE_CONSTEXPR=dstate,
+            DIM_CONSTEXPR=dim,
             num_warps=num_warps,
         )

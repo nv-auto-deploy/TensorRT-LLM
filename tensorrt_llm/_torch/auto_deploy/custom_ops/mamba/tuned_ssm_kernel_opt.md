@@ -54,6 +54,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 29   | fast_expf vs exp2 (reverted)        | 59.7     | 108.7    | 210.6     | 410.1     | 609.5     | same as exp2; kernel mem-bound  |
 | 30   | .cg cache modifier for loads (REV)  | 59.8     | 108.5    | 211.0     | 410.9     | 611.1     | no benefit; .cg unhelpful here  |
 | 31   | DSTATE_CONSTEXPR: compile-time loop | 57.3     | 105.1    | 203.2     | 398.7     | 586.3     | **+3-5% WIN** loop unrolled!    |
+| 32   | DIM_CONSTEXPR: eliminate dim mask   | 57.2     | 104.9    | 203.0     | 398.5     | 586.2     | marginal; mask cmp eliminated   |
 
 ## Key findings
 

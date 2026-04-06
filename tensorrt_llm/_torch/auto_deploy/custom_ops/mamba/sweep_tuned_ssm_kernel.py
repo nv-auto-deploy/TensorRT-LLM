@@ -240,6 +240,7 @@ def bench_kernel(
             DT_CLAMP_MIN=DT_CLAMP_MIN,
             DT_CLAMP_MAX=DT_CLAMP_MAX,
             DSTATE_CONSTEXPR=DSTATE,
+            DIM_CONSTEXPR=DIM,
             num_warps=warps,
             num_stages=stages,
         )
