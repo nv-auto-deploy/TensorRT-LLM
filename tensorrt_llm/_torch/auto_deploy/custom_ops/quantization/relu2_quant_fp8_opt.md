@@ -239,7 +239,10 @@ ______________________________________________________________________
 
 **iter 37 (scale_first):** Loading scale before x allows scale reciprocal to be computed while x is in-flight. P1K: 9.76µs — slightly worse. The scale load is likely not on the critical path. Discarded.
 
-**iter 38 (inv_scale_kernel):** Compute `inv_scale = 1.0/scale` inside kernel to replace per-element division with multiply. P1K: 9.78µs — slightly worse. The vector division is likely fused well by the compiler; extra scalar division overhead adds latency. Discarded.
+**iter 38 (inv_scale_kernel):** Compute `inv_scale = 1.0/scale` inside kernel to replace per-element
+vector division with vector multiply. The idea: scalar recip (1 instruction) + N multiplies vs
+N divisions. P1K: 9.78µs — slightly worse. The Triton compiler likely already handles this
+optimization; adding explicit scalar recip adds scheduling overhead. Discarded.
 
 **iter 39 (tl_fdiv):** tl.fdiv is identical to / at PTX level — no difference expected. P1K: 9.80µs. Discarded.
 
