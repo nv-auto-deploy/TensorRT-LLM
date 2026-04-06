@@ -225,6 +225,18 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 29 — num_stages=4 (DISCARDED)
+
+**Config:** BLOCK=4096, W=8, stages=4 — P1K=9.84µs vs stages=2: 9.61µs. Worse. Too much register pressure and memory overhead with 4 stages for this elementwise kernel. Reverted to stages=2.
+
+______________________________________________________________________
+
+### Iteration 28 — num_stages=3 (DISCARDED)
+
+**Config:** BLOCK=4096, W=8, stages=3 — P1K=9.86µs vs stages=2: 9.61µs. Worse. Diminishing returns beyond stages=2; memory-bound kernel with simple 1-load-1-store pattern. Reverted to stages=2.
+
+______________________________________________________________________
+
 ### Iteration 27 — num_stages=2 (APPLIED — best in stages sweep)
 
 **Sweep:** stages ∈ {1, 2, 3, 4} at BLOCK=4096, W=8. Results:
