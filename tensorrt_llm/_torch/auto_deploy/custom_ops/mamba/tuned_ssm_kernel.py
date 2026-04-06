@@ -109,8 +109,10 @@ def _tuned_ssm_update_kernel(
     dt_ptr += pid_b * stride_dt_batch + pid_h * stride_dt_head
     dt_bias_ptr += pid_h * stride_dt_bias_head
     A_ptr += pid_h * stride_A_head
-    B_ptr += pid_b * stride_B_batch + (pid_h // NHEADS_NGROUPS_RATIO) * stride_B_group
-    C_ptr += pid_b * stride_C_batch + (pid_h // NHEADS_NGROUPS_RATIO) * stride_C_group
+    # Group index: pid_h // NHEADS_NGROUPS_RATIO (compile-time division when ratio is power-of-2)
+    group_id = pid_h // NHEADS_NGROUPS_RATIO
+    B_ptr += pid_b * stride_B_batch + group_id * stride_B_group
+    C_ptr += pid_b * stride_C_batch + group_id * stride_C_group
     D_ptr += pid_h * stride_D_head
     out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
 
