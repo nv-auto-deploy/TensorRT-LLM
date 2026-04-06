@@ -683,28 +683,42 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-## Final Best Configuration
+## Final Best Configuration (Iter 50 — Campaign Complete)
+
+### Iteration 50 — Final doc and config confirmation
+
+**Final config applied to production kernel:**
 
 ```python
 BLOCK = 4096
 num_warps = 8
 num_stages = 2
-# relu in bf16 space, tl.clamp for quantize (v5_combined)
+# relu in bf16 space (tl.maximum on bf16 input, then upcast to fp32)
+# tl.clamp for FP8 quantize (single PTX instruction vs max/min nesting)
 ```
 
-| ID | Original (µs) | After iter 9 (µs) | After iter 27 (µs) | Total delta |
-|---|---|---|---|---|
-| D1 (c=1) | 5.33 | 5.27 | 5.24 | **−1.7%** |
-| D4 (c=4) | 5.31 | 5.20 | ~5.3 | noise |
-| D16 (c=16) | 5.44 | 5.57 | ~5.5 | noise |
-| P1K | 10.18 | 9.75 | **9.61** | **−5.6%** |
+**50-iteration performance summary:**
+
+| ID | Original (µs) | Final (µs) | Total delta |
+|---|---|---|---|
+| D1 (c=1) | 5.33 | ~5.3 | noise |
+| D4 (c=4) | 5.31 | ~5.4 | noise |
+| D16 (c=16) | 5.44 | ~5.5 | noise |
+| P1K | 10.18 | **~9.58** | **−5.9%** |
+
+**Key optimizations applied (cumulative):**
+
+1. **iter 3:** BLOCK 512→1024 (−1.1% P1K)
+1. **iter 8/9:** bf16 relu + tl.clamp structural changes (−4.2% P1K cumulative)
+1. **iters 19/26:** BLOCK 1024→2048→4096, W=4→8 (−2.4% P1K further)
+1. **iter 27:** num_stages=2 (−0.2% P1K)
+
+**39 discarded experiments included:** smaller/larger BLOCK sizes, num_warps variants,
+num_stages 3/4, eviction hints, relu alternatives, scale variants, grid strategies, launcher opts.
 
 **Conclusion:** The kernel is fundamentally launch-overhead-limited for decode sizes
-(D1–D16). At these sizes (3712–59392 elements), the memory transfer is \< 0.1 µs;
-all measured improvements of 0.1–0.3 µs are at the noise floor.
-
-For prefill (P1K), BLOCK=1024 + v5_combined saves ~4% vs original baseline.
-**This kernel is not a TPOT bottleneck at c=1,4,16.**
+(D1–D16, n=3712–59392 elements). The noise floor is ±0.15 µs (~1.6% at P1K). For prefill
+(P1K), the cumulative 5.9% improvement is sustained. **Not a TPOT bottleneck at c=1,4,16.**
 
 ______________________________________________________________________
 
