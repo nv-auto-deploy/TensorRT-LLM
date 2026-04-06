@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 25 — BLOCK=2048, num_warps=16 (DISCARDED)
+
+**Config:** BLOCK=2048, num_warps=16
+
+| ID | div (µs) | vs best (W=8) | Verdict |
+|---|---|---|---|
+| D1 | 5.28 | -0.05 | noise |
+| D4 | 5.18 | -0.23 | slight improvement |
+| D16 | 5.36 | -0.26 | slight improvement |
+| P1K | 10.07 | +0.47 | ❌ worse |
+
+**Analysis:** W=16 improves decode but hurts P1K significantly (10.07 vs 9.60µs). W=8 remains best overall. Reverted.
+
+______________________________________________________________________
+
 ### Iteration 24 — BLOCK=2048, num_warps=8 (APPLIED — new best P1K)
 
 **Config:** BLOCK=2048, num_warps=8
