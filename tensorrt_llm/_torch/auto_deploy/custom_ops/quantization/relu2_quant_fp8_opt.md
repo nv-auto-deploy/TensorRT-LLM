@@ -244,7 +244,9 @@ vector division with vector multiply. The idea: scalar recip (1 instruction) + N
 N divisions. P1K: 9.78µs — slightly worse. The Triton compiler likely already handles this
 optimization; adding explicit scalar recip adds scheduling overhead. Discarded.
 
-**iter 39 (tl_fdiv):** tl.fdiv is identical to / at PTX level — no difference expected. P1K: 9.80µs. Discarded.
+**iter 39 (tl_fdiv):** tl.fdiv is identical to / at PTX level for IEEE-754 floats — no difference
+expected. P1K: 9.80µs. The Triton compiler generates the same PTX either way for float32 division.
+Discarded.
 
 **iter 40 (square_then_max):** Reordering: `x^2 * (x>0)`. P1K: 9.59µs — essentially tied with 9.61µs, within noise. The reordering avoids the bf16→fp32→relu→fp32 sequence but requires a fp32 comparison. No clear winner.
 
