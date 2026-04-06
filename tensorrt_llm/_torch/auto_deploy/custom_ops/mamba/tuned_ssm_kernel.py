@@ -20,7 +20,8 @@ Fires when num_decode > 32 (tuned_backend_mamba dispatch threshold).
 
 Key optimizations over stock selective_state_update:
 - BLOCK_SIZE_M=32 (vs 4): reduces grid by 8x, improves SM scheduler efficiency
-- dt_clamp=[0.001, 0.1]: correctness fix, matches mamba2 time_step_limit
+- dt_clamp: optional, passed from model's time_step_limit (default: no clamping,
+  matching flashinfer.mamba.selective_state_update decode behavior)
 - DSTATE_CONSTEXPR: compile-time loop bound enables full unrolling (+3-5%)
 - DIM_CONSTEXPR/NHEADS_NGROUPS_RATIO: compile-time mask/div optimization
 - Dstate loop structure: handles any BLOCK_SIZE_DSTATE correctly
@@ -214,10 +215,6 @@ def _tuned_ssm_update_kernel(
     tl.store(out_ptr + offs_m * stride_out_dim, out_acc, mask=mask_m)
 
 
-DT_CLAMP_MIN = 0.001
-DT_CLAMP_MAX = 0.1
-
-
 def tuned_selective_state_update(
     state,
     x,
@@ -231,8 +228,8 @@ def tuned_selective_state_update(
     state_batch_indices=None,
     pad_slot_id=PAD_SLOT_ID,
     out=None,
-    dt_clamp_min=DT_CLAMP_MIN,
-    dt_clamp_max=DT_CLAMP_MAX,
+    dt_clamp_min=None,
+    dt_clamp_max=None,
 ):
     """Drop-in replacement for flashinfer.mamba.selective_state_update.
 
@@ -240,7 +237,8 @@ def tuned_selective_state_update(
     Key changes vs stock kernel:
     - BLOCK_SIZE_M=32: reduces grid 8x vs stock (vs 4x in original tuned version)
     - DSTATE_CONSTEXPR + DIM_CONSTEXPR + NHEADS_NGROUPS_RATIO: compile-time opts
-    - dt_clamp=[0.001, 0.1]: correctness fix (iter 1)
+    - dt_clamp: optional, defaults to None (no clamping, matches flashinfer behavior).
+      Pass time_step_limit from model config if clamping is desired.
     - num_stages=1: optimal for this memory-bound kernel
     Performance (H100): B33=56.9us B64=104.5us B128=202us B256=386us B384=577us
     """
@@ -300,6 +298,11 @@ def tuned_selective_state_update(
 
     has_sbi = state_batch_indices is not None
 
+    # dt clamping: default None = no clamping, matching flashinfer.selective_state_update.
+    # Pass extreme values so tl.clamp(dt, -inf, inf) is a no-op when not clamping.
+    _dt_clamp_min = float("-inf") if dt_clamp_min is None else float(dt_clamp_min)
+    _dt_clamp_max = float("inf") if dt_clamp_max is None else float(dt_clamp_max)
+
     def grid(META):
         return (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
 
@@ -356,8 +359,8 @@ def tuned_selective_state_update(
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_DSTATE=BLOCK_SIZE_DSTATE,
             HAS_STATE_BATCH_INDICES=has_sbi,
-            DT_CLAMP_MIN=dt_clamp_min,
-            DT_CLAMP_MAX=dt_clamp_max,
+            DT_CLAMP_MIN=_dt_clamp_min,
+            DT_CLAMP_MAX=_dt_clamp_max,
             DSTATE_CONSTEXPR=dstate,
             DIM_CONSTEXPR=dim,
             NHEADS_NGROUPS_RATIO=nheads // ngroups,

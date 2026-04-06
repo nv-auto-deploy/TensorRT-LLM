@@ -164,7 +164,7 @@ def _tuned_cached_ssm(
         else:
             # Large batch: tuned Triton kernel is faster (better throughput at batch>=33)
             # Kernel params: BLOCK_SIZE_M=32, BLOCK_SIZE_DSTATE=128, num_warps=4, num_stages=1
-            # dt_clamp=[0.001, 0.1] applied automatically (correctness fix)
+            # Pass time_step_limit from model config (None = no clamping, matches flashinfer)
             tuned_selective_state_update(
                 ssm_state_cache,
                 x_decode,
@@ -177,6 +177,8 @@ def _tuned_cached_ssm(
                 dt_softplus=True,
                 state_batch_indices=slot_idx_decode_i32,
                 out=preallocated_ssm_out_d,
+                dt_clamp_min=time_step_limit[0] if time_step_limit else None,
+                dt_clamp_max=time_step_limit[1] if time_step_limit else None,
             )
 
     if num_total_tokens > 0:

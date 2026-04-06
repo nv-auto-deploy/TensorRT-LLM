@@ -144,6 +144,8 @@ def _flashinfer_cached_ssm(
                 dt_softplus=True,
                 state_batch_indices=slot_idx_decode_i32,
                 out=y,
+                dt_clamp_min=time_step_limit[0] if time_step_limit else None,
+                dt_clamp_max=time_step_limit[1] if time_step_limit else None,
             )
 
         if out is not None:
@@ -255,6 +257,8 @@ def _flashinfer_cached_ssm(
                 dt_softplus=True,
                 state_batch_indices=slot_idx_decode_i32,
                 out=preallocated_ssm_out_d,
+                dt_clamp_min=time_step_limit[0] if time_step_limit else None,
+                dt_clamp_max=time_step_limit[1] if time_step_limit else None,
             )
 
     if out is not None:
