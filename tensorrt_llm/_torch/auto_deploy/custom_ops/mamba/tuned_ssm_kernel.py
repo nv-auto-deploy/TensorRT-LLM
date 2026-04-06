@@ -81,6 +81,7 @@ def _tuned_ssm_update_kernel(
     HAS_STATE_BATCH_INDICES: tl.constexpr,
     DT_CLAMP_MIN: tl.constexpr,
     DT_CLAMP_MAX: tl.constexpr,
+    DSTATE_CONSTEXPR: tl.constexpr,  # compile-time dstate for loop unrolling
 ):
     """Optimized SSM state update for decode (T=1).
 
@@ -140,9 +141,10 @@ def _tuned_ssm_update_kernel(
     dt_x_col = (dt * x)[:, None]  # [BLOCK_SIZE_M, 1]
 
     # Accumulate output over dstate in BLOCK_SIZE_DSTATE chunks
+    # Use DSTATE_CONSTEXPR for compile-time loop unrolling
     out_acc = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
 
-    for dstate_start in range(0, dstate, BLOCK_SIZE_DSTATE):
+    for dstate_start in range(0, DSTATE_CONSTEXPR, BLOCK_SIZE_DSTATE):
         offs_n = dstate_start + tl.arange(0, BLOCK_SIZE_DSTATE)
         mask = mask_m[:, None] & (offs_n[None, :] < dstate)
 
@@ -325,5 +327,6 @@ def tuned_selective_state_update(
             HAS_STATE_BATCH_INDICES=has_sbi,
             DT_CLAMP_MIN=dt_clamp_min,
             DT_CLAMP_MAX=dt_clamp_max,
+            DSTATE_CONSTEXPR=dstate,
             num_warps=num_warps,
         )

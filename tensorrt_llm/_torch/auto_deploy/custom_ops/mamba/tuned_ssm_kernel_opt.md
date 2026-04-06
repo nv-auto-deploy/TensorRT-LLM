@@ -53,6 +53,7 @@ Grid: \[dim/BLOCK_SIZE_M, batch, nheads\]
 | 28   | early state\*dA + FMA reorder (REV)  | 62.2     | 113.7    | 220.5     | 432.1     | 646.0     | WORSE: extra temp adds reg press|
 | 29   | fast_expf vs exp2 (reverted)        | 59.7     | 108.7    | 210.6     | 410.1     | 609.5     | same as exp2; kernel mem-bound  |
 | 30   | .cg cache modifier for loads (REV)  | 59.8     | 108.5    | 211.0     | 410.9     | 611.1     | no benefit; .cg unhelpful here  |
+| 31   | DSTATE_CONSTEXPR: compile-time loop | 57.3     | 105.1    | 203.2     | 398.7     | 586.3     | **+3-5% WIN** loop unrolled!    |
 
 ## Key findings
 

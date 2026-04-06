@@ -239,6 +239,7 @@ def bench_kernel(
             HAS_STATE_BATCH_INDICES=False,
             DT_CLAMP_MIN=DT_CLAMP_MIN,
             DT_CLAMP_MAX=DT_CLAMP_MAX,
+            DSTATE_CONSTEXPR=DSTATE,
             num_warps=warps,
             num_stages=stages,
         )
