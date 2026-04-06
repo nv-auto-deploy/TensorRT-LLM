@@ -231,8 +231,9 @@ ______________________________________________________________________
 
 Five consecutive P1K measurements: 9.54, 9.78, 9.43, 9.61, 9.54 µs → mean≈9.58µs, σ≈0.13µs
 
-**Conclusion:** The measurement noise floor at P1K is ±0.15µs (~1.6%). All differences \<0.2µs
-are within noise and not actionable. The optimization loop has converged.
+**Conclusion:** The measurement noise floor at P1K is ±0.15 µs (~1.6%). All differences \< 0.2 µs
+are within noise and not actionable. The optimization loop has converged at BLOCK=4096, W=8,
+stages=2 as the global optimum for this shape and GPU.
 
 ______________________________________________________________________
 
