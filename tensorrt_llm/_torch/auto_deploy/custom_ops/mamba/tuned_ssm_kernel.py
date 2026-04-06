@@ -167,10 +167,13 @@ def _tuned_ssm_update_kernel(
         mask = mask_m[:, None] & (offs_n[None, :] < dstate)
 
         # Load state [BLOCK_SIZE_M, BLOCK_SIZE_DSTATE]
+        # evict_last: hint L2 to retain state (read+written each iter, most reused)
         state_ptrs = state_ptr + (
             offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
         )
-        state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
+        state = tl.load(state_ptrs, mask=mask, other=0.0, eviction_policy="evict_last").to(
+            tl.float32
+        )
 
         # Load A [BLOCK_SIZE_M, BLOCK_SIZE_DSTATE]
         A_ptrs = A_ptr + offs_m[:, None] * stride_A_dim + offs_n[None, :] * stride_A_dstate
