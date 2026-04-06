@@ -225,6 +225,21 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 27 — num_stages=2 (APPLIED — best in stages sweep)
+
+**Sweep:** stages ∈ {1, 2, 3, 4} at BLOCK=4096, W=8. Results:
+
+| stages | D1 (µs) | P1K (µs) |
+|---|---|---|
+| 1 | 5.43 | 9.78 |
+| **2** | **5.24** | **9.61** |
+| 3 | 5.25 | 9.86 |
+| 4 | 5.25 | 9.84 |
+
+**Analysis:** stages=2 is best for both D1 and P1K. Allows software prefetching to overlap memory loads with compute. Stages 3/4 show diminishing returns (memory-bound kernel, pipeline depth not limiting). APPLIED.
+
+______________________________________________________________________
+
 ### Iteration 26 — BLOCK=4096, num_warps=8 (APPLIED — new best P1K)
 
 **Config:** BLOCK=4096, num_warps=8
@@ -485,15 +500,16 @@ ______________________________________________________________________
 ```python
 BLOCK = 4096
 num_warps = 8
+num_stages = 2
 # relu in bf16 space, tl.clamp for quantize (v5_combined)
 ```
 
-| ID | Original (µs) | After iter 9 (µs) | After iter 26 (µs) | Total delta |
+| ID | Original (µs) | After iter 9 (µs) | After iter 27 (µs) | Total delta |
 |---|---|---|---|---|
-| D1 (c=1) | 5.33 | 5.27 | 5.41 | +1.5% (noise) |
-| D4 (c=4) | 5.31 | 5.20 | 5.30 | -0.2% (noise) |
-| D16 (c=16) | 5.44 | 5.57 | 5.48 | +0.7% (noise) |
-| P1K | 10.18 | 9.75 | **9.43** | **−7.4%** |
+| D1 (c=1) | 5.33 | 5.27 | 5.24 | **−1.7%** |
+| D4 (c=4) | 5.31 | 5.20 | ~5.3 | noise |
+| D16 (c=16) | 5.44 | 5.57 | ~5.5 | noise |
+| P1K | 10.18 | 9.75 | **9.61** | **−5.6%** |
 
 **Conclusion:** The kernel is fundamentally launch-overhead-limited for decode sizes
 (D1–D16). At these sizes (3712–59392 elements), the memory transfer is \< 0.1 µs;
