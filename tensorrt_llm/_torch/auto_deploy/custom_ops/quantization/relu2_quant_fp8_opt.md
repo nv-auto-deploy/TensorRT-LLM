@@ -237,7 +237,10 @@ ______________________________________________________________________
 
 **iter 42 (stride_loop_x2):** Each program processes tile pid and tile pid+N (stride by grid size). Halves grid size. P1K: 9.74µs — slightly worse. The overhead of the secondary tile load+store breaks the pipeline. Discarded.
 
-**iter 43 (two_tiles_per_program):** Each program handles tiles 2*pid and 2*pid+1 (contiguous). P1K: 9.94µs — worse. Contiguous access should amortize launch cost but the extra work per SM increases latency. Discarded.
+**iter 43 (two_tiles_per_program):** Each program handles tiles 2*pid and 2*pid+1 (contiguous).
+P1K: 9.94µs — worse. Each SM does twice the work; while grid launch cost is halved, the serial
+execution of 2 tiles increases SM latency. At P1K, we have 928 tiles for 132 SMs — already ~7 waves,
+not launch-overhead-dominated. Discarded.
 
 **iter 44 (persistent):** Grid=132 SMs (H100 SM count), each SM loops over its tiles. P1K: 11.90µs — much worse. The loop-based dispatch adds significant overhead and reduces SM utilization efficiency for this workload. Discarded.
 
