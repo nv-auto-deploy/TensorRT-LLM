@@ -183,6 +183,34 @@ Best config so far: `num_warps=8, BLOCK_DIM=64, BLOCK_DSTATE=128`
 
 ______________________________________________________________________
 
+### Iter 4: num_warps=8 in launcher + tl.static_range attempted (reverted)
+
+**Change 1:** Updated `fused_conv_ssm_decode` launcher to use `num_warps=8` (was 4).
+**Result:** B=384: 608us → +3.6% vs baseline 631us. KEPT.
+
+**Change 2:** Replaced `range(...)` with `tl.static_range(...)` in all conv loops.
+**Result:** CATASTROPHIC REGRESSION — B=384: 608us → 966us (1.59x SLOWER).
+**Reason:** `tl.static_range` forces full loop unrolling. With 3 kernel loads per loop × 3 loop bodies unrolled, register pressure explodes. The H100 scheduler can no longer overlap memory latency with compute. REVERTED.
+
+**Lesson:** Triton's `range(kernel_width-1)` with `kernel_width: tl.constexpr` already unrolls optimally. Forcing extra unrolling via `tl.static_range` is counterproductive for memory-bound kernels with many active tensors.
+
+Final state of iter 4 (num_warps=8, range reverted):
+
+| batch | kernel_us | e2e_us | kernel_pct |
+|-------|-----------|--------|------------|
+|     1 |      9.22 |   9.24 |      99.8% |
+|     2 |     10.15 |  10.15 |     100.0% |
+|     4 |     12.73 |  12.98 |      98.0% |
+|     8 |     19.47 |  19.47 |     100.0% |
+|    16 |     32.44 |  32.17 |     100.8% |
+|    32 |     57.84 |  57.86 |     100.0% |
+|    64 |    106.68 | 106.93 |      99.8% |
+|   128 |    206.14 | 206.25 |      99.9% |
+|   256 |    406.85 | 407.15 |      99.9% |
+|   384 |    608.28 | 608.15 |     100.0% |
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access

@@ -112,7 +112,7 @@ def _fused_conv_ssm_kernel(
 
     conv_out_hidden = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
 
-    # Simple depthwise conv1d for kernel_width=4 (unrolled)
+    # Simple depthwise conv1d for kernel_width=4
     # Use conv_slot instead of pid_b for cache access
     for k in range(kernel_width - 1):  # k=0,1,2
         state_val = tl.load(
@@ -378,7 +378,7 @@ def fused_conv_ssm_decode(
 
     BLOCK_DIM = max(triton.next_power_of_2(dim), 16)
     BLOCK_DSTATE = triton.next_power_of_2(dstate)
-    num_warps = 4
+    num_warps = 8
 
     def grid(META):
         return (triton.cdiv(dim, META["BLOCK_DIM"]), batch, nheads)
