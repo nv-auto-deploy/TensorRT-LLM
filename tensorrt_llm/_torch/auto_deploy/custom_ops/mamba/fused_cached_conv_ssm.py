@@ -167,6 +167,8 @@ def _fused_cached_conv_ssm(
         conv_in_dec = inp_flat[num_prefill_tokens:num_total_tokens]  # [nd, conv_dim]
         dt_dec = dt_flat[num_prefill_tokens:num_total_tokens]  # [nd, nheads]
         slot_idx_dec = slot_idx[num_prefill:num_seq]
+        dt_clamp_min = float(time_step_limit[0]) if time_step_limit else 0.0
+        dt_clamp_max = float(time_step_limit[1]) if time_step_limit else float("inf")
 
         fused_conv_ssm_decode(
             conv_in_dec,
@@ -181,6 +183,8 @@ def _fused_cached_conv_ssm(
             slot_idx_dec,
             slot_idx_dec,
             ssm_out_flat[num_prefill_tokens:num_total_tokens],
+            dt_clamp_min=dt_clamp_min,
+            dt_clamp_max=dt_clamp_max,
         )
 
     if num_total_tokens > 0:

@@ -41,7 +41,7 @@ Grid: `(1, batch, 64)` → `batch × 64` thread blocks
 
 | # | Item | Type | Expected Impact | Effort |
 |---|------|------|-----------------|--------|
-| O1 | **`dt_clamp` missing** — `softplus(dt+dt_bias)` not clamped to `[time_step_min, time_step_max]`. 94% of real dt values exceed max=0.1, causing wrong SSM states. Add `DT_CLAMP_MIN/MAX: tl.constexpr` + `tl.minimum/maximum` after softplus. | **Correctness fix** | Critical | Low |
+| O1 | ~~**`dt_clamp` missing**~~ — **FIXED**: `dt_val = tl.minimum(tl.maximum(softplus(dt+dt_bias), dt_clamp_min), dt_clamp_max)`. `dt_clamp_min/max` passed as float args from `time_step_limit`. 94% of dt values exceed max=0.1 — clamping was critical for correct SSM states. | ~~Correctness fix~~ **Done** | ~~Critical~~ | ~~Low~~ |
 | O2 | **`num_warps` heuristic** — hardcoded to 4. SSM state load is \[64×128\]=32KB per block. With 4 warps (128 threads) each thread handles 64 fp32 elements; 8 warps doubles thread count, enables 128-byte coalesced LDG.128. Use `num_warps=8` for `batch>=32`. Previously measured +7% at batch=256. | Perf | +5–10% at batch≥32 | Low |
 | O3 | **B/C conv computed 8× redundantly per group** — `nheads_per_group=8` heads all compute identical B/C conv output (same group, same conv state). Lines 193–235 run 8× but produce the same values. Only the first head writes back state (line 243). Fix: compute B/C once per group via shared memory, broadcast to remaining 7 heads. | Perf | +10–15% (saves 7/8 of B/C conv) | Medium |
 | O4 | **`num_stages` not set** — SSM state load (32KB, HBM-bound) has high latency. Triton `num_stages=3` or `4` can overlap loads with compute. Currently default (2). | Perf | +3–7% | Low |
@@ -75,7 +75,7 @@ num_warps = 4  (hardcoded for all batch sizes)
 
 | # | Item | Type | Expected Impact | Effort |
 |---|------|------|-----------------|--------|
-| O1 | **`dt_clamp` missing** — same issue as fused_mamba_decode. No `time_step_limit` clamp after softplus. | **Correctness fix** | Critical | Low |
+| O1 | ~~**`dt_clamp` missing**~~ — this kernel is superseded by `fused_mamba_decode` for the fused path. The unfused `tuned_selective_state_update` (used as fallback) already clamps dt via its `dt_clamp_min/max` args. No fix needed here. | ~~Correctness fix~~ N/A | — | — |
 | O2 | **`num_warps` not swept for batch>32** — hardcoded to 4 regardless of batch. For batch≥64, try num_warps=8. | Perf | +5% at batch≥64 | Low |
 | O3 | **This kernel is on the hot path only when `fuse_conv_ssm` is disabled** — with fuse_conv_ssm enabled, this kernel is bypassed for decode. Lower priority. | Structural | — | — |
 

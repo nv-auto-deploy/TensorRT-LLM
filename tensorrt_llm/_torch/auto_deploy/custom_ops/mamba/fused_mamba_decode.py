@@ -327,6 +327,9 @@ def _fused_conv_ssm_kernel(
     stride_so_b,
     stride_so_h,
     stride_so_d,
+    # dt clamping (applied after softplus; use 0.0 / inf for no-op)
+    dt_clamp_min,
+    dt_clamp_max,
     # Meta
     BLOCK_DIM: tl.constexpr,  # tiles over head_dim for SSM
     BLOCK_DSTATE: tl.constexpr,
@@ -373,6 +376,7 @@ def _fused_conv_ssm_kernel(
     dt_val = tl.load(dt_ptr + pid_b * nheads + pid_h).to(tl.float32)
     dt_bias_val = tl.load(dt_bias_ptr + pid_h).to(tl.float32)
     dt_val = softplus(dt_val + dt_bias_val)
+    dt_val = tl.minimum(tl.maximum(dt_val, dt_clamp_min), dt_clamp_max)
 
     A_val = tl.load(A_ptr + pid_h).to(tl.float32)
     dA = tl.exp(A_val * dt_val)
@@ -1731,6 +1735,8 @@ def fused_conv_ssm_decode(
     conv_slot_idx: torch.Tensor,
     ssm_slot_idx: torch.Tensor,
     out: torch.Tensor,
+    dt_clamp_min: float = 0.0,
+    dt_clamp_max: float = float("inf"),
 ) -> None:
     """Launch _fused_conv_ssm_kernel for decode (T=1) tokens.
 
@@ -1804,6 +1810,8 @@ def fused_conv_ssm_decode(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        dt_clamp_min,
+        dt_clamp_max,
         BLOCK_DIM=BLOCK_DIM,
         BLOCK_DSTATE=BLOCK_DSTATE,
         num_warps=num_warps,
