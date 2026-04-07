@@ -543,6 +543,37 @@ Correctness: PASS (batch=1, batch=2).
 
 ______________________________________________________________________
 
+### Iter 15: evict_first on SSM state prefetch — WORSE (tested and rejected)
+
+Hypothesis: since the SSM state is the largest working set (16KB per CTA, total >>L2),
+using `evict_first` on the prefetch load could free L2 space for conv weights and inputs
+once the state data has been consumed. The GPU would treat it as a streaming access.
+
+Tested by changing `eviction_policy="evict_last"` → `eviction_policy="evict_first"` on the
+`state_prefetch = tl.load(state_ptrs, ...)` call only.
+
+Results:
+
+| batch | evict_last (us) | evict_first (us) | delta |
+|-------|-----------------|------------------|-------|
+|     1 |            7.19 |             7.45 | +3.6% |
+|     8 |           11.16 |            12.32 | +10.4% |
+|    64 |           57.81 |            57.42 | -0.7% |
+|   384 |          301.57 |           304.39 | +0.9% |
+
+**Conclusion:** `evict_first` is WORSE at the critical batch sizes (B=1, B=8, B=384).
+At B=384, 304 vs 301us = +0.9% regression.
+
+Analysis: The prefetch is a 16KB state tile that the warp will consume immediately
+in the SSM update step. Using `evict_first` tells the hardware this data can be
+evicted as soon as possible — which conflicts with the prefetch intent (we WANT the
+data to stay in cache until consumed). `evict_last` is the correct choice: it keeps
+the recently-fetched state in L2 long enough for the SSM computation to consume it.
+
+No code change. `evict_last` on SSM state prefetch remains the production setting.
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
