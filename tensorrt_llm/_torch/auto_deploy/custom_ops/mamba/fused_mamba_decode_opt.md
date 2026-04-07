@@ -660,6 +660,39 @@ No code change.
 
 ______________________________________________________________________
 
+### Iter 19: evict_first on SSM state STORE — significantly WORSE
+
+After computing the new SSM state, it is stored back to HBM.
+Hypothesis: since the updated state won't be re-read until the next decode step,
+`evict_first` on the store would avoid filling cache with written-once data,
+freeing L2 for conv weights and SSM state reads.
+
+Tested: `eviction_policy="evict_first"` only on the SSM state store:
+`tl.store(state_ptrs, state.to(...), mask=mask_dn, eviction_policy="evict_first")`.
+
+| batch | current (us) | ssm_store_evict_first (us) | delta |
+|-------|--------------|----------------------------|-------|
+|     1 |         7.29 |                       7.70 | +5.6% |
+|     8 |        11.28 |                      10.84 | -3.9% |
+|    64 |        57.96 |                      59.69 | +3.0% |
+|   128 |       106.10 |                     111.09 | +4.7% |
+|   256 |       203.53 |                     214.97 | +5.6% |
+|   384 |       301.91 |                     319.50 | +5.8% |
+
+**Conclusion:** SIGNIFICANTLY WORSE at large batch — +5.8% regression at B=384.
+
+Analysis: The SSM state has HIGH temporal locality across consecutive decode steps:
+each sequence's slot is accessed at every decode step. After writing the updated state,
+the GPU holds the written data in L2 (write-back), and the NEXT decode step reads the
+same slot — getting an L2 hit instead of an HBM fetch. `evict_first` on the store
+immediately evicts this data, making the next step incur a full HBM re-fetch.
+
+The "streaming write" assumption is incorrect for SSM state. The data is hot across
+decode steps and should remain in L2 as long as possible.
+No code change.
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
