@@ -884,6 +884,45 @@ No code change.
 
 ______________________________________________________________________
 
+### Iter 25: num_stages=2 on conv loops and B/C cost characterization
+
+**25a: num_stages=2 in tl.range for conv loops**
+
+Added `num_stages=2` to `for k in range(kernel_width-1)` loops in hidden channel and B/C
+conv sections, enabling software pipelining (prefetch next iteration while computing current).
+
+| batch | baseline (us) | num_stages=2 (us) | delta |
+|-------|---------------|-------------------|-------|
+|     1 |          7.21 |              7.39 |  +2.5% |
+|     2 |          7.79 |              7.84 |  +0.7% |
+|     4 |          8.70 |              8.66 |  -0.5% |
+|     8 |         10.91 |             11.15 |  +2.2% |
+|    64 |         57.65 |             57.27 |  -0.7% |
+|   384 |        301.09 |            301.50 |  +0.1% |
+
+**No improvement.** With only 3 loop iterations (kernel_width-1=3), pipelining overhead
+exceeds latency hiding benefit. No code change.
+
+**25b: B/C computation cost quantification**
+
+Zeroed B/C values to measure B/C section cost:
+
+| batch | e2e (us) | no_bc (us) | B/C cost | B/C % |
+|-------|----------|-------------|----------|-------|
+|     1 |     7.43 |        6.83 |    +0.60 |    8% |
+|     4 |     8.96 |        7.77 |    +1.19 |   13% |
+|     8 |    11.18 |        9.82 |    +1.36 |   12% |
+|    64 |    57.66 |       54.87 |    +2.80 |    5% |
+|   384 |   301.38 |      293.17 |    +8.21 |  2.7% |
+
+B/C is redundant for 7/8 of CTAs (only 8 unique groups need it). Maximum savings from
+perfect elimination: 0.5us at B=1, 7.2us at B=384. But any B/C separation requires
+an extra kernel launch (~3-5us overhead), making it net-negative. Not pursued.
+
+No code change.
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
