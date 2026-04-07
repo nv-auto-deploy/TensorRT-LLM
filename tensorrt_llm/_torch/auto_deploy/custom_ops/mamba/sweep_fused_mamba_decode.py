@@ -53,8 +53,13 @@ CONV_DIM = INTERMEDIATE_SIZE + 2 * NGROUPS * DSTATE  # 4096 + 2048 = 6144
 MAX_BATCH = 512
 
 
-def make_inputs(batch: int, dtype=torch.bfloat16, device="cuda"):
-    """Create synthetic inputs for one layer."""
+def make_inputs(batch: int, dtype=torch.bfloat16, ssm_dtype=torch.bfloat16, device="cuda"):
+    """Create synthetic inputs for one layer.
+
+    ssm_dtype: dtype for SSM state cache. In production (mamba_ssm_cache_dtype: auto),
+    this matches the model activation dtype (bfloat16 for Nano v3). Use float32 to
+    replicate the old (incorrect) benchmark behavior.
+    """
     conv_input = torch.randn(batch, CONV_DIM, dtype=dtype, device=device)
     conv_state = torch.randn(MAX_BATCH, CONV_DIM, KERNEL_WIDTH - 1, dtype=dtype, device=device)
     conv_weight = torch.randn(CONV_DIM, KERNEL_WIDTH, dtype=dtype, device=device)
@@ -64,7 +69,8 @@ def make_inputs(batch: int, dtype=torch.bfloat16, device="cuda"):
     # A should be negative for stability
     A = -torch.rand(NHEADS, dtype=torch.float32, device=device) - 0.1
     D = torch.randn(NHEADS, dtype=torch.float32, device=device)
-    ssm_state = torch.randn(MAX_BATCH, NHEADS, DIM, DSTATE, dtype=torch.float32, device=device)
+    # SSM state dtype matches production: bfloat16 with mamba_ssm_cache_dtype=auto
+    ssm_state = torch.randn(MAX_BATCH, NHEADS, DIM, DSTATE, dtype=ssm_dtype, device=device)
     slot_idx = torch.arange(batch, dtype=torch.int32, device=device)
     out = torch.zeros(batch, NHEADS, DIM, dtype=dtype, device=device)
     return (

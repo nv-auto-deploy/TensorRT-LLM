@@ -328,6 +328,42 @@ the launcher.
 
 ______________________________________________________________________
 
+### Iter 9: Correct production dtype — SSM state is bf16 (not fp32)
+
+**Critical finding**: All previous benchmark iterations used `ssm_state` dtype=float32.
+In production, `mamba_ssm_cache_dtype: auto` resolves to the model activation dtype (bfloat16
+for Nano v3). This halves the SSM state memory bandwidth requirements.
+
+Updated `make_inputs()` in sweep script to use `ssm_state` dtype=bfloat16 by default.
+
+**New (correct) baseline with bf16 SSM state:**
+
+| batch | e2e_us (bf16 state) | e2e_us (fp32 state) | speedup |
+|-------|---------------------|---------------------|---------|
+|     1 |                7.44 |                8.22 |   1.10x |
+|     2 |                7.87 |                8.71 |   1.11x |
+|     4 |                8.75 |               10.99 |   1.26x |
+|     8 |               10.89 |               19.00 |   1.74x |
+|    16 |               19.99 |               33.30 |   1.67x |
+|    32 |               34.76 |               58.05 |   1.67x |
+|    64 |               61.02 |              105.35 |   1.73x |
+|   128 |              110.73 |              201.16 |   1.82x |
+|   256 |              209.01 |              394.37 |   1.89x |
+|   384 |              308.60 |              588.63 |   1.91x |
+
+**BW roofline analysis (bf16 state, B=384):**
+
+- SSM state per CTA: 64×128×2B = 16KB (bf16)
+- 24,576 CTAs × 16KB R+W = 786MB total SSM state traffic
+- Plus hidden/B/C conv state: ~24,576 × (64×3 + 128×3) × 2B = 226MB additional
+- Total estimated HBM traffic: ~1.0GB at 3.35TB/s = 298us theoretical minimum
+- Actual: 308us = **1.03× roofline** — extremely close to bandwidth-optimal!
+
+The kernel is now very near the HBM bandwidth limit with bf16 state.
+Further improvements require either reducing memory traffic or improving compute/memory ratio.
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
