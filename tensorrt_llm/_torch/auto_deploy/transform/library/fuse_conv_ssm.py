@@ -224,12 +224,26 @@ class FuseConvSSM(BaseTransform):
                 )
 
             # Replace SSM node output with fused node output.
-            # After this, the reshape/split/conv chain feeding into ssm_node becomes
-            # dead code and will be cleaned up by eliminate_dead_code() below.
+            # After this, the reshape/split chain feeding into ssm_node becomes
+            # dead code.  Pure nodes are cleaned up by eliminate_dead_code().
+            # The conv_node is impure (mutates_args={"input"}) so DCE will NOT
+            # remove it automatically — we must erase it explicitly after DCE
+            # has eliminated all of its (now-dead) pure users.
             ssm_node.replace_all_uses_with(fused_node)
             graph.erase_node(ssm_node)
 
         graph.eliminate_dead_code()
+
+        # Explicitly erase the (impure) conv nodes whose users are now all gone.
+        # eliminate_dead_code() skips impure nodes even when they have no users,
+        # so we remove them manually here to prevent a double conv execution:
+        #   - without this, the original cuda_cached_causal_conv1d_wrapper still
+        #     runs (updating conv_state_cache and activating conv_input in-place),
+        #     and then fused_cached_conv_ssm re-runs conv on the already-activated
+        #     input → double conv state update + double SiLU → wrong outputs.
+        for conv_node, _ssm_node, _intermediate_size, _ngroups in pairs:
+            if conv_node.graph is graph and len(conv_node.users) == 0:
+                graph.erase_node(conv_node)
 
         return gm, TransformInfo(
             skipped=len(pairs) == 0,
