@@ -605,6 +605,34 @@ No code change.
 
 ______________________________________________________________________
 
+### Iter 17: evict_last on conv weight loads — no improvement
+
+Conv weights are `[CONV_DIM, KERNEL_WIDTH]` = 6144×4 = 49KB (bf16).
+Currently loaded with the default (no explicit) eviction policy.
+
+Hypothesis: `evict_last` on weight loads would encourage the H100 L2 to retain
+weights across batch elements, since all 384 batch × 64 heads × 64-dim CTAs read the
+same weight tensor.
+
+Tested by adding `eviction_policy="evict_last"` to ALL conv weight loads (hidden + B/C).
+
+| batch | current (us) | w_evict_last (us) | delta |
+|-------|--------------|-------------------|-------|
+|     1 |         7.38 |              7.58 | +2.6% |
+|     8 |        11.16 |             10.95 | -1.9% |
+|    64 |        57.81 |             58.15 | +0.6% |
+|   128 |       105.75 |            106.28 | +0.5% |
+|   256 |       203.21 |            203.68 | +0.2% |
+|   384 |       301.49 |            302.52 | +0.3% |
+
+**Conclusion:** No improvement — within noise at B=384 (302 vs 301us, +0.3%).
+The H100 L2 (50MB) already retains the 49KB weight tensor naturally without explicit hints.
+The weight-to-L2 ratio is 49KB / 50MB ≈ 0.1% — weights always fit in L2.
+Explicit evict_last hints add instruction overhead without cache benefit.
+No code change.
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
