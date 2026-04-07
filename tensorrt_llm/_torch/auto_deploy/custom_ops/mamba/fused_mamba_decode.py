@@ -518,12 +518,40 @@ def _fused_conv_ssm_kernel(
     c_bias = tl.load(conv_bias_ptr + C_channels, mask=mask_bc, other=0.0).to(tl.float32)
     C_vals += c_in * c_w_last + c_bias
 
-    # Update conv state for B and C channels (shift left, append new input).
-    # Only the first head in each group (pid_h % nheads_per_group == 0) performs the
-    # write to avoid write-write races: multiple heads in the same group share the
-    # same B/C channels, so concurrent state-shift stores from all group heads corrupt
-    # the state (a later head's shift-read at position k+1 sees the new x_in already
-    # stored there by an earlier head, propagating x_in into the wrong slot).
+    # Apply SiLU to B and C
+    B_vals = B_vals * (1.0 / (1.0 + tl.exp(-B_vals)))
+    C_vals = C_vals * (1.0 / (1.0 + tl.exp(-C_vals)))
+
+    # ---------------------------------------------------------------
+    # Step 3: SSM state update
+    # state = state * exp(A * dt) + x * dt * B
+    # out = sum(state * C) + x * D
+    # dt, A, D, dA were pre-computed at the top of the kernel.
+    # ---------------------------------------------------------------
+    # Use the prefetched SSM state (issued before conv computation)
+    state = state_prefetch.to(tl.float32)
+
+    # State update
+    dB = B_vals[None, :] * dt_val  # [1, BLOCK_DSTATE]
+    state = state * dA + dB * x_hidden[:, None]
+
+    # Output: sum(state * C) + x * D
+    out = tl.sum(state * C_vals[None, :], axis=1)
+    out += x_hidden * D_val
+
+    # Store output and SSM state
+    tl.store(
+        ssm_out_ptr + pid_b * stride_so_b + pid_h * stride_so_h + offs_d * stride_so_d,
+        out.to(tl.bfloat16),
+        mask=mask_d,
+    )
+    tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask_dn)
+
+    # Update B/C conv state AFTER SSM output stores.
+    # Moving the B/C state shift here (instead of before SiLU) allows the SSM
+    # computation and output store to execute while the B/C writes are pending in
+    # the store buffer, overlapping the B/C write latency with SSM compute.
+    # Only head-0 per group writes (race-free guard).
     if pid_h % nheads_per_group == 0:
         for k in range(kernel_width - 2):
             old_b = tl.load(
@@ -576,35 +604,6 @@ def _fused_conv_ssm_kernel(
             c_in.to(conv_state_ptr.dtype.element_ty),
             mask=mask_bc,
         )
-
-    # Apply SiLU to B and C
-    B_vals = B_vals * (1.0 / (1.0 + tl.exp(-B_vals)))
-    C_vals = C_vals * (1.0 / (1.0 + tl.exp(-C_vals)))
-
-    # ---------------------------------------------------------------
-    # Step 3: SSM state update
-    # state = state * exp(A * dt) + x * dt * B
-    # out = sum(state * C) + x * D
-    # dt, A, D, dA were pre-computed at the top of the kernel.
-    # ---------------------------------------------------------------
-    # Use the prefetched SSM state (issued before conv computation)
-    state = state_prefetch.to(tl.float32)
-
-    # State update
-    dB = B_vals[None, :] * dt_val  # [1, BLOCK_DSTATE]
-    state = state * dA + dB * x_hidden[:, None]
-
-    # Output: sum(state * C) + x * D
-    out = tl.sum(state * C_vals[None, :], axis=1)
-    out += x_hidden * D_val
-
-    # Store output and state
-    tl.store(
-        ssm_out_ptr + pid_b * stride_so_b + pid_h * stride_so_h + offs_d * stride_so_d,
-        out.to(tl.bfloat16),
-        mask=mask_d,
-    )
-    tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask_dn)
 
 
 @triton.jit()

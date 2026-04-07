@@ -505,6 +505,44 @@ Correctness: PASS (batch=1, batch=2).
 
 ______________________________________________________________________
 
+### Iter 14: Move B/C conv state writes to after SSM computation
+
+The B/C conv state shift-write (~512B) is a blocking operation for 1/8 of CTAs.
+Previously it occurred before SiLU and SSM computation (creating a sequential dependency).
+
+Reordered to: B/C conv reads → SiLU → SSM state update → output store → B/C state writes.
+
+This allows the GPU to:
+
+1. Begin SSM computation as soon as B/C conv values are computed
+1. Issue the B/C writes to the store buffer at the end, overlapping with SM pipeline drain
+1. The B/C writes are not on the critical path for the SSM output
+
+Additionally confirmed: B/C writes cost ~5us at B=384 (from `no_bc_write` test: 297us),
+while B/C reads cost ~10us. Total B/C overhead = ~11us (reads + writes are pipelined).
+
+Results:
+
+| batch | before (us) | after (us) | delta |
+|-------|-------------|------------|-------|
+|     1 |        7.53 |       7.19 |  -4.5% |
+|     2 |        7.83 |       7.82 |  -0.1% |
+|     4 |        8.41 |       8.71 |  +3.6% |
+|     8 |       10.64 |      11.16 |  +4.9% |
+|    16 |       19.03 |      19.26 |  +1.2% |
+|    32 |       33.27 |      33.16 |  -0.3% |
+|    64 |       58.16 |      57.81 |  -0.6% |
+|   128 |      106.87 |     105.76 |  -1.0% |
+|   256 |      204.91 |     203.20 |  -0.8% |
+|   384 |      303.55 |     301.57 |  -0.7% |
+
+B=384: 303us → 301us = **-0.7%**. B=64,128,256: -0.7% to -1.0%.
+Some small-batch regression (B=4,8): B/C writes moved after SSM, adding register pressure.
+
+Correctness: PASS (batch=1, batch=2).
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
