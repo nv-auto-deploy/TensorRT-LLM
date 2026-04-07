@@ -400,6 +400,38 @@ vs iter 9 baseline (num_warps=8, bf16): B=384 308us → 306us = **-0.6%** additi
 
 ______________________________________________________________________
 
+### Iter 11: Prefetch SSM state to overlap HBM latency with B/C computation
+
+The SSM state load (16KB per CTA with bf16 dtype) is the dominant memory access.
+By issuing the state load **before** the B/C conv computation, the GPU memory controller
+can begin fetching the state while the warp computes the B/C section (conv1d for B/C channels,
+state shift). This hides a portion of the 16KB state load latency.
+
+Change: moved `state_ptrs = ...` and `tl.load(state_ptrs, ...)` to the top of the kernel
+(before hidden conv computation), and replaced the later state load with `state_prefetch.to(fp32)`.
+
+Results:
+
+| batch | before (us) | after (us) | delta |
+|-------|-------------|------------|-------|
+|     1 |        7.31 |       7.21 |  -1.4% |
+|     2 |        7.54 |       7.63 |  +1.2% |
+|     4 |        8.44 |       8.45 |  +0.1% |
+|     8 |       10.43 |      10.80 |  +3.5% |
+|    16 |       19.45 |      19.50 |  +0.3% |
+|    32 |       34.28 |      34.16 |  -0.4% |
+|    64 |       59.90 |      58.99 |  -1.5% |
+|   128 |      109.19 |     107.59 |  -1.5% |
+|   256 |      207.12 |     206.13 |  -0.5% |
+|   384 |      306.48 |     304.56 |  -0.6% |
+
+B=384: 306us → 304us = **-0.6%**. B=64,128: -1.5% improvement.
+Small batch (B=8) slightly regresses — additional register pressure from holding state_prefetch.
+
+Correctness: PASS (batch=1, batch=2).
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
