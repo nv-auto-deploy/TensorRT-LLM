@@ -302,6 +302,32 @@ and stores results to a \[batch, 2, ngroups, dstate\] buffer.
 
 ______________________________________________________________________
 
+### Iter 8: Two-kernel approach (precomputed B/C) — NOT faster
+
+Added `_fused_conv_ssm_kernel_bc_buf` and `fused_conv_ssm_decode_two_kernel`:
+
+- Kernel 1 (`_bc_conv_compute_kernel`): grid `(batch, ngroups)` — computes B/C conv + state update (race-free), stores to `bc_buf[batch, 2, ngroups, dstate]`
+- Kernel 2 (`_fused_conv_ssm_kernel_bc_buf`): grid `(1, batch, 64)` — hidden-only conv + SSM reading B/C from bc_buf
+
+Benchmark vs single-kernel (e2e us):
+
+| batch | 1-kernel (us) | 2-kernel (us) | speedup |
+|-------|--------------|--------------|---------|
+|     1 |         8.07 |        10.86 |  0.743x |
+|     8 |        18.84 |        21.58 |  0.873x |
+|    64 |       105.41 |       107.12 |  0.984x |
+|   384 |       588.73 |       588.65 |  1.000x |
+
+**Conclusion:** No improvement at B=384 (kernel2 execution time is nearly the same as single kernel
+since hidden conv savings ≈ bc_buf load overhead). Small batch is worse due to extra kernel launch.
+The B/C conv section is NOT the bottleneck at large batch — the SSM state load/store dominates.
+
+The `_fused_conv_ssm_kernel_bc_buf` and `fused_conv_ssm_decode_two_kernel` are kept in the file
+for reference but are NOT the production path. The single-kernel `fused_conv_ssm_decode` remains
+the launcher.
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access

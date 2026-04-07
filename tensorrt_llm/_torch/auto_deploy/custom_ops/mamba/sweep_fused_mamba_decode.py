@@ -31,7 +31,11 @@ from typing import List
 
 import torch
 import triton
-from fused_mamba_decode import _fused_conv_ssm_kernel, fused_conv_ssm_decode
+from fused_mamba_decode import (
+    _fused_conv_ssm_kernel,
+    fused_conv_ssm_decode,
+    fused_conv_ssm_decode_two_kernel,
+)
 
 # ---------------------------------------------------------------------------
 # Nemotron Nano v3 dimensions
@@ -171,6 +175,46 @@ def bench_e2e(
 
     def fn():
         fused_conv_ssm_decode(
+            conv_input,
+            conv_state,
+            conv_weight,
+            conv_bias,
+            dt,
+            dt_bias,
+            A,
+            D,
+            ssm_state,
+            slot_idx,
+            slot_idx,
+            out,
+        )
+
+    ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    return ms * 1e3
+
+
+def bench_two_kernel(
+    batch: int,
+    warmup: int = 25,
+    rep: int = 100,
+) -> float:
+    """Benchmark the two-kernel (precomputed B/C) approach in microseconds."""
+    (
+        conv_input,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        dt,
+        dt_bias,
+        A,
+        D,
+        ssm_state,
+        slot_idx,
+        out,
+    ) = make_inputs(batch)
+
+    def fn():
+        fused_conv_ssm_decode_two_kernel(
             conv_input,
             conv_state,
             conv_weight,
@@ -412,16 +456,27 @@ def run_sweep(
     block_dstate: int,
     warmup: int = 25,
     rep: int = 100,
+    two_kernel: bool = False,
 ):
     """Run benchmark sweep and print table."""
-    print(f"\n{'batch':>6} | {'kernel_us':>10} | {'e2e_us':>10} | {'kernel_pct':>11}")
-    print("-" * 48)
-    for b in batch_sizes:
-        k_us = bench_kernel(b, num_warps, block_dim, block_dstate, warmup=warmup, rep=rep)
-        e_us = bench_e2e(b, warmup=warmup, rep=rep)
-        pct = 100.0 * k_us / e_us if e_us > 0 else 0.0
-        print(f"{b:6d} | {k_us:10.2f} | {e_us:10.2f} | {pct:10.1f}%")
-    print()
+    if two_kernel:
+        print(f"\n{'batch':>6} | {'1kern_us':>10} | {'2kern_us':>10} | {'speedup':>9}")
+        print("-" * 48)
+        for b in batch_sizes:
+            e_us = bench_e2e(b, warmup=warmup, rep=rep)
+            tk_us = bench_two_kernel(b, warmup=warmup, rep=rep)
+            speedup = e_us / tk_us if tk_us > 0 else 0.0
+            print(f"{b:6d} | {e_us:10.2f} | {tk_us:10.2f} | {speedup:8.3f}x")
+        print()
+    else:
+        print(f"\n{'batch':>6} | {'kernel_us':>10} | {'e2e_us':>10} | {'kernel_pct':>11}")
+        print("-" * 48)
+        for b in batch_sizes:
+            k_us = bench_kernel(b, num_warps, block_dim, block_dstate, warmup=warmup, rep=rep)
+            e_us = bench_e2e(b, warmup=warmup, rep=rep)
+            pct = 100.0 * k_us / e_us if e_us > 0 else 0.0
+            print(f"{b:6d} | {k_us:10.2f} | {e_us:10.2f} | {pct:10.1f}%")
+        print()
 
 
 def main():
@@ -444,6 +499,11 @@ def main():
         "--correctness",
         action="store_true",
         help="Run correctness check against reference",
+    )
+    parser.add_argument(
+        "--two_kernel",
+        action="store_true",
+        help="Benchmark two-kernel (precomputed B/C) approach vs single-kernel",
     )
     args = parser.parse_args()
 
@@ -485,6 +545,7 @@ def main():
         args.block_dstate,
         warmup=args.warmup,
         rep=args.rep,
+        two_kernel=args.two_kernel,
     )
 
 
