@@ -34,6 +34,7 @@ import triton
 from fused_mamba_decode import (
     _fused_conv_ssm_kernel,
     fused_conv_ssm_decode,
+    fused_conv_ssm_decode_persistent,
     fused_conv_ssm_decode_two_kernel,
 )
 
@@ -193,6 +194,48 @@ def bench_e2e(
             slot_idx,
             slot_idx,
             out,
+        )
+
+    ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    return ms * 1e3
+
+
+def bench_persistent(
+    batch: int,
+    n_ctas: int = 128,
+    warmup: int = 25,
+    rep: int = 100,
+) -> float:
+    """Benchmark the persistent kernel launcher in microseconds."""
+    (
+        conv_input,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        dt,
+        dt_bias,
+        A,
+        D,
+        ssm_state,
+        slot_idx,
+        out,
+    ) = make_inputs(batch)
+
+    def fn():
+        fused_conv_ssm_decode_persistent(
+            conv_input,
+            conv_state,
+            conv_weight,
+            conv_bias,
+            dt,
+            dt_bias,
+            A,
+            D,
+            ssm_state,
+            slot_idx,
+            slot_idx,
+            out,
+            n_ctas=n_ctas,
         )
 
     ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)

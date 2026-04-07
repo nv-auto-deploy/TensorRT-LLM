@@ -726,19 +726,179 @@ No code change.
 
 ______________________________________________________________________
 
+### Iter 21: num_warps sweep for B=1 and B=1 root-cause analysis
+
+**Goal:** Understand the B=1 bottleneck and test whether any quick parameter change helps.
+
+**num_warps sweep at B=1 (B=1,2,4,8,384):**
+
+| num_warps | B=1 (us) | B=2 (us) | B=4 (us) | B=8 (us) | B=384 (us) |
+|-----------|----------|----------|----------|----------|------------|
+| 1         | 12.69    | 11.94    | 12.62    | 15.63    | 518.06     |
+| 2         |  8.24    |  8.53    |  9.11    | 11.41    | 301.62     |
+| **4**     | **7.55** | **7.97** | **8.79** |**11.02** | **301.55** |
+| 8         |  7.68    |  8.11    |  8.94    | 12.04    | 330.58     |
+| 16        |  8.57    |  9.08    | 10.17    | 14.59    | 543.01     |
+
+**Winner: num_warps=4 remains optimal** — same as large batch. No change needed.
+
+**Root-cause profiling for B=1:**
+
+Noop kernel (state R+W only, no conv/compute) at B=1 = **6.16us** of the total 7.3us kernel time.
+This means the SSM state R+W accounts for 84% of B=1 latency.
+
+Key scaling measurements (noop state R+W):
+
+| B | CTAs | time (us) | us/CTA | eff BW (GB/s) |
+|---|------|-----------|--------|---------------|
+| 1 | 64   | 6.37      | 0.100  | 165           |
+| 2 | 128  | 7.05      | 0.055  | 298           |
+| 4 | 256  | 8.51      | 0.033  | 493           |
+| 8 | 512  | 11.47     | 0.022  | 731           |
+| 384 | 24576 | 285.81 | 0.012  | 1409          |
+
+**B=1 gets only 165 GB/s effective bandwidth vs 1409 GB/s at B=384 (8.5× gap).**
+
+This is the **GPU occupancy bottleneck**: with only 64 CTAs on 132 SMs, only 50% of SMs are active.
+Each active SM has only 1 CTA = 4 warps = 128 threads. This is insufficient to:
+
+1. Saturate the memory bus (need many concurrent outstanding requests)
+1. Hide memory latency (need >64 warps per SM for full hiding)
+
+**Critical finding:** The 6.16us noop time is INVARIANT to:
+
+- State tensor size (same at MAX_BATCH=1 vs MAX_BATCH=512)
+- Number of warps per CTA (same at num_warps=1 through 32)
+- BLOCK_DIM (same at 8, 16, 32, 64 — testing 64 vs 256 vs 512 CTAs all give same time)
+- CUDA graph vs non-graph execution (only 0.13us difference)
+
+This confirms the bottleneck is **fundamental occupancy**: 64 CTAs × any number of warps
+cannot exceed the ~6us minimum for the current workload at B=1.
+
+**Conclusion:** B=1 latency cannot be significantly improved via kernel-level optimization.
+The minimum achievable is ~6us (noop) + ~1us overhead = 7us.
+The 1.3us roofline is UNACHIEVABLE for single-kernel dispatch at B=1 because:
+
+- 64 CTAs on 132 SMs = 50% SM utilization → 2× longer than fully-utilized
+- Low occupancy → poor latency hiding → 4-5× additional slowdown vs full occupancy
+
+No code change.
+
+______________________________________________________________________
+
+### Iter 22: Persistent kernel — SLOWER at all batch sizes
+
+Implemented `_fused_conv_ssm_kernel_persistent` with `N_CTAs=128` (fills all 132 SMs).
+Grid: `(128,)` flat, each CTA loops over `total_work = batch * nheads` items.
+
+For B=1: 128 CTAs fill the GPU vs 64 CTAs at baseline. Should improve occupancy.
+
+Benchmark results (persistent kernel n_ctas=128 vs e2e):
+
+| batch | e2e (us) | persistent (us) | ratio |
+|-------|----------|-----------------|-------|
+| 1     | 7.21     | 8.63            | 1.20× SLOWER |
+| 2     | 7.85     | 8.63            | 1.10× SLOWER |
+| 4     | 8.71     | 11.23           | 1.29× SLOWER |
+| 8     | 11.16    | 16.66           | 1.49× SLOWER |
+| 64    | 57.84    | 108.89          | 1.88× SLOWER |
+| 384   | 301.78   | 616.66          | 2.04× SLOWER |
+
+**WORSE at all batch sizes.** The dynamic `while work_id < total_work` loop prevents Triton
+from making register allocation and compiler optimizations that the static flat grid enables.
+Also tried n_ctas=64 and n_ctas=256 — both worse.
+
+Kernel left in file for reference but NOT the production path.
+`fused_conv_ssm_decode` (flat grid) remains the launcher.
+
+No code change to launcher.
+
+______________________________________________________________________
+
+### Iter 23: Two-kernel dstate-split approach — SLOWER
+
+Implemented a two-phase approach to increase parallelism at B=1:
+
+- **Phase 1** (`_conv_hidden_bc_kernel`): Grid `(batch, nheads)` — compute hidden+B/C conv,
+  store `x_hidden[batch, nheads, dim]` and `B/C[batch, ngroups, dstate]` to buffers.
+- **Phase 2** (`_ssm_dstate_split_kernel`): Grid `(batch, nheads, N_DSTATE_TILES)` — SSM
+  update with dstate split. Uses `tl.atomic_add` to accumulate partial outputs.
+  For B=1 with N_DSTATE_TILES=4: 256 CTAs vs 64 in the original.
+
+Benchmark results (two-kernel split vs single-kernel e2e):
+
+| B | e2e (us) | 2-kernel n=2 | 2-kernel n=4 | 2-kernel n=8 |
+|---|----------|--------------|--------------|--------------|
+| 1 | 7.3      | 16.0 (2.2×)  | 16.2 (2.2×)  | 16.4 (2.2×)  |
+| 8 | 11.1     | 20.3 (1.8×)  | 21.4 (1.9×)  | 25.5 (2.3×)  |
+| 64 | 57.9    | 71.3 (1.2×)  | 91.4 (1.6×)  | 124 (2.1×)   |
+| 384 | 301.6  | 352 (1.2×)   | 538 (1.8×)   | 1034 (3.4×)  |
+
+**SIGNIFICANTLY WORSE.** Root causes:
+
+1. Extra kernel launch overhead for 3 kernels total (+9-10us per launch on H100)
+1. Extra memory traffic: intermediate buffers `x_hidden`, `B_buf`, `C_buf`
+1. `tl.atomic_add` for output accumulation is slow
+1. Phase 2 CTAs each redo the B/C work (can't reuse — the state split requires independent B/C)
+1. Correctness issues: bf16 intermediate precision loss (max_err=4.0 at batch=1)
+
+No code change to launcher.
+
+______________________________________________________________________
+
+### Iter 24: Root cause confirmed — GPU occupancy is the fundamental bottleneck at B=1
+
+**Comprehensive characterization:**
+
+At B=1, the irreducible minimum time is ~6.2us (state R+W noop). This is because:
+
+1. **64 CTAs on 132 SMs**: only 50% SM utilization, 68 SMs idle
+1. **Per-CTA effective BW**: 165 GB/s vs 1409 GB/s at B=384 (8.5× gap from occupancy)
+1. **No way to increase CTAs**: nheads=64 is fixed; splitting any dimension either
+   (a) doesn't increase CTAs in practice (BLOCK_DIM split) or
+   (b) adds atomic overhead that negates parallelism gains (dstate split)
+1. **CUDA graph**: no improvement (launch overhead = 0.13us, not the bottleneck)
+1. **num_warps**: all settings give same noop time; not a memory-bus-saturation issue
+
+**Effective approaches that DON'T work:**
+
+- Finer BLOCK_DIM (16): 4× CTAs but B/C overhead increases → same noop time
+- Persistent kernel: dynamic loop prevents compiler optimization → 1.2-2.0× slower
+- Dstate split: atomic_add + 3 kernel launches → 2× slower
+
+**What WOULD work (future work, not in scope for this kernel):**
+
+- **Cross-layer fusion**: fuse multiple Mamba layers' SSM updates into one kernel → N_layers × 64 CTAs
+- **Larger batch**: at B=2, we have 128 CTAs (fills all SMs), time = 7.9us = 1.08× B=1
+- **Accept the limit**: B=1 ~7us is an architectural minimum for nheads=64 on H100
+
+**Final B=1 analysis:**
+
+- Current best: 7.3us
+- Noop lower bound: 6.2us (state R+W only)
+- Theoretical arithmetic/BW roofline: 1.3us (UNREACHABLE for single dispatch at B=1)
+- Gap between noop and roofline: 4.9× from occupancy effects alone
+- Gap between full kernel and noop: 1.1us (conv + compute overhead)
+
+No code change.
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
 
 - \[ \] **Vectorized loads for conv state**: Conv state is \[max_batch, conv_dim, kw-1\]; access pattern is strided (per channel). Load BLOCK_DIM channels in a single vectorized transaction instead of element-by-element.
 - \[ \] **Vectorized conv weight loads**: weight\[channel, k\] — same pattern, all channels for a given k are contiguous in memory if stride_cw_d=1, stride_cw_w=conv_dim. Load as block vector.
-- \[ \] **evict_first on conv_input**: Tested in iter 20 — WORSE (+6.1% at B=384). conv_input is shared by all 64 heads per batch element; evict_first causes repeated HBM fetches.
+- \[x\] **evict_first on conv_input**: Tested in iter 20 — WORSE (+6.1% at B=384). conv_input is shared by all 64 heads per batch element; evict_first causes repeated HBM fetches.
 
 ### Structural
 
-- \[ \] **Persistent kernel**: For small batch (1-8), try a persistent kernel that loops over multiple batch elements within one CTA. Amortizes launch overhead and may improve L2 hit rate for weights.
+- \[x\] **Persistent kernel**: Tested in iter 22 — SLOWER (1.2-2.0×). Dynamic loop prevents Triton compiler optimization; register spillage; cannot match flat-grid performance.
+- \[x\] **B=1 dstate split (atomic_add)**: Tested in iter 23 — SLOWER (2×). Extra kernel launches, atomic_add overhead, and intermediate buffer traffic negate any parallelism gain.
 - \[ \] **Separate B/C conv state update kernel**: Tested in iter 7a (worse e2e due to kernel launch overhead).
 - \[ \] **Grid reorder**: Current order is (dim_tile, batch, nhead). Reorder to (batch, nhead, dim_tile) so consecutive CTAs share the same batch element → better L2 locality for conv_state and ssm_state.
+- \[x\] **B=1 GPU occupancy analysis (iter 24)**: Confirmed that B=1 latency (7.3us) is bounded by GPU occupancy. 64 CTAs on 132 SMs = 50% utilization → 165 GB/s effective BW vs 1409 GB/s at B=384. The noop lower bound (state R+W only) is 6.2us. The 1.3us BW roofline is UNREACHABLE with 64 CTAs.
 
 ### Precision
 

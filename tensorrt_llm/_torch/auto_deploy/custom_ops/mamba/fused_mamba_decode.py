@@ -907,6 +907,852 @@ def fused_conv_ssm_decode_two_kernel(
     )
 
 
+@triton.jit()
+def _fused_conv_ssm_kernel_persistent(
+    # Conv inputs
+    conv_input_ptr,  # [batch, conv_dim]
+    conv_state_ptr,  # [max_batch, conv_dim, kernel_width-1]
+    conv_weight_ptr,  # [conv_dim, kernel_width]
+    conv_bias_ptr,  # [conv_dim]
+    # SSM inputs
+    dt_ptr,  # [batch, nheads]
+    dt_bias_ptr,  # [nheads]
+    A_ptr,  # [nheads]
+    D_ptr,  # [nheads]
+    ssm_state_ptr,  # [max_batch, nheads, dim, dstate]
+    conv_slot_idx_ptr,  # [batch]
+    ssm_slot_idx_ptr,  # [batch]
+    # Output
+    ssm_out_ptr,  # [batch, nheads, dim]
+    # Work queue: total_work = batch * nheads (each item = one (batch, head) pair)
+    total_work,
+    # Dimensions
+    batch,
+    conv_dim,
+    intermediate_size,
+    nheads,
+    dim,
+    dstate,
+    ngroups,
+    nheads_per_group,
+    kernel_width: tl.constexpr,
+    # Strides
+    stride_ci_b,
+    stride_ci_d,
+    stride_cs_b,
+    stride_cs_d,
+    stride_cs_w,
+    stride_cw_d,
+    stride_cw_w,
+    stride_ss_b,
+    stride_ss_h,
+    stride_ss_d,
+    stride_ss_n,
+    stride_so_b,
+    stride_so_h,
+    stride_so_d,
+    # Meta
+    BLOCK_DIM: tl.constexpr,
+    BLOCK_DSTATE: tl.constexpr,
+    N_CTAs: tl.constexpr,  # total number of CTAs launched (= grid size)
+):
+    """Persistent kernel: each CTA loops over multiple (batch, head) work items.
+
+    Grid: (N_CTAs,) — flat 1D grid, N_CTAs >= SM count to fill the GPU.
+    Each CTA processes work items [cta_id, cta_id+N_CTAs, cta_id+2*N_CTAs, ...]
+    Work item i = (i // nheads, i % nheads) = (batch_idx, head_idx).
+
+    Key: head-0 per group (head_idx % nheads_per_group == 0) writes B/C state.
+    In the persistent loop, each CTA processes heads in order, so the B/C write
+    by head-0 is naturally serialized before the B/C read by heads 1..7 of the
+    same batch element — IF heads are processed in order across CTAs. To be safe,
+    we rely on the same guard as the original kernel: only head_idx%nheads_per_group==0
+    writes B/C state, and reads happen before writes within one work item.
+    """
+    cta_id = tl.program_id(0)
+
+    offs_d = tl.arange(0, BLOCK_DIM)
+    offs_n = tl.arange(0, BLOCK_DSTATE)
+    mask_d = offs_d < dim
+    mask_n = offs_n < dstate
+    mask_dn = mask_d[:, None] & mask_n[None, :]
+
+    # Each CTA processes work items at positions cta_id, cta_id+N_CTAs, ...
+    work_id = cta_id
+    while work_id < total_work:
+        pid_b = work_id // nheads
+        pid_h = work_id % nheads
+
+        conv_slot = tl.load(conv_slot_idx_ptr + pid_b).to(tl.int64)
+        ssm_slot = tl.load(ssm_slot_idx_ptr + pid_b).to(tl.int64)
+
+        group_idx = pid_h // nheads_per_group
+
+        # SSM scalars
+        dt_val = tl.load(dt_ptr + pid_b * nheads + pid_h).to(tl.float32)
+        dt_bias_val = tl.load(dt_bias_ptr + pid_h).to(tl.float32)
+        dt_val = softplus(dt_val + dt_bias_val)
+        A_val = tl.load(A_ptr + pid_h).to(tl.float32)
+        dA = tl.exp(A_val * dt_val)
+        D_val = tl.load(D_ptr + pid_h).to(tl.float32)
+
+        # SSM state prefetch
+        state_ptrs = (
+            ssm_state_ptr
+            + ssm_slot * stride_ss_b
+            + pid_h * stride_ss_h
+            + offs_d[:, None] * stride_ss_d
+            + offs_n[None, :] * stride_ss_n
+        )
+        state_prefetch = tl.load(state_ptrs, mask=mask_dn, other=0.0, eviction_policy="evict_last")
+
+        # Step 1: Hidden channel conv1d
+        hidden_channels = pid_h * dim + offs_d
+        mask_hc = hidden_channels < intermediate_size
+
+        conv_out_hidden = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
+        for k in range(kernel_width - 1):
+            state_val = tl.load(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + hidden_channels * stride_cs_d
+                + k * stride_cs_w,
+                mask=mask_hc,
+                other=0.0,
+                eviction_policy="evict_last",
+            ).to(tl.float32)
+            w_val = tl.load(
+                conv_weight_ptr + hidden_channels * stride_cw_d + k * stride_cw_w,
+                mask=mask_hc,
+                other=0.0,
+            ).to(tl.float32)
+            conv_out_hidden += state_val * w_val
+
+        x_in = tl.load(
+            conv_input_ptr + pid_b * stride_ci_b + hidden_channels * stride_ci_d,
+            mask=mask_hc,
+            other=0.0,
+        ).to(tl.float32)
+        w_last = tl.load(
+            conv_weight_ptr + hidden_channels * stride_cw_d + (kernel_width - 1) * stride_cw_w,
+            mask=mask_hc,
+            other=0.0,
+        ).to(tl.float32)
+        bias = tl.load(conv_bias_ptr + hidden_channels, mask=mask_hc, other=0.0).to(tl.float32)
+        conv_out_hidden += x_in * w_last + bias
+
+        # Update hidden conv state
+        for k in range(kernel_width - 2):
+            old_val = tl.load(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + hidden_channels * stride_cs_d
+                + (k + 1) * stride_cs_w,
+                mask=mask_hc,
+                other=0.0,
+            )
+            tl.store(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + hidden_channels * stride_cs_d
+                + k * stride_cs_w,
+                old_val,
+                mask=mask_hc,
+            )
+        tl.store(
+            conv_state_ptr
+            + conv_slot * stride_cs_b
+            + hidden_channels * stride_cs_d
+            + (kernel_width - 2) * stride_cs_w,
+            x_in.to(conv_state_ptr.dtype.element_ty),
+            mask=mask_hc,
+        )
+
+        # SiLU
+        sigmoid_val = 1.0 / (1.0 + tl.exp(-conv_out_hidden))
+        x_hidden = conv_out_hidden * sigmoid_val
+
+        # Step 2: B/C conv1d
+        B_offset = intermediate_size + group_idx * dstate
+        C_offset = intermediate_size + ngroups * dstate + group_idx * dstate
+
+        B_vals = tl.zeros((BLOCK_DSTATE,), dtype=tl.float32)
+        C_vals = tl.zeros((BLOCK_DSTATE,), dtype=tl.float32)
+
+        B_channels = B_offset + offs_n
+        C_channels = C_offset + offs_n
+        mask_bc = (B_channels < conv_dim) & mask_n
+
+        for k in range(kernel_width - 1):
+            b_state = tl.load(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + B_channels * stride_cs_d
+                + k * stride_cs_w,
+                mask=mask_bc,
+                other=0.0,
+                eviction_policy="evict_last",
+            ).to(tl.float32)
+            b_w = tl.load(
+                conv_weight_ptr + B_channels * stride_cw_d + k * stride_cw_w,
+                mask=mask_bc,
+                other=0.0,
+            ).to(tl.float32)
+            B_vals += b_state * b_w
+
+            c_state = tl.load(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + C_channels * stride_cs_d
+                + k * stride_cs_w,
+                mask=mask_bc,
+                other=0.0,
+                eviction_policy="evict_last",
+            ).to(tl.float32)
+            c_w = tl.load(
+                conv_weight_ptr + C_channels * stride_cw_d + k * stride_cw_w,
+                mask=mask_bc,
+                other=0.0,
+            ).to(tl.float32)
+            C_vals += c_state * c_w
+
+        b_in = tl.load(
+            conv_input_ptr + pid_b * stride_ci_b + B_channels * stride_ci_d,
+            mask=mask_bc,
+            other=0.0,
+        ).to(tl.float32)
+        b_w_last = tl.load(
+            conv_weight_ptr + B_channels * stride_cw_d + (kernel_width - 1) * stride_cw_w,
+            mask=mask_bc,
+            other=0.0,
+        ).to(tl.float32)
+        b_bias = tl.load(conv_bias_ptr + B_channels, mask=mask_bc, other=0.0).to(tl.float32)
+        B_vals += b_in * b_w_last + b_bias
+
+        c_in = tl.load(
+            conv_input_ptr + pid_b * stride_ci_b + C_channels * stride_ci_d,
+            mask=mask_bc,
+            other=0.0,
+        ).to(tl.float32)
+        c_w_last = tl.load(
+            conv_weight_ptr + C_channels * stride_cw_d + (kernel_width - 1) * stride_cw_w,
+            mask=mask_bc,
+            other=0.0,
+        ).to(tl.float32)
+        c_bias = tl.load(conv_bias_ptr + C_channels, mask=mask_bc, other=0.0).to(tl.float32)
+        C_vals += c_in * c_w_last + c_bias
+
+        # SiLU on B and C
+        B_vals = B_vals * (1.0 / (1.0 + tl.exp(-B_vals)))
+        C_vals = C_vals * (1.0 / (1.0 + tl.exp(-C_vals)))
+
+        # Step 3: SSM state update
+        state = state_prefetch.to(tl.float32)
+        dB = B_vals[None, :] * dt_val
+        state = state * dA + dB * x_hidden[:, None]
+
+        out = tl.sum(state * C_vals[None, :], axis=1)
+        out += x_hidden * D_val
+
+        # Store output and SSM state
+        tl.store(
+            ssm_out_ptr + pid_b * stride_so_b + pid_h * stride_so_h + offs_d * stride_so_d,
+            out.to(tl.bfloat16),
+            mask=mask_d,
+        )
+        tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask_dn)
+
+        # B/C conv state writes (after SSM output)
+        if pid_h % nheads_per_group == 0:
+            for k in range(kernel_width - 2):
+                old_b = tl.load(
+                    conv_state_ptr
+                    + conv_slot * stride_cs_b
+                    + B_channels * stride_cs_d
+                    + (k + 1) * stride_cs_w,
+                    mask=mask_bc,
+                    other=0.0,
+                )
+                tl.store(
+                    conv_state_ptr
+                    + conv_slot * stride_cs_b
+                    + B_channels * stride_cs_d
+                    + k * stride_cs_w,
+                    old_b,
+                    mask=mask_bc,
+                )
+            tl.store(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + B_channels * stride_cs_d
+                + (kernel_width - 2) * stride_cs_w,
+                b_in.to(conv_state_ptr.dtype.element_ty),
+                mask=mask_bc,
+            )
+
+            for k in range(kernel_width - 2):
+                old_c = tl.load(
+                    conv_state_ptr
+                    + conv_slot * stride_cs_b
+                    + C_channels * stride_cs_d
+                    + (k + 1) * stride_cs_w,
+                    mask=mask_bc,
+                    other=0.0,
+                )
+                tl.store(
+                    conv_state_ptr
+                    + conv_slot * stride_cs_b
+                    + C_channels * stride_cs_d
+                    + k * stride_cs_w,
+                    old_c,
+                    mask=mask_bc,
+                )
+            tl.store(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + C_channels * stride_cs_d
+                + (kernel_width - 2) * stride_cs_w,
+                c_in.to(conv_state_ptr.dtype.element_ty),
+                mask=mask_bc,
+            )
+
+        work_id += N_CTAs
+
+
+@triton.jit()
+def _fused_conv_ssm_kernel_dstate_split(
+    # Conv inputs
+    conv_input_ptr,  # [batch, conv_dim]
+    conv_state_ptr,  # [max_batch, conv_dim, kernel_width-1]
+    conv_weight_ptr,  # [conv_dim, kernel_width]
+    conv_bias_ptr,  # [conv_dim]
+    # SSM inputs
+    dt_ptr,  # [batch, nheads]
+    dt_bias_ptr,  # [nheads]
+    A_ptr,  # [nheads]
+    D_ptr,  # [nheads]
+    ssm_state_ptr,  # [max_batch, nheads, dim, dstate]
+    conv_slot_idx_ptr,  # [batch]
+    ssm_slot_idx_ptr,  # [batch]
+    # Output: float32 accumulation buffer [batch, nheads, dim]
+    out_accum_ptr,  # float32
+    # Dimensions
+    batch,
+    conv_dim,
+    intermediate_size,
+    nheads,
+    dim,
+    dstate,
+    ngroups,
+    nheads_per_group,
+    kernel_width: tl.constexpr,
+    # Strides (conv inputs)
+    stride_ci_b,
+    stride_ci_d,
+    stride_cs_b,
+    stride_cs_d,
+    stride_cs_w,
+    stride_cw_d,
+    stride_cw_w,
+    # SSM strides
+    stride_ss_b,
+    stride_ss_h,
+    stride_ss_d,
+    stride_ss_n,
+    # Output strides (float32 accum)
+    stride_so_b,
+    stride_so_h,
+    stride_so_d,
+    # Meta
+    BLOCK_DIM: tl.constexpr,
+    BLOCK_DSTATE: tl.constexpr,  # full dstate
+    DSTATE_TILE: tl.constexpr,  # tile size for dstate split
+    N_DSTATE_TILES: tl.constexpr,  # dstate // DSTATE_TILE
+    IS_FIRST_TILE: tl.constexpr,  # whether pid_n == 0 (writes hidden conv state + D*x)
+):
+    """Dstate-split SSM kernel: each CTA handles DSTATE_TILE dstate elements.
+
+    Grid: (cdiv(dim, BLOCK_DIM), batch, nheads * N_DSTATE_TILES)
+    pid_h_full = pid_h_base * N_DSTATE_TILES + pid_n
+    where pid_n = dstate tile index (0..N_DSTATE_TILES-1)
+
+    Multiple CTAs contribute partial sums to the same output element via atomic_add.
+    Conv state updates and D*x term are only done by the first dstate tile (pid_n==0).
+    """
+    pid_d = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_hn = tl.program_id(2)  # combined head * N_DSTATE_TILES + dstate_tile
+
+    pid_h = pid_hn // N_DSTATE_TILES
+    pid_n = pid_hn % N_DSTATE_TILES  # dstate tile index
+
+    conv_slot = tl.load(conv_slot_idx_ptr + pid_b).to(tl.int64)
+    ssm_slot = tl.load(ssm_slot_idx_ptr + pid_b).to(tl.int64)
+
+    group_idx = pid_h // nheads_per_group
+
+    offs_d = pid_d * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+    offs_n_tile = pid_n * DSTATE_TILE + tl.arange(0, DSTATE_TILE)
+    mask_d = offs_d < dim
+    mask_n_tile = offs_n_tile < dstate
+    mask_dn = mask_d[:, None] & mask_n_tile[None, :]
+
+    # SSM scalars
+    dt_val = tl.load(dt_ptr + pid_b * nheads + pid_h).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias_ptr + pid_h).to(tl.float32)
+    dt_val = softplus(dt_val + dt_bias_val)
+    A_val = tl.load(A_ptr + pid_h).to(tl.float32)
+    dA = tl.exp(A_val * dt_val)
+
+    # Load SSM state tile [BLOCK_DIM, DSTATE_TILE]
+    state_ptrs = (
+        ssm_state_ptr
+        + ssm_slot * stride_ss_b
+        + pid_h * stride_ss_h
+        + offs_d[:, None] * stride_ss_d
+        + offs_n_tile[None, :] * stride_ss_n
+    )
+    state = tl.load(state_ptrs, mask=mask_dn, other=0.0, eviction_policy="evict_last").to(
+        tl.float32
+    )
+
+    # Step 1: Hidden channel conv (only first dstate tile to avoid redundant work)
+    hidden_channels = pid_h * dim + offs_d
+    mask_hc = hidden_channels < intermediate_size
+
+    conv_out_hidden = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
+    if IS_FIRST_TILE:
+        for k in range(kernel_width - 1):
+            state_val = tl.load(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + hidden_channels * stride_cs_d
+                + k * stride_cs_w,
+                mask=mask_hc,
+                other=0.0,
+                eviction_policy="evict_last",
+            ).to(tl.float32)
+            w_val = tl.load(
+                conv_weight_ptr + hidden_channels * stride_cw_d + k * stride_cw_w,
+                mask=mask_hc,
+                other=0.0,
+            ).to(tl.float32)
+            conv_out_hidden += state_val * w_val
+
+        x_in = tl.load(
+            conv_input_ptr + pid_b * stride_ci_b + hidden_channels * stride_ci_d,
+            mask=mask_hc,
+            other=0.0,
+        ).to(tl.float32)
+        w_last = tl.load(
+            conv_weight_ptr + hidden_channels * stride_cw_d + (kernel_width - 1) * stride_cw_w,
+            mask=mask_hc,
+            other=0.0,
+        ).to(tl.float32)
+        bias = tl.load(conv_bias_ptr + hidden_channels, mask=mask_hc, other=0.0).to(tl.float32)
+        conv_out_hidden += x_in * w_last + bias
+
+        # Update hidden conv state
+        for k in range(kernel_width - 2):
+            old_val = tl.load(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + hidden_channels * stride_cs_d
+                + (k + 1) * stride_cs_w,
+                mask=mask_hc,
+                other=0.0,
+            )
+            tl.store(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + hidden_channels * stride_cs_d
+                + k * stride_cs_w,
+                old_val,
+                mask=mask_hc,
+            )
+        tl.store(
+            conv_state_ptr
+            + conv_slot * stride_cs_b
+            + hidden_channels * stride_cs_d
+            + (kernel_width - 2) * stride_cs_w,
+            x_in.to(conv_state_ptr.dtype.element_ty),
+            mask=mask_hc,
+        )
+    else:
+        # Non-first tiles still need x_in for dB computation
+        x_in = tl.load(
+            conv_input_ptr + pid_b * stride_ci_b + hidden_channels * stride_ci_d,
+            mask=mask_hc,
+            other=0.0,
+        ).to(tl.float32)
+        w_last = tl.load(
+            conv_weight_ptr + hidden_channels * stride_cw_d + (kernel_width - 1) * stride_cw_w,
+            mask=mask_hc,
+            other=0.0,
+        ).to(tl.float32)
+        bias = tl.load(conv_bias_ptr + hidden_channels, mask=mask_hc, other=0.0).to(tl.float32)
+        # Need full conv output — must redo for non-first tiles
+        for k in range(kernel_width - 1):
+            state_val = tl.load(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + hidden_channels * stride_cs_d
+                + k * stride_cs_w,
+                mask=mask_hc,
+                other=0.0,
+                eviction_policy="evict_last",
+            ).to(tl.float32)
+            w_val = tl.load(
+                conv_weight_ptr + hidden_channels * stride_cw_d + k * stride_cw_w,
+                mask=mask_hc,
+                other=0.0,
+            ).to(tl.float32)
+            conv_out_hidden += state_val * w_val
+        conv_out_hidden += x_in * w_last + bias
+
+    sigmoid_val = 1.0 / (1.0 + tl.exp(-conv_out_hidden))
+    x_hidden = conv_out_hidden * sigmoid_val
+
+    # Step 2: B/C conv for this dstate tile
+    B_offset = intermediate_size + group_idx * dstate + pid_n * DSTATE_TILE
+    C_offset = intermediate_size + ngroups * dstate + group_idx * dstate + pid_n * DSTATE_TILE
+
+    B_vals = tl.zeros((DSTATE_TILE,), dtype=tl.float32)
+    C_vals = tl.zeros((DSTATE_TILE,), dtype=tl.float32)
+
+    B_channels = B_offset + tl.arange(0, DSTATE_TILE)
+    C_channels = C_offset + tl.arange(0, DSTATE_TILE)
+    mask_bc = (B_channels < conv_dim) & mask_n_tile
+
+    for k in range(kernel_width - 1):
+        b_state = tl.load(
+            conv_state_ptr + conv_slot * stride_cs_b + B_channels * stride_cs_d + k * stride_cs_w,
+            mask=mask_bc,
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+        b_w = tl.load(
+            conv_weight_ptr + B_channels * stride_cw_d + k * stride_cw_w,
+            mask=mask_bc,
+            other=0.0,
+        ).to(tl.float32)
+        B_vals += b_state * b_w
+
+        c_state = tl.load(
+            conv_state_ptr + conv_slot * stride_cs_b + C_channels * stride_cs_d + k * stride_cs_w,
+            mask=mask_bc,
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+        c_w = tl.load(
+            conv_weight_ptr + C_channels * stride_cw_d + k * stride_cw_w,
+            mask=mask_bc,
+            other=0.0,
+        ).to(tl.float32)
+        C_vals += c_state * c_w
+
+    b_in = tl.load(
+        conv_input_ptr + pid_b * stride_ci_b + B_channels * stride_ci_d,
+        mask=mask_bc,
+        other=0.0,
+    ).to(tl.float32)
+    b_w_last = tl.load(
+        conv_weight_ptr + B_channels * stride_cw_d + (kernel_width - 1) * stride_cw_w,
+        mask=mask_bc,
+        other=0.0,
+    ).to(tl.float32)
+    b_bias = tl.load(conv_bias_ptr + B_channels, mask=mask_bc, other=0.0).to(tl.float32)
+    B_vals += b_in * b_w_last + b_bias
+
+    c_in = tl.load(
+        conv_input_ptr + pid_b * stride_ci_b + C_channels * stride_ci_d,
+        mask=mask_bc,
+        other=0.0,
+    ).to(tl.float32)
+    c_w_last = tl.load(
+        conv_weight_ptr + C_channels * stride_cw_d + (kernel_width - 1) * stride_cw_w,
+        mask=mask_bc,
+        other=0.0,
+    ).to(tl.float32)
+    c_bias = tl.load(conv_bias_ptr + C_channels, mask=mask_bc, other=0.0).to(tl.float32)
+    C_vals += c_in * c_w_last + c_bias
+
+    B_vals = B_vals * (1.0 / (1.0 + tl.exp(-B_vals)))
+    C_vals = C_vals * (1.0 / (1.0 + tl.exp(-C_vals)))
+
+    # Step 3: SSM state update for this dstate tile
+    dB = B_vals[None, :] * dt_val  # [1, DSTATE_TILE]
+    state = state * dA + dB * x_hidden[:, None]
+
+    # Partial output: sum(state * C) over this dstate tile → [BLOCK_DIM]
+    partial_out = tl.sum(state * C_vals[None, :], axis=1)  # [BLOCK_DIM]
+
+    # Atomic add partial output into float32 accumulation buffer
+    out_ptrs = out_accum_ptr + pid_b * stride_so_b + pid_h * stride_so_h + offs_d * stride_so_d
+    tl.atomic_add(out_ptrs, partial_out, mask=mask_d)
+
+    # D*x term — only first dstate tile to avoid duplication
+    if IS_FIRST_TILE:
+        D_val = tl.load(D_ptr + pid_h).to(tl.float32)
+        d_out = x_hidden * D_val
+        tl.atomic_add(out_ptrs, d_out, mask=mask_d)
+
+    # Store updated SSM state tile
+    tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask_dn)
+
+    # B/C conv state write — only head-0 per group, only first dstate tile
+    if IS_FIRST_TILE and (pid_h % nheads_per_group == 0):
+        for k in range(kernel_width - 2):
+            old_b = tl.load(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + B_channels * stride_cs_d
+                + (k + 1) * stride_cs_w,
+                mask=mask_bc,
+                other=0.0,
+            )
+            tl.store(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + B_channels * stride_cs_d
+                + k * stride_cs_w,
+                old_b,
+                mask=mask_bc,
+            )
+        tl.store(
+            conv_state_ptr
+            + conv_slot * stride_cs_b
+            + B_channels * stride_cs_d
+            + (kernel_width - 2) * stride_cs_w,
+            b_in.to(conv_state_ptr.dtype.element_ty),
+            mask=mask_bc,
+        )
+        for k in range(kernel_width - 2):
+            old_c = tl.load(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + C_channels * stride_cs_d
+                + (k + 1) * stride_cs_w,
+                mask=mask_bc,
+                other=0.0,
+            )
+            tl.store(
+                conv_state_ptr
+                + conv_slot * stride_cs_b
+                + C_channels * stride_cs_d
+                + k * stride_cs_w,
+                old_c,
+                mask=mask_bc,
+            )
+        tl.store(
+            conv_state_ptr
+            + conv_slot * stride_cs_b
+            + C_channels * stride_cs_d
+            + (kernel_width - 2) * stride_cs_w,
+            c_in.to(conv_state_ptr.dtype.element_ty),
+            mask=mask_bc,
+        )
+
+
+@triton.jit()
+def _cast_fp32_to_bf16_kernel(
+    src_ptr,  # [N] float32
+    dst_ptr,  # [N] bfloat16
+    N,
+    BLOCK: tl.constexpr,
+):
+    """Cast float32 accumulation buffer to bfloat16 output."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    val = tl.load(src_ptr + offs, mask=mask, other=0.0)
+    tl.store(dst_ptr + offs, val.to(tl.bfloat16), mask=mask)
+
+
+def fused_conv_ssm_decode_dstate_split(
+    conv_input: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    A: torch.Tensor,
+    D: torch.Tensor,
+    ssm_state: torch.Tensor,
+    conv_slot_idx: torch.Tensor,
+    ssm_slot_idx: torch.Tensor,
+    out: torch.Tensor,
+    n_dstate_tiles: int = 4,
+) -> None:
+    """Dstate-split kernel: splits dstate across CTAs for more parallelism.
+
+    Grid: (cdiv(dim, BLOCK_DIM), batch, nheads * n_dstate_tiles)
+    For B=1, nheads=64, n_dstate_tiles=4: 256 CTAs vs original 64.
+    Uses atomic_add to accumulate partial output across dstate tiles.
+    """
+    batch, conv_dim = conv_input.shape
+    _, nheads, dim, dstate = ssm_state.shape
+    kernel_width = conv_state.shape[-1] + 1
+    intermediate_size = nheads * dim
+    ngroups = (conv_dim - intermediate_size) // (2 * dstate)
+    nheads_per_group = nheads // ngroups
+
+    BLOCK_DIM = max(triton.next_power_of_2(dim), 16)
+    BLOCK_DSTATE = triton.next_power_of_2(dstate)
+    DSTATE_TILE = dstate // n_dstate_tiles
+    assert dstate % n_dstate_tiles == 0, (
+        f"dstate={dstate} must be divisible by n_dstate_tiles={n_dstate_tiles}"
+    )
+
+    conv_input = conv_input.contiguous()
+    conv_state = conv_state.contiguous()
+    conv_weight = conv_weight.contiguous()
+
+    # Float32 accumulation buffer for atomic adds
+    out_accum = torch.zeros(batch, nheads, dim, dtype=torch.float32, device=conv_input.device)
+
+    def grid(META):
+        return (triton.cdiv(dim, META["BLOCK_DIM"]), batch, nheads * n_dstate_tiles)
+
+    _fused_conv_ssm_kernel_dstate_split[grid](
+        conv_input,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        dt,
+        dt_bias,
+        A,
+        D,
+        ssm_state,
+        conv_slot_idx,
+        ssm_slot_idx,
+        out_accum,
+        batch,
+        conv_dim,
+        intermediate_size,
+        nheads,
+        dim,
+        dstate,
+        ngroups,
+        nheads_per_group,
+        kernel_width,
+        conv_input.stride(0),
+        conv_input.stride(1),
+        conv_state.stride(0),
+        conv_state.stride(1),
+        conv_state.stride(2),
+        conv_weight.stride(0),
+        conv_weight.stride(1),
+        ssm_state.stride(0),
+        ssm_state.stride(1),
+        ssm_state.stride(2),
+        ssm_state.stride(3),
+        out_accum.stride(0),
+        out_accum.stride(1),
+        out_accum.stride(2),
+        BLOCK_DIM=BLOCK_DIM,
+        BLOCK_DSTATE=BLOCK_DSTATE,
+        DSTATE_TILE=DSTATE_TILE,
+        N_DSTATE_TILES=n_dstate_tiles,
+        IS_FIRST_TILE=True,  # always True — we set n_dstate_tiles=1 path separately
+        num_warps=4,
+    )
+
+    # Cast float32 accumulation to bfloat16 output
+    N = batch * nheads * dim
+    CAST_BLOCK = 256
+    _cast_fp32_to_bf16_kernel[(triton.cdiv(N, CAST_BLOCK),)](
+        out_accum.view(-1),
+        out.view(-1),
+        N,
+        BLOCK=CAST_BLOCK,
+        num_warps=1,
+    )
+
+
+def fused_conv_ssm_decode_persistent(
+    conv_input: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    A: torch.Tensor,
+    D: torch.Tensor,
+    ssm_state: torch.Tensor,
+    conv_slot_idx: torch.Tensor,
+    ssm_slot_idx: torch.Tensor,
+    out: torch.Tensor,
+    n_ctas: int = 128,
+) -> None:
+    """Persistent kernel launcher: N_CTAs CTAs loop over all (batch, head) work items.
+
+    For small batch (B=1..8), N_CTAs > batch*nheads so each CTA does exactly 1 work item
+    but we fill all SMs, reducing launch overhead and improving SM utilization.
+    For large batch, N_CTAs < batch*nheads so CTAs loop over multiple items.
+    """
+    batch, conv_dim = conv_input.shape
+    _, nheads, dim, dstate = ssm_state.shape
+    kernel_width = conv_state.shape[-1] + 1
+    intermediate_size = nheads * dim
+    ngroups = (conv_dim - intermediate_size) // (2 * dstate)
+    nheads_per_group = nheads // ngroups
+
+    BLOCK_DIM = max(triton.next_power_of_2(dim), 16)
+    BLOCK_DSTATE = triton.next_power_of_2(dstate)
+
+    total_work = batch * nheads
+    # Cap N_CTAs at total_work to avoid idle CTAs that do 0 iterations
+    actual_n_ctas = min(n_ctas, total_work)
+
+    conv_input = conv_input.contiguous()
+    conv_state = conv_state.contiguous()
+    conv_weight = conv_weight.contiguous()
+
+    _fused_conv_ssm_kernel_persistent[(actual_n_ctas,)](
+        conv_input,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        dt,
+        dt_bias,
+        A,
+        D,
+        ssm_state,
+        conv_slot_idx,
+        ssm_slot_idx,
+        out,
+        total_work,
+        batch,
+        conv_dim,
+        intermediate_size,
+        nheads,
+        dim,
+        dstate,
+        ngroups,
+        nheads_per_group,
+        kernel_width,
+        conv_input.stride(0),
+        conv_input.stride(1),
+        conv_state.stride(0),
+        conv_state.stride(1),
+        conv_state.stride(2),
+        conv_weight.stride(0),
+        conv_weight.stride(1),
+        ssm_state.stride(0),
+        ssm_state.stride(1),
+        ssm_state.stride(2),
+        ssm_state.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        BLOCK_DIM=BLOCK_DIM,
+        BLOCK_DSTATE=BLOCK_DSTATE,
+        N_CTAs=actual_n_ctas,
+        num_warps=4,
+    )
+
+
 def fused_conv_ssm_decode(
     conv_input: torch.Tensor,
     conv_state: torch.Tensor,
