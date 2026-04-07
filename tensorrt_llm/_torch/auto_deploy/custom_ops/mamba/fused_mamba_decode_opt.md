@@ -107,6 +107,82 @@ The kernel has a pre-existing write-read race for B/C conv state when `nheads_pe
 
 ______________________________________________________________________
 
+### Iter 1: num_warps sweep {1, 2, 4, 8, 16}
+
+Tested at B=1,8,64,384 with BLOCK_DIM=64, BLOCK_DSTATE=128.
+
+| num_warps | B=1 kernel_us | B=8 kernel_us | B=64 kernel_us | B=384 kernel_us |
+|-----------|---------------|---------------|----------------|-----------------|
+| 1         | 32.46         | 94.61         | 675.67         | 4035.09         |
+| 2         | 9.68          | 18.91         | 111.14         | 642.09          |
+| 4 (base)  | 8.78          | 19.58         | 109.88         | 630.83          |
+| **8**     | **8.99**      | **19.44**     | **106.91**     | **608.25**      |
+| 16        | 9.03          | 20.57         | 115.82         | 661.94          |
+
+**Winner: num_warps=8** — ~3% better at B=384, B=256.
+
+- num_warps=1 is catastrophically slow (serialized warp).
+- num_warps=2 is slightly slower than 4 at small batch.
+- num_warps=8 gives best throughput for large batch.
+- num_warps=16 is slower (too many warps for this register-heavy kernel).
+
+Full sweep with num_warps=8:
+
+| batch | kernel_us | e2e_us | kernel_pct |
+|-------|-----------|--------|------------|
+|     1 |      8.99 |   9.16 |      98.1% |
+|     2 |     10.38 |  10.43 |      99.5% |
+|     4 |     12.70 |  12.91 |      98.4% |
+|     8 |     19.44 |  19.94 |      97.5% |
+|    16 |     32.43 |  32.76 |      99.0% |
+|    32 |     57.81 |  58.92 |      98.1% |
+|    64 |    106.91 | 110.04 |      97.2% |
+|   128 |    206.16 | 212.85 |      96.9% |
+|   256 |    406.89 | 421.93 |      96.4% |
+|   384 |    608.25 | 631.04 |      96.4% |
+
+______________________________________________________________________
+
+### Iter 2: BLOCK_DIM sweep {32, 64, 128} with num_warps=8
+
+Tested at B=1,8,64,384.
+
+| BLOCK_DIM | B=1 kernel_us | B=8 kernel_us | B=64 kernel_us | B=384 kernel_us |
+|-----------|---------------|---------------|----------------|-----------------|
+| 32        | 8.90          | 20.37         | 110.78         | 621.71          |
+| **64** (base) | **8.99** | **19.44**     | **106.91**     | **608.25**      |
+| 128       | 9.44          | 25.28         | 142.97         | 850.82          |
+
+**Winner: BLOCK_DIM=64** — the default is optimal.
+
+- BLOCK_DIM=32: slightly worse at B>=8 (more tiles = more kernel launch / scheduling overhead, and more B/C redundancy).
+- BLOCK_DIM=128: much worse (exceeds dim=64, padding waste; larger state tiles increase register pressure).
+
+______________________________________________________________________
+
+### Iter 3: BLOCK_DSTATE sweep {64, 128, 256} with num_warps=8
+
+Tested at B=1,8,64,384.
+
+| BLOCK_DSTATE | B=1 kernel_us | B=8 kernel_us | B=64 kernel_us | B=384 kernel_us | correct? |
+|--------------|---------------|---------------|----------------|-----------------|----------|
+| 64           | 8.10          | 13.20         | 59.74          | 339.14          | FAIL     |
+| **128** (base) | **8.99**   | **19.44**     | **106.91**     | **608.25**      | PASS     |
+| 256          | 9.64          | 25.98         | 154.45         | 905.58          | PASS     |
+
+**BLOCK_DSTATE=64 is incorrect** — with dstate=128, BLOCK_DSTATE=64 only processes half the state (no loop over dstate tiles), producing wrong results. Fast but wrong.
+
+**Winner: BLOCK_DSTATE=128** — the default is correct and optimal.
+
+**Conclusion from parameter sweep (iters 1-3):**
+Best config so far: `num_warps=8, BLOCK_DIM=64, BLOCK_DSTATE=128`
+
+- B=384: 608us (vs 631us baseline) = **+3.6% improvement**
+- B=64: 107us (vs 110us baseline) = **+2.8% improvement**
+- Small batch (B=1,2,4): within noise of baseline
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
