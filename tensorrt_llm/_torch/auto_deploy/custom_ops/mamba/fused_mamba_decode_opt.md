@@ -253,6 +253,55 @@ vs iter 4 (num_warps=8): B=384 608us → 589us = **-3.1% additional improvement*
 
 ______________________________________________________________________
 
+### Iter 7: Attempted optimizations (reverted)
+
+Multiple structural changes attempted but not kept:
+
+**7a. Separate B/C conv state update kernel** (`_bc_conv_state_update_kernel`):
+Run B/C state shift in a 2nd kernel (batch×ngroups grid) after the main kernel.
+Main kernel timing improved: B=384 582us vs 589us (-1.2%).
+But e2e WORSE: 591us vs 589us due to 2nd kernel launch overhead (~9us).
+REVERTED.
+
+**7b. 2D batch-load for conv state** (`[BLOCK_DIM, KW_PAD]` single load):
+Load all k=0..kw-2 state values per channel at once.
+Requires `tl.arange(0, KW_PAD)` where KW_PAD=4 (power of 2 for kw-1=3).
+CATASTROPHIC REGRESSION: B=384 617us (+4.8%). Excess register pressure from \[64, 4\] tile.
+REVERTED.
+
+**7c. num_stages=2 for software pipelining**:
+No meaningful improvement (B=384 within noise of current best).
+Not applied.
+
+**7d. evict_first on conv weight loads**:
+No improvement. Weights (49KB) are small enough to stay in L2 naturally.
+Not applied.
+
+**7e. BLOCK_DIM=32 with num_warps=2**:
+Halves state register pressure per CTA. B=384 589.6us (within noise of 588.6us baseline).
+No improvement on current H100.
+
+**7f. `_bc_conv_compute_kernel` (precompute B/C once per group)**:
+Implemented as a separate kernel that computes B/C values, updates B/C state,
+and stores results to a \[batch, 2, ngroups, dstate\] buffer.
+
+- B/C kernel alone: 12us for B=384 (3,072 CTAs vs 24,576 main CTAs)
+- Would eliminate 7/8 redundant B/C computation from main kernel
+- Main kernel could remove B/C section (saves ~30% of memory ops per CTA)
+- Estimated savings at B=384: ~97us → 491us total (vs current 589us = -17%)
+- But requires implementing a new main kernel that reads from bc_buf
+- Not yet integrated into launcher. Left as future work.
+
+**Register pressure analysis:**
+
+- Current kernel: 445 b32 registers per thread (from PTX)
+- With 256 threads/CTA and 65536 regs/SM → only 1 CTA per SM possible!
+- Root cause: state\[BLOCK_DIM=64, BLOCK_DSTATE=128\] = 8192 fp32 values per CTA
+- Solutions explored: BLOCK_DIM=32 (halves state regs, no net improvement on H100),
+  dstate tiling (not yet implemented), B/C precompute (not yet integrated).
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
@@ -290,7 +339,32 @@ ______________________________________________________________________
 
 ## 5. Final Best Configuration
 
-TBD after iterations complete.
+**Applied optimizations (in `fused_mamba_decode.py`):**
+
+1. `num_warps=8` (was 4) — +3.6% at B=384
+1. `eviction_policy="evict_last"` on SSM state load — +10.8% at B=1, +3.1% at B=384
+1. `eviction_policy="evict_last"` on conv state loads (hidden + B/C) — marginal at B=1
+
+**Per-shape best config table (all use num_warps=8, BLOCK_DIM=64, BLOCK_DSTATE=128):**
+
+| batch | iter-0 baseline (us) | best e2e (us) | improvement |
+|-------|----------------------|---------------|-------------|
+|     1 |                 9.00 |          8.22 |      -8.7%  |
+|     2 |                10.02 |          8.95 |     -10.7%  |
+|     4 |                12.52 |         11.23 |     -10.3%  |
+|     8 |                19.57 |         19.01 |      -2.9%  |
+|    16 |                32.35 |         33.27 |      +2.8%  |
+|    32 |                58.78 |         58.03 |      -1.3%  |
+|    64 |               109.91 |        105.59 |      -3.9%  |
+|   128 |               212.73 |        201.12 |      -5.5%  |
+|   256 |               421.63 |        394.25 |      -6.5%  |
+|   384 |               631.03 |        588.61 |      -6.7%  |
+
+**Not yet applied (future work):**
+
+- Precomputed B/C values (estimated -17% at B=384 but requires significant refactoring)
+- dstate tiling to reduce register pressure (enables >1 CTA/SM)
+- The `_bc_conv_compute_kernel` is defined in the file but not wired into the launcher
 
 ______________________________________________________________________
 

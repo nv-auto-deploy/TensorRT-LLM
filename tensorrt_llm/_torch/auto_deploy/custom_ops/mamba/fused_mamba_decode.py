@@ -30,6 +30,257 @@ from tensorrt_llm._torch.modules.mamba.softplus import softplus
 
 
 @triton.jit()
+def _bc_conv_compute_kernel(
+    conv_input_ptr,  # [batch, conv_dim]
+    conv_state_ptr,  # [max_batch, conv_dim, kernel_width-1]
+    conv_weight_ptr,  # [conv_dim, kernel_width]
+    conv_bias_ptr,  # [conv_dim]
+    conv_slot_idx_ptr,  # [batch]
+    bc_buf_ptr,  # [batch, 2, ngroups, dstate] — output (B=[:, 0, :, :], C=[:, 1, :, :])
+    batch,
+    ngroups,
+    dstate,
+    intermediate_size,
+    conv_dim,
+    kernel_width: tl.constexpr,
+    stride_ci_b,
+    stride_ci_d,
+    stride_cs_b,
+    stride_cs_d,
+    stride_cs_w,
+    stride_cw_d,
+    stride_cw_w,
+    BLOCK_DSTATE: tl.constexpr,
+):
+    """Compute B/C conv values, update B/C state, and store results to bc_buf.
+
+    Grid: (batch, ngroups) — each CTA handles one (batch, group) pair.
+    Eliminates 7/8 redundant B/C computation across heads in the same group.
+    """
+    pid_b = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    conv_slot = tl.load(conv_slot_idx_ptr + pid_b).to(tl.int64)
+
+    offs_n = tl.arange(0, BLOCK_DSTATE)
+    mask_n = offs_n < dstate
+
+    B_offset = intermediate_size + pid_g * dstate
+    C_offset = intermediate_size + ngroups * dstate + pid_g * dstate
+
+    B_channels = B_offset + offs_n
+    C_channels = C_offset + offs_n
+    mask_bc = (B_channels < conv_dim) & mask_n
+
+    B_vals = tl.zeros((BLOCK_DSTATE,), dtype=tl.float32)
+    C_vals = tl.zeros((BLOCK_DSTATE,), dtype=tl.float32)
+
+    for k in range(kernel_width - 1):
+        b_state = tl.load(
+            conv_state_ptr + conv_slot * stride_cs_b + B_channels * stride_cs_d + k * stride_cs_w,
+            mask=mask_bc,
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+        b_w = tl.load(
+            conv_weight_ptr + B_channels * stride_cw_d + k * stride_cw_w, mask=mask_bc, other=0.0
+        ).to(tl.float32)
+        B_vals += b_state * b_w
+
+        c_state = tl.load(
+            conv_state_ptr + conv_slot * stride_cs_b + C_channels * stride_cs_d + k * stride_cs_w,
+            mask=mask_bc,
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+        c_w = tl.load(
+            conv_weight_ptr + C_channels * stride_cw_d + k * stride_cw_w, mask=mask_bc, other=0.0
+        ).to(tl.float32)
+        C_vals += c_state * c_w
+
+    # Current input for B, C
+    b_in = tl.load(
+        conv_input_ptr + pid_b * stride_ci_b + B_channels * stride_ci_d, mask=mask_bc, other=0.0
+    ).to(tl.float32)
+    b_w_last = tl.load(
+        conv_weight_ptr + B_channels * stride_cw_d + (kernel_width - 1) * stride_cw_w,
+        mask=mask_bc,
+        other=0.0,
+    ).to(tl.float32)
+    b_bias = tl.load(conv_bias_ptr + B_channels, mask=mask_bc, other=0.0).to(tl.float32)
+    B_vals += b_in * b_w_last + b_bias
+
+    c_in = tl.load(
+        conv_input_ptr + pid_b * stride_ci_b + C_channels * stride_ci_d, mask=mask_bc, other=0.0
+    ).to(tl.float32)
+    c_w_last = tl.load(
+        conv_weight_ptr + C_channels * stride_cw_d + (kernel_width - 1) * stride_cw_w,
+        mask=mask_bc,
+        other=0.0,
+    ).to(tl.float32)
+    c_bias = tl.load(conv_bias_ptr + C_channels, mask=mask_bc, other=0.0).to(tl.float32)
+    C_vals += c_in * c_w_last + c_bias
+
+    # Apply SiLU to B and C
+    B_vals = B_vals * (1.0 / (1.0 + tl.exp(-B_vals)))
+    C_vals = C_vals * (1.0 / (1.0 + tl.exp(-C_vals)))
+
+    # Store to bc_buf: [batch, 2, ngroups, dstate]
+    # B at [pid_b, 0, pid_g, offs_n], C at [pid_b, 1, pid_g, offs_n]
+    b_buf_offs = pid_b * (2 * ngroups * dstate) + 0 * (ngroups * dstate) + pid_g * dstate + offs_n
+    c_buf_offs = pid_b * (2 * ngroups * dstate) + 1 * (ngroups * dstate) + pid_g * dstate + offs_n
+    tl.store(bc_buf_ptr + b_buf_offs, B_vals.to(tl.bfloat16), mask=mask_n)
+    tl.store(bc_buf_ptr + c_buf_offs, C_vals.to(tl.bfloat16), mask=mask_n)
+
+    # Update B/C conv state (shift + append new input) — race-free since one CTA per group
+    for k in range(kernel_width - 2):
+        old_b = tl.load(
+            conv_state_ptr
+            + conv_slot * stride_cs_b
+            + B_channels * stride_cs_d
+            + (k + 1) * stride_cs_w,
+            mask=mask_bc,
+            other=0.0,
+        )
+        tl.store(
+            conv_state_ptr + conv_slot * stride_cs_b + B_channels * stride_cs_d + k * stride_cs_w,
+            old_b,
+            mask=mask_bc,
+        )
+    tl.store(
+        conv_state_ptr
+        + conv_slot * stride_cs_b
+        + B_channels * stride_cs_d
+        + (kernel_width - 2) * stride_cs_w,
+        b_in.to(conv_state_ptr.dtype.element_ty),
+        mask=mask_bc,
+    )
+
+    for k in range(kernel_width - 2):
+        old_c = tl.load(
+            conv_state_ptr
+            + conv_slot * stride_cs_b
+            + C_channels * stride_cs_d
+            + (k + 1) * stride_cs_w,
+            mask=mask_bc,
+            other=0.0,
+        )
+        tl.store(
+            conv_state_ptr + conv_slot * stride_cs_b + C_channels * stride_cs_d + k * stride_cs_w,
+            old_c,
+            mask=mask_bc,
+        )
+    tl.store(
+        conv_state_ptr
+        + conv_slot * stride_cs_b
+        + C_channels * stride_cs_d
+        + (kernel_width - 2) * stride_cs_w,
+        c_in.to(conv_state_ptr.dtype.element_ty),
+        mask=mask_bc,
+    )
+
+
+@triton.jit()
+def _bc_conv_state_update_kernel(
+    conv_input_ptr,  # [batch, conv_dim]
+    conv_state_ptr,  # [max_batch, conv_dim, kernel_width-1]
+    conv_slot_idx_ptr,  # [batch]
+    batch,
+    ngroups,
+    dstate,
+    intermediate_size,
+    conv_dim,
+    kernel_width: tl.constexpr,
+    stride_ci_b,
+    stride_ci_d,
+    stride_cs_b,
+    stride_cs_d,
+    stride_cs_w,
+    BLOCK_DSTATE: tl.constexpr,
+):
+    """Update B/C conv state for all groups. Grid: (batch, ngroups).
+
+    This kernel runs AFTER _fused_conv_ssm_kernel so the B/C state shift
+    is serialized (no race condition). The main kernel reads the PRE-shift
+    state, then this kernel performs the shift.
+    """
+    pid_b = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    conv_slot = tl.load(conv_slot_idx_ptr + pid_b).to(tl.int64)
+
+    offs_n = tl.arange(0, BLOCK_DSTATE)
+    mask_n = offs_n < dstate
+
+    B_offset = intermediate_size + pid_g * dstate
+    C_offset = intermediate_size + ngroups * dstate + pid_g * dstate
+
+    B_channels = B_offset + offs_n
+    C_channels = C_offset + offs_n
+    mask_bc = (B_channels < conv_dim) & mask_n
+
+    # Load the new inputs for B/C
+    b_in = tl.load(
+        conv_input_ptr + pid_b * stride_ci_b + B_channels * stride_ci_d,
+        mask=mask_bc,
+        other=0.0,
+    )
+    c_in = tl.load(
+        conv_input_ptr + pid_b * stride_ci_b + C_channels * stride_ci_d,
+        mask=mask_bc,
+        other=0.0,
+    )
+
+    # Shift B state: [k] <- [k+1], then store new input at end
+    for k in range(kernel_width - 2):
+        old_b = tl.load(
+            conv_state_ptr
+            + conv_slot * stride_cs_b
+            + B_channels * stride_cs_d
+            + (k + 1) * stride_cs_w,
+            mask=mask_bc,
+            other=0.0,
+        )
+        tl.store(
+            conv_state_ptr + conv_slot * stride_cs_b + B_channels * stride_cs_d + k * stride_cs_w,
+            old_b,
+            mask=mask_bc,
+        )
+    tl.store(
+        conv_state_ptr
+        + conv_slot * stride_cs_b
+        + B_channels * stride_cs_d
+        + (kernel_width - 2) * stride_cs_w,
+        b_in,
+        mask=mask_bc,
+    )
+
+    # Shift C state
+    for k in range(kernel_width - 2):
+        old_c = tl.load(
+            conv_state_ptr
+            + conv_slot * stride_cs_b
+            + C_channels * stride_cs_d
+            + (k + 1) * stride_cs_w,
+            mask=mask_bc,
+            other=0.0,
+        )
+        tl.store(
+            conv_state_ptr + conv_slot * stride_cs_b + C_channels * stride_cs_d + k * stride_cs_w,
+            old_c,
+            mask=mask_bc,
+        )
+    tl.store(
+        conv_state_ptr
+        + conv_slot * stride_cs_b
+        + C_channels * stride_cs_d
+        + (kernel_width - 2) * stride_cs_w,
+        c_in,
+        mask=mask_bc,
+    )
+
+
+@triton.jit()
 def _fused_conv_ssm_kernel(
     # Conv inputs
     conv_input_ptr,  # [batch, conv_dim] — raw input to conv (before split)
