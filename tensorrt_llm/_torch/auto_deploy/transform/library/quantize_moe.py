@@ -32,6 +32,7 @@ from ...utils.quantization_utils import (
     should_skip_quantization,
 )
 from ..interface import SharedConfig, TransformInfo, TransformRegistry
+from .fused_moe import _moe_stack_load_hook
 from .quantization import (
     FP8LinearQuantizationFromConfig,
     NVFP4LinearQuantizationFromConfig,
@@ -125,9 +126,17 @@ def _quantize_moe_node(
                 scales = [gm.graph.get_attr(modname + "." + s) for s in scale_keys]
                 scale_nodes_group.append(scales)
 
-        # Derive canonical name: "experts.0.w1", "experts.1.w1" → "experts.w1_stacked_quant"
+        # Derive canonical name from the LAST numeric component (expert index), not the first
+        # (which would be the layer index).  Example:
+        #   "backbone.layers.0.mixer.experts.0.up_proj.weight"  →  idx of expert "0" = 5
+        #   parent_path = "backbone.layers.0.mixer.experts"
+        #   attr_suffix = "up_proj_weight"
+        #   stacked_name = "backbone.layers.0.mixer.experts.up_proj_weight_stacked_quant"
+        # Using the first digit would strip the layer index and cause all layers to collide
+        # on the same stacked_name.
         parts = weight_names[0].split(".")
-        idx_pos = next((i for i, p in enumerate(parts) if p.isdigit()), len(parts) - 1)
+        digit_positions = [i for i, p in enumerate(parts) if p.isdigit()]
+        idx_pos = digit_positions[-1] if digit_positions else len(parts) - 1
         parent_path = ".".join(parts[:idx_pos])
         attr_suffix = "_".join(parts[idx_pos + 1 :])
         stacked_name = f"{parent_path}.{attr_suffix}_stacked_quant"
@@ -142,6 +151,18 @@ def _quantize_moe_node(
                 current.add_module(part, nn.Module())
             current = getattr(current, part)
         current.register_parameter(stacked_parts[-1], nn.Parameter(stacked, requires_grad=False))
+
+        # Register a load hook to stack per-expert checkpoint weights into the stacked key.
+        # This must run AFTER the per-expert load_hooks (registered above), so that BF16
+        # weights are already converted to FP8 before stacking.  Hook registration order
+        # is preserved by PyTorch, so registering here (after the loop) is correct.
+        gm._register_load_state_dict_pre_hook(
+            partial(
+                _moe_stack_load_hook,
+                stacked_key=stacked_name,
+                per_expert_keys=list(weight_names),
+            )
+        )
 
         for name in weight_names:
             name_parts = name.split(".")

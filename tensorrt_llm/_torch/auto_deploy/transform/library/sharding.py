@@ -1847,7 +1847,9 @@ def _insert_sharded_moe(
         orig_key = str(weight_node.target)
         tensor = gm.get_parameter(orig_key)
         sliced = tensor[lo:hi].contiguous()
-        new_key = orig_key + "_ep"
+        # Flatten dotted paths (e.g. "experts.w1_stacked_quant") so that register_parameter
+        # (which forbids "." in names) and get_attr (flat root lookup) both work correctly.
+        new_key = orig_key.replace(".", "_") + "_ep"
         gm.register_parameter(new_key, nn.Parameter(sliced, requires_grad=False))
         # Register a load hook so checkpoint loading maps orig_key → new_key[lo:hi]
         gm._register_load_state_dict_pre_hook(
