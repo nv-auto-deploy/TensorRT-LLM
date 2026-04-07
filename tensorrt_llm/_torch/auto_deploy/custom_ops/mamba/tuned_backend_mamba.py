@@ -76,7 +76,6 @@ def _tuned_cached_ssm(
     ssm_state_size = B.shape[3]
     batch_info = BatchInfo(batch_info_host)
     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
-    num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 
     # Preallocate output tensor
@@ -123,8 +122,8 @@ def _tuned_cached_ssm(
         slot_idx,
         num_prefill,
         num_prefill_tokens,
-        num_seq,
-        num_total_tokens,
+        num_decode,
+        num_decode,
         num_heads,
         head_dim,
         ssm_state_size,
