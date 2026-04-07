@@ -44,7 +44,7 @@ from .tuned_ssm_kernel import tuned_selective_state_update
 _FLASHINFER_DECODE_THRESHOLD = 32
 
 
-@torch.library.custom_op("auto_deploy::tuned_cached_ssm", mutates_args={})
+@torch.library.custom_op("auto_deploy::tuned_cached_ssm", mutates_args={"ssm_state_cache"})
 def _tuned_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
