@@ -693,13 +693,46 @@ No code change.
 
 ______________________________________________________________________
 
+### Iter 20: evict_first on conv_input loads — WORSE at large batch
+
+conv_input `[batch, conv_dim]` is fresh per decode step — new input to be convolved.
+Hypothesis: since conv_input is consumed once (per decode step), `evict_first` on
+these loads frees L2 for more important data (conv state, SSM state).
+
+Tested: `eviction_policy="evict_first"` on all conv_input loads — x_in (hidden channels),
+b_in and c_in (B/C channels).
+
+| batch | current (us) | input_evict_first (us) | delta |
+|-------|--------------|------------------------|-------|
+|     1 |         7.40 |                   7.45 | +0.7% |
+|     8 |        11.16 |                  10.98 | -1.6% |
+|    64 |        57.58 |                  59.56 | +3.4% |
+|   128 |       105.75 |                 111.22 | +5.2% |
+|   256 |       203.19 |                 214.84 | +5.7% |
+|   384 |       301.76 |                 320.13 | +6.1% |
+
+**Conclusion:** SIGNIFICANTLY WORSE at large batch — +6.1% regression at B=384.
+
+Analysis: conv_input `[batch, conv_dim=6144]` is 12KB per batch element (bf16).
+Each batch element's input is shared across all 64 heads — 64 CTAs per batch element
+all read the same 12KB input slice. With `evict_first`, after the first head reads
+the input slice, the cache lines are evicted, forcing the remaining 63 heads to
+re-fetch the same data from HBM. This causes ~63x bandwidth amplification on
+conv_input, far outweighing any savings from freeing L2 for other data.
+
+At B=1 (64 CTAs for 1 batch element), this is the most severe — but measured noise
+hides it. At B=384 (24,576 CTAs), the effect aggregates to a clear +6.1% regression.
+No code change.
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
 
 - \[ \] **Vectorized loads for conv state**: Conv state is \[max_batch, conv_dim, kw-1\]; access pattern is strided (per channel). Load BLOCK_DIM channels in a single vectorized transaction instead of element-by-element.
 - \[ \] **Vectorized conv weight loads**: weight\[channel, k\] — same pattern, all channels for a given k are contiguous in memory if stride_cw_d=1, stride_cw_w=conv_dim. Load as block vector.
-- \[ \] **evict_first on conv_input**: Each batch element's input (12KB) is read by all 64 heads. evict_first would evict early and force re-fetches — TESTED in iter 20, significantly worse.
+- \[ \] **evict_first on conv_input**: Tested in iter 20 — WORSE (+6.1% at B=384). conv_input is shared by all 64 heads per batch element; evict_first causes repeated HBM fetches.
 
 ### Structural
 
