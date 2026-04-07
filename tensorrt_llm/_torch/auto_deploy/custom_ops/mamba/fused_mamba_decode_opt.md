@@ -633,6 +633,33 @@ No code change.
 
 ______________________________________________________________________
 
+### Iter 18: evict_first on conv state WRITES — no improvement
+
+The hidden conv state shift involves 2 loads (k+1 → k shifts) and 3 stores (shifted
+values + new x_in). These writes are next-read at the following decode step.
+
+Hypothesis: `evict_first` on writes avoids polluting L2 with just-written data, freeing
+L2 space for the SSM state prefetch and conv state reads.
+
+Tested: `eviction_policy="evict_first"` on all hidden conv state store ops AND all B/C
+conv state store ops (both shift writes and new-value writes).
+
+| batch | current (us) | conv_write_evict_first (us) | delta |
+|-------|--------------|------------------------------|-------|
+|     1 |         7.52 |                         7.52 |  -0.0% |
+|     8 |        11.00 |                        11.00 |  +0.0% |
+|    64 |        57.67 |                        57.85 |  +0.3% |
+|   128 |       106.14 |                       105.95 |  -0.2% |
+|   256 |       203.25 |                       203.54 |  +0.1% |
+|   384 |       301.61 |                       302.11 |  +0.2% |
+
+**Conclusion:** Completely within noise at all batch sizes. The conv state writes
+are a small fraction of total traffic (~10% of SSM state traffic) and GPU write-combine
+hardware already handles them efficiently. No benefit from streaming hints.
+No code change.
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
