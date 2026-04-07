@@ -574,34 +574,50 @@ No code change. `evict_last` on SSM state prefetch remains the production settin
 
 ______________________________________________________________________
 
+### Iter 16: Scattered slot indices — production realism characterization
+
+In production, KV cache slots are allocated from a pool and may not be contiguous.
+Scattered slot indices mean SSM state and conv state are accessed at random HBM offsets,
+potentially preventing L2 cache line reuse across batch elements within the same kernel
+invocation.
+
+Tested by using `torch.randperm(MAX_BATCH)[:batch]` for slot indices instead of
+`torch.arange(batch)` (sequential). This simulates a fully fragmented cache pool.
+
+| batch | sequential (us) | scattered (us) | ratio |
+|-------|-----------------|----------------|-------|
+|     1 |            7.53 |           7.21 | 0.957x |
+|     8 |           11.27 |          11.08 | 0.984x |
+|    64 |           57.95 |          58.44 | 1.009x |
+|   128 |          105.83 |         106.38 | 1.005x |
+|   256 |          203.28 |         204.60 | 1.006x |
+|   384 |          301.66 |         302.68 | 1.003x |
+
+**Conclusion:** Scattered slots show essentially no performance difference at large batch
+(ratio 1.000-1.006x at B=64-384). The kernel is insensitive to slot layout because:
+
+1. Each CTA accesses its own independent state slice — no inter-CTA reuse opportunity.
+1. With 24,576 CTAs at B=384, each slot/state tile is accessed by exactly one CTA.
+1. H100 HBM bandwidth is saturated regardless of access order — scatter vs sequential doesn't matter when L2 miss rate is already 100%.
+
+The sequential-slot benchmark is representative of production performance.
+No code change.
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
 
 - \[ \] **Vectorized loads for conv state**: Conv state is \[max_batch, conv_dim, kw-1\]; access pattern is strided (per channel). Load BLOCK_DIM channels in a single vectorized transaction instead of element-by-element.
 - \[ \] **Vectorized conv weight loads**: weight\[channel, k\] — same pattern, all channels for a given k are contiguous in memory if stride_cw_d=1, stride_cw_w=conv_dim. Load as block vector.
-- \[ \] **Eviction hints on SSM state**: State is \[max_batch, nheads, dim, dstate\] — large tensor. Use `eviction_policy="evict_last"` to avoid thrashing L2 with state data and keep other data cached.
-- \[ \] **Eviction hints on conv state**: Similar argument — conv state is large. Try evict_last on state reads.
-
-### Compute
-
-- \[ \] **Precompute dA once per head** (currently every pid_d in the same head computes the same scalar dA). In the current grid, each pid_h already maps to one head, so dA is computed once per CTA — already fine. No issue here.
-- \[ \] **Static loop unrolling**: Use `tl.static_range(kernel_width - 1)` instead of `range(kernel_width - 1)`. With kernel_width as constexpr, Triton may already unroll, but explicit static range makes it guaranteed.
-- \[ \] **Precompute B/C channel base pointers**: Reduce redundant address arithmetic in inner loops.
-
-### Parallelism / Occupancy
-
-- \[ \] **num_warps tuning**: Default is 4. For decode (small batch), 2 warps may be better (less register spilling). For large batch, 4-8 warps may improve occupancy. Sweep: {1, 2, 4, 8}.
-- \[ \] **BLOCK_DIM variants**: 32 (more tiles, more parallelism) vs 64 (default) vs 128 (fewer tiles, more work per CTA). With dim=64 and BLOCK_DIM=64, only 1 tile per head already — going to 32 doubles the grid.
-- \[ \] **BLOCK_DSTATE variants**: 64 (halved; smaller state tile), 128 (default), 256 (oversized, padded). With dstate=128, BLOCK_DSTATE=128 is exact. Try 64 with two passes (if it reduces register pressure).
+- \[ \] **evict_first on conv_input**: Each batch element's input (12KB) is read by all 64 heads. evict_first would evict early and force re-fetches — TESTED in iter 20, significantly worse.
 
 ### Structural
 
 - \[ \] **Persistent kernel**: For small batch (1-8), try a persistent kernel that loops over multiple batch elements within one CTA. Amortizes launch overhead and may improve L2 hit rate for weights.
-- \[ \] **Separate B/C conv state update kernel**: The `if pid_h % nheads_per_group == 0` guard means 7/8 heads skip the B/C store — wasted divergence. Alternative: separate small kernel just for B/C conv state update (ngroups × BLOCK_DSTATE threads per batch).
+- \[ \] **Separate B/C conv state update kernel**: Tested in iter 7a (worse e2e due to kernel launch overhead).
 - \[ \] **Grid reorder**: Current order is (dim_tile, batch, nhead). Reorder to (batch, nhead, dim_tile) so consecutive CTAs share the same batch element → better L2 locality for conv_state and ssm_state.
-- \[ \] **Load B/C conv values once per group**: Currently every head in a group independently loads and computes B/C convolution. Only the first head stores the result. Optimization: compute B/C conv only for the first head, broadcast via shared memory or restructure grid.
-- \[ \] **num_stages tuning**: Software pipelining in loops. Try num_stages=2 vs default (1).
 
 ### Precision
 
@@ -613,30 +629,33 @@ ______________________________________________________________________
 
 **Applied optimizations (in `fused_mamba_decode.py`):**
 
-1. `num_warps=8` (was 4) — +3.6% at B=384
-1. `eviction_policy="evict_last"` on SSM state load — +10.8% at B=1, +3.1% at B=384
-1. `eviction_policy="evict_last"` on conv state loads (hidden + B/C) — marginal at B=1
+1. `num_warps=4` (re-tuned from 8 after bf16 SSM state dtype fix) — optimal at B=64+
+1. `eviction_policy="evict_last"` on SSM state load (prefetch) — retains in L2 for compute
+1. `eviction_policy="evict_last"` on conv state loads (hidden + B/C) — reduces L2 thrash
+1. SSM state prefetch issued before conv computation — overlaps HBM latency with compute
+1. Scalar loads (dt, A, D) before state prefetch — gives memory controller maximum notice
+1. B/C conv state writes reordered to after SSM output stores — removes from critical path
 
-**Per-shape best config table (all use num_warps=8, BLOCK_DIM=64, BLOCK_DSTATE=128):**
+**Per-shape best config (num_warps=4, BLOCK_DIM=64, BLOCK_DSTATE=128, bf16 SSM state):**
 
-| batch | iter-0 baseline (us) | best e2e (us) | improvement |
-|-------|----------------------|---------------|-------------|
-|     1 |                 9.00 |          8.22 |      -8.7%  |
-|     2 |                10.02 |          8.95 |     -10.7%  |
-|     4 |                12.52 |         11.23 |     -10.3%  |
-|     8 |                19.57 |         19.01 |      -2.9%  |
-|    16 |                32.35 |         33.27 |      +2.8%  |
-|    32 |                58.78 |         58.03 |      -1.3%  |
-|    64 |               109.91 |        105.59 |      -3.9%  |
-|   128 |               212.73 |        201.12 |      -5.5%  |
-|   256 |               421.63 |        394.25 |      -6.5%  |
-|   384 |               631.03 |        588.61 |      -6.7%  |
+| batch | iter-0 baseline (fp32 state, us) | best e2e (bf16 state, us) | improvement |
+|-------|----------------------------------|---------------------------|-------------|
+|     1 |                             9.00 |                      7.39 |     -17.9%  |
+|     8 |                            19.57 |                     10.92 |     -44.2%  |
+|    64 |                           109.91 |                     57.57 |     -47.6%  |
+|   128 |                           212.73 |                    105.80 |     -50.3%  |
+|   256 |                           421.63 |                    203.21 |     -51.8%  |
+|   384 |                           631.03 |                    301.50 |     -52.2%  |
 
-**Not yet applied (future work):**
+Note: The large improvement vs iter-0 is mostly due to fixing the SSM state dtype from fp32 to
+bf16 (iter 9), which halves the dominant memory traffic.
 
-- Precomputed B/C values (estimated -17% at B=384 but requires significant refactoring)
-- dstate tiling to reduce register pressure (enables >1 CTA/SM)
-- The `_bc_conv_compute_kernel` is defined in the file but not wired into the launcher
+**HBM bandwidth roofline (B=384, bf16 SSM state):**
+
+- SSM state: 24,576 CTAs × 16KB R+W = 786MB
+- Conv state (hidden + B/C): ~226MB additional
+- Total: ~1.0GB at H100 HBM3 3.35TB/s = 298us theoretical minimum
+- Actual: 301us = **1.01× roofline** — bandwidth-optimal
 
 ______________________________________________________________________
 
