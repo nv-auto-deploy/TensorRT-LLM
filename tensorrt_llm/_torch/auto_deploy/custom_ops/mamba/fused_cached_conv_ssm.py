@@ -166,7 +166,7 @@ def _fused_cached_conv_ssm(
     if num_decode > 0:
         conv_in_dec = inp_flat[num_prefill_tokens:num_total_tokens]  # [nd, conv_dim]
         dt_dec = dt_flat[num_prefill_tokens:num_total_tokens]  # [nd, nheads]
-        slot_idx_dec = slot_idx[num_prefill:num_seq].to(torch.int32)
+        slot_idx_dec = slot_idx[num_prefill:num_seq]
 
         fused_conv_ssm_decode(
             conv_in_dec,
