@@ -88,7 +88,7 @@ def _tuned_cached_ssm(
     preallocated_ssm_out_p = preallocated_ssm_out[:num_prefill_tokens]
 
     # Prefill: reuse mamba_chunk_scan_combined (already fast)
-    num_prefill, num_prefill_tokens, num_total_tokens, num_seq = _run_ssm_prefill(
+    _run_ssm_prefill(
         hs_flat,
         B_flat,
         C_flat,
