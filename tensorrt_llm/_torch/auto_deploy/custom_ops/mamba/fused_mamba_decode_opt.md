@@ -469,6 +469,42 @@ Process all 8 heads in a group sequentially within one CTA, loading B/C state on
 
 ______________________________________________________________________
 
+### Iter 13: Load SSM scalars (dt, A, D) before state prefetch
+
+Reordered kernel: load scalar values (dt, dt_bias, A, D — 4 scalars ≈ 8B) and compute
+softplus+exp **before** issuing the SSM state prefetch. This means:
+
+1. Scalar loads are serviced from L2/L1 (fast, ~1 cycle)
+1. dA = exp(A * softplus(dt + dt_bias)) is computed
+1. State prefetch is then issued with all prior scalar work complete
+1. Conv1d sections execute while state load is in flight
+
+Previously, state prefetch was issued before any scalar computation, meaning the
+scalar work only slightly preceded the actual state consumption. Now the scalar
+computation fully precedes the issue, giving the memory controller maximum notice.
+
+Results:
+
+| batch | before (us) | after (us) | delta |
+|-------|-------------|------------|-------|
+|     1 |        7.21 |       7.53 |  +4.5% |
+|     2 |        7.63 |       7.83 |  +2.6% |
+|     4 |        8.45 |       8.41 |  -0.5% |
+|     8 |       10.80 |      10.64 |  -1.5% |
+|    16 |       19.50 |      19.03 |  -2.4% |
+|    32 |       34.16 |      33.27 |  -2.6% |
+|    64 |       58.99 |      58.16 |  -1.4% |
+|   128 |      107.59 |     106.87 |  -0.7% |
+|   256 |      206.13 |     204.91 |  -0.6% |
+|   384 |      304.56 |     303.55 |  -0.3% |
+
+B=384: 304us → 303us = **-0.3%**. B=16,32: **-2.5%** improvement.
+B=1,2 slightly worse — scalar computation adds instructions to critical path at tiny batch.
+
+Correctness: PASS (batch=1, batch=2).
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access

@@ -355,11 +355,24 @@ def _fused_conv_ssm_kernel(
     mask_dn = mask_d[:, None] & mask_n[None, :]
 
     # ---------------------------------------------------------------
-    # Prefetch SSM state early to overlap HBM latency with B/C compute.
-    # The SSM state load (16KB per CTA) is issued here so that the GPU
-    # memory controller can begin fetching it while the warp computes
-    # the B/C conv convolution below. This hides ~50% of the state
-    # load latency behind B/C compute at large batch sizes.
+    # Load SSM scalars early (dt, A, D are tiny — a few bytes each).
+    # Computing softplus and dA before the state prefetch means the
+    # scalar ALU work completes before we issue the large 16KB state
+    # load, giving the memory controller maximum time to fetch it.
+    # ---------------------------------------------------------------
+    dt_val = tl.load(dt_ptr + pid_b * nheads + pid_h).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias_ptr + pid_h).to(tl.float32)
+    dt_val = softplus(dt_val + dt_bias_val)
+
+    A_val = tl.load(A_ptr + pid_h).to(tl.float32)
+    dA = tl.exp(A_val * dt_val)
+    D_val = tl.load(D_ptr + pid_h).to(tl.float32)
+
+    # ---------------------------------------------------------------
+    # Prefetch SSM state after scalar computation.
+    # The load is issued early so the GPU can fetch the 16KB state
+    # tile while the warp executes the conv1d sections below.
+    # This overlaps memory latency with compute.
     # ---------------------------------------------------------------
     state_ptrs = (
         ssm_state_ptr
@@ -572,17 +585,9 @@ def _fused_conv_ssm_kernel(
     # Step 3: SSM state update
     # state = state * exp(A * dt) + x * dt * B
     # out = sum(state * C) + x * D
+    # dt, A, D, dA were pre-computed at the top of the kernel.
     # ---------------------------------------------------------------
-    # Load dt (broadcast from [batch, nheads])
-    dt_val = tl.load(dt_ptr + pid_b * nheads + pid_h).to(tl.float32)
-    dt_bias_val = tl.load(dt_bias_ptr + pid_h).to(tl.float32)
-    dt_val = softplus(dt_val + dt_bias_val)
-
-    # Load A (scalar per head)
-    A_val = tl.load(A_ptr + pid_h).to(tl.float32)
-    dA = tl.exp(A_val * dt_val)  # scalar
-
-    # Use the prefetched SSM state (issued before B/C computation)
+    # Use the prefetched SSM state (issued before conv computation)
     state = state_prefetch.to(tl.float32)
 
     # State update
@@ -591,7 +596,6 @@ def _fused_conv_ssm_kernel(
 
     # Output: sum(state * C) + x * D
     out = tl.sum(state * C_vals[None, :], axis=1)
-    D_val = tl.load(D_ptr + pid_h).to(tl.float32)
     out += x_hidden * D_val
 
     # Store output and state
