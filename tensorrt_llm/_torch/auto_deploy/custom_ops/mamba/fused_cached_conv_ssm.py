@@ -113,16 +113,17 @@ def _fused_cached_conv_ssm(
             cache_indices=slot_idx[:num_prefill].to(torch.int32),
             has_initial_state=use_initial_states[:num_prefill],
             conv_states=conv_state_cache,
-            activation=None,  # SiLU applied inline below on hidden channels only (avoids large-batch regression)
+            activation=None,  # SiLU applied inline below (avoids large-batch kernel regression)
             pad_slot_id=PAD_SLOT_ID,
         )  # [conv_dim, prefill_tokens]
         inp_flat[:num_prefill_tokens] = y_varlen.T
 
+        # Apply SiLU to ALL channels (x, B, C) to match the original model, which applies
+        # self.act (SiLU) to the entire conv output before splitting into x/B/C.
+        torch.nn.functional.silu(inp_flat[:num_prefill_tokens], inplace=True)
+
         # Split conv output for SSM
         x_p = inp_flat[:num_prefill_tokens, :intermediate_size]
-        torch.nn.functional.silu(
-            x_p, inplace=True
-        )  # SiLU on hidden only; B/C channels are not activated
         B_p = inp_flat[
             :num_prefill_tokens, intermediate_size : intermediate_size + ngroups * dstate
         ]

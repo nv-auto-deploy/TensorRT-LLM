@@ -381,7 +381,7 @@ def _fused_conv_ssm_kernel(
         + offs_d[:, None] * stride_ss_d
         + offs_n[None, :] * stride_ss_n
     )
-    state_prefetch = tl.load(state_ptrs, mask=mask_dn, other=0.0, eviction_policy="evict_last")
+    state_prefetch = tl.load(state_ptrs, mask=mask_dn, other=0.0)
 
     # ---------------------------------------------------------------
     # Step 1: Conv1d update for hidden channels (slot-indexed)
@@ -425,33 +425,6 @@ def _fused_conv_ssm_kernel(
     ).to(tl.float32)
     bias = tl.load(conv_bias_ptr + hidden_channels, mask=mask_hc, other=0.0).to(tl.float32)
     conv_out_hidden += x_in * w_last + bias
-
-    # Update conv state: shift left, append new input
-    for k in range(kernel_width - 2):
-        old_val = tl.load(
-            conv_state_ptr
-            + conv_slot * stride_cs_b
-            + hidden_channels * stride_cs_d
-            + (k + 1) * stride_cs_w,
-            mask=mask_hc,
-            other=0.0,
-        )
-        tl.store(
-            conv_state_ptr
-            + conv_slot * stride_cs_b
-            + hidden_channels * stride_cs_d
-            + k * stride_cs_w,
-            old_val,
-            mask=mask_hc,
-        )
-    tl.store(
-        conv_state_ptr
-        + conv_slot * stride_cs_b
-        + hidden_channels * stride_cs_d
-        + (kernel_width - 2) * stride_cs_w,
-        x_in.to(conv_state_ptr.dtype.element_ty),
-        mask=mask_hc,
-    )
 
     # Apply SiLU: x * sigmoid(x)
     sigmoid_val = 1.0 / (1.0 + tl.exp(-conv_out_hidden))
@@ -522,6 +495,39 @@ def _fused_conv_ssm_kernel(
     B_vals = B_vals * (1.0 / (1.0 + tl.exp(-B_vals)))
     C_vals = C_vals * (1.0 / (1.0 + tl.exp(-C_vals)))
 
+    # Update hidden conv state: shift left, append new input.
+    # This is placed AFTER all B/C reads to avoid a cache-line false-sharing hazard:
+    # the last hidden channel (ch=intermediate_size-1) and the first B channel
+    # (ch=intermediate_size) share the same L1/L2 cache line. Writing hidden ch
+    # before reading B/C can cause other CTAs on different SMs to observe stale
+    # B/C values from their L1 cache (the write invalidates/updates the cache line
+    # while the B/C read is still in flight on the other SM).
+    for k in range(kernel_width - 2):
+        old_val = tl.load(
+            conv_state_ptr
+            + conv_slot * stride_cs_b
+            + hidden_channels * stride_cs_d
+            + (k + 1) * stride_cs_w,
+            mask=mask_hc,
+            other=0.0,
+        )
+        tl.store(
+            conv_state_ptr
+            + conv_slot * stride_cs_b
+            + hidden_channels * stride_cs_d
+            + k * stride_cs_w,
+            old_val,
+            mask=mask_hc,
+        )
+    tl.store(
+        conv_state_ptr
+        + conv_slot * stride_cs_b
+        + hidden_channels * stride_cs_d
+        + (kernel_width - 2) * stride_cs_w,
+        x_in.to(conv_state_ptr.dtype.element_ty),
+        mask=mask_hc,
+    )
+
     # ---------------------------------------------------------------
     # Step 3: SSM state update
     # state = state * exp(A * dt) + x * dt * B
@@ -547,63 +553,12 @@ def _fused_conv_ssm_kernel(
     )
     tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask_dn)
 
-    # Update B/C conv state AFTER SSM output stores.
-    # Moving the B/C state shift here (instead of before SiLU) allows the SSM
-    # computation and output store to execute while the B/C writes are pending in
-    # the store buffer, overlapping the B/C write latency with SSM compute.
-    # Only head-0 per group writes (race-free guard).
-    if pid_h % nheads_per_group == 0:
-        for k in range(kernel_width - 2):
-            old_b = tl.load(
-                conv_state_ptr
-                + conv_slot * stride_cs_b
-                + B_channels * stride_cs_d
-                + (k + 1) * stride_cs_w,
-                mask=mask_bc,
-                other=0.0,
-            )
-            tl.store(
-                conv_state_ptr
-                + conv_slot * stride_cs_b
-                + B_channels * stride_cs_d
-                + k * stride_cs_w,
-                old_b,
-                mask=mask_bc,
-            )
-        tl.store(
-            conv_state_ptr
-            + conv_slot * stride_cs_b
-            + B_channels * stride_cs_d
-            + (kernel_width - 2) * stride_cs_w,
-            b_in.to(conv_state_ptr.dtype.element_ty),
-            mask=mask_bc,
-        )
-
-        for k in range(kernel_width - 2):
-            old_c = tl.load(
-                conv_state_ptr
-                + conv_slot * stride_cs_b
-                + C_channels * stride_cs_d
-                + (k + 1) * stride_cs_w,
-                mask=mask_bc,
-                other=0.0,
-            )
-            tl.store(
-                conv_state_ptr
-                + conv_slot * stride_cs_b
-                + C_channels * stride_cs_d
-                + k * stride_cs_w,
-                old_c,
-                mask=mask_bc,
-            )
-        tl.store(
-            conv_state_ptr
-            + conv_slot * stride_cs_b
-            + C_channels * stride_cs_d
-            + (kernel_width - 2) * stride_cs_w,
-            c_in.to(conv_state_ptr.dtype.element_ty),
-            mask=mask_bc,
-        )
+    # NOTE: B/C conv state update is intentionally omitted here.
+    # The in-kernel B/C state shift (guarded by pid_h%nheads_per_group==0) causes
+    # a data race at large batch sizes: head-0 can write the shifted B/C state
+    # while other heads in the same group are still reading it on a different SM.
+    # Instead, _bc_conv_state_update_kernel is launched as a separate kernel in
+    # fused_conv_ssm_decode, serializing the shift after all heads have finished.
 
 
 @triton.jit()
@@ -1842,4 +1797,29 @@ def fused_conv_ssm_decode(
         BLOCK_DIM=BLOCK_DIM,
         BLOCK_DSTATE=BLOCK_DSTATE,
         num_warps=num_warps,
+    )
+
+    # Kernel 2: update B/C conv state (serialized after main kernel to avoid race).
+    # The main kernel (_fused_conv_ssm_kernel) reads B/C state from all heads in the
+    # same group concurrently. Having head-0 write the B/C shift in-kernel causes a
+    # data race at large batch sizes: head-0 on one SM can write the shifted state
+    # before other heads on different SMs finish reading. Running the shift as a
+    # separate kernel guarantees all reads complete before any writes occur.
+    _bc_conv_state_update_kernel[(batch, ngroups)](
+        conv_input,
+        conv_state,
+        conv_slot_idx,
+        batch,
+        ngroups,
+        dstate,
+        intermediate_size,
+        conv_dim,
+        kernel_width,
+        conv_input.stride(0),
+        conv_input.stride(1),
+        conv_state.stride(0),
+        conv_state.stride(1),
+        conv_state.stride(2),
+        BLOCK_DSTATE=BLOCK_DSTATE,
+        num_warps=4,
     )
