@@ -937,7 +937,9 @@ def fused_conv_ssm_decode(
 
     BLOCK_DIM = max(triton.next_power_of_2(dim), 16)
     BLOCK_DSTATE = triton.next_power_of_2(dstate)
-    num_warps = 8
+    # With bf16 SSM state (production default), num_warps=4 is optimal:
+    # halved register pressure allows better occupancy vs num_warps=8.
+    num_warps = 4
 
     def grid(META):
         return (triton.cdiv(dim, META["BLOCK_DIM"]), batch, nheads)

@@ -494,7 +494,7 @@ def main():
         default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
         help="Batch sizes to benchmark",
     )
-    parser.add_argument("--num_warps", type=int, default=8, help="Number of warps")
+    parser.add_argument("--num_warps", type=int, default=4, help="Number of warps")
     parser.add_argument("--block_dim", type=int, default=64, help="BLOCK_DIM (tile over head dim)")
     parser.add_argument(
         "--block_dstate", type=int, default=128, help="BLOCK_DSTATE (tile over dstate)"

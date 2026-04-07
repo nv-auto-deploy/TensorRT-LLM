@@ -364,6 +364,42 @@ Further improvements require either reducing memory traffic or improving compute
 
 ______________________________________________________________________
 
+### Iter 10: Re-sweep num_warps with correct bf16 SSM state dtype
+
+With bf16 SSM state (half the register pressure for state tile), the optimal warp count changes.
+
+| num_warps | B=1 (us) | B=8 (us) | B=64 (us) | B=384 (us) |
+|-----------|----------|----------|-----------|------------|
+| 1         |    12.85 |    19.13 |    117.49 |     628.66 |
+| 2         |     8.77 |    11.56 |     62.17 |     317.04 |
+| **4**     |  **7.57**| **10.61**|  **60.11**|  **306.28**|
+| 8         |     7.41 |    10.86 |     61.26 |     307.99 |
+| 16        |     7.73 |    12.69 |     73.53 |     388.67 |
+
+**Winner: num_warps=4** at large batch (B=64,384).
+B=1 is slightly better with num_warps=8 (7.41 vs 7.57us) but num_warps=4 dominates at production batch sizes.
+
+Updated launcher from num_warps=8 → num_warps=4.
+
+Full sweep with num_warps=4 + bf16 SSM state:
+
+| batch | kernel_us | e2e_us | kernel_pct |
+|-------|-----------|--------|------------|
+|     1 |      7.52 |   7.31 |     102.9% |
+|     2 |      7.77 |   7.54 |     103.1% |
+|     4 |      8.43 |   8.44 |      99.9% |
+|     8 |     10.44 |  10.43 |     100.0% |
+|    16 |     19.22 |  19.45 |      98.8% |
+|    32 |     34.10 |  34.28 |      99.5% |
+|    64 |     59.92 |  59.90 |     100.0% |
+|   128 |    109.06 | 109.19 |      99.9% |
+|   256 |    207.09 | 207.12 |     100.0% |
+|   384 |    306.52 | 306.48 |     100.0% |
+
+vs iter 9 baseline (num_warps=8, bf16): B=384 308us → 306us = **-0.6%** additional improvement.
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
