@@ -114,6 +114,7 @@ def _fused_conv_ssm_kernel(
 
     # Simple depthwise conv1d for kernel_width=4
     # Use conv_slot instead of pid_b for cache access
+    # evict_last on conv state: large tensor, evict after read to preserve L2 for weights
     for k in range(kernel_width - 1):  # k=0,1,2
         state_val = tl.load(
             conv_state_ptr
@@ -122,6 +123,7 @@ def _fused_conv_ssm_kernel(
             + k * stride_cs_w,
             mask=mask_hc,
             other=0.0,
+            eviction_policy="evict_last",
         ).to(tl.float32)
         w_val = tl.load(
             conv_weight_ptr + hidden_channels * stride_cw_d + k * stride_cw_w,
@@ -195,6 +197,7 @@ def _fused_conv_ssm_kernel(
             conv_state_ptr + conv_slot * stride_cs_b + B_channels * stride_cs_d + k * stride_cs_w,
             mask=mask_bc,
             other=0.0,
+            eviction_policy="evict_last",
         ).to(tl.float32)
         b_w = tl.load(
             conv_weight_ptr + B_channels * stride_cw_d + k * stride_cw_w, mask=mask_bc, other=0.0
@@ -205,6 +208,7 @@ def _fused_conv_ssm_kernel(
             conv_state_ptr + conv_slot * stride_cs_b + C_channels * stride_cs_d + k * stride_cs_w,
             mask=mask_bc,
             other=0.0,
+            eviction_policy="evict_last",
         ).to(tl.float32)
         c_w = tl.load(
             conv_weight_ptr + C_channels * stride_cw_d + k * stride_cw_w, mask=mask_bc, other=0.0
@@ -312,6 +316,7 @@ def _fused_conv_ssm_kernel(
     dA = tl.exp(A_val * dt_val)  # scalar
 
     # Load SSM state: [BLOCK_DIM, BLOCK_DSTATE] (slot-indexed)
+    # evict_last: SSM state is large; evict after use to preserve L2 for weights/conv
     state_ptrs = (
         ssm_state_ptr
         + ssm_slot * stride_ss_b
@@ -319,7 +324,9 @@ def _fused_conv_ssm_kernel(
         + offs_d[:, None] * stride_ss_d
         + offs_n[None, :] * stride_ss_n
     )
-    state = tl.load(state_ptrs, mask=mask_dn, other=0.0).to(tl.float32)
+    state = tl.load(state_ptrs, mask=mask_dn, other=0.0, eviction_policy="evict_last").to(
+        tl.float32
+    )
 
     # State update
     dB = B_vals[None, :] * dt_val  # [1, BLOCK_DSTATE]

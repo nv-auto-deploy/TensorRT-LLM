@@ -211,6 +211,48 @@ Final state of iter 4 (num_warps=8, range reverted):
 
 ______________________________________________________________________
 
+### Iter 5: eviction_policy="evict_last" on SSM state load
+
+The SSM state `[max_batch, nheads, dim, dstate]` is a large tensor (~MAX_BATCH×64×64×128×4B = ~2GB for MAX_BATCH=512).
+Each CTA only uses a small slice but the total working set vastly exceeds L2 cache (50MB on H100).
+Setting `eviction_policy="evict_last"` on the state load hints the GPU to deprioritize state cachelines,
+freeing L2 for conv weights and input data which benefit more from reuse across batch elements.
+
+Results (SSM state evict_last only):
+
+| batch | before (us) | after (us) | delta |
+|-------|-------------|------------|-------|
+|     1 |        9.24 |       8.24 | -10.8% |
+|     8 |       19.47 |      18.85 |  -3.2% |
+|    64 |      106.93 |     105.64 |  -1.2% |
+|   384 |      608.15 |     589.07 |  -3.1% |
+
+______________________________________________________________________
+
+### Iter 6: eviction_policy="evict_last" on conv state loads (hidden + B/C)
+
+Additional evict_last on hidden channel conv state reads and B/C channel conv state reads.
+
+Full sweep results (iter 5 + iter 6 combined — SSM + conv state evict_last):
+
+| batch | kernel_us | e2e_us | kernel_pct |
+|-------|-----------|--------|------------|
+|     1 |      8.25 |   8.24 |     100.1% |
+|     2 |      8.71 |   8.72 |      99.9% |
+|     4 |     11.26 |  10.98 |     102.6% |
+|     8 |     18.77 |  22.71 |      82.7% |
+|    16 |     33.56 |  33.56 |     100.0% |
+|    32 |     58.34 |  58.07 |     100.5% |
+|    64 |    105.37 | 105.59 |      99.8% |
+|   128 |    201.06 | 201.19 |      99.9% |
+|   256 |    394.21 | 394.38 |     100.0% |
+|   384 |    588.94 | 588.57 |     100.1% |
+
+vs baseline (iter 0): B=384 631us → 589us = **-6.7% total improvement** vs baseline.
+vs iter 4 (num_warps=8): B=384 608us → 589us = **-3.1% additional improvement**.
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
