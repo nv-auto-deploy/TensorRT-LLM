@@ -209,6 +209,10 @@ def _bc_conv_state_update_kernel(
 
     conv_slot = tl.load(conv_slot_idx_ptr + pid_b).to(tl.int64)
 
+    # Skip pad slots (slot == -1 means padding — no state to update).
+    if conv_slot < 0:
+        return
+
     offs_n = tl.arange(0, BLOCK_DSTATE)
     mask_n = offs_n < dstate
 
@@ -345,6 +349,12 @@ def _fused_conv_ssm_kernel(
     # Load slot indices for cache access
     conv_slot = tl.load(conv_slot_idx_ptr + pid_b).to(tl.int64)
     ssm_slot = tl.load(ssm_slot_idx_ptr + pid_b).to(tl.int64)
+
+    # Skip pad slots (slot == -1 means padding, no real sequence).
+    # Without this guard, pad slots produce OOB memory accesses (ptr - stride)
+    # that silently corrupt adjacent tensors, causing catastrophically wrong outputs.
+    if conv_slot < 0 or ssm_slot < 0:
+        return
 
     group_idx = pid_h // nheads_per_group
 
