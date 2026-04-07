@@ -432,6 +432,43 @@ Correctness: PASS (batch=1, batch=2).
 
 ______________________________________________________________________
 
+### Iter 12: Characterization experiments (batched heads, skip B/C, BLOCK_DIM=32)
+
+Several structural changes were tested with bf16 SSM state to understand the performance breakdown.
+All tested against current best (iter 11 prefetch kernel, 304us at B=384).
+
+**12a: Skip B/C conv computation** (lower bound test):
+Zero out B/C values to measure how much the B/C section costs.
+
+- B=384: 293us (vs 304us) — B/C section costs ~11us = 3.6% of total kernel time.
+- Small B is more sensitive: B=8: 10.22 vs 10.8us (5.4% of kernel time).
+
+**12b: Batched heads (1 CTA per group)** — grid `(batch, ngroups)`:
+Process all 8 heads in a group sequentially within one CTA, loading B/C state once for all heads.
+
+- B=384: 348us (vs 304us) — SLOWER due to fewer CTAs (3072 vs 24576), worse GPU utilization.
+
+**12c: BLOCK_DIM=32, num_warps=2**:
+
+- B=384: 307.9us (vs 304us) — SLIGHTLY WORSE. More CTAs but smaller state tiles help.
+- B=1: 7.62us (vs 7.21us) — worse at small batch.
+
+**12d: num_stages=2 (tl.range with num_stages=2)**:
+
+- B=384: 306us (vs 304us) — within noise. No benefit from pipelining short loops.
+
+**12e: Eviction policy on SSM state store** (default/evict_last/evict_first):
+
+- All within noise at B=384 (~306us). SSM store eviction policy doesn't matter.
+
+**Key insight from characterization:**
+
+- B/C conv costs only 3-5% of total kernel time at large batch.
+- The dominant cost is SSM state R/W (16KB per CTA, already at bandwidth roofline).
+- Further improvements are marginal — kernel is ~1.0x bandwidth roofline.
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Memory Access
