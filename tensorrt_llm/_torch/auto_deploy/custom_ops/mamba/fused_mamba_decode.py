@@ -61,6 +61,8 @@ def _bc_conv_compute_kernel(
     pid_g = tl.program_id(1)
 
     conv_slot = tl.load(conv_slot_idx_ptr + pid_b).to(tl.int64)
+    if conv_slot < 0:
+        return
 
     offs_n = tl.arange(0, BLOCK_DSTATE)
     mask_n = offs_n < dstate
@@ -620,6 +622,9 @@ def _fused_conv_ssm_kernel_bc_buf(
     stride_so_b,
     stride_so_h,
     stride_so_d,
+    # dt clamping (applied after softplus; use 0.0 / inf for no-op)
+    dt_clamp_min,
+    dt_clamp_max,
     # Meta
     BLOCK_DIM: tl.constexpr,
     BLOCK_DSTATE: tl.constexpr,
@@ -639,6 +644,8 @@ def _fused_conv_ssm_kernel_bc_buf(
 
     conv_slot = tl.load(conv_slot_idx_ptr + pid_b).to(tl.int64)
     ssm_slot = tl.load(ssm_slot_idx_ptr + pid_b).to(tl.int64)
+    if conv_slot < 0 or ssm_slot < 0:
+        return
 
     group_idx = pid_h // nheads_per_group
 
@@ -735,6 +742,7 @@ def _fused_conv_ssm_kernel_bc_buf(
     dt_val = tl.load(dt_ptr + pid_b * nheads + pid_h).to(tl.float32)
     dt_bias_val = tl.load(dt_bias_ptr + pid_h).to(tl.float32)
     dt_val = softplus(dt_val + dt_bias_val)
+    dt_val = tl.minimum(tl.maximum(dt_val, dt_clamp_min), dt_clamp_max)
 
     A_val = tl.load(A_ptr + pid_h).to(tl.float32)
     dA = tl.exp(A_val * dt_val)
@@ -778,6 +786,8 @@ def fused_conv_ssm_decode_two_kernel(
     conv_slot_idx: torch.Tensor,
     ssm_slot_idx: torch.Tensor,
     out: torch.Tensor,
+    dt_clamp_min: float = 0.0,
+    dt_clamp_max: float = float("inf"),
 ) -> None:
     """Two-kernel launch: B/C precompute + SSM-only main kernel.
 
@@ -788,7 +798,7 @@ def fused_conv_ssm_decode_two_kernel(
     """
     batch, conv_dim = conv_input.shape
     _, nheads, dim, dstate = ssm_state.shape
-    kernel_width = conv_state.shape[-1] + 1
+    kernel_width = conv_weight.shape[-1]
     intermediate_size = nheads * dim
     ngroups = (conv_dim - intermediate_size) // (2 * dstate)
     nheads_per_group = nheads // ngroups
@@ -797,8 +807,14 @@ def fused_conv_ssm_decode_two_kernel(
     BLOCK_DSTATE = triton.next_power_of_2(dstate)
 
     conv_input = conv_input.contiguous()
-    conv_state = conv_state.contiguous()
     conv_weight = conv_weight.contiguous()
+    conv_bias = conv_bias.contiguous()
+    dt = dt.contiguous()
+    dt_bias = dt_bias.contiguous()
+    A = A.contiguous()
+    D = D.contiguous()
+    conv_slot_idx = conv_slot_idx.contiguous()
+    ssm_slot_idx = ssm_slot_idx.contiguous()
 
     # Allocate B/C buffer: [batch, 2, ngroups, dstate] in bf16
     bc_buf = torch.empty(batch, 2, ngroups, dstate, dtype=torch.bfloat16, device=conv_input.device)
@@ -870,6 +886,8 @@ def fused_conv_ssm_decode_two_kernel(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        dt_clamp_min,
+        dt_clamp_max,
         BLOCK_DIM=BLOCK_DIM,
         BLOCK_DSTATE=BLOCK_DSTATE,
         num_warps=8,
@@ -954,6 +972,9 @@ def _fused_conv_ssm_kernel_persistent(
 
         conv_slot = tl.load(conv_slot_idx_ptr + pid_b).to(tl.int64)
         ssm_slot = tl.load(ssm_slot_idx_ptr + pid_b).to(tl.int64)
+        if conv_slot < 0 or ssm_slot < 0:
+            work_id += N_CTAs
+            continue
 
         group_idx = pid_h // nheads_per_group
 
@@ -1257,6 +1278,8 @@ def _fused_conv_ssm_kernel_dstate_split(
 
     conv_slot = tl.load(conv_slot_idx_ptr + pid_b).to(tl.int64)
     ssm_slot = tl.load(ssm_slot_idx_ptr + pid_b).to(tl.int64)
+    if conv_slot < 0 or ssm_slot < 0:
+        return
 
     group_idx = pid_h // nheads_per_group
 
@@ -1561,7 +1584,7 @@ def fused_conv_ssm_decode_dstate_split(
     """
     batch, conv_dim = conv_input.shape
     _, nheads, dim, dstate = ssm_state.shape
-    kernel_width = conv_state.shape[-1] + 1
+    kernel_width = conv_weight.shape[-1]
     intermediate_size = nheads * dim
     ngroups = (conv_dim - intermediate_size) // (2 * dstate)
     nheads_per_group = nheads // ngroups
@@ -1574,8 +1597,14 @@ def fused_conv_ssm_decode_dstate_split(
     )
 
     conv_input = conv_input.contiguous()
-    conv_state = conv_state.contiguous()
     conv_weight = conv_weight.contiguous()
+    conv_bias = conv_bias.contiguous()
+    dt = dt.contiguous()
+    dt_bias = dt_bias.contiguous()
+    A = A.contiguous()
+    D = D.contiguous()
+    conv_slot_idx = conv_slot_idx.contiguous()
+    ssm_slot_idx = ssm_slot_idx.contiguous()
 
     # Float32 accumulation buffer for atomic adds
     out_accum = torch.zeros(batch, nheads, dim, dtype=torch.float32, device=conv_input.device)
@@ -1662,7 +1691,7 @@ def fused_conv_ssm_decode_persistent(
     """
     batch, conv_dim = conv_input.shape
     _, nheads, dim, dstate = ssm_state.shape
-    kernel_width = conv_state.shape[-1] + 1
+    kernel_width = conv_weight.shape[-1]
     intermediate_size = nheads * dim
     ngroups = (conv_dim - intermediate_size) // (2 * dstate)
     nheads_per_group = nheads // ngroups
@@ -1675,8 +1704,14 @@ def fused_conv_ssm_decode_persistent(
     actual_n_ctas = min(n_ctas, total_work)
 
     conv_input = conv_input.contiguous()
-    conv_state = conv_state.contiguous()
     conv_weight = conv_weight.contiguous()
+    conv_bias = conv_bias.contiguous()
+    dt = dt.contiguous()
+    dt_bias = dt_bias.contiguous()
+    A = A.contiguous()
+    D = D.contiguous()
+    conv_slot_idx = conv_slot_idx.contiguous()
+    ssm_slot_idx = ssm_slot_idx.contiguous()
 
     _fused_conv_ssm_kernel_persistent[(actual_n_ctas,)](
         conv_input,
@@ -1755,8 +1790,9 @@ def fused_conv_ssm_decode(
         out:          [batch, nheads, dim] preallocated output (written in bf16)
     """
     batch, conv_dim = conv_input.shape
+
     _, nheads, dim, dstate = ssm_state.shape
-    kernel_width = conv_state.shape[-1] + 1
+    kernel_width = conv_weight.shape[-1]
     intermediate_size = nheads * dim
     ngroups = (conv_dim - intermediate_size) // (2 * dstate)
     nheads_per_group = nheads // ngroups
@@ -1771,8 +1807,14 @@ def fused_conv_ssm_decode(
         return (triton.cdiv(dim, META["BLOCK_DIM"]), batch, nheads)
 
     conv_input = conv_input.contiguous()
-    conv_state = conv_state.contiguous()
     conv_weight = conv_weight.contiguous()
+    conv_bias = conv_bias.contiguous()
+    dt = dt.contiguous()
+    dt_bias = dt_bias.contiguous()
+    A = A.contiguous()
+    D = D.contiguous()
+    conv_slot_idx = conv_slot_idx.contiguous()
+    ssm_slot_idx = ssm_slot_idx.contiguous()
 
     _fused_conv_ssm_kernel[grid](
         conv_input,
