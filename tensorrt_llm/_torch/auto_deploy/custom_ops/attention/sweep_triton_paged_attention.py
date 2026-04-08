@@ -255,9 +255,10 @@ def bench_decode_stage1(
     )
     head_ratio = n_heads // n_kv_heads
     head_ratio_padded = max(1, 2 ** math.ceil(math.log2(head_ratio))) if head_ratio > 1 else 1
-    effective_seq = min(seq_len, sw_val) if sw_val and sw_val > 0 else seq_len
-    num_splits = _get_num_splits(effective_seq, batch, n_kv_heads, page_size)
     sw_kernel = sw_val if sw_val and sw_val > 0 else 0
+    effective_seq = min(seq_len, sw_kernel) if sw_kernel > 0 else seq_len
+    # Pass sw_kernel so _get_num_splits uses the correct SW-aware threshold
+    num_splits = _get_num_splits(effective_seq, batch, n_kv_heads, page_size, sw_kernel)
     head_dim_padded = triton.next_power_of_2(head_dim)
 
     partial_o = torch.empty(
@@ -385,7 +386,14 @@ def bench_decode_e2e(
 
     def fn():
         triton_paged_decode(
-            q, kv_cache, kv_indices, kv_indptr, kv_last_page_len, sm_scale, sliding_window=sw
+            q,
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            sm_scale,
+            sliding_window=sw,
+            max_decode_seq_len=seq_len,
         )
 
     ms = triton.testing.do_bench(fn, warmup=25, rep=100)

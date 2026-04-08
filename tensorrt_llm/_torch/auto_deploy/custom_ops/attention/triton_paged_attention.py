@@ -168,7 +168,13 @@ def update_paged_kv_cache(
 # =============================================================================
 
 
-def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_size: int) -> int:
+def _get_num_splits(
+    max_seq_len: int,
+    batch_size: int,
+    n_kv_heads: int,
+    page_size: int,
+    sliding_window: int = 0,
+) -> int:
     """Compute optimal number of KV splits for FlashDecoding.
 
     With GQA batching, the grid is (batch, n_kv_heads, num_splits).
@@ -180,8 +186,12 @@ def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_siz
     num_sms = _get_num_sms()
     existing_parallelism = batch_size * n_kv_heads
 
-    # Already enough parallelism
-    if existing_parallelism >= num_sms * 2:
+    # Iter 26: use a lower splits=1 threshold for non-SW shapes.
+    # Non-SW inner loops are cheaper (no per-page global_pos+window_mask ops), so
+    # fewer longer splits are fine. SW shapes keep the higher 2×num_sms threshold
+    # to avoid long SW-masked loops (which regressed +30% in iter 25).
+    splits1_threshold = num_sms if sliding_window == 0 else num_sms * 2
+    if existing_parallelism >= splits1_threshold:
         return 1
 
     # Target ~4 waves of thread blocks
@@ -234,6 +244,7 @@ def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_siz
         "HEAD_RATIO_PADDED",
         "SLIDING_WINDOW",
         "LOGIT_CAP",
+        "SKIP_SW_MASK",
     ],
 )
 @triton.jit
@@ -277,6 +288,7 @@ def _flash_decode_stage1_kernel(
     NUM_SPLITS: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr = 0,
     LOGIT_CAP: tl.constexpr = 0.0,
+    SKIP_SW_MASK: tl.constexpr = False,
 ):
     """
     Key optimizations:
@@ -363,57 +375,119 @@ def _flash_decode_stage1_kernel(
     kv_head_base = kv_head_id * cache_stride_head
     local_kv = page_offsets[:, None] * cache_stride_token + dhead_offsets[None, :]
 
-    for local_page_idx in range(num_pages_this_split):
-        page_idx = page_split_start + local_page_idx
-        physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
-
-        # Determine valid tokens in this page
-        is_last_page_of_seq = page_idx == (num_pages - 1)
-        valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
-        page_mask = page_offsets < valid_tokens
-
-        # Compute cache offset (use int64 to avoid overflow when physical_page * stride > 2^31)
-        # cache_page_base is a scalar int64; local_kv broadcasts to [PAGE_SIZE, HEAD_DIM_PADDED]
-        cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
-        kv_mask_2d = page_mask[:, None] & head_dim_mask[None, :]
-
-        k = tl.load(
-            kv_cache_ptr + cache_page_base + local_kv, mask=kv_mask_2d, other=0.0
-        )  # [PAGE_SIZE, HEAD_DIM_PADDED]
-        v = tl.load(
-            kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv,
-            mask=kv_mask_2d,
-            other=0.0,
-        )  # [PAGE_SIZE, HEAD_DIM_PADDED]
-
-        # [HEAD_RATIO_PADDED, HEAD_DIM_PADDED] @ [HEAD_DIM_PADDED, PAGE_SIZE] -> [HEAD_RATIO_PADDED, PAGE_SIZE]
-        attn = tl.dot(q_all, tl.trans(k)) * SM_SCALE
-
-        # Iter 18: logit soft-capping (Gemma-4: logit_cap=50.0). Apply BEFORE masking
-        # so that -inf from page/window masks propagates cleanly through softmax.
-        # Iter 24: use tl_libdevice.tanh (__nv_tanhf, 1 SFU instruction) instead of
-        # 6-op sigmoid-based tanh: cap*tanh(x/cap) = cap * libdevice.tanh(x/cap).
-        if LOGIT_CAP > 0.0:
-            attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
-
-        # Combine validity mask with sliding window mask
-        if SLIDING_WINDOW > 0:
-            global_pos = page_idx * PAGE_SIZE + page_offsets
-            window_mask = global_pos >= first_valid_pos
-            attn = tl.where(page_mask[None, :] & window_mask[None, :], attn, float("-inf"))
+    # Iter 28: SKIP_SW_MASK is a compile-time constexpr set by the launcher when all sequences
+    # in the batch satisfy seq_len <= SLIDING_WINDOW (so first_valid_pos=0 for every thread).
+    # When True, the SW-masking branch is dead code and the compiler elides it entirely,
+    # giving the same register footprint as SLIDING_WINDOW=0 kernels.
+    # When False (seq_len > SW possible), fall back to the first_valid_pos_in_page dual-loop.
+    if SLIDING_WINDOW > 0 and not SKIP_SW_MASK:
+        first_valid_pos_in_page = first_valid_pos - page_split_start * PAGE_SIZE
+        if first_valid_pos_in_page <= 0:
+            # Fast path: entire split within window — no SW masking needed.
+            for local_page_idx in range(num_pages_this_split):
+                page_idx = page_split_start + local_page_idx
+                physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+                is_last_page_of_seq = page_idx == (num_pages - 1)
+                valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
+                page_mask = page_offsets < valid_tokens
+                cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
+                kv_mask_2d = page_mask[:, None] & head_dim_mask[None, :]
+                k = tl.load(kv_cache_ptr + cache_page_base + local_kv, mask=kv_mask_2d, other=0.0)
+                v = tl.load(
+                    kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv,
+                    mask=kv_mask_2d,
+                    other=0.0,
+                )
+                attn = tl.dot(q_all, tl.trans(k)) * SM_SCALE
+                if LOGIT_CAP > 0.0:
+                    attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
+                attn = tl.where(page_mask[None, :], attn, float("-inf"))
+                m_ij = tl.max(attn, axis=1)
+                m_i_new = tl.maximum(m_i, m_ij)
+                alpha = tl.exp(m_i - m_i_new)
+                p = tl.exp(attn - m_i_new[:, None])
+                acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                m_i = m_i_new
         else:
+            # SW masking path (split 0 when first_valid_pos > 0 and non-page-aligned).
+            # Decrement first_valid_pos_in_page by PAGE_SIZE each iteration; once negative,
+            # window_mask becomes all-True (page_offsets >= negative_value = True).
+            for local_page_idx in range(num_pages_this_split):
+                page_idx = page_split_start + local_page_idx
+                physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+                is_last_page_of_seq = page_idx == (num_pages - 1)
+                valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
+                page_mask = page_offsets < valid_tokens
+                cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
+                kv_mask_2d = page_mask[:, None] & head_dim_mask[None, :]
+                k = tl.load(kv_cache_ptr + cache_page_base + local_kv, mask=kv_mask_2d, other=0.0)
+                v = tl.load(
+                    kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv,
+                    mask=kv_mask_2d,
+                    other=0.0,
+                )
+                attn = tl.dot(q_all, tl.trans(k)) * SM_SCALE
+                if LOGIT_CAP > 0.0:
+                    attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
+                window_mask = page_offsets >= first_valid_pos_in_page
+                attn = tl.where(page_mask[None, :] & window_mask[None, :], attn, float("-inf"))
+                first_valid_pos_in_page -= PAGE_SIZE
+                m_ij = tl.max(attn, axis=1)
+                m_i_new = tl.maximum(m_i, m_ij)
+                alpha = tl.exp(m_i - m_i_new)
+                p = tl.exp(attn - m_i_new[:, None])
+                acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                m_i = m_i_new
+    else:
+        # SKIP_SW_MASK=True or SLIDING_WINDOW=0: no SW masking. Compiler eliminates the
+        # dual-loop block above, keeping register pressure identical to SW=0 kernels.
+        for local_page_idx in range(num_pages_this_split):
+            page_idx = page_split_start + local_page_idx
+            physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+
+            # Determine valid tokens in this page
+            is_last_page_of_seq = page_idx == (num_pages - 1)
+            valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
+            page_mask = page_offsets < valid_tokens
+
+            # Compute cache offset (use int64 to avoid overflow when physical_page * stride > 2^31)
+            # cache_page_base is a scalar int64; local_kv broadcasts to [PAGE_SIZE, HEAD_DIM_PADDED]
+            cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
+            kv_mask_2d = page_mask[:, None] & head_dim_mask[None, :]
+
+            k = tl.load(
+                kv_cache_ptr + cache_page_base + local_kv, mask=kv_mask_2d, other=0.0
+            )  # [PAGE_SIZE, HEAD_DIM_PADDED]
+            v = tl.load(
+                kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv,
+                mask=kv_mask_2d,
+                other=0.0,
+            )  # [PAGE_SIZE, HEAD_DIM_PADDED]
+
+            # [HEAD_RATIO_PADDED, HEAD_DIM_PADDED] @ [HEAD_DIM_PADDED, PAGE_SIZE] -> [HEAD_RATIO_PADDED, PAGE_SIZE]
+            attn = tl.dot(q_all, tl.trans(k)) * SM_SCALE
+
+            # Iter 18: logit soft-capping (Gemma-4: logit_cap=50.0). Apply BEFORE masking
+            # so that -inf from page/window masks propagates cleanly through softmax.
+            # Iter 24: use tl_libdevice.tanh (__nv_tanhf, 1 SFU instruction) instead of
+            # 6-op sigmoid-based tanh: cap*tanh(x/cap) = cap * libdevice.tanh(x/cap).
+            if LOGIT_CAP > 0.0:
+                attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
+
             attn = tl.where(page_mask[None, :], attn, float("-inf"))
 
-        # Online softmax update (vectorized over HEAD_RATIO_PADDED)
-        m_ij = tl.max(attn, axis=1)  # [HEAD_RATIO_PADDED]
-        m_i_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_i_new)
-        p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO_PADDED, PAGE_SIZE]
+            # Online softmax update (vectorized over HEAD_RATIO_PADDED)
+            m_ij = tl.max(attn, axis=1)  # [HEAD_RATIO_PADDED]
+            m_i_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO_PADDED, PAGE_SIZE]
 
-        # [HEAD_RATIO_PADDED, PAGE_SIZE] @ [PAGE_SIZE, HEAD_DIM_PADDED] -> [HEAD_RATIO_PADDED, HEAD_DIM_PADDED]
-        acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        m_i = m_i_new
+            # [HEAD_RATIO_PADDED, PAGE_SIZE] @ [PAGE_SIZE, HEAD_DIM_PADDED] -> [HEAD_RATIO_PADDED, HEAD_DIM_PADDED]
+            acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_i_new
 
     # Finalize: normalize and compute LSE
     l_i_safe = tl.where(l_i == 0.0, 1.0, l_i)
@@ -463,6 +537,7 @@ def _flash_decode_stage1_kernel(
         "HEAD_RATIO_PADDED",
         "SLIDING_WINDOW",
         "LOGIT_CAP",
+        "SKIP_SW_MASK",
     ],
 )
 @triton.jit
@@ -507,6 +582,7 @@ def _flash_decode_stage1_two_chunk_kernel(
     HD_CHUNK2: tl.constexpr,  # Second chunk size (power-of-2, covers HD_CHUNK1..HD_CHUNK1+HD_CHUNK2-1)
     SLIDING_WINDOW: tl.constexpr = 0,
     LOGIT_CAP: tl.constexpr = 0.0,
+    SKIP_SW_MASK: tl.constexpr = False,
 ):
     """Two-chunk stage1 for non-power-of-2 head_dim (e.g. 176 = 128 + 64).
 
@@ -601,65 +677,150 @@ def _flash_decode_stage1_two_chunk_kernel(
     local_kv_c2 = (
         page_offsets[:, None] * cache_stride_token + dhead_c2[None, :]
     )  # [PAGE_SIZE, HD_C2]
-    for local_page_idx in range(num_pages_this_split):
-        page_idx = page_split_start + local_page_idx
-        physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
-
-        is_last_page_of_seq = page_idx == (num_pages - 1)
-        valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
-        page_mask = page_offsets < valid_tokens
-
-        # Cache page base: scalar int64 — local_kv_c{1,2} broadcast to [PAGE_SIZE, HD_CHUNK{1,2}]
-        cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
-
-        # Load K in two chunks: [PAGE_SIZE, HD_CHUNK1] and [PAGE_SIZE, HD_CHUNK2]
-        k_c1 = tl.load(
-            kv_cache_ptr + cache_page_base + local_kv_c1,
-            mask=page_mask[:, None],
-            other=0.0,
-        )
-        k_c2 = tl.load(
-            kv_cache_ptr + cache_page_base + local_kv_c2,
-            mask=page_mask[:, None] & head_dim_mask_c2[None, :],
-            other=0.0,
-        )
-
-        # QK: sum contributions from both chunks → [HEAD_RATIO_PADDED, PAGE_SIZE]
-        attn = (tl.dot(q_c1, tl.trans(k_c1)) + tl.dot(q_c2, tl.trans(k_c2))) * SM_SCALE
-
-        # Iter 18: logit soft-capping; iter 24: libdevice.tanh (1 SFU) vs 6-op sigmoid approx.
-        if LOGIT_CAP > 0.0:
-            attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
-
-        if SLIDING_WINDOW > 0:
-            global_pos = page_idx * PAGE_SIZE + page_offsets
-            window_mask = global_pos >= first_valid_pos
-            attn = tl.where(page_mask[None, :] & window_mask[None, :], attn, float("-inf"))
+    # Iter 28: SKIP_SW_MASK is a compile-time constexpr set by the launcher when all sequences
+    # in the batch satisfy seq_len <= SLIDING_WINDOW (so first_valid_pos=0 for every thread).
+    # When True, the SW-masking branch is dead code and the compiler elides it entirely,
+    # giving the same register footprint as SLIDING_WINDOW=0 kernels.
+    if SLIDING_WINDOW > 0 and not SKIP_SW_MASK:
+        first_valid_pos_in_page = first_valid_pos - page_split_start * PAGE_SIZE
+        if first_valid_pos_in_page <= 0:
+            # Fast path: entire split is within window — no SW masking.
+            for local_page_idx in range(num_pages_this_split):
+                page_idx = page_split_start + local_page_idx
+                physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+                is_last_page_of_seq = page_idx == (num_pages - 1)
+                valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
+                page_mask = page_offsets < valid_tokens
+                cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
+                k_c1 = tl.load(
+                    kv_cache_ptr + cache_page_base + local_kv_c1, mask=page_mask[:, None], other=0.0
+                )
+                k_c2 = tl.load(
+                    kv_cache_ptr + cache_page_base + local_kv_c2,
+                    mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+                    other=0.0,
+                )
+                attn = (tl.dot(q_c1, tl.trans(k_c1)) + tl.dot(q_c2, tl.trans(k_c2))) * SM_SCALE
+                if LOGIT_CAP > 0.0:
+                    attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
+                attn = tl.where(page_mask[None, :], attn, float("-inf"))
+                m_ij = tl.max(attn, axis=1)
+                m_i_new = tl.maximum(m_i, m_ij)
+                alpha = tl.exp(m_i - m_i_new)
+                p = tl.exp(attn - m_i_new[:, None])
+                v_c1 = tl.load(
+                    kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c1,
+                    mask=page_mask[:, None],
+                    other=0.0,
+                )
+                v_c2 = tl.load(
+                    kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c2,
+                    mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+                    other=0.0,
+                )
+                acc_c1 = tl.dot(p.to(v_c1.dtype), v_c1, acc=acc_c1 * alpha[:, None])
+                acc_c2 = tl.dot(p.to(v_c2.dtype), v_c2, acc=acc_c2 * alpha[:, None])
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                m_i = m_i_new
         else:
+            # SW masking path: first_valid_pos_in_page > 0 means split 0 straddles the window
+            # boundary. Decrement first_valid_pos_in_page each page; once negative → all-True.
+            for local_page_idx in range(num_pages_this_split):
+                page_idx = page_split_start + local_page_idx
+                physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+                is_last_page_of_seq = page_idx == (num_pages - 1)
+                valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
+                page_mask = page_offsets < valid_tokens
+                cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
+                k_c1 = tl.load(
+                    kv_cache_ptr + cache_page_base + local_kv_c1, mask=page_mask[:, None], other=0.0
+                )
+                k_c2 = tl.load(
+                    kv_cache_ptr + cache_page_base + local_kv_c2,
+                    mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+                    other=0.0,
+                )
+                attn = (tl.dot(q_c1, tl.trans(k_c1)) + tl.dot(q_c2, tl.trans(k_c2))) * SM_SCALE
+                if LOGIT_CAP > 0.0:
+                    attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
+                window_mask = page_offsets >= first_valid_pos_in_page
+                attn = tl.where(page_mask[None, :] & window_mask[None, :], attn, float("-inf"))
+                first_valid_pos_in_page -= PAGE_SIZE
+                m_ij = tl.max(attn, axis=1)
+                m_i_new = tl.maximum(m_i, m_ij)
+                alpha = tl.exp(m_i - m_i_new)
+                p = tl.exp(attn - m_i_new[:, None])
+                v_c1 = tl.load(
+                    kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c1,
+                    mask=page_mask[:, None],
+                    other=0.0,
+                )
+                v_c2 = tl.load(
+                    kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c2,
+                    mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+                    other=0.0,
+                )
+                acc_c1 = tl.dot(p.to(v_c1.dtype), v_c1, acc=acc_c1 * alpha[:, None])
+                acc_c2 = tl.dot(p.to(v_c2.dtype), v_c2, acc=acc_c2 * alpha[:, None])
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                m_i = m_i_new
+    else:
+        # SKIP_SW_MASK=True or SLIDING_WINDOW=0: no SW masking. Compiler eliminates the
+        # dual-loop block above entirely, preserving the same register footprint as SW=0.
+        for local_page_idx in range(num_pages_this_split):
+            page_idx = page_split_start + local_page_idx
+            physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+
+            is_last_page_of_seq = page_idx == (num_pages - 1)
+            valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
+            page_mask = page_offsets < valid_tokens
+
+            # Cache page base: scalar int64 — local_kv_c{1,2} broadcast to [PAGE_SIZE, HD_CHUNK{1,2}]
+            cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
+
+            # Load K in two chunks: [PAGE_SIZE, HD_CHUNK1] and [PAGE_SIZE, HD_CHUNK2]
+            k_c1 = tl.load(
+                kv_cache_ptr + cache_page_base + local_kv_c1,
+                mask=page_mask[:, None],
+                other=0.0,
+            )
+            k_c2 = tl.load(
+                kv_cache_ptr + cache_page_base + local_kv_c2,
+                mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+                other=0.0,
+            )
+
+            # QK: sum contributions from both chunks → [HEAD_RATIO_PADDED, PAGE_SIZE]
+            attn = (tl.dot(q_c1, tl.trans(k_c1)) + tl.dot(q_c2, tl.trans(k_c2))) * SM_SCALE
+
+            # Iter 18: logit soft-capping; iter 24: libdevice.tanh (1 SFU) vs 6-op sigmoid approx.
+            if LOGIT_CAP > 0.0:
+                attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
+
             attn = tl.where(page_mask[None, :], attn, float("-inf"))
 
-        m_ij = tl.max(attn, axis=1)
-        m_i_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_i_new)
-        p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO_PADDED, PAGE_SIZE]
+            m_ij = tl.max(attn, axis=1)
+            m_i_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO_PADDED, PAGE_SIZE]
 
-        # Load V in two chunks (using precomputed local_kv_c{1,2} offsets)
-        v_c1 = tl.load(
-            kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c1,
-            mask=page_mask[:, None],
-            other=0.0,
-        )
-        v_c2 = tl.load(
-            kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c2,
-            mask=page_mask[:, None] & head_dim_mask_c2[None, :],
-            other=0.0,
-        )
+            # Load V in two chunks (using precomputed local_kv_c{1,2} offsets)
+            v_c1 = tl.load(
+                kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c1,
+                mask=page_mask[:, None],
+                other=0.0,
+            )
+            v_c2 = tl.load(
+                kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c2,
+                mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+                other=0.0,
+            )
 
-        # PV: update per-chunk accumulators
-        acc_c1 = tl.dot(p.to(v_c1.dtype), v_c1, acc=acc_c1 * alpha[:, None])
-        acc_c2 = tl.dot(p.to(v_c2.dtype), v_c2, acc=acc_c2 * alpha[:, None])
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        m_i = m_i_new
+            # PV: update per-chunk accumulators
+            acc_c1 = tl.dot(p.to(v_c1.dtype), v_c1, acc=acc_c1 * alpha[:, None])
+            acc_c2 = tl.dot(p.to(v_c2.dtype), v_c2, acc=acc_c2 * alpha[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_i_new
 
     # Normalize and store in two chunks
     l_i_safe = tl.where(l_i == 0.0, 1.0, l_i)
@@ -790,6 +951,7 @@ def triton_paged_decode(
     sliding_window: Optional[int] = None,
     logit_cap: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
+    max_decode_seq_len: Optional[int] = None,
 ) -> torch.Tensor:
     """Optimized paged decode with GQA batching + FlashDecoding + page-aligned iteration.
 
@@ -803,6 +965,10 @@ def triton_paged_decode(
         sliding_window: If set, only attend to the last sliding_window tokens
         logit_cap: If set (>0), apply logit soft-capping: cap * tanh(score / cap)
         out: Optional output tensor [batch_size, n_heads, head_dim]
+        max_decode_seq_len: Optional caller-provided max sequence length across the batch
+            (CPU int, no GPU sync needed). When provided and <= sliding_window, enables the
+            SKIP_SW_MASK=True kernel variant which eliminates SW-masking overhead entirely.
+            When None, conservatively uses SKIP_SW_MASK=False (correct, no regression).
 
     Returns:
         Output tensor [batch_size, n_heads, head_dim]
@@ -827,7 +993,7 @@ def triton_paged_decode(
 
     # Use effective sequence length (capped by sliding window) for split-K heuristic
     effective_seq_len = min(max_seq_len, sw) if sw > 0 else max_seq_len
-    num_splits = _get_num_splits(effective_seq_len, batch_size, n_kv_heads, page_size)
+    num_splits = _get_num_splits(effective_seq_len, batch_size, n_kv_heads, page_size, sw)
 
     # Allocate intermediate buffers for split-K
     partial_o = torch.empty(
@@ -871,6 +1037,12 @@ def triton_paged_decode(
         kv_cache.stride(2),
         kv_cache.stride(3),
     )
+    # Iter 28: SKIP_SW_MASK=True eliminates SW-masking branch at compile time (same register
+    # footprint as SLIDING_WINDOW=0 kernels). Set when caller guarantees max_seq_len <= sw.
+    # Use max_decode_seq_len if provided (CPU int, no GPU sync). Otherwise conservative False
+    # (correct, no regression vs iter 26). Note: sw==0 case handled by SLIDING_WINDOW constexpr.
+    skip_sw_mask = sw == 0 or (max_decode_seq_len is not None and max_decode_seq_len <= sw)
+
     stage1_common_kwargs = dict(
         SM_SCALE=sm_scale,
         N_HEADS=n_heads,
@@ -882,6 +1054,7 @@ def triton_paged_decode(
         NUM_SPLITS=num_splits,
         SLIDING_WINDOW=sw,
         LOGIT_CAP=lc,
+        SKIP_SW_MASK=skip_sw_mask,
     )
 
     if head_dim_padded == head_dim:
