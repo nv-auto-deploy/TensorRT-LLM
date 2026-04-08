@@ -449,6 +449,28 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 13 — bf16 partial_o to halve stage2 bandwidth (FAILED, reverted)
+
+**What changed:**
+
+- Stage1 (both kernels) store `(acc / l_i_safe).to(bfloat16)` instead of float32.
+- partial_o allocated as `q.dtype` (bf16) instead of float32.
+- Stage2: explicitly cast loaded partial_o to float32 for accumulation.
+- Also tried adding NUM_SPLITS to two-chunk autotune key to prevent same config for short/long loops.
+
+**Correctness:** PASS (132/132)
+
+**Results:** Mixed — significant regression on L3:
+
+- D5: 36.74 → 33.12 (-9.8%), D8: 166.41 → 155.61 (-6.7%), S1: 15.11 → 14.38 (-4.8%)
+- L3: 34.18 → 41.37 (+21%), L3 stage1 30.88 → 37.71 (+22%)
+
+**Analysis:** The `(acc / l_i_safe).to(bfloat16)` cast in the two-chunk kernel increases register pressure (need both float32 and bf16 in scope simultaneously) and changes SASS, causing the autotuner to select a worse config for L3 (16 pages/split). Short-loop shapes (D5: 4 pages/split) see improvement because they have less loop overhead to amortize. Reverted.
+
+**Commit:** see git log (reverted)
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space
