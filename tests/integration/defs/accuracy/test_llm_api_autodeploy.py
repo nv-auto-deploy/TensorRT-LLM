@@ -21,8 +21,10 @@ import yaml
 from defs.conftest import get_llm_root, get_sm_version, skip_pre_blackwell
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
+from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import (Eagle3DecodingConfig, KvCacheConfig,
+                                 MTPDecodingConfig)
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -575,6 +577,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         kwargs["attn_backend"] = attn_backend
         kwargs["compile_backend"] = "torch-simple"
         kwargs["cuda_graph_config"] = None
+        kwargs["disable_overlap_scheduler"] = True
 
         kwargs.setdefault("transforms", {}).setdefault(
             "detect_sharding", {})["enable_attention_dp"] = enable_attention_dp
@@ -599,6 +602,45 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
         print_memory_usage("after evaluation")
+
+    @pytest.mark.parametrize("world_size", [8])
+    @pytest.mark.parametrize("model_id", ["bf16"])
+    def test_accuracy_pytorch_backend(self, model_id, world_size):
+        """Run the same model on the PyTorch backend with trtllm attention.
+
+        This is a diagnostic test to confirm that thop.attention works with
+        prompt_lens as context_lengths in the PyTorch backend. Compare with
+        test_accuracy to find divergences in thop.attention arguments.
+        """
+        if get_device_count() < world_size:
+            pytest.skip(f"Not enough devices for world_size={world_size}")
+
+        model_path = self.MODEL_PATHS[model_id]
+
+        # Match low_memory_overrides: max_batch_size=32, free_gpu_memory_fraction=0.4
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            mamba_ssm_cache_dtype="float32",
+            free_gpu_memory_fraction=0.4,
+        )
+
+        print_memory_usage("test start (pytorch backend)")
+        with PyTorchLLM(
+                model_path,
+                kv_cache_config=kv_cache_config,
+                max_batch_size=32,
+                tensor_parallel_size=world_size,
+                moe_expert_parallel_size=world_size,
+                enable_attention_dp=False,
+                cuda_graph_config=None,
+                disable_overlap_scheduler=True,
+        ) as llm:
+            print_memory_usage("after engine build (pytorch backend)")
+
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+        print_memory_usage("after evaluation (pytorch backend)")
 
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [4, 8])

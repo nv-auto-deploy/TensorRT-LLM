@@ -760,7 +760,7 @@ class ADEngine(ModelEngine):
             input_ids.extend(prompt_tokens)
             cu_seqlen.append(len(input_ids))
             input_pos.append(begin_compute)
-            context_lens.append(request.py_orig_prompt_len)
+            context_lens.append(request.context_chunk_size)
 
             # store extra arguments
             if request.py_multimodal_data is not None:
@@ -802,7 +802,7 @@ class ADEngine(ModelEngine):
 
             cu_seqlen.append(len(input_ids))
             input_pos.append(num_tokens_seen)
-            context_lens.append(request.py_orig_prompt_len)
+            context_lens.append(request.py_prompt_len)
 
             if is_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
