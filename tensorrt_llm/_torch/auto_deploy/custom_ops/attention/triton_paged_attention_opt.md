@@ -377,6 +377,25 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 9 — One-pass stage2 reduction (FAILED, reverted)
+
+**What changed:**
+
+- Replaced two-pass stage2 reduction with one-pass online log-sum-exp: combines `find global_max` + `weighted sum` passes into a single loop using running rescaling `alpha = exp(old_lse - new_max)`, `acc = acc * alpha + weight * partial_o`.
+
+**Correctness:** PASS (132/132)
+
+**Results:** Large regression for NUM_SPLITS=32 shapes:
+
+- S1 (splits=32): s2 6.91→18.23 μs (+164%), e2e 15.11→20.32 (+35%)
+- L1 (splits=32): s2 7.09→18.49 μs (+161%), e2e 17.35→22.92 (+32%)
+
+**Analysis:** Per-iteration alpha rescaling adds `exp() + vector multiply` overhead absent in two-pass. For splits=32, this 32 extra exp + vector ops exceeds savings from halved partial_lse reads. Reverted.
+
+**Commit:** see git log (reverted)
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space
