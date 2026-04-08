@@ -208,6 +208,10 @@ class Quantization(BaseTransform):
         gm._register_load_state_dict_pre_hook(
             partial(self.load_hook, weight_name=lin_weight.node_key)
         )
+        if self.post_load_hook:
+            gm.register_load_state_dict_post_hook(
+                partial(self.post_load_hook, weight_name=lin_weight.node_key)
+            )
 
         with gm.graph.inserting_before(node):
             scales = {}
@@ -893,18 +897,27 @@ class FineGrainedFP8LinearQuantization(Quantization):
         if weight_param is None or weight_param.dtype != torch.float8_e4m3fn:
             return
 
-        # Find the corresponding scale parameter
-        mod_prefix = attr_name.rsplit("weight", 1)[0]
-        scale_attr = mod_prefix + "weight_scale_inv"
+        # Find the corresponding scale parameter.
+        # Linear path registers buffer as "weight_scale_inv" directly.
+        # BMM path registers as "{attr_name}_weight_scale_inv" (e.g. "weight_weight_scale_inv").
+        scale_attr = "weight_scale_inv"
         scale_param = getattr(target_module, scale_attr, None)
+        if scale_param is None:
+            scale_attr = attr_name + "_weight_scale_inv"
+            scale_param = getattr(target_module, scale_attr, None)
         if scale_param is None:
             return
 
-        # Only convert scales for 128x128 block projections. Small projections
-        # (e.g. q_a_proj N=24, kv_a_proj N=9 after TP sharding) use the BF16
-        # dequant+cuBLAS fallback and need raw FP32 scales.
+        # Only convert scales for 128x128 block projections. Projections with
+        # non-128 block sizes (e.g. q_a_proj with per-row scales: block_n=1)
+        # use the BF16 dequant+cuBLAS fallback and need raw FP32 scales.
         N, K = weight_param.shape[-2], weight_param.shape[-1]
-        if N < 128 or K < 128:
+        scale_n, scale_k = scale_param.shape[-2], scale_param.shape[-1]
+        if scale_n == 0 or scale_k == 0:
+            return
+        block_n = N // scale_n
+        block_k = K // scale_k
+        if block_n != 128 or block_k != 128:
             return
 
         with torch.no_grad():
