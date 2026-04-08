@@ -485,6 +485,32 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 16 — Q_BLOCK=16 in context kernel autotune (FAILED, reverted)
+
+**What changed:** Added 3 configs with `Q_BLOCK=16` to `_paged_context_kernel` autotune. Hypothesis: for very low-parallelism shapes (B=1, q_len=64), grid=(1, 16, 1)=16 programs uses only 12% of H100's 132 SMs. Q_BLOCK=16 gives 4× more programs.
+
+**Correctness:** PASS (132/132)
+
+**Results:**
+
+| ID | Baseline (μs) | Iter 16 (μs) | Delta |
+|----|--------------|-------------|-------|
+| P1 (B=1, q=64) | 14.23 | 12.49 | **-12%** |
+| P2 (B=1, q=256) | 28.84 | 28.68 | flat |
+| P3 (B=4, q=128) | 20.18 | 23.46 | **+16%** |
+| C1 (B=1, q=128, kv=512) | 48.06 | 48.90 | flat |
+| C2 (B=1, q=128, kv=1024) | 85.55 | 89.69 | **+5%** |
+| C3 (B=4, q=128, kv=512) | 50.84 | 94.70 | **+86%** |
+| C4 (B=4, q=256, kv=2048) | 178.04 | 581.59 | **+226%** |
+
+**Analysis:** Autotune picked Q_BLOCK=16 based on P1 (first benchmarked shape). This is optimal for P1 (small B × small q_len → 12% SM utilization with Q_BLOCK=64) but catastrophic for B=4 shapes where Q_BLOCK=128 was needed for GEMM efficiency. Root cause: autotune key lacks `batch` or `q_len` dimension, so one config is selected for all shapes. Reverted.
+
+**Lesson:** Adding smaller Q_BLOCK configs to autotune hurts because the autotuner can't distinguish B=1/q=64 (needs Q_BLOCK=16) from B=4/q=256 (needs Q_BLOCK=128). A shape-aware Python-side dispatch (not autotune) would be needed.
+
+**Commit:** see git log (reverted)
+
+______________________________________________________________________
+
 ### Iteration 15 — Add NUM_SPLITS to two-chunk stage1 autotune key (FAILED, reverted)
 
 **What changed:** Added `NUM_SPLITS` to two-chunk stage1 kernel autotune key. Hypothesis: small-split (D1: 2 pages/split) and large-split (L3: 16 pages/split) need different optimal configs.
