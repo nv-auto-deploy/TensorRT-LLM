@@ -747,6 +747,63 @@ or GPU scheduler.
 
 ______________________________________________________________________
 
+### Iteration 24 — Use tl_libdevice.tanh for logit soft-capping (code quality + minor perf)
+
+**What changed:** Replaced the sigmoid-based tanh approximation with native CUDA libdevice tanh:
+
+- Old: `LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (attn / LOGIT_CAP)) - 1.0)` — 6 instructions
+  (mul + neg + exp SFU + add + rcp SFU + FMA with constant folding)
+- New: `LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)` — 3 instructions
+  (mul by 1/LOGIT_CAP + `__nv_tanhf` SFU + mul by LOGIT_CAP)
+
+Added `import triton.language.extra.cuda.libdevice as tl_libdevice` at module level.
+`tl_libdevice.tanh` dispatches to `__nv_tanhf` for fp32 inputs (verified via source inspection).
+Applied to all 6 softcap compute sites (2 decode kernels × 1 site, 1 context kernel × 4 sites).
+
+**Performance impact:** Negligible (logit cap computation is \<1% of total GEMM work),
+but code is cleaner and uses the hardware tanh.approx.f32 SFU vs 2-SFU sigmoid chain.
+
+**Correctness:** PASS (163/163)
+
+**Commit:** see git log
+
+______________________________________________________________________
+
+### Iteration 25 — Lower splits=1 threshold to num_sms (FAILED, reverted)
+
+**What changed:** In `_get_num_splits`, changed the splits=1 early-return threshold from
+`existing_parallelism >= num_sms * 2` to `existing_parallelism >= num_sms`. For Gemma-4
+(n_kv_heads=8, H100 132 SMs): batch=32 → 256 >= 132 → splits=1 (was splits=4).
+
+**Expected gain:** D6 (batch=32, no SW): saves ~6 μs stage2 by bypassing it, -3.5% e2e.
+
+**Actual results:**
+
+| Shape | Before | After | Delta |
+|-------|--------|-------|-------|
+| D6 (batch=32, SW=0) | 53.20 | 51.92 | **-2.4%** ✓ |
+| S3 (batch=32, SW=1024) | 82.93 | 107.52 | **+30% REGRESSION** |
+
+**Analysis:** S3 (SW=1024, batch=32) with splits=1 processes 64 pages per program (SL=1024,
+page_size=16, window_pages=64). With splits=4, each program processed 16 pages. The 4× larger
+loop has worse performance because:
+
+1. SW masking overhead (global_pos + window_mask vector ops) scales with pages per split
+1. Online softmax accumulators (acc_c1, acc_c2, m_i, l_i) stay in registers for 64 iterations,
+   increasing register pressure vs 16 iterations
+1. The autotuner may select a config optimized for shorter loops (splits=4) that's suboptimal
+   for the 64-page inner loop
+
+The D6 improvement (+2.4%) is far outweighed by the S3 regression (+30%). Reverted.
+
+**Lesson:** The optimal splits is NOT always 1 even when existing_parallelism ≥ num_sms.
+Shorter inner loops (more splits) can be faster by reducing register pressure and per-split
+SW masking overhead for sliding window shapes.
+
+**Commit:** see git log (reverted)
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space

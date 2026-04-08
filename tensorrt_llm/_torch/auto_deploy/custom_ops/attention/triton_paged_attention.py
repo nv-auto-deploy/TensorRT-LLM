@@ -27,6 +27,7 @@ import flashinfer
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.cuda.libdevice as tl_libdevice
 from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
@@ -390,8 +391,10 @@ def _flash_decode_stage1_kernel(
 
         # Iter 18: logit soft-capping (Gemma-4: logit_cap=50.0). Apply BEFORE masking
         # so that -inf from page/window masks propagates cleanly through softmax.
+        # Iter 24: use tl_libdevice.tanh (__nv_tanhf, 1 SFU instruction) instead of
+        # 6-op sigmoid-based tanh: cap*tanh(x/cap) = cap * libdevice.tanh(x/cap).
         if LOGIT_CAP > 0.0:
-            attn = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (attn / LOGIT_CAP)) - 1.0)
+            attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
 
         # Combine validity mask with sliding window mask
         if SLIDING_WINDOW > 0:
@@ -624,9 +627,9 @@ def _flash_decode_stage1_two_chunk_kernel(
         # QK: sum contributions from both chunks → [HEAD_RATIO_PADDED, PAGE_SIZE]
         attn = (tl.dot(q_c1, tl.trans(k_c1)) + tl.dot(q_c2, tl.trans(k_c2))) * SM_SCALE
 
-        # Iter 18: logit soft-capping (Gemma-4: logit_cap=50.0). Apply BEFORE masking.
+        # Iter 18: logit soft-capping; iter 24: libdevice.tanh (1 SFU) vs 6-op sigmoid approx.
         if LOGIT_CAP > 0.0:
-            attn = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (attn / LOGIT_CAP)) - 1.0)
+            attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
 
         if SLIDING_WINDOW > 0:
             global_pos = page_idx * PAGE_SIZE + page_offsets
@@ -1108,7 +1111,7 @@ def _paged_context_kernel(
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
             # Iter 18: logit soft-capping. Apply BEFORE masking.
             if LOGIT_CAP > 0.0:
-                qk = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (qk / LOGIT_CAP)) - 1.0)
+                qk = LOGIT_CAP * tl_libdevice.tanh(qk / LOGIT_CAP)
 
             # Per-query sliding window mask: each query position q_pos
             # can attend to KV in [q_pos - W + 1, q_pos].
@@ -1139,7 +1142,7 @@ def _paged_context_kernel(
 
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
             if LOGIT_CAP > 0.0:
-                qk = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (qk / LOGIT_CAP)) - 1.0)
+                qk = LOGIT_CAP * tl_libdevice.tanh(qk / LOGIT_CAP)
 
             if not is_full_q_block:
                 qk = tl.where(q_mask[:, None], qk, float("-inf"))
@@ -1158,7 +1161,7 @@ def _paged_context_kernel(
 
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
             if LOGIT_CAP > 0.0:
-                qk = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (qk / LOGIT_CAP)) - 1.0)
+                qk = LOGIT_CAP * tl_libdevice.tanh(qk / LOGIT_CAP)
 
             if not is_full_q_block:
                 qk = tl.where(q_mask[:, None], qk, float("-inf"))
@@ -1204,7 +1207,7 @@ def _paged_context_kernel(
         qk = tl.dot(q, tl.trans(k)) * SM_SCALE
         # Iter 18: logit soft-capping. Apply BEFORE masking.
         if LOGIT_CAP > 0.0:
-            qk = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (qk / LOGIT_CAP)) - 1.0)
+            qk = LOGIT_CAP * tl_libdevice.tanh(qk / LOGIT_CAP)
         kv_positions = kv_base_pos + page_offsets[None, :]
         causal_mask = q_positions_2d >= kv_positions
         if SLIDING_WINDOW > 0:
