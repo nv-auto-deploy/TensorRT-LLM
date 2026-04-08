@@ -245,6 +245,7 @@ def _get_num_splits(
         "SLIDING_WINDOW",
         "LOGIT_CAP",
         "SKIP_SW_MASK",
+        "WRITE_DIRECT",
     ],
 )
 @triton.jit
@@ -257,9 +258,11 @@ def _flash_decode_stage1_kernel(
     kv_indices_ptr,
     kv_indptr_ptr,
     kv_last_page_len_ptr,
-    # Intermediate outputs
+    # Intermediate outputs (unused when WRITE_DIRECT=True)
     partial_o_ptr,
     partial_lse_ptr,
+    # Direct output pointer: only used when WRITE_DIRECT=True (num_splits==1 path)
+    direct_o_ptr,
     # Q strides: [batch, n_heads, head_dim]
     q_stride_batch: tl.constexpr,
     q_stride_head: tl.constexpr,
@@ -276,6 +279,9 @@ def _flash_decode_stage1_kernel(
     cache_stride_kv: tl.constexpr,
     cache_stride_head: tl.constexpr,
     cache_stride_token: tl.constexpr,
+    # Direct output strides: [batch, n_heads, head_dim] — only used when WRITE_DIRECT=True
+    do_stride_batch: tl.constexpr,
+    do_stride_head: tl.constexpr,
     # Constants
     SM_SCALE: tl.constexpr,
     N_HEADS: tl.constexpr,
@@ -289,6 +295,7 @@ def _flash_decode_stage1_kernel(
     SLIDING_WINDOW: tl.constexpr = 0,
     LOGIT_CAP: tl.constexpr = 0.0,
     SKIP_SW_MASK: tl.constexpr = False,
+    WRITE_DIRECT: tl.constexpr = False,  # Iter 29: write bf16 output directly, skip partial bufs
 ):
     """
     Key optimizations:
@@ -333,28 +340,41 @@ def _flash_decode_stage1_kernel(
 
     # Handle inactive splits (beyond the sequence's pages)
     if page_split_start >= num_pages:
-        # Store zeros + -inf LSE for valid HEAD_RATIO Q heads only
-        po_offsets = (
-            batch_id * po_stride_batch
-            + head_ids[:, None] * po_stride_head
-            + split_id * po_stride_split
-            + dhead_offsets[None, :]
-        )
-        tl.store(
-            partial_o_ptr + po_offsets,
-            tl.zeros([HEAD_RATIO_PADDED, HEAD_DIM_PADDED], dtype=tl.float32),
-            mask=head_mask[:, None] & head_dim_mask[None, :],
-        )
-        plse_offsets = (
-            batch_id * plse_stride_batch
-            + head_ids * plse_stride_head
-            + split_id * plse_stride_split
-        )
-        tl.store(
-            partial_lse_ptr + plse_offsets,
-            tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf"),
-            mask=head_mask,
-        )
+        if WRITE_DIRECT:
+            # Iter 29: write zeros directly to output (no partial buffers).
+            do_offsets = (
+                batch_id * do_stride_batch
+                + head_ids[:, None] * do_stride_head
+                + dhead_offsets[None, :]
+            )
+            tl.store(
+                direct_o_ptr + do_offsets,
+                tl.zeros([HEAD_RATIO_PADDED, HEAD_DIM_PADDED], dtype=tl.bfloat16),
+                mask=head_mask[:, None] & head_dim_mask[None, :],
+            )
+        else:
+            # Store zeros + -inf LSE for valid HEAD_RATIO Q heads only
+            po_offsets = (
+                batch_id * po_stride_batch
+                + head_ids[:, None] * po_stride_head
+                + split_id * po_stride_split
+                + dhead_offsets[None, :]
+            )
+            tl.store(
+                partial_o_ptr + po_offsets,
+                tl.zeros([HEAD_RATIO_PADDED, HEAD_DIM_PADDED], dtype=tl.float32),
+                mask=head_mask[:, None] & head_dim_mask[None, :],
+            )
+            plse_offsets = (
+                batch_id * plse_stride_batch
+                + head_ids * plse_stride_head
+                + split_id * plse_stride_split
+            )
+            tl.store(
+                partial_lse_ptr + plse_offsets,
+                tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf"),
+                mask=head_mask,
+            )
         return
 
     # Load Q for HEAD_RATIO heads sharing this KV head: [HEAD_RATIO_PADDED, HEAD_DIM_PADDED]
@@ -489,26 +509,42 @@ def _flash_decode_stage1_kernel(
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_i_new
 
-    # Finalize: normalize and compute LSE
+    # Finalize: normalize, then either write directly to output (WRITE_DIRECT) or to partial buffers.
     l_i_safe = tl.where(l_i == 0.0, 1.0, l_i)
-    partial_o_val = acc / l_i_safe[:, None]  # [HEAD_RATIO_PADDED, HEAD_DIM_PADDED]
-    lse_val = m_i + tl.log(l_i_safe)  # [HEAD_RATIO_PADDED]
 
-    # Store results for valid HEAD_RATIO Q heads and valid head_dim elements
-    po_offsets = (
-        batch_id * po_stride_batch
-        + head_ids[:, None] * po_stride_head
-        + split_id * po_stride_split
-        + dhead_offsets[None, :]
-    )
-    tl.store(
-        partial_o_ptr + po_offsets, partial_o_val, mask=head_mask[:, None] & head_dim_mask[None, :]
-    )
+    if WRITE_DIRECT:
+        # Iter 29: write bf16 output directly — skips partial_o fp32 write and stage2/copy_.
+        # Eliminates ~5-6µs kernel-launch overhead for splits=1 shapes (D6-D10, S4-S5).
+        out_val = (acc / l_i_safe[:, None]).to(tl.bfloat16)
+        do_offsets = (
+            batch_id * do_stride_batch + head_ids[:, None] * do_stride_head + dhead_offsets[None, :]
+        )
+        tl.store(
+            direct_o_ptr + do_offsets, out_val, mask=head_mask[:, None] & head_dim_mask[None, :]
+        )
+    else:
+        partial_o_val = acc / l_i_safe[:, None]  # [HEAD_RATIO_PADDED, HEAD_DIM_PADDED]
+        lse_val = m_i + tl.log(l_i_safe)  # [HEAD_RATIO_PADDED]
 
-    plse_offsets = (
-        batch_id * plse_stride_batch + head_ids * plse_stride_head + split_id * plse_stride_split
-    )
-    tl.store(partial_lse_ptr + plse_offsets, lse_val, mask=head_mask)
+        # Store results for valid HEAD_RATIO Q heads and valid head_dim elements
+        po_offsets = (
+            batch_id * po_stride_batch
+            + head_ids[:, None] * po_stride_head
+            + split_id * po_stride_split
+            + dhead_offsets[None, :]
+        )
+        tl.store(
+            partial_o_ptr + po_offsets,
+            partial_o_val,
+            mask=head_mask[:, None] & head_dim_mask[None, :],
+        )
+
+        plse_offsets = (
+            batch_id * plse_stride_batch
+            + head_ids * plse_stride_head
+            + split_id * plse_stride_split
+        )
+        tl.store(partial_lse_ptr + plse_offsets, lse_val, mask=head_mask)
 
 
 @triton.autotune(
@@ -538,6 +574,7 @@ def _flash_decode_stage1_kernel(
         "SLIDING_WINDOW",
         "LOGIT_CAP",
         "SKIP_SW_MASK",
+        "WRITE_DIRECT",
     ],
 )
 @triton.jit
@@ -550,9 +587,11 @@ def _flash_decode_stage1_two_chunk_kernel(
     kv_indices_ptr,
     kv_indptr_ptr,
     kv_last_page_len_ptr,
-    # Intermediate outputs
+    # Intermediate outputs (unused when WRITE_DIRECT=True)
     partial_o_ptr,
     partial_lse_ptr,
+    # Direct output pointer: only used when WRITE_DIRECT=True (num_splits==1 path)
+    direct_o_ptr,
     # Q strides: [batch, n_heads, head_dim]
     q_stride_batch: tl.constexpr,
     q_stride_head: tl.constexpr,
@@ -569,6 +608,9 @@ def _flash_decode_stage1_two_chunk_kernel(
     cache_stride_kv: tl.constexpr,
     cache_stride_head: tl.constexpr,
     cache_stride_token: tl.constexpr,
+    # Direct output strides: [batch, n_heads, head_dim] — only used when WRITE_DIRECT=True
+    do_stride_batch: tl.constexpr,
+    do_stride_head: tl.constexpr,
     # Constants
     SM_SCALE: tl.constexpr,
     N_HEADS: tl.constexpr,
@@ -583,6 +625,7 @@ def _flash_decode_stage1_two_chunk_kernel(
     SLIDING_WINDOW: tl.constexpr = 0,
     LOGIT_CAP: tl.constexpr = 0.0,
     SKIP_SW_MASK: tl.constexpr = False,
+    WRITE_DIRECT: tl.constexpr = False,  # Iter 29: write bf16 output directly, skip partial bufs
 ):
     """Two-chunk stage1 for non-power-of-2 head_dim (e.g. 176 = 128 + 64).
 
@@ -623,32 +666,46 @@ def _flash_decode_stage1_two_chunk_kernel(
     head_mask = head_local < HEAD_RATIO
 
     if page_split_start >= num_pages:
-        # Inactive split: store zeros + -inf LSE
-        po_base = (
-            batch_id * po_stride_batch
-            + head_ids[:, None] * po_stride_head
-            + split_id * po_stride_split
-        )
-        tl.store(
-            partial_o_ptr + po_base + dhead_c1[None, :],
-            tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK1], dtype=tl.float32),
-            mask=head_mask[:, None],
-        )
-        tl.store(
-            partial_o_ptr + po_base + dhead_c2[None, :],
-            tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK2], dtype=tl.float32),
-            mask=head_mask[:, None] & head_dim_mask_c2[None, :],
-        )
-        plse_offsets = (
-            batch_id * plse_stride_batch
-            + head_ids * plse_stride_head
-            + split_id * plse_stride_split
-        )
-        tl.store(
-            partial_lse_ptr + plse_offsets,
-            tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf"),
-            mask=head_mask,
-        )
+        if WRITE_DIRECT:
+            # Iter 29: write zeros directly to output (no partial buffers).
+            do_base = batch_id * do_stride_batch + head_ids[:, None] * do_stride_head
+            tl.store(
+                direct_o_ptr + do_base + dhead_c1[None, :],
+                tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK1], dtype=tl.bfloat16),
+                mask=head_mask[:, None],
+            )
+            tl.store(
+                direct_o_ptr + do_base + dhead_c2[None, :],
+                tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK2], dtype=tl.bfloat16),
+                mask=head_mask[:, None] & head_dim_mask_c2[None, :],
+            )
+        else:
+            # Inactive split: store zeros + -inf LSE
+            po_base = (
+                batch_id * po_stride_batch
+                + head_ids[:, None] * po_stride_head
+                + split_id * po_stride_split
+            )
+            tl.store(
+                partial_o_ptr + po_base + dhead_c1[None, :],
+                tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK1], dtype=tl.float32),
+                mask=head_mask[:, None],
+            )
+            tl.store(
+                partial_o_ptr + po_base + dhead_c2[None, :],
+                tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK2], dtype=tl.float32),
+                mask=head_mask[:, None] & head_dim_mask_c2[None, :],
+            )
+            plse_offsets = (
+                batch_id * plse_stride_batch
+                + head_ids * plse_stride_head
+                + split_id * plse_stride_split
+            )
+            tl.store(
+                partial_lse_ptr + plse_offsets,
+                tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf"),
+                mask=head_mask,
+            )
         return
 
     # Load Q in two chunks: [HEAD_RATIO_PADDED, HD_CHUNK1] and [HEAD_RATIO_PADDED, HD_CHUNK2]
@@ -822,25 +879,44 @@ def _flash_decode_stage1_two_chunk_kernel(
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_i_new
 
-    # Normalize and store in two chunks
+    # Normalize and store: either directly to bf16 output (WRITE_DIRECT) or to partial buffers.
     l_i_safe = tl.where(l_i == 0.0, 1.0, l_i)
-    po_base = (
-        batch_id * po_stride_batch + head_ids[:, None] * po_stride_head + split_id * po_stride_split
-    )
-    tl.store(
-        partial_o_ptr + po_base + dhead_c1[None, :],
-        acc_c1 / l_i_safe[:, None],
-        mask=head_mask[:, None],
-    )
-    tl.store(
-        partial_o_ptr + po_base + dhead_c2[None, :],
-        acc_c2 / l_i_safe[:, None],
-        mask=head_mask[:, None] & head_dim_mask_c2[None, :],
-    )
-    plse_offsets = (
-        batch_id * plse_stride_batch + head_ids * plse_stride_head + split_id * plse_stride_split
-    )
-    tl.store(partial_lse_ptr + plse_offsets, m_i + tl.log(l_i_safe), mask=head_mask)
+
+    if WRITE_DIRECT:
+        # Iter 29: write bf16 output directly — skips partial_o fp32 write and stage2/copy_.
+        do_base = batch_id * do_stride_batch + head_ids[:, None] * do_stride_head
+        tl.store(
+            direct_o_ptr + do_base + dhead_c1[None, :],
+            (acc_c1 / l_i_safe[:, None]).to(tl.bfloat16),
+            mask=head_mask[:, None],
+        )
+        tl.store(
+            direct_o_ptr + do_base + dhead_c2[None, :],
+            (acc_c2 / l_i_safe[:, None]).to(tl.bfloat16),
+            mask=head_mask[:, None] & head_dim_mask_c2[None, :],
+        )
+    else:
+        po_base = (
+            batch_id * po_stride_batch
+            + head_ids[:, None] * po_stride_head
+            + split_id * po_stride_split
+        )
+        tl.store(
+            partial_o_ptr + po_base + dhead_c1[None, :],
+            acc_c1 / l_i_safe[:, None],
+            mask=head_mask[:, None],
+        )
+        tl.store(
+            partial_o_ptr + po_base + dhead_c2[None, :],
+            acc_c2 / l_i_safe[:, None],
+            mask=head_mask[:, None] & head_dim_mask_c2[None, :],
+        )
+        plse_offsets = (
+            batch_id * plse_stride_batch
+            + head_ids * plse_stride_head
+            + split_id * plse_stride_split
+        )
+        tl.store(partial_lse_ptr + plse_offsets, m_i + tl.log(l_i_safe), mask=head_mask)
 
 
 @triton.autotune(
@@ -995,22 +1071,39 @@ def triton_paged_decode(
     effective_seq_len = min(max_seq_len, sw) if sw > 0 else max_seq_len
     num_splits = _get_num_splits(effective_seq_len, batch_size, n_kv_heads, page_size, sw)
 
-    # Allocate intermediate buffers for split-K
-    partial_o = torch.empty(
-        batch_size,
-        n_heads,
-        num_splits,
-        head_dim,
-        dtype=torch.float32,
-        device=q.device,
-    )
-    partial_lse = torch.empty(
-        batch_size,
-        n_heads,
-        num_splits,
-        dtype=torch.float32,
-        device=q.device,
-    )
+    # Iter 29: WRITE_DIRECT=True for num_splits==1 — stage1 writes final bf16 output directly,
+    # skipping the partial_o fp32 write and the subsequent copy_() kernel. Saves ~5-6µs of
+    # kernel-launch overhead for splits=1 shapes (D6-D10, S4-S5 for Gemma-4/H100).
+    write_direct = num_splits == 1
+
+    if write_direct:
+        # Dummy 1-element tensors; stage1 will not write to them (WRITE_DIRECT=True path).
+        partial_o = torch.empty(1, dtype=torch.float32, device=q.device)
+        partial_lse = torch.empty(1, dtype=torch.float32, device=q.device)
+        po_s0, po_s1, po_s2 = 0, 0, 0
+        plse_s0, plse_s1, plse_s2 = 0, 0, 0
+    else:
+        partial_o = torch.empty(
+            batch_size,
+            n_heads,
+            num_splits,
+            head_dim,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        partial_lse = torch.empty(
+            batch_size,
+            n_heads,
+            num_splits,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        po_s0, po_s1, po_s2 = partial_o.stride(0), partial_o.stride(1), partial_o.stride(2)
+        plse_s0, plse_s1, plse_s2 = (
+            partial_lse.stride(0),
+            partial_lse.stride(1),
+            partial_lse.stride(2),
+        )
 
     # Stage 1: GQA-batched parallel KV processing.
     # For non-power-of-2 head_dim, use the two-chunk kernel which splits head_dim into
@@ -1024,18 +1117,21 @@ def triton_paged_decode(
         kv_last_page_len,
         partial_o,
         partial_lse,
+        output,  # direct_o_ptr: output tensor passed to both kernels; only used if WRITE_DIRECT
         q.stride(0),
         q.stride(1),
-        partial_o.stride(0),
-        partial_o.stride(1),
-        partial_o.stride(2),
-        partial_lse.stride(0),
-        partial_lse.stride(1),
-        partial_lse.stride(2),
+        po_s0,
+        po_s1,
+        po_s2,
+        plse_s0,
+        plse_s1,
+        plse_s2,
         kv_cache.stride(0),
         kv_cache.stride(1),
         kv_cache.stride(2),
         kv_cache.stride(3),
+        output.stride(0),  # do_stride_batch
+        output.stride(1),  # do_stride_head
     )
     # Iter 28: SKIP_SW_MASK=True eliminates SW-masking branch at compile time (same register
     # footprint as SLIDING_WINDOW=0 kernels). Set when caller guarantees max_seq_len <= sw.
@@ -1055,6 +1151,7 @@ def triton_paged_decode(
         SLIDING_WINDOW=sw,
         LOGIT_CAP=lc,
         SKIP_SW_MASK=skip_sw_mask,
+        WRITE_DIRECT=write_direct,
     )
 
     if head_dim_padded == head_dim:
@@ -1081,12 +1178,7 @@ def triton_paged_decode(
             **stage1_common_kwargs,
         )
 
-    if num_splits == 1:
-        # Skip stage2: partial_o[:, :, 0, :] already holds the normalized output.
-        # This saves a full kernel launch + memory round-trip for large batches
-        # (num_splits == 1 when batch_size * n_kv_heads >= 2 * num_SMs).
-        output.copy_(partial_o.squeeze(2))
-    else:
+    if not write_direct:
         # Stage 2: Combine partial results — tiled over HEAD_DIM for more SM parallelism.
         # BLOCK_HD is autotuned; use lambda grid so it adapts to the chosen config.
         _flash_decode_stage2_kernel[
@@ -1111,6 +1203,7 @@ def triton_paged_decode(
             HEAD_DIM_PADDED=head_dim_padded,
             NUM_SPLITS=num_splits,
         )
+    # WRITE_DIRECT=True (write_direct): stage1 already wrote to output directly; nothing to do.
 
     return output
 

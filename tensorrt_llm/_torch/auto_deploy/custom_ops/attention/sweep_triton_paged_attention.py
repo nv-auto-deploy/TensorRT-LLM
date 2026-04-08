@@ -261,10 +261,26 @@ def bench_decode_stage1(
     num_splits = _get_num_splits(effective_seq, batch, n_kv_heads, page_size, sw_kernel)
     head_dim_padded = triton.next_power_of_2(head_dim)
 
-    partial_o = torch.empty(
-        batch, n_heads, num_splits, head_dim, dtype=torch.float32, device=DEVICE
-    )
-    partial_lse = torch.empty(batch, n_heads, num_splits, dtype=torch.float32, device=DEVICE)
+    # Iter 29: WRITE_DIRECT=True for num_splits==1 (matches production path)
+    write_direct = num_splits == 1
+    output_direct = torch.empty(batch, n_heads, head_dim, dtype=torch.bfloat16, device=DEVICE)
+
+    if write_direct:
+        partial_o = torch.empty(1, dtype=torch.float32, device=DEVICE)
+        partial_lse = torch.empty(1, dtype=torch.float32, device=DEVICE)
+        po_s0, po_s1, po_s2 = 0, 0, 0
+        plse_s0, plse_s1, plse_s2 = 0, 0, 0
+    else:
+        partial_o = torch.empty(
+            batch, n_heads, num_splits, head_dim, dtype=torch.float32, device=DEVICE
+        )
+        partial_lse = torch.empty(batch, n_heads, num_splits, dtype=torch.float32, device=DEVICE)
+        po_s0, po_s1, po_s2 = partial_o.stride(0), partial_o.stride(1), partial_o.stride(2)
+        plse_s0, plse_s1, plse_s2 = (
+            partial_lse.stride(0),
+            partial_lse.stride(1),
+            partial_lse.stride(2),
+        )
 
     extra_kwargs = {}
     if num_warps_override is not None:
@@ -280,18 +296,21 @@ def bench_decode_stage1(
         kv_last_page_len,
         partial_o,
         partial_lse,
+        output_direct,  # direct_o_ptr
         q.stride(0),
         q.stride(1),
-        partial_o.stride(0),
-        partial_o.stride(1),
-        partial_o.stride(2),
-        partial_lse.stride(0),
-        partial_lse.stride(1),
-        partial_lse.stride(2),
+        po_s0,
+        po_s1,
+        po_s2,
+        plse_s0,
+        plse_s1,
+        plse_s2,
         kv_cache.stride(0),
         kv_cache.stride(1),
         kv_cache.stride(2),
         kv_cache.stride(3),
+        output_direct.stride(0),  # do_stride_batch
+        output_direct.stride(1),  # do_stride_head
     )
     common_kwargs = dict(
         SM_SCALE=sm_scale,
@@ -303,6 +322,7 @@ def bench_decode_stage1(
         HEAD_RATIO_PADDED=head_ratio_padded,
         NUM_SPLITS=num_splits,
         SLIDING_WINDOW=sw_kernel,
+        WRITE_DIRECT=write_direct,
         **extra_kwargs,
     )
 

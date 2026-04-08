@@ -935,6 +935,51 @@ overhead for single-sequence decode (small batch benefits most from reduced regi
 
 ______________________________________________________________________
 
+### Iteration 29 — WRITE_DIRECT constexpr: fuse stage2 into stage1 for num_splits=1
+
+**What changed:** Added `WRITE_DIRECT: tl.constexpr = False` to both stage1 kernels. When True,
+stage1 writes the final bf16 output directly to the output tensor and skips writing fp32
+`partial_o` / `partial_lse`. The `copy_()` call (or stage2 kernel) is skipped entirely.
+
+Added `direct_o_ptr, do_stride_batch: tl.constexpr, do_stride_head: tl.constexpr` parameters
+to both stage1 kernels. In the launcher, when `num_splits == 1`:
+
+- `write_direct = True`
+- Tiny dummy tensors replace `partial_o` / `partial_lse` (compiler eliminates unused stores)
+- `output` passed as `direct_o_ptr`; stage1 writes `(acc / l_i_safe).to(bfloat16)` directly
+
+**Why `num_splits==1` matters:** For large batches (D6-D10, S4-S5 for Gemma-4/H100), existing
+parallelism ≥ splits=1 threshold. The previous path was:
+
+1. Stage1 writes partial_o (fp32) and partial_lse — **1 kernel write pass**
+1. `output.copy_(partial_o.squeeze(2))` type-converts fp32→bf16 — **1 copy kernel**
+
+The copy\_ kernel has ~5µs launch overhead plus ~0.5µs bandwidth cost. With WRITE_DIRECT:
+
+1. Stage1 writes bf16 output directly (skips fp32 partial_o and lse writes)
+   No further kernels needed — eliminates the ~5-6µs copy\_ overhead entirely.
+
+**Results:**
+
+| Shape | Iter28 e2e | Iter29 e2e | Delta | s1%e2e |
+|-------|-----------|-----------|-------|--------|
+| D6 (B=32, splits=1) | 51.62 | 48.42 | **-6.2%** | 100.5% |
+| D7 (B=64, splits=1) | 84.08 | 81.07 | **-3.6%** | 99.7% |
+| D8 (B=128, splits=1) | 153.95 | 150.54 | **-2.2%** | 100.0% |
+| D9 (B=256, splits=1) | 279.73 | 274.84 | **-1.7%** | 99.9% |
+| D10 (B=384, splits=1) | 407.30 | 400.96 | **-1.6%** | 100.0% |
+| S4 (B=128, SW=1024, splits=1) | 271.33 | 265.22 | **-2.2%** | 99.9% |
+| S5 (B=384, SW=1024, splits=1) | 776.30 | 763.30 | **-1.7%** | 99.8% |
+| D1-D5, S1-S3, L1-L4 (splits>1) | flat | flat | — | — |
+
+The `s1%e2e ≈ 100%` for all splits=1 shapes confirms stage2/copy\_ is fully eliminated.
+
+**Correctness:** PASS (163/163)
+
+**Commit:** see git log
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space
