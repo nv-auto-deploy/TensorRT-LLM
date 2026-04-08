@@ -726,9 +726,9 @@ def _flash_decode_stage2_kernel(
     vs the original (batch, n_heads) 2D grid. Each program reads all NUM_SPLITS LSE
     scalars and its BLOCK_HD slice of each split's partial output.
 
-    Iter 20: one-pass online softmax combination (flash-attention style), replacing the
-    prior two-pass algorithm. Saves one full scan of partial_lse_ptr (NUM_SPLITS scalar
-    reads) and eliminates the first loop. Also hoists batch/head offset outside loop.
+    Two-pass algorithm: pass 1 finds global max LSE (cheap scalar ops), pass 2
+    computes the weighted sum using the known max (one tl.exp per split vs two for
+    the one-pass online approach). Batch/head offsets hoisted outside both loops.
     """
     batch_id = tl.program_id(axis=0)
     head_id = tl.program_id(axis=1)
@@ -743,44 +743,39 @@ def _flash_decode_stage2_kernel(
     if hd_start >= HEAD_DIM:
         return
 
-    # Iter 20: hoist batch/head base offsets outside the split loop.
+    # Hoist batch/head base offsets outside both loops.
     plse_head_base = batch_id * plse_stride_batch + head_id * plse_stride_head
     po_head_base = batch_id * po_stride_batch + head_id * po_stride_head
     o_offset = batch_id * o_stride_batch + head_id * o_stride_head + dhead_offsets
 
-    # Iter 20: one-pass online combination.
-    # Maintains running (m_i, l_i, acc) updated flash-attention style.
-    # Replaces prior two-pass: pass1 = find max LSE, pass2 = weighted sum.
-    # Saves NUM_SPLITS scalar reads of partial_lse_ptr and the first loop.
-    m_i = float("-inf")  # running max LSE
-    l_i = 0.0  # running softmax denominator
-    acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
-
+    # Pass 1: find global max LSE across all splits (scalar ops only).
+    global_max_lse = float("-inf")
     for split_id in range(NUM_SPLITS):
         lse = tl.load(partial_lse_ptr + plse_head_base + split_id * plse_stride_split)
-        m_i_new = tl.maximum(m_i, lse)
+        global_max_lse = tl.maximum(global_max_lse, lse)
 
-        # Guard against NaN when m_i == m_i_new == -inf (all splits inactive so far)
-        alpha = tl.where(m_i > float("-inf"), tl.exp(m_i - m_i_new), 0.0)
-        weight = tl.where(m_i_new > float("-inf"), tl.exp(lse - m_i_new), 0.0)
+    # Guard: if all splits had -inf LSE (empty sequence), output zeros.
+    if global_max_lse == float("-inf"):
+        tl.store(o_ptr + o_offset, tl.zeros([BLOCK_HD], dtype=tl.float32), mask=head_dim_mask)
+        return
 
+    # Pass 2: weighted sum using global max — only ONE tl.exp per split.
+    norm = 0.0
+    acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
+    for split_id in range(NUM_SPLITS):
+        lse = tl.load(partial_lse_ptr + plse_head_base + split_id * plse_stride_split)
+        weight = tl.exp(lse - global_max_lse)
         partial_o = tl.load(
             partial_o_ptr + po_head_base + split_id * po_stride_split + dhead_offsets,
             mask=head_dim_mask,
             other=0.0,
         )
-        acc = acc * alpha + weight * partial_o
-        l_i = l_i * alpha + weight
-        m_i = m_i_new
+        acc += weight * partial_o
+        norm += weight
 
-    # Guard: if all splits had -inf LSE (empty sequence), output zeros
-    if m_i == float("-inf"):
-        tl.store(o_ptr + o_offset, tl.zeros([BLOCK_HD], dtype=tl.float32), mask=head_dim_mask)
-        return
-
-    # Normalize and store
-    l_i = tl.where(l_i == 0.0, 1.0, l_i)
-    tl.store(o_ptr + o_offset, acc / l_i, mask=head_dim_mask)
+    # Normalize and store.
+    norm = tl.where(norm == 0.0, 1.0, norm)
+    tl.store(o_ptr + o_offset, acc / norm, mask=head_dim_mask)
 
 
 def triton_paged_decode(

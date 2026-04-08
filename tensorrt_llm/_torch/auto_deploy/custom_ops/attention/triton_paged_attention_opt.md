@@ -621,6 +621,87 @@ Unified the variable and moved the single computation before both loops.
 
 ______________________________________________________________________
 
+### Iteration 20 — One-pass stage2 online softmax (FAILED, reverted in iter 22)
+
+**What changed:** In `_flash_decode_stage2_kernel`, replaced the prior two-pass algorithm
+(pass 1: find global max LSE, pass 2: weighted sum) with a single-pass online combination
+maintaining running `(m_i, l_i, acc)` flash-attention style. Also hoisted batch/head offsets
+outside the loop.
+
+**Correctness:** PASS (163/163)
+
+**Results:**
+
+| ID | Iter17 e2e (μs) | Iter20 e2e (μs) | Delta |
+|----|-----------------|-----------------|-------|
+| D1 | 12.47 | 12.46 | flat |
+| D2 | 14.14 | 19.82 | **+40% REGRESSION** |
+| D3 | 17.40 | 23.23 | **+33% REGRESSION** |
+| D4 | 23.36 | 23.26 | flat |
+| D5 | 34.51 | 34.33 | flat |
+| S1 | 14.11 | 19.76 | **+40% REGRESSION** |
+| L3 | 33.40 | 38.99 | **+17% REGRESSION** |
+
+**Analysis:** The one-pass algorithm requires TWO `tl.exp` calls per split (α = exp(m_old − m_new)
+and weight = exp(lse − m_new)) plus TWO `tl.where` guards. GPU predicated execution computes
+both branches of `tl.where`, so both `tl.exp` calls always execute. The two-pass algorithm only
+needs ONE `tl.exp` per split in pass 2 (weight = exp(lse − global_max)), with no guards needed
+since global_max is already known. The extra exp+where overhead dominates at NUM_SPLITS=16-32.
+The hoisting optimization (batch/head offsets) is correct and kept; only the loop algorithm is reverted.
+
+**Commit:** see git log (reverted in iter 22)
+
+______________________________________________________________________
+
+### Iteration 21 — Tighten Phase 2 loop upper bound in context kernel
+
+**What changed:** In `_paged_context_kernel`, Phase 2 loop (boundary/causal pages) previously
+iterated from `num_full_pages` to `num_kv_pages` and used an inner `if kv_base_pos <= max_q_pos:`
+check to skip pages beyond the current Q block's causal window. Replaced with a tighter loop bound:
+`phase2_end = tl.minimum(num_kv_pages, max_q_pos // PAGE_SIZE + 1)`, encoding the causal skip
+in the loop bound itself and removing the per-page branch.
+
+**Changes:**
+
+- Added `max_q_pos = q_offsets[-1] + cache_len` scalar computation before Phase 2
+- Changed loop `for page_idx in range(num_full_pages, num_kv_pages):` to
+  `for page_idx in range(num_full_pages, phase2_end):`
+- Removed inner `if kv_base_pos <= max_q_pos:` branch and dedented the softmax update block
+
+**Affected shapes:** Context/prefill with chunked input (early Q blocks in long prefill skip
+all pages beyond the Q causal window). For single-block Q (typical short prefill), max_q_pos
+≈ q_len + cache_len, so phase2_end ≈ num_kv_pages — no difference. For multi-block Q during
+long prefill, saves O(num_q_blocks) page iterations.
+
+**Correctness:** PASS (163/163)
+
+**Commit:** see git log
+
+______________________________________________________________________
+
+### Iteration 22 — Revert iter 20 one-pass stage2; restore two-pass with hoisting
+
+**What changed:** Reverted `_flash_decode_stage2_kernel` from iter 20's one-pass online algorithm
+back to the two-pass approach. Kept the batch/head offset hoisting (a pure win from iter 20)
+but replaced the algorithm with the standard two-pass:
+
+- **Pass 1** (scalar ops only): loop over NUM_SPLITS to find `global_max_lse`
+- **Pass 2** (vector ops): loop over NUM_SPLITS, compute `weight = tl.exp(lse - global_max_lse)`,
+  accumulate `acc += weight * partial_o`
+
+Key difference vs one-pass: pass 2 has ONE `tl.exp` per split (vs two in one-pass), no `tl.where`
+guards needed (global_max already known), and no per-element alpha rescaling of `acc`.
+
+Also kept: early-exit guard `if global_max_lse == float("-inf")` for empty sequences (all-inf LSE).
+
+**Correctness:** PASS (163/163 — same test suite)
+
+**Expected recovery:** D2 +40%, D3 +33%, S1 +40%, L3 +17% regressions from iter 20 resolved.
+
+**Commit:** see git log
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space
