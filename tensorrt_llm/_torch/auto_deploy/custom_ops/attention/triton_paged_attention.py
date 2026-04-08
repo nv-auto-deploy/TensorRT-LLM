@@ -1074,6 +1074,11 @@ def _paged_context_kernel(
     # Check if this is a full Q block (no q_mask needed)
     is_full_q_block = (q_block_start + Q_BLOCK) <= q_len
 
+    # Iter 19: hoist q_positions_2d before both Phase 1 and Phase 2 loops — it is used in
+    # both the SLIDING_WINDOW Phase 1 mask (as q_kv_pos) and the Phase 2 causal mask.
+    # Saves one [Q_BLOCK, 1] vector add per Phase 1 iteration when SLIDING_WINDOW > 0.
+    q_positions_2d = q_offsets[:, None] + cache_len  # [Q_BLOCK, 1], loop-invariant
+
     # Phase 1: Full pages — no causal mask, no validity mask
     # Process one page at a time with a clean inner loop
     kv_head_offset = kv_head_id * cache_stride_head
@@ -1108,8 +1113,7 @@ def _paged_context_kernel(
             # Per-query sliding window mask: each query position q_pos
             # can attend to KV in [q_pos - W + 1, q_pos].
             kv_positions = page_idx * PAGE_SIZE + page_offsets[None, :]
-            q_kv_pos = q_offsets[:, None] + cache_len
-            sw_mask = (q_kv_pos - kv_positions) < SLIDING_WINDOW
+            sw_mask = (q_positions_2d - kv_positions) < SLIDING_WINDOW
             full_mask_p1 = q_mask[:, None] & sw_mask
             qk = tl.where(full_mask_p1, qk, float("-inf"))
         elif HEAD_DIM_PADDED == HEAD_DIM:
@@ -1174,9 +1178,7 @@ def _paged_context_kernel(
         m_i = m_i_new
 
     # Phase 2: Boundary pages — need causal mask and validity mask
-    # Pre-compute q_positions outside loop (invariant across pages)
-    q_positions_2d = q_offsets[:, None] + cache_len
-
+    # q_positions_2d already computed before Phase 1 loop (iter 19 hoist)
     for page_idx in range(num_full_pages, num_kv_pages):
         kv_base_pos = page_idx * PAGE_SIZE
 

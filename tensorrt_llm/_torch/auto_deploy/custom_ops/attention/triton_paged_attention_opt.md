@@ -600,6 +600,27 @@ Soft-capping is applied after `score *= SM_SCALE` but before page/causal/sliding
 
 ______________________________________________________________________
 
+### Iteration 19 — Hoist q_positions_2d before both context kernel loops
+
+**What changed:** In `_paged_context_kernel`, `q_kv_pos = q_offsets[:, None] + cache_len` was
+computed inside the Phase 1 loop (SLIDING_WINDOW path) on every iteration, despite being fully
+loop-invariant. An identical computation `q_positions_2d` was already hoisted before Phase 2.
+Unified the variable and moved the single computation before both loops.
+
+**Changes:**
+
+- Added `q_positions_2d = q_offsets[:, None] + cache_len` before Phase 1 loop
+- Phase 1 SW path: replaced `q_kv_pos = ...` + `sw_mask = (q_kv_pos - ...)` with `sw_mask = (q_positions_2d - ...)`
+- Removed duplicate `q_positions_2d` assignment before Phase 2
+
+**Affected shapes:** Context with SLIDING_WINDOW > 0 (S1-S4). Saves one `[Q_BLOCK, 1]` vector add per Phase 1 iteration.
+
+**Correctness:** PASS (163/163)
+
+**Commit:** see git log
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space
