@@ -396,6 +396,26 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 10 — Context kernel Q_BLOCK=256 expansion (FAILED, reverted)
+
+**What changed:**
+
+- Added Q_BLOCK=256 configs to context kernel autotune (2 configs: num_stages=2/3, num_warps=16).
+- Hypothesis: longer Q tiles reduce grid size for long prefills and improve QK GEMM size.
+
+**Correctness:** PASS (132/132)
+
+**Results:** All context shapes regressed 6-10% vs iter 0 baseline:
+
+- C1 (q=128, sl=512): 47.81 → 50.76-52.60 μs (+6-10%)
+- C4 (q=256, sl=2048): 177.49 → 190-196 μs (+7-10%)
+
+**Analysis:** The autotuner explored Q_BLOCK=256 configs and selected a slower config. Q_BLOCK=256 may have higher register usage (spills) for the GQA-batched inner loop, causing more pipeline stalls. Also, with Q_BLOCK=256 and q_len=128, the block is 2× bigger than the actual work → wasted computation. Reverted.
+
+**Commit:** see git log (reverted)
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space
