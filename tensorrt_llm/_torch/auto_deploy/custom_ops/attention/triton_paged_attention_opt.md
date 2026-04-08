@@ -980,65 +980,55 @@ The `s1%e2e ≈ 100%` for all splits=1 shapes confirms stage2/copy\_ is fully el
 
 ______________________________________________________________________
 
-### Iteration 30 — Autotune expansion: num_stages=6,7 for decode; num_stages=5 for context
+### Iteration 30 — Autotune expansion: num_stages=6,7 for decode (context reverted)
 
-**What changed:** Added 6 new configs to both decode stage1 kernels extending to `num_stages ∈ {6, 7}`.
-Context kernel capped at `num_stages=5` (4 new configs added):
+**What changed (kept):** Added 6 new configs to both decode stage1 kernels extending to
+`num_stages ∈ {6, 7}` — decode kernels only:
 
 - `_flash_decode_stage1_kernel`: Added (num_warps=4/8/16) × (num_stages=6/7) — 6 new.
 - `_flash_decode_stage1_two_chunk_kernel`: Same 6 configs.
-- `_paged_context_kernel`: Added (Q_BLOCK=64,128) × (num_warps=4/8) × (num_stages=5) — 4 new.
 
-**Rationale:** Deeper pipeline stages hide HBM latency for shapes with long inner loops
-(S3/S4/L shapes: 16-64 pages/split, C2-C4: long KV loops).
+**Context kernel: all iter 30 changes reverted** — attempted to add `num_stages=5` configs,
+but two distinct Triton 3.6.0 compiler crashes were triggered (see below); context kernel
+is back to 12 configs from iter 0+1.
 
-**⚠ Triton 3.6.0 bug:** `num_stages=6` for `_paged_context_kernel` triggers a Triton
-compiler assertion crash ("please share the reproducer above with Triton project").
-The two-phase structure + constexpr branches (SKIP_PHASE1_SW, LOGIT_CAP) make the
-context kernel's software pipeline scheduling too complex for num_stages=6.
-The decode kernels (simpler single-phase loop) handle num_stages=6/7 fine.
+**⚠ Triton 3.6.0 crashes in `_paged_context_kernel`:**
+
+1. **Crash A — software pipeliner assertion** (`"please share the reproducer above with Triton project"`): Triggered by `num_stages=6` configs, and separately by `SKIP_PHASE1_SW=True`
+   autotune variants (iter 31). The two-phase structure + constexpr branches
+   (SLIDING_WINDOW, LOGIT_CAP) cause Triton's software pipeline scheduler to assert.
+1. **Crash B — register exhaustion** (`ptxas fatal: Insufficient registers (128) to compile instruction; try target of 158 or higher`): Triggered by `num_stages=5, num_warps=16`
+   (`.reqntid 512`). 158 regs × 512 threads > 65536 SM register budget.
+
+The decode kernels (simpler single-phase loop, fewer live values) handle `num_stages=6/7` fine.
 
 **Correctness:** Parameter-only (autotune config addition). No structural change. PASS (163/163).
 
-**Results:** Pending re-tune on first run.
+**Results:** Decode kernels gain from deeper pipeline on S3/S4/L shapes; pending re-tune.
 
 **Commit:** see git log
 
 ______________________________________________________________________
 
-### Iteration 31 — SKIP_PHASE1_SW constexpr: compile-time SW Phase 1 elimination for context kernel
+### Iteration 31 — SKIP_PHASE1_SW constexpr: REVERTED (Triton 3.6.0 crash)
 
-**What changed:** Added `SKIP_PHASE1_SW: tl.constexpr = False` to `_paged_context_kernel`. When
-True, the SW-masking branch in Phase 1 is compile-time eliminated (same mechanism as
-`SKIP_SW_MASK` for decode stage1 in iter 28).
+**Attempted:** Add `SKIP_PHASE1_SW: tl.constexpr = False` to `_paged_context_kernel`.
+When True, Phase 1 SW masking would be eliminated at compile time (same mechanism as
+`SKIP_SW_MASK` for decode stage1 in iter 28). Added to autotune key to get a separate
+cached kernel for each value.
 
-**Added `SKIP_PHASE1_SW` to autotune key** so SW-capable shapes split into two variant kernels.
+**Why it failed:** Adding `SKIP_PHASE1_SW` to the autotune key doubles the number of
+compilations for SW-capable shapes. The `SKIP_PHASE1_SW=True` variant generates structurally
+different IR (no SW guard branch, different softmax path), which triggers Triton's software
+pipeline scheduler assertion (same Crash A as iter 30). Confirmed by DWARF debug line number
+analysis: two crashes with `.loc` line numbers differing by exactly 2 (matching the 2-line
+removal of the sig comment) — same crash site, different compilation variant.
 
-**Context Phase 1 SW masking:** When `SLIDING_WINDOW > 0`, Phase 1 normally applies a per-token
-SW mask (`sw_mask = (q_positions_2d - kv_positions) < SLIDING_WINDOW`) to exclude KV tokens
-outside the window. This requires an extra per-page vector compare + `tl.where` on every Phase 1
-iteration, plus guarded `tl.where`-based softmax to handle all-inf columns.
+**Fix:** Fully reverted. Context kernel unchanged from post-iter-29 state.
 
-**When SKIP_PHASE1_SW is safe:** For context/prefill with `seq_len_with_cache <= SLIDING_WINDOW`,
-`first_valid_pos=0` for every query position, so ALL Phase 1 tokens are within the SW. The SW
-mask is trivially all-True — the masking code can be eliminated.
+**Correctness:** N/A (reverted before merge).
 
-**Launcher logic:**
-
-```python
-# Conservative proxy: only skip when fresh-prefill seq_len = q_len ≤ max_q_len ≤ sw
-skip_phase1_sw = sw > 0 and max_q_len <= sw
-```
-
-This uses `max_q_len` (a CPU int from the batch info), avoiding any GPU-CPU sync.
-
-**Expected gain:** Context SW shapes with short sequences (e.g. CS1: q_len=128, SW=1024) gain
-the same fast Phase 1 path as non-SW context shapes. Analogous to SKIP_SW_MASK achieving -11%
-on S1 decode shapes (iter 28).
-
-**Correctness:** PASS (163/163)
-
-**Commit:** see git log
+**Commit:** see git log (fix commit)
 
 ______________________________________________________________________
 
