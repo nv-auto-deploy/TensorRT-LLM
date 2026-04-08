@@ -598,7 +598,6 @@ def _flash_decode_stage1_two_chunk_kernel(
     local_kv_c2 = (
         page_offsets[:, None] * cache_stride_token + dhead_c2[None, :]
     )  # [PAGE_SIZE, HD_C2]
-
     for local_page_idx in range(num_pages_this_split):
         page_idx = page_split_start + local_page_idx
         physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)

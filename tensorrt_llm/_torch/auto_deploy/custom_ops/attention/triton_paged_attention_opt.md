@@ -696,9 +696,54 @@ Also kept: early-exit guard `if global_max_lse == float("-inf")` for empty seque
 
 **Correctness:** PASS (163/163 — same test suite)
 
-**Expected recovery:** D2 +40%, D3 +33%, S1 +40%, L3 +17% regressions from iter 20 resolved.
+**Results post-revert (iter 22 baseline):**
+
+| ID | e2e(μs) | Δ vs iter17 |
+|----|---------|-------------|
+| D1 | 12.62 | flat |
+| D2 | 14.14 | flat |
+| D3 | 17.37 | flat |
+| S1 | 14.04 | -0.5% |
+| L3 | 33.33 | -0.2% |
 
 **Commit:** see git log
+
+______________________________________________________________________
+
+### Iteration 23 — SW boundary mask precomputation (FAILED, reverted)
+
+**What changed:** Attempted to precompute sliding window boundary mask outside the inner page loop
+in both stage1 kernels. Logic: only `first_window_page` can have tokens outside the window;
+all pages with `page_idx > first_window_page` are fully within the window. Added
+`boundary_window_mask = page_offsets >= (first_valid_pos % PAGE_SIZE)` before the loop, and
+changed inner loop masking to `if page_idx == first_window_page: use boundary_mask else: use page_mask`.
+
+**Expected savings:** Eliminate per-page `global_pos` (mul+add) and `window_mask` (compare) vector
+computations for all pages except the boundary page. For S3 (16 pages/split), 94% of pages would
+skip these 2 vector ops.
+
+**Actual results:**
+
+| ID | Iter22 e2e | Iter23 e2e | Delta |
+|----|-----------|-----------|-------|
+| S1 | 14.04 | 14.32 | +2.0% |
+| S2 | 32.69 | 34.93 | **+6.9%** |
+| S3 | 82.84 | 87.74 | **+5.9%** |
+| S4 | 268.58 | 316.80 | **+18%** |
+
+**Analysis:** Triton's predicated execution computes BOTH branches of `if page_idx == first_window_page:`.
+The runtime scalar comparison adds a predicated branch pair to the loop body. For the non-boundary
+case (all splits 1+, most iterations of split 0), the False branch runs but the True branch's
+compute also executes (GPU predication computes both, selects result). This adds overhead instead
+of removing it. The S4 regression (+18%) also suggests autotune cache invalidation for the modified
+SW kernel picked a worse config during re-tuning.
+
+**Lesson:** Runtime branches inside Triton loops for SW boundary specialization require true
+warp-divergence-free uniform conditions. The `page_idx == first_window_page` check varies
+PER ITERATION of the loop, not per kernel invocation, so it cannot be eliminated by the compiler
+or GPU scheduler.
+
+**Commit:** see git log (reverted)
 
 ______________________________________________________________________
 
