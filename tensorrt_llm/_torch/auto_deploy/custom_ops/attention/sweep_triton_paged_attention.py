@@ -542,6 +542,13 @@ def bench_gather_kernel(
     k_sdpa = torch.empty(batch, n_kv_heads, max_kv_len, head_dim, dtype=DTYPE, device=DEVICE)
     v_sdpa = torch.empty(batch, n_kv_heads, max_kv_len, head_dim, dtype=DTYPE, device=DEVICE)
 
+    head_dim_padded = triton.next_power_of_2(head_dim)
+    if head_dim_padded == head_dim:
+        hd_chunk1, hd_chunk2 = 0, 0
+    else:
+        hd_chunk1 = head_dim_padded // 2
+        hd_chunk2 = triton.next_power_of_2(head_dim - hd_chunk1)
+
     def fn():
         _fast_gather_sdpa_kernel[(total_pages, n_kv_heads)](
             kv_cache,
@@ -559,7 +566,9 @@ def bench_gather_kernel(
             N_KV_HEADS=n_kv_heads,
             PAGE_SIZE=page_size,
             HEAD_DIM=head_dim,
-            HEAD_DIM_PADDED=triton.next_power_of_2(head_dim),
+            HEAD_DIM_PADDED=head_dim_padded,
+            HD_CHUNK1=hd_chunk1,
+            HD_CHUNK2=hd_chunk2,
         )
 
     ms = triton.testing.do_bench(fn, warmup=25, rep=100)

@@ -1188,49 +1188,79 @@ def _fast_gather_sdpa_kernel(
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     HEAD_DIM_PADDED: tl.constexpr,
+    HD_CHUNK1: tl.constexpr,  # First chunk size (0 = single-chunk mode)
+    HD_CHUNK2: tl.constexpr,  # Second chunk size
 ):
     """Gather scattered pages into separate K, V buffers in SDPA layout.
 
     Grid: (total_pages, N_KV_HEADS)
     Each program copies one page for one KV head into contiguous K and V
     outputs shaped [num_seq, n_kv_heads, max_kv_len, head_dim].
-    No precomputed mapping needed — seq_id and local_page computed from global index.
+
+    When HD_CHUNK1 > 0 (non-power-of-2 head_dim), uses two-chunk loading to
+    reduce 25% of bandwidth vs HEAD_DIM_PADDED=256 approach.
     """
     page_global_idx = tl.program_id(0)
     kv_head_id = tl.program_id(1)
 
-    # Compute seq_id and local_page from global page index
     seq_id = page_global_idx // MAX_PAGES
     local_page = page_global_idx % MAX_PAGES
 
     physical_page = tl.load(kv_indices_ptr + page_global_idx)
-
     token_offsets = tl.arange(0, PAGE_SIZE)
-    head_offsets = tl.arange(0, HEAD_DIM_PADDED)
-    head_dim_mask = head_offsets < HEAD_DIM
 
-    # Source: kv_cache[physical_page, 0/1, kv_head_id, :, :]
     src_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_id * cache_stride_head
-    src_offsets = token_offsets[:, None] * cache_stride_token + head_offsets[None, :]
-
-    k_data = tl.load(kv_cache_ptr + src_base + src_offsets, mask=head_dim_mask[None, :], other=0.0)
-    v_data = tl.load(
-        kv_cache_ptr + src_base + cache_stride_kv + src_offsets,
-        mask=head_dim_mask[None, :],
-        other=0.0,
-    )
-
-    # Destination: out_k/v[seq_id, kv_head_id, local_page*PAGE_SIZE + :, :]
     local_token_start = local_page * PAGE_SIZE
-    dst_base = (
+    dst_token_base = (
         seq_id * out_stride_seq
         + kv_head_id * out_stride_head
         + (local_token_start + token_offsets[:, None]) * out_stride_token
-        + head_offsets[None, :]
     )
 
-    tl.store(out_k_ptr + dst_base, k_data, mask=head_dim_mask[None, :])
-    tl.store(out_v_ptr + dst_base, v_data, mask=head_dim_mask[None, :])
+    if HD_CHUNK1 == 0:
+        # Single-chunk path (power-of-2 head_dim)
+        head_offsets = tl.arange(0, HEAD_DIM_PADDED)
+        head_dim_mask = head_offsets < HEAD_DIM
+        src_offsets = token_offsets[:, None] * cache_stride_token + head_offsets[None, :]
+        k_data = tl.load(
+            kv_cache_ptr + src_base + src_offsets, mask=head_dim_mask[None, :], other=0.0
+        )
+        v_data = tl.load(
+            kv_cache_ptr + src_base + cache_stride_kv + src_offsets,
+            mask=head_dim_mask[None, :],
+            other=0.0,
+        )
+        dst_base = dst_token_base + head_offsets[None, :]
+        tl.store(out_k_ptr + dst_base, k_data, mask=head_dim_mask[None, :])
+        tl.store(out_v_ptr + dst_base, v_data, mask=head_dim_mask[None, :])
+    else:
+        # Two-chunk path (non-power-of-2 head_dim): reduce bandwidth by ~25%
+        dhead_c1 = tl.arange(0, HD_CHUNK1)  # [0, HD_CHUNK1) — all valid
+        dhead_c2 = HD_CHUNK1 + tl.arange(0, HD_CHUNK2)  # [HD_CHUNK1, HD_CHUNK1+HD_CHUNK2)
+        head_dim_mask_c2 = dhead_c2 < HEAD_DIM
+
+        src_c1 = token_offsets[:, None] * cache_stride_token + dhead_c1[None, :]
+        src_c2 = token_offsets[:, None] * cache_stride_token + dhead_c2[None, :]
+
+        k_c1 = tl.load(kv_cache_ptr + src_base + src_c1)
+        k_c2 = tl.load(
+            kv_cache_ptr + src_base + src_c2,
+            mask=head_dim_mask_c2[None, :],
+            other=0.0,
+        )
+        v_c1 = tl.load(kv_cache_ptr + src_base + cache_stride_kv + src_c1)
+        v_c2 = tl.load(
+            kv_cache_ptr + src_base + cache_stride_kv + src_c2,
+            mask=head_dim_mask_c2[None, :],
+            other=0.0,
+        )
+
+        dst_c1 = dst_token_base + dhead_c1[None, :]
+        dst_c2 = dst_token_base + dhead_c2[None, :]
+        tl.store(out_k_ptr + dst_c1, k_c1)
+        tl.store(out_k_ptr + dst_c2, k_c2, mask=head_dim_mask_c2[None, :])
+        tl.store(out_v_ptr + dst_c1, v_c1)
+        tl.store(out_v_ptr + dst_c2, v_c2, mask=head_dim_mask_c2[None, :])
 
 
 def triton_paged_context(
@@ -1297,6 +1327,12 @@ def triton_paged_context(
         )
         k_sdpa = kv_buf[0]
         v_sdpa = kv_buf[1]
+        head_dim_padded = triton.next_power_of_2(head_dim)
+        if head_dim_padded == head_dim:
+            hd_gather_chunk1, hd_gather_chunk2 = 0, 0  # single-chunk
+        else:
+            hd_gather_chunk1 = head_dim_padded // 2
+            hd_gather_chunk2 = triton.next_power_of_2(head_dim - hd_gather_chunk1)
         _fast_gather_sdpa_kernel[(total_expected_pages, n_kv_heads)](
             kv_cache,
             kv_indices,
@@ -1313,7 +1349,9 @@ def triton_paged_context(
             N_KV_HEADS=n_kv_heads,
             PAGE_SIZE=page_size,
             HEAD_DIM=head_dim,
-            HEAD_DIM_PADDED=triton.next_power_of_2(head_dim),
+            HEAD_DIM_PADDED=head_dim_padded,
+            HD_CHUNK1=hd_gather_chunk1,
+            HD_CHUNK2=hd_gather_chunk2,
         )
 
         # SDPA with GQA

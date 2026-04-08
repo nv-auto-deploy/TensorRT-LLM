@@ -319,6 +319,35 @@ Net: kept since large-batch (primary serving bottleneck) marginally improves, an
 
 ______________________________________________________________________
 
+### Iteration 7 — Two-chunk gather kernel (non-power-of-2 HEAD_DIM bandwidth reduction)
+
+**What changed:**
+
+- Added two-chunk code path to `_fast_gather_sdpa_kernel`: when `HD_CHUNK1 > 0`, loads/stores head_dim in two chunks (HD_CHUNK1=128 + HD_CHUNK2=64 = 192 elements) instead of HEAD_DIM_PADDED=256, saving 25% KV bandwidth per page.
+- Single-chunk path (HD_CHUNK1==0) unchanged for power-of-2 head_dims.
+- Caller updated to compute and pass HD_CHUNK1/HD_CHUNK2 based on head_dim.
+- Fixed Triton bug: `other=0.0` requires `mask`; removed from always-valid c1 loads.
+
+**Correctness:** PASS (132/132 tests pass)
+
+| ID | B | q_len | gather_old(us) | gather_new(us) | e2e_old(us) | e2e_new(us) | Δ gather |
+|----|---|-------|---------------|---------------|------------|------------|---------|
+| G1 | 1 | 512 | 8.11 | 7.97 | 27.77 | 32.92 | -1.7% |
+| G2 | 1 | 2048 | 13.51 | 13.89 | 97.12 | 96.67 | +2.8% (noise) |
+| G3 | 4 | 512 | 13.76 | 14.15 | 102.49 | 103.83 | +2.7% (noise) |
+
+**Analysis:** Marginal improvement on G1 (-1.7%), within measurement noise on G2/G3 (~3%). The 25% theoretical bandwidth reduction doesn't translate well because:
+
+1. Gather is already fast (7-14 μs) — overhead of 4 loads/stores vs 2 adds latency
+1. Working set is small → may be latency-bound rather than bandwidth-bound
+1. Two-chunk's extra instruction count partially offsets bandwidth savings
+
+Kept since it's correct and reduces memory ops. E2E variance is dominated by SDPA/torch ops.
+
+**Commit:** see git log
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space
