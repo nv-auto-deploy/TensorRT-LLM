@@ -744,6 +744,7 @@ class ADEngine(ModelEngine):
         flat_gather_indices: List[int] = [] if has_new_tokens else None
         mask_scatter_indices: List[int] = [] if has_new_tokens else None
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
+        context_lens: List[int] = []
         dummy_token = -1
 
         # look at context requests first
@@ -759,6 +760,7 @@ class ADEngine(ModelEngine):
             input_ids.extend(prompt_tokens)
             cu_seqlen.append(len(input_ids))
             input_pos.append(begin_compute)
+            context_lens.append(request.py_orig_prompt_len)
 
             # store extra arguments
             if request.py_multimodal_data is not None:
@@ -800,6 +802,7 @@ class ADEngine(ModelEngine):
 
             cu_seqlen.append(len(input_ids))
             input_pos.append(num_tokens_seen)
+            context_lens.append(request.py_orig_prompt_len)
 
             if is_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
@@ -859,6 +862,7 @@ class ADEngine(ModelEngine):
             cu_num_pages=cu_num_pages,
             extra_page_per_seq=extra_page_per_seq,
             slot_idx=state_slot_idx,
+            context_lens=context_lens,
             gather_context_logits=gather_context_logits,
             _gather_idx=flat_gather_indices,
             _mask_scatter_indices=mask_scatter_indices,

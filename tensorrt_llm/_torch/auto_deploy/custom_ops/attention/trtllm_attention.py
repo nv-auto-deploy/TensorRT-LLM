@@ -82,6 +82,7 @@ class _TrtllmPlanner:
         # keeping a separate copy here since we sometimes have to overwrite the original values
         self.host_past_kv_lengths: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
         self.host_context_lengths: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
+        self.context_lengths_gpu: Optional[torch.Tensor] = None  # [max_batch] int32 device
         # Persistent block_offsets buffer for CUDA graph compatibility.
         # Pre-allocated to max size so the tensor address is stable across replays.
         self.block_offsets: Optional[torch.Tensor] = None
@@ -121,6 +122,7 @@ class _TrtllmPlanner:
         self.host_context_lengths = torch.zeros(
             max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
+        self.context_lengths_gpu = torch.zeros(max_batch, dtype=torch.int32, device=device)
 
     def get_layer_tensors(
         self,
@@ -163,6 +165,8 @@ class _TrtllmPlanner:
         seq_len_with_cache_host: torch.Tensor,
         input_pos_host: torch.Tensor,
         seq_len_host: torch.Tensor,
+        context_lens_host: Optional[torch.Tensor] = None,
+        context_lens: Optional[torch.Tensor] = None,
     ) -> None:
         """Per-forward HOST metadata: pinned tensors for thop.attention.
 
@@ -170,6 +174,9 @@ class _TrtllmPlanner:
         (including CUDA graph replays).
         """
         num_seq = num_prefill + num_decode
+
+        # Use context_lens for context_lengths (matches PyTorch backend).
+        ctx_lens_host = context_lens_host if context_lens_host is not None else seq_len_host
 
         # host_request_types: 0 = prefill (context), 1 = decode (generation)
         self.host_request_types[:num_prefill].fill_(0)
@@ -182,11 +189,13 @@ class _TrtllmPlanner:
             self.host_total_kv_lens[1] = max_context_length * num_decode
             self.host_past_kv_lengths[:num_seq].fill_(max_context_length)
             self.host_context_lengths[:num_seq].fill_(max_context_length)
+            self.context_lengths_gpu[:num_seq].fill_(max_context_length)
         else:
             self.host_total_kv_lens[0] = seq_len_with_cache_host[:num_prefill].sum()
             self.host_total_kv_lens[1] = seq_len_with_cache_host[num_prefill:num_seq].sum()
             self.host_past_kv_lengths[:num_seq] = input_pos_host[:num_seq]
-            self.host_context_lengths[:num_seq] = seq_len_host[:num_seq]
+            self.host_context_lengths[:num_seq] = ctx_lens_host[:num_seq]
+            self.context_lengths_gpu[:num_seq].copy_(context_lens[:num_seq])
 
     def plan_device(
         self,
@@ -235,6 +244,8 @@ def prepare_trtllm_metadata_host(
     seq_len_with_cache_host: torch.Tensor,
     input_pos_host: torch.Tensor,
     seq_len_host: torch.Tensor,
+    context_lens_host: Optional[torch.Tensor] = None,
+    context_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """Fill thop-specific HOST metadata (pinned tensors for thop.attention).
 
@@ -255,6 +266,8 @@ def prepare_trtllm_metadata_host(
         seq_len_with_cache_host=seq_len_with_cache_host,
         input_pos_host=input_pos_host,
         seq_len_host=seq_len_host,
+        context_lens_host=context_lens_host,
+        context_lens=context_lens,
     )
 
 
@@ -398,7 +411,7 @@ def trtllm_mha_with_cache(
         )
     # Map SequenceInfo fields to thop.attention args
     sequence_length = seq_len_with_cache[:num_seq]  # device
-    context_lengths = seq_len[:num_seq]  # device
+    context_lengths = _GlobalTrtllmPlanner.context_lengths_gpu[:num_seq]
     host_past_kv_lengths = _GlobalTrtllmPlanner.host_past_kv_lengths[:num_seq]  # host (pinned)
     host_context_lengths = _GlobalTrtllmPlanner.host_context_lengths[:num_seq]  # host (pinned)
 

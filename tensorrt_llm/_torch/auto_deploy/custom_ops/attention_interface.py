@@ -658,6 +658,7 @@ class SequenceInfo:
             ### ADDITIONAL ARGUMENTS AVAILABLE THAT ARE DERIVED FROM THE BASIC ARGUMENTS ###########
             ("seq_len", self.max_batch_size, torch.int),
             ("seq_len_with_cache", self.max_batch_size, torch.int),
+            ("context_lens", self.max_batch_size, torch.int),
             ("use_initial_states", self.max_batch_size, torch.bool),
             ### OTHER ARGUMENTS USED BY THE RUNTIME ################################################
             ("extra_page_per_seq", self.max_batch_size, torch.int),
@@ -1044,6 +1045,7 @@ class SequenceInfo:
         cu_num_pages: Union[Sequence[int], torch.Tensor, None] = None,
         extra_page_per_seq: Optional[Sequence[int]] = None,
         slot_idx: Union[Sequence[int], torch.Tensor, None] = None,
+        context_lens: Union[Sequence[int], torch.Tensor, None] = None,
         ### RUNTIME ARGUMENTS ######################################################################
         gather_context_logits: bool = False,
         _gather_idx: Union[Sequence[int], torch.Tensor, None] = None,
@@ -1170,6 +1172,14 @@ class SequenceInfo:
         # check for updated use_initial_states
         use_initial_states = ip_host > 0
         self._stage_arg("use_initial_states", use_initial_states)
+
+        # context_lens: original context length per sequence, constant across iterations.
+        if context_lens is not None:
+            if isinstance(context_lens, (list, tuple)):
+                context_lens = torch.tensor(context_lens, dtype=torch.int)
+            self._stage_arg("context_lens", context_lens)
+        elif not self._is_active("context_lens"):
+            self._stage_arg("context_lens", sl_host)
 
         num_prefill = self.batch_info.get_num_sequences()[0]
 

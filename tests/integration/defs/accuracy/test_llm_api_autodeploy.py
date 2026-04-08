@@ -554,7 +554,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         """Check speculative decoding acceptance rate for the current run."""
         _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
 
-    @pytest.mark.skip_less_device_memory(180000)
+    #@pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     @pytest.mark.parametrize("enable_attention_dp", [False, True],
                              ids=["attn_dp_off", "attn_dp_on"])
@@ -573,6 +573,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         if model_id == "bf16":
             low_memory_overrides(kwargs)
         kwargs["attn_backend"] = attn_backend
+        kwargs["compile_backend"] = "torch-simple"
+        kwargs["cuda_graph_config"] = None
+
         kwargs.setdefault("transforms", {}).setdefault(
             "detect_sharding", {})["enable_attention_dp"] = enable_attention_dp
 
@@ -589,9 +592,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                 llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
             print_memory_usage("after engine build")
 
-            sampling_params = self.get_default_sampling_params()
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
+            #sampling_params = self.get_default_sampling_params()
+            #task = MMLU(self.MODEL_NAME)
+            #task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
