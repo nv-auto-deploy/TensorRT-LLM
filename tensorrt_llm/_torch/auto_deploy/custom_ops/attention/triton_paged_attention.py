@@ -205,12 +205,23 @@ def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_siz
 
 @triton.autotune(
     configs=[
+        # Original 6 configs
         triton.Config({}, num_warps=2, num_stages=2),
         triton.Config({}, num_warps=2, num_stages=3),
         triton.Config({}, num_warps=4, num_stages=2),
         triton.Config({}, num_warps=4, num_stages=3),
         triton.Config({}, num_warps=8, num_stages=2),
         triton.Config({}, num_warps=8, num_stages=3),
+        # Iter 1: expand to num_warps=16, num_stages=4/5
+        triton.Config({}, num_warps=1, num_stages=2),
+        triton.Config({}, num_warps=1, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=4),
+        triton.Config({}, num_warps=4, num_stages=5),
+        triton.Config({}, num_warps=8, num_stages=4),
+        triton.Config({}, num_warps=8, num_stages=5),
+        triton.Config({}, num_warps=16, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=3),
+        triton.Config({}, num_warps=16, num_stages=4),
     ],
     key=["HEAD_DIM", "HEAD_DIM_PADDED", "PAGE_SIZE", "HEAD_RATIO_PADDED", "SLIDING_WINDOW"],
 )
@@ -609,12 +620,20 @@ def triton_paged_decode(
 # =============================================================================
 @triton.autotune(
     configs=[
+        # Original 6 configs
         triton.Config({"Q_BLOCK": 64}, num_stages=2, num_warps=2),
         triton.Config({"Q_BLOCK": 64}, num_stages=2, num_warps=4),
         triton.Config({"Q_BLOCK": 64}, num_stages=4, num_warps=4),
         triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=4),
         triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=3, num_warps=8),
+        # Iter 1: additional Q_BLOCK=32 for very short prefills, and more stages
+        triton.Config({"Q_BLOCK": 32}, num_stages=2, num_warps=2),
+        triton.Config({"Q_BLOCK": 32}, num_stages=3, num_warps=4),
+        triton.Config({"Q_BLOCK": 64}, num_stages=3, num_warps=4),
+        triton.Config({"Q_BLOCK": 64}, num_stages=4, num_warps=8),
+        triton.Config({"Q_BLOCK": 128}, num_stages=4, num_warps=8),
+        triton.Config({"Q_BLOCK": 128}, num_stages=4, num_warps=16),
     ],
     key=["HEAD_DIM", "HEAD_DIM_PADDED", "PAGE_SIZE"],
 )

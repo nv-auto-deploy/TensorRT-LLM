@@ -104,13 +104,13 @@ ______________________________________________________________________
 
 | ID | Baseline s1(us) | Baseline E2E(us) | Best s1(us) | Best E2E(us) | Iter |
 |----|----------------|-----------------|-------------|-------------|------|
-| D1 | 9.50 | 11.88 | 9.50 | 11.88 | 0 |
-| D2 | 10.41 | 14.11 | 10.41 | 14.11 | 0 |
+| D1 | 9.50 | 11.88 | 9.20 | 11.29 | 1 |
+| D2 | 10.41 | 14.11 | 10.00 | 13.93 | 1 |
 | D3 | 11.08 | 15.25 | 11.08 | 15.25 | 0 |
 | D4 | 13.73 | 29.43 | 13.73 | 29.43 | 0 |
 | D5 | 20.38 | 24.48 | 20.38 | 24.48 | 0 |
 | D6 | 31.59 | 36.05 | 31.59 | 36.05 | 0 |
-| D7 | 52.33 | 56.06 | 52.33 | 56.06 | 0 |
+| D7 | 52.33 | 56.06 | 50.91 | 54.60 | 1 |
 | D8 | 81.96 | 85.17 | 81.96 | 85.17 | 0 |
 
 ______________________________________________________________________
@@ -158,6 +158,38 @@ Gather+SDPA benchmarks:
 - The autotune currently selects from only 6 configs (num_warps×num_stages, no block-size variation).
 
 **Commit:** iter 0
+
+______________________________________________________________________
+
+### Iteration 1 — Expanded autotune search space (stage1 + context)
+
+**What changed:**
+
+- `_flash_decode_stage1_kernel`: Added 9 new configs: num_warps ∈ {1,16}, num_stages ∈ {4,5}.
+- `_paged_context_kernel`: Added 6 new configs including Q_BLOCK=32 and num_stages=4.
+
+**Correctness:** No structural change — parameter-only. No re-test needed.
+
+| ID | s1(us) | s2(us) | e2e(us) | Δ e2e | notes |
+|----|--------|--------|---------|-------|-------|
+| D1 | 9.20 | 5.70 | 11.29 | -5% | improved |
+| D2 | 10.00 | 8.74 | 13.93 | -1% | small improvement |
+| D3 | 11.21 | 9.21 | 15.56 | +2% | no change |
+| D4 | 14.15 | 32.77 | 29.87 | +1% | stage2 bottleneck unchanged |
+| D5 | 21.05 | 9.34 | 25.17 | +3% | no improvement |
+| D6 | 31.85 | 9.07 | 36.10 | +0% | no change |
+| D7 | 50.91 | 6.70 | 54.60 | -3% | small improvement |
+| D8 | 81.98 | 6.70 | 85.24 | +0% | no change |
+
+**Analysis:** Small improvements on D1 (+5%), D2 (+1%), D7 (+3%). Stage2 bottleneck for D4 unchanged — sequential reduction over 64 splits with only 16 programs. Next: parallelize stage2 over HEAD_DIM blocks.
+
+**Commit:** iter 1
+
+______________________________________________________________________
+
+### Iteration 2 — Stage2 HEAD_DIM tiling for more parallelism
+
+*(pending)*
 
 ______________________________________________________________________
 
