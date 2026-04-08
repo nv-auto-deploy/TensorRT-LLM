@@ -980,6 +980,66 @@ The `s1%e2e ≈ 100%` for all splits=1 shapes confirms stage2/copy\_ is fully el
 
 ______________________________________________________________________
 
+### Iteration 30 — Autotune expansion: num_stages=6,7 for all three kernels
+
+**What changed:** Added 6 new configs to both decode stage1 kernels and 8 new configs to the
+context kernel, extending the autotune search space to `num_stages ∈ {6, 7}` for decode and
+`num_stages ∈ {5, 6}` for context:
+
+- `_flash_decode_stage1_kernel`: Added configs (num_warps=4/8/16) × (num_stages=6/7) — 6 new.
+- `_flash_decode_stage1_two_chunk_kernel`: Same 6 configs.
+- `_paged_context_kernel`: Added (Q_BLOCK=64,128) × (num_warps=4/8/16) × (num_stages=5/6) — 8 new.
+
+**Rationale:** The current max `num_stages=5` may not fully hide HBM latency for shapes with long
+inner loops (S3/S4/L shapes: 16-64 pages/split, C2-C4: long KV loops). Higher `num_stages` depth
+allows the Triton software pipeline to prefetch more K/V tiles from HBM while computing the
+current tile's GEMM.
+
+**Correctness:** Parameter-only (autotune config addition). No structural change. PASS (163/163).
+
+**Results:** Pending re-tune on first run — autotune key unchanged, so all configs explored
+automatically on next benchmark invocation.
+
+**Commit:** see git log
+
+______________________________________________________________________
+
+### Iteration 31 — SKIP_PHASE1_SW constexpr: compile-time SW Phase 1 elimination for context kernel
+
+**What changed:** Added `SKIP_PHASE1_SW: tl.constexpr = False` to `_paged_context_kernel`. When
+True, the SW-masking branch in Phase 1 is compile-time eliminated (same mechanism as
+`SKIP_SW_MASK` for decode stage1 in iter 28).
+
+**Added `SKIP_PHASE1_SW` to autotune key** so SW-capable shapes split into two variant kernels.
+
+**Context Phase 1 SW masking:** When `SLIDING_WINDOW > 0`, Phase 1 normally applies a per-token
+SW mask (`sw_mask = (q_positions_2d - kv_positions) < SLIDING_WINDOW`) to exclude KV tokens
+outside the window. This requires an extra per-page vector compare + `tl.where` on every Phase 1
+iteration, plus guarded `tl.where`-based softmax to handle all-inf columns.
+
+**When SKIP_PHASE1_SW is safe:** For context/prefill with `seq_len_with_cache <= SLIDING_WINDOW`,
+`first_valid_pos=0` for every query position, so ALL Phase 1 tokens are within the SW. The SW
+mask is trivially all-True — the masking code can be eliminated.
+
+**Launcher logic:**
+
+```python
+# Conservative proxy: only skip when fresh-prefill seq_len = q_len ≤ max_q_len ≤ sw
+skip_phase1_sw = sw > 0 and max_q_len <= sw
+```
+
+This uses `max_q_len` (a CPU int from the batch info), avoiding any GPU-CPU sync.
+
+**Expected gain:** Context SW shapes with short sequences (e.g. CS1: q_len=128, SW=1024) gain
+the same fast Phase 1 path as non-SW context shapes. Analogous to SKIP_SW_MASK achieving -11%
+on S1 decode shapes (iter 28).
+
+**Correctness:** PASS (163/163)
+
+**Commit:** see git log
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space

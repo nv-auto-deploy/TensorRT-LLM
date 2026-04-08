@@ -236,6 +236,14 @@ def _get_num_splits(
         triton.Config({}, num_warps=16, num_stages=2),
         triton.Config({}, num_warps=16, num_stages=3),
         triton.Config({}, num_warps=16, num_stages=4),
+        # Iter 30: deeper pipeline stages for long inner loops (S3/S4/L shapes).
+        # Higher num_stages hides HBM latency by prefetching more K/V tiles in advance.
+        triton.Config({}, num_warps=4, num_stages=6),
+        triton.Config({}, num_warps=4, num_stages=7),
+        triton.Config({}, num_warps=8, num_stages=6),
+        triton.Config({}, num_warps=8, num_stages=7),
+        triton.Config({}, num_warps=16, num_stages=5),
+        triton.Config({}, num_warps=16, num_stages=6),
     ],
     key=[
         "HEAD_DIM",
@@ -549,12 +557,14 @@ def _flash_decode_stage1_kernel(
 
 @triton.autotune(
     configs=[
+        # Original 6 configs
         triton.Config({}, num_warps=2, num_stages=2),
         triton.Config({}, num_warps=2, num_stages=3),
         triton.Config({}, num_warps=4, num_stages=2),
         triton.Config({}, num_warps=4, num_stages=3),
         triton.Config({}, num_warps=8, num_stages=2),
         triton.Config({}, num_warps=8, num_stages=3),
+        # Iter 1 additions
         triton.Config({}, num_warps=1, num_stages=2),
         triton.Config({}, num_warps=1, num_stages=3),
         triton.Config({}, num_warps=4, num_stages=4),
@@ -564,6 +574,13 @@ def _flash_decode_stage1_kernel(
         triton.Config({}, num_warps=16, num_stages=2),
         triton.Config({}, num_warps=16, num_stages=3),
         triton.Config({}, num_warps=16, num_stages=4),
+        # Iter 30: deeper pipeline stages for long inner loops (S3/S4/L shapes)
+        triton.Config({}, num_warps=4, num_stages=6),
+        triton.Config({}, num_warps=4, num_stages=7),
+        triton.Config({}, num_warps=8, num_stages=6),
+        triton.Config({}, num_warps=8, num_stages=7),
+        triton.Config({}, num_warps=16, num_stages=5),
+        triton.Config({}, num_warps=16, num_stages=6),
     ],
     key=[
         "HEAD_DIM",
@@ -1227,11 +1244,28 @@ def triton_paged_decode(
         triton.Config({"Q_BLOCK": 64}, num_stages=4, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=4, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=4, num_warps=16),
+        # Iter 30: deeper pipeline for longer KV loops (C2-C4, long-context prefill)
+        triton.Config({"Q_BLOCK": 64}, num_stages=5, num_warps=4),
+        triton.Config({"Q_BLOCK": 64}, num_stages=5, num_warps=8),
+        triton.Config({"Q_BLOCK": 64}, num_stages=6, num_warps=4),
+        triton.Config({"Q_BLOCK": 64}, num_stages=6, num_warps=8),
+        triton.Config({"Q_BLOCK": 128}, num_stages=5, num_warps=8),
+        triton.Config({"Q_BLOCK": 128}, num_stages=5, num_warps=16),
+        triton.Config({"Q_BLOCK": 128}, num_stages=6, num_warps=8),
+        triton.Config({"Q_BLOCK": 128}, num_stages=6, num_warps=16),
     ],
     # Iter 12: add SLIDING_WINDOW to key so sw=0 and sw>0 shapes get different configs.
     # Sliding-window path has extra per-token masking and different phase1/phase2 balance.
     # Iter 18: add LOGIT_CAP to key — softcap path has tanh vs no-op, different perf profile.
-    key=["HEAD_DIM", "HEAD_DIM_PADDED", "PAGE_SIZE", "SLIDING_WINDOW", "LOGIT_CAP"],
+    # Iter 31: add SKIP_PHASE1_SW — SW-capable but seq<=SW shapes use no-SW fast path.
+    key=[
+        "HEAD_DIM",
+        "HEAD_DIM_PADDED",
+        "PAGE_SIZE",
+        "SLIDING_WINDOW",
+        "LOGIT_CAP",
+        "SKIP_PHASE1_SW",
+    ],
 )
 @triton.jit
 def _paged_context_kernel(
@@ -1266,6 +1300,10 @@ def _paged_context_kernel(
     PAGE_SIZE: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr = 0,
     LOGIT_CAP: tl.constexpr = 0.0,
+    # Iter 31: when True, Phase 1 uses the fast no-SW path (compiler eliminates SW masking).
+    # Set by launcher when max_seq_len_with_cache <= SLIDING_WINDOW, so first_valid_pos=0
+    # for every sequence and the SW mask is trivially all-True (no tokens are masked).
+    SKIP_PHASE1_SW: tl.constexpr = False,
 ):
     """Context/prefill attention with paged KV cache, causal skip, and page-aligned iteration.
 
@@ -1359,10 +1397,12 @@ def _paged_context_kernel(
         # Use int64 to avoid overflow when physical_page * stride > 2^31
         page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
 
-        # When sliding window is active, the first window page may partially
+        # When sliding window is active and NOT skipped, the first window page may partially
         # overlap the window boundary, requiring per-token masking.
-        # Use masked loads (like Phase 2) instead of block_ptr loads.
-        if SLIDING_WINDOW > 0:
+        # Iter 31: SKIP_PHASE1_SW=True (seq_len <= SW) → first_valid_pos=0 for all seqs, so
+        # all Phase 1 pages are trivially within the window; SW masking is never needed.
+        # Compiler eliminates this block entirely when SKIP_PHASE1_SW=True.
+        if SLIDING_WINDOW > 0 and not SKIP_PHASE1_SW:
             k = tl.load(
                 kv_cache_ptr + page_base + local_kv,
                 mask=head_dim_mask[None, :],
@@ -1434,9 +1474,10 @@ def _paged_context_kernel(
 
         m_ij = tl.max(qk, axis=1)
         m_i_new = tl.maximum(m_i, m_ij)
-        if SLIDING_WINDOW > 0:
+        if SLIDING_WINDOW > 0 and not SKIP_PHASE1_SW:
             # Guard against NaN when m_i == m_i_new == -inf (no valid tokens seen
             # yet for a query whose window doesn't overlap this page at all).
+            # Not needed when SKIP_PHASE1_SW=True (all tokens are in-window).
             alpha = tl.where(m_i > float("-inf"), tl.exp(m_i - m_i_new), 0.0)
             p = tl.where(m_i_new[:, None] > float("-inf"), tl.exp(qk - m_i_new[:, None]), 0.0)
         else:
@@ -1713,6 +1754,13 @@ def triton_paged_context(
             num_q_blocks = (max_q_len + q_block - 1) // q_block
             return (num_seq, n_heads, num_q_blocks)
 
+        # Iter 31: SKIP_PHASE1_SW=True when all sequences have seq_len_with_cache <= SW.
+        # In this case first_valid_pos=0 for every seq, so Phase 1 SW masking is trivially
+        # all-True and can be eliminated at compile time (same savings as SKIP_SW_MASK for
+        # decode). Use max_q_len (CPU int, no GPU sync) as proxy since seq_len_with_cache ≤
+        # max_q_len + cache_len. For prefill-only (cache_len=0), seq_len = q_len ≤ max_q_len.
+        # Conservative: only skip when max_q_len <= sw (guaranteed seq_len ≤ sw for fresh prefill).
+        skip_phase1_sw = sw > 0 and max_q_len <= sw
         _paged_context_kernel[grid_paged](
             q,
             kv_cache,
@@ -1738,6 +1786,7 @@ def triton_paged_context(
             PAGE_SIZE=page_size,
             SLIDING_WINDOW=sw,
             LOGIT_CAP=lc,
+            SKIP_PHASE1_SW=skip_phase1_sw,
         )
 
     return output
