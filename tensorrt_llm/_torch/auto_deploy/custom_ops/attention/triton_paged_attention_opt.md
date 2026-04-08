@@ -471,6 +471,20 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 14 — Gather kernel autotune num_warps (no improvement, reverted)
+
+**What changed:** Added `@triton.autotune` to `_fast_gather_sdpa_kernel` with 6 configs sweeping num_warps ∈ {1,2,4,8}. Key: `[HEAD_DIM, HEAD_DIM_PADDED, PAGE_SIZE, HD_CHUNK1, HD_CHUNK2]`.
+
+**Correctness:** PASS (132/132)
+
+**Results:** G1: 7.97→8.06 μs (+1.1%), G2: 13.89→14.20 μs (+2.2%). Within noise — no improvement.
+
+**Analysis:** Gather is a pure memory copy. Autotuner picked same config as default. Extra benchmarking overhead on first use without measurable benefit. Reverted.
+
+**Commit:** see git log (reverted)
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space
