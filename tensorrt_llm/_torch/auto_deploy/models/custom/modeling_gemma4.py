@@ -980,6 +980,18 @@ class Gemma4ForConditionalGenerationFactory(AutoModelForCausalLMFactory):
             return None
         return ADGemma4Tokenizer.from_pretrained(self.tokenizer)
 
+    def get_cache_config_updates(self):
+        """Keep Gemma4 on the default KV-cache dtype for Triton paged attention.
+
+        The NVFP4 checkpoint ships ``kv_cache_quant_algo=FP8`` metadata, but the
+        current ``triton_paged`` attention path used for Gemma4 does not support
+        FP8 KV-cache tensors during kernel compilation.
+        """
+        updates = super().get_cache_config_updates()
+        if updates.get("dtype") == "fp8":
+            return {"dtype": "auto"}
+        return updates
+
 
 # ---------------------------------------------------------------------------
 # Registration

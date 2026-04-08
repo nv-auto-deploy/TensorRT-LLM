@@ -85,7 +85,13 @@ class QuantConfigReaderRegistry:
 
 @QuantConfigReaderRegistry.register("modelopt")
 class ModelOPTQuantConfigReader(QuantConfigReader):
-    _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens", "*.mixer.gate*", "*.mlp.gate")
+    _ALWAYS_EXCLUDE = (
+        "lm_head",
+        "model.embed_tokens",
+        "model.language_model.embed_tokens",
+        "*.mixer.gate*",
+        "*.mlp.gate",
+    )
     DEFAULT_TORCH_DTYPE = "float16"
     DEFAULT_KV_CACHE_DTYPE = "fp8"
 
@@ -188,7 +194,7 @@ class HFQuantConfigReader(QuantConfigReader):
     Quantization reader that process transformers.quantizers.HFQuantizer functionality
     """
 
-    _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens")
+    _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens", "model.language_model.embed_tokens")
     _SUPPORTED_QUANT_METHODS = ("mxfp4", "gptq", "fp8")
 
     def __init__(self):

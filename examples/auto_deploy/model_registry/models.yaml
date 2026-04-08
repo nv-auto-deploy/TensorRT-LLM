@@ -155,6 +155,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: nvidia/OpenReasoning-Nemotron-32B
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: nvidia/Gemma-4-31B-IT-NVFP4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'gemma4_dense.yaml']
 - name: mistralai/Mistral-Large-Instruct-2407
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: deepseek-ai/DeepSeek-R1-Distill-Llama-70B
