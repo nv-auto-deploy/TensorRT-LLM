@@ -991,3 +991,256 @@ class TestFlashInferComparison:
 
         # Compare
         torch.testing.assert_close(output_triton.float(), output_fi.float(), rtol=1e-2, atol=1e-2)
+
+
+def _reference_attention_with_logit_cap(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sm_scale: float,
+    logit_cap: float,
+    causal: bool = False,
+) -> torch.Tensor:
+    """PyTorch reference: scaled dot-product attention with logit soft-capping.
+
+    Args:
+        q: [B, H, Sq, D]
+        k: [B, H, Sk, D]
+        v: [B, H, Sk, D]
+
+    Returns:
+        output: [B, H, Sq, D]
+    """
+    scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * sm_scale
+    # Apply logit soft-capping BEFORE masking (matches triton kernel behavior)
+    scores = logit_cap * torch.tanh(scores / logit_cap)
+    if causal:
+        sq, sk = scores.shape[-2], scores.shape[-1]
+        causal_mask = torch.triu(torch.ones(sq, sk, device=q.device, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+    weights = torch.softmax(scores, dim=-1)
+    return torch.matmul(weights, v.float()).to(q.dtype)
+
+
+class TestLogitSoftCap:
+    """Tests for logit soft-capping support (Gemma-4: logit_cap=50.0)."""
+
+    LOGIT_CAP = 50.0
+
+    @pytest.mark.parametrize("batch_size", [1, 4])
+    @pytest.mark.parametrize("head_dim", [64, 128, 176])
+    @pytest.mark.parametrize("seq_len", [64, 256])
+    def test_decode_logit_cap(self, batch_size: int, head_dim: int, seq_len: int):
+        """Decode kernel with logit_cap produces correct output vs PyTorch reference."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_decode,
+            update_paged_kv_cache,
+        )
+
+        n_heads, n_kv_heads, page_size = 16, 8, 16
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = batch_size * num_pages_per_seq + 5
+
+        q = torch.randn(batch_size, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        v = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+
+        k_flat = k.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+        v_flat = v.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device="cuda", dtype=torch.int32), seq_len
+        )
+        positions = torch.tile(
+            torch.arange(seq_len, device="cuda", dtype=torch.int32), (batch_size,)
+        )
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * num_pages_per_seq,
+            num_pages_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        kv_indices = torch.arange(
+            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
+        )
+        last_token_in_page = seq_len % page_size
+        kv_last_page_len = torch.full(
+            (batch_size,),
+            last_token_in_page if last_token_in_page > 0 else page_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        kv_cache = torch.zeros(
+            num_blocks, 2, n_kv_heads, page_size, head_dim, dtype=torch.float16, device="cuda"
+        )
+        update_paged_kv_cache(
+            k_flat, v_flat, batch_indices, positions, kv_cache, kv_indices, kv_indptr
+        )
+
+        output_triton = triton_paged_decode(
+            q,
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            sm_scale,
+            logit_cap=self.LOGIT_CAP,
+        )
+
+        # PyTorch reference
+        q_ref = q.unsqueeze(2)  # [B, H, 1, D]
+        k_ref = k.transpose(1, 2)  # [B, Hkv, S, D]
+        v_ref = v.transpose(1, 2)
+        head_ratio = n_heads // n_kv_heads
+        k_ref = k_ref.repeat_interleave(head_ratio, dim=1)
+        v_ref = v_ref.repeat_interleave(head_ratio, dim=1)
+        output_ref = _reference_attention_with_logit_cap(
+            q_ref, k_ref, v_ref, sm_scale, self.LOGIT_CAP, causal=False
+        ).squeeze(2)
+
+        torch.testing.assert_close(output_triton.float(), output_ref.float(), rtol=1e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("batch_size", [1, 2])
+    @pytest.mark.parametrize("head_dim", [64, 128, 176])
+    @pytest.mark.parametrize("seq_len", [32, 128, 256])
+    def test_context_logit_cap(self, batch_size: int, head_dim: int, seq_len: int):
+        """Context kernel with logit_cap produces correct output vs PyTorch reference."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_context,
+            update_paged_kv_cache,
+        )
+
+        n_heads, n_kv_heads, page_size = 16, 8, 16
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = batch_size * num_pages_per_seq + 5
+
+        q = torch.randn(batch_size * seq_len, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(
+            batch_size * seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        v = torch.randn(
+            batch_size * seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+
+        qo_indptr = torch.arange(
+            0, (batch_size + 1) * seq_len, seq_len, dtype=torch.int32, device="cuda"
+        )
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * num_pages_per_seq,
+            num_pages_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        kv_indices = torch.arange(
+            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
+        )
+        last_token_in_page = seq_len % page_size
+        kv_last_page_len = torch.full(
+            (batch_size,),
+            last_token_in_page if last_token_in_page > 0 else page_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        seq_len_with_cache = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device="cuda", dtype=torch.int32), seq_len
+        )
+        positions = torch.tile(
+            torch.arange(seq_len, device="cuda", dtype=torch.int32), (batch_size,)
+        )
+        kv_cache = torch.zeros(
+            num_blocks, 2, n_kv_heads, page_size, head_dim, dtype=torch.float16, device="cuda"
+        )
+        update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+
+        output_triton = triton_paged_context(
+            q,
+            kv_cache,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            seq_len_with_cache,
+            sm_scale,
+            logit_cap=self.LOGIT_CAP,
+        )
+
+        # PyTorch reference: per-sequence causal attention with logit_cap
+        q_4d = q.reshape(batch_size, seq_len, n_heads, head_dim).permute(0, 2, 1, 3)
+        k_4d = k.reshape(batch_size, seq_len, n_kv_heads, head_dim).permute(0, 2, 1, 3)
+        v_4d = v.reshape(batch_size, seq_len, n_kv_heads, head_dim).permute(0, 2, 1, 3)
+        head_ratio = n_heads // n_kv_heads
+        k_4d = k_4d.repeat_interleave(head_ratio, dim=1)
+        v_4d = v_4d.repeat_interleave(head_ratio, dim=1)
+        output_ref_4d = _reference_attention_with_logit_cap(
+            q_4d, k_4d, v_4d, sm_scale, self.LOGIT_CAP, causal=True
+        )
+        output_ref = output_ref_4d.permute(0, 2, 1, 3).reshape(
+            batch_size * seq_len, n_heads, head_dim
+        )
+
+        torch.testing.assert_close(output_triton.float(), output_ref.float(), rtol=1e-2, atol=2e-2)
+
+    def test_decode_no_logit_cap_unchanged(self):
+        """Verify that logit_cap=None produces same result as omitting logit_cap arg."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_decode,
+            update_paged_kv_cache,
+        )
+
+        batch_size, n_heads, n_kv_heads, head_dim, page_size, seq_len = 2, 8, 8, 64, 16, 128
+        sm_scale = 1.0 / math.sqrt(head_dim)
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = batch_size * num_pages_per_seq + 5
+
+        q = torch.randn(batch_size, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(
+            batch_size * seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        v = torch.randn(
+            batch_size * seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * num_pages_per_seq,
+            num_pages_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        kv_indices = torch.arange(
+            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
+        )
+        last_token_in_page = seq_len % page_size
+        kv_last_page_len = torch.full(
+            (batch_size,),
+            last_token_in_page if last_token_in_page > 0 else page_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        kv_cache = torch.zeros(
+            num_blocks, 2, n_kv_heads, page_size, head_dim, dtype=torch.float16, device="cuda"
+        )
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device="cuda", dtype=torch.int32), seq_len
+        )
+        positions = torch.tile(
+            torch.arange(seq_len, device="cuda", dtype=torch.int32), (batch_size,)
+        )
+        update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+
+        out_no_cap = triton_paged_decode(
+            q, kv_cache, kv_indices, kv_indptr, kv_last_page_len, sm_scale
+        )
+        out_cap_none = triton_paged_decode(
+            q, kv_cache, kv_indices, kv_indptr, kv_last_page_len, sm_scale, logit_cap=None
+        )
+        torch.testing.assert_close(out_no_cap, out_cap_none)

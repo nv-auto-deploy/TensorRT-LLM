@@ -226,7 +226,14 @@ def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_siz
         triton.Config({}, num_warps=16, num_stages=3),
         triton.Config({}, num_warps=16, num_stages=4),
     ],
-    key=["HEAD_DIM", "HEAD_DIM_PADDED", "PAGE_SIZE", "HEAD_RATIO_PADDED", "SLIDING_WINDOW"],
+    key=[
+        "HEAD_DIM",
+        "HEAD_DIM_PADDED",
+        "PAGE_SIZE",
+        "HEAD_RATIO_PADDED",
+        "SLIDING_WINDOW",
+        "LOGIT_CAP",
+    ],
 )
 @triton.jit
 def _flash_decode_stage1_kernel(
@@ -268,6 +275,7 @@ def _flash_decode_stage1_kernel(
     HEAD_RATIO_PADDED: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr = 0,
+    LOGIT_CAP: tl.constexpr = 0.0,
 ):
     """
     Key optimizations:
@@ -380,6 +388,11 @@ def _flash_decode_stage1_kernel(
         # [HEAD_RATIO_PADDED, HEAD_DIM_PADDED] @ [HEAD_DIM_PADDED, PAGE_SIZE] -> [HEAD_RATIO_PADDED, PAGE_SIZE]
         attn = tl.dot(q_all, tl.trans(k)) * SM_SCALE
 
+        # Iter 18: logit soft-capping (Gemma-4: logit_cap=50.0). Apply BEFORE masking
+        # so that -inf from page/window masks propagates cleanly through softmax.
+        if LOGIT_CAP > 0.0:
+            attn = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (attn / LOGIT_CAP)) - 1.0)
+
         # Combine validity mask with sliding window mask
         if SLIDING_WINDOW > 0:
             global_pos = page_idx * PAGE_SIZE + page_offsets
@@ -439,7 +452,15 @@ def _flash_decode_stage1_kernel(
         triton.Config({}, num_warps=16, num_stages=3),
         triton.Config({}, num_warps=16, num_stages=4),
     ],
-    key=["HEAD_DIM", "HD_CHUNK1", "HD_CHUNK2", "PAGE_SIZE", "HEAD_RATIO_PADDED", "SLIDING_WINDOW"],
+    key=[
+        "HEAD_DIM",
+        "HD_CHUNK1",
+        "HD_CHUNK2",
+        "PAGE_SIZE",
+        "HEAD_RATIO_PADDED",
+        "SLIDING_WINDOW",
+        "LOGIT_CAP",
+    ],
 )
 @triton.jit
 def _flash_decode_stage1_two_chunk_kernel(
@@ -482,6 +503,7 @@ def _flash_decode_stage1_two_chunk_kernel(
     HD_CHUNK1: tl.constexpr,  # First chunk size (power-of-2, covers indices 0..HD_CHUNK1-1)
     HD_CHUNK2: tl.constexpr,  # Second chunk size (power-of-2, covers HD_CHUNK1..HD_CHUNK1+HD_CHUNK2-1)
     SLIDING_WINDOW: tl.constexpr = 0,
+    LOGIT_CAP: tl.constexpr = 0.0,
 ):
     """Two-chunk stage1 for non-power-of-2 head_dim (e.g. 176 = 128 + 64).
 
@@ -602,6 +624,10 @@ def _flash_decode_stage1_two_chunk_kernel(
 
         # QK: sum contributions from both chunks → [HEAD_RATIO_PADDED, PAGE_SIZE]
         attn = (tl.dot(q_c1, tl.trans(k_c1)) + tl.dot(q_c2, tl.trans(k_c2))) * SM_SCALE
+
+        # Iter 18: logit soft-capping (Gemma-4: logit_cap=50.0). Apply BEFORE masking.
+        if LOGIT_CAP > 0.0:
+            attn = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (attn / LOGIT_CAP)) - 1.0)
 
         if SLIDING_WINDOW > 0:
             global_pos = page_idx * PAGE_SIZE + page_offsets
@@ -759,6 +785,7 @@ def triton_paged_decode(
     kv_last_page_len: torch.Tensor,
     sm_scale: float,
     sliding_window: Optional[int] = None,
+    logit_cap: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Optimized paged decode with GQA batching + FlashDecoding + page-aligned iteration.
@@ -771,6 +798,7 @@ def triton_paged_decode(
         kv_last_page_len: Valid tokens in last page [batch_size]
         sm_scale: Softmax scale factor
         sliding_window: If set, only attend to the last sliding_window tokens
+        logit_cap: If set (>0), apply logit soft-capping: cap * tanh(score / cap)
         out: Optional output tensor [batch_size, n_heads, head_dim]
 
     Returns:
@@ -786,6 +814,8 @@ def triton_paged_decode(
     max_seq_len = max_pages * page_size
     # Normalize sliding_window: None/non-positive → 0 (full attention)
     sw = sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
+    # Normalize logit_cap: None/non-positive → 0.0 (no capping)
+    lc = float(logit_cap) if logit_cap is not None and logit_cap > 0.0 else 0.0
 
     output = out if out is not None else torch.empty_like(q)
 
@@ -848,6 +878,7 @@ def triton_paged_decode(
         HEAD_RATIO_PADDED=head_ratio_padded,
         NUM_SPLITS=num_splits,
         SLIDING_WINDOW=sw,
+        LOGIT_CAP=lc,
     )
 
     if head_dim_padded == head_dim:
@@ -930,7 +961,8 @@ def triton_paged_decode(
     ],
     # Iter 12: add SLIDING_WINDOW to key so sw=0 and sw>0 shapes get different configs.
     # Sliding-window path has extra per-token masking and different phase1/phase2 balance.
-    key=["HEAD_DIM", "HEAD_DIM_PADDED", "PAGE_SIZE", "SLIDING_WINDOW"],
+    # Iter 18: add LOGIT_CAP to key — softcap path has tanh vs no-op, different perf profile.
+    key=["HEAD_DIM", "HEAD_DIM_PADDED", "PAGE_SIZE", "SLIDING_WINDOW", "LOGIT_CAP"],
 )
 @triton.jit
 def _paged_context_kernel(
@@ -964,6 +996,7 @@ def _paged_context_kernel(
     HEAD_DIM_PADDED: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr = 0,
+    LOGIT_CAP: tl.constexpr = 0.0,
 ):
     """Context/prefill attention with paged KV cache, causal skip, and page-aligned iteration.
 
@@ -1068,6 +1101,9 @@ def _paged_context_kernel(
             )
 
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+            # Iter 18: logit soft-capping. Apply BEFORE masking.
+            if LOGIT_CAP > 0.0:
+                qk = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (qk / LOGIT_CAP)) - 1.0)
 
             # Per-query sliding window mask: each query position q_pos
             # can attend to KV in [q_pos - W + 1, q_pos].
@@ -1098,6 +1134,8 @@ def _paged_context_kernel(
             v = tl.load(v_block_ptr)
 
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+            if LOGIT_CAP > 0.0:
+                qk = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (qk / LOGIT_CAP)) - 1.0)
 
             if not is_full_q_block:
                 qk = tl.where(q_mask[:, None], qk, float("-inf"))
@@ -1115,6 +1153,8 @@ def _paged_context_kernel(
             )
 
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+            if LOGIT_CAP > 0.0:
+                qk = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (qk / LOGIT_CAP)) - 1.0)
 
             if not is_full_q_block:
                 qk = tl.where(q_mask[:, None], qk, float("-inf"))
@@ -1157,6 +1197,9 @@ def _paged_context_kernel(
             )
 
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+            # Iter 18: logit soft-capping. Apply BEFORE masking.
+            if LOGIT_CAP > 0.0:
+                qk = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (qk / LOGIT_CAP)) - 1.0)
             kv_positions = kv_base_pos + page_offsets[None, :]
             causal_mask = q_positions_2d >= kv_positions
             if SLIDING_WINDOW > 0:
@@ -1294,6 +1337,7 @@ def triton_paged_context(
     seq_len_with_cache: torch.Tensor,
     sm_scale: float,
     sliding_window: Optional[int] = None,
+    logit_cap: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Context/prefill attention with paged KV cache."""
@@ -1322,6 +1366,8 @@ def triton_paged_context(
     # (assumes pure prefill where q_len == kv_len for each seq)
     # Normalize sliding_window for kernel constexpr: None/non-positive → 0
     sw = sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
+    # Normalize logit_cap: None/non-positive → 0.0 (no capping)
+    lc = float(logit_cap) if logit_cap is not None and logit_cap > 0.0 else 0.0
 
     max_pages = (max_q_len + page_size - 1) // page_size
     total_expected_pages = num_seq * max_pages
@@ -1331,6 +1377,7 @@ def triton_paged_context(
         and max_pages > 0
         and kv_indices.shape[0] == total_expected_pages  # all seqs same page count
         and sw == 0  # SDPA doesn't support sliding window natively
+        and lc == 0.0  # cuDNN SDPA doesn't support logit soft-capping
     )
 
     if use_sdpa:
@@ -1416,6 +1463,7 @@ def triton_paged_context(
             HEAD_DIM_PADDED=triton.next_power_of_2(head_dim),
             PAGE_SIZE=page_size,
             SLIDING_WINDOW=sw,
+            LOGIT_CAP=lc,
         )
 
     return output
@@ -1482,6 +1530,7 @@ def triton_paged_mha_with_cache(
     # CONSTANTS
     scale: Optional[float],
     sliding_window: Optional[int] = None,
+    logit_cap: Optional[float] = None,
     # OPTIONAL PRE-ALLOCATED OUTPUT
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -1533,6 +1582,7 @@ def triton_paged_mha_with_cache(
             seq_len_with_cache,
             sm_scale,
             sliding_window=sliding_window,
+            logit_cap=logit_cap,
             out=y[:num_prefill_tokens],
         )
 
@@ -1546,6 +1596,7 @@ def triton_paged_mha_with_cache(
             last_page_len[num_prefill:num_seq],
             sm_scale,
             sliding_window=sliding_window,
+            logit_cap=logit_cap,
             out=y[num_prefill_tokens:num_total_tokens],
         )
 
@@ -1580,6 +1631,7 @@ def triton_paged_mha_with_cache_fake(
     kv_cache: torch.Tensor,
     scale: Optional[float],
     sliding_window: Optional[int] = None,
+    logit_cap: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if out is not None:
@@ -1679,5 +1731,6 @@ class TritonPagedAttention(AttentionDescriptor):
             scale = None
 
         sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
+        logit_cap = extract_op_args(source_attn_node, "logit_cap")[0]
 
-        return [scale, sliding_window]
+        return [scale, sliding_window, logit_cap]

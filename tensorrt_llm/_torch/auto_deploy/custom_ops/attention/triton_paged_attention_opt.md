@@ -568,6 +568,38 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 18 — Logit soft-capping support (Gemma-4: logit_cap=50.0)
+
+**What changed:** Added full logit soft-cap support to all three attention kernels and the Python dispatch layer. Previously `triton_paged_mha_with_cache` completely ignored `logit_cap`, producing incorrect attention scores for Gemma-4 (which uses `attn_logit_softcapping=50.0`).
+
+**Changes (7 locations):**
+
+1. Added `"LOGIT_CAP"` to autotune keys of all 3 kernels (`_flash_decode_stage1_kernel`, `_flash_decode_stage1_two_chunk_kernel`, `_paged_context_kernel`) — softcap changes the compute pattern and may prefer different configs
+1. Added `LOGIT_CAP: tl.constexpr = 0.0` parameter to all 3 kernels
+1. Added soft-capping code `LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (score / LOGIT_CAP)) - 1.0)` BEFORE masking in all 4 compute sites (stage1 kernel + two-chunk kernel + context phase1 ×3 branches + context phase2)
+1. Added `logit_cap: Optional[float] = None` to `triton_paged_decode` and `triton_paged_context`
+1. Added `logit_cap: Optional[float] = None` to `triton_paged_mha_with_cache` op and fake op
+1. Updated `get_constants` to extract `logit_cap` from source attention node
+1. Disabled SDPA path when `logit_cap > 0` (cuDNN SDPA doesn't support soft-capping)
+
+**Implementation note — tanh via tl.sigmoid:**\
+Triton 3.6.0 does not have `tl.math.tanh`. Using the identity `tanh(x) = 2·sigmoid(2x) − 1` which is numerically stable: for large |x|, sigmoid saturates to 0/1, so `tanh` saturates to ±1 correctly.
+
+**Implementation note — apply BEFORE masking:**\
+Soft-capping is applied after `score *= SM_SCALE` but before page/causal/sliding-window masks. This ensures `-inf` from masks propagates cleanly through softmax (`exp(-inf)=0`). The difference vs applying after masking is negligible: `exp(−logit_cap)=exp(−50)≈1.9e-22≈0` for any masked position.
+
+**Correctness:** PASS — 31/31 new `TestLogitSoftCap` tests pass, covering:
+
+- Decode with logit_cap=50.0 for head_dim ∈ {64, 128, 176}, batch ∈ {1, 4}, seq_len ∈ {64, 256}
+- Context with logit_cap=50.0 for head_dim ∈ {64, 128, 176}, batch ∈ {1, 2}, seq_len ∈ {32, 128, 256}
+- Backward-compat: logit_cap=None gives same result as omitting arg
+
+**Performance impact:** Zero overhead when `logit_cap=0.0` (default) because the `if LOGIT_CAP > 0.0:` is a compile-time constexpr branch — Triton eliminates the dead branch. When `logit_cap > 0`, overhead is one `sigmoid` per score element (~1 SFU cycle per 32 elements on H100), dominated by the QK matmul.
+
+**Commit:** see git log
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space
