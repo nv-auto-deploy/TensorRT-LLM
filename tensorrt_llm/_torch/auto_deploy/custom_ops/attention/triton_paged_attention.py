@@ -1244,15 +1244,13 @@ def triton_paged_decode(
         triton.Config({"Q_BLOCK": 64}, num_stages=4, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=4, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=4, num_warps=16),
-        # Iter 30: deeper pipeline for longer KV loops (C2-C4, long-context prefill)
+        # Iter 30: deeper pipeline for longer KV loops (C2-C4, long-context prefill).
+        # Note: num_stages=6 crashes Triton 3.6.0 for the context kernel (two-phase structure
+        # + constexpr branches trigger a compiler assertion). Cap at num_stages=5.
         triton.Config({"Q_BLOCK": 64}, num_stages=5, num_warps=4),
         triton.Config({"Q_BLOCK": 64}, num_stages=5, num_warps=8),
-        triton.Config({"Q_BLOCK": 64}, num_stages=6, num_warps=4),
-        triton.Config({"Q_BLOCK": 64}, num_stages=6, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=5, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=5, num_warps=16),
-        triton.Config({"Q_BLOCK": 128}, num_stages=6, num_warps=8),
-        triton.Config({"Q_BLOCK": 128}, num_stages=6, num_warps=16),
     ],
     # Iter 12: add SLIDING_WINDOW to key so sw=0 and sw>0 shapes get different configs.
     # Sliding-window path has extra per-token masking and different phase1/phase2 balance.

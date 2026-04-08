@@ -980,25 +980,27 @@ The `s1%e2e ≈ 100%` for all splits=1 shapes confirms stage2/copy\_ is fully el
 
 ______________________________________________________________________
 
-### Iteration 30 — Autotune expansion: num_stages=6,7 for all three kernels
+### Iteration 30 — Autotune expansion: num_stages=6,7 for decode; num_stages=5 for context
 
-**What changed:** Added 6 new configs to both decode stage1 kernels and 8 new configs to the
-context kernel, extending the autotune search space to `num_stages ∈ {6, 7}` for decode and
-`num_stages ∈ {5, 6}` for context:
+**What changed:** Added 6 new configs to both decode stage1 kernels extending to `num_stages ∈ {6, 7}`.
+Context kernel capped at `num_stages=5` (4 new configs added):
 
-- `_flash_decode_stage1_kernel`: Added configs (num_warps=4/8/16) × (num_stages=6/7) — 6 new.
+- `_flash_decode_stage1_kernel`: Added (num_warps=4/8/16) × (num_stages=6/7) — 6 new.
 - `_flash_decode_stage1_two_chunk_kernel`: Same 6 configs.
-- `_paged_context_kernel`: Added (Q_BLOCK=64,128) × (num_warps=4/8/16) × (num_stages=5/6) — 8 new.
+- `_paged_context_kernel`: Added (Q_BLOCK=64,128) × (num_warps=4/8) × (num_stages=5) — 4 new.
 
-**Rationale:** The current max `num_stages=5` may not fully hide HBM latency for shapes with long
-inner loops (S3/S4/L shapes: 16-64 pages/split, C2-C4: long KV loops). Higher `num_stages` depth
-allows the Triton software pipeline to prefetch more K/V tiles from HBM while computing the
-current tile's GEMM.
+**Rationale:** Deeper pipeline stages hide HBM latency for shapes with long inner loops
+(S3/S4/L shapes: 16-64 pages/split, C2-C4: long KV loops).
+
+**⚠ Triton 3.6.0 bug:** `num_stages=6` for `_paged_context_kernel` triggers a Triton
+compiler assertion crash ("please share the reproducer above with Triton project").
+The two-phase structure + constexpr branches (SKIP_PHASE1_SW, LOGIT_CAP) make the
+context kernel's software pipeline scheduling too complex for num_stages=6.
+The decode kernels (simpler single-phase loop) handle num_stages=6/7 fine.
 
 **Correctness:** Parameter-only (autotune config addition). No structural change. PASS (163/163).
 
-**Results:** Pending re-tune on first run — autotune key unchanged, so all configs explored
-automatically on next benchmark invocation.
+**Results:** Pending re-tune on first run.
 
 **Commit:** see git log
 
