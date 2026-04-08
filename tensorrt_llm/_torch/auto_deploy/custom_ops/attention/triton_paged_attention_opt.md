@@ -485,6 +485,20 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 15 — Add NUM_SPLITS to two-chunk stage1 autotune key (FAILED, reverted)
+
+**What changed:** Added `NUM_SPLITS` to two-chunk stage1 kernel autotune key. Hypothesis: small-split (D1: 2 pages/split) and large-split (L3: 16 pages/split) need different optimal configs.
+
+**Correctness:** PASS (132/132)
+
+**Results:** D4 +24%, L3 +25% regression; D5 -8%, D6 -9%, D9 -4% improvement.
+
+**Analysis:** Adding NUM_SPLITS triggers 15 separate autotune runs for each unique splits value. For heavy shapes (NUM_SPLITS=16/32), the autotune benchmark itself might be noisy (375 kernel launches per shapes with heavy inner loops), selecting suboptimal configs. The inconsistent per-shape results suggest autotune instability. Reverted.
+
+**Commit:** see git log (reverted)
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space
