@@ -416,6 +416,20 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 11 — Update kernel autotune num_warps (FAILED, reverted)
+
+**What changed:** Added `@triton.autotune` to `_update_paged_kv_cache_kernel` with 6 configs sweeping num_warps ∈ {1,2,4,8} × num_stages ∈ {1,2}. Key: `[HEAD_DIM, HEAD_DIM_PADDED, N_KV_HEADS, PAGE_SIZE]`.
+
+**Correctness:** PASS (132/132)
+
+**Results:** D5 +12%, D10 +16% regression; D1 -4% improvement.
+
+**Analysis:** Autotune key lacks NUM_TOKENS, so one config applies to all grid sizes. Autotuner picked config optimal for large prefill grids (T=512) but wasteful for decode T=1 (grid=(1,8)=8 programs — 8 warps per 8-program kernel is ~1 warp per program). Reverted. Fix: need per-grid-size config selection or two separate kernels.
+
+**Commit:** see git log (reverted)
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space
