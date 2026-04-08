@@ -599,32 +599,38 @@ def triton_paged_decode(
         SLIDING_WINDOW=sw,
     )
 
-    # Stage 2: Combine partial results — tiled over HEAD_DIM for more SM parallelism.
-    # BLOCK_HD=64 gives 4 programs per (batch, head), up to 4× more parallelism than
-    # the original 2D (batch, n_heads) grid for models with large head_dim.
-    s2_block_hd = 64
-    n_hd_blocks = triton.cdiv(head_dim_padded, s2_block_hd)
-    _flash_decode_stage2_kernel[(batch_size, n_heads, n_hd_blocks)](
-        partial_o,
-        partial_lse,
-        output,
-        # Partial output strides
-        partial_o.stride(0),
-        partial_o.stride(1),
-        partial_o.stride(2),
-        # Partial LSE strides
-        partial_lse.stride(0),
-        partial_lse.stride(1),
-        partial_lse.stride(2),
-        # Output strides
-        output.stride(0),
-        output.stride(1),
-        # Constants
-        HEAD_DIM=head_dim,
-        HEAD_DIM_PADDED=head_dim_padded,
-        NUM_SPLITS=num_splits,
-        BLOCK_HD=s2_block_hd,
-    )
+    if num_splits == 1:
+        # Skip stage2: partial_o[:, :, 0, :] already holds the normalized output.
+        # This saves a full kernel launch + memory round-trip for large batches
+        # (num_splits == 1 when batch_size * n_kv_heads >= 2 * num_SMs).
+        output.copy_(partial_o.squeeze(2))
+    else:
+        # Stage 2: Combine partial results — tiled over HEAD_DIM for more SM parallelism.
+        # BLOCK_HD=64 gives 4 programs per (batch, head), up to 4× more parallelism than
+        # the original 2D (batch, n_heads) grid for models with large head_dim.
+        s2_block_hd = 64
+        n_hd_blocks = triton.cdiv(head_dim_padded, s2_block_hd)
+        _flash_decode_stage2_kernel[(batch_size, n_heads, n_hd_blocks)](
+            partial_o,
+            partial_lse,
+            output,
+            # Partial output strides
+            partial_o.stride(0),
+            partial_o.stride(1),
+            partial_o.stride(2),
+            # Partial LSE strides
+            partial_lse.stride(0),
+            partial_lse.stride(1),
+            partial_lse.stride(2),
+            # Output strides
+            output.stride(0),
+            output.stride(1),
+            # Constants
+            HEAD_DIM=head_dim,
+            HEAD_DIM_PADDED=head_dim_padded,
+            NUM_SPLITS=num_splits,
+            BLOCK_HD=s2_block_hd,
+        )
 
     return output
 

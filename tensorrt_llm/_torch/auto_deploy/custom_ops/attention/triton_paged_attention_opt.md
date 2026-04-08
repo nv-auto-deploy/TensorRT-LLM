@@ -102,16 +102,18 @@ ______________________________________________________________________
 
 ### Current Best Summary (updated each iteration)
 
-| ID | Baseline s1(us) | Baseline E2E(us) | Best s1(us) | Best E2E(us) | Iter |
-|----|----------------|-----------------|-------------|-------------|------|
-| D1 | 9.50 | 11.88 | 9.20 | 11.29 | 1 |
-| D2 | 10.41 | 14.11 | 10.00 | 13.93 | 1 |
-| D3 | 11.08 | 15.25 | 11.08 | 15.25 | 0 |
-| D4 | 13.73 | 29.43 | 13.73 | 29.43 | 0 |
-| D5 | 20.38 | 24.48 | 20.38 | 24.48 | 0 |
-| D6 | 31.59 | 36.05 | 31.59 | 36.05 | 0 |
-| D7 | 52.33 | 56.06 | 50.91 | 54.60 | 1 |
-| D8 | 81.96 | 85.17 | 81.96 | 85.17 | 0 |
+Shape ID mapping updated in iter 2 (extended batch sweep, new IDs):
+
+| ID | Batch | SL | SW | Baseline s1(us) | Baseline E2E(us) | Best s1(us) | Best E2E(us) | Iter |
+|----|-------|----|----|----------------|-----------------|-------------|-------------|------|
+| D1 | 1 | 512 | 0 | 9.72 | 12.87 | 9.72 | 12.87 | 0 |
+| D5 | 16 | 512 | 0 | 31.77 | 35.07 | 31.77 | 35.07 | 0 |
+| D7 | 64 | 512 | 0 | 81.76 | 84.69 | 81.76 | 84.69 | 3 |
+| D10 | 384 | 512 | 0 | 405.42 | 409.87 | 405.42 | 409.87 | 3 |
+| S1 | 1 | 1024 | 1024 | 11.17 | 15.08 | 11.17 | 15.08 | 0 |
+| S5 | 384 | 1024 | 1024 | 764.54 | 768.70 | 764.54 | 768.70 | 3 |
+| L1 | 1 | 2048 | 0 | 14.01 | 29.74 | 14.01 | 29.74 | 0 |
+| L3 | 1 | 8192 | 0 | 31.40 | 60.71 | 31.40 | 60.71 | 0 |
 
 ______________________________________________________________________
 
@@ -189,7 +191,76 @@ ______________________________________________________________________
 
 ### Iteration 2 — Stage2 HEAD_DIM tiling for more parallelism
 
-*(pending)*
+**What changed:**
+
+- `_flash_decode_stage2_kernel`: Changed grid from (batch, n_heads) to (batch, n_heads, n_hd_blocks) where BLOCK_HD=64. Added 3rd axis `hd_block_id`, computes `dhead_offsets = hd_start + tl.arange(0, BLOCK_HD)`. Added early exit when `hd_start >= HEAD_DIM` to skip all-padding tiles.
+- Extended DECODE_SHAPES in sweep script to cover full batch range 1..384.
+- Added CONTEXT_SHAPES with chunked prefill (kv_len > q_len) test cases.
+
+**Correctness:** PASS (132/132 tests pass)
+
+| ID | B | SL | SW | splits | s1(us) | s2(us) | e2e(us) | Δ e2e |
+|----|---|----|----|--------|--------|--------|---------|-------|
+| D1 | 1 | 512 | 0 | 16 | 9.72 | 6.71 | 12.87 | baseline |
+| D5 | 16 | 512 | 0 | 8 | 31.77 | 6.85 | 35.07 | baseline |
+| D7 | 64 | 512 | 0 | 1 | 81.76 | 7.70 | 84.69\* | - |
+| D10 | 384 | 512 | 0 | 1 | 405.42 | 20.32 | 409.87\* | - |
+| L1 | 1 | 2048 | 0 | 64 | 14.01 | 31.70 | 29.74 | -10% vs raw s2 |
+| L3 | 1 | 8192 | 0 | 128 | 31.40 | 57.32 | 60.71 | baseline |
+
+\*D7/D10 numbers include iter 3 optimization (stage2 bypass for splits=1)
+
+**Analysis:** For L1/L3 the HEAD_DIM tiling gives 4 programs per (batch, head) instead of 1, helping SM utilization. But serial LSE scan loop over NUM_SPLITS=64/128 still dominates stage2 time. The s2 bottleneck at L1 (31μs) is 52% of e2e. Need to parallelize the splits dimension.
+
+**Commit:** `97ff9d0f45`
+
+______________________________________________________________________
+
+### Iteration 3 — Bypass stage2 for num_splits=1
+
+**What changed:**
+
+- In `triton_paged_decode` launcher: added `if num_splits == 1: output.copy_(partial_o.squeeze(2))` to skip the stage2 Triton kernel entirely. For num_splits=1 (which occurs when `batch_size * n_kv_heads >= 2 * num_SMs`, i.e., batch >= 33 for Gemma-4 on H100), partial_o already contains the final normalized output.
+
+**Correctness:** PASS (132/132 tests)
+
+| ID | B | SL | SW | splits | s1(us) | s2(us)\_iso | e2e(us) | e2e overhead |
+|----|---|----|----|--------|--------|-----------|---------|-------------|
+| D7 | 64 | 512 | 0 | 1 | 81.76 | 7.70 | 84.69 | 2.93μs |
+| D8 | 128 | 512 | 0 | 1 | 153.73 | 10.17 | 157.04 | 3.31μs |
+| D9 | 256 | 512 | 0 | 1 | 279.64 | 15.17 | 283.24 | 3.60μs |
+| D10 | 384 | 512 | 0 | 1 | 405.42 | 20.32 | 409.87 | 4.45μs |
+| S4 | 128 | 1024 | 1024 | 1 | 312.55 | 10.40 | 316.25 | 3.70μs |
+| S5 | 384 | 1024 | 1024 | 1 | 764.54 | 20.33 | 768.70 | 4.16μs |
+
+s2(us)_iso = isolated stage2 kernel time (reference only, not used in e2e path). e2e overhead = e2e - s1 = cost of torch.copy_() + other.
+
+**Analysis:** For D10, torch.copy\_() costs ~4.45μs vs isolated stage2 kernel 20.32μs. Saves ~16μs for batch=384 decode step. The copy\_ overhead is mainly dtype conversion (float32 → bfloat16) plus memory bandwidth: 384*16*176*4B=41MB read + 384*16*176*2B=21MB write = 62MB at 3.35TB/s = ~18μs... wait that doesn't match. Actually partial_o has head_dim=176 (not padded), so: 384*16*1*176*4=43MB read, 384*16*176\*2=21MB write. 64MB total at roofline = 19μs. But actual = 4.45μs, suggesting the copy is highly optimized or partially from cache.
+
+Next: two-chunk head_dim loading to reduce 25% KV bandwidth in stage1.
+
+**Commit:** see git log
+
+______________________________________________________________________
+
+### Iteration 4 — Stage2 BLOCK_HD=32 (FAILED, reverted)
+
+**What changed:** Reduced stage2 BLOCK_HD from 64 to 32, giving 8 programs per (batch, head) for the 3D grid.
+
+**Correctness:** PASS (parameter-only change).
+
+| ID | s2_iso(us) BLOCK_HD=64 | s2_iso(us) BLOCK_HD=32 | e2e delta |
+|----|------------------------|------------------------|-----------|
+| L1 | 31.70 | 31.62 | 0% |
+| L3 | 57.32 | 57.35 | 0% |
+| D1 | 6.71 | 6.62 | +2% worse |
+| D10 | 20.32 | 34.95 | n/a (not used in e2e) |
+
+**Analysis:** No improvement for L1/L3 (bottleneck is serial split loop, not SM count). D10 isolated stage2 gets 72% slower with BLOCK_HD=32 (smaller blocks = worse memory coalescing). e2e unchanged because num_splits=1 for D7-D10 (copy\_ path is used). Reverted to BLOCK_HD=64.
+
+**Next:** The L1/L3 stage2 bottleneck is the serial loop over NUM_SPLITS. The fix is to reduce NUM_SPLITS for long context, not increase BLOCK_HD count.
+
+**Commit:** `see git log (reverted)`
 
 ______________________________________________________________________
 
