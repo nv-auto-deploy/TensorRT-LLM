@@ -1183,51 +1183,54 @@ def _paged_context_kernel(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_i_new
 
-    # Phase 2: Boundary pages — need causal mask and validity mask
-    # q_positions_2d already computed before Phase 1 loop (iter 19 hoist)
-    for page_idx in range(num_full_pages, num_kv_pages):
+    # Phase 2: Boundary pages — need causal mask and validity mask.
+    # q_positions_2d already computed before Phase 1 loop (iter 19 hoist).
+    # Iter 21: tighten upper loop bound to max_q_pos // PAGE_SIZE + 1 so the
+    # causal skip (kv_base_pos > max_q_pos) is encoded in the loop bound.
+    # This eliminates the per-page `if kv_base_pos <= max_q_pos:` branch and,
+    # for early Q blocks in long prefill, skips all pages beyond the Q window.
+    phase2_end = tl.minimum(num_kv_pages, max_q_pos // PAGE_SIZE + 1)
+    for page_idx in range(num_full_pages, phase2_end):
         kv_base_pos = page_idx * PAGE_SIZE
 
-        # Causal skip: if entire page is beyond last Q position, skip it.
-        if kv_base_pos <= max_q_pos:
-            physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
-            valid_tokens = tl.minimum(PAGE_SIZE, total_kv_len - kv_base_pos)
-            page_mask = page_offsets < valid_tokens
+        physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+        valid_tokens = tl.minimum(PAGE_SIZE, total_kv_len - kv_base_pos)
+        page_mask = page_offsets < valid_tokens
 
-            # Use int64 to avoid overflow when physical_page * stride > 2^31
-            page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
-            kv_mask_2d = page_mask[:, None] & head_dim_mask[None, :]
-            k = tl.load(kv_cache_ptr + page_base + local_kv, mask=kv_mask_2d, other=0.0)
-            v = tl.load(
-                kv_cache_ptr + page_base + local_kv + cache_stride_kv,
-                mask=kv_mask_2d,
-                other=0.0,
-            )
+        # Use int64 to avoid overflow when physical_page * stride > 2^31
+        page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
+        kv_mask_2d = page_mask[:, None] & head_dim_mask[None, :]
+        k = tl.load(kv_cache_ptr + page_base + local_kv, mask=kv_mask_2d, other=0.0)
+        v = tl.load(
+            kv_cache_ptr + page_base + local_kv + cache_stride_kv,
+            mask=kv_mask_2d,
+            other=0.0,
+        )
 
-            qk = tl.dot(q, tl.trans(k)) * SM_SCALE
-            # Iter 18: logit soft-capping. Apply BEFORE masking.
-            if LOGIT_CAP > 0.0:
-                qk = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (qk / LOGIT_CAP)) - 1.0)
-            kv_positions = kv_base_pos + page_offsets[None, :]
-            causal_mask = q_positions_2d >= kv_positions
-            if SLIDING_WINDOW > 0:
-                sliding_mask = (q_positions_2d - kv_positions) < SLIDING_WINDOW
-                full_mask = q_mask[:, None] & causal_mask & sliding_mask & page_mask[None, :]
-            else:
-                full_mask = q_mask[:, None] & causal_mask & page_mask[None, :]
-            qk = tl.where(full_mask, qk, float("-inf"))
+        qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+        # Iter 18: logit soft-capping. Apply BEFORE masking.
+        if LOGIT_CAP > 0.0:
+            qk = LOGIT_CAP * (2.0 * tl.sigmoid(2.0 * (qk / LOGIT_CAP)) - 1.0)
+        kv_positions = kv_base_pos + page_offsets[None, :]
+        causal_mask = q_positions_2d >= kv_positions
+        if SLIDING_WINDOW > 0:
+            sliding_mask = (q_positions_2d - kv_positions) < SLIDING_WINDOW
+            full_mask = q_mask[:, None] & causal_mask & sliding_mask & page_mask[None, :]
+        else:
+            full_mask = q_mask[:, None] & causal_mask & page_mask[None, :]
+        qk = tl.where(full_mask, qk, float("-inf"))
 
-            m_ij = tl.max(qk, axis=1)
-            m_i_new = tl.maximum(m_i, m_ij)
-            if SLIDING_WINDOW > 0:
-                alpha = tl.where(m_i > float("-inf"), tl.exp(m_i - m_i_new), 0.0)
-                p = tl.where(m_i_new[:, None] > float("-inf"), tl.exp(qk - m_i_new[:, None]), 0.0)
-            else:
-                alpha = tl.exp(m_i - m_i_new)
-                p = tl.exp(qk - m_i_new[:, None])
-            acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
-            l_i = l_i * alpha + tl.sum(p, axis=1)
-            m_i = m_i_new
+        m_ij = tl.max(qk, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        if SLIDING_WINDOW > 0:
+            alpha = tl.where(m_i > float("-inf"), tl.exp(m_i - m_i_new), 0.0)
+            p = tl.where(m_i_new[:, None] > float("-inf"), tl.exp(qk - m_i_new[:, None]), 0.0)
+        else:
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(qk - m_i_new[:, None])
+        acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_i_new
 
     l_i = tl.where(l_i == 0.0, 1.0, l_i)
     o = acc / l_i[:, None]
