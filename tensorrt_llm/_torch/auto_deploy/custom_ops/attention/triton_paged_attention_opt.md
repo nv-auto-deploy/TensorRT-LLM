@@ -185,6 +185,11 @@ ______________________________________________________________________
 
 **Analysis:** Small improvements on D1 (+5%), D2 (+1%), D7 (+3%). Stage2 bottleneck for D4 unchanged — sequential reduction over 64 splits with only 16 programs. Next: parallelize stage2 over HEAD_DIM blocks.
 
+**⚠ Post-hoc fix:** `_paged_context_kernel` config `Q_BLOCK=128, num_stages=4, num_warps=16` later
+removed — triggers register exhaustion for `HEAD_DIM_PADDED=256` (head_dim=176, Gemma-4).
+The config worked for smaller head dims (HEAD_DIM_PADDED≤128) but hits the 128 reg/thread SM
+limit when tile size = 128×256 elements.
+
 **Commit:** iter 1
 
 ______________________________________________________________________

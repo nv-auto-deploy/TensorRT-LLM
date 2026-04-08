@@ -1243,7 +1243,8 @@ def triton_paged_decode(
         triton.Config({"Q_BLOCK": 64}, num_stages=3, num_warps=4),
         triton.Config({"Q_BLOCK": 64}, num_stages=4, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=4, num_warps=8),
-        triton.Config({"Q_BLOCK": 128}, num_stages=4, num_warps=16),
+        # Note: num_warps=16 (512 threads) removed — triggers register exhaustion for
+        # HEAD_DIM_PADDED=256 (head_dim=176): 158 regs/thread > 128 SM limit (Triton 3.6.0).
     ],
     # Iter 12: add SLIDING_WINDOW to key so sw=0 and sw>0 shapes get different configs.
     # Sliding-window path has extra per-token masking and different phase1/phase2 balance.
