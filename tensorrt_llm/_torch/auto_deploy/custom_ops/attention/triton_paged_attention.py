@@ -348,6 +348,12 @@ def _flash_decode_stage1_kernel(
     l_i = tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32)
 
     num_pages_this_split = page_split_end - page_split_start
+    page_offsets = tl.arange(0, PAGE_SIZE)
+    # Iter 17: precompute loop-invariant offset table [PAGE_SIZE, HEAD_DIM_PADDED] outside loop.
+    # Saves one vector multiply per iteration vs computing inside the loop.
+    kv_head_base = kv_head_id * cache_stride_head
+    local_kv = page_offsets[:, None] * cache_stride_token + dhead_offsets[None, :]
+
     for local_page_idx in range(num_pages_this_split):
         page_idx = page_split_start + local_page_idx
         physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
@@ -355,24 +361,18 @@ def _flash_decode_stage1_kernel(
         # Determine valid tokens in this page
         is_last_page_of_seq = page_idx == (num_pages - 1)
         valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
-
-        page_offsets = tl.arange(0, PAGE_SIZE)
         page_mask = page_offsets < valid_tokens
 
         # Compute cache offset (use int64 to avoid overflow when physical_page * stride > 2^31)
-        cache_base = (
-            physical_page.to(tl.int64) * cache_stride_block
-            + kv_head_id * cache_stride_head
-            + page_offsets[:, None] * cache_stride_token
-            + dhead_offsets[None, :]
-        )
+        # cache_page_base is a scalar int64; local_kv broadcasts to [PAGE_SIZE, HEAD_DIM_PADDED]
+        cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
         kv_mask_2d = page_mask[:, None] & head_dim_mask[None, :]
 
         k = tl.load(
-            kv_cache_ptr + cache_base, mask=kv_mask_2d, other=0.0
+            kv_cache_ptr + cache_page_base + local_kv, mask=kv_mask_2d, other=0.0
         )  # [PAGE_SIZE, HEAD_DIM_PADDED]
         v = tl.load(
-            kv_cache_ptr + cache_base + cache_stride_kv,
+            kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv,
             mask=kv_mask_2d,
             other=0.0,
         )  # [PAGE_SIZE, HEAD_DIM_PADDED]
@@ -567,6 +567,15 @@ def _flash_decode_stage1_two_chunk_kernel(
 
     page_offsets = tl.arange(0, PAGE_SIZE)
     num_pages_this_split = page_split_end - page_split_start
+    # Iter 17: precompute loop-invariant KV load offsets [PAGE_SIZE, HD_CHUNK{1,2}] outside loop.
+    # kv_head_base is a scalar; local_kv_c{1,2} broadcast when added to page scalar.
+    kv_head_base = kv_head_id * cache_stride_head
+    local_kv_c1 = (
+        page_offsets[:, None] * cache_stride_token + dhead_c1[None, :]
+    )  # [PAGE_SIZE, HD_C1]
+    local_kv_c2 = (
+        page_offsets[:, None] * cache_stride_token + dhead_c2[None, :]
+    )  # [PAGE_SIZE, HD_C2]
 
     for local_page_idx in range(num_pages_this_split):
         page_idx = page_split_start + local_page_idx
@@ -576,21 +585,17 @@ def _flash_decode_stage1_two_chunk_kernel(
         valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
         page_mask = page_offsets < valid_tokens
 
-        # Cache base for this page (int64 to avoid overflow)
-        cache_page_base = (
-            physical_page.to(tl.int64) * cache_stride_block
-            + kv_head_id * cache_stride_head
-            + page_offsets[:, None] * cache_stride_token
-        )
+        # Cache page base: scalar int64 — local_kv_c{1,2} broadcast to [PAGE_SIZE, HD_CHUNK{1,2}]
+        cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
 
         # Load K in two chunks: [PAGE_SIZE, HD_CHUNK1] and [PAGE_SIZE, HD_CHUNK2]
         k_c1 = tl.load(
-            kv_cache_ptr + cache_page_base + dhead_c1[None, :],
+            kv_cache_ptr + cache_page_base + local_kv_c1,
             mask=page_mask[:, None],
             other=0.0,
         )
         k_c2 = tl.load(
-            kv_cache_ptr + cache_page_base + dhead_c2[None, :],
+            kv_cache_ptr + cache_page_base + local_kv_c2,
             mask=page_mask[:, None] & head_dim_mask_c2[None, :],
             other=0.0,
         )
@@ -610,14 +615,14 @@ def _flash_decode_stage1_two_chunk_kernel(
         alpha = tl.exp(m_i - m_i_new)
         p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO_PADDED, PAGE_SIZE]
 
-        # Load V in two chunks
+        # Load V in two chunks (using precomputed local_kv_c{1,2} offsets)
         v_c1 = tl.load(
-            kv_cache_ptr + cache_page_base + cache_stride_kv + dhead_c1[None, :],
+            kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c1,
             mask=page_mask[:, None],
             other=0.0,
         )
         v_c2 = tl.load(
-            kv_cache_ptr + cache_page_base + cache_stride_kv + dhead_c2[None, :],
+            kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c2,
             mask=page_mask[:, None] & head_dim_mask_c2[None, :],
             other=0.0,
         )

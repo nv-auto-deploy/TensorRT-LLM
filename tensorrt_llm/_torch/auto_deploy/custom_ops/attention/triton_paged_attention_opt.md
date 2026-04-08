@@ -485,6 +485,49 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 17 — Hoist loop-invariant KV offset tables outside inner page loop (KEPT)
+
+**What changed:**
+
+- In both `_flash_decode_stage1_kernel` and `_flash_decode_stage1_two_chunk_kernel`:
+  - Moved `page_offsets = tl.arange(0, PAGE_SIZE)` outside the inner loop (original kernel had it inside)
+  - Precomputed `kv_head_base = kv_head_id * cache_stride_head` (scalar) outside loop
+  - Precomputed `local_kv_c1 = page_offsets[:, None] * cache_stride_token + dhead_c1[None, :]` and `local_kv_c2` as `[PAGE_SIZE, HD_CHUNK]` tensors outside loop — matching the pattern already used in `_paged_context_kernel`
+- The loop body now computes only the loop-variant part: `cache_page_base = physical_page.to(int64) * cache_stride_block + kv_head_base` (scalar)
+
+**Correctness:** PASS (132/132)
+
+**Results vs iter 8 baseline:**
+
+| ID | Baseline e2e (μs) | Iter 17 e2e (μs) | Delta |
+|----|------------------|-----------------|-------|
+| D1 | 12.73 | 12.47 | -2.0% |
+| D2 | 16.38 | 14.14 | **-13.7%** |
+| D3 | 22.40 | 17.40 | **-22.3%** |
+| D4 | 29.43 | 23.36 | **-20.6%** |
+| D5 | 41.22 | 34.51 | **-16.3%** |
+| D6 | 60.92 | 53.24 | **-12.6%** |
+| D7 | 93.26 | 84.00 | **-9.9%** |
+| D8 | 170.69 | 153.57 | **-10.0%** |
+| D9 | 324.89 | 279.65 | **-13.9%** |
+| D10 | 477.90 | 407.19 | **-14.8%** |
+| S1 | 14.35 | 14.11 | -1.7% |
+| S2 | 35.85 | 32.82 | **-8.5%** |
+| S3 | 94.75 | 82.86 | **-12.5%** |
+| S4 | 320.91 | 268.55 | **-16.3%** |
+| L1 | 17.43 | 16.79 | **-3.7%** |
+| L2 | 60.67 | 53.24 | **-12.2%** |
+| L3 | 34.87 | 33.40 | **-4.2%** |
+| L4 | 168.07 | 152.68 | **-9.2%** |
+
+**Analysis:** Large, consistent improvements across almost all shapes. The Triton compiler was NOT automatically hoisting the `page_offsets[:, None] * cache_stride_token + dhead_c{1,2}[None, :]` computation outside the inner loop — even though it is loop-invariant (no dependency on loop variable or page table data). Making it explicit via Python-level hoisting at the Triton AST level forces the pre-computation outside the loop, saving 2D offset table recomputation per page iteration. This is purely an instruction-count reduction with no mathematical change.
+
+Median improvement: ~12% across most decode shapes. Shapes with more pages per split benefit more (D3: -22% with 2 pages/split and 16 programs/iteration needing more compute).
+
+**Commit:** see git log
+
+______________________________________________________________________
+
 ### Iteration 16 — Q_BLOCK=16 in context kernel autotune (FAILED, reverted)
 
 **What changed:** Added 3 configs with `Q_BLOCK=16` to `_paged_context_kernel` autotune. Hypothesis: for very low-parallelism shapes (B=1, q_len=64), grid=(1, 16, 1)=16 programs uses only 12% of H100's 132 SMs. Q_BLOCK=16 gives 4× more programs.
