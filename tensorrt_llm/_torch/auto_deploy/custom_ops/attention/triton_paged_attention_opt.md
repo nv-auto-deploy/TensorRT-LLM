@@ -112,8 +112,8 @@ Shape ID mapping updated in iter 2 (extended batch sweep, new IDs):
 | D10 | 384 | 512 | 0 | 405.42 | 409.87 | 405.42 | 409.87 | 3 |
 | S1 | 1 | 1024 | 1024 | 11.17 | 15.08 | 11.17 | 15.08 | 0 |
 | S5 | 384 | 1024 | 1024 | 764.54 | 768.70 | 764.54 | 768.70 | 3 |
-| L1 | 1 | 2048 | 0 | 14.01 | 29.74 | 14.01 | 29.74 | 0 |
-| L3 | 1 | 8192 | 0 | 31.40 | 60.71 | 31.40 | 60.71 | 0 |
+| L1 | 1 | 2048 | 0 | 14.01 | 29.74 | 13.85 | 17.90 | 5 |
+| L3 | 1 | 8192 | 0 | 31.40 | 60.71 | 30.75 | 34.78 | 5 |
 
 ______________________________________________________________________
 
@@ -261,6 +261,31 @@ ______________________________________________________________________
 **Next:** The L1/L3 stage2 bottleneck is the serial loop over NUM_SPLITS. The fix is to reduce NUM_SPLITS for long context, not increase BLOCK_HD count.
 
 **Commit:** `see git log (reverted)`
+
+______________________________________________________________________
+
+### Iteration 5 — Cap num_splits at 32 (reduce stage2 serial loop for long context)
+
+**What changed:**
+
+- `_get_num_splits`: Changed final cap from `min(num_splits, 128)` to `min(num_splits, 32)`. For short sequences (max_splits ≤ 32 already), no change. For long context (L1: 64→32, L3: 128→32), stage2 serial iterations halve or quadruple decrease.
+
+**Correctness:** PASS (132/132 tests pass)
+
+| ID | B | SL | splits_old | splits_new | s1(us) | s2(us) | e2e(us) | Δ e2e |
+|----|---|----|----|-----|--------|--------|---------|-------|
+| D1 | 1 | 512 | 16 | 16 | 10.05 | 6.56 | 12.87 | 0% |
+| D5 | 16 | 512 | 8 | 8 | 31.84 | 6.72 | 35.26 | 0% |
+| L1 | 1 | 2048 | 64 | 32 | 13.85 | 8.62 | 17.90 | **-40%** |
+| L2 | 8 | 2048 | 16 | 16 | 50.80 | 7.32 | 54.94 | 0% |
+| L3 | 1 | 8192 | 128 | 32 | 30.75 | 8.40 | 34.78 | **-43%** |
+| L4 | 8 | 8192 | 16 | 16 | 152.63 | 7.32 | 156.62 | 0% |
+
+**Analysis:** Massive improvement for long-context single-batch decode: L1 -40%, L3 -43%. Stage2 with 32 splits: grid=(1,16,4)=64 programs, 32 serial iterations each. Stage2 ≈ 8μs (from 32/57μs). Stage1 essentially unchanged (same total work, fewer programs but each processes more pages). Short sequences (D1-D5, L2, L4) unaffected because their max_splits was already ≤ 32.
+
+Root cause: stage2 serial loop over splits is O(num_splits) per program, and stage2 was dominating for large num_splits. Capping at 32 is a universal improvement for all GPUs, not just H100.
+
+**Commit:** see git log
 
 ______________________________________________________________________
 

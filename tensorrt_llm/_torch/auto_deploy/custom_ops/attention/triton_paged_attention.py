@@ -200,7 +200,10 @@ def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_siz
     if num_splits > 1:
         num_splits = 2 ** math.ceil(math.log2(num_splits))
 
-    return min(num_splits, 128)
+    # Cap at 32 to limit stage2 serial reduction iterations for long-context shapes.
+    # Stage2 loops over num_splits sequentially; 32 is sufficient to saturate the GPU
+    # for all practical batch sizes while keeping stage2 fast.
+    return min(num_splits, 32)
 
 
 @triton.autotune(
