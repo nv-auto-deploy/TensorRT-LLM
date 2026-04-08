@@ -33,18 +33,14 @@ class FuseAddRMSNorm(BaseTransform):
     to correctly handle patterns where intermediate nodes (add, rms_norm) have
     multiple users in the graph.
 
-    Matches both flashinfer_rms_norm and triton_rms_norm nodes. The fused
-    replacement (flashinfer_fused_add_rms_norm) is mathematically equivalent
-    regardless of which unfused norm variant was originally used.
-
     Pattern 1 (without cast):
         %add = aten.add(%x, %residual)
-        %norm = flashinfer_rms_norm|triton_rms_norm(%add, %weight, eps)
+        %norm = flashinfer_rms_norm(%add, %weight, eps)
 
     Pattern 2 (with cast):
         %add = aten.add(%x, %residual)
         %cast = aten.to.dtype(%add, bfloat16)
-        %norm = flashinfer_rms_norm|triton_rms_norm(%cast, %weight, eps)
+        %norm = flashinfer_rms_norm(%cast, %weight, eps)
 
     Both are replaced with:
         %fused = flashinfer_fused_add_rms_norm(%x, %residual, %weight, eps)
@@ -67,8 +63,7 @@ class FuseAddRMSNorm(BaseTransform):
 
         for node in graph.nodes:
             # Match flashinfer_rms_norm (handles both overload packet and .default)
-            if not (is_op(node, torch.ops.auto_deploy.flashinfer_rms_norm) or
-                    is_op(node, torch.ops.auto_deploy.triton_rms_norm)):
+            if not is_op(node, torch.ops.auto_deploy.flashinfer_rms_norm):
                 continue
 
             input_to_norm = node.args[0]
