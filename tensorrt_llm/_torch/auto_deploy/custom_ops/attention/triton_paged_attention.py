@@ -21,7 +21,7 @@ This module provides a Triton-based paged attention implementation with:
 """
 
 import math
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import flashinfer
 import torch
@@ -1282,8 +1282,7 @@ def triton_paged_mha_with_cache(
     triton_positions: torch.Tensor,
     # CACHES - combined KV cache
     kv_cache: torch.Tensor,
-    # CONSTANTS must come before dynamic tensor inputs. The KV-cache transform
-    # appends constants positionally and forwards dynamic inputs as kwargs.
+    # CONSTANTS
     scale: Optional[float] = None,
     sliding_window: Optional[int] = None,
     # DYNAMIC INPUTS
@@ -1458,10 +1457,6 @@ class TritonPagedAttention(AttentionDescriptor):
         }
 
     @classmethod
-    def get_dynamic_inputs(cls, source_attn_node: Node) -> Dict[str, Optional[Node]]:
-        return {"custom_attn_mask": extract_op_args(source_attn_node, "attn_mask")[0]}
-
-    @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         layout, scale, attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "layout", "scale", "attn_mask", "dropout_p", "is_causal"
@@ -1485,3 +1480,10 @@ class TritonPagedAttention(AttentionDescriptor):
         sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
 
         return [scale, sliding_window]
+
+    @classmethod
+    def get_cached_attention_extra_args(
+        cls, source_attn_node: Node, prepared_attn_mask: Optional[Node]
+    ) -> List[Optional[Node]]:
+        del source_attn_node
+        return [prepared_attn_mask]

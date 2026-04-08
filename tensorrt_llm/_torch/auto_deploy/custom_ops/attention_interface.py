@@ -1957,22 +1957,23 @@ class AttentionDescriptor(ABC):
         """Provide a list of constant arguments to be passed to the attention op.
 
         The constant arguments are passed to the attention op as positional arguments after the
-        caches. Dynamic inputs from ``get_dynamic_inputs`` are passed separately as kwargs.
-        Cached attention op signatures should keep these constant parameters before any dynamic
-        tensor inputs so the transform's mixed calling convention binds correctly.
-        The constants are expected to be of type int, float, str, or None.
+        caches. The constants are expected to be of type int, float, str, or None.
         """
         return []
 
     @classmethod
-    def get_dynamic_inputs(cls, source_attn_node: Node) -> Dict[str, Optional[Node]]:
-        """Provide backend-owned dynamic tensor inputs forwarded to the cached attention op.
+    def get_cached_attention_extra_args(
+        cls,
+        source_attn_node: Node,
+        prepared_attn_mask: Optional[Node],
+    ) -> List[Optional[Node]]:
+        """Provide optional extra positional args for cached attention insertion.
 
-        Returns a mapping from keyword argument name to the corresponding FX node
-        (or ``None``).  These are passed as **kwargs** to the cached attention op,
-        so custom op signatures should place them after trailing constant parameters.
+        This is for backend-specific graph edges that should remain explicit in the transformed
+        graph, such as a prepared custom attention mask.
         """
-        return {}
+        del source_attn_node, prepared_attn_mask
+        return []
 
     @staticmethod
     def resolve_cache_dtype(dtype_config: str, fallback_dtype: torch.dtype) -> torch.dtype:

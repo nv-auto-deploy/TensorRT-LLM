@@ -242,10 +242,11 @@ class HFReplaceCachedAttn(_InsertCachedOperator):
         meta_nodes_std: List[Node],
         meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
-        dynamic_kwargs: Dict[str, Optional[Node]],
+        extra_args: List[Optional[Node]],
         constants: List[Constant],
     ):
         """Here we now need to actually do the correct mapping of the cached attn nodes."""
+        del extra_args
         # store reference to metadata, caches, and constants for this attn node
         attn_node.meta["metadata_cache_keys"] = (*meta_nodes_std, *meta_nodes_extra, *cache_nodes)
         attn_node.meta["constants"] = constants

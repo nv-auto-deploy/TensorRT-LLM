@@ -54,6 +54,24 @@ class SemanticMaskRegistry:
         return None
 
     @classmethod
+    def get_source_op(cls, node: Optional[Node]) -> Optional[object]:
+        if node is None:
+            return None
+        for source_op, _ in cls._registry:
+            if is_op(node, source_op):
+                return source_op
+        return None
+
+    @classmethod
+    def get_supported_backends(cls, node: Optional[Node]) -> List[str]:
+        source_op = cls.get_source_op(node)
+        if source_op is None:
+            return []
+        return sorted(
+            {backend for registered_op, backend in cls._registry if registered_op == source_op}
+        )
+
+    @classmethod
     def required_inputs(cls, spec: SemanticMaskLoweringSpec) -> List[str]:
         return [arg.name for arg in spec.prepare_op._schema.arguments]
 

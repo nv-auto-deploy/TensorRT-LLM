@@ -83,8 +83,17 @@ class _InsertCachedOperator(BaseTransform):
     ) -> Optional[Node]:
         """Lower a semantic attn_mask node into a backend-prepared cached mask node."""
         attn_mask = extract_op_args(attn_node, "attn_mask")[0]
+        source_semantic_op = SemanticMaskRegistry.get_source_op(attn_mask)
         spec = SemanticMaskRegistry.get(attn_mask, backend)
         if spec is None:
+            if source_semantic_op is not None:
+                supported_backends = ", ".join(
+                    SemanticMaskRegistry.get_supported_backends(attn_mask)
+                )
+                raise RuntimeError(
+                    f"Cached attention backend {backend!r} does not support lowering semantic "
+                    f"mask op {source_semantic_op!s}. Supported backends: {supported_backends}."
+                )
             return attn_mask
 
         if attn_mask in semantic_mask_cache:
@@ -202,7 +211,7 @@ class _InsertCachedOperator(BaseTransform):
         meta_nodes_std: List[Node],
         meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
-        dynamic_kwargs: Dict[str, Optional[Node]],
+        extra_args: List[Optional[Node]],
         constants: List[Constant],
     ):
         """Insert a cached attention node into the graph."""
@@ -215,8 +224,8 @@ class _InsertCachedOperator(BaseTransform):
                     *meta_nodes_extra,
                     *cache_nodes,
                     *constants,
+                    *extra_args,
                 ),
-                kwargs=dynamic_kwargs,
             )
         attn_node.replace_all_uses_with(cached_attn_node)
         gm.graph.erase_node(attn_node)
@@ -269,8 +278,6 @@ class _InsertCachedOperator(BaseTransform):
             # allow backend-specific prep before constants are extracted
             attn_descriptor.prepare_node_for_cache_insertion(gm, attn_node)
 
-            # retrieve constants for attention_op
-            dynamic_inputs = attn_descriptor.get_dynamic_inputs(attn_node)
             prepared_mask = self._process_semantic_mask(
                 gm,
                 cm,
@@ -279,9 +286,8 @@ class _InsertCachedOperator(BaseTransform):
                 attn_node,
                 semantic_mask_cache,
             )
-            if "custom_attn_mask" in dynamic_inputs:
-                dynamic_inputs["custom_attn_mask"] = prepared_mask
             constants = attn_descriptor.get_constants(attn_node)
+            extra_args = attn_descriptor.get_cached_attention_extra_args(attn_node, prepared_mask)
 
             # insert cached attention replacement op
             self._insert_cached_attn_node(
@@ -291,7 +297,7 @@ class _InsertCachedOperator(BaseTransform):
                 meta_nodes_std,
                 meta_nodes_extra,
                 cache_in_nodes,
-                dynamic_inputs,
+                extra_args,
                 constants,
             )
 

@@ -16,7 +16,7 @@
 """Torch backend attention using pure PyTorch reference implementations."""
 
 import math
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -382,7 +382,9 @@ def _torch_context_mha_readonly(
         out.copy_(torch.cat(attn_outputs, dim=0))
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_attention_with_cache", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::torch_cached_attention_with_cache", mutates_args=("k_cache", "v_cache")
+)
 def torch_backend_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -401,8 +403,7 @@ def torch_backend_mha_with_cache(
     v_cache: torch.Tensor,
     # BUFFERS
     # <none>
-    # CONSTANTS must come before dynamic tensor inputs. The KV-cache transform
-    # appends constants positionally and forwards dynamic inputs as kwargs.
+    # CONSTANTS
     scale: Optional[float] = None,
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
@@ -519,7 +520,6 @@ def torch_backend_mha_with_cache_fake(
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    custom_attn_mask: Optional[torch.Tensor] = None,
     # BUFFERS
     # <none>
     # CONSTANTS
@@ -527,6 +527,7 @@ def torch_backend_mha_with_cache_fake(
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
+    custom_attn_mask: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if out is not None:
@@ -583,10 +584,6 @@ class TorchBackendAttention(AttentionDescriptor):
         }
 
     @classmethod
-    def get_dynamic_inputs(cls, source_attn_node: Node) -> Dict[str, Optional[Node]]:
-        return {"custom_attn_mask": extract_op_args(source_attn_node, "attn_mask")[0]}
-
-    @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         # Sanity check: layout == "bsnd"
         layout = extract_op_args(source_attn_node, "layout")[0]
@@ -627,3 +624,10 @@ class TorchBackendAttention(AttentionDescriptor):
             sliding_window,  # sliding window parameter
             logit_cap,  # logit cap parameter
         ]
+
+    @classmethod
+    def get_cached_attention_extra_args(
+        cls, source_attn_node: Node, prepared_attn_mask: Optional[Node]
+    ) -> List[Optional[Node]]:
+        del source_attn_node
+        return [prepared_attn_mask]

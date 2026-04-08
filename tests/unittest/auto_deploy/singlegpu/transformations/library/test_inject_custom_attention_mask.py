@@ -3,6 +3,7 @@
 
 """Tests for semantic multimodal mask lowering during cached-attention insertion."""
 
+import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
@@ -141,10 +142,7 @@ def test_insert_cached_attention_lowers_semantic_mask_for_torch_backend():
         if is_op(node, torch.ops.auto_deploy.torch_cached_attention_with_cache)
     ]
     assert len(cached_nodes) == 1
-    assert is_op(
-        cached_nodes[0].kwargs["custom_attn_mask"],
-        torch.ops.auto_deploy.gemma4_prepare_multimodal_mask,
-    )
+    assert is_op(cached_nodes[0].args[-1], torch.ops.auto_deploy.gemma4_prepare_multimodal_mask)
 
 
 @torch.inference_mode()
@@ -188,7 +186,44 @@ def test_insert_cached_attention_lowers_semantic_mask_for_triton_paged_backend()
         if is_op(node, torch.ops.auto_deploy.triton_paged_mha_with_cache)
     ]
     assert len(cached_nodes) == 1
-    assert is_op(
-        cached_nodes[0].kwargs["custom_attn_mask"],
-        torch.ops.auto_deploy.gemma4_prepare_multimodal_mask,
+    assert is_op(cached_nodes[0].args[-1], torch.ops.auto_deploy.gemma4_prepare_multimodal_mask)
+
+
+@torch.inference_mode()
+def test_insert_cached_attention_rejects_unsupported_semantic_mask_backend():
+    model = SpanMaskedAttentionModel().eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+    position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64).repeat(input_ids.shape[0], 1)
+    mm_token_positions = torch.tensor([1, 3], dtype=torch.int32)
+    mm_token_lengths = torch.tensor([2, 2], dtype=torch.int32)
+    mm_item_cu_seqlen = torch.tensor([0, 2], dtype=torch.int32)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(
+            input_ids,
+            position_ids,
+            mm_token_positions,
+            mm_token_lengths,
+            mm_item_cu_seqlen,
+        ),
+        clone=True,
     )
+    cm = _create_seq_info()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "Cached attention backend 'flashinfer' does not support lowering semantic mask op"
+            ".*gemma4_multimodal_mask.*Supported backends: torch, triton_paged"
+        ),
+    ):
+        InferenceOptimizer(
+            None,
+            {
+                "insert_cached_attention": {
+                    "stage": "cache_init",
+                    "backend": "flashinfer",
+                },
+            },
+        )(cm, gm)
