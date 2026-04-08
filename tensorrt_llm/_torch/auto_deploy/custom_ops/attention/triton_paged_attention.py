@@ -723,8 +723,12 @@ def _flash_decode_stage2_kernel(
     """Combine partial outputs from all splits for one (batch, head, hd_block) triple.
 
     Grid axis 2 tiles HEAD_DIM into BLOCK_HD-element chunks, giving more SM parallelism
-    vs the original (batch, n_heads) 2D grid. Each program still reads all NUM_SPLITS
-    LSE scalars (cheap) and its BLOCK_HD slice of each split's partial output.
+    vs the original (batch, n_heads) 2D grid. Each program reads all NUM_SPLITS LSE
+    scalars and its BLOCK_HD slice of each split's partial output.
+
+    Iter 20: one-pass online softmax combination (flash-attention style), replacing the
+    prior two-pass algorithm. Saves one full scan of partial_lse_ptr (NUM_SPLITS scalar
+    reads) and eliminates the first loop. Also hoists batch/head offset outside loop.
     """
     batch_id = tl.program_id(axis=0)
     head_id = tl.program_id(axis=1)
@@ -739,42 +743,44 @@ def _flash_decode_stage2_kernel(
     if hd_start >= HEAD_DIM:
         return
 
-    # Find global maximum LSE across all splits (scalar reads, cheap)
-    global_max_lse = float("-inf")
+    # Iter 20: hoist batch/head base offsets outside the split loop.
+    plse_head_base = batch_id * plse_stride_batch + head_id * plse_stride_head
+    po_head_base = batch_id * po_stride_batch + head_id * po_stride_head
+    o_offset = batch_id * o_stride_batch + head_id * o_stride_head + dhead_offsets
+
+    # Iter 20: one-pass online combination.
+    # Maintains running (m_i, l_i, acc) updated flash-attention style.
+    # Replaces prior two-pass: pass1 = find max LSE, pass2 = weighted sum.
+    # Saves NUM_SPLITS scalar reads of partial_lse_ptr and the first loop.
+    m_i = float("-inf")  # running max LSE
+    l_i = 0.0  # running softmax denominator
+    acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
+
     for split_id in range(NUM_SPLITS):
-        plse_offset = (
-            batch_id * plse_stride_batch + head_id * plse_stride_head + split_id * plse_stride_split
+        lse = tl.load(partial_lse_ptr + plse_head_base + split_id * plse_stride_split)
+        m_i_new = tl.maximum(m_i, lse)
+
+        # Guard against NaN when m_i == m_i_new == -inf (all splits inactive so far)
+        alpha = tl.where(m_i > float("-inf"), tl.exp(m_i - m_i_new), 0.0)
+        weight = tl.where(m_i_new > float("-inf"), tl.exp(lse - m_i_new), 0.0)
+
+        partial_o = tl.load(
+            partial_o_ptr + po_head_base + split_id * po_stride_split + dhead_offsets,
+            mask=head_dim_mask,
+            other=0.0,
         )
-        lse = tl.load(partial_lse_ptr + plse_offset)
-        global_max_lse = tl.maximum(global_max_lse, lse)
+        acc = acc * alpha + weight * partial_o
+        l_i = l_i * alpha + weight
+        m_i = m_i_new
 
     # Guard: if all splits had -inf LSE (empty sequence), output zeros
-    o_offset = batch_id * o_stride_batch + head_id * o_stride_head + dhead_offsets
-    if global_max_lse == float("-inf"):
+    if m_i == float("-inf"):
         tl.store(o_ptr + o_offset, tl.zeros([BLOCK_HD], dtype=tl.float32), mask=head_dim_mask)
         return
 
-    # Weighted combination over this BLOCK_HD slice
-    acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
-    total_weight = 0.0
-
-    for split_id in range(NUM_SPLITS):
-        plse_offset = (
-            batch_id * plse_stride_batch + head_id * plse_stride_head + split_id * plse_stride_split
-        )
-        lse = tl.load(partial_lse_ptr + plse_offset)
-        weight = tl.exp(lse - global_max_lse)
-
-        po_base = batch_id * po_stride_batch + head_id * po_stride_head + split_id * po_stride_split
-        partial_o = tl.load(partial_o_ptr + po_base + dhead_offsets, mask=head_dim_mask, other=0.0)
-
-        acc += weight * partial_o
-        total_weight += weight
-
     # Normalize and store
-    total_weight = tl.where(total_weight == 0.0, 1.0, total_weight)
-    o = acc / total_weight
-    tl.store(o_ptr + o_offset, o, mask=head_dim_mask)
+    l_i = tl.where(l_i == 0.0, 1.0, l_i)
+    tl.store(o_ptr + o_offset, acc / l_i, mask=head_dim_mask)
 
 
 def triton_paged_decode(
