@@ -440,17 +440,28 @@ def _flash_decode_stage2_kernel(
     HEAD_DIM: tl.constexpr,
     HEAD_DIM_PADDED: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
 ):
-    """
-    Each program combines results from all splits for one (batch, head) pair.
+    """Combine partial outputs from all splits for one (batch, head, hd_block) triple.
+
+    Grid axis 2 tiles HEAD_DIM into BLOCK_HD-element chunks, giving more SM parallelism
+    vs the original (batch, n_heads) 2D grid. Each program still reads all NUM_SPLITS
+    LSE scalars (cheap) and its BLOCK_HD slice of each split's partial output.
     """
     batch_id = tl.program_id(axis=0)
     head_id = tl.program_id(axis=1)
+    hd_block_id = tl.program_id(axis=2)
 
-    dhead_offsets = tl.arange(0, HEAD_DIM_PADDED)
+    # This tile's head_dim range
+    hd_start = hd_block_id * BLOCK_HD
+    dhead_offsets = hd_start + tl.arange(0, BLOCK_HD)
     head_dim_mask = dhead_offsets < HEAD_DIM
 
-    # Find global maximum LSE across splits for numerical stability
+    # Early exit: entire tile is padding (only happens when HEAD_DIM_PADDED > HEAD_DIM)
+    if hd_start >= HEAD_DIM:
+        return
+
+    # Find global maximum LSE across all splits (scalar reads, cheap)
     global_max_lse = float("-inf")
     for split_id in range(NUM_SPLITS):
         plse_offset = (
@@ -462,13 +473,11 @@ def _flash_decode_stage2_kernel(
     # Guard: if all splits had -inf LSE (empty sequence), output zeros
     o_offset = batch_id * o_stride_batch + head_id * o_stride_head + dhead_offsets
     if global_max_lse == float("-inf"):
-        tl.store(
-            o_ptr + o_offset, tl.zeros([HEAD_DIM_PADDED], dtype=tl.float32), mask=head_dim_mask
-        )
+        tl.store(o_ptr + o_offset, tl.zeros([BLOCK_HD], dtype=tl.float32), mask=head_dim_mask)
         return
 
-    # Weighted combination: weight_i = exp(lse_i - global_max)
-    acc = tl.zeros([HEAD_DIM_PADDED], dtype=tl.float32)
+    # Weighted combination over this BLOCK_HD slice
+    acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
     total_weight = 0.0
 
     for split_id in range(NUM_SPLITS):
@@ -590,8 +599,12 @@ def triton_paged_decode(
         SLIDING_WINDOW=sw,
     )
 
-    # Stage 2: Combine partial results
-    _flash_decode_stage2_kernel[(batch_size, n_heads)](
+    # Stage 2: Combine partial results — tiled over HEAD_DIM for more SM parallelism.
+    # BLOCK_HD=64 gives 4 programs per (batch, head), up to 4× more parallelism than
+    # the original 2D (batch, n_heads) grid for models with large head_dim.
+    s2_block_hd = 64
+    n_hd_blocks = triton.cdiv(head_dim_padded, s2_block_hd)
+    _flash_decode_stage2_kernel[(batch_size, n_heads, n_hd_blocks)](
         partial_o,
         partial_lse,
         output,
@@ -610,6 +623,7 @@ def triton_paged_decode(
         HEAD_DIM=head_dim,
         HEAD_DIM_PADDED=head_dim_padded,
         NUM_SPLITS=num_splits,
+        BLOCK_HD=s2_block_hd,
     )
 
     return output

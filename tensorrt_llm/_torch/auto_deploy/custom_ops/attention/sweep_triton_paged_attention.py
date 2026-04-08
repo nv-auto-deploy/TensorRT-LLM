@@ -75,23 +75,47 @@ DEVICE = "cuda"
 # ---------------------------------------------------------------------------
 
 # Decode shapes — (id, batch, n_heads, n_kv_heads, head_dim, page_size, seq_len, sliding_window)
+# Covers full batch sweep 1..384 (powers of 2 + 384) at practical serving seq lengths.
 DECODE_SHAPES = [
-    ("D1", 1, 16, 8, 176, 16, 128, 0),
-    ("D2", 1, 16, 8, 176, 16, 512, 0),
-    ("D3", 1, 16, 8, 176, 16, 1024, 1024),
-    ("D4", 1, 16, 8, 176, 16, 2048, 0),
-    ("D5", 8, 16, 8, 176, 16, 512, 0),
-    ("D6", 8, 16, 8, 176, 16, 1024, 1024),
-    ("D7", 32, 16, 8, 176, 16, 512, 0),
-    ("D8", 64, 16, 8, 176, 16, 512, 1024),
+    # Batch sweep at seq=512 full attention (representative decode step)
+    ("D1", 1, 16, 8, 176, 16, 512, 0),
+    ("D2", 2, 16, 8, 176, 16, 512, 0),
+    ("D3", 4, 16, 8, 176, 16, 512, 0),
+    ("D4", 8, 16, 8, 176, 16, 512, 0),
+    ("D5", 16, 16, 8, 176, 16, 512, 0),
+    ("D6", 32, 16, 8, 176, 16, 512, 0),
+    ("D7", 64, 16, 8, 176, 16, 512, 0),
+    ("D8", 128, 16, 8, 176, 16, 512, 0),
+    ("D9", 256, 16, 8, 176, 16, 512, 0),
+    ("D10", 384, 16, 8, 176, 16, 512, 0),
+    # Batch sweep at seq=1024 SW=1024 (24 sliding-window layers in Gemma-4)
+    ("S1", 1, 16, 8, 176, 16, 1024, 1024),
+    ("S2", 8, 16, 8, 176, 16, 1024, 1024),
+    ("S3", 32, 16, 8, 176, 16, 1024, 1024),
+    ("S4", 128, 16, 8, 176, 16, 1024, 1024),
+    ("S5", 384, 16, 8, 176, 16, 1024, 1024),
+    # Long context full attention (6 full-attn layers in Gemma-4)
+    ("L1", 1, 16, 8, 176, 16, 2048, 0),
+    ("L2", 8, 16, 8, 176, 16, 2048, 0),
+    ("L3", 1, 16, 8, 176, 16, 8192, 0),
+    ("L4", 8, 16, 8, 176, 16, 8192, 0),
 ]
 
 # Context/prefill shapes (Triton paged path, q_len < 512)
 # columns: (id, batch, n_heads, n_kv_heads, head_dim, page_size, q_len, kv_len)
+# kv_len > q_len tests chunked prefill (cache already populated).
 CONTEXT_SHAPES = [
+    # Pure prefill (no cache)
     ("P1", 1, 16, 8, 176, 16, 64, 64),
     ("P2", 1, 16, 8, 176, 16, 256, 256),
     ("P3", 4, 16, 8, 176, 16, 128, 128),
+    # Chunked prefill: q_len=128 chunk with large existing cache
+    ("C1", 1, 16, 8, 176, 16, 128, 512),
+    ("C2", 1, 16, 8, 176, 16, 128, 1024),
+    ("C3", 4, 16, 8, 176, 16, 128, 512),
+    ("C4", 4, 16, 8, 176, 16, 256, 2048),
+    # SW chunked prefill
+    ("CS1", 1, 16, 8, 176, 16, 128, 512),
 ]
 
 # Gather+SDPA shapes (q_len >= 512) — (id, batch, n_heads, n_kv_heads, head_dim, page_size, q_len)
@@ -293,8 +317,12 @@ def bench_decode_stage2(
     partial_lse = torch.randn(batch, n_heads, num_splits, dtype=torch.float32, device=DEVICE)
     output = torch.empty(batch, n_heads, head_dim, dtype=torch.float32, device=DEVICE)
 
+    head_dim_padded = triton.next_power_of_2(head_dim)
+    s2_block_hd = 64
+    n_hd_blocks = triton.cdiv(head_dim_padded, s2_block_hd)
+
     def fn():
-        _flash_decode_stage2_kernel[(batch, n_heads)](
+        _flash_decode_stage2_kernel[(batch, n_heads, n_hd_blocks)](
             partial_o,
             partial_lse,
             output,
@@ -307,8 +335,9 @@ def bench_decode_stage2(
             output.stride(0),
             output.stride(1),
             HEAD_DIM=head_dim,
-            HEAD_DIM_PADDED=triton.next_power_of_2(head_dim),
+            HEAD_DIM_PADDED=head_dim_padded,
             NUM_SPLITS=num_splits,
+            BLOCK_HD=s2_block_hd,
         )
 
     ms = triton.testing.do_bench(fn, warmup=25, rep=100)
