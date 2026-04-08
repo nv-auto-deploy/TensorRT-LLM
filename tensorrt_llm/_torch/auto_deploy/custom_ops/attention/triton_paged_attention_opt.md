@@ -430,6 +430,25 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+### Iteration 12 — Add SLIDING_WINDOW to context kernel autotune key
+
+**What changed:**
+
+- Added `SLIDING_WINDOW` to context kernel autotune key. SW shapes (Gemma-4 has 24 SW layers + 6 full) use a different code path (extra per-token masking, different phase1/phase2 balance) and may benefit from different configs.
+
+**Correctness:** PASS (132/132)
+
+**Results:** No measurable change; all shapes within noise of iter 8 baseline:
+
+- C1: 50.68 μs (baseline 50.76, flat)
+- CS1: 50.96 μs (was ~50.78, flat)
+
+**Analysis:** The autotune selected the same optimal config for both SW and non-SW shapes at these shapes. The key addition is correct (prevents overfitting one config across two different code paths) but provides no measurable speedup. Kept as a correctness improvement.
+
+**Commit:** see git log
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space
