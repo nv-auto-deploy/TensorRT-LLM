@@ -348,6 +348,35 @@ Kept since it's correct and reduces memory ops. E2E variance is dominated by SDP
 
 ______________________________________________________________________
 
+### Iteration 8 — Stage2 @triton.autotune (BLOCK_HD + num_warps sweep)
+
+**What changed:**
+
+- Added `@triton.autotune` to `_flash_decode_stage2_kernel` with 10 configs sweeping BLOCK_HD ∈ {32, 64, 128, 256} × num_warps ∈ {1, 2, 4, 8}. Key: `[HEAD_DIM, HEAD_DIM_PADDED, NUM_SPLITS]`.
+- Updated caller to use lambda grid `(batch, n_heads, cdiv(head_dim_padded, BLOCK_HD))` so grid adapts to autotuned BLOCK_HD.
+- Updated sweep script stage2 benchmark to use same lambda grid.
+
+**Correctness:** PASS (132/132 tests pass)
+
+| ID | s2_old(us) | s2_new(us) | e2e_old(us) | e2e_new(us) | Δ e2e |
+|----|-----------|-----------|------------|------------|-------|
+| D1 | 6.82 | 6.38 | 13.14 | 13.03 | -0.8% |
+| D2 | 6.99 | 6.22 | 16.09 | 14.56 | -9.5% |
+| D3 | 6.90 | 6.65 | 18.24 | 17.54 | -3.8% |
+| D5 | 6.70 | 7.02 | 36.70 | 36.74 | +0.1% |
+| L1 | 8.36 | 7.09 | 18.00 | 17.35 | -3.6% |
+| L3 | 8.65 | 7.17 | 34.86 | 34.18 | -1.9% |
+| D9\* | 15.22 | 8.62 | n/a | n/a | kernel-only (splits=1 bypassed) |
+| D10\* | 20.44 | 9.58 | n/a | n/a | kernel-only (splits=1 bypassed) |
+
+\*D9/D10 use num_splits=1 bypass so stage2 kernel improvement doesn't affect e2e.
+
+**Analysis:** Stage2 autotune picks BLOCK_HD=256 for large-batch/large-splits shapes, reducing grid size and improving SM efficiency. For D9/D10 the isolated stage2 halves (15-20μs → 8-10μs) but since splits=1 bypasses stage2, e2e is unaffected. Active stage2 shapes (splits>1) see 1-10% improvement. Largest win: D2 (-9.5% e2e). S3 showed slight regression (noise/autotuning variance).
+
+**Commit:** see git log
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space

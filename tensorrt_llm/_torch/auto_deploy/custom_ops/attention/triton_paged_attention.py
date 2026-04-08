@@ -649,6 +649,22 @@ def _flash_decode_stage1_two_chunk_kernel(
     tl.store(partial_lse_ptr + plse_offsets, m_i + tl.log(l_i_safe), mask=head_mask)
 
 
+@triton.autotune(
+    configs=[
+        # Iter 8: sweep BLOCK_HD and num_warps for stage2
+        triton.Config({"BLOCK_HD": 32}, num_warps=1, num_stages=1),
+        triton.Config({"BLOCK_HD": 32}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_HD": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_HD": 64}, num_warps=1, num_stages=1),
+        triton.Config({"BLOCK_HD": 64}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_HD": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_HD": 128}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_HD": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_HD": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_HD": 256}, num_warps=8, num_stages=1),
+    ],
+    key=["HEAD_DIM", "HEAD_DIM_PADDED", "NUM_SPLITS"],
+)
 @triton.jit
 def _flash_decode_stage2_kernel(
     # Partial results
@@ -860,11 +876,10 @@ def triton_paged_decode(
         output.copy_(partial_o.squeeze(2))
     else:
         # Stage 2: Combine partial results — tiled over HEAD_DIM for more SM parallelism.
-        # BLOCK_HD=64 gives 4 programs per (batch, head), up to 4× more parallelism than
-        # the original 2D (batch, n_heads) grid for models with large head_dim.
-        s2_block_hd = 64
-        n_hd_blocks = triton.cdiv(head_dim_padded, s2_block_hd)
-        _flash_decode_stage2_kernel[(batch_size, n_heads, n_hd_blocks)](
+        # BLOCK_HD is autotuned; use lambda grid so it adapts to the chosen config.
+        _flash_decode_stage2_kernel[
+            lambda meta: (batch_size, n_heads, triton.cdiv(head_dim_padded, meta["BLOCK_HD"]))
+        ](
             partial_o,
             partial_lse,
             output,
@@ -883,7 +898,6 @@ def triton_paged_decode(
             HEAD_DIM=head_dim,
             HEAD_DIM_PADDED=head_dim_padded,
             NUM_SPLITS=num_splits,
-            BLOCK_HD=s2_block_hd,
         )
 
     return output

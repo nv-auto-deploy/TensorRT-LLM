@@ -344,11 +344,11 @@ def bench_decode_stage2(
     output = torch.empty(batch, n_heads, head_dim, dtype=torch.float32, device=DEVICE)
 
     head_dim_padded = triton.next_power_of_2(head_dim)
-    s2_block_hd = 64
-    n_hd_blocks = triton.cdiv(head_dim_padded, s2_block_hd)
 
     def fn():
-        _flash_decode_stage2_kernel[(batch, n_heads, n_hd_blocks)](
+        _flash_decode_stage2_kernel[
+            lambda meta: (batch, n_heads, triton.cdiv(head_dim_padded, meta["BLOCK_HD"]))
+        ](
             partial_o,
             partial_lse,
             output,
@@ -363,7 +363,6 @@ def bench_decode_stage2(
             HEAD_DIM=head_dim,
             HEAD_DIM_PADDED=head_dim_padded,
             NUM_SPLITS=num_splits,
-            BLOCK_HD=s2_block_hd,
         )
 
     ms = triton.testing.do_bench(fn, warmup=25, rep=100)
