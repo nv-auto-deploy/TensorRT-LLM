@@ -289,6 +289,36 @@ Root cause: stage2 serial loop over splits is O(num_splits) per program, and sta
 
 ______________________________________________________________________
 
+### Iteration 6 — Two-chunk head_dim for stage1 (non-power-of-2 HEAD_DIM)
+
+**What changed:**
+
+- Added `_flash_decode_stage1_two_chunk_kernel`: splits head_dim=176 into two chunks (CHUNK1=128, CHUNK2=64), avoiding HEAD_DIM_PADDED=256 padding waste. For head_dim=176: loads 192 elements (128+64) vs 256, saving 25% bandwidth per KV load.
+- Launcher `triton_paged_decode` dispatches to two-chunk kernel when `head_dim_padded != head_dim`.
+- Updated `bench_decode_stage1` to benchmark the correct kernel variant.
+
+**Correctness:** PASS (132/132 tests pass; two-chunk dispatches correctly for head_dim=176)
+
+| ID | B | SL | splits | s1_old(us) | s1_twochunk(us) | e2e_old(us) | e2e_new(us) | Δ |
+|----|---|----|----|--------|--------|---------|---------|-------|
+| D1 | 1 | 512 | 16 | 9.72 | 9.91 | 12.87 | 12.87 | 0% |
+| D5 | 16 | 512 | 8 | 31.84 | 33.04 | 35.26 | 36.40 | +3% worse |
+| D7 | 64 | 512 | 1 | 81.76 | 81.35 | 84.69 | 84.21 | -0.6% |
+| D10 | 384 | 512 | 1 | 405.42 | 402.41 | 409.87 | 406.76 | -0.8% |
+| L1 | 1 | 2048 | 32 | 13.85 | 13.80 | 17.90 | 17.72 | -1.0% |
+| L3 | 1 | 8192 | 32 | 30.75 | 30.48 | 34.78 | 34.63 | -0.4% |
+
+**Analysis:** Mixed results. Large-batch BW-bound shapes (D7-D10): +0.6-0.8% improvement. Small-page-count shapes (D5, 4 pages/split): +3% regression from two extra dot products per page iteration. The two-chunk approach reduces theoretical KV bandwidth by 25% (192 vs 256 elements) but the benefit is small because:
+
+1. Tensor core overhead of 4 dots vs 2 adds latency for short loops
+1. Software pipelining (num_stages) may be less effective with two separate loads per page
+
+Net: kept since large-batch (primary serving bottleneck) marginally improves, and the kernel is correct.
+
+**Commit:** see git log
+
+______________________________________________________________________
+
 ## 4. Optimization Ideas Backlog
 
 ### Category A — Decode Stage1 Autotune Space

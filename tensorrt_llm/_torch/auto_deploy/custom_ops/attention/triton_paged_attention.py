@@ -421,6 +421,234 @@ def _flash_decode_stage1_kernel(
     tl.store(partial_lse_ptr + plse_offsets, lse_val, mask=head_mask)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=2, num_stages=2),
+        triton.Config({}, num_warps=2, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=1, num_stages=2),
+        triton.Config({}, num_warps=1, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=4),
+        triton.Config({}, num_warps=4, num_stages=5),
+        triton.Config({}, num_warps=8, num_stages=4),
+        triton.Config({}, num_warps=8, num_stages=5),
+        triton.Config({}, num_warps=16, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=3),
+        triton.Config({}, num_warps=16, num_stages=4),
+    ],
+    key=["HEAD_DIM", "HD_CHUNK1", "HD_CHUNK2", "PAGE_SIZE", "HEAD_RATIO_PADDED", "SLIDING_WINDOW"],
+)
+@triton.jit
+def _flash_decode_stage1_two_chunk_kernel(
+    # Query input
+    q_ptr,
+    # KV cache (combined)
+    kv_cache_ptr,
+    # Page table
+    kv_indices_ptr,
+    kv_indptr_ptr,
+    kv_last_page_len_ptr,
+    # Intermediate outputs
+    partial_o_ptr,
+    partial_lse_ptr,
+    # Q strides: [batch, n_heads, head_dim]
+    q_stride_batch: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    # Partial output strides: [batch, n_heads, num_splits, head_dim]
+    po_stride_batch: tl.constexpr,
+    po_stride_head: tl.constexpr,
+    po_stride_split: tl.constexpr,
+    # Partial LSE strides: [batch, n_heads, num_splits]
+    plse_stride_batch: tl.constexpr,
+    plse_stride_head: tl.constexpr,
+    plse_stride_split: tl.constexpr,
+    # Cache strides: [num_blocks, 2, n_kv_heads, page_size, head_dim]
+    cache_stride_block: tl.constexpr,
+    cache_stride_kv: tl.constexpr,
+    cache_stride_head: tl.constexpr,
+    cache_stride_token: tl.constexpr,
+    # Constants
+    SM_SCALE: tl.constexpr,
+    N_HEADS: tl.constexpr,
+    N_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_RATIO: tl.constexpr,
+    HEAD_RATIO_PADDED: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    HD_CHUNK1: tl.constexpr,  # First chunk size (power-of-2, covers indices 0..HD_CHUNK1-1)
+    HD_CHUNK2: tl.constexpr,  # Second chunk size (power-of-2, covers HD_CHUNK1..HD_CHUNK1+HD_CHUNK2-1)
+    SLIDING_WINDOW: tl.constexpr = 0,
+):
+    """Two-chunk stage1 for non-power-of-2 head_dim (e.g. 176 = 128 + 64).
+
+    Splits head_dim into two power-of-2 chunks so Triton tl.dot and tl.arange
+    work without padding. For head_dim=176: HD_CHUNK1=128, HD_CHUNK2=64 covers
+    indices 0..191, with masking for 176..191 in chunk2.
+    Saves 25% KV bandwidth vs HEAD_DIM_PADDED=256 approach.
+    """
+    batch_id = tl.program_id(axis=0)
+    kv_head_id = tl.program_id(axis=1)
+    split_id = tl.program_id(axis=2)
+
+    kv_page_start = tl.load(kv_indptr_ptr + batch_id)
+    kv_page_end = tl.load(kv_indptr_ptr + batch_id + 1)
+    num_pages = kv_page_end - kv_page_start
+    last_page_len = tl.load(kv_last_page_len_ptr + batch_id)
+
+    seq_len = (num_pages - 1) * PAGE_SIZE + last_page_len
+    if SLIDING_WINDOW > 0:
+        first_valid_pos = tl.maximum(0, seq_len - SLIDING_WINDOW)
+        first_window_page = first_valid_pos // PAGE_SIZE
+    else:
+        first_valid_pos = 0
+        first_window_page = 0
+
+    window_pages = num_pages - first_window_page
+    pages_per_split = (window_pages + NUM_SPLITS - 1) // NUM_SPLITS
+    page_split_start = first_window_page + split_id * pages_per_split
+    page_split_end = tl.minimum(page_split_start + pages_per_split, num_pages)
+
+    # Head-dim chunk offsets and mask for chunk2 (chunk1 is fully valid)
+    dhead_c1 = tl.arange(0, HD_CHUNK1)  # indices 0..HD_CHUNK1-1 (all valid)
+    dhead_c2 = HD_CHUNK1 + tl.arange(0, HD_CHUNK2)  # indices HD_CHUNK1..HD_CHUNK1+HD_CHUNK2-1
+    head_dim_mask_c2 = dhead_c2 < HEAD_DIM  # mask out padding in chunk2
+
+    head_local = tl.arange(0, HEAD_RATIO_PADDED)
+    head_ids = kv_head_id * HEAD_RATIO + head_local
+    head_mask = head_local < HEAD_RATIO
+
+    if page_split_start >= num_pages:
+        # Inactive split: store zeros + -inf LSE
+        po_base = (
+            batch_id * po_stride_batch
+            + head_ids[:, None] * po_stride_head
+            + split_id * po_stride_split
+        )
+        tl.store(
+            partial_o_ptr + po_base + dhead_c1[None, :],
+            tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK1], dtype=tl.float32),
+            mask=head_mask[:, None],
+        )
+        tl.store(
+            partial_o_ptr + po_base + dhead_c2[None, :],
+            tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK2], dtype=tl.float32),
+            mask=head_mask[:, None] & head_dim_mask_c2[None, :],
+        )
+        plse_offsets = (
+            batch_id * plse_stride_batch
+            + head_ids * plse_stride_head
+            + split_id * plse_stride_split
+        )
+        tl.store(
+            partial_lse_ptr + plse_offsets,
+            tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf"),
+            mask=head_mask,
+        )
+        return
+
+    # Load Q in two chunks: [HEAD_RATIO_PADDED, HD_CHUNK1] and [HEAD_RATIO_PADDED, HD_CHUNK2]
+    q_base = batch_id * q_stride_batch + head_ids[:, None] * q_stride_head
+    q_c1 = tl.load(q_ptr + q_base + dhead_c1[None, :], mask=head_mask[:, None], other=0.0)
+    q_c2 = tl.load(
+        q_ptr + q_base + dhead_c2[None, :],
+        mask=head_mask[:, None] & head_dim_mask_c2[None, :],
+        other=0.0,
+    )
+
+    # Per-chunk accumulators
+    acc_c1 = tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK1], dtype=tl.float32)
+    acc_c2 = tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK2], dtype=tl.float32)
+    m_i = tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf")
+    l_i = tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32)
+
+    page_offsets = tl.arange(0, PAGE_SIZE)
+    num_pages_this_split = page_split_end - page_split_start
+
+    for local_page_idx in range(num_pages_this_split):
+        page_idx = page_split_start + local_page_idx
+        physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+
+        is_last_page_of_seq = page_idx == (num_pages - 1)
+        valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
+        page_mask = page_offsets < valid_tokens
+
+        # Cache base for this page (int64 to avoid overflow)
+        cache_page_base = (
+            physical_page.to(tl.int64) * cache_stride_block
+            + kv_head_id * cache_stride_head
+            + page_offsets[:, None] * cache_stride_token
+        )
+
+        # Load K in two chunks: [PAGE_SIZE, HD_CHUNK1] and [PAGE_SIZE, HD_CHUNK2]
+        k_c1 = tl.load(
+            kv_cache_ptr + cache_page_base + dhead_c1[None, :],
+            mask=page_mask[:, None],
+            other=0.0,
+        )
+        k_c2 = tl.load(
+            kv_cache_ptr + cache_page_base + dhead_c2[None, :],
+            mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+            other=0.0,
+        )
+
+        # QK: sum contributions from both chunks → [HEAD_RATIO_PADDED, PAGE_SIZE]
+        attn = (tl.dot(q_c1, tl.trans(k_c1)) + tl.dot(q_c2, tl.trans(k_c2))) * SM_SCALE
+
+        if SLIDING_WINDOW > 0:
+            global_pos = page_idx * PAGE_SIZE + page_offsets
+            window_mask = global_pos >= first_valid_pos
+            attn = tl.where(page_mask[None, :] & window_mask[None, :], attn, float("-inf"))
+        else:
+            attn = tl.where(page_mask[None, :], attn, float("-inf"))
+
+        m_ij = tl.max(attn, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_i_new)
+        p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO_PADDED, PAGE_SIZE]
+
+        # Load V in two chunks
+        v_c1 = tl.load(
+            kv_cache_ptr + cache_page_base + cache_stride_kv + dhead_c1[None, :],
+            mask=page_mask[:, None],
+            other=0.0,
+        )
+        v_c2 = tl.load(
+            kv_cache_ptr + cache_page_base + cache_stride_kv + dhead_c2[None, :],
+            mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+            other=0.0,
+        )
+
+        # PV: update per-chunk accumulators
+        acc_c1 = tl.dot(p.to(v_c1.dtype), v_c1, acc=acc_c1 * alpha[:, None])
+        acc_c2 = tl.dot(p.to(v_c2.dtype), v_c2, acc=acc_c2 * alpha[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_i_new
+
+    # Normalize and store in two chunks
+    l_i_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    po_base = (
+        batch_id * po_stride_batch + head_ids[:, None] * po_stride_head + split_id * po_stride_split
+    )
+    tl.store(
+        partial_o_ptr + po_base + dhead_c1[None, :],
+        acc_c1 / l_i_safe[:, None],
+        mask=head_mask[:, None],
+    )
+    tl.store(
+        partial_o_ptr + po_base + dhead_c2[None, :],
+        acc_c2 / l_i_safe[:, None],
+        mask=head_mask[:, None] & head_dim_mask_c2[None, :],
+    )
+    plse_offsets = (
+        batch_id * plse_stride_batch + head_ids * plse_stride_head + split_id * plse_stride_split
+    )
+    tl.store(partial_lse_ptr + plse_offsets, m_i + tl.log(l_i_safe), mask=head_mask)
+
+
 @triton.jit
 def _flash_decode_stage2_kernel(
     # Partial results
@@ -564,8 +792,11 @@ def triton_paged_decode(
         device=q.device,
     )
 
-    # Stage 1: GQA-batched parallel KV processing
-    _flash_decode_stage1_kernel[(batch_size, n_kv_heads, num_splits)](
+    # Stage 1: GQA-batched parallel KV processing.
+    # For non-power-of-2 head_dim, use the two-chunk kernel which splits head_dim into
+    # two power-of-2 chunks (e.g. 176 = 128 + 64), reducing KV bandwidth by 25% vs
+    # the HEAD_DIM_PADDED=256 approach.
+    stage1_common_args = (
         q,
         kv_cache,
         kv_indices,
@@ -573,34 +804,54 @@ def triton_paged_decode(
         kv_last_page_len,
         partial_o,
         partial_lse,
-        # Q strides
         q.stride(0),
         q.stride(1),
-        # Partial output strides
         partial_o.stride(0),
         partial_o.stride(1),
         partial_o.stride(2),
-        # Partial LSE strides
         partial_lse.stride(0),
         partial_lse.stride(1),
         partial_lse.stride(2),
-        # Cache strides
         kv_cache.stride(0),
         kv_cache.stride(1),
         kv_cache.stride(2),
         kv_cache.stride(3),
-        # Constants
+    )
+    stage1_common_kwargs = dict(
         SM_SCALE=sm_scale,
         N_HEADS=n_heads,
         N_KV_HEADS=n_kv_heads,
         HEAD_DIM=head_dim,
-        HEAD_DIM_PADDED=head_dim_padded,
         PAGE_SIZE=page_size,
         HEAD_RATIO=head_ratio,
         HEAD_RATIO_PADDED=head_ratio_padded,
         NUM_SPLITS=num_splits,
         SLIDING_WINDOW=sw,
     )
+
+    if head_dim_padded == head_dim:
+        # Power-of-2 head_dim: use original kernel (no padding waste)
+        _flash_decode_stage1_kernel[(batch_size, n_kv_heads, num_splits)](
+            *stage1_common_args,
+            HEAD_DIM_PADDED=head_dim_padded,
+            **stage1_common_kwargs,
+        )
+    else:
+        # Non-power-of-2 head_dim: two-chunk kernel for ~25% bandwidth savings.
+        # Split head_dim into two power-of-2 chunks: e.g. head_dim=176 → 128 + 64.
+        # Chunk2 is padded to the next power-of-2 >= (head_dim - chunk1); padding masked out.
+        hd_chunk1 = (
+            head_dim_padded // 2
+        )  # Largest power-of-2 that fits in head_dim (< head_dim_padded)
+        hd_chunk2 = triton.next_power_of_2(
+            head_dim - hd_chunk1
+        )  # Covers remainder with minimal padding
+        _flash_decode_stage1_two_chunk_kernel[(batch_size, n_kv_heads, num_splits)](
+            *stage1_common_args,
+            HD_CHUNK1=hd_chunk1,
+            HD_CHUNK2=hd_chunk2,
+            **stage1_common_kwargs,
+        )
 
     if num_splits == 1:
         # Skip stage2: partial_o[:, :, 0, :] already holds the normalized output.

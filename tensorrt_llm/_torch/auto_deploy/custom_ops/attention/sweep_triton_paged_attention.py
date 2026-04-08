@@ -59,6 +59,7 @@ if _REPO_ROOT not in sys.path:
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (  # noqa: E402
     _fast_gather_sdpa_kernel,
     _flash_decode_stage1_kernel,
+    _flash_decode_stage1_two_chunk_kernel,
     _flash_decode_stage2_kernel,
     _get_num_splits,
     _paged_context_kernel,
@@ -245,7 +246,10 @@ def bench_decode_stage1(
     num_warps_override=None,
     num_stages_override=None,
 ) -> Tuple[float, float, int]:
-    """Benchmark _flash_decode_stage1_kernel. Returns (stage1_us, num_splits)."""
+    """Benchmark stage1 kernel (dispatches to two-chunk for non-power-of-2 head_dim).
+
+    Returns (stage1_us, num_splits).
+    """
     q, kv_cache, kv_indices, kv_indptr, kv_last_page_len, sm_scale, sw = make_decode_inputs(
         batch, n_heads, n_kv_heads, head_dim, page_size, seq_len, sw_val or 0
     )
@@ -254,6 +258,7 @@ def bench_decode_stage1(
     effective_seq = min(seq_len, sw_val) if sw_val and sw_val > 0 else seq_len
     num_splits = _get_num_splits(effective_seq, batch, n_kv_heads, page_size)
     sw_kernel = sw_val if sw_val and sw_val > 0 else 0
+    head_dim_padded = triton.next_power_of_2(head_dim)
 
     partial_o = torch.empty(
         batch, n_heads, num_splits, head_dim, dtype=torch.float32, device=DEVICE
@@ -266,39 +271,60 @@ def bench_decode_stage1(
     if num_stages_override is not None:
         extra_kwargs["num_stages"] = num_stages_override
 
-    def fn():
-        _flash_decode_stage1_kernel[(batch, n_kv_heads, num_splits)](
-            q,
-            kv_cache,
-            kv_indices,
-            kv_indptr,
-            kv_last_page_len,
-            partial_o,
-            partial_lse,
-            q.stride(0),
-            q.stride(1),
-            partial_o.stride(0),
-            partial_o.stride(1),
-            partial_o.stride(2),
-            partial_lse.stride(0),
-            partial_lse.stride(1),
-            partial_lse.stride(2),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
-            kv_cache.stride(3),
-            SM_SCALE=sm_scale,
-            N_HEADS=n_heads,
-            N_KV_HEADS=n_kv_heads,
-            HEAD_DIM=head_dim,
-            HEAD_DIM_PADDED=triton.next_power_of_2(head_dim),
-            PAGE_SIZE=page_size,
-            HEAD_RATIO=head_ratio,
-            HEAD_RATIO_PADDED=head_ratio_padded,
-            NUM_SPLITS=num_splits,
-            SLIDING_WINDOW=sw_kernel,
-            **extra_kwargs,
-        )
+    common_args = (
+        q,
+        kv_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+        partial_o,
+        partial_lse,
+        q.stride(0),
+        q.stride(1),
+        partial_o.stride(0),
+        partial_o.stride(1),
+        partial_o.stride(2),
+        partial_lse.stride(0),
+        partial_lse.stride(1),
+        partial_lse.stride(2),
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        kv_cache.stride(3),
+    )
+    common_kwargs = dict(
+        SM_SCALE=sm_scale,
+        N_HEADS=n_heads,
+        N_KV_HEADS=n_kv_heads,
+        HEAD_DIM=head_dim,
+        PAGE_SIZE=page_size,
+        HEAD_RATIO=head_ratio,
+        HEAD_RATIO_PADDED=head_ratio_padded,
+        NUM_SPLITS=num_splits,
+        SLIDING_WINDOW=sw_kernel,
+        **extra_kwargs,
+    )
+
+    if head_dim_padded == head_dim:
+
+        def fn():
+            _flash_decode_stage1_kernel[(batch, n_kv_heads, num_splits)](
+                *common_args,
+                HEAD_DIM_PADDED=head_dim_padded,
+                **common_kwargs,
+            )
+
+    else:
+        hd_chunk1 = head_dim_padded // 2
+        hd_chunk2 = triton.next_power_of_2(head_dim - hd_chunk1)
+
+        def fn():
+            _flash_decode_stage1_two_chunk_kernel[(batch, n_kv_heads, num_splits)](
+                *common_args,
+                HD_CHUNK1=hd_chunk1,
+                HD_CHUNK2=hd_chunk2,
+                **common_kwargs,
+            )
 
     ms = triton.testing.do_bench(fn, warmup=25, rep=100)
     return ms * 1000.0, num_splits
