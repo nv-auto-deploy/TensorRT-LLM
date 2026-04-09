@@ -591,7 +591,7 @@ class Gemma4TextDecoderLayer(nn.Module):
             hidden_states,
             residual,
             self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.variance_epsilon,
+            self.post_attention_layernorm.eps,
         )
 
         # Feed-forward (dense MLP ± MoE)
@@ -604,7 +604,7 @@ class Gemma4TextDecoderLayer(nn.Module):
                 hs_flat,
                 self.pre_feedforward_layernorm.weight,
                 self.pre_feedforward_layernorm_2.weight,
-                self.pre_feedforward_layernorm.variance_epsilon,
+                self.pre_feedforward_layernorm.eps,
             )
             hs_dense = self.mlp(hs_dense_input.reshape(hidden_states.shape))
 
@@ -619,7 +619,7 @@ class Gemma4TextDecoderLayer(nn.Module):
                 hs_moe,
                 self.post_feedforward_layernorm_1.weight,
                 self.post_feedforward_layernorm_2.weight,
-                self.post_feedforward_layernorm_1.variance_epsilon,
+                self.post_feedforward_layernorm_1.eps,
             ).reshape(hidden_states.shape)
         else:
             hidden_states = self.pre_feedforward_layernorm(hidden_states)
@@ -630,7 +630,7 @@ class Gemma4TextDecoderLayer(nn.Module):
             hidden_states,
             residual,
             self.post_feedforward_layernorm.weight,
-            self.post_feedforward_layernorm.variance_epsilon,
+            self.post_feedforward_layernorm.eps,
             self.layer_scalar,
         )
         return hidden_states
