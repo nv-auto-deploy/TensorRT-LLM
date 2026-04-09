@@ -126,8 +126,22 @@ def _pattern_matches(modname: str, pattern: str) -> bool:
     Keep behavior aligned with upstream: evaluate exclude entries via fnmatch.
     This preserves exact module-path excludes (for example:
     ``model.layers.0.self_attn.q_a_proj``) and wildcard entries.
+
+    Quant configs (e.g. hf_quant_config.json) may use full HF parameter paths
+    like ``model.language_model.layers.0.linear_attn*`` while the graph module
+    uses shorter paths like ``layers.0.linear_attn.in_proj_qkv``.  We try
+    stripping common model prefixes so the exclusion still applies.
     """
-    return fnmatch(modname, pattern)
+    if fnmatch(modname, pattern):
+        return True
+    # Try stripping common HF model prefixes from the pattern so that
+    # exclude patterns written for the full model path also match the
+    # shorter graph-module parameter names.  Check longer prefixes first.
+    for prefix in ("model.language_model.", "model.text_model.", "model."):
+        if pattern.startswith(prefix):
+            if fnmatch(modname, pattern[len(prefix) :]):
+                return True
+    return False
 
 
 def should_skip_quantization(

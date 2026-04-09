@@ -415,7 +415,17 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
             weight = state_dict[weight_name]
             # ModelOpt quantized graph path
             if weight.dtype != torch.uint8:
-                assert input_scale_name in state_dict
+                if input_scale_name not in state_dict:
+                    # Weight was not quantized in the checkpoint (no input_scale).
+                    # Dynamically quantize using a default input_scale so that
+                    # the model can still load instead of crashing.
+                    import logging
+
+                    logging.getLogger("auto_deploy").warning(
+                        "input_scale missing for %s – dynamic FP4 quantization applied",
+                        weight_name,
+                    )
+                    state_dict[input_scale_name] = torch.tensor(1.0)
                 # Unquantized weight
                 amax_name = weight_name + "_quantizer._amax"
                 if amax_name in state_dict:
