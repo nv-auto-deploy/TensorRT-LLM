@@ -38,7 +38,6 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from tokenizers import Tokenizer
 from torch import nn
 from transformers import AutoConfig, PretrainedConfig, PreTrainedTokenizerFast
@@ -48,6 +47,9 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_router import (
+    gemma4_router_triton,
+)
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
@@ -332,20 +334,26 @@ class Gemma4Router(nn.Module):
         self.register_buffer("root_size", torch.tensor(config.hidden_size**-0.5), persistent=False)
         self.eps = config.rms_norm_eps
         self.top_k = config.top_k_experts
+        # Transposed proj weight [H, E] for coalesced W_T loads in the Triton router.
+        # Registered as a non-persistent buffer so it lives on the right device but
+        # is not saved to checkpoints.
+        self.register_buffer("proj_T", torch.empty(0), persistent=False)
+
+    def _ensure_proj_T(self):
+        """Lazily materialize proj_T from self.proj.weight on first use."""
+        if self.proj_T.numel() == 0:
+            self.proj_T = self.proj.weight.data.t().contiguous()
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # RMSNorm without learnable scale
-        normed = hidden_states.float()
-        normed = normed * torch.rsqrt(normed.pow(2).mean(-1, keepdim=True) + self.eps)
-        normed = normed.type_as(hidden_states)
-        # Apply scalar and per-dim scaling
-        normed = normed * self.root_size.to(hidden_states.dtype)
-        normed = normed * self.scale.to(hidden_states.dtype)
-        # Route
-        expert_scores = self.proj(normed)
-        probs = F.softmax(expert_scores, dim=-1)
-        top_k_weights, top_k_index = torch.topk(probs, k=self.top_k, dim=-1)
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        self._ensure_proj_T()
+        top_k_weights, top_k_index = gemma4_router_triton(
+            hidden_states,
+            self.scale,
+            self.proj_T,
+            float(self.root_size),
+            self.eps,
+            self.top_k,
+        )
         return top_k_weights, top_k_index
 
 
