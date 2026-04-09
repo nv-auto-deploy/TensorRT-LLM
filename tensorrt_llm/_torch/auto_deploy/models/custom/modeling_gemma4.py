@@ -47,6 +47,10 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_fusions import (
+    gemma4_post_norm_add,
+    gemma4_post_norm_add_scale,
+)
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_router import (
     gemma4_router,
 )
@@ -580,8 +584,13 @@ class Gemma4TextDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings)
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+        # Fused: post_attention_layernorm + residual add -> 2 kernels -> 1
+        hidden_states = gemma4_post_norm_add(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+        )
 
         # Feed-forward (dense MLP ± MoE)
         residual = hidden_states
@@ -605,10 +614,14 @@ class Gemma4TextDecoderLayer(nn.Module):
             hidden_states = self.pre_feedforward_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)
 
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-
-        hidden_states = hidden_states * self.layer_scalar
+        # Fused: post_feedforward_layernorm + residual add + layer_scalar -> 3 kernels -> 1
+        hidden_states = gemma4_post_norm_add_scale(
+            hidden_states,
+            residual,
+            self.post_feedforward_layernorm.weight,
+            self.post_feedforward_layernorm.variance_epsilon,
+            self.layer_scalar,
+        )
         return hidden_states
 
 
