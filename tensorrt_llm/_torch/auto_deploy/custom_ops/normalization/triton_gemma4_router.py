@@ -206,17 +206,22 @@ def gemma4_router_triton(
 def gemma4_router(
     hidden: torch.Tensor,
     scale: torch.Tensor,
-    proj_T: torch.Tensor,
+    proj_weight: torch.Tensor,
     root_size: float,
     eps: float,
     top_k: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused Gemma4 router custom op: RMSNorm + proj + softmax + topk.
 
+    Accepts ``proj_weight`` in its natural ``[E, H]`` (nn.Linear) layout and
+    transposes it to ``[H, E]`` internally so callers can pass ``self.proj.weight``
+    directly without maintaining a separate transposed buffer.
+
     Registered as a torch custom op so that FakeTensor / meta-tensor tracing
     during torch.export sees only shape inference (via ``register_fake``) rather
     than the actual Triton kernel, which cannot execute on meta tensors.
     """
+    proj_T = proj_weight.t().contiguous()
     return gemma4_router_triton(hidden, scale, proj_T, root_size, eps, top_k)
 
 
@@ -224,7 +229,7 @@ def gemma4_router(
 def _gemma4_router_fake(
     hidden: torch.Tensor,
     scale: torch.Tensor,
-    proj_T: torch.Tensor,
+    proj_weight: torch.Tensor,
     root_size: float,
     eps: float,
     top_k: int,

@@ -339,22 +339,12 @@ class Gemma4Router(nn.Module):
         self._root_size_val: float = config.hidden_size**-0.5
         self.eps = config.rms_norm_eps
         self.top_k = config.top_k_experts
-        # Transposed proj weight [H, E] for coalesced W_T loads in the Triton router.
-        # Registered as a non-persistent buffer so it lives on the right device but
-        # is not saved to checkpoints.
-        self.register_buffer("proj_T", torch.empty(0), persistent=False)
-
-    def _ensure_proj_T(self) -> None:
-        """Lazily materialize proj_T from self.proj.weight on first use."""
-        if self.proj_T.numel() == 0:
-            self.proj_T = self.proj.weight.data.t().contiguous()
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        self._ensure_proj_T()
         return gemma4_router(
             hidden_states,
             self.scale,
-            self.proj_T,
+            self.proj.weight,
             self._root_size_val,
             self.eps,
             self.top_k,
