@@ -48,7 +48,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_router import (
-    gemma4_router_triton,
+    gemma4_router,
 )
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
@@ -331,7 +331,8 @@ class Gemma4Router(nn.Module):
         super().__init__()
         self.proj = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.scale = nn.Parameter(torch.ones(config.hidden_size))
-        self.register_buffer("root_size", torch.tensor(config.hidden_size**-0.5), persistent=False)
+        # Store as Python float to avoid .item() on meta tensors during tracing.
+        self._root_size_val: float = config.hidden_size**-0.5
         self.eps = config.rms_norm_eps
         self.top_k = config.top_k_experts
         # Transposed proj weight [H, E] for coalesced W_T loads in the Triton router.
@@ -339,22 +340,21 @@ class Gemma4Router(nn.Module):
         # is not saved to checkpoints.
         self.register_buffer("proj_T", torch.empty(0), persistent=False)
 
-    def _ensure_proj_T(self):
+    def _ensure_proj_T(self) -> None:
         """Lazily materialize proj_T from self.proj.weight on first use."""
         if self.proj_T.numel() == 0:
             self.proj_T = self.proj.weight.data.t().contiguous()
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         self._ensure_proj_T()
-        top_k_weights, top_k_index = gemma4_router_triton(
+        return gemma4_router(
             hidden_states,
             self.scale,
             self.proj_T,
-            float(self.root_size),
+            self._root_size_val,
             self.eps,
             self.top_k,
         )
-        return top_k_weights, top_k_index
 
 
 class Gemma4Expert(nn.Module):

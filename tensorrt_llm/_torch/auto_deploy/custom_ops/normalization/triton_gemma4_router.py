@@ -29,6 +29,9 @@ Key design decisions:
 - Fast softmax: use exp2(x * log2e) instead of exp(x) for ~10% faster exp.
 """
 
+import math as _math
+from typing import Tuple
+
 import torch
 import triton
 import triton.language as tl
@@ -168,9 +171,7 @@ def gemma4_router_triton(
     out_weights = torch.empty((T, K), dtype=torch.float32, device=hidden.device)
     out_indices = torch.empty((T, K), dtype=torch.int32, device=hidden.device)
 
-    import math
-
-    log2e = math.log2(math.e)
+    log2e = _math.log2(_math.e)
 
     grid = (triton.cdiv(T, n_tokens),)
     _gemma4_router_fwd[grid](
@@ -194,3 +195,42 @@ def gemma4_router_triton(
         num_stages=num_stages,
     )
     return out_weights, out_indices
+
+
+# ---------------------------------------------------------------------------
+# Custom op registration — needed for FakeTensor / meta tensor tracing in AD
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("auto_deploy::gemma4_router", mutates_args=(), device_types="cuda")
+def gemma4_router(
+    hidden: torch.Tensor,
+    scale: torch.Tensor,
+    proj_T: torch.Tensor,
+    root_size: float,
+    eps: float,
+    top_k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused Gemma4 router custom op: RMSNorm + proj + softmax + topk.
+
+    Registered as a torch custom op so that FakeTensor / meta-tensor tracing
+    during torch.export sees only shape inference (via ``register_fake``) rather
+    than the actual Triton kernel, which cannot execute on meta tensors.
+    """
+    return gemma4_router_triton(hidden, scale, proj_T, root_size, eps, top_k)
+
+
+@gemma4_router.register_fake
+def _gemma4_router_fake(
+    hidden: torch.Tensor,
+    scale: torch.Tensor,
+    proj_T: torch.Tensor,
+    root_size: float,
+    eps: float,
+    top_k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    T = hidden.shape[0]
+    return (
+        torch.empty((T, top_k), dtype=torch.float32, device=hidden.device),
+        torch.empty((T, top_k), dtype=torch.int32, device=hidden.device),
+    )
