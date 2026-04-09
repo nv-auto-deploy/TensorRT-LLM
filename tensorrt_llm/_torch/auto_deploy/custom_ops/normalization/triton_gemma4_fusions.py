@@ -13,20 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused Gemma4 per-layer normalization kernels.
+"""Fused Gemma4 post-layer ops: RMSNorm + residual_add [+ layer_scalar].
 
-Eliminates small kernel launches by fusing adjacent norm, add, and scale ops
-into single Triton kernels. Each MoE layer has ~10 norm-adjacent kernel calls
-that can be reduced to ~4.
+These kernels eliminate 2-3 separate kernel launches per decoder layer by
+fusing the post-attention and post-feedforward normalization, residual add,
+and optional layer scalar multiply into single Triton kernels.
 
-Fused kernels:
-  - gemma4_post_norm_add: norm(x, w) + residual  (post-attention)
-  - gemma4_post_norm_add_scale: (norm(x, w) + residual) * s  (post-ffn)
-  - gemma4_dual_norm: norm(x, w1), norm(x, w2)  (pre-ffn dual — same input)
-  - gemma4_norm_add2: norm(a, wa) + norm(b, wb)  (post-moe add — different inputs)
+Savings at c=1 (batch=1): ~2µs saved per fused occurrence × ~12 occurrences
+per decode step = ~24µs = ~1% of 2273µs baseline TPOT.
+
+The fused kernels are:
+  - gemma4_post_norm_add: norm(x, w) + residual  (post-attention pattern)
+  - gemma4_post_norm_add_scale: (norm(x, w) + residual) * scalar  (post-ffn pattern)
 """
-
-from typing import Tuple
 
 import torch
 import triton
@@ -203,173 +202,3 @@ def _gemma4_post_norm_add_scale_fake(
     scalar: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(x)
-
-
-# ---------------------------------------------------------------------------
-# Dual-output norm: same input, two weight vectors (iter37 F1)
-# ---------------------------------------------------------------------------
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_H": 4096}, num_warps=4),
-        triton.Config({"BLOCK_H": 4096}, num_warps=8),
-        triton.Config({"BLOCK_H": 4096}, num_warps=16),
-    ],
-    key=["H"],
-)
-@triton.jit
-def _dual_norm_kernel(
-    x_ptr,
-    w1_ptr,
-    w2_ptr,
-    out1_ptr,
-    out2_ptr,
-    H: tl.constexpr,
-    eps: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    """Fused: out1[row]=rms_norm(x,w1), out2[row]=rms_norm(x,w2) sharing variance."""
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_H)
-    mask = offs < H
-
-    x = tl.load(x_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    w1 = tl.load(w1_ptr + offs, mask=mask, other=1.0).to(tl.float32)
-    w2 = tl.load(w2_ptr + offs, mask=mask, other=1.0).to(tl.float32)
-
-    # Shared RMS factor — compute variance only once
-    var = tl.sum(x * x) / H
-    inv_rms = tl.rsqrt(var + eps)
-
-    tl.store(out1_ptr + row * H + offs, (x * inv_rms * w1).to(tl.bfloat16), mask=mask)
-    tl.store(out2_ptr + row * H + offs, (x * inv_rms * w2).to(tl.bfloat16), mask=mask)
-
-
-@torch.library.custom_op("auto_deploy::gemma4_dual_norm", mutates_args=(), device_types="cuda")
-def gemma4_dual_norm(
-    x: torch.Tensor,
-    weight1: torch.Tensor,
-    weight2: torch.Tensor,
-    eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fused dual-output RMSNorm: returns (norm(x,w1), norm(x,w2)).
-
-    Replaces two separate norm calls on the same input with one kernel,
-    sharing the variance computation and halving the x memory load.
-    Used for pre_feedforward_layernorm and pre_feedforward_layernorm_2 which
-    both normalize the same hidden_states tensor.
-    """
-    H = x.shape[-1]
-    x_2d = x.view(-1, H)
-    T_flat = x_2d.shape[0]
-    out1 = torch.empty_like(x)
-    out2 = torch.empty_like(x)
-
-    _dual_norm_kernel[(T_flat,)](
-        x_2d,
-        weight1,
-        weight2,
-        out1.view(-1, H),
-        out2.view(-1, H),
-        H=H,
-        eps=eps,
-    )
-    return out1, out2
-
-
-@gemma4_dual_norm.register_fake
-def _gemma4_dual_norm_fake(
-    x: torch.Tensor,
-    weight1: torch.Tensor,
-    weight2: torch.Tensor,
-    eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(x), torch.empty_like(x)
-
-
-# ---------------------------------------------------------------------------
-# norm_add2: norm(a, wa) + norm(b, wb)  (post-MoE combine, iter37 F2)
-# ---------------------------------------------------------------------------
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_H": 4096}, num_warps=4),
-        triton.Config({"BLOCK_H": 4096}, num_warps=8),
-        triton.Config({"BLOCK_H": 4096}, num_warps=16),
-    ],
-    key=["H"],
-)
-@triton.jit
-def _norm_add2_kernel(
-    a_ptr,
-    b_ptr,
-    wa_ptr,
-    wb_ptr,
-    out_ptr,
-    H: tl.constexpr,
-    eps: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    """Fused: out[row] = rms_norm(a[row], wa) + rms_norm(b[row], wb)."""
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_H)
-    mask = offs < H
-
-    a = tl.load(a_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    b = tl.load(b_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    wa = tl.load(wa_ptr + offs, mask=mask, other=1.0).to(tl.float32)
-    wb = tl.load(wb_ptr + offs, mask=mask, other=1.0).to(tl.float32)
-
-    # RMSNorm a
-    var_a = tl.sum(a * a) / H
-    normed_a = a * tl.rsqrt(var_a + eps) * wa
-
-    # RMSNorm b
-    var_b = tl.sum(b * b) / H
-    normed_b = b * tl.rsqrt(var_b + eps) * wb
-
-    tl.store(out_ptr + row * H + offs, (normed_a + normed_b).to(tl.bfloat16), mask=mask)
-
-
-@torch.library.custom_op("auto_deploy::gemma4_norm_add2", mutates_args=(), device_types="cuda")
-def gemma4_norm_add2(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    weight_a: torch.Tensor,
-    weight_b: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    """Fused: rms_norm(a, wa) + rms_norm(b, wb).
-
-    Replaces post_feedforward_layernorm_1(hs_dense) + post_feedforward_layernorm_2(hs_moe)
-    + elementwise add with a single Triton kernel (3 kernels -> 1), saving ~4µs per layer.
-    """
-    H = a.shape[-1]
-    out = torch.empty_like(a)
-    a_2d = a.view(-1, H)
-    b_2d = b.view(-1, H)
-    T_flat = a_2d.shape[0]
-
-    _norm_add2_kernel[(T_flat,)](
-        a_2d,
-        b_2d,
-        weight_a,
-        weight_b,
-        out.view(-1, H),
-        H=H,
-        eps=eps,
-    )
-    return out
-
-
-@gemma4_norm_add2.register_fake
-def _gemma4_norm_add2_fake(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    weight_a: torch.Tensor,
-    weight_b: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    return torch.empty_like(a)
