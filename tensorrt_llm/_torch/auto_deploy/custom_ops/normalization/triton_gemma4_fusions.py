@@ -113,6 +113,13 @@ def _post_norm_add_scale_kernel(
 # Custom op registration for torch.export / FakeTensor tracing
 # ---------------------------------------------------------------------------
 
+# Threshold: use Triton fused kernel for T ≤ this value; use flashinfer for T > this.
+# At small T (≤ 8) each kernel launch costs ~200-300ns in a CUDA graph; fusing
+# 2 launches into 1 saves ~250ns × 2 sites × 30 layers ≈ 15µs at c=1.
+# At large T (> 8) flashinfer's vectorised RMSNorm + elementwise add outperform
+# the Triton kernel (which wastes 31% of elements due to BLOCK_H=4096 > H=2816).
+_TRITON_T_THRESHOLD = 8
+
 
 @torch.library.custom_op("auto_deploy::gemma4_post_norm_add", mutates_args=(), device_types="cuda")
 def gemma4_post_norm_add(
@@ -121,27 +128,27 @@ def gemma4_post_norm_add(
     weight: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Fused post-attention: rms_norm(x, weight, eps) + residual.
+    """Adaptive post-attention: rms_norm(x, weight, eps) + residual.
 
-    Replaces two separate kernel calls (flashinfer RMSNorm + elementwise add)
-    with a single fused Triton kernel, saving ~1.5-2µs per occurrence.
+    Dispatches to a fused Triton kernel for small T (≤ _TRITON_T_THRESHOLD) where
+    reducing kernel-launch count in the CUDA graph pays off, and falls back to
+    flashinfer RMSNorm + elementwise add for larger T where flashinfer's vectorised
+    kernel achieves higher bandwidth utilisation.
     """
+    import flashinfer
+
     H = x.shape[-1]
     out = torch.empty_like(x)
-    # Reshape to 2D [T_flat, H] for row-parallel kernel
     x_2d = x.view(-1, H)
     residual_2d = residual.view(-1, H)
     T_flat = x_2d.shape[0]
     out_2d = out.view(-1, H)
 
-    _post_norm_add_kernel[(T_flat,)](
-        x_2d,
-        residual_2d,
-        weight,
-        out_2d,
-        H=H,
-        eps=eps,
-    )
+    if T_flat <= _TRITON_T_THRESHOLD:
+        _post_norm_add_kernel[(T_flat,)](x_2d, residual_2d, weight, out_2d, H=H, eps=eps)
+    else:
+        torch.add(flashinfer.norm.rmsnorm(x_2d, weight, eps), residual_2d, out=out_2d)
+
     return out
 
 
@@ -165,12 +172,13 @@ def gemma4_post_norm_add_scale(
     eps: float,
     scalar: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused post-feedforward: (rms_norm(x, weight, eps) + residual) * scalar.
+    """Adaptive post-feedforward: (rms_norm(x, weight, eps) + residual) * scalar.
 
-    Replaces three separate kernel calls (RMSNorm + residual add + scalar
-    multiply) with a single fused Triton kernel, saving ~2.5-3µs per
-    occurrence per layer.
+    Same adaptive dispatch as gemma4_post_norm_add: Triton for T ≤ threshold
+    (saves 2 kernel launches in CUDA graph), flashinfer + elementwise for T > threshold.
     """
+    import flashinfer
+
     H = x.shape[-1]
     out = torch.empty_like(x)
     x_2d = x.view(-1, H)
@@ -178,18 +186,17 @@ def gemma4_post_norm_add_scale(
     T_flat = x_2d.shape[0]
     out_2d = out.view(-1, H)
 
-    # scalar is a 1-element tensor [1]; load its pointer into the kernel
-    scalar_flat = scalar.view(-1)
+    if T_flat <= _TRITON_T_THRESHOLD:
+        _post_norm_add_scale_kernel[(T_flat,)](
+            x_2d, residual_2d, weight, scalar.view(-1), out_2d, H=H, eps=eps
+        )
+    else:
+        torch.mul(
+            flashinfer.norm.rmsnorm(x_2d, weight, eps) + residual_2d,
+            scalar,
+            out=out_2d,
+        )
 
-    _post_norm_add_scale_kernel[(T_flat,)](
-        x_2d,
-        residual_2d,
-        weight,
-        scalar_flat,
-        out_2d,
-        H=H,
-        eps=eps,
-    )
     return out
 
 
