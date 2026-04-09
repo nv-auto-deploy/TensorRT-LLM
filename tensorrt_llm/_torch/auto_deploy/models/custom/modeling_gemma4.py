@@ -48,6 +48,8 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_fusions import (
+    gemma4_dual_norm,
+    gemma4_norm_add2,
     gemma4_post_norm_add,
     gemma4_post_norm_add_scale,
 )
@@ -596,20 +598,29 @@ class Gemma4TextDecoderLayer(nn.Module):
         residual = hidden_states
 
         if self.enable_moe_block:
-            # Dense MLP path
-            hs_dense = self.pre_feedforward_layernorm(hidden_states)
-            hs_dense = self.mlp(hs_dense)
-            hs_dense = self.post_feedforward_layernorm_1(hs_dense)
+            # Fused: pre_feedforward_layernorm + pre_feedforward_layernorm_2 (same input) -> 2 -> 1
+            hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            hs_dense_input, hs_moe_input = gemma4_dual_norm(
+                hs_flat,
+                self.pre_feedforward_layernorm.weight,
+                self.pre_feedforward_layernorm_2.weight,
+                self.pre_feedforward_layernorm.variance_epsilon,
+            )
+            hs_dense = self.mlp(hs_dense_input.reshape(hidden_states.shape))
 
             # MoE path
-            hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             top_k_weights, top_k_index = self.router(hs_flat)
-            hs_moe = self.pre_feedforward_layernorm_2(hs_flat)
-            hs_moe = self.moe(hs_moe, top_k_index, top_k_weights)
-            hs_moe = hs_moe.reshape(hidden_states.shape)
-            hs_moe = self.post_feedforward_layernorm_2(hs_moe)
+            hs_moe = self.moe(hs_moe_input, top_k_index, top_k_weights)
 
-            hidden_states = hs_dense + hs_moe
+            # Fused: post_feedforward_layernorm_1(hs_dense) + post_feedforward_layernorm_2(hs_moe) + add -> 3 -> 1
+            hs_dense_flat = hs_dense.reshape(-1, hs_dense.shape[-1])
+            hidden_states = gemma4_norm_add2(
+                hs_dense_flat,
+                hs_moe,
+                self.post_feedforward_layernorm_1.weight,
+                self.post_feedforward_layernorm_2.weight,
+                self.post_feedforward_layernorm_1.variance_epsilon,
+            ).reshape(hidden_states.shape)
         else:
             hidden_states = self.pre_feedforward_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)
