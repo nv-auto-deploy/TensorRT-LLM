@@ -50,6 +50,7 @@ from transformers.utils import ModelOutput, cached_file
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_fusions import (
     gemma4_post_add_norm_add_scale,
     gemma4_post_norm_add,
+    gemma4_post_norm_add_and_pre_ff_norm,
     gemma4_post_norm_add_scale,
 )
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_router import (
@@ -575,20 +576,25 @@ class Gemma4TextDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings)
-        # Fused: post_attention_layernorm + residual add -> 2 kernels -> 1
-        hidden_states = gemma4_post_norm_add(
-            hidden_states,
-            residual,
-            self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.eps,
-        )
 
         # Feed-forward (dense MLP ± MoE)
-        residual = hidden_states
-
         if self.enable_moe_block:
+            # Fused: post_attention_layernorm + residual_add + pre_feedforward_layernorm
+            # → 2 kernels → 1 packed-tensor kernel; saves 1 kernel launch per MoE layer.
+            # packed[0] = rms_norm(attn_out, post_attn_w) + residual  (hidden_states)
+            # packed[1] = rms_norm(packed[0], pre_ff_w)               (dense MLP input)
+            packed = gemma4_post_norm_add_and_pre_ff_norm(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.pre_feedforward_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
+            hidden_states = packed[0]
+            residual = hidden_states
+
             # Dense MLP path
-            hs_dense = self.pre_feedforward_layernorm(hidden_states)
+            hs_dense = packed[1]
             hs_dense = self.mlp(hs_dense)
             hs_dense = self.post_feedforward_layernorm_1(hs_dense)
 
@@ -611,6 +617,14 @@ class Gemma4TextDecoderLayer(nn.Module):
             )
             return hidden_states
         else:
+            # Fused: post_attention_layernorm + residual add -> 2 kernels -> 1
+            hidden_states = gemma4_post_norm_add(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
+            residual = hidden_states
             hidden_states = self.pre_feedforward_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)
 

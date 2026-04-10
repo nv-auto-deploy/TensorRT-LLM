@@ -118,6 +118,58 @@ def _post_norm_add_scale_kernel(
     key=["H"],
 )
 @triton.jit
+def _post_norm_add_and_pre_ff_norm_kernel(
+    attn_out_ptr,
+    residual_ptr,
+    w_post_attn_ptr,
+    w_pre_ff_ptr,
+    out_hs_ptr,
+    out_pre_ff_ptr,
+    H: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Fused post-attention norm and pre-feedforward norm sharing one kernel launch.
+
+    Computes two sequential RMSNorms in a single kernel:
+      out_hs[row]     = rms_norm(attn_out[row], w_post_attn, eps) + residual[row]
+      out_pre_ff[row] = rms_norm(out_hs[row],   w_pre_ff,    eps)
+
+    The intermediate out_hs stays in registers between the two norms, avoiding
+    a round-trip through global memory and eliminating one kernel launch per layer.
+    """
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+
+    attn_out = tl.load(attn_out_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+    residual = tl.load(residual_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+    w1 = tl.load(w_post_attn_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+    w2 = tl.load(w_pre_ff_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+
+    # Step 1: post-attention RMSNorm + residual add → hidden_states
+    var1 = tl.sum(attn_out * attn_out) / H
+    inv_rms1 = tl.rsqrt(var1 + eps)
+    hs = attn_out * inv_rms1 * w1 + residual
+
+    # Step 2: pre-feedforward RMSNorm of hidden_states (in registers — no extra load)
+    var2 = tl.sum(hs * hs) / H
+    inv_rms2 = tl.rsqrt(var2 + eps)
+    pre_ff = hs * inv_rms2 * w2
+
+    tl.store(out_hs_ptr + row * H + offs, hs.to(tl.bfloat16), mask=mask)
+    tl.store(out_pre_ff_ptr + row * H + offs, pre_ff.to(tl.bfloat16), mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 4096}, num_warps=4),
+        triton.Config({"BLOCK_H": 4096}, num_warps=8),
+        triton.Config({"BLOCK_H": 4096}, num_warps=16),
+    ],
+    key=["H"],
+)
+@triton.jit
 def _post_add_norm_add_scale_kernel(
     a_ptr,
     b_ptr,
@@ -308,3 +360,63 @@ def _gemma4_post_add_norm_add_scale_fake(
     scalar: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(a)
+
+
+@torch.library.custom_op(
+    "auto_deploy::gemma4_post_norm_add_and_pre_ff_norm", mutates_args=(), device_types="cuda"
+)
+def gemma4_post_norm_add_and_pre_ff_norm(
+    attn_out: torch.Tensor,
+    residual: torch.Tensor,
+    post_attn_weight: torch.Tensor,
+    pre_ff_weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Fused post-attention norm + pre-feedforward norm: saves 1 kernel launch per layer.
+
+    Returns a packed tensor of shape (2, *attn_out.shape) where:
+      packed[0] = rms_norm(attn_out, post_attn_weight, eps) + residual  (hidden_states)
+      packed[1] = rms_norm(packed[0], pre_ff_weight, eps)               (pre-feedforward input)
+
+    Dispatches to the fused Triton kernel for T ≤ _TRITON_T_THRESHOLD (decode path),
+    saving one round-trip through global memory and one kernel launch per decoder layer.
+    Falls back to two flashinfer rmsnorm calls for large T (prefill path).
+    """
+    import flashinfer
+
+    H = attn_out.shape[-1]
+    T_flat = attn_out.numel() // H
+    attn_2d = attn_out.reshape(T_flat, H)
+    residual_2d = residual.reshape(T_flat, H)
+
+    # packed_flat: (2, T_flat, H) — packed[0]=hidden_states, packed[1]=pre_ff_in
+    packed_flat = torch.empty(2, T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
+
+    if T_flat <= _TRITON_T_THRESHOLD:
+        _post_norm_add_and_pre_ff_norm_kernel[(T_flat,)](
+            attn_2d,
+            residual_2d,
+            post_attn_weight,
+            pre_ff_weight,
+            packed_flat[0],
+            packed_flat[1],
+            H=H,
+            eps=eps,
+        )
+    else:
+        hs_2d = flashinfer.norm.rmsnorm(attn_2d, post_attn_weight, eps) + residual_2d
+        packed_flat[0].copy_(hs_2d)
+        packed_flat[1].copy_(flashinfer.norm.rmsnorm(hs_2d, pre_ff_weight, eps))
+
+    return packed_flat.reshape(2, *attn_out.shape)
+
+
+@gemma4_post_norm_add_and_pre_ff_norm.register_fake
+def _gemma4_post_norm_add_and_pre_ff_norm_fake(
+    attn_out: torch.Tensor,
+    residual: torch.Tensor,
+    post_attn_weight: torch.Tensor,
+    pre_ff_weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    return torch.empty(2, *attn_out.shape, dtype=torch.bfloat16, device=attn_out.device)
