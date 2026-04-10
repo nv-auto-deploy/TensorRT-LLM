@@ -509,6 +509,10 @@ class ADEngine(ModelEngine):
         self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
         self.iter_counter = 0
         self.iter_states = {}
+        # Per-request input_pos cache for gen_requests loop (non-overlap, non-draft only).
+        # Maps py_request_id → expected input_pos for the NEXT step. Rebuilt each step to
+        # automatically evict finished requests.
+        self._gen_input_pos_cache: Dict[int, int] = {}
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
         self.enable_attention_dp = mapping.enable_attention_dp if mapping else False
@@ -771,6 +775,10 @@ class ADEngine(ModelEngine):
         num_prefill = len(context_requests)
         num_prefill_tokens = len(input_ids)
 
+        # Cache input_pos per request to avoid max_beam_num_tokens C++ call on each step.
+        # Only valid for non-overlap, non-draft requests (increment is exactly +1 per step).
+        _old_input_pos_cache = self._gen_input_pos_cache
+        _new_input_pos_cache: Dict[int, int] = {}
         for request in gen_requests:
             # check if need overlap and draft length
             is_overlap = not self._disable_overlap_scheduler and not request.is_dummy
@@ -783,9 +791,22 @@ class ADEngine(ModelEngine):
             # 2. Overlap: we are preparing for the next iteration -->
             #    use max_beam_num_tokens; the overlap scheduler offset (new_tokens_lens - 1)
             #    applied in offset_with_new_lens_ accounts for not-yet-committed tokens.
-            num_tokens_seen = request.max_beam_num_tokens
-            if not is_overlap:
-                num_tokens_seen -= 1
+            if is_overlap or draft_len > 0:
+                # Cannot cache: overlap uses different semantics; draft requests advance by
+                # (1 + num_accepted) which is unknown until after the model runs.
+                num_tokens_seen = request.max_beam_num_tokens
+                if not is_overlap:
+                    num_tokens_seen -= 1
+            else:
+                # Non-overlap, no draft: input_pos advances by exactly +1 each step.
+                # Use cached value to skip the max_beam_num_tokens C++ call.
+                req_id = request.py_request_id
+                _cached = _old_input_pos_cache.get(req_id)
+                if _cached is not None:
+                    num_tokens_seen = _cached
+                else:
+                    num_tokens_seen = request.max_beam_num_tokens - 1
+                _new_input_pos_cache[req_id] = num_tokens_seen + 1
 
             # build input ids
             if is_overlap:
@@ -795,7 +816,9 @@ class ADEngine(ModelEngine):
                 slot_gather_indices.append(start)
                 flat_gather_indices.extend(range(start, start + (1 + draft_len) * stride, stride))
             else:
-                input_ids.append(request.get_token(0, request.get_num_tokens(0) - 1))
+                # get_last_tokens(0) retrieves the last committed token in 1 C++ call,
+                # replacing get_token(0, get_num_tokens(0) - 1) which required 2 calls.
+                input_ids.append(request.get_last_tokens(0))
                 input_ids.extend([] if draft_len == 0 else request.py_draft_tokens)
 
             cu_seqlen.append(len(input_ids))
@@ -804,7 +827,21 @@ class ADEngine(ModelEngine):
             if is_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
+        self._gen_input_pos_cache = _new_input_pos_cache
+
         # store cache information for all requests now
+        # Use batched C++ lookup when batch is large enough to amortize the API overhead.
+        # Below the threshold, individual calls are cheaper due to lower Python/C++ setup cost.
+        _BATCH_CACHE_THRESHOLD = 64
+        _tokens_per_block = kv_cache_manager.tokens_per_block
+        _use_mamba = hasattr(kv_cache_manager, "mamba_cache_index")
+        _req_ids = [r.py_request_id for r in ordered_requests]
+        _n_reqs = len(_req_ids)
+        if _n_reqs >= _BATCH_CACHE_THRESHOLD:
+            # Single C++ call for all requests — amortizes overhead at large batch sizes
+            _all_cache_indices = kv_cache_manager.get_batch_cache_indices(_req_ids)
+        else:
+            _all_cache_indices = None  # use per-request fallback below
         cache_loc: List[int] = []
         cu_num_pages: List[int] = [0]
         extra_page_per_seq: List[int] = []
@@ -812,7 +849,7 @@ class ADEngine(ModelEngine):
         for i, request in enumerate(ordered_requests):
             # store seq slot idx (use mamba_cache_index if available)
             request.py_batch_idx = request.py_seq_slot
-            if hasattr(kv_cache_manager, "mamba_cache_index"):
+            if _use_mamba:
                 state_slot_idx_i = kv_cache_manager.mamba_cache_index[request.py_request_id]
             else:
                 state_slot_idx_i = request.py_seq_slot
@@ -821,10 +858,15 @@ class ADEngine(ModelEngine):
             # get some info on the current request
             seq_len_i = cu_seqlen[i + 1] - cu_seqlen[i]
             end_compute_i = input_pos[i] + seq_len_i
-            num_active_blocks_i = kv_cache_manager.get_num_kv_blocks(end_compute_i)
+            # Inline get_num_kv_blocks (pure Python, saves function-call overhead per request)
+            num_active_blocks_i = (end_compute_i + _tokens_per_block - 1) // _tokens_per_block
 
             # construct cache information for the current request
-            cache_indices = kv_cache_manager.get_cache_indices(request)
+            cache_indices = (
+                _all_cache_indices[i]
+                if _all_cache_indices is not None
+                else kv_cache_manager.get_cache_indices(request)
+            )
             cache_loc.extend(cache_indices[:num_active_blocks_i])
             cu_num_pages.append(cu_num_pages[i] + num_active_blocks_i)
             if len(cache_indices) > num_active_blocks_i:
