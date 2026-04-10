@@ -362,6 +362,131 @@ def _gemma4_post_add_norm_add_scale_fake(
     return torch.empty_like(a)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 4096}, num_warps=4),
+        triton.Config({"BLOCK_H": 4096}, num_warps=8),
+        triton.Config({"BLOCK_H": 4096}, num_warps=16),
+    ],
+    key=["H"],
+)
+@triton.jit
+def _post_add_norm_add_scale_and_next_input_norm_kernel(
+    a_ptr,
+    b_ptr,
+    residual_ptr,
+    weight_ptr,
+    scalar_ptr,
+    w_next_ptr,
+    out_ptr,
+    out_next_ptr,
+    H: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Fused: current-layer MoE final op + next-layer input_layernorm.
+
+    out[row]      = (rms_norm(a[row]+b[row], weight, eps) + residual[row]) * scalar
+    out_next[row] = rms_norm(out[row], w_next, eps)
+
+    Saves 1 kernel launch per non-last MoE layer: 'out' stays in registers for the
+    second reduction, avoiding a global-memory round-trip to compute input_layernorm
+    of the next layer.
+    """
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+
+    a = tl.load(a_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(b_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+    x = a + b
+    residual = tl.load(residual_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(weight_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+    scalar = tl.load(scalar_ptr).to(tl.float32)
+    w_next = tl.load(w_next_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+
+    # Step 1: current layer's combine + norm + residual + scale
+    var1 = tl.sum(x * x) / H
+    inv_rms1 = tl.rsqrt(var1 + eps)
+    normed1 = x * inv_rms1 * weight
+    out = (normed1 + residual) * scalar
+
+    # Step 2: next layer's input_layernorm (out stays in registers — no extra load)
+    var2 = tl.sum(out * out) / H
+    inv_rms2 = tl.rsqrt(var2 + eps)
+    out_next = out * inv_rms2 * w_next
+
+    tl.store(out_ptr + row * H + offs, out.to(tl.bfloat16), mask=mask)
+    tl.store(out_next_ptr + row * H + offs, out_next.to(tl.bfloat16), mask=mask)
+
+
+@torch.library.custom_op(
+    "auto_deploy::gemma4_post_add_norm_add_scale_and_next_input_norm",
+    mutates_args=(),
+    device_types="cuda",
+)
+def gemma4_post_add_norm_add_scale_and_next_input_norm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    scalar: torch.Tensor,
+    w_next: torch.Tensor,
+) -> torch.Tensor:
+    """Fused MoE final op + next-layer input_layernorm: saves 1 kernel launch per non-last MoE layer.
+
+    Returns packed (2, *a.shape):
+      packed[0] = (rms_norm(a+b, weight, eps) + residual) * scalar  [hidden_states]
+      packed[1] = rms_norm(packed[0], w_next, eps)                   [input_layernorm output for next layer]
+    """
+    import flashinfer
+
+    H = a.shape[-1]
+    T_flat = a.numel() // H
+    a_2d = a.view(-1, H)
+    b_2d = b.view(-1, H)
+    residual_2d = residual.view(-1, H)
+    packed_flat = torch.empty(2, T_flat, H, dtype=torch.bfloat16, device=a.device)
+
+    if T_flat <= _TRITON_T_THRESHOLD:
+        _post_add_norm_add_scale_and_next_input_norm_kernel[(T_flat,)](
+            a_2d,
+            b_2d,
+            residual_2d,
+            weight,
+            scalar.view(-1),
+            w_next,
+            packed_flat[0],
+            packed_flat[1],
+            H=H,
+            eps=eps,
+        )
+    else:
+        x_2d = a_2d + b_2d
+        torch.mul(
+            flashinfer.norm.rmsnorm(x_2d, weight, eps) + residual_2d,
+            scalar,
+            out=packed_flat[0],
+        )
+        packed_flat[1].copy_(flashinfer.norm.rmsnorm(packed_flat[0], w_next, eps))
+
+    return packed_flat.reshape(2, *a.shape)
+
+
+@gemma4_post_add_norm_add_scale_and_next_input_norm.register_fake
+def _gemma4_post_add_norm_add_scale_and_next_input_norm_fake(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    scalar: torch.Tensor,
+    w_next: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(2, *a.shape, dtype=torch.bfloat16, device=a.device)
+
+
 @torch.library.custom_op(
     "auto_deploy::gemma4_post_norm_add_and_pre_ff_norm", mutates_args=(), device_types="cuda"
 )
