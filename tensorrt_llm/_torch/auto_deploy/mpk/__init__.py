@@ -20,11 +20,16 @@ from .gemma_analyzer import GemmaGraphAnalyzer
 from .gemma_layer_lowering import GemmaLayerLoweringPlanner
 from .mirage_bridge import (
     MirageBindingResult,
+    build_gemma_mirage_runtime_callable,
+    compile_supported_rmsnorm_linear_smoke,
     create_test_persistent_kernel,
     execute_layer_plan_reference,
     exercise_layer_plan_against_mirage,
     exercise_mirage_task_registration,
     resolve_layer_plan_against_mirage,
+    run_mirage_linear_with_residual_forward_correctness,
+    run_mirage_norm_linear_forward_correctness,
+    run_mirage_paged_attention_forward_correctness,
 )
 from .runtime_wrapper import GemmaMpkRuntimeWrapper
 from .translator import GemmaMpkTranslator
@@ -62,9 +67,14 @@ __all__ = [
     "GemmaNodeRef",
     "MirageBindingResult",
     "SUPPORTED_SOURCE_OP_FAMILIES",
+    "build_gemma_mirage_runtime_callable",
+    "compile_supported_rmsnorm_linear_smoke",
     "create_test_persistent_kernel",
     "execute_layer_plan_reference",
     "exercise_layer_plan_against_mirage",
     "exercise_mirage_task_registration",
     "resolve_layer_plan_against_mirage",
+    "run_mirage_linear_with_residual_forward_correctness",
+    "run_mirage_paged_attention_forward_correctness",
+    "run_mirage_norm_linear_forward_correctness",
 ]

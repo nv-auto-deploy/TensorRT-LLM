@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import subprocess
+import sys
+
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -25,6 +30,7 @@ from tensorrt_llm._torch.auto_deploy.mpk import (
     exercise_layer_plan_against_mirage,
     resolve_layer_plan_against_mirage,
 )
+from tensorrt_llm._torch.auto_deploy.mpk.mirage_bridge import _require_mirage
 
 
 def _make_gemma4_layer_info() -> GemmaLayerInfo:
@@ -186,6 +192,11 @@ def _manual_reference_outputs(hidden_in: torch.Tensor, weights: dict[str, torch.
 
 
 def test_gemma4_layer_lowering_resolves_and_runs_on_mirage():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
     layer_info = _make_gemma4_layer_info()
     layer_plan = GemmaLayerLoweringPlanner().build(layer_info)
 
@@ -200,6 +211,161 @@ def test_gemma4_layer_lowering_resolves_and_runs_on_mirage():
     assert "router_topk_softmax" in result["executed_steps"]
     assert result["generated_json_len"] > 0
     assert result["generated_cuda_len"] > 0
+
+
+def test_supported_mirage_smoke_compiles_and_launches():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "compile_supported_rmsnorm_linear_smoke; "
+                "print(compile_supported_rmsnorm_linear_smoke("
+                "output_dir='./mirage_compile_supported_smoke_test_subproc'))"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "'compiled': True" in proc.stdout
+    assert "'launched': True" in proc.stdout
+
+
+def test_mirage_norm_linear_matches_reference_numerically():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_norm_linear_forward_correctness; "
+                "result = run_mirage_norm_linear_forward_correctness(); "
+                "print(result); "
+                "assert result['max_abs'] < 1.5; "
+                "assert result['mean_abs'] < 0.3"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "max_abs" in proc.stdout
+
+
+def test_mirage_paged_attention_matches_reference_numerically():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_paged_attention_forward_correctness; "
+                "result = run_mirage_paged_attention_forward_correctness(); "
+                "print(result); "
+                "assert result['attn_max_abs'] < 0.1; "
+                "assert result['attn_mean_abs'] < 0.01"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "attn_max_abs" in proc.stdout
+
+
+def test_mirage_linear_with_residual_matches_reference_numerically():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_linear_with_residual_forward_correctness; "
+                "result = run_mirage_linear_with_residual_forward_correctness(); "
+                "print(result); "
+                "assert result['linear_max_abs'] < 1.0; "
+                "assert result['linear_mean_abs'] < 0.2"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "linear_max_abs" in proc.stdout
 
 
 def test_gemma4_translated_attention_block_matches_reference():
