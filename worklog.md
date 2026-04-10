@@ -490,3 +490,139 @@ The next concrete step is to define the first Gemma4MoE decode-semantic IR sketc
 - what remains outside the MPK region for v1
 
 That work should use the late post-cache-init graph as the source of truth, not the raw exported FX graph.
+
+## 2026-04-10 Mirage Block Debugging Checkpoint
+
+This round made two meaningful live-Mirage advances:
+
+- the split-dense Gemma-style MoE block is now a real passing correctness test
+- the attention-side live tests remain passing, so we now have both sides of a
+  synthetic layer validated independently
+
+### What turned out to be real bugs or bad assumptions
+
+#### 1. MoE expert launch geometry was wrong
+
+The biggest correctness miss on the MoE path was not primarily kernel math.
+It was launch coverage.
+
+Evidence:
+
+- Mirage MoE kernels shard activated experts by `task_metadata.expert_offset`
+- one logical MoE op needs multiple `grid_dim.x` launches to cover the full
+  expert stride
+- our earlier helpers were launching `grid_dim=(1,1,1)`, which only exercised
+  shard 0
+
+Fix:
+
+- add `_moe_expert_grid_dim(...)`
+- use full expert-stride launch shapes for:
+  - `moe_w13_linear_layer`
+  - `moe_w2_linear_layer`
+
+Effect:
+
+- `w2` and final block-output error dropped from clearly broken to acceptably
+  small for the split-dense live block
+
+#### 2. Mirage SM90 MoE mask layout needed patching
+
+The generated SM90 MoE code was using `make_shape(num_experts)` for the expert
+mask layout even though the runtime contract stores the sentinel/count in
+`num_experts + 1`.
+
+Fix:
+
+- patch the generated CUDA source in `patch_generated_mirage_cuda_source(...)`
+  so the SM90 MoE mask layout uses `num_experts + 1`
+
+This did not solve the whole block by itself, but it removed one real
+codegen/runtime mismatch.
+
+#### 3. Some earlier "routing" and "activation" error measurements were
+not isolating the right thing
+
+Two comparisons were misleading:
+
+- reading `router_logits` after `moe_topk_softmax_routing_layer`
+  - Mirage's fused top-k kernel mutates/zeros the input buffer as part of the
+    workflow, so post-kernel `router_logits` is not a valid pre-topk reference
+- comparing activation output only against the full float reference path
+  - that mixes in upstream bf16 matmul drift instead of isolating the live
+    activation kernel itself
+
+Best practice:
+
+- compare routing outputs against the float reference from the same semantic
+  stage, but do not expect the raw logits input buffer to survive unchanged
+- compare activation both to the semantic float reference and to a stage-local
+  reference built from the live upstream tensors when isolating kernel quality
+
+### What is now genuinely passing
+
+Focused Mirage tests that now pass:
+
+- split-dense projection helper
+- split-dense MoE block helper
+- hybrid attention sublayer
+- PK attention block
+- PK attention sublayer
+
+Verified commands:
+
+- `bash -ic 'f1 && PYTHONPATH=$PWD:/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/common/mirage/python python3 -m pytest -q tests/unittest/auto_deploy/singlegpu/transformations/library/test_gemma4_mpk_layer.py -k "split_dense_projection or split_dense_block"'`
+  - result: `2 passed`
+- `bash -ic 'f1 && PYTHONPATH=$PWD:/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/common/mirage/python python3 -m pytest -q tests/unittest/auto_deploy/singlegpu/transformations/library/test_gemma4_mpk_layer.py -k "hybrid_attention_sublayer_single_token or attention_block_pk or attention_sublayer_pk"'`
+  - result: `3 passed`
+
+### First full live-layer attempt: current blocker
+
+The first synthetic full live layer helper was added:
+
+- `run_mirage_gemma_full_layer_split_dense_forward_correctness(...)`
+
+Current shape:
+
+- live attention sublayer
+- live dense FFN branch
+- live split-dense MoE branch
+- final `hidden_out = ffn_down + moe_reduce`
+
+What blocked first:
+
+- Mirage rejected the FFN GELU inputs due to non-canonical stride expectations
+  on size-1 leading dims
+
+Fix:
+
+- explicitly materialize packed destination tensors before calling the Mirage
+  GELU-mul kernel
+
+What blocks now:
+
+- the generic Mirage GELU-mul compile path inside the full-layer composition is
+  extremely slow / CPU-heavy
+- this currently looks like a compile-cost issue rather than the earlier fast
+  correctness failures
+
+Important interpretation:
+
+- the full-layer path is not numerically validated yet
+- but the blocker has moved from obvious wrong math to runtime/compile behavior
+  in the activation helper path
+
+### Current recommended next step
+
+Use the now-proven live attention block and live split-dense MoE block as the
+stable floor, then make the full-layer helper practical by removing or
+replacing the expensive generic activation compile path.
+
+Most likely directions:
+
+1. reuse a cached/proven Mirage activation kernel shape instead of triggering
+   fresh generic graph compilation inside the full-layer helper
+2. if needed, replace the activation helper with a compiled PK-friendly path
+   that Mirage handles more predictably
+3. only after the synthetic live full-layer helper finishes and is numerically
+   bounded should we wire the same structure into the real runtime path
