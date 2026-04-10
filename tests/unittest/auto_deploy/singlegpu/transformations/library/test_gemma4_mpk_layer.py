@@ -393,10 +393,10 @@ def test_mirage_linear_with_residual_pk_matches_reference_across_repeats():
                 "run_mirage_linear_with_residual_pk_forward_correctness; "
                 "result = run_mirage_linear_with_residual_pk_forward_correctness(); "
                 "print(result); "
-                "assert result['repeat_0_max_abs'] < 1.0; "
-                "assert result['repeat_0_mean_abs'] < 0.2; "
-                "assert result['repeat_1_max_abs'] < 1.0; "
-                "assert result['repeat_1_mean_abs'] < 0.2"
+                "assert result['repeat_0_max_abs'] < 0.01; "
+                "assert result['repeat_0_mean_abs'] < 0.001; "
+                "assert result['repeat_1_max_abs'] < 0.01; "
+                "assert result['repeat_1_mean_abs'] < 0.001"
             ),
         ],
         env=env,
@@ -407,6 +407,333 @@ def test_mirage_linear_with_residual_pk_matches_reference_across_repeats():
 
     assert proc.returncode == 0, proc.stderr
     assert "repeat_1_max_abs" in proc.stdout
+
+
+def test_mirage_hybrid_attention_sublayer_single_token_matches_reference_across_repeats():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_hybrid_attention_sublayer_forward_correctness; "
+                "result = run_mirage_hybrid_attention_sublayer_forward_correctness("
+                "num_tokens=1, repeats=2); "
+                "print(result); "
+                "assert result['repeat_0_qkv_max_abs'] < 0.03; "
+                "assert result['repeat_0_qkv_mean_abs'] < 0.005; "
+                "assert result['repeat_0_attn_max_abs'] < 0.005; "
+                "assert result['repeat_0_attn_mean_abs'] < 0.001; "
+                "assert result['repeat_0_block_max_abs'] < 0.01; "
+                "assert result['repeat_0_block_mean_abs'] < 0.002; "
+                "assert result['repeat_1_qkv_max_abs'] < 0.03; "
+                "assert result['repeat_1_qkv_mean_abs'] < 0.005; "
+                "assert result['repeat_1_attn_max_abs'] < 0.005; "
+                "assert result['repeat_1_attn_mean_abs'] < 0.001; "
+                "assert result['repeat_1_block_max_abs'] < 0.01; "
+                "assert result['repeat_1_block_mean_abs'] < 0.002"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "repeat_1_block_max_abs" in proc.stdout
+
+
+def test_mirage_attention_block_pk_matches_reference_across_repeats():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_attention_block_pk_forward_correctness; "
+                "result = run_mirage_attention_block_pk_forward_correctness(); "
+                "print(result); "
+                "assert result['repeat_0_attn_max_abs'] < 0.005; "
+                "assert result['repeat_0_attn_mean_abs'] < 0.001; "
+                "assert result['repeat_0_block_max_abs'] < 0.005; "
+                "assert result['repeat_0_block_mean_abs'] < 0.001; "
+                "assert result['repeat_1_attn_max_abs'] < 0.005; "
+                "assert result['repeat_1_attn_mean_abs'] < 0.001; "
+                "assert result['repeat_1_block_max_abs'] < 0.005; "
+                "assert result['repeat_1_block_mean_abs'] < 0.001"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "repeat_1_block_max_abs" in proc.stdout
+
+
+def test_mirage_attention_sublayer_pk_matches_reference_across_repeats():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_attention_sublayer_pk_forward_correctness; "
+                "result = run_mirage_attention_sublayer_pk_forward_correctness(); "
+                "print(result); "
+                "assert result['repeat_0_qkv_max_abs'] < 0.02; "
+                "assert result['repeat_0_qkv_mean_abs'] < 0.005; "
+                "assert result['repeat_0_attn_max_abs'] < 0.05; "
+                "assert result['repeat_0_attn_mean_abs'] < 0.01; "
+                "assert result['repeat_0_block_max_abs'] < 0.06; "
+                "assert result['repeat_0_block_mean_abs'] < 0.01; "
+                "assert result['repeat_1_qkv_max_abs'] < 0.02; "
+                "assert result['repeat_1_qkv_mean_abs'] < 0.005; "
+                "assert result['repeat_1_attn_max_abs'] < 0.05; "
+                "assert result['repeat_1_attn_mean_abs'] < 0.01; "
+                "assert result['repeat_1_block_max_abs'] < 0.06; "
+                "assert result['repeat_1_block_mean_abs'] < 0.01"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "repeat_1_block_max_abs" in proc.stdout
+
+
+def test_mirage_moe_silu_block_matches_reference():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_moe_silu_block_forward_correctness; "
+                "result = run_mirage_moe_silu_block_forward_correctness(); "
+                "print(result); "
+                "assert result['topk_weight_max_abs'] < 0.005; "
+                "assert result['topk_weight_mean_abs'] < 0.0002; "
+                "assert result['routing_overlap_count'] >= 7.0; "
+                "assert result['w2_max_abs'] < 0.03; "
+                "assert result['w2_mean_abs'] < 0.005; "
+                "assert result['out_max_abs'] < 0.01; "
+                "assert result['out_mean_abs'] < 0.002"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "routing_overlap_count" in proc.stdout
+
+
+def test_mirage_moe_gelu_split_block_matches_reference():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_moe_gelu_split_block_forward_correctness; "
+                "result = run_mirage_moe_gelu_split_block_forward_correctness(); "
+                "print(result); "
+                "assert result['topk_weight_max_abs'] < 0.005; "
+                "assert result['topk_weight_mean_abs'] < 0.0002; "
+                "assert result['routing_overlap_count'] >= 7.0; "
+                "assert result['act_max_abs'] < 0.06; "
+                "assert result['act_mean_abs'] < 0.005; "
+                "assert result['w2_max_abs'] < 0.03; "
+                "assert result['w2_mean_abs'] < 0.005; "
+                "assert result['out_max_abs'] < 0.01; "
+                "assert result['out_mean_abs'] < 0.002"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "routing_overlap_count" in proc.stdout
+
+
+def test_mirage_moe_gelu_split_dense_projection_matches_reference():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_moe_gelu_split_dense_projection_forward_correctness; "
+                "result = run_mirage_moe_gelu_split_dense_projection_forward_correctness(); "
+                "print(result); "
+                "assert result['post_attn_max_abs'] > 5.0; "
+                "assert result['post_attn_mean_abs'] > 1.0; "
+                "assert result['gate_max_abs'] < 0.02; "
+                "assert result['gate_mean_abs'] < 0.004; "
+                "assert result['up_max_abs'] < 0.02; "
+                "assert result['up_mean_abs'] < 0.004"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "post_attn_max_abs" in proc.stdout
+
+
+def test_mirage_moe_gelu_split_dense_block_matches_reference():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_moe_gelu_split_dense_block_forward_correctness; "
+                "result = run_mirage_moe_gelu_split_dense_block_forward_correctness(); "
+                "print(result); "
+                "assert result['topk_weight_max_abs'] < 0.005; "
+                "assert result['topk_weight_mean_abs'] < 0.002; "
+                "assert result['routing_overlap_count'] >= 7.0; "
+                "assert result['gate_max_abs'] < 0.02; "
+                "assert result['gate_mean_abs'] < 0.004; "
+                "assert result['up_max_abs'] < 0.02; "
+                "assert result['up_mean_abs'] < 0.004; "
+                "assert result['act_live_inputs_max_abs'] < 0.07; "
+                "assert result['act_live_inputs_mean_abs'] < 0.004; "
+                "assert result['w2_max_abs'] < 0.07; "
+                "assert result['w2_mean_abs'] < 0.006; "
+                "assert result['out_max_abs'] < 0.03; "
+                "assert result['out_mean_abs'] < 0.005"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "routing_overlap_count" in proc.stdout
 
 
 def test_gemma4_translated_attention_block_matches_reference():

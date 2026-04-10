@@ -29,6 +29,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -200,6 +201,57 @@ void norm_linear(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("norm_linear", &norm_linear, "attention qkv norm linear kernel");
+}
+"""
+
+_ATTN_QKV_NORM_LINEAR_SINGLE_TOKEN_WRAPPER_SOURCE = """
+#include "bfloat16.h"
+#include "norm_linear.cuh"
+#include "norm_linear_new.cuh"
+#include <cstdio>
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+
+using bfloat16 = type::bfloat16_t;
+
+template <typename T>
+__global__ void norm_linear_kernel_wrapper(
+    void const* input_ptr,
+    void const* norm_weight_ptr,
+    void const* weight_ptr,
+    float eps,
+    void* output_ptr) {
+  kernel::norm_linear_task_impl<T, 1, 768, 512, 768>(
+      input_ptr, norm_weight_ptr, weight_ptr, eps, output_ptr);
+}
+
+void norm_linear(
+    torch::Tensor input,
+    torch::Tensor norm_weight,
+    torch::Tensor weight,
+    torch::Tensor output,
+    float eps) {
+  dim3 grid_dim(1, 1, 1);
+  dim3 block_dim(128, 1, 1);
+  size_t smem_size = 1024 * 150;
+  cudaFuncSetAttribute(
+      norm_linear_kernel_wrapper<bfloat16>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      smem_size);
+  norm_linear_kernel_wrapper<bfloat16><<<grid_dim, block_dim, smem_size>>>(
+      input.data_ptr(),
+      norm_weight.data_ptr(),
+      weight.data_ptr(),
+      eps,
+      output.data_ptr());
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    printf("CUDA kernel launch error: %s\\n", cudaGetErrorString(err));
+  }
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("norm_linear", &norm_linear, "single-token attention qkv norm linear kernel");
 }
 """
 
@@ -492,6 +544,112 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 """
 
+_PAGED_ATTENTION_SINGLE_TOKEN_WRAPPER_SOURCE = """
+#include "bfloat16.h"
+#include "multitoken_paged_attention.cuh"
+#include <cstdio>
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+
+using bfloat16 = type::bfloat16_t;
+
+template <typename T>
+__global__ void multitoken_paged_attention_wrapper(
+    void const* qkv_ptr,
+    void* paged_k_cache_ptr,
+    void* paged_v_cache_ptr,
+    void* output_ptr,
+    int const* qo_indptr_buffer_ptr,
+    int const* paged_kv_indptr_buffer_ptr,
+    int const* paged_kv_indices_buffer_ptr,
+    int const* paged_kv_last_page_len_buffer_ptr,
+    int16_t request_id,
+    bool qk_norm,
+    bool rope,
+    void const* q_norm_weight_ptr,
+    void const* k_norm_weight_ptr,
+    void const* cos_ptr,
+    void const* sin_ptr,
+    float q_eps,
+    float k_eps) {
+  kernel::multitoken_paged_attention_task_impl<T, 4, 1, 128, 768, 512, 128, 512, 64, 1>(
+      qkv_ptr,
+      paged_k_cache_ptr,
+      paged_v_cache_ptr,
+      output_ptr,
+      qo_indptr_buffer_ptr,
+      paged_kv_indptr_buffer_ptr,
+      paged_kv_indices_buffer_ptr,
+      paged_kv_last_page_len_buffer_ptr,
+      request_id,
+      qk_norm,
+      rope,
+      q_norm_weight_ptr,
+      k_norm_weight_ptr,
+      cos_ptr,
+      sin_ptr,
+      q_eps,
+      k_eps);
+}
+
+void multitoken_paged_attention(
+    torch::Tensor qkv,
+    torch::Tensor paged_k_cache,
+    torch::Tensor paged_v_cache,
+    torch::Tensor output,
+    torch::Tensor qo_indptr_buffer,
+    torch::Tensor paged_kv_indptr_buffer,
+    torch::Tensor paged_kv_indices_buffer,
+    torch::Tensor paged_kv_last_page_len_buffer,
+    int16_t request_id,
+    bool qk_norm,
+    bool rope,
+    torch::optional<torch::Tensor> q_norm_weight = torch::nullopt,
+    torch::optional<torch::Tensor> k_norm_weight = torch::nullopt,
+    torch::optional<torch::Tensor> cos = torch::nullopt,
+    torch::optional<torch::Tensor> sin = torch::nullopt,
+    float q_eps = 0.0f,
+    float k_eps = 0.0f) {
+  dim3 grid_dim(1, 1, 1);
+  dim3 block_dim(128, 1, 1);
+  size_t smem_size = 88888;
+  void const* q_norm_weight_ptr = qk_norm ? q_norm_weight->data_ptr() : nullptr;
+  void const* k_norm_weight_ptr = qk_norm ? k_norm_weight->data_ptr() : nullptr;
+  void const* cos_ptr = rope ? cos->data_ptr() : nullptr;
+  void const* sin_ptr = rope ? sin->data_ptr() : nullptr;
+  cudaFuncSetAttribute(
+      multitoken_paged_attention_wrapper<bfloat16>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      smem_size);
+  multitoken_paged_attention_wrapper<bfloat16><<<grid_dim, block_dim, smem_size>>>(
+      qkv.data_ptr(),
+      paged_k_cache.data_ptr(),
+      paged_v_cache.data_ptr(),
+      output.data_ptr(),
+      qo_indptr_buffer.data_ptr<int>(),
+      paged_kv_indptr_buffer.data_ptr<int>(),
+      paged_kv_indices_buffer.data_ptr<int>(),
+      paged_kv_last_page_len_buffer.data_ptr<int>(),
+      request_id,
+      qk_norm,
+      rope,
+      q_norm_weight_ptr,
+      k_norm_weight_ptr,
+      cos_ptr,
+      sin_ptr,
+      q_eps,
+      k_eps);
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    printf("CUDA kernel launch error: %s\\n", cudaGetErrorString(err));
+  }
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("multitoken_paged_attention", &multitoken_paged_attention, "single-token paged attention kernel");
+}
+"""
+
 
 def _find_mirage_package_dir() -> Optional[Path]:
     for path_entry in sys.path:
@@ -628,6 +786,13 @@ def _load_mirage_attn_qkv_norm_linear_extension() -> Any:
     )
 
 
+def _load_mirage_attn_qkv_norm_linear_single_token_extension() -> Any:
+    return _load_mirage_runtime_extension(
+        name="ad_mirage_attn_qkv_norm_linear_single_token_rt",
+        source_text=_ATTN_QKV_NORM_LINEAR_SINGLE_TOKEN_WRAPPER_SOURCE,
+    )
+
+
 def _load_mirage_attention_sublayer_extension() -> Any:
     return _load_mirage_runtime_extension(
         name="ad_mirage_attention_sublayer_rt",
@@ -649,6 +814,13 @@ def _load_mirage_attention_extension() -> Any:
     )
 
 
+def _load_mirage_attention_single_token_extension() -> Any:
+    return _load_mirage_runtime_extension(
+        name="ad_mirage_attention_single_token_rt",
+        source_text=_PAGED_ATTENTION_SINGLE_TOKEN_WRAPPER_SOURCE,
+    )
+
+
 def patch_generated_mirage_cuda_source(cuda_code: str) -> str:
     """Patch known Mirage-generated CUDA source compatibility gaps.
 
@@ -658,17 +830,32 @@ def patch_generated_mirage_cuda_source(cuda_code: str) -> str:
     source locally before invoking ``nvcc``.
     """
 
-    if "norm_linear_task_impl" not in cuda_code:
-        return cuda_code
-
     anchor = '#include "persistent_kernel.cuh"\n'
     compat_headers = (
         '#include "persistent_kernel.cuh"\n'
         '#include "tasks/ampere/norm_linear.cuh"\n'
         '#include "tasks/ampere/norm_linear_new.cuh"\n'
     )
-    if anchor in cuda_code and "norm_linear_new.cuh" not in cuda_code:
-        return cuda_code.replace(anchor, compat_headers, 1)
+    if "norm_linear_task_impl" in cuda_code and "norm_linear_new.cuh" not in cuda_code:
+        if anchor in cuda_code:
+            cuda_code = cuda_code.replace(anchor, compat_headers, 1)
+
+    # Mirage's SM90 MoE linear task registration currently emits the expert-mask
+    # layout with ``num_experts`` entries even though the kernel reads the final
+    # ``num_experts`` slot as the "num activated experts" sentinel. Patch the
+    # generated SM90 callsites so the mask layout is sized to ``num_experts + 1``.
+    def _fix_sm90_moe_mask(match: re.Match[str]) -> str:
+        num_experts = int(match.group(2))
+        return f"{match.group(1)}{num_experts + 1}{match.group(3)}"
+
+    sm90_moe_mask_pattern = re.compile(
+        r"(cute::Layout layout_expert_mask =\s*cute::make_layout\(cute::make_shape\()"
+        r"(\d+)"
+        r"(\),\s*cute::make_stride\(cute::Int<1>\{\}\)\);\s*"
+        r"cute::Tensor mMask.*?kernel::moe_linear_sm90_task_impl)",
+        flags=re.DOTALL,
+    )
+    cuda_code = sm90_moe_mask_pattern.sub(_fix_sm90_moe_mask, cuda_code)
     return cuda_code
 
 
@@ -745,6 +932,16 @@ def compile_persistent_kernel_with_patches(
         num_remote_schedulers=pk.num_remote_schedulers,
         use_cutlass_kernel=pk.use_cutlass_kernel,
     )
+
+    # On Hopper, Mirage's default compile command includes both
+    # ``-arch=sm_90a`` and the explicit ``-gencode=arch=compute_90a,code=sm_90a``.
+    # With CUDA 13.1, that combination emits an extra ``compute_90`` PTX stream
+    # in addition to the desired ``compute_90a`` stream. Hopper-only WGMMA code
+    # in Mirage then fails during ptxas on the unintended ``sm_90`` PTX path.
+    # Keeping only the explicit ``compute_90a -> sm_90a`` gencode avoids the
+    # stray PTX target while preserving the intended Hopper cubin.
+    if pk.target_cc == 90:
+        cc_cmd = [arg for arg in cc_cmd if arg != "-arch=sm_90a"]
     subprocess.check_call(cc_cmd)
 
     spec = importlib.util.spec_from_file_location("__mirage_launcher", so_path)
@@ -1175,7 +1372,6 @@ def run_mirage_linear_with_residual_pk_forward_correctness(
         max_num_pages=8,
         page_size=64,
         use_cutlass_kernel=False,
-        target_cc_override=80,
     )
     linear_input = (torch.randn((4, 512), device="cuda", dtype=torch.bfloat16) / 8.0).contiguous()
     residual = (torch.randn((4, 512), device="cuda", dtype=torch.bfloat16) / 8.0).contiguous()
@@ -1234,7 +1430,6 @@ def run_mirage_rmsnorm_linear_pk_forward_correctness(
         max_num_pages=8,
         page_size=64,
         use_cutlass_kernel=False,
-        target_cc_override=80,
     )
     hidden_in = (torch.randn((1, 512), device="cuda", dtype=torch.bfloat16) / 8.0).contiguous()
     norm_weight = torch.ones((512,), device="cuda", dtype=torch.bfloat16)
@@ -1459,7 +1654,6 @@ def run_mirage_attention_sublayer_pk_forward_correctness(
         max_num_pages=max_num_pages,
         page_size=page_size,
         use_cutlass_kernel=False,
-        target_cc_override=80,
     )
     qo_indptr = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
     paged_kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
@@ -1600,7 +1794,22 @@ def run_mirage_attention_sublayer_pk_forward_correctness(
         pk()
         torch.cuda.synchronize()
         qkv_diff = (qkv_out.float() - qkv_ref).abs()
-        attn_diff = (attn_out.float() - ref_attn).abs()
+        post_k_cache = k_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+        post_v_cache = v_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+        ref_attn_live = _reference_multitoken_paged_attention(
+            q=qkv_out.float()[:, : qo_heads * head_dim].view(num_tokens, qo_heads, head_dim),
+            paged_k_cache=post_k_cache,
+            paged_v_cache=post_v_cache,
+            qo_heads=qo_heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            num_tokens=num_tokens,
+            paged_kv_indptr_buffer=paged_kv_indptr,
+            paged_kv_indices_buffer=paged_kv_indices,
+            paged_kv_last_page_len_buffer=paged_kv_last_page_len,
+        ).reshape(num_tokens, hidden_size)
+        attn_diff = (attn_out.float() - ref_attn_live).abs()
         if not torch.isfinite(block_out.float()).all():
             metrics[f"repeat_{repeat_idx}_qkv_max_abs"] = float(qkv_diff.max().item())
             metrics[f"repeat_{repeat_idx}_qkv_mean_abs"] = float(qkv_diff.mean().item())
@@ -1609,7 +1818,9 @@ def run_mirage_attention_sublayer_pk_forward_correctness(
             metrics[f"repeat_{repeat_idx}_block_max_abs"] = float("inf")
             metrics[f"repeat_{repeat_idx}_block_mean_abs"] = float("inf")
             continue
-        block_diff = (block_out.float() - ref_block).abs()
+        ref_block_live = ref_attn_live @ o_proj_weight.float().transpose(0, 1)
+        ref_block_live = ref_block_live + hidden_in.float()
+        block_diff = (block_out.float() - ref_block_live).abs()
         metrics[f"repeat_{repeat_idx}_qkv_max_abs"] = float(qkv_diff.max().item())
         metrics[f"repeat_{repeat_idx}_qkv_mean_abs"] = float(qkv_diff.mean().item())
         metrics[f"repeat_{repeat_idx}_attn_max_abs"] = float(attn_diff.max().item())
@@ -1645,7 +1856,6 @@ def run_mirage_attention_block_pk_forward_correctness(
         max_num_pages=max_num_pages,
         page_size=page_size,
         use_cutlass_kernel=False,
-        target_cc_override=80,
     )
     qo_indptr = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
     paged_kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
@@ -1756,19 +1966,1698 @@ def run_mirage_attention_block_pk_forward_correctness(
         block_out.zero_()
         pk()
         torch.cuda.synchronize()
-        attn_diff = (attn_out.float() - ref_attn).abs()
+        post_k_cache = k_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+        post_v_cache = v_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+        ref_attn_live = _reference_multitoken_paged_attention(
+            q=qkv_in.float()[:, : qo_heads * head_dim].view(num_tokens, qo_heads, head_dim),
+            paged_k_cache=post_k_cache,
+            paged_v_cache=post_v_cache,
+            qo_heads=qo_heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            num_tokens=num_tokens,
+            paged_kv_indptr_buffer=paged_kv_indptr,
+            paged_kv_indices_buffer=paged_kv_indices,
+            paged_kv_last_page_len_buffer=paged_kv_last_page_len,
+        ).reshape(num_tokens, hidden_size)
+        attn_diff = (attn_out.float() - ref_attn_live).abs()
         if not torch.isfinite(block_out.float()).all():
             metrics[f"repeat_{repeat_idx}_attn_max_abs"] = float(attn_diff.max().item())
             metrics[f"repeat_{repeat_idx}_attn_mean_abs"] = float(attn_diff.mean().item())
             metrics[f"repeat_{repeat_idx}_block_max_abs"] = float("inf")
             metrics[f"repeat_{repeat_idx}_block_mean_abs"] = float("inf")
             continue
-        block_diff = (block_out.float() - ref_block).abs()
+        ref_block_live = ref_attn_live @ o_proj_weight.float().transpose(0, 1)
+        ref_block_live = ref_block_live + residual.float()
+        block_diff = (block_out.float() - ref_block_live).abs()
         metrics[f"repeat_{repeat_idx}_attn_max_abs"] = float(attn_diff.max().item())
         metrics[f"repeat_{repeat_idx}_attn_mean_abs"] = float(attn_diff.mean().item())
         metrics[f"repeat_{repeat_idx}_block_max_abs"] = float(block_diff.max().item())
         metrics[f"repeat_{repeat_idx}_block_mean_abs"] = float(block_diff.mean().item())
     return metrics
+
+
+def run_mirage_moe_silu_block_forward_correctness(
+    *,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Run a live Mirage SiLU-style MoE block and compare against torch."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    num_experts = 128
+    topk = 8
+    batch = 1
+    hidden = 256
+    intermediate = 64
+
+    pk = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=batch,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+
+    hidden_in = torch.randn((batch, hidden), device="cuda", dtype=torch.bfloat16) / 8
+    router_weight = torch.randn((num_experts, hidden), device="cuda", dtype=torch.bfloat16) / 16
+    router_logits = torch.zeros((batch, num_experts), device="cuda", dtype=torch.bfloat16)
+    topk_weight = torch.zeros((batch, topk), device="cuda", dtype=torch.float32)
+    routing_indices = torch.zeros((num_experts, batch), device="cuda", dtype=torch.int32)
+    routing_mask = torch.zeros((num_experts + 1,), device="cuda", dtype=torch.int32)
+    moe_w13_weight = (
+        torch.randn((num_experts, 2 * intermediate, hidden), device="cuda", dtype=torch.bfloat16)
+        / 16
+    )
+    moe_w13_out = torch.zeros((batch, topk, 2 * intermediate), device="cuda", dtype=torch.bfloat16)
+    moe_act_out = torch.zeros((batch, topk, intermediate), device="cuda", dtype=torch.bfloat16)
+    moe_w2_weight = (
+        torch.randn((num_experts, hidden, intermediate), device="cuda", dtype=torch.bfloat16) / 16
+    )
+    moe_w2_out = torch.zeros((batch, topk, hidden), device="cuda", dtype=torch.bfloat16)
+    hidden_out = torch.zeros((batch, hidden), device="cuda", dtype=torch.bfloat16)
+
+    hidden_dt = pk.attach_input(hidden_in.contiguous(), name="dbg_moe_hidden")
+    router_weight_dt = pk.attach_input(router_weight.contiguous(), name="dbg_moe_router_weight")
+    router_logits_dt = pk.attach_input(router_logits, name="dbg_moe_router_logits")
+    topk_weight_dt = pk.attach_input(topk_weight, name="dbg_moe_topk_weight")
+    routing_indices_dt = pk.attach_input(routing_indices, name="dbg_moe_routing_indices")
+    routing_mask_dt = pk.attach_input(routing_mask, name="dbg_moe_routing_mask")
+    moe_w13_weight_dt = pk.attach_input(moe_w13_weight.contiguous(), name="dbg_moe_w13_weight")
+    moe_w13_out_dt = pk.attach_input(moe_w13_out, name="dbg_moe_w13_out")
+    moe_act_out_dt = pk.attach_input(moe_act_out, name="dbg_moe_act_out")
+    moe_w2_weight_dt = pk.attach_input(moe_w2_weight.contiguous(), name="dbg_moe_w2_weight")
+    moe_w2_out_dt = pk.attach_input(moe_w2_out, name="dbg_moe_w2_out")
+    hidden_out_dt = pk.attach_input(hidden_out, name="dbg_moe_hidden_out")
+
+    pk.linear_layer(
+        input=hidden_dt,
+        weight=router_weight_dt,
+        output=router_logits_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.moe_topk_softmax_routing_layer(
+        input=router_logits_dt,
+        output=(topk_weight_dt, routing_indices_dt, routing_mask_dt),
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.moe_w13_linear_layer(
+        input=hidden_dt,
+        weight=moe_w13_weight_dt,
+        moe_routing_indices=routing_indices_dt,
+        moe_mask=routing_mask_dt,
+        output=moe_w13_out_dt,
+        grid_dim=_moe_expert_grid_dim(pk, w13_linear=True),
+        block_dim=(128, 1, 1),
+    )
+    pk.moe_silu_mul_layer(
+        input=moe_w13_out_dt,
+        output=moe_act_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.moe_w2_linear_layer(
+        input=moe_act_out_dt,
+        weight=moe_w2_weight_dt,
+        moe_routing_indices=routing_indices_dt,
+        moe_mask=routing_mask_dt,
+        output=moe_w2_out_dt,
+        grid_dim=_moe_expert_grid_dim(pk, w13_linear=False),
+        block_dim=(128, 1, 1),
+    )
+    pk.moe_mul_sum_add_layer(
+        input=moe_w2_out_dt,
+        weight=topk_weight_dt,
+        residual=hidden_dt,
+        output=hidden_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(pk)
+    _reset_pk_runtime_state(pk, active_tokens=batch)
+    pk()
+    torch.cuda.synchronize()
+
+    if not all(
+        torch.isfinite(t.float()).all()
+        for t in (router_logits, topk_weight, moe_w13_out, moe_act_out, moe_w2_out, hidden_out)
+    ):
+        return {
+            "topk_weight_max_abs": float("inf"),
+            "topk_weight_mean_abs": float("inf"),
+            "routing_prefix_matches": -1.0,
+            "routing_overlap_count": -1.0,
+            "w2_max_abs": float("inf"),
+            "w2_mean_abs": float("inf"),
+            "out_max_abs": float("inf"),
+            "out_mean_abs": float("inf"),
+        }
+
+    ref_logits = hidden_in.float() @ router_weight.float().transpose(0, 1)
+    ref_topk_values, ref_topk_indices = torch.topk(ref_logits, k=topk, dim=-1)
+    ref_topk_weight = torch.softmax(ref_topk_values, dim=-1)
+
+    ref_moe_w13 = []
+    ref_moe_w2 = []
+    for batch_idx in range(batch):
+        w13_rows = []
+        w2_rows = []
+        for route_idx in range(topk):
+            expert_index = int(ref_topk_indices[batch_idx, route_idx].item())
+            expert_w13 = moe_w13_weight[expert_index].float()
+            expert_w2 = moe_w2_weight[expert_index].float()
+            w13_row = hidden_in[batch_idx].float() @ expert_w13.transpose(0, 1)
+            act_row = _expert_gated_activation(w13_row.unsqueeze(0), act_fn="silu").squeeze(0)
+            w2_row = act_row @ expert_w2.transpose(0, 1)
+            w13_rows.append(w13_row)
+            w2_rows.append(w2_row)
+        ref_moe_w13.append(torch.stack(w13_rows, dim=0))
+        ref_moe_w2.append(torch.stack(w2_rows, dim=0))
+    ref_moe_w13 = torch.stack(ref_moe_w13, dim=0)
+    ref_moe_act = _expert_gated_activation(ref_moe_w13, act_fn="silu")
+    ref_moe_w2 = torch.stack(ref_moe_w2, dim=0)
+    ref_hidden_out = (ref_moe_w2 * ref_topk_weight.unsqueeze(-1)).sum(dim=1) + hidden_in.float()
+
+    selected_experts = []
+    for expert_index in range(num_experts):
+        rank = int(routing_indices[expert_index, 0].item())
+        if rank != 0:
+            selected_experts.append((expert_index, rank))
+    selected_experts = sorted(selected_experts, key=lambda item: item[1])
+    selected_ids = [expert for expert, _ in selected_experts[:topk]]
+    ref_ids = ref_topk_indices[0].cpu().tolist()
+    prefix_matches = sum(
+        1 for actual_expert, ref_expert in zip(selected_ids, ref_ids) if actual_expert == ref_expert
+    )
+    overlap_count = len(set(selected_ids) & set(ref_ids))
+
+    topk_weight_diff = (topk_weight.float() - ref_topk_weight).abs()
+    moe_w2_diff = (moe_w2_out.float() - ref_moe_w2).abs()
+    hidden_out_diff = (hidden_out.float() - ref_hidden_out).abs()
+    return {
+        "topk_weight_max_abs": float(topk_weight_diff.max().item()),
+        "topk_weight_mean_abs": float(topk_weight_diff.mean().item()),
+        "routing_prefix_matches": float(prefix_matches),
+        "routing_overlap_count": float(overlap_count),
+        "w13_max_abs": float((moe_w13_out.float() - ref_moe_w13).abs().max().item()),
+        "w13_mean_abs": float((moe_w13_out.float() - ref_moe_w13).abs().mean().item()),
+        "act_max_abs": float((moe_act_out.float() - ref_moe_act).abs().max().item()),
+        "act_mean_abs": float((moe_act_out.float() - ref_moe_act).abs().mean().item()),
+        "w2_max_abs": float(moe_w2_diff.max().item()),
+        "w2_mean_abs": float(moe_w2_diff.mean().item()),
+        "out_max_abs": float(hidden_out_diff.max().item()),
+        "out_mean_abs": float(hidden_out_diff.mean().item()),
+    }
+
+
+def run_mirage_moe_gelu_split_block_forward_correctness(
+    *,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Run a live Gemma-style GELU-gated MoE block via split expert linears."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    import mirage
+
+    torch.manual_seed(seed)
+    num_experts = 128
+    topk = 8
+    batch = 1
+    hidden = 256
+    intermediate = 64
+
+    def _run_gelu_mul_kernel(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        graph = mirage.new_kernel_graph()
+        gate_in = graph.new_input(tuple(gate.shape), dtype=mirage.bfloat16)
+        up_in = graph.new_input(tuple(up.shape), dtype=mirage.bfloat16)
+        out = graph.mul(graph.gelu(gate_in), up_in)
+        graph.mark_output(out)
+        return graph(inputs=[gate, up], target_cc=90)[0]
+
+    hidden_in = torch.randn((batch, hidden), device="cuda", dtype=torch.bfloat16) / 8
+    router_weight = torch.randn((num_experts, hidden), device="cuda", dtype=torch.bfloat16) / 16
+    topk_weight = torch.zeros((batch, topk), device="cuda", dtype=torch.float32)
+    routing_indices = torch.zeros((num_experts, batch), device="cuda", dtype=torch.int32)
+    routing_mask = torch.zeros((num_experts + 1,), device="cuda", dtype=torch.int32)
+    gate_weight = (
+        torch.randn((num_experts, intermediate, hidden), device="cuda", dtype=torch.bfloat16) / 16
+    )
+    up_weight = (
+        torch.randn((num_experts, intermediate, hidden), device="cuda", dtype=torch.bfloat16) / 16
+    )
+    w2_weight = (
+        torch.randn((num_experts, hidden, intermediate), device="cuda", dtype=torch.bfloat16) / 16
+    )
+
+    gate_out = torch.zeros((batch, topk, intermediate), device="cuda", dtype=torch.bfloat16)
+    up_out = torch.zeros((batch, topk, intermediate), device="cuda", dtype=torch.bfloat16)
+    router_logits = torch.zeros((batch, num_experts), device="cuda", dtype=torch.bfloat16)
+
+    # Phase 1: routing plus separate gate/up expert projections.
+    phase1 = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=batch,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    hidden_dt = phase1.attach_input(hidden_in.contiguous(), name="dbg_moe_gelu_hidden")
+    router_weight_dt = phase1.attach_input(
+        router_weight.contiguous(), name="dbg_moe_gelu_router_weight"
+    )
+    router_logits_dt = phase1.attach_input(router_logits, name="dbg_moe_gelu_router_logits")
+    topk_weight_dt = phase1.attach_input(topk_weight, name="dbg_moe_gelu_topk_weight")
+    routing_indices_dt = phase1.attach_input(routing_indices, name="dbg_moe_gelu_routing_indices")
+    routing_mask_dt = phase1.attach_input(routing_mask, name="dbg_moe_gelu_routing_mask")
+    gate_weight_dt = phase1.attach_input(gate_weight.contiguous(), name="dbg_moe_gelu_gate_w")
+    up_weight_dt = phase1.attach_input(up_weight.contiguous(), name="dbg_moe_gelu_up_w")
+    gate_out_dt = phase1.attach_input(gate_out, name="dbg_moe_gelu_gate_out")
+    up_out_dt = phase1.attach_input(up_out, name="dbg_moe_gelu_up_out")
+    phase1.linear_layer(
+        input=hidden_dt,
+        weight=router_weight_dt,
+        output=router_logits_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    phase1.moe_topk_softmax_routing_layer(
+        input=router_logits_dt,
+        output=(topk_weight_dt, routing_indices_dt, routing_mask_dt),
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    phase1.moe_w13_linear_layer(
+        input=hidden_dt,
+        weight=gate_weight_dt,
+        moe_routing_indices=routing_indices_dt,
+        moe_mask=routing_mask_dt,
+        output=gate_out_dt,
+        grid_dim=_moe_expert_grid_dim(phase1, w13_linear=True),
+        block_dim=(128, 1, 1),
+    )
+    phase1.moe_w13_linear_layer(
+        input=hidden_dt,
+        weight=up_weight_dt,
+        moe_routing_indices=routing_indices_dt,
+        moe_mask=routing_mask_dt,
+        output=up_out_dt,
+        grid_dim=_moe_expert_grid_dim(phase1, w13_linear=True),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(phase1)
+    _reset_pk_runtime_state(phase1, active_tokens=batch)
+    phase1()
+    torch.cuda.synchronize()
+
+    gelu_out = _run_gelu_mul_kernel(gate_out.contiguous(), up_out.contiguous()).contiguous()
+
+    # Phase 2: expert output projection and reduction.
+    phase2 = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=batch,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    gelu_out_dt = phase2.attach_input(gelu_out, name="dbg_moe_gelu_act_out")
+    topk_weight_dt_2 = phase2.attach_input(topk_weight, name="dbg_moe_gelu_topk_weight_2")
+    routing_indices_dt_2 = phase2.attach_input(
+        routing_indices, name="dbg_moe_gelu_routing_indices_2"
+    )
+    routing_mask_dt_2 = phase2.attach_input(routing_mask, name="dbg_moe_gelu_routing_mask_2")
+    w2_weight_dt = phase2.attach_input(w2_weight.contiguous(), name="dbg_moe_gelu_w2_weight")
+    w2_out = torch.zeros((batch, topk, hidden), device="cuda", dtype=torch.bfloat16)
+    hidden_out = torch.zeros((batch, hidden), device="cuda", dtype=torch.bfloat16)
+    w2_out_dt = phase2.attach_input(w2_out, name="dbg_moe_gelu_w2_out")
+    hidden_residual_dt = phase2.attach_input(
+        hidden_in.contiguous(), name="dbg_moe_gelu_hidden_residual"
+    )
+    hidden_out_dt = phase2.attach_input(hidden_out, name="dbg_moe_gelu_hidden_out")
+    phase2.moe_w2_linear_layer(
+        input=gelu_out_dt,
+        weight=w2_weight_dt,
+        moe_routing_indices=routing_indices_dt_2,
+        moe_mask=routing_mask_dt_2,
+        output=w2_out_dt,
+        grid_dim=_moe_expert_grid_dim(phase2, w13_linear=False),
+        block_dim=(128, 1, 1),
+    )
+    phase2.moe_mul_sum_add_layer(
+        input=w2_out_dt,
+        weight=topk_weight_dt_2,
+        residual=hidden_residual_dt,
+        output=hidden_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(phase2)
+    _reset_pk_runtime_state(phase2, active_tokens=batch)
+    phase2()
+    torch.cuda.synchronize()
+
+    ref_logits = hidden_in.float() @ router_weight.float().transpose(0, 1)
+    ref_topk_values, ref_topk_indices = torch.topk(ref_logits, k=topk, dim=-1)
+    ref_topk_weight = torch.softmax(ref_topk_values, dim=-1)
+
+    ref_gate = []
+    ref_up = []
+    ref_gelu = []
+    ref_w2 = []
+    for batch_idx in range(batch):
+        gate_rows = []
+        up_rows = []
+        gelu_rows = []
+        w2_rows = []
+        for route_idx in range(topk):
+            expert_index = int(ref_topk_indices[batch_idx, route_idx].item())
+            gate_row = hidden_in[batch_idx].float() @ gate_weight[expert_index].float().transpose(
+                0, 1
+            )
+            up_row = hidden_in[batch_idx].float() @ up_weight[expert_index].float().transpose(0, 1)
+            gelu_row = F.gelu(gate_row) * up_row
+            w2_row = gelu_row @ w2_weight[expert_index].float().transpose(0, 1)
+            gate_rows.append(gate_row)
+            up_rows.append(up_row)
+            gelu_rows.append(gelu_row)
+            w2_rows.append(w2_row)
+        ref_gate.append(torch.stack(gate_rows, dim=0))
+        ref_up.append(torch.stack(up_rows, dim=0))
+        ref_gelu.append(torch.stack(gelu_rows, dim=0))
+        ref_w2.append(torch.stack(w2_rows, dim=0))
+    ref_gate = torch.stack(ref_gate, dim=0)
+    ref_up = torch.stack(ref_up, dim=0)
+    ref_gelu = torch.stack(ref_gelu, dim=0)
+    ref_w2 = torch.stack(ref_w2, dim=0)
+    ref_hidden_out = (ref_w2 * ref_topk_weight.unsqueeze(-1)).sum(dim=1) + hidden_in.float()
+
+    selected_experts = []
+    for expert_index in range(num_experts):
+        rank = int(routing_indices[expert_index, 0].item())
+        if rank != 0:
+            selected_experts.append((expert_index, rank))
+    selected_experts = sorted(selected_experts, key=lambda item: item[1])
+    selected_ids = [expert for expert, _ in selected_experts[:topk]]
+    ref_ids = ref_topk_indices[0].cpu().tolist()
+    prefix_matches = sum(
+        1 for actual_expert, ref_expert in zip(selected_ids, ref_ids) if actual_expert == ref_expert
+    )
+    overlap_count = len(set(selected_ids) & set(ref_ids))
+
+    return {
+        "topk_weight_max_abs": float((topk_weight.float() - ref_topk_weight).abs().max().item()),
+        "topk_weight_mean_abs": float((topk_weight.float() - ref_topk_weight).abs().mean().item()),
+        "routing_prefix_matches": float(prefix_matches),
+        "routing_overlap_count": float(overlap_count),
+        "gate_max_abs": float((gate_out.float() - ref_gate).abs().max().item()),
+        "gate_mean_abs": float((gate_out.float() - ref_gate).abs().mean().item()),
+        "up_max_abs": float((up_out.float() - ref_up).abs().max().item()),
+        "up_mean_abs": float((up_out.float() - ref_up).abs().mean().item()),
+        "act_max_abs": float((gelu_out.float() - ref_gelu).abs().max().item()),
+        "act_mean_abs": float((gelu_out.float() - ref_gelu).abs().mean().item()),
+        "w2_max_abs": float((w2_out.float() - ref_w2).abs().max().item()),
+        "w2_mean_abs": float((w2_out.float() - ref_w2).abs().mean().item()),
+        "out_max_abs": float((hidden_out.float() - ref_hidden_out).abs().max().item()),
+        "out_mean_abs": float((hidden_out.float() - ref_hidden_out).abs().mean().item()),
+    }
+
+
+def run_mirage_moe_gelu_split_dense_projection_forward_correctness(
+    *,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Run Gemma-style expert gate/up projections via dense Mirage linear tasks.
+
+    This targets the exact regime where ``moe_w13_linear_layer`` is currently
+    numerically unstable for Gemma-like attention-scale inputs. The purpose is
+    to validate a live Mirage fallback composition using the dense
+    ``linear_layer`` task, one expert at a time, in top-k rank order.
+    """
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    num_tokens = 1
+    hidden_size = 512
+    qo_heads = 4
+    kv_heads = 1
+    head_dim = 128
+    page_size = 64
+    max_num_pages = 64
+    num_experts = 128
+    topk = 8
+    intermediate = 64
+
+    # Build one attention-like residual stream so we test the actual regime that
+    # breaks the fused MoE expert kernel, rather than only tiny random inputs.
+    pk = create_test_persistent_kernel(
+        max_seq_length=512,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=num_tokens,
+        max_num_pages=max_num_pages,
+        page_size=page_size,
+        use_cutlass_kernel=False,
+    )
+    qo_indptr = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
+    paged_kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    paged_kv_indices = torch.arange(max_num_pages, device="cuda", dtype=torch.int32)
+    paged_kv_last_page_len = torch.tensor([8 + num_tokens], device="cuda", dtype=torch.int32)
+    pk.meta_tensors["qo_indptr_buffer"].zero_()
+    pk.meta_tensors["qo_indptr_buffer"][:2] = qo_indptr
+    pk.meta_tensors["paged_kv_indptr_buffer"].zero_()
+    pk.meta_tensors["paged_kv_indptr_buffer"][:2] = paged_kv_indptr
+    pk.meta_tensors["paged_kv_indices_buffer"].copy_(paged_kv_indices)
+    pk.meta_tensors["paged_kv_last_page_len_buffer"].fill_(8 + num_tokens)
+
+    hidden_in = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
+    attn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    qkv_weight = (
+        torch.randn(
+            ((qo_heads + 2 * kv_heads) * head_dim, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 16.0
+    )
+    q_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    k_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    cos = torch.ones((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    sin = torch.zeros((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    k_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    v_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    o_proj_weight = (
+        torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+
+    rmsnorm_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    qkv_out = torch.zeros(
+        (num_tokens, (qo_heads + 2 * kv_heads) * head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    attn_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    post_attn = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+
+    hidden_dt = pk.attach_input(hidden_in.contiguous(), name="dbg_split_dense_hidden")
+    attn_norm_dt = pk.attach_input(attn_norm_weight.contiguous(), name="dbg_split_dense_attn_norm")
+    qkv_weight_dt = pk.attach_input(qkv_weight.contiguous(), name="dbg_split_dense_qkv_weight")
+    rmsnorm_out_dt = pk.attach_input(rmsnorm_out, name="dbg_split_dense_rmsnorm_out")
+    qkv_out_dt = pk.attach_input(qkv_out, name="dbg_split_dense_qkv_out")
+    q_norm_dt = pk.attach_input(q_norm_weight.contiguous(), name="dbg_split_dense_q_norm")
+    k_norm_dt = pk.attach_input(k_norm_weight.contiguous(), name="dbg_split_dense_k_norm")
+    cos_dt = pk.attach_input(cos.contiguous(), name="dbg_split_dense_cos")
+    sin_dt = pk.attach_input(sin.contiguous(), name="dbg_split_dense_sin")
+    k_cache_dt = pk.attach_input(k_cache.contiguous(), name="dbg_split_dense_k_cache")
+    v_cache_dt = pk.attach_input(v_cache.contiguous(), name="dbg_split_dense_v_cache")
+    attn_out_dt = pk.attach_input(attn_out, name="dbg_split_dense_attn_out")
+    o_proj_weight_dt = pk.attach_input(o_proj_weight.contiguous(), name="dbg_split_dense_o_proj")
+    post_attn_dt = pk.attach_input(post_attn, name="dbg_split_dense_post_attn")
+
+    pk.rmsnorm_layer(
+        input=hidden_dt,
+        weight=attn_norm_dt,
+        output=rmsnorm_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_layer(
+        input=rmsnorm_out_dt,
+        weight=qkv_weight_dt,
+        output=qkv_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.paged_attention_layer(
+        input=qkv_out_dt,
+        k_cache=k_cache_dt,
+        v_cache=v_cache_dt,
+        q_norm=q_norm_dt,
+        k_norm=k_norm_dt,
+        cos_pos_embed=cos_dt,
+        sin_pos_embed=sin_dt,
+        output=attn_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_with_residual_layer(
+        input=attn_out_dt,
+        weight=o_proj_weight_dt,
+        residual=hidden_dt,
+        output=post_attn_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(pk)
+    _reset_pk_runtime_state(
+        pk,
+        active_tokens=num_tokens,
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=paged_kv_indptr,
+        paged_kv_indices=paged_kv_indices,
+        paged_kv_last_page_len=paged_kv_last_page_len,
+    )
+    pk()
+    torch.cuda.synchronize()
+
+    # Use the reference attention residual so we isolate expert-projection
+    # correctness from the already-accepted attention approximation.
+    qkv_variance = hidden_in.float().pow(2).mean(dim=-1, keepdim=True)
+    qkv_ref = (hidden_in.float() * torch.rsqrt(qkv_variance + 1e-5)) * attn_norm_weight.float()
+    qkv_ref = qkv_ref @ qkv_weight.float().transpose(0, 1)
+    torch_k_cache = k_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    torch_v_cache = v_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    q = qkv_ref[:, : qo_heads * head_dim].view(num_tokens, qo_heads, head_dim)
+    k = qkv_ref[:, qo_heads * head_dim : qo_heads * head_dim + kv_heads * head_dim]
+    v = qkv_ref[:, qo_heads * head_dim + kv_heads * head_dim :]
+    page_idx = int(paged_kv_indices[0].item())
+    page_offset = int(paged_kv_last_page_len[0].item()) - num_tokens
+    torch_k_cache[page_idx, page_offset : page_offset + num_tokens] = k
+    torch_v_cache[page_idx, page_offset : page_offset + num_tokens] = v
+    ref_attn = _reference_multitoken_paged_attention(
+        q=q,
+        paged_k_cache=torch_k_cache,
+        paged_v_cache=torch_v_cache,
+        qo_heads=qo_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        num_tokens=num_tokens,
+        paged_kv_indptr_buffer=paged_kv_indptr,
+        paged_kv_indices_buffer=paged_kv_indices,
+        paged_kv_last_page_len_buffer=paged_kv_last_page_len,
+    ).reshape(num_tokens, hidden_size)
+    post_attn_ref = (ref_attn @ o_proj_weight.float().transpose(0, 1) + hidden_in.float()).to(
+        torch.bfloat16
+    )
+
+    router_weight = (
+        torch.randn((num_experts, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+    gate_weight = (
+        torch.randn((num_experts, intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    up_weight = (
+        torch.randn((num_experts, intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    logits = post_attn_ref.float() @ router_weight.float().transpose(0, 1)
+    _, topk_indices = torch.topk(logits, k=topk, dim=-1)
+    experts = topk_indices[0].tolist()
+
+    expert_pk = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    expert_hidden_dt = expert_pk.attach_input(
+        post_attn_ref.contiguous(), name="dbg_split_dense_expert_hidden"
+    )
+    gate_outs = []
+    up_outs = []
+    for rank, expert in enumerate(experts):
+        gate_weight_dt = expert_pk.attach_input(
+            gate_weight[expert].contiguous(), name=f"dbg_split_dense_gate_w_{rank}"
+        )
+        up_weight_dt = expert_pk.attach_input(
+            up_weight[expert].contiguous(), name=f"dbg_split_dense_up_w_{rank}"
+        )
+        gate_out = torch.zeros((1, intermediate), device="cuda", dtype=torch.bfloat16)
+        up_out = torch.zeros((1, intermediate), device="cuda", dtype=torch.bfloat16)
+        gate_out_dt = expert_pk.attach_input(gate_out, name=f"dbg_split_dense_gate_out_{rank}")
+        up_out_dt = expert_pk.attach_input(up_out, name=f"dbg_split_dense_up_out_{rank}")
+        expert_pk.linear_layer(
+            input=expert_hidden_dt,
+            weight=gate_weight_dt,
+            output=gate_out_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        expert_pk.linear_layer(
+            input=expert_hidden_dt,
+            weight=up_weight_dt,
+            output=up_out_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        gate_outs.append(gate_out)
+        up_outs.append(up_out)
+
+    compile_persistent_kernel_with_patches(expert_pk)
+    _reset_pk_runtime_state(expert_pk, active_tokens=1)
+    expert_pk()
+    torch.cuda.synchronize()
+
+    gate_live = torch.stack([tensor[0].float() for tensor in gate_outs], dim=0).unsqueeze(0)
+    up_live = torch.stack([tensor[0].float() for tensor in up_outs], dim=0).unsqueeze(0)
+    gate_ref = torch.stack(
+        [
+            post_attn_ref[0].float() @ gate_weight[expert].float().transpose(0, 1)
+            for expert in experts
+        ],
+        dim=0,
+    ).unsqueeze(0)
+    up_ref = torch.stack(
+        [
+            post_attn_ref[0].float() @ up_weight[expert].float().transpose(0, 1)
+            for expert in experts
+        ],
+        dim=0,
+    ).unsqueeze(0)
+    return {
+        "post_attn_max_abs": float(post_attn_ref.float().abs().max().item()),
+        "post_attn_mean_abs": float(post_attn_ref.float().abs().mean().item()),
+        "gate_max_abs": float((gate_live - gate_ref).abs().max().item()),
+        "gate_mean_abs": float((gate_live - gate_ref).abs().mean().item()),
+        "up_max_abs": float((up_live - up_ref).abs().max().item()),
+        "up_mean_abs": float((up_live - up_ref).abs().mean().item()),
+    }
+
+
+def run_mirage_moe_split_dense_w2_reduce_forward_correctness(
+    *,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Run the second half of a split-dense Gemma-style MoE block live.
+
+    This validates the practical workaround path after the gate/up projections:
+    per-expert dense ``linear_layer`` calls for ``w2`` followed by the live
+    Mirage ``moe_mul_sum_add_layer`` reduction.
+    """
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    batch = 1
+    topk = 8
+    hidden = 512
+    intermediate = 64
+    num_experts = 128
+
+    experts = [3, 7, 12, 18, 44, 79, 95, 111]
+    act_in = torch.randn((batch, topk, intermediate), device="cuda", dtype=torch.bfloat16) / 8.0
+    topk_weight = torch.softmax(
+        torch.randn((batch, topk), device="cuda", dtype=torch.float32), dim=-1
+    )
+    residual = torch.randn((batch, hidden), device="cuda", dtype=torch.bfloat16) / 8.0
+    w2_weight = (
+        torch.randn((num_experts, hidden, intermediate), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+
+    phase = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    w2_outs = []
+    for rank, expert in enumerate(experts):
+        act_rank = torch.empty((batch, intermediate), device="cuda", dtype=torch.bfloat16)
+        act_rank.copy_(act_in[:, rank, :])
+        act_dt = phase.attach_input(act_rank, name=f"dbg_split_dense_w2_act_{rank}")
+        w2_weight_dt = phase.attach_input(
+            w2_weight[expert].contiguous(), name=f"dbg_split_dense_w2_w_{rank}"
+        )
+        w2_out = torch.zeros((batch, hidden), device="cuda", dtype=torch.bfloat16)
+        w2_out_dt = phase.attach_input(w2_out, name=f"dbg_split_dense_w2_out_{rank}")
+        phase.linear_layer(
+            input=act_dt,
+            weight=w2_weight_dt,
+            output=w2_out_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        w2_outs.append(w2_out)
+
+    compile_persistent_kernel_with_patches(phase)
+    _reset_pk_runtime_state(phase, active_tokens=1)
+    phase()
+    torch.cuda.synchronize()
+    w2_live = (
+        torch.stack([tensor[0].float() for tensor in w2_outs], dim=0).unsqueeze(0).contiguous()
+    )
+
+    reduce_pk = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    w2_live_dt = reduce_pk.attach_input(
+        w2_live.to(torch.bfloat16), name="dbg_split_dense_reduce_w2"
+    )
+    topk_weight_dt = reduce_pk.attach_input(topk_weight, name="dbg_split_dense_reduce_topk")
+    residual_dt = reduce_pk.attach_input(residual.contiguous(), name="dbg_split_dense_reduce_res")
+    out = torch.zeros((batch, hidden), device="cuda", dtype=torch.bfloat16)
+    out_dt = reduce_pk.attach_input(out, name="dbg_split_dense_reduce_out")
+    reduce_pk.moe_mul_sum_add_layer(
+        input=w2_live_dt,
+        weight=topk_weight_dt,
+        residual=residual_dt,
+        output=out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(reduce_pk)
+    _reset_pk_runtime_state(reduce_pk, active_tokens=1)
+    reduce_pk()
+    torch.cuda.synchronize()
+
+    w2_ref = torch.stack(
+        [
+            act_in[0, rank].float() @ w2_weight[expert].float().transpose(0, 1)
+            for rank, expert in enumerate(experts)
+        ],
+        dim=0,
+    ).unsqueeze(0)
+    out_ref = (w2_ref * topk_weight.unsqueeze(-1)).sum(dim=1) + residual.float()
+    return {
+        "w2_max_abs": float((w2_live - w2_ref).abs().max().item()),
+        "w2_mean_abs": float((w2_live - w2_ref).abs().mean().item()),
+        "out_max_abs": float((out.float() - out_ref).abs().max().item()),
+        "out_mean_abs": float((out.float() - out_ref).abs().mean().item()),
+    }
+
+
+def run_mirage_moe_gelu_split_dense_block_forward_correctness(
+    *,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Run a live Gemma-style MoE block with split-dense gate/up only.
+
+    This is the current best live Mirage composition for the Gemma decode path:
+    live routing, dense per-expert gate/up projections, live GELU*mul,
+    fused live ``moe_w2_linear_layer``, and live ``moe_mul_sum_add_layer``.
+    """
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    import mirage
+
+    torch.manual_seed(seed)
+    num_tokens = 1
+    hidden_size = 512
+    qo_heads = 4
+    kv_heads = 1
+    head_dim = 128
+    page_size = 64
+    max_num_pages = 64
+    num_experts = 128
+    topk = 8
+    intermediate = 64
+
+    def _run_gelu_mul_kernel(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        graph = mirage.new_kernel_graph()
+        gate_in = graph.new_input(tuple(gate.shape), dtype=mirage.bfloat16)
+        up_in = graph.new_input(tuple(up.shape), dtype=mirage.bfloat16)
+        out = graph.mul(graph.gelu(gate_in), up_in)
+        graph.mark_output(out)
+        return graph(inputs=[gate, up], target_cc=90)[0]
+
+    # Recreate the attention-scale residual stream used in the dense projection
+    # test so the MoE block sees the exact regime that breaks fused ``w13``.
+    pk = create_test_persistent_kernel(
+        max_seq_length=512,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=num_tokens,
+        max_num_pages=max_num_pages,
+        page_size=page_size,
+        use_cutlass_kernel=False,
+    )
+    qo_indptr = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
+    paged_kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    paged_kv_indices = torch.arange(max_num_pages, device="cuda", dtype=torch.int32)
+    paged_kv_last_page_len = torch.tensor([8 + num_tokens], device="cuda", dtype=torch.int32)
+    pk.meta_tensors["qo_indptr_buffer"].zero_()
+    pk.meta_tensors["qo_indptr_buffer"][:2] = qo_indptr
+    pk.meta_tensors["paged_kv_indptr_buffer"].zero_()
+    pk.meta_tensors["paged_kv_indptr_buffer"][:2] = paged_kv_indptr
+    pk.meta_tensors["paged_kv_indices_buffer"].copy_(paged_kv_indices)
+    pk.meta_tensors["paged_kv_last_page_len_buffer"].fill_(8 + num_tokens)
+
+    hidden_in = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
+    attn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    qkv_weight = (
+        torch.randn(
+            ((qo_heads + 2 * kv_heads) * head_dim, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 16.0
+    )
+    q_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    k_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    cos = torch.ones((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    sin = torch.zeros((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    k_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    v_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    o_proj_weight = (
+        torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+
+    rmsnorm_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    qkv_out = torch.zeros(
+        (num_tokens, (qo_heads + 2 * kv_heads) * head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    attn_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    post_attn = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+
+    hidden_dt = pk.attach_input(hidden_in.contiguous(), name="dbg_split_dense_block_hidden")
+    attn_norm_dt = pk.attach_input(
+        attn_norm_weight.contiguous(), name="dbg_split_dense_block_attn_norm"
+    )
+    qkv_weight_dt = pk.attach_input(
+        qkv_weight.contiguous(), name="dbg_split_dense_block_qkv_weight"
+    )
+    rmsnorm_out_dt = pk.attach_input(rmsnorm_out, name="dbg_split_dense_block_rmsnorm_out")
+    qkv_out_dt = pk.attach_input(qkv_out, name="dbg_split_dense_block_qkv_out")
+    q_norm_dt = pk.attach_input(q_norm_weight.contiguous(), name="dbg_split_dense_block_q_norm")
+    k_norm_dt = pk.attach_input(k_norm_weight.contiguous(), name="dbg_split_dense_block_k_norm")
+    cos_dt = pk.attach_input(cos.contiguous(), name="dbg_split_dense_block_cos")
+    sin_dt = pk.attach_input(sin.contiguous(), name="dbg_split_dense_block_sin")
+    k_cache_dt = pk.attach_input(k_cache.contiguous(), name="dbg_split_dense_block_k_cache")
+    v_cache_dt = pk.attach_input(v_cache.contiguous(), name="dbg_split_dense_block_v_cache")
+    attn_out_dt = pk.attach_input(attn_out, name="dbg_split_dense_block_attn_out")
+    o_proj_weight_dt = pk.attach_input(
+        o_proj_weight.contiguous(), name="dbg_split_dense_block_o_proj"
+    )
+    post_attn_dt = pk.attach_input(post_attn, name="dbg_split_dense_block_post_attn")
+
+    pk.rmsnorm_layer(
+        input=hidden_dt,
+        weight=attn_norm_dt,
+        output=rmsnorm_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_layer(
+        input=rmsnorm_out_dt,
+        weight=qkv_weight_dt,
+        output=qkv_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.paged_attention_layer(
+        input=qkv_out_dt,
+        k_cache=k_cache_dt,
+        v_cache=v_cache_dt,
+        q_norm=q_norm_dt,
+        k_norm=k_norm_dt,
+        cos_pos_embed=cos_dt,
+        sin_pos_embed=sin_dt,
+        output=attn_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_with_residual_layer(
+        input=attn_out_dt,
+        weight=o_proj_weight_dt,
+        residual=hidden_dt,
+        output=post_attn_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(pk)
+    _reset_pk_runtime_state(
+        pk,
+        active_tokens=num_tokens,
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=paged_kv_indptr,
+        paged_kv_indices=paged_kv_indices,
+        paged_kv_last_page_len=paged_kv_last_page_len,
+    )
+    pk()
+    torch.cuda.synchronize()
+
+    qkv_variance = hidden_in.float().pow(2).mean(dim=-1, keepdim=True)
+    qkv_ref = (hidden_in.float() * torch.rsqrt(qkv_variance + 1e-5)) * attn_norm_weight.float()
+    qkv_ref = qkv_ref @ qkv_weight.float().transpose(0, 1)
+    torch_k_cache = k_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    torch_v_cache = v_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    q = qkv_ref[:, : qo_heads * head_dim].view(num_tokens, qo_heads, head_dim)
+    k = qkv_ref[:, qo_heads * head_dim : qo_heads * head_dim + kv_heads * head_dim]
+    v = qkv_ref[:, qo_heads * head_dim + kv_heads * head_dim :]
+    page_idx = int(paged_kv_indices[0].item())
+    page_offset = int(paged_kv_last_page_len[0].item()) - num_tokens
+    torch_k_cache[page_idx, page_offset : page_offset + num_tokens] = k
+    torch_v_cache[page_idx, page_offset : page_offset + num_tokens] = v
+    ref_attn = _reference_multitoken_paged_attention(
+        q=q,
+        paged_k_cache=torch_k_cache,
+        paged_v_cache=torch_v_cache,
+        qo_heads=qo_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        num_tokens=num_tokens,
+        paged_kv_indptr_buffer=paged_kv_indptr,
+        paged_kv_indices_buffer=paged_kv_indices,
+        paged_kv_last_page_len_buffer=paged_kv_last_page_len,
+    ).reshape(num_tokens, hidden_size)
+    post_attn_ref = (ref_attn @ o_proj_weight.float().transpose(0, 1) + hidden_in.float()).to(
+        torch.bfloat16
+    )
+
+    router_weight = (
+        torch.randn((num_experts, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+    gate_weight = (
+        torch.randn((num_experts, intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    up_weight = (
+        torch.randn((num_experts, intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    w2_weight = (
+        torch.randn((num_experts, hidden_size, intermediate), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    router_logits = torch.zeros((num_tokens, num_experts), device="cuda", dtype=torch.bfloat16)
+    topk_weight = torch.zeros((num_tokens, topk), device="cuda", dtype=torch.float32)
+    routing_indices = torch.zeros((num_experts, num_tokens), device="cuda", dtype=torch.int32)
+    routing_mask = torch.zeros((num_experts + 1,), device="cuda", dtype=torch.int32)
+
+    # Phase 1: live routing.
+    router_pk = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    router_hidden_dt = router_pk.attach_input(
+        post_attn_ref.contiguous(), name="dbg_split_dense_block_router_hidden"
+    )
+    router_weight_dt = router_pk.attach_input(
+        router_weight.contiguous(), name="dbg_split_dense_block_router_weight"
+    )
+    router_logits_dt = router_pk.attach_input(
+        router_logits, name="dbg_split_dense_block_router_logits"
+    )
+    topk_weight_dt = router_pk.attach_input(topk_weight, name="dbg_split_dense_block_topk_weight")
+    routing_indices_dt = router_pk.attach_input(
+        routing_indices, name="dbg_split_dense_block_routing_indices"
+    )
+    routing_mask_dt = router_pk.attach_input(
+        routing_mask, name="dbg_split_dense_block_routing_mask"
+    )
+    router_pk.linear_layer(
+        input=router_hidden_dt,
+        weight=router_weight_dt,
+        output=router_logits_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    router_pk.moe_topk_softmax_routing_layer(
+        input=router_logits_dt,
+        output=(topk_weight_dt, routing_indices_dt, routing_mask_dt),
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(router_pk)
+    _reset_pk_runtime_state(router_pk, active_tokens=1)
+    router_pk()
+    torch.cuda.synchronize()
+
+    selected_experts = []
+    for expert_index in range(num_experts):
+        rank = int(routing_indices[expert_index, 0].item())
+        if rank != 0:
+            selected_experts.append((expert_index, rank))
+    selected_experts = sorted(selected_experts, key=lambda item: item[1])
+    experts = [expert for expert, _ in selected_experts[:topk]]
+
+    # Phase 2: dense gate/up expert projections.
+    expert_pk = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    expert_hidden_dt = expert_pk.attach_input(
+        post_attn_ref.contiguous(), name="dbg_split_dense_block_expert_hidden"
+    )
+    gate_outs = []
+    up_outs = []
+    for rank, expert in enumerate(experts):
+        gate_weight_dt = expert_pk.attach_input(
+            gate_weight[expert].contiguous(), name=f"dbg_split_dense_block_gate_w_{rank}"
+        )
+        up_weight_dt = expert_pk.attach_input(
+            up_weight[expert].contiguous(), name=f"dbg_split_dense_block_up_w_{rank}"
+        )
+        gate_out = torch.zeros((1, intermediate), device="cuda", dtype=torch.bfloat16)
+        up_out = torch.zeros((1, intermediate), device="cuda", dtype=torch.bfloat16)
+        gate_out_dt = expert_pk.attach_input(
+            gate_out, name=f"dbg_split_dense_block_gate_out_{rank}"
+        )
+        up_out_dt = expert_pk.attach_input(up_out, name=f"dbg_split_dense_block_up_out_{rank}")
+        expert_pk.linear_layer(
+            input=expert_hidden_dt,
+            weight=gate_weight_dt,
+            output=gate_out_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        expert_pk.linear_layer(
+            input=expert_hidden_dt,
+            weight=up_weight_dt,
+            output=up_out_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        gate_outs.append(gate_out)
+        up_outs.append(up_out)
+
+    compile_persistent_kernel_with_patches(expert_pk)
+    _reset_pk_runtime_state(expert_pk, active_tokens=1)
+    expert_pk()
+    torch.cuda.synchronize()
+
+    gate_live = torch.stack([tensor[0].float() for tensor in gate_outs], dim=0).unsqueeze(0)
+    up_live = torch.stack([tensor[0].float() for tensor in up_outs], dim=0).unsqueeze(0)
+    gelu_out = _run_gelu_mul_kernel(
+        gate_live.to(torch.bfloat16), up_live.to(torch.bfloat16)
+    ).contiguous()
+
+    # Phase 3: fused live w2 and reduction.
+    phase3 = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    gelu_out_dt = phase3.attach_input(gelu_out, name="dbg_split_dense_block_act_out")
+    topk_weight_dt_3 = phase3.attach_input(topk_weight, name="dbg_split_dense_block_topk_weight_3")
+    routing_indices_dt_3 = phase3.attach_input(
+        routing_indices, name="dbg_split_dense_block_routing_indices_3"
+    )
+    routing_mask_dt_3 = phase3.attach_input(
+        routing_mask, name="dbg_split_dense_block_routing_mask_3"
+    )
+    w2_weight_dt = phase3.attach_input(
+        w2_weight.contiguous(), name="dbg_split_dense_block_w2_weight"
+    )
+    w2_out = torch.zeros((num_tokens, topk, hidden_size), device="cuda", dtype=torch.bfloat16)
+    hidden_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    w2_out_dt = phase3.attach_input(w2_out, name="dbg_split_dense_block_w2_out")
+    hidden_residual_dt = phase3.attach_input(
+        post_attn_ref.contiguous(), name="dbg_split_dense_block_hidden_residual"
+    )
+    hidden_out_dt = phase3.attach_input(hidden_out, name="dbg_split_dense_block_hidden_out")
+    phase3.moe_w2_linear_layer(
+        input=gelu_out_dt,
+        weight=w2_weight_dt,
+        moe_routing_indices=routing_indices_dt_3,
+        moe_mask=routing_mask_dt_3,
+        output=w2_out_dt,
+        grid_dim=_moe_expert_grid_dim(phase3, w13_linear=False),
+        block_dim=(128, 1, 1),
+    )
+    phase3.moe_mul_sum_add_layer(
+        input=w2_out_dt,
+        weight=topk_weight_dt_3,
+        residual=hidden_residual_dt,
+        output=hidden_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(phase3)
+    _reset_pk_runtime_state(phase3, active_tokens=1)
+    phase3()
+    torch.cuda.synchronize()
+
+    live_router_logits = router_logits.float()
+    live_topk_values, live_topk_indices = torch.topk(live_router_logits, k=topk, dim=-1)
+    live_topk_weight = torch.softmax(live_topk_values, dim=-1)
+
+    ref_logits = post_attn_ref.float() @ router_weight.float().transpose(0, 1)
+    ref_topk_values, ref_topk_indices = torch.topk(ref_logits, k=topk, dim=-1)
+    ref_topk_weight = torch.softmax(ref_topk_values, dim=-1)
+    ref_ids = ref_topk_indices[0].cpu().tolist()
+
+    gate_ref = torch.stack(
+        [
+            post_attn_ref[0].float() @ gate_weight[expert].float().transpose(0, 1)
+            for expert in experts
+        ],
+        dim=0,
+    ).unsqueeze(0)
+    up_ref = torch.stack(
+        [
+            post_attn_ref[0].float() @ up_weight[expert].float().transpose(0, 1)
+            for expert in experts
+        ],
+        dim=0,
+    ).unsqueeze(0)
+    live_gelu_ref = (F.gelu(gate_live) * up_live).contiguous()
+    ref_gelu = (F.gelu(gate_ref) * up_ref).contiguous()
+    ref_w2 = torch.stack(
+        [
+            ref_gelu[0, rank].float() @ w2_weight[expert].float().transpose(0, 1)
+            for rank, expert in enumerate(experts)
+        ],
+        dim=0,
+    ).unsqueeze(0)
+    ref_hidden_out = (ref_w2 * topk_weight.unsqueeze(-1)).sum(dim=1) + post_attn_ref.float()
+
+    selected_ids = experts
+    prefix_matches = sum(
+        1 for actual_expert, ref_expert in zip(selected_ids, ref_ids) if actual_expert == ref_expert
+    )
+    overlap_count = len(set(selected_ids) & set(ref_ids))
+
+    return {
+        "post_attn_max_abs": float(post_attn_ref.float().abs().max().item()),
+        "post_attn_mean_abs": float(post_attn_ref.float().abs().mean().item()),
+        "topk_weight_live_logits_max_abs": float(
+            (topk_weight.float() - live_topk_weight).abs().max().item()
+        ),
+        "topk_weight_live_logits_mean_abs": float(
+            (topk_weight.float() - live_topk_weight).abs().mean().item()
+        ),
+        "routing_live_logits_prefix_matches": float(
+            sum(
+                1
+                for actual_expert, live_expert in zip(
+                    selected_ids, live_topk_indices[0].cpu().tolist()
+                )
+                if actual_expert == live_expert
+            )
+        ),
+        "routing_live_logits_overlap_count": float(
+            len(set(selected_ids) & set(live_topk_indices[0].cpu().tolist()))
+        ),
+        "topk_weight_max_abs": float((topk_weight.float() - ref_topk_weight).abs().max().item()),
+        "topk_weight_mean_abs": float((topk_weight.float() - ref_topk_weight).abs().mean().item()),
+        "routing_prefix_matches": float(prefix_matches),
+        "routing_overlap_count": float(overlap_count),
+        "gate_max_abs": float((gate_live - gate_ref).abs().max().item()),
+        "gate_mean_abs": float((gate_live - gate_ref).abs().mean().item()),
+        "up_max_abs": float((up_live - up_ref).abs().max().item()),
+        "up_mean_abs": float((up_live - up_ref).abs().mean().item()),
+        "act_live_inputs_max_abs": float((gelu_out.float() - live_gelu_ref).abs().max().item()),
+        "act_live_inputs_mean_abs": float((gelu_out.float() - live_gelu_ref).abs().mean().item()),
+        "act_max_abs": float((gelu_out.float() - ref_gelu).abs().max().item()),
+        "act_mean_abs": float((gelu_out.float() - ref_gelu).abs().mean().item()),
+        "w2_max_abs": float((w2_out.float() - ref_w2).abs().max().item()),
+        "w2_mean_abs": float((w2_out.float() - ref_w2).abs().mean().item()),
+        "out_max_abs": float((hidden_out.float() - ref_hidden_out).abs().max().item()),
+        "out_mean_abs": float((hidden_out.float() - ref_hidden_out).abs().mean().item()),
+    }
+
+
+def run_mirage_gemma_full_layer_split_dense_forward_correctness(
+    *,
+    eps: float = 1e-5,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Run a synthetic Gemma-style layer live through attention, FFN, and MoE."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    import mirage
+
+    torch.manual_seed(seed)
+    num_tokens = 1
+    hidden_size = 512
+    qo_heads = 4
+    kv_heads = 1
+    head_dim = 128
+    page_size = 64
+    max_num_pages = 64
+    num_experts = 128
+    topk = 8
+    intermediate = 64
+    ffn_intermediate = 64
+
+    def _run_gelu_mul_kernel(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        graph = mirage.new_kernel_graph()
+        gate_in = graph.new_input(tuple(gate.shape), dtype=mirage.bfloat16)
+        up_in = graph.new_input(tuple(up.shape), dtype=mirage.bfloat16)
+        out = graph.mul(graph.gelu(gate_in), up_in)
+        graph.mark_output(out)
+        return graph(inputs=[gate, up], target_cc=90)[0]
+
+    # Attention sublayer.
+    attn_pk = create_test_persistent_kernel(
+        max_seq_length=512,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=num_tokens,
+        max_num_pages=max_num_pages,
+        page_size=page_size,
+        use_cutlass_kernel=False,
+    )
+    qo_indptr = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
+    paged_kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    paged_kv_indices = torch.arange(max_num_pages, device="cuda", dtype=torch.int32)
+    paged_kv_last_page_len = torch.tensor([8 + num_tokens], device="cuda", dtype=torch.int32)
+
+    hidden_in = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
+    attn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    qkv_weight = (
+        torch.randn(
+            ((qo_heads + 2 * kv_heads) * head_dim, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 16.0
+    )
+    q_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    k_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    cos = torch.ones((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    sin = torch.zeros((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    k_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    v_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    o_proj_weight = (
+        torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+
+    rmsnorm_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    qkv_out = torch.zeros(
+        (num_tokens, (qo_heads + 2 * kv_heads) * head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    attn_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    post_attn = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+
+    hidden_dt = attn_pk.attach_input(hidden_in.contiguous(), name="full_layer_hidden")
+    attn_norm_dt = attn_pk.attach_input(attn_norm_weight.contiguous(), name="full_layer_attn_norm")
+    qkv_weight_dt = attn_pk.attach_input(qkv_weight.contiguous(), name="full_layer_qkv_weight")
+    rmsnorm_out_dt = attn_pk.attach_input(rmsnorm_out, name="full_layer_rmsnorm_out")
+    qkv_out_dt = attn_pk.attach_input(qkv_out, name="full_layer_qkv_out")
+    q_norm_dt = attn_pk.attach_input(q_norm_weight.contiguous(), name="full_layer_q_norm")
+    k_norm_dt = attn_pk.attach_input(k_norm_weight.contiguous(), name="full_layer_k_norm")
+    cos_dt = attn_pk.attach_input(cos.contiguous(), name="full_layer_cos")
+    sin_dt = attn_pk.attach_input(sin.contiguous(), name="full_layer_sin")
+    k_cache_dt = attn_pk.attach_input(k_cache.contiguous(), name="full_layer_k_cache")
+    v_cache_dt = attn_pk.attach_input(v_cache.contiguous(), name="full_layer_v_cache")
+    attn_out_dt = attn_pk.attach_input(attn_out, name="full_layer_attn_out")
+    o_proj_weight_dt = attn_pk.attach_input(o_proj_weight.contiguous(), name="full_layer_o_proj")
+    post_attn_dt = attn_pk.attach_input(post_attn, name="full_layer_post_attn")
+
+    attn_pk.rmsnorm_layer(
+        input=hidden_dt,
+        weight=attn_norm_dt,
+        output=rmsnorm_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    attn_pk.linear_layer(
+        input=rmsnorm_out_dt,
+        weight=qkv_weight_dt,
+        output=qkv_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    attn_pk.paged_attention_layer(
+        input=qkv_out_dt,
+        k_cache=k_cache_dt,
+        v_cache=v_cache_dt,
+        q_norm=q_norm_dt,
+        k_norm=k_norm_dt,
+        cos_pos_embed=cos_dt,
+        sin_pos_embed=sin_dt,
+        output=attn_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    attn_pk.linear_with_residual_layer(
+        input=attn_out_dt,
+        weight=o_proj_weight_dt,
+        residual=hidden_dt,
+        output=post_attn_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(attn_pk)
+    _reset_pk_runtime_state(
+        attn_pk,
+        active_tokens=num_tokens,
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=paged_kv_indptr,
+        paged_kv_indices=paged_kv_indices,
+        paged_kv_last_page_len=paged_kv_last_page_len,
+    )
+    attn_pk()
+    torch.cuda.synchronize()
+
+    qkv_variance = hidden_in.float().pow(2).mean(dim=-1, keepdim=True)
+    qkv_ref = (hidden_in.float() * torch.rsqrt(qkv_variance + eps)) * attn_norm_weight.float()
+    qkv_ref = qkv_ref @ qkv_weight.float().transpose(0, 1)
+    torch_k_cache = k_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    torch_v_cache = v_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    q = qkv_ref[:, : qo_heads * head_dim].view(num_tokens, qo_heads, head_dim)
+    k = qkv_ref[:, qo_heads * head_dim : qo_heads * head_dim + kv_heads * head_dim]
+    v = qkv_ref[:, qo_heads * head_dim + kv_heads * head_dim :]
+    page_idx = int(paged_kv_indices[0].item())
+    page_offset = int(paged_kv_last_page_len[0].item()) - num_tokens
+    torch_k_cache[page_idx, page_offset : page_offset + num_tokens] = k
+    torch_v_cache[page_idx, page_offset : page_offset + num_tokens] = v
+    ref_attn = _reference_multitoken_paged_attention(
+        q=q,
+        paged_k_cache=torch_k_cache,
+        paged_v_cache=torch_v_cache,
+        qo_heads=qo_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        num_tokens=num_tokens,
+        paged_kv_indptr_buffer=paged_kv_indptr,
+        paged_kv_indices_buffer=paged_kv_indices,
+        paged_kv_last_page_len_buffer=paged_kv_last_page_len,
+    ).reshape(num_tokens, hidden_size)
+    post_attn_ref = ref_attn @ o_proj_weight.float().transpose(0, 1) + hidden_in.float()
+    post_attn_live = post_attn.float()
+
+    # Dense FFN branch from live attention output.
+    ffn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    ffn_gate_up_weight = (
+        torch.randn((2 * ffn_intermediate, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+    ffn_down_weight = (
+        torch.randn((hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+
+    ffn_phase1 = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    ffn_hidden_dt = ffn_phase1.attach_input(
+        post_attn.detach().contiguous(), name="full_layer_ffn_hidden"
+    )
+    ffn_norm_dt = ffn_phase1.attach_input(ffn_norm_weight.contiguous(), name="full_layer_ffn_norm")
+    ffn_gate_up_weight_dt = ffn_phase1.attach_input(
+        ffn_gate_up_weight.contiguous(), name="full_layer_ffn_gate_up_weight"
+    )
+    ffn_normed = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_gate_up = torch.zeros(
+        (num_tokens, 2 * ffn_intermediate), device="cuda", dtype=torch.bfloat16
+    )
+    ffn_normed_dt = ffn_phase1.attach_input(ffn_normed, name="full_layer_ffn_normed")
+    ffn_gate_up_dt = ffn_phase1.attach_input(ffn_gate_up, name="full_layer_ffn_gate_up")
+    ffn_phase1.rmsnorm_layer(
+        input=ffn_hidden_dt,
+        weight=ffn_norm_dt,
+        output=ffn_normed_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    ffn_phase1.linear_layer(
+        input=ffn_normed_dt,
+        weight=ffn_gate_up_weight_dt,
+        output=ffn_gate_up_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(ffn_phase1)
+    _reset_pk_runtime_state(ffn_phase1, active_tokens=1)
+    ffn_phase1()
+    torch.cuda.synchronize()
+
+    ffn_gate_live, ffn_up_live = torch.chunk(ffn_gate_up, 2, dim=-1)
+    packed_ffn_gate = torch.empty(
+        (num_tokens, ffn_intermediate), device="cuda", dtype=torch.bfloat16
+    )
+    packed_ffn_up = torch.empty((num_tokens, ffn_intermediate), device="cuda", dtype=torch.bfloat16)
+    packed_ffn_gate.copy_(ffn_gate_live)
+    packed_ffn_up.copy_(ffn_up_live)
+    ffn_gate_live = packed_ffn_gate
+    ffn_up_live = packed_ffn_up
+    # The 3D MoE-shaped activation path compiles much faster than the 2D
+    # variant for this small FFN case, so route the FFN activation through the
+    # same kernel shape and squeeze it back.
+    ffn_act = _run_gelu_mul_kernel(ffn_gate_live.unsqueeze(1), ffn_up_live.unsqueeze(1))
+    ffn_act = ffn_act.squeeze(1).contiguous()
+
+    ffn_phase2 = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    ffn_act_dt = ffn_phase2.attach_input(ffn_act, name="full_layer_ffn_act")
+    ffn_down_weight_dt = ffn_phase2.attach_input(
+        ffn_down_weight.contiguous(), name="full_layer_ffn_down_weight"
+    )
+    ffn_down = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_down_dt = ffn_phase2.attach_input(ffn_down, name="full_layer_ffn_down")
+    ffn_phase2.linear_layer(
+        input=ffn_act_dt,
+        weight=ffn_down_weight_dt,
+        output=ffn_down_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(ffn_phase2)
+    _reset_pk_runtime_state(ffn_phase2, active_tokens=1)
+    ffn_phase2()
+    torch.cuda.synchronize()
+
+    ffn_norm_ref = _rms_norm(post_attn_live, ffn_norm_weight, eps=eps)
+    ffn_gate_up_ref = ffn_norm_ref @ ffn_gate_up_weight.float().transpose(0, 1)
+    ffn_gate_ref, ffn_up_ref = torch.chunk(ffn_gate_up_ref, 2, dim=-1)
+    ffn_down_ref = (F.gelu(ffn_gate_ref) * ffn_up_ref) @ ffn_down_weight.float().transpose(0, 1)
+
+    # MoE branch from the same live attention output.
+    router_weight = (
+        torch.randn((num_experts, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+    gate_weight = (
+        torch.randn((num_experts, intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    up_weight = (
+        torch.randn((num_experts, intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    w2_weight = (
+        torch.randn((num_experts, hidden_size, intermediate), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    router_logits = torch.zeros((num_tokens, num_experts), device="cuda", dtype=torch.bfloat16)
+    topk_weight = torch.zeros((num_tokens, topk), device="cuda", dtype=torch.float32)
+    routing_indices = torch.zeros((num_experts, num_tokens), device="cuda", dtype=torch.int32)
+    routing_mask = torch.zeros((num_experts + 1,), device="cuda", dtype=torch.int32)
+
+    router_pk = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    router_hidden_dt = router_pk.attach_input(
+        post_attn.detach().contiguous(), name="full_layer_router_hidden"
+    )
+    router_weight_dt = router_pk.attach_input(
+        router_weight.contiguous(), name="full_layer_router_weight"
+    )
+    router_logits_dt = router_pk.attach_input(router_logits, name="full_layer_router_logits")
+    topk_weight_dt = router_pk.attach_input(topk_weight, name="full_layer_topk_weight")
+    routing_indices_dt = router_pk.attach_input(routing_indices, name="full_layer_routing_indices")
+    routing_mask_dt = router_pk.attach_input(routing_mask, name="full_layer_routing_mask")
+    router_pk.linear_layer(
+        input=router_hidden_dt,
+        weight=router_weight_dt,
+        output=router_logits_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    router_pk.moe_topk_softmax_routing_layer(
+        input=router_logits_dt,
+        output=(topk_weight_dt, routing_indices_dt, routing_mask_dt),
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(router_pk)
+    _reset_pk_runtime_state(router_pk, active_tokens=1)
+    router_pk()
+    torch.cuda.synchronize()
+
+    selected_experts = []
+    for expert_index in range(num_experts):
+        rank = int(routing_indices[expert_index, 0].item())
+        if rank != 0:
+            selected_experts.append((expert_index, rank))
+    selected_experts = sorted(selected_experts, key=lambda item: item[1])
+    experts = [expert for expert, _ in selected_experts[:topk]]
+
+    expert_pk = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    expert_hidden_dt = expert_pk.attach_input(
+        post_attn.detach().contiguous(), name="full_layer_expert_hidden"
+    )
+    gate_outs = []
+    up_outs = []
+    for rank, expert in enumerate(experts):
+        gate_weight_dt = expert_pk.attach_input(
+            gate_weight[expert].contiguous(), name=f"full_layer_gate_w_{rank}"
+        )
+        up_weight_dt = expert_pk.attach_input(
+            up_weight[expert].contiguous(), name=f"full_layer_up_w_{rank}"
+        )
+        gate_out = torch.zeros((1, intermediate), device="cuda", dtype=torch.bfloat16)
+        up_out = torch.zeros((1, intermediate), device="cuda", dtype=torch.bfloat16)
+        gate_out_dt = expert_pk.attach_input(gate_out, name=f"full_layer_gate_out_{rank}")
+        up_out_dt = expert_pk.attach_input(up_out, name=f"full_layer_up_out_{rank}")
+        expert_pk.linear_layer(
+            input=expert_hidden_dt,
+            weight=gate_weight_dt,
+            output=gate_out_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        expert_pk.linear_layer(
+            input=expert_hidden_dt,
+            weight=up_weight_dt,
+            output=up_out_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        gate_outs.append(gate_out)
+        up_outs.append(up_out)
+
+    compile_persistent_kernel_with_patches(expert_pk)
+    _reset_pk_runtime_state(expert_pk, active_tokens=1)
+    expert_pk()
+    torch.cuda.synchronize()
+
+    gate_live = torch.stack([tensor[0].float() for tensor in gate_outs], dim=0).unsqueeze(0)
+    up_live = torch.stack([tensor[0].float() for tensor in up_outs], dim=0).unsqueeze(0)
+    moe_gate_in = torch.empty((num_tokens, topk, intermediate), device="cuda", dtype=torch.bfloat16)
+    moe_up_in = torch.empty((num_tokens, topk, intermediate), device="cuda", dtype=torch.bfloat16)
+    moe_gate_in.copy_(gate_live.to(torch.bfloat16))
+    moe_up_in.copy_(up_live.to(torch.bfloat16))
+    moe_act = _run_gelu_mul_kernel(moe_gate_in, moe_up_in).contiguous()
+
+    phase3 = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    moe_act_dt = phase3.attach_input(moe_act, name="full_layer_moe_act")
+    topk_weight_dt_3 = phase3.attach_input(topk_weight, name="full_layer_topk_weight_3")
+    routing_indices_dt_3 = phase3.attach_input(routing_indices, name="full_layer_routing_indices_3")
+    routing_mask_dt_3 = phase3.attach_input(routing_mask, name="full_layer_routing_mask_3")
+    w2_weight_dt = phase3.attach_input(w2_weight.contiguous(), name="full_layer_w2_weight")
+    w2_out = torch.zeros((num_tokens, topk, hidden_size), device="cuda", dtype=torch.bfloat16)
+    hidden_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    w2_out_dt = phase3.attach_input(w2_out, name="full_layer_w2_out")
+    ffn_down_dt = phase3.attach_input(
+        ffn_down.detach().contiguous(), name="full_layer_ffn_residual"
+    )
+    hidden_out_dt = phase3.attach_input(hidden_out, name="full_layer_hidden_out")
+    phase3.moe_w2_linear_layer(
+        input=moe_act_dt,
+        weight=w2_weight_dt,
+        moe_routing_indices=routing_indices_dt_3,
+        moe_mask=routing_mask_dt_3,
+        output=w2_out_dt,
+        grid_dim=_moe_expert_grid_dim(phase3, w13_linear=False),
+        block_dim=(128, 1, 1),
+    )
+    phase3.moe_mul_sum_add_layer(
+        input=w2_out_dt,
+        weight=topk_weight_dt_3,
+        residual=ffn_down_dt,
+        output=hidden_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(phase3)
+    _reset_pk_runtime_state(phase3, active_tokens=1)
+    phase3()
+    torch.cuda.synchronize()
+
+    ref_logits = post_attn_live @ router_weight.float().transpose(0, 1)
+    ref_topk_values, ref_topk_indices = torch.topk(ref_logits, k=topk, dim=-1)
+    ref_topk_weight = torch.softmax(ref_topk_values, dim=-1)
+    ref_ids = ref_topk_indices[0].cpu().tolist()
+    gate_ref = torch.stack(
+        [post_attn_live[0] @ gate_weight[expert].float().transpose(0, 1) for expert in experts],
+        dim=0,
+    ).unsqueeze(0)
+    up_ref = torch.stack(
+        [post_attn_live[0] @ up_weight[expert].float().transpose(0, 1) for expert in experts],
+        dim=0,
+    ).unsqueeze(0)
+    ref_moe_act = (F.gelu(gate_ref) * up_ref).contiguous()
+    ref_w2 = torch.stack(
+        [
+            ref_moe_act[0, rank] @ w2_weight[expert].float().transpose(0, 1)
+            for rank, expert in enumerate(experts)
+        ],
+        dim=0,
+    ).unsqueeze(0)
+    ref_hidden_out = (ref_w2 * ref_topk_weight.unsqueeze(-1)).sum(dim=1) + ffn_down_ref
+
+    return {
+        "post_attn_max_abs": float((post_attn_live - post_attn_ref).abs().max().item()),
+        "post_attn_mean_abs": float((post_attn_live - post_attn_ref).abs().mean().item()),
+        "ffn_down_max_abs": float((ffn_down.float() - ffn_down_ref).abs().max().item()),
+        "ffn_down_mean_abs": float((ffn_down.float() - ffn_down_ref).abs().mean().item()),
+        "topk_weight_max_abs": float((topk_weight.float() - ref_topk_weight).abs().max().item()),
+        "topk_weight_mean_abs": float((topk_weight.float() - ref_topk_weight).abs().mean().item()),
+        "routing_overlap_count": float(len(set(experts) & set(ref_ids))),
+        "moe_act_max_abs": float((moe_act.float() - ref_moe_act).abs().max().item()),
+        "moe_act_mean_abs": float((moe_act.float() - ref_moe_act).abs().mean().item()),
+        "w2_max_abs": float((w2_out.float() - ref_w2).abs().max().item()),
+        "w2_mean_abs": float((w2_out.float() - ref_w2).abs().mean().item()),
+        "hidden_out_max_abs": float((hidden_out.float() - ref_hidden_out).abs().max().item()),
+        "hidden_out_mean_abs": float((hidden_out.float() - ref_hidden_out).abs().mean().item()),
+    }
 
 
 def run_mirage_hybrid_attention_sublayer_forward_correctness(
@@ -1790,8 +3679,12 @@ def run_mirage_hybrid_attention_sublayer_forward_correctness(
         raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
 
     torch.manual_seed(seed)
-    qkv_module = _load_mirage_attn_qkv_norm_linear_extension()
-    attn_module = _load_mirage_attention_extension()
+    if num_tokens == 1:
+        qkv_module = _load_mirage_attn_qkv_norm_linear_single_token_extension()
+        attn_module = _load_mirage_attention_single_token_extension()
+    else:
+        qkv_module = _load_mirage_attn_qkv_norm_linear_extension()
+        attn_module = _load_mirage_attention_extension()
 
     hidden_size = 512
     qo_heads = 4
@@ -1841,7 +3734,6 @@ def run_mirage_hybrid_attention_sublayer_forward_correctness(
         max_num_pages=8,
         page_size=64,
         use_cutlass_kernel=False,
-        target_cc_override=80,
     )
     linear_input = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
     residual = hidden_in.clone().contiguous()
@@ -2057,6 +3949,21 @@ def _reset_pk_runtime_state(
         pk.init_request_func()
 
 
+def _moe_expert_grid_dim(pk, *, w13_linear: bool) -> tuple[int, int, int]:
+    """Return the grid shape needed to cover all expert-offset shards.
+
+    Mirage's MoE kernels shard activated experts by ``task_metadata.expert_offset``
+    using a target-specific expert stride. Launch ``grid_dim.x`` to cover that
+    full stride so a single logical MoE op computes all expert shards.
+    """
+
+    if getattr(pk, "target_cc", None) == 90:
+        expert_stride = 5 if w13_linear else 4
+    else:
+        expert_stride = 10 if w13_linear else 8
+    return (expert_stride, 1, 1)
+
+
 def build_gemma_mirage_runtime_callable(
     translation_plan: Dict[str, Any],
 ) -> Callable[..., Any]:
@@ -2194,8 +4101,10 @@ def _build_test_tensor_registry(pk) -> Dict[str, Any]:
         torch.zeros((8, 8), dtype=torch.bfloat16, device="cuda"), name="bridge_router_weight"
     )
     registry["router_logits"] = pk.new_tensor((4, 8), name="bridge_router_logits")
-    registry["topk_weight"] = pk.new_tensor((4, 2), name="bridge_topk_weight")
-    registry["routing_indices"] = pk.new_tensor((2, 4), name="bridge_routing_indices")
+    registry["topk_weight"] = pk.attach_input(
+        torch.zeros((4, 2), dtype=torch.float32, device="cuda"), name="bridge_topk_weight"
+    )
+    registry["routing_indices"] = pk.new_tensor((8, 4), name="bridge_routing_indices")
     registry["routing_mask"] = pk.new_tensor((9,), name="bridge_routing_mask")
 
     registry["moe_weight_w13"] = pk.attach_input(
@@ -2301,7 +4210,7 @@ def exercise_layer_plan_against_mirage(
                 moe_routing_indices=tensors["routing_indices"],
                 moe_mask=tensors["routing_mask"],
                 output=tensors["moe_w13_out"],
-                grid_dim=(1, 1, 1),
+                grid_dim=_moe_expert_grid_dim(pk, w13_linear=True),
                 block_dim=(128, 1, 1),
             )
         elif step.name == "moe_activation":
@@ -2318,7 +4227,7 @@ def exercise_layer_plan_against_mirage(
                 moe_routing_indices=tensors["routing_indices"],
                 moe_mask=tensors["routing_mask"],
                 output=tensors["moe_w2_out"],
-                grid_dim=(1, 1, 1),
+                grid_dim=_moe_expert_grid_dim(pk, w13_linear=False),
                 block_dim=(128, 1, 1),
             )
         elif step.name == "moe_reduce":
@@ -2431,8 +4340,10 @@ def exercise_mirage_task_registration() -> Dict[str, Any]:
         block_dim=(128, 1, 1),
     )
 
-    topk_weight = pk.new_tensor((4, 2), name="bridge_topk_weight")
-    routing_indices = pk.new_tensor((2, 4), name="bridge_routing_indices")
+    topk_weight = pk.attach_input(
+        torch.zeros((4, 2), dtype=torch.float32, device="cuda"), name="bridge_topk_weight"
+    )
+    routing_indices = pk.new_tensor((8, 4), name="bridge_routing_indices")
     routing_mask = pk.new_tensor((9,), name="bridge_routing_mask")
     pk.moe_topk_softmax_routing_layer(
         input=router_logits,
@@ -2451,7 +4362,7 @@ def exercise_mirage_task_registration() -> Dict[str, Any]:
         moe_routing_indices=routing_indices,
         moe_mask=routing_mask,
         output=moe_w13_out,
-        grid_dim=(1, 1, 1),
+        grid_dim=_moe_expert_grid_dim(pk, w13_linear=True),
         block_dim=(128, 1, 1),
     )
 
@@ -2473,7 +4384,7 @@ def exercise_mirage_task_registration() -> Dict[str, Any]:
         moe_routing_indices=routing_indices,
         moe_mask=routing_mask,
         output=moe_w2_out,
-        grid_dim=(1, 1, 1),
+        grid_dim=_moe_expert_grid_dim(pk, w13_linear=False),
         block_dim=(128, 1, 1),
     )
 
