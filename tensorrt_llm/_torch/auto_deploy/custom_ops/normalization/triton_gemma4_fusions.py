@@ -494,9 +494,9 @@ def _qkv_norm_kernel(
 
     w_q = tl.load(q_w_ptr + offs, mask=mask & is_q, other=0.0).to(tl.float32)
     w_k = tl.load(k_w_ptr + offs, mask=mask & is_k, other=0.0).to(tl.float32)
-    # v_norm uses weight=ones (no learned scale); default other=1.0 applies the
-    # identity scale for inactive regions, but only the v rows write output.
-    w_v = tl.load(v_w_ptr + offs, mask=mask & ~is_q & ~is_k, other=1.0).to(tl.float32)
+    # other=0.0 for non-v rows: v_w contributes 0 to w so it does not corrupt
+    # w_q or w_k.  For v rows the actual weight is loaded (all-ones for Gemma4).
+    w_v = tl.load(v_w_ptr + offs, mask=mask & ~is_q & ~is_k, other=0.0).to(tl.float32)
     w = w_q + w_k + w_v
 
     var = tl.sum(x * x) / H
