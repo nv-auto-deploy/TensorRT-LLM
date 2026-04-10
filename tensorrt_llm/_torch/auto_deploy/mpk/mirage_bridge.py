@@ -152,6 +152,240 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 """
 
+_ATTN_QKV_NORM_LINEAR_WRAPPER_SOURCE = """
+#include "bfloat16.h"
+#include "norm_linear.cuh"
+#include "norm_linear_new.cuh"
+#include <cstdio>
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+
+using bfloat16 = type::bfloat16_t;
+
+template <typename T>
+__global__ void norm_linear_kernel_wrapper(
+    void const* input_ptr,
+    void const* norm_weight_ptr,
+    void const* weight_ptr,
+    float eps,
+    void* output_ptr) {
+  kernel::norm_linear_task_impl<T, 4, 768, 512, 768>(
+      input_ptr, norm_weight_ptr, weight_ptr, eps, output_ptr);
+}
+
+void norm_linear(
+    torch::Tensor input,
+    torch::Tensor norm_weight,
+    torch::Tensor weight,
+    torch::Tensor output,
+    float eps) {
+  dim3 grid_dim(1, 1, 1);
+  dim3 block_dim(128, 1, 1);
+  size_t smem_size = 1024 * 150;
+  cudaFuncSetAttribute(
+      norm_linear_kernel_wrapper<bfloat16>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      smem_size);
+  norm_linear_kernel_wrapper<bfloat16><<<grid_dim, block_dim, smem_size>>>(
+      input.data_ptr(),
+      norm_weight.data_ptr(),
+      weight.data_ptr(),
+      eps,
+      output.data_ptr());
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    printf("CUDA kernel launch error: %s\\n", cudaGetErrorString(err));
+  }
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("norm_linear", &norm_linear, "attention qkv norm linear kernel");
+}
+"""
+
+_ATTENTION_SUBLAYER_WRAPPER_SOURCE = """
+#include "bfloat16.h"
+#include "linear.cuh"
+#include "multitoken_paged_attention.cuh"
+#include "norm_linear.cuh"
+#include "norm_linear_new.cuh"
+#include <cstdio>
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+
+using bfloat16 = type::bfloat16_t;
+
+template <typename T>
+__global__ void qkv_norm_linear_kernel_wrapper(
+    void const* input_ptr,
+    void const* norm_weight_ptr,
+    void const* weight_ptr,
+    float eps,
+    void* output_ptr) {
+  kernel::norm_linear_task_impl<T, 4, 768, 512, 768>(
+      input_ptr, norm_weight_ptr, weight_ptr, eps, output_ptr);
+}
+
+template <typename T>
+__global__ void multitoken_paged_attention_wrapper(
+    void const* qkv_ptr,
+    void* paged_k_cache_ptr,
+    void* paged_v_cache_ptr,
+    void* output_ptr,
+    int const* qo_indptr_buffer_ptr,
+    int const* paged_kv_indptr_buffer_ptr,
+    int const* paged_kv_indices_buffer_ptr,
+    int const* paged_kv_last_page_len_buffer_ptr,
+    int16_t request_id,
+    bool qk_norm,
+    bool rope,
+    void const* q_norm_weight_ptr,
+    void const* k_norm_weight_ptr,
+    void const* cos_ptr,
+    void const* sin_ptr,
+    float q_eps,
+    float k_eps) {
+  kernel::multitoken_paged_attention_task_impl<T, 4, 1, 128, 768, 512, 128, 512, 64, 4>(
+      qkv_ptr,
+      paged_k_cache_ptr,
+      paged_v_cache_ptr,
+      output_ptr,
+      qo_indptr_buffer_ptr,
+      paged_kv_indptr_buffer_ptr,
+      paged_kv_indices_buffer_ptr,
+      paged_kv_last_page_len_buffer_ptr,
+      request_id,
+      qk_norm,
+      rope,
+      q_norm_weight_ptr,
+      k_norm_weight_ptr,
+      cos_ptr,
+      sin_ptr,
+      q_eps,
+      k_eps);
+}
+
+template <typename T>
+__global__ void linear_with_residual_kernel_wrapper(
+    void const* input_ptr,
+    void const* weight_ptr,
+    void const* residual_ptr,
+    void* output_ptr) {
+  kernel::linear_kernel<T, 4, 512, 512>(
+      input_ptr, weight_ptr, residual_ptr, output_ptr, 4, true);
+}
+
+void qkv_norm_linear(
+    torch::Tensor input,
+    torch::Tensor norm_weight,
+    torch::Tensor weight,
+    torch::Tensor output,
+    float eps) {
+  dim3 grid_dim(1, 1, 1);
+  dim3 block_dim(128, 1, 1);
+  size_t smem_size = 1024 * 150;
+  cudaFuncSetAttribute(
+      qkv_norm_linear_kernel_wrapper<bfloat16>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      smem_size);
+  qkv_norm_linear_kernel_wrapper<bfloat16><<<grid_dim, block_dim, smem_size>>>(
+      input.data_ptr(),
+      norm_weight.data_ptr(),
+      weight.data_ptr(),
+      eps,
+      output.data_ptr());
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    printf("CUDA kernel launch error: %s\\n", cudaGetErrorString(err));
+  }
+}
+
+void multitoken_paged_attention(
+    torch::Tensor qkv,
+    torch::Tensor paged_k_cache,
+    torch::Tensor paged_v_cache,
+    torch::Tensor output,
+    torch::Tensor qo_indptr_buffer,
+    torch::Tensor paged_kv_indptr_buffer,
+    torch::Tensor paged_kv_indices_buffer,
+    torch::Tensor paged_kv_last_page_len_buffer,
+    int16_t request_id,
+    bool qk_norm,
+    bool rope,
+    torch::optional<torch::Tensor> q_norm_weight = torch::nullopt,
+    torch::optional<torch::Tensor> k_norm_weight = torch::nullopt,
+    torch::optional<torch::Tensor> cos = torch::nullopt,
+    torch::optional<torch::Tensor> sin = torch::nullopt,
+    float q_eps = 0.0f,
+    float k_eps = 0.0f) {
+  dim3 grid_dim(1, 1, 1);
+  dim3 block_dim(128, 1, 1);
+  size_t smem_size = 88888;
+  void const* q_norm_weight_ptr = qk_norm ? q_norm_weight->data_ptr() : nullptr;
+  void const* k_norm_weight_ptr = qk_norm ? k_norm_weight->data_ptr() : nullptr;
+  void const* cos_ptr = rope ? cos->data_ptr() : nullptr;
+  void const* sin_ptr = rope ? sin->data_ptr() : nullptr;
+  cudaFuncSetAttribute(
+      multitoken_paged_attention_wrapper<bfloat16>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      smem_size);
+  multitoken_paged_attention_wrapper<bfloat16><<<grid_dim, block_dim, smem_size>>>(
+      qkv.data_ptr(),
+      paged_k_cache.data_ptr(),
+      paged_v_cache.data_ptr(),
+      output.data_ptr(),
+      qo_indptr_buffer.data_ptr<int>(),
+      paged_kv_indptr_buffer.data_ptr<int>(),
+      paged_kv_indices_buffer.data_ptr<int>(),
+      paged_kv_last_page_len_buffer.data_ptr<int>(),
+      request_id,
+      qk_norm,
+      rope,
+      q_norm_weight_ptr,
+      k_norm_weight_ptr,
+      cos_ptr,
+      sin_ptr,
+      q_eps,
+      k_eps);
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    printf("CUDA kernel launch error: %s\\n", cudaGetErrorString(err));
+  }
+}
+
+void linear_with_residual(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor residual,
+    torch::Tensor output) {
+  dim3 grid_dim(1, 1, 1);
+  dim3 block_dim(128, 1, 1);
+  size_t smem_size = mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE;
+  cudaFuncSetAttribute(
+      linear_with_residual_kernel_wrapper<bfloat16>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      smem_size);
+  linear_with_residual_kernel_wrapper<bfloat16><<<grid_dim, block_dim, smem_size>>>(
+      input.data_ptr(),
+      weight.data_ptr(),
+      residual.data_ptr(),
+      output.data_ptr());
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    printf("CUDA kernel launch error: %s\\n", cudaGetErrorString(err));
+  }
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("qkv_norm_linear", &qkv_norm_linear, "attention qkv norm linear kernel");
+  m.def("multitoken_paged_attention", &multitoken_paged_attention, "paged attention kernel");
+  m.def(
+      "linear_with_residual",
+      &linear_with_residual,
+      "linear with residual kernel");
+}
+"""
+
 _PAGED_ATTENTION_WRAPPER_SOURCE = """
 #include "bfloat16.h"
 #include "multitoken_paged_attention.cuh"
@@ -384,6 +618,20 @@ def _load_mirage_norm_linear_extension() -> Any:
     return _load_mirage_runtime_extension(
         name="ad_mirage_norm_linear_rt",
         source_text=_NORM_LINEAR_WRAPPER_SOURCE,
+    )
+
+
+def _load_mirage_attn_qkv_norm_linear_extension() -> Any:
+    return _load_mirage_runtime_extension(
+        name="ad_mirage_attn_qkv_norm_linear_rt",
+        source_text=_ATTN_QKV_NORM_LINEAR_WRAPPER_SOURCE,
+    )
+
+
+def _load_mirage_attention_sublayer_extension() -> Any:
+    return _load_mirage_runtime_extension(
+        name="ad_mirage_attention_sublayer_rt",
+        source_text=_ATTENTION_SUBLAYER_WRAPPER_SOURCE,
     )
 
 
@@ -894,7 +1142,7 @@ def run_mirage_linear_with_residual_forward_correctness(
     linear_input = (torch.randn((4, 512), device="cuda", dtype=torch.bfloat16) / 8.0).contiguous()
     residual = (torch.randn((4, 512), device="cuda", dtype=torch.bfloat16) / 8.0).contiguous()
     weight = (torch.randn((512, 512), device="cuda", dtype=torch.bfloat16) / 16.0).contiguous()
-    out = torch.empty_like(linear_input)
+    out = torch.zeros_like(linear_input)
 
     linear_module.linear_with_residual(linear_input, weight, residual, out)
     if not torch.isfinite(out.float()).all():
@@ -907,6 +1155,797 @@ def run_mirage_linear_with_residual_forward_correctness(
         "linear_max_abs": float(linear_diff.max().item()),
         "linear_mean_abs": float(linear_diff.mean().item()),
     }
+
+
+def run_mirage_linear_with_residual_pk_forward_correctness(
+    *,
+    seed: int = 0,
+    repeats: int = 2,
+) -> Dict[str, float]:
+    """Run a tiny compiled Mirage PersistentKernel linear block repeatedly."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    pk = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=4,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+        target_cc_override=80,
+    )
+    linear_input = (torch.randn((4, 512), device="cuda", dtype=torch.bfloat16) / 8.0).contiguous()
+    residual = (torch.randn((4, 512), device="cuda", dtype=torch.bfloat16) / 8.0).contiguous()
+    weight = (torch.randn((512, 512), device="cuda", dtype=torch.bfloat16) / 16.0).contiguous()
+    output = torch.zeros((4, 512), device="cuda", dtype=torch.bfloat16)
+
+    input_dt = pk.attach_input(linear_input, name="pk_linear_input")
+    weight_dt = pk.attach_input(weight, name="pk_linear_weight")
+    residual_dt = pk.attach_input(residual, name="pk_linear_residual")
+    output_dt = pk.attach_input(output, name="pk_linear_output")
+    pk.linear_with_residual_layer(
+        input=input_dt,
+        weight=weight_dt,
+        residual=residual_dt,
+        output=output_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(pk)
+
+    ref_linear = linear_input.float() @ weight.float().transpose(0, 1)
+    ref_linear = ref_linear + residual.float()
+
+    metrics: Dict[str, float] = {}
+    for repeat_idx in range(repeats):
+        _reset_pk_runtime_state(pk, active_tokens=linear_input.shape[0])
+        output.zero_()
+        pk()
+        torch.cuda.synchronize()
+        if not torch.isfinite(output.float()).all():
+            metrics[f"repeat_{repeat_idx}_max_abs"] = float("inf")
+            metrics[f"repeat_{repeat_idx}_mean_abs"] = float("inf")
+            continue
+        linear_diff = (output.float() - ref_linear).abs()
+        metrics[f"repeat_{repeat_idx}_max_abs"] = float(linear_diff.max().item())
+        metrics[f"repeat_{repeat_idx}_mean_abs"] = float(linear_diff.mean().item())
+    return metrics
+
+
+def run_mirage_rmsnorm_linear_pk_forward_correctness(
+    *,
+    eps: float = 1e-5,
+    seed: int = 0,
+    repeats: int = 2,
+) -> Dict[str, float]:
+    """Run a tiny compiled Mirage PersistentKernel rmsnorm->linear block repeatedly."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    pk = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+        target_cc_override=80,
+    )
+    hidden_in = (torch.randn((1, 512), device="cuda", dtype=torch.bfloat16) / 8.0).contiguous()
+    norm_weight = torch.ones((512,), device="cuda", dtype=torch.bfloat16)
+    linear_weight = (
+        torch.randn((768, 512), device="cuda", dtype=torch.bfloat16) / 16.0
+    ).contiguous()
+    rmsnorm_out = torch.zeros((1, 512), device="cuda", dtype=torch.bfloat16)
+    linear_out = torch.zeros((1, 768), device="cuda", dtype=torch.bfloat16)
+
+    hidden_dt = pk.attach_input(hidden_in, name="pk_rmsnorm_linear_hidden")
+    norm_weight_dt = pk.attach_input(norm_weight, name="pk_rmsnorm_linear_weight")
+    linear_weight_dt = pk.attach_input(linear_weight, name="pk_rmsnorm_linear_proj_weight")
+    rmsnorm_out_dt = pk.attach_input(rmsnorm_out, name="pk_rmsnorm_linear_norm_out")
+    linear_out_dt = pk.attach_input(linear_out, name="pk_rmsnorm_linear_out")
+    pk.rmsnorm_layer(
+        input=hidden_dt,
+        weight=norm_weight_dt,
+        output=rmsnorm_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_layer(
+        input=rmsnorm_out_dt,
+        weight=linear_weight_dt,
+        output=linear_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(pk)
+
+    variance = hidden_in.float().pow(2).mean(dim=-1, keepdim=True)
+    rmsnorm_ref = (hidden_in.float() * torch.rsqrt(variance + eps)) * norm_weight.float()
+    linear_ref = rmsnorm_ref @ linear_weight.float().transpose(0, 1)
+
+    metrics: Dict[str, float] = {}
+    for repeat_idx in range(repeats):
+        _reset_pk_runtime_state(pk, active_tokens=hidden_in.shape[0])
+        rmsnorm_out.zero_()
+        linear_out.zero_()
+        pk()
+        torch.cuda.synchronize()
+        rmsnorm_diff = (rmsnorm_out.float() - rmsnorm_ref).abs()
+        linear_diff = (linear_out.float() - linear_ref).abs()
+        metrics[f"repeat_{repeat_idx}_rmsnorm_max_abs"] = float(rmsnorm_diff.max().item())
+        metrics[f"repeat_{repeat_idx}_rmsnorm_mean_abs"] = float(rmsnorm_diff.mean().item())
+        metrics[f"repeat_{repeat_idx}_linear_max_abs"] = float(linear_diff.max().item())
+        metrics[f"repeat_{repeat_idx}_linear_mean_abs"] = float(linear_diff.mean().item())
+    return metrics
+
+
+def run_mirage_attention_sublayer_forward_correctness(
+    *,
+    eps: float = 1e-5,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Run a live Mirage attention sublayer and compare each stage against torch.
+
+    The tested composition is:
+    ``rmsnorm+qkv linear -> paged attention -> o_proj + residual``.
+    """
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    sublayer_module = _load_mirage_attention_sublayer_extension()
+
+    num_tokens = 1
+    hidden_size = 512
+    qo_heads = 4
+    kv_heads = 1
+    head_dim = 128
+    page_size = 64
+    max_num_pages = 64
+
+    hidden_in = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
+    attn_norm_weight = torch.ones((1, hidden_size), device="cuda", dtype=torch.bfloat16)
+    qkv_weight = (
+        torch.randn(
+            ((qo_heads + 2 * kv_heads) * head_dim, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 16.0
+    )
+    qkv_out = torch.empty(
+        (num_tokens, (qo_heads + 2 * kv_heads) * head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    sublayer_module.qkv_norm_linear(
+        hidden_in.contiguous(), attn_norm_weight, qkv_weight, qkv_out, eps
+    )
+
+    qkv_variance = hidden_in.float().pow(2).mean(dim=-1, keepdim=True)
+    qkv_ref = (hidden_in.float() * torch.rsqrt(qkv_variance + eps)) * attn_norm_weight.float()
+    qkv_ref = qkv_ref @ qkv_weight.float().transpose(0, 1)
+    qkv_diff = (qkv_out.float() - qkv_ref).abs()
+
+    paged_k_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads * head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    paged_v_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads * head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    torch_paged_k_cache = paged_k_cache.clone()
+    torch_paged_v_cache = paged_v_cache.clone()
+
+    qo_indptr_buffer = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
+    paged_kv_indptr_buffer = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    paged_kv_indices_buffer = torch.arange(max_num_pages, device="cuda", dtype=torch.int32)
+    paged_kv_last_page_len_buffer = torch.tensor([8 + num_tokens], device="cuda", dtype=torch.int32)
+
+    k = qkv_out[:, qo_heads * head_dim : qo_heads * head_dim + kv_heads * head_dim]
+    v = qkv_out[:, qo_heads * head_dim + kv_heads * head_dim :]
+    page_idx = int(paged_kv_indices_buffer[0].item())
+    page_offset = int(paged_kv_last_page_len_buffer[0].item()) - num_tokens
+    torch_paged_k_cache[page_idx, page_offset : page_offset + num_tokens] = k
+    torch_paged_v_cache[page_idx, page_offset : page_offset + num_tokens] = v
+
+    attn_out = torch.empty((num_tokens * qo_heads, head_dim), device="cuda", dtype=torch.bfloat16)
+    q_norm_weight = torch.ones((1, head_dim), device="cuda", dtype=torch.bfloat16)
+    k_norm_weight = torch.ones((1, head_dim), device="cuda", dtype=torch.bfloat16)
+    all_cos = torch.ones((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    all_sin = torch.zeros((513, head_dim), device="cuda", dtype=torch.bfloat16)
+
+    sublayer_module.multitoken_paged_attention(
+        qkv_out.contiguous(),
+        paged_k_cache,
+        paged_v_cache,
+        attn_out,
+        qo_indptr_buffer,
+        paged_kv_indptr_buffer,
+        paged_kv_indices_buffer,
+        paged_kv_last_page_len_buffer,
+        0,
+        False,
+        False,
+        q_norm_weight,
+        k_norm_weight,
+        all_cos,
+        all_sin,
+        eps,
+        eps,
+    )
+
+    q = qkv_out[:, : qo_heads * head_dim].view(num_tokens, qo_heads, head_dim)
+    ref_attn = _reference_multitoken_paged_attention(
+        q=q,
+        paged_k_cache=torch_paged_k_cache,
+        paged_v_cache=torch_paged_v_cache,
+        qo_heads=qo_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        num_tokens=num_tokens,
+        paged_kv_indptr_buffer=paged_kv_indptr_buffer,
+        paged_kv_indices_buffer=paged_kv_indices_buffer,
+        paged_kv_last_page_len_buffer=paged_kv_last_page_len_buffer,
+    )
+    attn_diff = (attn_out.float() - ref_attn.float()).abs()
+
+    o_proj_weight = (
+        torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+    post_attn_residual = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    linear_input = attn_out.reshape(num_tokens, hidden_size).contiguous()
+    sublayer_module.linear_with_residual(
+        linear_input,
+        o_proj_weight.contiguous(),
+        hidden_in.contiguous(),
+        post_attn_residual,
+    )
+
+    if not torch.isfinite(post_attn_residual.float()).all():
+        return {
+            "qkv_max_abs": float(qkv_diff.max().item()),
+            "qkv_mean_abs": float(qkv_diff.mean().item()),
+            "attn_max_abs": float(attn_diff.max().item()),
+            "attn_mean_abs": float(attn_diff.mean().item()),
+            "linear_max_abs": float("inf"),
+            "linear_mean_abs": float("inf"),
+        }
+
+    ref_linear = ref_attn.reshape(num_tokens, hidden_size)
+    ref_linear = ref_linear @ o_proj_weight.float().transpose(0, 1)
+    ref_linear = ref_linear + hidden_in.float()
+    linear_diff = (post_attn_residual.float() - ref_linear).abs()
+
+    return {
+        "qkv_max_abs": float(qkv_diff.max().item()),
+        "qkv_mean_abs": float(qkv_diff.mean().item()),
+        "attn_max_abs": float(attn_diff.max().item()),
+        "attn_mean_abs": float(attn_diff.mean().item()),
+        "linear_max_abs": float(linear_diff.max().item()),
+        "linear_mean_abs": float(linear_diff.mean().item()),
+    }
+
+
+def run_mirage_attention_sublayer_pk_forward_correctness(
+    *,
+    eps: float = 1e-5,
+    seed: int = 0,
+    repeats: int = 2,
+) -> Dict[str, float]:
+    """Run a tiny compiled Mirage PersistentKernel attention sublayer repeatedly."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    num_tokens = 1
+    hidden_size = 512
+    qo_heads = 4
+    kv_heads = 1
+    head_dim = 128
+    page_size = 64
+    max_num_pages = 64
+
+    pk = create_test_persistent_kernel(
+        max_seq_length=512,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=num_tokens,
+        max_num_pages=max_num_pages,
+        page_size=page_size,
+        use_cutlass_kernel=False,
+        target_cc_override=80,
+    )
+    qo_indptr = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
+    paged_kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    paged_kv_indices = torch.arange(max_num_pages, device="cuda", dtype=torch.int32)
+    paged_kv_last_page_len = torch.tensor([8 + num_tokens], device="cuda", dtype=torch.int32)
+    pk.meta_tensors["qo_indptr_buffer"].zero_()
+    pk.meta_tensors["qo_indptr_buffer"][:2] = qo_indptr
+    pk.meta_tensors["paged_kv_indptr_buffer"].zero_()
+    pk.meta_tensors["paged_kv_indptr_buffer"][:2] = paged_kv_indptr
+    pk.meta_tensors["paged_kv_indices_buffer"].copy_(paged_kv_indices)
+    pk.meta_tensors["paged_kv_last_page_len_buffer"].fill_(8 + num_tokens)
+
+    hidden_in = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
+    attn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    qkv_weight = (
+        torch.randn(
+            ((qo_heads + 2 * kv_heads) * head_dim, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 16.0
+    )
+    q_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    k_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    cos = torch.ones((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    sin = torch.zeros((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    k_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    v_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    o_proj_weight = (
+        torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+
+    rmsnorm_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    qkv_out = torch.zeros(
+        (num_tokens, (qo_heads + 2 * kv_heads) * head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    attn_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    block_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+
+    hidden_dt = pk.attach_input(hidden_in.contiguous(), name="pk_attn_hidden")
+    attn_norm_dt = pk.attach_input(attn_norm_weight.contiguous(), name="pk_attn_norm_weight")
+    qkv_weight_dt = pk.attach_input(qkv_weight.contiguous(), name="pk_attn_qkv_weight")
+    rmsnorm_out_dt = pk.attach_input(rmsnorm_out, name="pk_attn_rmsnorm_out")
+    qkv_out_dt = pk.attach_input(qkv_out, name="pk_attn_qkv_out")
+    q_norm_dt = pk.attach_input(q_norm_weight.contiguous(), name="pk_attn_q_norm")
+    k_norm_dt = pk.attach_input(k_norm_weight.contiguous(), name="pk_attn_k_norm")
+    cos_dt = pk.attach_input(cos.contiguous(), name="pk_attn_cos")
+    sin_dt = pk.attach_input(sin.contiguous(), name="pk_attn_sin")
+    k_cache_dt = pk.attach_input(k_cache.contiguous(), name="pk_attn_k_cache")
+    v_cache_dt = pk.attach_input(v_cache.contiguous(), name="pk_attn_v_cache")
+    attn_out_dt = pk.attach_input(attn_out, name="pk_attn_out")
+    o_proj_weight_dt = pk.attach_input(o_proj_weight.contiguous(), name="pk_attn_o_proj_weight")
+    block_out_dt = pk.attach_input(block_out, name="pk_attn_block_out")
+
+    pk.rmsnorm_layer(
+        input=hidden_dt,
+        weight=attn_norm_dt,
+        output=rmsnorm_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_layer(
+        input=rmsnorm_out_dt,
+        weight=qkv_weight_dt,
+        output=qkv_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.paged_attention_layer(
+        input=qkv_out_dt,
+        k_cache=k_cache_dt,
+        v_cache=v_cache_dt,
+        q_norm=q_norm_dt,
+        k_norm=k_norm_dt,
+        cos_pos_embed=cos_dt,
+        sin_pos_embed=sin_dt,
+        output=attn_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_with_residual_layer(
+        input=attn_out_dt,
+        weight=o_proj_weight_dt,
+        residual=hidden_dt,
+        output=block_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(pk)
+
+    qkv_variance = hidden_in.float().pow(2).mean(dim=-1, keepdim=True)
+    qkv_ref = (hidden_in.float() * torch.rsqrt(qkv_variance + eps)) * attn_norm_weight.float()
+    qkv_ref = qkv_ref @ qkv_weight.float().transpose(0, 1)
+
+    torch_k_cache = k_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    torch_v_cache = v_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    q = qkv_ref[:, : qo_heads * head_dim].view(num_tokens, qo_heads, head_dim)
+    k = qkv_ref[:, qo_heads * head_dim : qo_heads * head_dim + kv_heads * head_dim]
+    v = qkv_ref[:, qo_heads * head_dim + kv_heads * head_dim :]
+    page_idx = int(paged_kv_indices[0].item())
+    page_offset = int(paged_kv_last_page_len[0].item()) - num_tokens
+    torch_k_cache[page_idx, page_offset : page_offset + num_tokens] = k
+    torch_v_cache[page_idx, page_offset : page_offset + num_tokens] = v
+    ref_attn = _reference_multitoken_paged_attention(
+        q=q,
+        paged_k_cache=torch_k_cache,
+        paged_v_cache=torch_v_cache,
+        qo_heads=qo_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        num_tokens=num_tokens,
+        paged_kv_indptr_buffer=paged_kv_indptr,
+        paged_kv_indices_buffer=paged_kv_indices,
+        paged_kv_last_page_len_buffer=paged_kv_last_page_len,
+    ).reshape(num_tokens, hidden_size)
+    ref_block = ref_attn @ o_proj_weight.float().transpose(0, 1)
+    ref_block = ref_block + hidden_in.float()
+
+    metrics: Dict[str, float] = {}
+    for repeat_idx in range(repeats):
+        _reset_pk_runtime_state(
+            pk,
+            active_tokens=num_tokens,
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+        )
+        rmsnorm_out.zero_()
+        qkv_out.zero_()
+        attn_out.zero_()
+        block_out.zero_()
+        pk()
+        torch.cuda.synchronize()
+        qkv_diff = (qkv_out.float() - qkv_ref).abs()
+        attn_diff = (attn_out.float() - ref_attn).abs()
+        if not torch.isfinite(block_out.float()).all():
+            metrics[f"repeat_{repeat_idx}_qkv_max_abs"] = float(qkv_diff.max().item())
+            metrics[f"repeat_{repeat_idx}_qkv_mean_abs"] = float(qkv_diff.mean().item())
+            metrics[f"repeat_{repeat_idx}_attn_max_abs"] = float(attn_diff.max().item())
+            metrics[f"repeat_{repeat_idx}_attn_mean_abs"] = float(attn_diff.mean().item())
+            metrics[f"repeat_{repeat_idx}_block_max_abs"] = float("inf")
+            metrics[f"repeat_{repeat_idx}_block_mean_abs"] = float("inf")
+            continue
+        block_diff = (block_out.float() - ref_block).abs()
+        metrics[f"repeat_{repeat_idx}_qkv_max_abs"] = float(qkv_diff.max().item())
+        metrics[f"repeat_{repeat_idx}_qkv_mean_abs"] = float(qkv_diff.mean().item())
+        metrics[f"repeat_{repeat_idx}_attn_max_abs"] = float(attn_diff.max().item())
+        metrics[f"repeat_{repeat_idx}_attn_mean_abs"] = float(attn_diff.mean().item())
+        metrics[f"repeat_{repeat_idx}_block_max_abs"] = float(block_diff.max().item())
+        metrics[f"repeat_{repeat_idx}_block_mean_abs"] = float(block_diff.mean().item())
+    return metrics
+
+
+def run_mirage_attention_block_pk_forward_correctness(
+    *,
+    seed: int = 0,
+    repeats: int = 2,
+) -> Dict[str, float]:
+    """Run a tiny compiled Mirage PersistentKernel attention->linear block repeatedly."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    num_tokens = 1
+    hidden_size = 512
+    qo_heads = 4
+    kv_heads = 1
+    head_dim = 128
+    page_size = 64
+    max_num_pages = 64
+
+    pk = create_test_persistent_kernel(
+        max_seq_length=512,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=num_tokens,
+        max_num_pages=max_num_pages,
+        page_size=page_size,
+        use_cutlass_kernel=False,
+        target_cc_override=80,
+    )
+    qo_indptr = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
+    paged_kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    paged_kv_indices = torch.arange(max_num_pages, device="cuda", dtype=torch.int32)
+    paged_kv_last_page_len = torch.tensor([8 + num_tokens], device="cuda", dtype=torch.int32)
+    pk.meta_tensors["qo_indptr_buffer"].zero_()
+    pk.meta_tensors["qo_indptr_buffer"][:2] = qo_indptr
+    pk.meta_tensors["paged_kv_indptr_buffer"].zero_()
+    pk.meta_tensors["paged_kv_indptr_buffer"][:2] = paged_kv_indptr
+    pk.meta_tensors["paged_kv_indices_buffer"].copy_(paged_kv_indices)
+    pk.meta_tensors["paged_kv_last_page_len_buffer"].fill_(8 + num_tokens)
+
+    qkv_in = (
+        torch.randn(
+            (num_tokens, (qo_heads + 2 * kv_heads) * head_dim),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 16.0
+    )
+    q_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    k_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    cos = torch.ones((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    sin = torch.zeros((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    k_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    v_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    residual = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
+    o_proj_weight = (
+        torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+    attn_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    block_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+
+    qkv_dt = pk.attach_input(qkv_in.contiguous(), name="pk_attn_block_qkv")
+    q_norm_dt = pk.attach_input(q_norm_weight.contiguous(), name="pk_attn_block_q_norm")
+    k_norm_dt = pk.attach_input(k_norm_weight.contiguous(), name="pk_attn_block_k_norm")
+    cos_dt = pk.attach_input(cos.contiguous(), name="pk_attn_block_cos")
+    sin_dt = pk.attach_input(sin.contiguous(), name="pk_attn_block_sin")
+    k_cache_dt = pk.attach_input(k_cache.contiguous(), name="pk_attn_block_k_cache")
+    v_cache_dt = pk.attach_input(v_cache.contiguous(), name="pk_attn_block_v_cache")
+    residual_dt = pk.attach_input(residual.contiguous(), name="pk_attn_block_residual")
+    o_proj_weight_dt = pk.attach_input(o_proj_weight.contiguous(), name="pk_attn_block_o_proj")
+    attn_out_dt = pk.attach_input(attn_out, name="pk_attn_block_attn_out")
+    block_out_dt = pk.attach_input(block_out, name="pk_attn_block_out")
+
+    pk.paged_attention_layer(
+        input=qkv_dt,
+        k_cache=k_cache_dt,
+        v_cache=v_cache_dt,
+        q_norm=q_norm_dt,
+        k_norm=k_norm_dt,
+        cos_pos_embed=cos_dt,
+        sin_pos_embed=sin_dt,
+        output=attn_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_with_residual_layer(
+        input=attn_out_dt,
+        weight=o_proj_weight_dt,
+        residual=residual_dt,
+        output=block_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(pk)
+
+    torch_k_cache = k_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    torch_v_cache = v_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    q = qkv_in[:, : qo_heads * head_dim].view(num_tokens, qo_heads, head_dim)
+    k = qkv_in[:, qo_heads * head_dim : qo_heads * head_dim + kv_heads * head_dim]
+    v = qkv_in[:, qo_heads * head_dim + kv_heads * head_dim :]
+    page_idx = int(paged_kv_indices[0].item())
+    page_offset = int(paged_kv_last_page_len[0].item()) - num_tokens
+    torch_k_cache[page_idx, page_offset : page_offset + num_tokens] = k
+    torch_v_cache[page_idx, page_offset : page_offset + num_tokens] = v
+    ref_attn = _reference_multitoken_paged_attention(
+        q=q,
+        paged_k_cache=torch_k_cache,
+        paged_v_cache=torch_v_cache,
+        qo_heads=qo_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        num_tokens=num_tokens,
+        paged_kv_indptr_buffer=paged_kv_indptr,
+        paged_kv_indices_buffer=paged_kv_indices,
+        paged_kv_last_page_len_buffer=paged_kv_last_page_len,
+    ).reshape(num_tokens, hidden_size)
+    ref_block = ref_attn @ o_proj_weight.float().transpose(0, 1)
+    ref_block = ref_block + residual.float()
+
+    metrics: Dict[str, float] = {}
+    for repeat_idx in range(repeats):
+        _reset_pk_runtime_state(
+            pk,
+            active_tokens=num_tokens,
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+        )
+        attn_out.zero_()
+        block_out.zero_()
+        pk()
+        torch.cuda.synchronize()
+        attn_diff = (attn_out.float() - ref_attn).abs()
+        if not torch.isfinite(block_out.float()).all():
+            metrics[f"repeat_{repeat_idx}_attn_max_abs"] = float(attn_diff.max().item())
+            metrics[f"repeat_{repeat_idx}_attn_mean_abs"] = float(attn_diff.mean().item())
+            metrics[f"repeat_{repeat_idx}_block_max_abs"] = float("inf")
+            metrics[f"repeat_{repeat_idx}_block_mean_abs"] = float("inf")
+            continue
+        block_diff = (block_out.float() - ref_block).abs()
+        metrics[f"repeat_{repeat_idx}_attn_max_abs"] = float(attn_diff.max().item())
+        metrics[f"repeat_{repeat_idx}_attn_mean_abs"] = float(attn_diff.mean().item())
+        metrics[f"repeat_{repeat_idx}_block_max_abs"] = float(block_diff.max().item())
+        metrics[f"repeat_{repeat_idx}_block_mean_abs"] = float(block_diff.mean().item())
+    return metrics
+
+
+def run_mirage_hybrid_attention_sublayer_forward_correctness(
+    *,
+    eps: float = 1e-5,
+    seed: int = 0,
+    repeats: int = 2,
+    num_tokens: int = 1,
+) -> Dict[str, float]:
+    """Run a hybrid live attention sublayer using proven reusable Mirage pieces.
+
+    Composition:
+    - direct Mirage qkv norm-linear
+    - direct Mirage paged attention
+    - compiled PersistentKernel linear_with_residual
+    """
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    qkv_module = _load_mirage_attn_qkv_norm_linear_extension()
+    attn_module = _load_mirage_attention_extension()
+
+    hidden_size = 512
+    qo_heads = 4
+    kv_heads = 1
+    head_dim = 128
+    page_size = 64
+    max_num_pages = 64
+
+    hidden_in = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
+    attn_norm_weight = torch.ones((1, hidden_size), device="cuda", dtype=torch.bfloat16)
+    qkv_weight = (
+        torch.randn(
+            ((qo_heads + 2 * kv_heads) * head_dim, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 16.0
+    )
+    qkv_out = torch.zeros(
+        (num_tokens, (qo_heads + 2 * kv_heads) * head_dim), device="cuda", dtype=torch.bfloat16
+    )
+
+    paged_k_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads * head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    paged_v_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads * head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    qo_indptr_buffer = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
+    paged_kv_indptr_buffer = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    paged_kv_indices_buffer = torch.arange(max_num_pages, device="cuda", dtype=torch.int32)
+    paged_kv_last_page_len_buffer = torch.tensor([8 + num_tokens], device="cuda", dtype=torch.int32)
+    attn_out_flat = torch.zeros(
+        (num_tokens * qo_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    q_norm_weight = torch.ones((1, head_dim), device="cuda", dtype=torch.bfloat16)
+    k_norm_weight = torch.ones((1, head_dim), device="cuda", dtype=torch.bfloat16)
+    all_cos = torch.ones((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    all_sin = torch.zeros((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    page_idx = int(paged_kv_indices_buffer[0].item())
+    page_offset = int(paged_kv_last_page_len_buffer[0].item()) - num_tokens
+
+    pk = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=num_tokens,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+        target_cc_override=80,
+    )
+    linear_input = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    residual = hidden_in.clone().contiguous()
+    o_proj_weight = (
+        torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+    block_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    input_dt = pk.attach_input(linear_input, name="hybrid_attn_linear_input")
+    weight_dt = pk.attach_input(o_proj_weight.contiguous(), name="hybrid_attn_linear_weight")
+    residual_dt = pk.attach_input(residual, name="hybrid_attn_linear_residual")
+    output_dt = pk.attach_input(block_out, name="hybrid_attn_linear_output")
+    pk.linear_with_residual_layer(
+        input=input_dt,
+        weight=weight_dt,
+        residual=residual_dt,
+        output=output_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(pk)
+
+    qkv_variance = hidden_in.float().pow(2).mean(dim=-1, keepdim=True)
+    qkv_ref = (hidden_in.float() * torch.rsqrt(qkv_variance + eps)) * attn_norm_weight.float()
+    qkv_ref = qkv_ref @ qkv_weight.float().transpose(0, 1)
+
+    metrics: Dict[str, float] = {}
+    for repeat_idx in range(repeats):
+        _reset_pk_runtime_state(pk, active_tokens=num_tokens)
+        qkv_out.zero_()
+        attn_out_flat.zero_()
+        linear_input.zero_()
+        block_out.zero_()
+
+        qkv_module.norm_linear(hidden_in.contiguous(), attn_norm_weight, qkv_weight, qkv_out, eps)
+        qkv_diff = (qkv_out.float() - qkv_ref).abs()
+
+        torch_k_cache = paged_k_cache.clone()
+        torch_v_cache = paged_v_cache.clone()
+        k = qkv_out[:, qo_heads * head_dim : qo_heads * head_dim + kv_heads * head_dim]
+        v = qkv_out[:, qo_heads * head_dim + kv_heads * head_dim :]
+        torch_k_cache[page_idx, page_offset : page_offset + num_tokens] = k
+        torch_v_cache[page_idx, page_offset : page_offset + num_tokens] = v
+
+        attn_module.multitoken_paged_attention(
+            qkv_out.contiguous(),
+            paged_k_cache,
+            paged_v_cache,
+            attn_out_flat,
+            qo_indptr_buffer,
+            paged_kv_indptr_buffer,
+            paged_kv_indices_buffer,
+            paged_kv_last_page_len_buffer,
+            0,
+            False,
+            False,
+            q_norm_weight,
+            k_norm_weight,
+            all_cos,
+            all_sin,
+            eps,
+            eps,
+        )
+
+        ref_attn = _reference_multitoken_paged_attention(
+            q=qkv_out[:, : qo_heads * head_dim].view(num_tokens, qo_heads, head_dim),
+            paged_k_cache=torch_k_cache,
+            paged_v_cache=torch_v_cache,
+            qo_heads=qo_heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            num_tokens=num_tokens,
+            paged_kv_indptr_buffer=paged_kv_indptr_buffer,
+            paged_kv_indices_buffer=paged_kv_indices_buffer,
+            paged_kv_last_page_len_buffer=paged_kv_last_page_len_buffer,
+        )
+        attn_diff = (attn_out_flat.float() - ref_attn.float()).abs()
+
+        linear_input.copy_(attn_out_flat.reshape(num_tokens, hidden_size))
+        residual.copy_(hidden_in)
+        pk()
+        torch.cuda.synchronize()
+
+        if not torch.isfinite(block_out.float()).all():
+            metrics[f"repeat_{repeat_idx}_qkv_max_abs"] = float(qkv_diff.max().item())
+            metrics[f"repeat_{repeat_idx}_qkv_mean_abs"] = float(qkv_diff.mean().item())
+            metrics[f"repeat_{repeat_idx}_attn_max_abs"] = float(attn_diff.max().item())
+            metrics[f"repeat_{repeat_idx}_attn_mean_abs"] = float(attn_diff.mean().item())
+            metrics[f"repeat_{repeat_idx}_block_max_abs"] = float("inf")
+            metrics[f"repeat_{repeat_idx}_block_mean_abs"] = float("inf")
+            continue
+
+        ref_block = ref_attn.reshape(num_tokens, hidden_size)
+        ref_block = ref_block @ o_proj_weight.float().transpose(0, 1)
+        ref_block = ref_block + hidden_in.float()
+        block_diff = (block_out.float() - ref_block).abs()
+
+        metrics[f"repeat_{repeat_idx}_qkv_max_abs"] = float(qkv_diff.max().item())
+        metrics[f"repeat_{repeat_idx}_qkv_mean_abs"] = float(qkv_diff.mean().item())
+        metrics[f"repeat_{repeat_idx}_attn_max_abs"] = float(attn_diff.max().item())
+        metrics[f"repeat_{repeat_idx}_attn_mean_abs"] = float(attn_diff.mean().item())
+        metrics[f"repeat_{repeat_idx}_block_max_abs"] = float(block_diff.max().item())
+        metrics[f"repeat_{repeat_idx}_block_mean_abs"] = float(block_diff.mean().item())
+    return metrics
 
 
 def resolve_layer_plan_against_mirage(
@@ -979,6 +2018,43 @@ def _compose_rmsnorm_linear_layer(
         grid_dim=grid_dim,
         block_dim=block_dim,
     )
+
+
+def _reset_pk_runtime_state(
+    pk,
+    *,
+    active_tokens: int = 1,
+    qo_indptr: Optional[torch.Tensor] = None,
+    paged_kv_indptr: Optional[torch.Tensor] = None,
+    paged_kv_indices: Optional[torch.Tensor] = None,
+    paged_kv_last_page_len: Optional[torch.Tensor] = None,
+) -> None:
+    pk.meta_tensors["step"].zero_()
+    pk.meta_tensors["tokens"].zero_()
+    pk.meta_tensors["input_tokens"].zero_()
+    pk.meta_tensors["output_tokens"].zero_()
+    pk.meta_tensors["num_new_tokens"].fill_(1)
+    pk.meta_tensors["prompt_lengths"].zero_()
+    pk.meta_tensors["prompt_lengths"][0] = active_tokens
+    pk.meta_tensors["tokens"][0, :active_tokens] = torch.arange(
+        active_tokens, device=pk.meta_tensors["tokens"].device, dtype=torch.int64
+    )
+    pk.meta_tensors["qo_indptr_buffer"].zero_()
+    pk.meta_tensors["paged_kv_indptr_buffer"].zero_()
+    pk.meta_tensors["paged_kv_indices_buffer"].zero_()
+    pk.meta_tensors["paged_kv_last_page_len_buffer"].zero_()
+    if qo_indptr is not None:
+        pk.meta_tensors["qo_indptr_buffer"][: qo_indptr.numel()] = qo_indptr
+    if paged_kv_indptr is not None:
+        pk.meta_tensors["paged_kv_indptr_buffer"][: paged_kv_indptr.numel()] = paged_kv_indptr
+    if paged_kv_indices is not None:
+        pk.meta_tensors["paged_kv_indices_buffer"][: paged_kv_indices.numel()] = paged_kv_indices
+    if paged_kv_last_page_len is not None:
+        pk.meta_tensors["paged_kv_last_page_len_buffer"][: paged_kv_last_page_len.numel()] = (
+            paged_kv_last_page_len
+        )
+    if hasattr(pk, "init_request_func") and pk.init_request_func is not None:
+        pk.init_request_func()
 
 
 def build_gemma_mirage_runtime_callable(

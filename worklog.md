@@ -239,6 +239,243 @@ So the first compiler problem is not:
 
 - "how do we run MPK?"
 
+## Apr 10: Live Mirage Debugging Status
+
+This round focused on moving from planning and dry-run translation toward real
+live Mirage execution, while debugging in increasing scope:
+
+```text
+single live block
+-> repeated live block
+-> small composed live block
+-> larger composed live block
+```
+
+The main rule for this phase was:
+
+- only keep and trust milestones that are numerically validated
+- do not count eager fallback or graph-shape-only success as backend success
+
+## What Was Proven Live
+
+### 1. Standalone live Mirage kernels can be numerically correct
+
+We added and validated real numerical checks for:
+
+- direct Mirage `norm_linear`
+- direct Mirage `paged_attention`
+- direct Mirage `linear_with_residual`
+
+These are implemented in:
+
+- [mirage_bridge.py](/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/dev_feat1/TensorRT-LLM/tensorrt_llm/_torch/auto_deploy/mpk/mirage_bridge.py)
+
+and exercised from:
+
+- [test_gemma4_mpk_layer.py](/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/dev_feat1/TensorRT-LLM/tests/unittest/auto_deploy/singlegpu/transformations/library/test_gemma4_mpk_layer.py)
+
+### 2. A compiled Mirage `PersistentKernel` `linear_with_residual` block works cleanly
+
+The strongest stable live foothold we now have is:
+
+- a real compiled `PersistentKernel`
+- with a `linear_with_residual_layer`
+- numerically validated against torch reference
+- stable across repeated launches in the same process
+
+This is captured by:
+
+- `run_mirage_linear_with_residual_pk_forward_correctness(...)`
+
+and the passing test:
+
+- `test_mirage_linear_with_residual_pk_matches_reference_across_repeats`
+
+This is the current "working to working" baseline.
+
+## Main Bugs Found
+
+### 1. Direct wrapped `linear_with_residual` was not safely reusable in-process
+
+Observation:
+
+- the direct extension-wrapper path for `linear_with_residual`
+- could be correct on first launch
+- but often became non-finite or wildly incorrect on later launches
+
+Implication:
+
+- this direct wrapper is not trustworthy as the execution substrate for larger
+  composed live blocks
+- we should prefer the compiled Mirage `PersistentKernel` launcher path for
+  reusable execution
+
+### 2. Repeated Mirage launches require explicit runtime/request-state reset
+
+Observation:
+
+- several composed live paths were correct once but failed on the second launch
+- this was not just a numerical drift issue; it was runtime-state reuse
+
+Evidence from Mirage runtime code:
+
+- `PersistentKernel` exposes `init_request_func()`
+- the runtime tracks mutable per-request state such as:
+  - `step`
+  - `tokens`
+  - `input_tokens`
+  - `output_tokens`
+  - `prompt_lengths`
+  - `qo_indptr_buffer`
+  - `paged_kv_indptr_buffer`
+  - `paged_kv_indices_buffer`
+  - `paged_kv_last_page_len_buffer`
+
+Relevant code:
+
+- [persistent_kernel.py](/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/common/mirage/python/mirage/mpk/persistent_kernel.py#L1562)
+- [persistent_kernel.cuh](/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/common/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh#L196)
+- [persistent_kernel.cuh](/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/common/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh#L246)
+
+Fix:
+
+- add explicit bridge-side runtime reset before repeated `PersistentKernel`
+  launches
+- zero and reseed the relevant meta tensors
+- call Mirage `init_request_func()` after reset
+
+This is now implemented by:
+
+- `_reset_pk_runtime_state(...)`
+  in [mirage_bridge.py](/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/dev_feat1/TensorRT-LLM/tensorrt_llm/_torch/auto_deploy/mpk/mirage_bridge.py)
+
+Result:
+
+- repeated PK `linear_with_residual` launches became stable
+- repeated PK/hybrid attention-block probes became deterministic instead of
+  "first good / second broken"
+
+### 3. Mirage request prep semantics matter for token count
+
+Observation from runtime code:
+
+- Mirage decides how many active tokens to process from request state
+- if `prompt_length - step > 0`, it takes a prefill-like path
+- otherwise it falls back to decode-like single-token processing
+
+Implication:
+
+- multi-token tests cannot rely on buffer shapes alone
+- the runtime metadata must explicitly describe the intended active-token count
+
+Fix:
+
+- `_reset_pk_runtime_state(...)` now seeds:
+  - `prompt_lengths`
+  - `tokens`
+  - request metadata buffers
+
+This made the runtime behavior more interpretable, even when the larger block
+still remained numerically wrong.
+
+## Current Live Scope Status
+
+### Stable and trusted
+
+- direct Mirage `norm_linear`
+- direct Mirage `paged_attention`
+- compiled PK `linear_with_residual`
+
+### Stable after reset, but still numerically off
+
+- composed live attention block probes
+- hybrid live attention sublayer probes
+
+These now fail in deterministic ways rather than random repeat corruption.
+That is progress, but they are not yet promotion-worthy as passing tests.
+
+### Not yet solved
+
+- full live Gemma attention sublayer through Mirage
+- full live Gemma block through Mirage
+- full live Gemma4MoE execution through Mirage
+
+## Best Practices For Interfacing With MPK / Mirage
+
+These are the main lessons so far.
+
+### 1. Prefer the compiled `PersistentKernel` path over ad hoc direct wrappers
+
+Direct extension wrappers are useful for narrow experiments, but they are not
+the safest reusable execution substrate.
+
+Best practice:
+
+- use direct wrappers only for single-kernel bring-up and local numerical probes
+- move reusable execution onto compiled `PersistentKernel` launchers as early as
+  possible
+
+### 2. Always treat Mirage runtime state as mutable and per-request
+
+Do not assume a compiled kernel is stateless between launches.
+
+Best practice:
+
+- reset request/runtime meta tensors before repeated launches in tests
+- reseed:
+  - `step`
+  - `tokens`
+  - `input_tokens`
+  - `output_tokens`
+  - `num_new_tokens`
+  - `prompt_lengths`
+  - `qo_indptr_buffer`
+  - `paged_kv_indptr_buffer`
+  - `paged_kv_indices_buffer`
+  - `paged_kv_last_page_len_buffer`
+- call `init_request_func()` when available
+
+### 3. Encode active-token count in metadata, not only in tensor shapes
+
+Mirage request prep logic uses runtime metadata to determine batching behavior.
+
+Best practice:
+
+- when testing multi-token or prefill-like paths, explicitly set
+  `prompt_lengths` and related metadata to match the intended live request
+  shape
+
+### 4. Synchronize after PK launches when validating numerics
+
+Mirage launches are async from Python.
+
+Best practice:
+
+- call `torch.cuda.synchronize()` before reading results in numerical tests
+- otherwise later host reads may see stale or partially completed state
+
+### 5. Grow scope only from numerically validated working pieces
+
+This debugging round reinforced the value of:
+
+- first proving one live kernel
+- then one repeated live block
+- then one small composed live block
+
+instead of jumping directly to end-to-end full-model execution
+
+## Recommended Next Debugging Order
+
+The next best order remains:
+
+1. keep PK `linear_with_residual` as the trusted reusable live baseline
+2. get a single-token live attention sublayer fully clean and testable
+3. only then move to multi-token / bigger attention blocks
+4. then revisit full layer
+5. only after that attempt full-model live Mirage execution
+
+This preserves the current "working to working" debugging discipline.
+
 It is:
 
 - "how do we canonicalize AutoDeploy's post-cache-init decode graph into a stable semantic region that MPK can own?"

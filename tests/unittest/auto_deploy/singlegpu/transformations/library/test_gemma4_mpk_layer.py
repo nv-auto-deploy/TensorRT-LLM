@@ -368,6 +368,47 @@ def test_mirage_linear_with_residual_matches_reference_numerically():
     assert "linear_max_abs" in proc.stdout
 
 
+def test_mirage_linear_with_residual_pk_matches_reference_across_repeats():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_linear_with_residual_pk_forward_correctness; "
+                "result = run_mirage_linear_with_residual_pk_forward_correctness(); "
+                "print(result); "
+                "assert result['repeat_0_max_abs'] < 1.0; "
+                "assert result['repeat_0_mean_abs'] < 0.2; "
+                "assert result['repeat_1_max_abs'] < 1.0; "
+                "assert result['repeat_1_mean_abs'] < 0.2"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "repeat_1_max_abs" in proc.stdout
+
+
 def test_gemma4_translated_attention_block_matches_reference():
     layer_plan = GemmaLayerLoweringPlanner().build(_make_gemma4_layer_info())
     hidden_in, weights = _make_reference_inputs()
