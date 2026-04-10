@@ -27,9 +27,15 @@ from .mirage_bridge import (
     exercise_layer_plan_against_mirage,
     exercise_mirage_task_registration,
     resolve_layer_plan_against_mirage,
+    run_mirage_attention_block_pk_forward_correctness,
+    run_mirage_attention_sublayer_forward_correctness,
+    run_mirage_attention_sublayer_pk_forward_correctness,
+    run_mirage_hybrid_attention_sublayer_forward_correctness,
     run_mirage_linear_with_residual_forward_correctness,
+    run_mirage_linear_with_residual_pk_forward_correctness,
     run_mirage_norm_linear_forward_correctness,
     run_mirage_paged_attention_forward_correctness,
+    run_mirage_rmsnorm_linear_pk_forward_correctness,
 )
 from .runtime_wrapper import GemmaMpkRuntimeWrapper
 from .translator import GemmaMpkTranslator
@@ -74,7 +80,13 @@ __all__ = [
     "exercise_layer_plan_against_mirage",
     "exercise_mirage_task_registration",
     "resolve_layer_plan_against_mirage",
+    "run_mirage_attention_sublayer_forward_correctness",
+    "run_mirage_attention_block_pk_forward_correctness",
+    "run_mirage_hybrid_attention_sublayer_forward_correctness",
+    "run_mirage_attention_sublayer_pk_forward_correctness",
     "run_mirage_linear_with_residual_forward_correctness",
+    "run_mirage_linear_with_residual_pk_forward_correctness",
     "run_mirage_paged_attention_forward_correctness",
     "run_mirage_norm_linear_forward_correctness",
+    "run_mirage_rmsnorm_linear_pk_forward_correctness",
 ]
