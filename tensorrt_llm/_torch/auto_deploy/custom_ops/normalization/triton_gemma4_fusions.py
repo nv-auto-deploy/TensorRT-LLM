@@ -123,20 +123,26 @@ def _post_norm_add_and_pre_ff_norm_kernel(
     residual_ptr,
     w_post_attn_ptr,
     w_pre_ff_ptr,
+    w_pre_ff2_ptr,
     out_hs_ptr,
     out_pre_ff_ptr,
+    out_pre_ff2_ptr,
     H: tl.constexpr,
     eps: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    """Fused post-attention norm and pre-feedforward norm sharing one kernel launch.
+    """Fused post-attention norm and two pre-feedforward norms in one kernel launch.
 
-    Computes two sequential RMSNorms in a single kernel:
-      out_hs[row]     = rms_norm(attn_out[row], w_post_attn, eps) + residual[row]
-      out_pre_ff[row] = rms_norm(out_hs[row],   w_pre_ff,    eps)
+    Computes three sequential ops sharing one kernel:
+      out_hs[row]      = rms_norm(attn_out[row], w_post_attn, eps) + residual[row]
+      out_pre_ff[row]  = rms_norm(out_hs[row], w_pre_ff,  eps)   [dense MLP input]
+      out_pre_ff2[row] = rms_norm(out_hs[row], w_pre_ff2, eps)   [MoE input]
 
-    The intermediate out_hs stays in registers between the two norms, avoiding
-    a round-trip through global memory and eliminating one kernel launch per layer.
+    out_hs stays in registers between steps, eliminating one memory round-trip.
+    out_pre_ff and out_pre_ff2 share the SAME inv_rms2 (both normalize out_hs),
+    so the second reduction is computed once and applied to both weight vectors —
+    the third output adds only one load + multiply + store per element with no
+    extra reduction.  Eliminates 2 kernel launches per MoE layer vs baseline.
     """
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
@@ -146,6 +152,7 @@ def _post_norm_add_and_pre_ff_norm_kernel(
     residual = tl.load(residual_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
     w1 = tl.load(w_post_attn_ptr + offs, mask=mask, other=1.0).to(tl.float32)
     w2 = tl.load(w_pre_ff_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+    w3 = tl.load(w_pre_ff2_ptr + offs, mask=mask, other=1.0).to(tl.float32)
 
     # Step 1: post-attention RMSNorm + residual add → hidden_states
     var1 = tl.sum(attn_out * attn_out) / H
@@ -157,8 +164,12 @@ def _post_norm_add_and_pre_ff_norm_kernel(
     inv_rms2 = tl.rsqrt(var2 + eps)
     pre_ff = hs * inv_rms2 * w2
 
+    # Step 3: second pre-feedforward RMSNorm — reuses inv_rms2, NO extra reduction
+    pre_ff2 = hs * inv_rms2 * w3
+
     tl.store(out_hs_ptr + row * H + offs, hs.to(tl.bfloat16), mask=mask)
     tl.store(out_pre_ff_ptr + row * H + offs, pre_ff.to(tl.bfloat16), mask=mask)
+    tl.store(out_pre_ff2_ptr + row * H + offs, pre_ff2.to(tl.bfloat16), mask=mask)
 
 
 @triton.autotune(
@@ -362,131 +373,6 @@ def _gemma4_post_add_norm_add_scale_fake(
     return torch.empty_like(a)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_H": 4096}, num_warps=4),
-        triton.Config({"BLOCK_H": 4096}, num_warps=8),
-        triton.Config({"BLOCK_H": 4096}, num_warps=16),
-    ],
-    key=["H"],
-)
-@triton.jit
-def _post_add_norm_add_scale_and_next_input_norm_kernel(
-    a_ptr,
-    b_ptr,
-    residual_ptr,
-    weight_ptr,
-    scalar_ptr,
-    w_next_ptr,
-    out_ptr,
-    out_next_ptr,
-    H: tl.constexpr,
-    eps: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    """Fused: current-layer MoE final op + next-layer input_layernorm.
-
-    out[row]      = (rms_norm(a[row]+b[row], weight, eps) + residual[row]) * scalar
-    out_next[row] = rms_norm(out[row], w_next, eps)
-
-    Saves 1 kernel launch per non-last MoE layer: 'out' stays in registers for the
-    second reduction, avoiding a global-memory round-trip to compute input_layernorm
-    of the next layer.
-    """
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_H)
-    mask = offs < H
-
-    a = tl.load(a_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    b = tl.load(b_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    x = a + b
-    residual = tl.load(residual_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    weight = tl.load(weight_ptr + offs, mask=mask, other=1.0).to(tl.float32)
-    scalar = tl.load(scalar_ptr).to(tl.float32)
-    w_next = tl.load(w_next_ptr + offs, mask=mask, other=1.0).to(tl.float32)
-
-    # Step 1: current layer's combine + norm + residual + scale
-    var1 = tl.sum(x * x) / H
-    inv_rms1 = tl.rsqrt(var1 + eps)
-    normed1 = x * inv_rms1 * weight
-    out = (normed1 + residual) * scalar
-
-    # Step 2: next layer's input_layernorm (out stays in registers — no extra load)
-    var2 = tl.sum(out * out) / H
-    inv_rms2 = tl.rsqrt(var2 + eps)
-    out_next = out * inv_rms2 * w_next
-
-    tl.store(out_ptr + row * H + offs, out.to(tl.bfloat16), mask=mask)
-    tl.store(out_next_ptr + row * H + offs, out_next.to(tl.bfloat16), mask=mask)
-
-
-@torch.library.custom_op(
-    "auto_deploy::gemma4_post_add_norm_add_scale_and_next_input_norm",
-    mutates_args=(),
-    device_types="cuda",
-)
-def gemma4_post_add_norm_add_scale_and_next_input_norm(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    scalar: torch.Tensor,
-    w_next: torch.Tensor,
-) -> torch.Tensor:
-    """Fused MoE final op + next-layer input_layernorm: saves 1 kernel launch per non-last MoE layer.
-
-    Returns packed (2, *a.shape):
-      packed[0] = (rms_norm(a+b, weight, eps) + residual) * scalar  [hidden_states]
-      packed[1] = rms_norm(packed[0], w_next, eps)                   [input_layernorm output for next layer]
-    """
-    import flashinfer
-
-    H = a.shape[-1]
-    T_flat = a.numel() // H
-    a_2d = a.view(-1, H)
-    b_2d = b.view(-1, H)
-    residual_2d = residual.view(-1, H)
-    packed_flat = torch.empty(2, T_flat, H, dtype=torch.bfloat16, device=a.device)
-
-    if T_flat <= _TRITON_T_THRESHOLD:
-        _post_add_norm_add_scale_and_next_input_norm_kernel[(T_flat,)](
-            a_2d,
-            b_2d,
-            residual_2d,
-            weight,
-            scalar.view(-1),
-            w_next,
-            packed_flat[0],
-            packed_flat[1],
-            H=H,
-            eps=eps,
-        )
-    else:
-        x_2d = a_2d + b_2d
-        torch.mul(
-            flashinfer.norm.rmsnorm(x_2d, weight, eps) + residual_2d,
-            scalar,
-            out=packed_flat[0],
-        )
-        packed_flat[1].copy_(flashinfer.norm.rmsnorm(packed_flat[0], w_next, eps))
-
-    return packed_flat.reshape(2, *a.shape)
-
-
-@gemma4_post_add_norm_add_scale_and_next_input_norm.register_fake
-def _gemma4_post_add_norm_add_scale_and_next_input_norm_fake(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    scalar: torch.Tensor,
-    w_next: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty(2, *a.shape, dtype=torch.bfloat16, device=a.device)
-
-
 @torch.library.custom_op(
     "auto_deploy::gemma4_post_norm_add_and_pre_ff_norm", mutates_args=(), device_types="cuda"
 )
@@ -495,17 +381,22 @@ def gemma4_post_norm_add_and_pre_ff_norm(
     residual: torch.Tensor,
     post_attn_weight: torch.Tensor,
     pre_ff_weight: torch.Tensor,
+    pre_ff_weight_2: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Fused post-attention norm + pre-feedforward norm: saves 1 kernel launch per layer.
+    """Fused post-attention norm + two pre-feedforward norms: saves 2 kernel launches per MoE layer.
 
-    Returns a packed tensor of shape (2, *attn_out.shape) where:
+    Returns a packed tensor of shape (3, *attn_out.shape) where:
       packed[0] = rms_norm(attn_out, post_attn_weight, eps) + residual  (hidden_states)
-      packed[1] = rms_norm(packed[0], pre_ff_weight, eps)               (pre-feedforward input)
+      packed[1] = rms_norm(packed[0], pre_ff_weight, eps)               (dense MLP input)
+      packed[2] = rms_norm(packed[0], pre_ff_weight_2, eps)             (MoE input)
 
-    Dispatches to the fused Triton kernel for T ≤ _TRITON_T_THRESHOLD (decode path),
-    saving one round-trip through global memory and one kernel launch per decoder layer.
-    Falls back to two flashinfer rmsnorm calls for large T (prefill path).
+    packed[1] and packed[2] share the SAME inv_rms of packed[0]; the third output
+    reuses the already-computed inv_rms2 and adds only one multiply+store per element
+    with no extra reduction, eliminating the separate pre_feedforward_layernorm_2 launch.
+
+    Dispatches to the fused Triton kernel for T ≤ _TRITON_T_THRESHOLD (decode path).
+    Falls back to three flashinfer rmsnorm calls for large T (prefill path).
     """
     import flashinfer
 
@@ -514,8 +405,8 @@ def gemma4_post_norm_add_and_pre_ff_norm(
     attn_2d = attn_out.reshape(T_flat, H)
     residual_2d = residual.reshape(T_flat, H)
 
-    # packed_flat: (2, T_flat, H) — packed[0]=hidden_states, packed[1]=pre_ff_in
-    packed_flat = torch.empty(2, T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
+    # packed_flat: (3, T_flat, H)
+    packed_flat = torch.empty(3, T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
 
     if T_flat <= _TRITON_T_THRESHOLD:
         _post_norm_add_and_pre_ff_norm_kernel[(T_flat,)](
@@ -523,8 +414,10 @@ def gemma4_post_norm_add_and_pre_ff_norm(
             residual_2d,
             post_attn_weight,
             pre_ff_weight,
+            pre_ff_weight_2,
             packed_flat[0],
             packed_flat[1],
+            packed_flat[2],
             H=H,
             eps=eps,
         )
@@ -536,8 +429,9 @@ def gemma4_post_norm_add_and_pre_ff_norm(
             out=packed_flat[0],
         )
         packed_flat[1].copy_(flashinfer.norm.rmsnorm(packed_flat[0], pre_ff_weight, eps))
+        packed_flat[2].copy_(flashinfer.norm.rmsnorm(packed_flat[0], pre_ff_weight_2, eps))
 
-    return packed_flat.reshape(2, *attn_out.shape)
+    return packed_flat.reshape(3, *attn_out.shape)
 
 
 @gemma4_post_norm_add_and_pre_ff_norm.register_fake
@@ -546,6 +440,7 @@ def _gemma4_post_norm_add_and_pre_ff_norm_fake(
     residual: torch.Tensor,
     post_attn_weight: torch.Tensor,
     pre_ff_weight: torch.Tensor,
+    pre_ff_weight_2: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    return torch.empty(2, *attn_out.shape, dtype=torch.bfloat16, device=attn_out.device)
+    return torch.empty(3, *attn_out.shape, dtype=torch.bfloat16, device=attn_out.device)
