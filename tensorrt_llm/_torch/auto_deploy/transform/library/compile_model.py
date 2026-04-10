@@ -83,6 +83,17 @@ class CompileModel(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
+        autodeploy_meta = self._get_autodeploy_meta(mod)
+        if autodeploy_meta.get("mpk_runtime_mode") == "mirage_runtime":
+            ad_logger.info("Skipping compile_model because Gemma MPK runtime mode is active.")
+            info = TransformInfo(
+                skipped=True,
+                num_matches=0,
+                is_clean=True,
+                has_valid_shapes=True,
+            )
+            return mod, info
+
         cm.info.reset()
 
         def _get_args_kwargs(bs: int) -> ArgsKwargs:

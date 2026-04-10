@@ -23,26 +23,21 @@ import torch.nn as nn
 
 
 class GemmaMpkRuntimeWrapper(nn.Module):
-    """Wrapper that will eventually own a compiled MPK artifact.
+    """Wrapper that owns the Gemma MPK runtime boundary.
 
-    The current implementation is intentionally conservative:
-    - if a compiled MPK callable is provided, it is invoked directly
-    - otherwise, an eager fallback module is used
-
-    This gives the MPK lowering path a concrete runtime integration target
-    without changing the current execution behavior.
+    Once the MPK path is selected we intentionally do not retain an eager
+    fallback. This avoids silently executing the original graph when the
+    Mirage-backed runtime path is expected.
     """
 
     def __init__(
         self,
         *,
-        eager_fallback: Optional[nn.Module] = None,
         mpk_callable: Optional[Callable[..., Any]] = None,
         translation_plan: Optional[Dict[str, Any]] = None,
         input_names: Optional[Sequence[str]] = None,
     ) -> None:
         super().__init__()
-        self.eager_fallback = eager_fallback
         self.mpk_callable = mpk_callable
         self.translation_plan = translation_plan or {}
         self.input_names = tuple(input_names or ())
@@ -50,16 +45,12 @@ class GemmaMpkRuntimeWrapper(nn.Module):
     def forward(self, *args, **kwargs):
         if self.mpk_callable is not None:
             return self.mpk_callable(*args, **kwargs)
-        if self.eager_fallback is not None:
-            if not kwargs and self.input_names and len(args) == len(self.input_names):
-                kwargs = dict(zip(self.input_names, args))
-                args = ()
-            return self.eager_fallback(*args, **kwargs)
         raise RuntimeError(
-            "GemmaMpkRuntimeWrapper has neither an MPK callable nor an eager fallback."
+            "GemmaMpkRuntimeWrapper was invoked without a live MPK callable. "
+            "The Gemma MPK path no longer supports eager fallback."
         )
 
     def extra_repr(self) -> str:
-        mode = "mpk" if self.mpk_callable is not None else "fallback"
+        mode = "mpk" if self.mpk_callable is not None else "missing_mpk_callable"
         has_plan = bool(self.translation_plan)
         return f"mode={mode}, has_plan={has_plan}, num_inputs={len(self.input_names)}"

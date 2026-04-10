@@ -36,6 +36,7 @@ from pydantic import Field
 from torch.fx import Graph, GraphModule
 
 from ...models.factory import ModelFactory
+from ...mpk.mirage_bridge import build_gemma_mirage_runtime_callable
 from ...mpk.runtime_wrapper import GemmaMpkRuntimeWrapper
 from ...mpk.translator import GemmaMpkTranslator
 from ...shim.interface import CachedSequenceInterface
@@ -131,10 +132,10 @@ class LowerToMpk(BaseTransform):
         if not self.config.dry_run_only:
             model = self._wrap_graphmodule_with_runtime_wrapper(model, plan.to_dict())
             wrapped_meta = self._get_autodeploy_meta(model)
-            wrapped_meta["mpk_runtime_mode"] = "fallback_wrapper"
+            wrapped_meta["mpk_runtime_mode"] = "mirage_runtime"
             self._set_autodeploy_meta(model, wrapped_meta)
             ad_logger.info(
-                "Gemma MPK runtime wrapper installed as a GraphModule call_module with eager fallback"
+                "Gemma MPK runtime wrapper installed as a GraphModule call_module without eager fallback"
             )
 
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
@@ -147,15 +148,13 @@ class LowerToMpk(BaseTransform):
     ) -> GraphModule:
         """Wrap the full graph in a runtime wrapper while preserving GraphModule shape.
 
-        The wrapper is the first concrete runtime integration point for MPK. Today it
-        forwards to the original graph via eager fallback. Later, ``mpk_callable`` can
-        be populated with a live Mirage-backed executable without changing the outer FX
-        contract seen by downstream compile stages.
+        The wrapper is the first strict runtime integration point for MPK.
+        Once this path is selected, execution must go through an MPK callable
+        instead of silently falling back to the original graph.
         """
 
         wrapper = GemmaMpkRuntimeWrapper(
-            eager_fallback=model,
-            mpk_callable=None,
+            mpk_callable=build_gemma_mirage_runtime_callable(translation_plan),
             translation_plan=translation_plan,
             input_names=[node.name for node in model.graph.nodes if node.op == "placeholder"],
         )
