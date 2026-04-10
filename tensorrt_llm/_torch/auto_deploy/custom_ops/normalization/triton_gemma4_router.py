@@ -239,3 +239,197 @@ def _gemma4_router_fake(
         torch.empty((T, top_k), dtype=torch.float32, device=hidden.device),
         torch.empty((T, top_k), dtype=torch.int32, device=hidden.device),
     )
+
+
+# ---------------------------------------------------------------------------
+# Extended router fused with pre_feedforward_layernorm_2
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _gemma4_router_and_pre_ff2_fwd(
+    hidden_ptr,  # [T, H] input hidden states
+    scale_ptr,  # [H]    per-dim router scale
+    proj_T_ptr,  # [H, E] transposed proj weight
+    pre_ff_w2_ptr,  # [H]    pre_feedforward_layernorm_2 weight
+    weights_ptr,  # [T, K] output top-k weights (normalized)
+    indices_ptr,  # [T, K] output top-k expert indices (int32)
+    out_pre_ff2_ptr,  # [T, H] output pre-feedforward-2 normed hidden states
+    stride_th,  # stride of hidden / out_pre_ff2 along token dim (= H)
+    stride_hE,  # stride of proj_T along H dim (= E)
+    T,
+    H: tl.constexpr,
+    E: tl.constexpr,
+    K: tl.constexpr,
+    root_size,
+    eps,
+    BLOCK_H: tl.constexpr,
+    N_TOKENS: tl.constexpr,
+    LOG2E: tl.constexpr,
+):
+    """Router kernel extended to also compute pre_feedforward_layernorm_2 output.
+
+    Adds a second pass over H (after the main var+scores accumulation) to write:
+        out_pre_ff2[t, h] = hidden[t, h] * inv_rms * pre_ff_w2[h]
+    where inv_rms = rsqrt(mean(hidden[t]^2) + eps) — the same value used for
+    router score normalisation (norm_factor = inv_rms * root_size).
+
+    The second H-loop re-reads hidden and reads pre_ff_w2 once, adding only
+    ~2.3% extra memory bandwidth vs the dominant proj_T load (H*E elements).
+    Net effect: eliminates one separate pre_feedforward_layernorm_2 kernel
+    launch per MoE layer with negligible cost.
+    """
+    prog_id = tl.program_id(0)
+    t_base = prog_id * N_TOKENS
+
+    h_offs = tl.arange(0, BLOCK_H)
+    e_offs = tl.arange(0, E)
+
+    for n in tl.static_range(N_TOKENS):
+        t = t_base + n
+
+        var = tl.zeros([1], dtype=tl.float32)
+        scores = tl.zeros([E], dtype=tl.float32)
+
+        for h_base in tl.range(0, H, BLOCK_H):
+            h_idx = h_base + h_offs
+            mask = h_idx < H
+            token_mask = (t < T) & mask
+            x = tl.load(hidden_ptr + t * stride_th + h_idx, mask=token_mask, other=0.0).to(
+                tl.float32
+            )
+            s = tl.load(scale_ptr + h_idx, mask=mask, other=0.0).to(tl.float32)
+            var += tl.sum(x * x, 0)
+            w_T = tl.load(
+                proj_T_ptr + h_idx[:, None] * stride_hE + e_offs[None, :],
+                mask=mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            xs = (x * s)[:, None]
+            scores += tl.sum(xs * w_T, 0)
+
+        if t < T:
+            # Separate inv_rms from norm_factor so it can be reused for pre_ff_2
+            inv_rms = tl.rsqrt(var / H + eps)
+            norm_factor = inv_rms * root_size
+            scores = scores * norm_factor
+
+            max_s = tl.max(scores, 0)
+            exp_s = tl.exp2((scores - max_s) * LOG2E)
+            sum_exp = tl.sum(exp_s, 0)
+            probs = exp_s / sum_exp
+
+            _topk_and_store(probs, e_offs, weights_ptr, indices_ptr, t * K, E, K)
+
+            # Second pass: pre_ff_2[h] = hidden[h] * inv_rms * pre_ff_w2[h]
+            # Re-reads hidden (~2.3% extra BW vs dominant proj_T load) but saves
+            # a full separate kernel launch for pre_feedforward_layernorm_2.
+            for h_base in tl.range(0, H, BLOCK_H):
+                h_idx = h_base + h_offs
+                mask = h_idx < H
+                x2 = tl.load(hidden_ptr + t * stride_th + h_idx, mask=mask, other=0.0).to(
+                    tl.float32
+                )
+                w2 = tl.load(pre_ff_w2_ptr + h_idx, mask=mask, other=0.0).to(tl.float32)
+                tl.store(
+                    out_pre_ff2_ptr + t * stride_th + h_idx,
+                    (x2 * inv_rms * w2).to(tl.bfloat16),
+                    mask=mask,
+                )
+
+
+def gemma4_router_triton_and_pre_ff2(
+    hidden: torch.Tensor,  # [T, H]
+    scale: torch.Tensor,  # [H]
+    proj_T: torch.Tensor,  # [H, E]
+    pre_ff_weight_2: torch.Tensor,  # [H]
+    root_size: float,
+    eps: float,
+    top_k: int,
+    num_warps: int = 8,
+    num_stages: int = 2,
+    block_h: int = 512,
+    n_tokens: int = 1,
+) -> tuple:
+    """Fused router + pre_feedforward_layernorm_2: returns (weights, indices, pre_ff_2)."""
+    T, H = hidden.shape
+    E = proj_T.shape[1]
+    K = top_k
+
+    out_weights = torch.empty((T, K), dtype=torch.float32, device=hidden.device)
+    out_indices = torch.empty((T, K), dtype=torch.int32, device=hidden.device)
+    out_pre_ff2 = torch.empty((T, H), dtype=torch.bfloat16, device=hidden.device)
+
+    log2e = _math.log2(_math.e)
+
+    grid = (triton.cdiv(T, n_tokens),)
+    _gemma4_router_and_pre_ff2_fwd[grid](
+        hidden,
+        scale,
+        proj_T,
+        pre_ff_weight_2,
+        out_weights,
+        out_indices,
+        out_pre_ff2,
+        hidden.stride(0),
+        proj_T.stride(0),
+        T=T,
+        H=H,
+        E=E,
+        K=K,
+        root_size=root_size,
+        eps=eps,
+        BLOCK_H=block_h,
+        N_TOKENS=n_tokens,
+        LOG2E=log2e,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out_weights, out_indices, out_pre_ff2
+
+
+@torch.library.custom_op(
+    "auto_deploy::gemma4_router_and_pre_ff2", mutates_args=(), device_types="cuda"
+)
+def gemma4_router_and_pre_ff2(
+    hidden: torch.Tensor,
+    scale: torch.Tensor,
+    proj_weight: torch.Tensor,
+    pre_ff_weight_2: torch.Tensor,
+    root_size: float,
+    eps: float,
+    top_k: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused Gemma4 router + pre_feedforward_layernorm_2.
+
+    Returns (top_k_weights [T,K] float32, top_k_indices [T,K] int32, pre_ff_2 [T,H] bfloat16).
+
+    pre_ff_2 = rms_norm(hidden, pre_ff_weight_2, eps) is produced as a zero-overhead
+    by-product: the router's first H-loop already computes inv_rms = rsqrt(mean(x^2)+eps),
+    and a second H-loop writes pre_ff_2 = hidden * inv_rms * pre_ff_weight_2 at only
+    ~2.3% extra memory bandwidth vs the dominant proj_T load (H*E elements).
+
+    Accepts proj_weight in its natural [E, H] (nn.Linear) layout and transposes internally.
+    """
+    proj_T = proj_weight.t().contiguous()
+    return gemma4_router_triton_and_pre_ff2(
+        hidden, scale, proj_T, pre_ff_weight_2, root_size, eps, top_k
+    )
+
+
+@gemma4_router_and_pre_ff2.register_fake
+def _gemma4_router_and_pre_ff2_fake(
+    hidden: torch.Tensor,
+    scale: torch.Tensor,
+    proj_weight: torch.Tensor,
+    pre_ff_weight_2: torch.Tensor,
+    root_size: float,
+    eps: float,
+    top_k: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    T, H = hidden.shape
+    return (
+        torch.empty((T, top_k), dtype=torch.float32, device=hidden.device),
+        torch.empty((T, top_k), dtype=torch.int32, device=hidden.device),
+        torch.empty((T, H), dtype=torch.bfloat16, device=hidden.device),
+    )

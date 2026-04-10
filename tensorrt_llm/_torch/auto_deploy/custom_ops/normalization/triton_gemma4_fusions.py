@@ -123,26 +123,20 @@ def _post_norm_add_and_pre_ff_norm_kernel(
     residual_ptr,
     w_post_attn_ptr,
     w_pre_ff_ptr,
-    w_pre_ff2_ptr,
     out_hs_ptr,
     out_pre_ff_ptr,
-    out_pre_ff2_ptr,
     H: tl.constexpr,
     eps: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    """Fused post-attention norm and two pre-feedforward norms in one kernel launch.
+    """Fused post-attention norm and pre-feedforward norm in one kernel launch.
 
-    Computes three sequential ops sharing one kernel:
-      out_hs[row]      = rms_norm(attn_out[row], w_post_attn, eps) + residual[row]
-      out_pre_ff[row]  = rms_norm(out_hs[row], w_pre_ff,  eps)   [dense MLP input]
-      out_pre_ff2[row] = rms_norm(out_hs[row], w_pre_ff2, eps)   [MoE input]
+    Computes two sequential ops sharing one kernel:
+      out_hs[row]     = rms_norm(attn_out[row], w_post_attn, eps) + residual[row]
+      out_pre_ff[row] = rms_norm(out_hs[row], w_pre_ff, eps)   [dense MLP input]
 
     out_hs stays in registers between steps, eliminating one memory round-trip.
-    out_pre_ff and out_pre_ff2 share the SAME inv_rms2 (both normalize out_hs),
-    so the second reduction is computed once and applied to both weight vectors —
-    the third output adds only one load + multiply + store per element with no
-    extra reduction.  Eliminates 2 kernel launches per MoE layer vs baseline.
+    Eliminates 1 kernel launch per MoE layer vs baseline.
     """
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
@@ -152,7 +146,6 @@ def _post_norm_add_and_pre_ff_norm_kernel(
     residual = tl.load(residual_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
     w1 = tl.load(w_post_attn_ptr + offs, mask=mask, other=1.0).to(tl.float32)
     w2 = tl.load(w_pre_ff_ptr + offs, mask=mask, other=1.0).to(tl.float32)
-    w3 = tl.load(w_pre_ff2_ptr + offs, mask=mask, other=1.0).to(tl.float32)
 
     # Step 1: post-attention RMSNorm + residual add → hidden_states
     var1 = tl.sum(attn_out * attn_out) / H
@@ -164,12 +157,8 @@ def _post_norm_add_and_pre_ff_norm_kernel(
     inv_rms2 = tl.rsqrt(var2 + eps)
     pre_ff = hs * inv_rms2 * w2
 
-    # Step 3: second pre-feedforward RMSNorm — reuses inv_rms2, NO extra reduction
-    pre_ff2 = hs * inv_rms2 * w3
-
     tl.store(out_hs_ptr + row * H + offs, hs.to(tl.bfloat16), mask=mask)
     tl.store(out_pre_ff_ptr + row * H + offs, pre_ff.to(tl.bfloat16), mask=mask)
-    tl.store(out_pre_ff2_ptr + row * H + offs, pre_ff2.to(tl.bfloat16), mask=mask)
 
 
 @triton.autotune(
@@ -381,22 +370,18 @@ def gemma4_post_norm_add_and_pre_ff_norm(
     residual: torch.Tensor,
     post_attn_weight: torch.Tensor,
     pre_ff_weight: torch.Tensor,
-    pre_ff_weight_2: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Fused post-attention norm + two pre-feedforward norms: saves 2 kernel launches per MoE layer.
+    """Fused post-attention norm + pre-feedforward norm: saves 1 kernel launch per MoE layer.
 
-    Returns a packed tensor of shape (3, *attn_out.shape) where:
+    Returns a packed tensor of shape (2, *attn_out.shape) where:
       packed[0] = rms_norm(attn_out, post_attn_weight, eps) + residual  (hidden_states)
       packed[1] = rms_norm(packed[0], pre_ff_weight, eps)               (dense MLP input)
-      packed[2] = rms_norm(packed[0], pre_ff_weight_2, eps)             (MoE input)
 
-    packed[1] and packed[2] share the SAME inv_rms of packed[0]; the third output
-    reuses the already-computed inv_rms2 and adds only one multiply+store per element
-    with no extra reduction, eliminating the separate pre_feedforward_layernorm_2 launch.
+    packed[0] stays in registers between steps, eliminating one memory round-trip.
 
     Dispatches to the fused Triton kernel for T ≤ _TRITON_T_THRESHOLD (decode path).
-    Falls back to three flashinfer rmsnorm calls for large T (prefill path).
+    Falls back to two flashinfer rmsnorm calls for large T (prefill path).
     """
     import flashinfer
 
@@ -405,8 +390,8 @@ def gemma4_post_norm_add_and_pre_ff_norm(
     attn_2d = attn_out.reshape(T_flat, H)
     residual_2d = residual.reshape(T_flat, H)
 
-    # packed_flat: (3, T_flat, H)
-    packed_flat = torch.empty(3, T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
+    # packed_flat: (2, T_flat, H)
+    packed_flat = torch.empty(2, T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
 
     if T_flat <= _TRITON_T_THRESHOLD:
         _post_norm_add_and_pre_ff_norm_kernel[(T_flat,)](
@@ -414,10 +399,8 @@ def gemma4_post_norm_add_and_pre_ff_norm(
             residual_2d,
             post_attn_weight,
             pre_ff_weight,
-            pre_ff_weight_2,
             packed_flat[0],
             packed_flat[1],
-            packed_flat[2],
             H=H,
             eps=eps,
         )
@@ -429,9 +412,8 @@ def gemma4_post_norm_add_and_pre_ff_norm(
             out=packed_flat[0],
         )
         packed_flat[1].copy_(flashinfer.norm.rmsnorm(packed_flat[0], pre_ff_weight, eps))
-        packed_flat[2].copy_(flashinfer.norm.rmsnorm(packed_flat[0], pre_ff_weight_2, eps))
 
-    return packed_flat.reshape(3, *attn_out.shape)
+    return packed_flat.reshape(2, *attn_out.shape)
 
 
 @gemma4_post_norm_add_and_pre_ff_norm.register_fake
@@ -440,7 +422,6 @@ def _gemma4_post_norm_add_and_pre_ff_norm_fake(
     residual: torch.Tensor,
     post_attn_weight: torch.Tensor,
     pre_ff_weight: torch.Tensor,
-    pre_ff_weight_2: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    return torch.empty(3, *attn_out.shape, dtype=torch.bfloat16, device=attn_out.device)
+    return torch.empty(2, *attn_out.shape, dtype=torch.bfloat16, device=attn_out.device)

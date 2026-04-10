@@ -55,6 +55,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_fusi
 )
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_router import (
     gemma4_router,
+    gemma4_router_and_pre_ff2,
 )
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
@@ -579,19 +580,15 @@ class Gemma4TextDecoderLayer(nn.Module):
 
         # Feed-forward (dense MLP ± MoE)
         if self.enable_moe_block:
-            # Fused: post_attention_layernorm + residual_add + pre_feedforward_layernorm ×2
-            # → 3 kernels → 1 packed-tensor kernel; saves 2 kernel launches per MoE layer.
+            # Fused: post_attention_layernorm + residual_add + pre_feedforward_layernorm
+            # → 2 kernels → 1 packed-tensor kernel; saves 1 kernel launch per MoE layer.
             # packed[0] = rms_norm(attn_out, post_attn_w) + residual  (hidden_states)
             # packed[1] = rms_norm(packed[0], pre_ff_w)               (dense MLP input)
-            # packed[2] = rms_norm(packed[0], pre_ff_w_2)             (MoE input)
-            # packed[1] and packed[2] share the same inv_rms of packed[0] — the third
-            # output adds only one multiply+store per element with no extra reduction.
             packed = gemma4_post_norm_add_and_pre_ff_norm(
                 hidden_states,
                 residual,
                 self.post_attention_layernorm.weight,
                 self.pre_feedforward_layernorm.weight,
-                self.pre_feedforward_layernorm_2.weight,
                 self.post_attention_layernorm.eps,
             )
             hidden_states = packed[0]
@@ -602,10 +599,20 @@ class Gemma4TextDecoderLayer(nn.Module):
             hs_dense = self.mlp(hs_dense)
             hs_dense = self.post_feedforward_layernorm_1(hs_dense)
 
-            # MoE path — use packed[2] instead of calling pre_feedforward_layernorm_2
+            # MoE path — router fused with pre_feedforward_layernorm_2.
+            # The router already computes inv_rms = rsqrt(mean(hs^2) + eps) for score
+            # normalisation; the fused op adds a second H-loop (only ~2.3% extra BW)
+            # to write pre_ff_2 = hs * inv_rms * w, eliminating a separate kernel launch.
             hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-            top_k_weights, top_k_index = self.router(hs_flat)
-            hs_moe = packed[2].reshape(-1, hidden_states.shape[-1])
+            top_k_weights, top_k_index, hs_moe = gemma4_router_and_pre_ff2(
+                hs_flat,
+                self.router.scale,
+                self.router.proj.weight,
+                self.pre_feedforward_layernorm_2.weight,
+                self.router._root_size_val,
+                self.router.eps,
+                self.router.top_k,
+            )
             hs_moe = self.moe(hs_moe, top_k_index, top_k_weights)
             hs_moe = hs_moe.reshape(hidden_states.shape)
             hs_moe = self.post_feedforward_layernorm_2(hs_moe)
