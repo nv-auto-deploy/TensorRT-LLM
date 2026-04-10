@@ -49,10 +49,8 @@ from transformers.utils import ModelOutput, cached_file
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_fusions import (
     gemma4_post_add_norm_add_scale,
-    gemma4_post_norm_add,
     gemma4_post_norm_add_and_pre_ff_norm,
     gemma4_post_norm_add_scale,
-    gemma4_qkv_norm,
 )
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_router import (
     gemma4_router,
@@ -469,26 +467,9 @@ class Gemma4TextAttention(nn.Module):
         else:
             v = k  # K=V: reuse key as value
 
-        # Fused: q_norm + k_norm + v_norm → 3 kernel launches → 1 (saves 2 per layer).
-        # Returns packed [T*(Hq+2*Hk), D]; unpack via views (no copy).
-        Hq = self.num_heads
-        Hk = self.num_kv_heads
-        D = self.head_dim
-        T = batch_size * seq_len
-        packed_norms = gemma4_qkv_norm(
-            q.reshape(T * Hq, D),
-            k.reshape(T * Hk, D),
-            v.reshape(T * Hk, D),
-            self.q_norm.weight,
-            self.k_norm.weight,
-            self.v_norm.weight,
-            self.q_norm.eps,
-        )  # shape: [T*(Hq+2*Hk), D]
-        Tq = T * Hq
-        Tk = T * Hk
-        q = packed_norms[:Tq].reshape(batch_size, seq_len, Hq, D)
-        k = packed_norms[Tq : Tq + Tk].reshape(batch_size, seq_len, Hk, D)
-        v = packed_norms[Tq + Tk :].reshape(batch_size, seq_len, Hk, D)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        v = self.v_norm(v)
 
         cos, sin = position_embeddings
         q, k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 2)
@@ -635,16 +616,18 @@ class Gemma4TextDecoderLayer(nn.Module):
             )
             return hidden_states
         else:
-            # Fused: post_attention_layernorm + residual add -> 2 kernels -> 1
-            hidden_states = gemma4_post_norm_add(
+            # Fused: post_attention_layernorm + residual_add + pre_feedforward_layernorm
+            # → 2 kernels → 1 (same op already used for MoE layers); saves 1 node per dense layer.
+            packed = gemma4_post_norm_add_and_pre_ff_norm(
                 hidden_states,
                 residual,
                 self.post_attention_layernorm.weight,
+                self.pre_feedforward_layernorm.weight,
                 self.post_attention_layernorm.eps,
             )
+            hidden_states = packed[0]
             residual = hidden_states
-            hidden_states = self.pre_feedforward_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(packed[1])
 
         # Fused: post_feedforward_layernorm + residual add + layer_scalar -> 3 kernels -> 1
         hidden_states = gemma4_post_norm_add_scale(
