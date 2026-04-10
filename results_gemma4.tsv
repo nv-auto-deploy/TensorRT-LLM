@@ -36,4 +36,5 @@ iter	commit	ttft_c1	tpot_c1	tps_c1	ttft_c16	tpot_c16	tps_c16	ttft_c256	tpot_c256
 34	bc89a89e15	45.96	2.264	432.1	122.69	3.255	4730.9	3594.74	18.059	11513.6	-	keep	iter39: adaptive Triton/flashinfer dispatch — tpot@c1 -1.5% vs iter25, c16 flat, c256 +3.8% (investigate)
 35	(discarded)	46.30	2.355	414.1	124.68	3.521	4397.7	3702.15	18.573	11232.4	-	discard	iter40: dual_norm+norm_add2 — tpot@c1 +4.0%, c16 +8.2% REGRESSION; root cause: dual_norm serializes multi_stream_moe (both MLP+MoE streams now wait for 1 fused op)
 36	(discarded)	55.35	5.357	186.7	536.09	12.470	80.2	96639.86	18.906	52.9	-	discard	iter41: fused QKV norm (tuple custom_op) — tpot@c1 +137%, c16 +295% REGRESSION; root cause: tuple-return custom_op not captured in CUDA graph, 30 graph exit/reentry per decode step
-37	(pending)	-	-	-	-	-	-	-	-	-	-	pending	iter42: fuse dense+MoE add with post-feedforward norm (single-tensor return, CUDA-graph-safe)
+37	(discarded)	55.26	5.419	184.5	461.39	12.515	79.9	96506.69	18.833	53.1	-	discard	iter42-wrong-model: accidentally ran FULL 30-layer model instead of 6-layer reduced (multi_stream_moe=30 vs 6 expected); results not comparable to baseline
+38	(pending)	-	-	-	-	-	-	-	-	-	-	pending	iter42-rerun: same code as iter42 but with correct 6-layer reduced_config_gemma4.yaml
