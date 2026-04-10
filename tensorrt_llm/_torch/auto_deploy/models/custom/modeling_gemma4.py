@@ -48,10 +48,11 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_fusions import (
-    gemma4_post_dense_moe_norm_add_norm_add_scale,
+    gemma4_post_add_norm_add_scale,
     gemma4_post_norm_add,
     gemma4_post_norm_add_and_pre_ff_norm,
     gemma4_post_norm_add_scale,
+    gemma4_qkv_norm,
 )
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_router import (
     gemma4_router,
@@ -468,9 +469,26 @@ class Gemma4TextAttention(nn.Module):
         else:
             v = k  # K=V: reuse key as value
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        v = self.v_norm(v)
+        # Fused: q_norm + k_norm + v_norm → 3 kernel launches → 1 (saves 2 per layer).
+        # Returns packed [T*(Hq+2*Hk), D]; unpack via views (no copy).
+        Hq = self.num_heads
+        Hk = self.num_kv_heads
+        D = self.head_dim
+        T = batch_size * seq_len
+        packed_norms = gemma4_qkv_norm(
+            q.reshape(T * Hq, D),
+            k.reshape(T * Hk, D),
+            v.reshape(T * Hk, D),
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.v_norm.weight,
+            self.q_norm.eps,
+        )  # shape: [T*(Hq+2*Hk), D]
+        Tq = T * Hq
+        Tk = T * Hk
+        q = packed_norms[:Tq].reshape(batch_size, seq_len, Hq, D)
+        k = packed_norms[Tq : Tq + Tk].reshape(batch_size, seq_len, Hk, D)
+        v = packed_norms[Tq + Tk :].reshape(batch_size, seq_len, Hk, D)
 
         cos, sin = position_embeddings
         q, k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 2)
@@ -593,30 +611,24 @@ class Gemma4TextDecoderLayer(nn.Module):
             hidden_states = packed[0]
             residual = hidden_states
 
-            # Dense MLP path — pass raw (unnormed) to combine kernel (iter50)
+            # Dense MLP path
             hs_dense = packed[1]
             hs_dense = self.mlp(hs_dense)
+            hs_dense = self.post_feedforward_layernorm_1(hs_dense)
 
-            # MoE path — standard router (no second-H-loop fusion, avoids iter47 regression)
-            # pre_feedforward_layernorm_2 remains a separate kernel here; its output is the
-            # MoE input, so it cannot be fused into the post-MoE combine kernel.
+            # MoE path
             hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             top_k_weights, top_k_index = self.router(hs_flat)
             hs_moe = self.pre_feedforward_layernorm_2(hs_flat)
             hs_moe = self.moe(hs_moe, top_k_index, top_k_weights)
             hs_moe = hs_moe.reshape(hidden_states.shape)
+            hs_moe = self.post_feedforward_layernorm_2(hs_moe)
 
-            # Fused 3-reduction combine: post_feedforward_layernorm_1 (dense) +
-            # post_feedforward_layernorm_2 (MoE) + combine + post_feedforward_norm
-            # + residual + scale → saves 2 kernel launches per MoE layer vs iter44
-            # (post_ff_ln_1 and post_ff_ln_2 absorbed into this single Triton kernel).
-            # a_raw = raw dense MLP output; b_raw = raw MoE output (before post_ff_ln_2).
-            hidden_states = gemma4_post_dense_moe_norm_add_norm_add_scale(
+            # Fused: dense+MoE combine + post_feedforward_norm + residual + scale -> 2 kernels -> 1
+            hidden_states = gemma4_post_add_norm_add_scale(
                 hs_dense,
                 hs_moe,
                 residual,
-                self.post_feedforward_layernorm_1.weight,
-                self.post_feedforward_layernorm_2.weight,
                 self.post_feedforward_layernorm.weight,
                 self.post_feedforward_layernorm.eps,
                 self.layer_scalar,

@@ -129,14 +129,14 @@ def _post_norm_add_and_pre_ff_norm_kernel(
     eps: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    """Fused post-attention norm and pre-feedforward norm in one kernel launch.
+    """Fused post-attention norm and pre-feedforward norm sharing one kernel launch.
 
-    Computes two sequential ops sharing one kernel:
+    Computes two sequential RMSNorms in a single kernel:
       out_hs[row]     = rms_norm(attn_out[row], w_post_attn, eps) + residual[row]
-      out_pre_ff[row] = rms_norm(out_hs[row], w_pre_ff, eps)   [dense MLP input]
+      out_pre_ff[row] = rms_norm(out_hs[row],   w_pre_ff,    eps)
 
-    out_hs stays in registers between steps, eliminating one memory round-trip.
-    Eliminates 1 kernel launch per MoE layer vs baseline.
+    The intermediate out_hs stays in registers between the two norms, avoiding
+    a round-trip through global memory and eliminating one kernel launch per layer.
     """
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
@@ -198,67 +198,6 @@ def _post_add_norm_add_scale_kernel(
     weight = tl.load(weight_ptr + offs, mask=mask, other=1.0).to(tl.float32)
     scalar = tl.load(scalar_ptr).to(tl.float32)
 
-    var = tl.sum(x * x) / H
-    inv_rms = tl.rsqrt(var + eps)
-    normed = x * inv_rms * weight
-
-    out = (normed + residual) * scalar
-    tl.store(out_ptr + row * H + offs, out.to(tl.bfloat16), mask=mask)
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_H": 4096}, num_warps=4),
-        triton.Config({"BLOCK_H": 4096}, num_warps=8),
-        triton.Config({"BLOCK_H": 4096}, num_warps=16),
-    ],
-    key=["H"],
-)
-@triton.jit
-def _post_moe_norm_add_norm_add_scale_kernel(
-    a_ptr,
-    b_raw_ptr,
-    residual_ptr,
-    w_moe_ln_ptr,
-    weight_ptr,
-    scalar_ptr,
-    out_ptr,
-    H: tl.constexpr,
-    eps: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    """Fused: out[row] = (rms_norm(a[row] + rms_norm(b_raw[row], w_moe_ln, eps), weight, eps) + residual[row]) * scalar.
-
-    Extends post_add_norm_add_scale by also fusing post_feedforward_layernorm_2 (applied to
-    the raw MoE output b_raw) into the same kernel.  Two sequential RMSNorm reductions
-    are computed in registers before any stores:
-      Step 1: b_normed = rms_norm(b_raw, w_moe_ln, eps)   [post_feedforward_layernorm_2]
-      Step 2: x = a + b_normed
-      Step 3: out = (rms_norm(x, weight, eps) + residual) * scalar
-
-    Eliminates 1 kernel launch per MoE layer (N_MoE layers × ~14µs ≈ ~84µs ≈ 3.9%).
-    Two reductions have the same register footprint as post_norm_add_and_pre_ff_norm.
-    """
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_H)
-    mask = offs < H
-
-    a = tl.load(a_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    b_raw = tl.load(b_raw_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    residual = tl.load(residual_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    w_moe = tl.load(w_moe_ln_ptr + offs, mask=mask, other=1.0).to(tl.float32)
-    weight = tl.load(weight_ptr + offs, mask=mask, other=1.0).to(tl.float32)
-    scalar = tl.load(scalar_ptr).to(tl.float32)
-
-    # Step 1: post_feedforward_layernorm_2 on raw MoE output (stays in registers)
-    var_moe = tl.sum(b_raw * b_raw) / H
-    inv_rms_moe = tl.rsqrt(var_moe + eps)
-    b_normed = b_raw * inv_rms_moe * w_moe
-
-    # Step 2: dense + normed-MoE combine
-    x = a + b_normed
-
-    # Step 3: post_feedforward_layernorm + residual add + layer scalar
     var = tl.sum(x * x) / H
     inv_rms = tl.rsqrt(var + eps)
     normed = x * inv_rms * weight
@@ -424,211 +363,6 @@ def _gemma4_post_add_norm_add_scale_fake(
 
 
 @torch.library.custom_op(
-    "auto_deploy::gemma4_post_moe_norm_add_norm_add_scale", mutates_args=(), device_types="cuda"
-)
-def gemma4_post_moe_norm_add_norm_add_scale(
-    a: torch.Tensor,
-    b_raw: torch.Tensor,
-    residual: torch.Tensor,
-    w_moe_ln: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    scalar: torch.Tensor,
-) -> torch.Tensor:
-    """Fused MoE post-norm + combine + post-norm + scale: saves 1 kernel launch per MoE layer.
-
-    Computes: (rms_norm(a + rms_norm(b_raw, w_moe_ln, eps), weight, eps) + residual) * scalar
-
-    Fuses post_feedforward_layernorm_2 (on raw MoE output b_raw) into the combine kernel,
-    eliminating 1 separate kernel launch per MoE layer.  Two sequential RMSNorm reductions
-    share the same kernel, same register file — same pattern as post_norm_add_and_pre_ff_norm.
-
-    Dispatches to the fused Triton kernel for T ≤ _TRITON_T_THRESHOLD (decode path).
-    Falls back to flashinfer rmsnorm + elementwise ops for large T (prefill path).
-    """
-    import flashinfer
-
-    H = a.shape[-1]
-    out = torch.empty_like(a)
-    a_2d = a.view(-1, H)
-    b_raw_2d = b_raw.view(-1, H)
-    residual_2d = residual.view(-1, H)
-    T_flat = a_2d.shape[0]
-    out_2d = out.view(-1, H)
-
-    if T_flat <= _TRITON_T_THRESHOLD:
-        _post_moe_norm_add_norm_add_scale_kernel[(T_flat,)](
-            a_2d, b_raw_2d, residual_2d, w_moe_ln, weight, scalar.view(-1), out_2d, H=H, eps=eps
-        )
-    else:
-        b_normed_2d = flashinfer.norm.rmsnorm(b_raw_2d, w_moe_ln, eps)
-        x_2d = a_2d + b_normed_2d
-        torch.mul(
-            flashinfer.norm.rmsnorm(x_2d, weight, eps) + residual_2d,
-            scalar,
-            out=out_2d,
-        )
-
-    return out
-
-
-@gemma4_post_moe_norm_add_norm_add_scale.register_fake
-def _gemma4_post_moe_norm_add_norm_add_scale_fake(
-    a: torch.Tensor,
-    b_raw: torch.Tensor,
-    residual: torch.Tensor,
-    w_moe_ln: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    scalar: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty_like(a)
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_H": 4096}, num_warps=4),
-        triton.Config({"BLOCK_H": 4096}, num_warps=8),
-        triton.Config({"BLOCK_H": 4096}, num_warps=16),
-    ],
-    key=["H"],
-)
-@triton.jit
-def _post_dense_moe_norm_add_norm_add_scale_kernel(
-    a_raw_ptr,
-    b_raw_ptr,
-    residual_ptr,
-    w_dense_ln_ptr,
-    w_moe_ln_ptr,
-    weight_ptr,
-    scalar_ptr,
-    out_ptr,
-    H: tl.constexpr,
-    eps: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    """Fused: 3-reduction combine kernel that also applies post_feedforward_layernorm_1 and _2.
-
-    Computes: (rms_norm(rms_norm(a_raw, w_dense_ln) + rms_norm(b_raw, w_moe_ln), weight) + residual) * scalar
-
-    Three sequential RMSNorm reductions all computed in the same register file:
-      Step 1: a_normed = rms_norm(a_raw, w_dense_ln)   [post_feedforward_layernorm_1]
-      Step 2: b_normed = rms_norm(b_raw, w_moe_ln)     [post_feedforward_layernorm_2]
-      Step 3: x = a_normed + b_normed
-      Step 4: out = (rms_norm(x, weight) + residual) * scalar
-
-    Eliminates post_feedforward_layernorm_1 + post_feedforward_layernorm_2 from the graph
-    (2 kernel launches per MoE layer → ~28µs / layer, ~168µs total for 6 MoE layers).
-    H100 register budget: 3 weight arrays + 3 data arrays = 6 × 32 fp32/thread ≈ 192 regs,
-    comfortably within the 256-register-per-thread limit.
-    """
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_H)
-    mask = offs < H
-
-    a_raw = tl.load(a_raw_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    b_raw = tl.load(b_raw_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    residual = tl.load(residual_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    w_dense = tl.load(w_dense_ln_ptr + offs, mask=mask, other=1.0).to(tl.float32)
-    w_moe = tl.load(w_moe_ln_ptr + offs, mask=mask, other=1.0).to(tl.float32)
-    weight = tl.load(weight_ptr + offs, mask=mask, other=1.0).to(tl.float32)
-    scalar = tl.load(scalar_ptr).to(tl.float32)
-
-    # Step 1: post_feedforward_layernorm_1 on dense MLP output
-    var_dense = tl.sum(a_raw * a_raw) / H
-    inv_rms_dense = tl.rsqrt(var_dense + eps)
-    a_normed = a_raw * inv_rms_dense * w_dense
-
-    # Step 2: post_feedforward_layernorm_2 on raw MoE output
-    var_moe = tl.sum(b_raw * b_raw) / H
-    inv_rms_moe = tl.rsqrt(var_moe + eps)
-    b_normed = b_raw * inv_rms_moe * w_moe
-
-    # Step 3: combine
-    x = a_normed + b_normed
-
-    # Step 4: post_feedforward_layernorm + residual add + layer scalar
-    var = tl.sum(x * x) / H
-    inv_rms = tl.rsqrt(var + eps)
-    normed = x * inv_rms * weight
-
-    out = (normed + residual) * scalar
-    tl.store(out_ptr + row * H + offs, out.to(tl.bfloat16), mask=mask)
-
-
-@torch.library.custom_op(
-    "auto_deploy::gemma4_post_dense_moe_norm_add_norm_add_scale",
-    mutates_args=(),
-    device_types="cuda",
-)
-def gemma4_post_dense_moe_norm_add_norm_add_scale(
-    a_raw: torch.Tensor,
-    b_raw: torch.Tensor,
-    residual: torch.Tensor,
-    w_dense_ln: torch.Tensor,
-    w_moe_ln: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    scalar: torch.Tensor,
-) -> torch.Tensor:
-    """Fused 3-reduction combine: applies post_ff_ln_1 + post_ff_ln_2 + combine + post_ff_ln + scale.
-
-    Saves 2 kernel launches per MoE layer vs iter47 baseline (post_ff_ln_1 + post_ff_ln_2).
-
-    Dispatches to the fused Triton kernel for T ≤ _TRITON_T_THRESHOLD (decode path).
-    Falls back to flashinfer rmsnorm + elementwise ops for large T (prefill path).
-    """
-    import flashinfer
-
-    H = a_raw.shape[-1]
-    out = torch.empty_like(a_raw)
-    a_raw_2d = a_raw.view(-1, H)
-    b_raw_2d = b_raw.view(-1, H)
-    residual_2d = residual.view(-1, H)
-    T_flat = a_raw_2d.shape[0]
-    out_2d = out.view(-1, H)
-
-    if T_flat <= _TRITON_T_THRESHOLD:
-        _post_dense_moe_norm_add_norm_add_scale_kernel[(T_flat,)](
-            a_raw_2d,
-            b_raw_2d,
-            residual_2d,
-            w_dense_ln,
-            w_moe_ln,
-            weight,
-            scalar.view(-1),
-            out_2d,
-            H=H,
-            eps=eps,
-        )
-    else:
-        a_normed_2d = flashinfer.norm.rmsnorm(a_raw_2d, w_dense_ln, eps)
-        b_normed_2d = flashinfer.norm.rmsnorm(b_raw_2d, w_moe_ln, eps)
-        x_2d = a_normed_2d + b_normed_2d
-        torch.mul(
-            flashinfer.norm.rmsnorm(x_2d, weight, eps) + residual_2d,
-            scalar,
-            out=out_2d,
-        )
-
-    return out
-
-
-@gemma4_post_dense_moe_norm_add_norm_add_scale.register_fake
-def _gemma4_post_dense_moe_norm_add_norm_add_scale_fake(
-    a_raw: torch.Tensor,
-    b_raw: torch.Tensor,
-    residual: torch.Tensor,
-    w_dense_ln: torch.Tensor,
-    w_moe_ln: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    scalar: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty_like(a_raw)
-
-
-@torch.library.custom_op(
     "auto_deploy::gemma4_post_norm_add_and_pre_ff_norm", mutates_args=(), device_types="cuda"
 )
 def gemma4_post_norm_add_and_pre_ff_norm(
@@ -638,15 +372,14 @@ def gemma4_post_norm_add_and_pre_ff_norm(
     pre_ff_weight: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Fused post-attention norm + pre-feedforward norm: saves 1 kernel launch per MoE layer.
+    """Fused post-attention norm + pre-feedforward norm: saves 1 kernel launch per layer.
 
     Returns a packed tensor of shape (2, *attn_out.shape) where:
       packed[0] = rms_norm(attn_out, post_attn_weight, eps) + residual  (hidden_states)
-      packed[1] = rms_norm(packed[0], pre_ff_weight, eps)               (dense MLP input)
+      packed[1] = rms_norm(packed[0], pre_ff_weight, eps)               (pre-feedforward input)
 
-    packed[0] stays in registers between steps, eliminating one memory round-trip.
-
-    Dispatches to the fused Triton kernel for T ≤ _TRITON_T_THRESHOLD (decode path).
+    Dispatches to the fused Triton kernel for T ≤ _TRITON_T_THRESHOLD (decode path),
+    saving one round-trip through global memory and one kernel launch per decoder layer.
     Falls back to two flashinfer rmsnorm calls for large T (prefill path).
     """
     import flashinfer
@@ -656,7 +389,7 @@ def gemma4_post_norm_add_and_pre_ff_norm(
     attn_2d = attn_out.reshape(T_flat, H)
     residual_2d = residual.reshape(T_flat, H)
 
-    # packed_flat: (2, T_flat, H)
+    # packed_flat: (2, T_flat, H) — packed[0]=hidden_states, packed[1]=pre_ff_in
     packed_flat = torch.empty(2, T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
 
     if T_flat <= _TRITON_T_THRESHOLD:
@@ -691,3 +424,139 @@ def _gemma4_post_norm_add_and_pre_ff_norm_fake(
     eps: float,
 ) -> torch.Tensor:
     return torch.empty(2, *attn_out.shape, dtype=torch.bfloat16, device=attn_out.device)
+
+
+# ---------------------------------------------------------------------------
+# Fused Q/K/V RMSNorm (iter51)
+# ---------------------------------------------------------------------------
+# Gemma4 attention applies separate q_norm, k_norm, v_norm kernels after the
+# QKV projection.  At c=1 (decode) each is a distinct CUDA-graph node; fusing
+# all three into one saves 2 graph-node replays per layer (×30 layers = 60
+# fewer replays ≈ 240-360 µs improvement on the full 30-layer model).
+#
+# The fused kernel processes Hq + Hk + Hk rows (one per attention head) in a
+# single launch.  Rows [0, Hq) use q_norm weight; [Hq, Hq+Hk) use k_norm
+# weight; [Hq+Hk, Hq+2·Hk) use v_norm weight.  Output is a flat packed
+# tensor so no tuple-return issues arise with CUDA-graph capture.
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 512}, num_warps=2),
+        triton.Config({"BLOCK_H": 512}, num_warps=4),
+        triton.Config({"BLOCK_H": 512}, num_warps=8),
+        triton.Config({"BLOCK_H": 1024}, num_warps=4),
+        triton.Config({"BLOCK_H": 1024}, num_warps=8),
+    ],
+    key=["H"],
+)
+@triton.jit
+def _qkv_norm_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    out_ptr,  # flat packed output [Hq+Hk+Hk, H]
+    q_w_ptr,
+    k_w_ptr,
+    v_w_ptr,
+    Hq,  # number of Q-head rows  (T * num_q_heads)
+    Hk,  # number of K-head rows  (T * num_kv_heads)
+    H: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Fused RMSNorm for Q, K, V heads in a single kernel launch.
+
+    Each block handles one head row of H elements.  The first Hq blocks
+    normalise Q heads (weight = q_w), the next Hk blocks normalise K heads
+    (weight = k_w), and the final Hk blocks normalise V heads (weight = v_w).
+    Outputs are written contiguously into the packed out_ptr buffer.
+    """
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+
+    Hqk = Hq + Hk
+    is_q = row < Hq
+    is_k = (row >= Hq) & (row < Hqk)
+
+    # Safe local row indices (clamp to 0 in inactive regions to avoid
+    # out-of-bounds address computation in predicated loads).
+    q_local = tl.where(is_q, row, 0)
+    k_local = tl.where(is_k, row - Hq, 0)
+    v_local = tl.where(~is_q & ~is_k, row - Hqk, 0)
+
+    # Predicated loads: only one branch produces non-zero data per block.
+    x_q = tl.load(q_ptr + q_local * H + offs, mask=mask & is_q, other=0.0).to(tl.float32)
+    x_k = tl.load(k_ptr + k_local * H + offs, mask=mask & is_k, other=0.0).to(tl.float32)
+    x_v = tl.load(v_ptr + v_local * H + offs, mask=mask & ~is_q & ~is_k, other=0.0).to(tl.float32)
+    x = x_q + x_k + x_v  # exactly one term is non-zero
+
+    w_q = tl.load(q_w_ptr + offs, mask=mask & is_q, other=0.0).to(tl.float32)
+    w_k = tl.load(k_w_ptr + offs, mask=mask & is_k, other=0.0).to(tl.float32)
+    # v_norm uses weight=ones (no learned scale); default other=1.0 applies the
+    # identity scale for inactive regions, but only the v rows write output.
+    w_v = tl.load(v_w_ptr + offs, mask=mask & ~is_q & ~is_k, other=1.0).to(tl.float32)
+    w = w_q + w_k + w_v
+
+    var = tl.sum(x * x) / H
+    inv_rms = tl.rsqrt(var + eps)
+    out = (x * inv_rms * w).to(tl.bfloat16)
+
+    tl.store(out_ptr + row * H + offs, out, mask=mask)
+
+
+@torch.library.custom_op("auto_deploy::gemma4_qkv_norm", mutates_args=(), device_types="cuda")
+def gemma4_qkv_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    v_w: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Fused Q/K/V RMSNorm: saves 2 kernel launches per attention layer.
+
+    Inputs (all 2-D, [total_q_heads, head_dim] etc.):
+      q  [T·Hq, D]  k  [T·Hk, D]  v  [T·Hk, D]
+    Output (packed):
+      [T·(Hq + 2·Hk), D]  where rows 0..T·Hq-1 are q_normed,
+                           rows T·Hq..T·(Hq+Hk)-1 are k_normed,
+                           rows T·(Hq+Hk)..end are v_normed.
+
+    Dispatches to the fused Triton kernel for T ≤ _TRITON_T_THRESHOLD (decode
+    path).  Falls back to three separate flashinfer calls for large T.
+    """
+    import flashinfer
+
+    Tq, D = q.shape
+    Tk = k.shape[0]
+
+    out = torch.empty(Tq + 2 * Tk, D, dtype=q.dtype, device=q.device)
+
+    # T (number of tokens) = Tq / num_q_heads — but we guard on TOTAL rows.
+    # For decode (c=1) Tq = num_heads ≤ 32; for prefill Tq ≫ threshold.
+    if Tq <= _TRITON_T_THRESHOLD * 32:  # ≤ 8 tokens × 32 heads heuristic
+        _qkv_norm_kernel[(Tq + 2 * Tk,)](q, k, v, out, q_w, k_w, v_w, Hq=Tq, Hk=Tk, H=D, eps=eps)
+    else:
+        flashinfer.norm.rmsnorm(q, q_w, eps, out=out[:Tq])
+        flashinfer.norm.rmsnorm(k, k_w, eps, out=out[Tq : Tq + Tk])
+        flashinfer.norm.rmsnorm(v, v_w, eps, out=out[Tq + Tk :])
+
+    return out
+
+
+@gemma4_qkv_norm.register_fake
+def _gemma4_qkv_norm_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    v_w: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    Tq, D = q.shape
+    Tk = k.shape[0]
+    return torch.empty(Tq + 2 * Tk, D, dtype=q.dtype, device=q.device)
