@@ -49,6 +49,7 @@ from transformers.utils import ModelOutput, cached_file
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_fusions import (
     gemma4_post_add_norm_add_scale,
+    gemma4_post_norm_add,
     gemma4_post_norm_add_and_pre_ff_norm,
     gemma4_post_norm_add_scale,
 )
@@ -616,18 +617,16 @@ class Gemma4TextDecoderLayer(nn.Module):
             )
             return hidden_states
         else:
-            # Fused: post_attention_layernorm + residual_add + pre_feedforward_layernorm
-            # → 2 kernels → 1 (same op already used for MoE layers); saves 1 node per dense layer.
-            packed = gemma4_post_norm_add_and_pre_ff_norm(
+            # Fused: post_attention_layernorm + residual add -> 2 kernels -> 1
+            hidden_states = gemma4_post_norm_add(
                 hidden_states,
                 residual,
                 self.post_attention_layernorm.weight,
-                self.pre_feedforward_layernorm.weight,
                 self.post_attention_layernorm.eps,
             )
-            hidden_states = packed[0]
             residual = hidden_states
-            hidden_states = self.mlp(packed[1])
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
 
         # Fused: post_feedforward_layernorm + residual add + layer_scalar -> 3 kernels -> 1
         hidden_states = gemma4_post_norm_add_scale(
