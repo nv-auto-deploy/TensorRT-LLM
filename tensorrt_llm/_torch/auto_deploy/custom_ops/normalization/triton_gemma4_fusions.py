@@ -442,6 +442,9 @@ def _gemma4_post_norm_add_and_pre_ff_norm_fake(
 
 @triton.autotune(
     configs=[
+        triton.Config({"BLOCK_H": 256}, num_warps=2),
+        triton.Config({"BLOCK_H": 256}, num_warps=4),
+        triton.Config({"BLOCK_H": 256}, num_warps=8),
         triton.Config({"BLOCK_H": 512}, num_warps=2),
         triton.Config({"BLOCK_H": 512}, num_warps=4),
         triton.Config({"BLOCK_H": 512}, num_warps=8),
@@ -535,9 +538,9 @@ def gemma4_qkv_norm(
 
     out = torch.empty(Tq + 2 * Tk, D, dtype=q.dtype, device=q.device)
 
-    # T (number of tokens) = Tq / num_q_heads — but we guard on TOTAL rows.
-    # For decode (c=1) Tq = num_heads ≤ 32; for prefill Tq ≫ threshold.
-    if Tq <= _TRITON_T_THRESHOLD * 32:  # ≤ 8 tokens × 32 heads heuristic
+    # Use Triton only for T=1 decode (Tq ≤ 32 covers all Gemma4 head counts).
+    # Larger T (c=16+) uses flashinfer to avoid Triton overhead regression.
+    if Tq <= 32:  # T=1 only: Hq ≤ 16 for sliding, ≤ 16 for global
         _qkv_norm_kernel[(Tq + 2 * Tk,)](q, k, v, out, q_w, k_w, v_w, Hq=Tq, Hk=Tk, H=D, eps=eps)
     else:
         flashinfer.norm.rmsnorm(q, q_w, eps, out=out[:Tq])
