@@ -1,0 +1,39 @@
+iter	commit	ttft_c1	tpot_c1	tps_c1	ttft_c16	tpot_c16	tps_c16	ttft_c256	tpot_c256	tps_c256	correctness	status	description
+0	12e9b34e30	71.24	2.443	397.0	341.42	3.720	3934.8	3346.67	18.264	33498.2	-	keep	baseline (reduced 6-layer)
+1	ebaf35d380 (discarded)	-	-	-	-	-	-	-	-	-	-	discard	fuse_add_rms_norm: no effect on Gemma4 pattern
+2	315e266ea0	71.24	2.362	-	341.42	3.710	-	-	18.220	-	-	keep	multi_stream_moe: +3.3% tpot@c1
+3	d09de39cb0	46.04	2.340	418.2	152.88	3.716	4131.5	3200.55	18.381	11566.6	pass	keep	accuracy fix (synchronize+piecewise reclassify): still improved vs baseline
+4	(discarded)	45.26	2.395	409.0	110.17	3.715	4178.3	3368.15	18.480	11422.5	-	discard	fuse_gemms_mixed_children: tpot@c1 -2.3% worse than iter3
+5	(discarded)	46.22	2.385	410.5	103.77	3.739	4157.7	3276.94	18.916	11289.5	-	discard	multi_stream_gemm: tpot@c1 -1.9% worse than iter3
+6	(crash)	-	-	-	-	-	-	-	-	-	-	discard	trtllm attn_backend: CRASH head_dim=512 not supported by MMHA
+7	(crash)	-	-	-	-	-	-	-	-	-	-	discard	flashinfer attn_backend: CRASH head_dim=512 not supported by FlashInfer prefill kernel
+8	e4ce0b4db5	46.98	2.241	436.0	116.21	3.372	4579.7	3861.78	19.132	10772.4	-	keep	disable mlir_elementwise_fusion: tpot@c1 +4.2%, tpot@c16 +9.2% (c256 tpot -4.1%)
+9	(discarded)	45.91	2.387	410.2	147.72	3.717	4133.5	3598.63	18.951	11041.3	-	discard	fuse_rmsnorm rmsnorm_backend=triton: tpot@c1 -2.0% vs iter3 baseline
+10	(discarded)	48.87	2.408	406.3	102.40	3.703	4198.1	3588.80	18.761	11133.3	-	discard	piecewise_enabled=false: tpot@c1 -2.9% vs iter3 baseline
+11	(discarded)	47.34	2.419	404.4	250.28	3.751	3992.9	4085.36	19.574	10539.2	-	discard	gather_logits_before_lm_head=false: tpot@c1 -3.4% vs iter3 baseline
+12	(crash)	-	-	-	-	-	-	-	-	-	-	discard	fuse_gemms=false: CRASH all 3 runs (AssertionError: Sampling failed)
+13	(crash)	-	-	-	-	-	-	-	-	-	-	discard	flashinfer + no multi_stream_moe: CRASH head_dim=512 same as iter7
+14	(discarded)	45.63	2.337	418.9	112.62	3.352	4611.4	3961.85	18.990	10787.6	-	discard	fuse_swiglu: tpot@c1 -4.3% worse than iter8
+15	(discarded)	46.40	2.293	426.5	196.48	3.454	4375.2	3870.70	18.303	11193.2	-	discard	no multi_stream_moe: tpot@c1 -2.3% worse than iter8
+16	(discarded)	46.44	2.619	374.6	175.15	4.321	3554.8	3703.12	19.773	10663.1	-	discard	no fuse_rmsnorm: tpot@c1 -16.9% much worse
+17	(discarded)	45.85	2.281	429.0	113.46	3.367	4589.2	4252.06	18.935	10743.9	-	discard	fuse_gemms_mixed+no_mlir: tpot@c1 -1.8% marginally worse
+18	(discarded)	47.22	2.415	405.3	200.36	3.810	3938.7	3520.84	19.260	10952.8	-	discard	mlir_shape_prop: tpot@c1 -7.8% worse
+19	(discarded)	45.85	2.279	429.1	118.77	3.382	4563.0	3822.81	18.410	11182.1	-	discard	multi_stream_gemm+no_mlir: tpot@c1 -1.7% marginally worse
+20	(discarded)	46.80	2.314	422.6	112.71	3.388	4563.7	3840.56	18.442	11189.0	-	discard	no_cpu_sync in begin_aux: tpot@c1 -3.3% worse (c256 -3.8% better)
+21	(discarded)	71.47	2.321	417.1	463.95	3.388	4148.0	4108.15	18.798	10872.3	-	discard	fuse_add_rms_norm+no_mlir: tpot@c1 -3.6% worse; ttft@c1 +52% much worse
+22	(profile)	46.81	3.126	314.7	-	-	-	-	-	-	-	-	profile run (profiling overhead active, not perf data)
+23	(discarded)	46.26	2.268	431.1	161.08	3.395	4491.9	3890.93	18.398	11158.6	-	discard	no_cpu_sync+fuse_add_rms: tpot@c1 -1.2% still worse
+24	(discarded)	46.82	2.322	421.3	149.47	3.377	4530.2	3520.68	18.180	11473.3	-	discard	no_piecewise+no_mlir: tpot@c1 -3.6% worse (c256 -5.0% better)
+25	0dc1d9d4b8	46.66	2.299	434.5	122.72	3.257	5211.2	1085.25	17.396	11720.2	pass	keep	fused Triton router: tpot@c16 -3.4%, tpot@c256 -9.1% vs iter8 (router saves batched dispatch overhead)
+26	(discarded)	-	-	-	-	-	-	-	-	-	-	-	discard	multi_stream_gemm: ISL=2048 batch neutral (<1.5%); consistent with iter5/iter19 findings
+27	(discarded)	-	-	-	-	-	-	-	-	-	-	-	discard	fuse_gemms_mixed_children: ISL=2048 batch neutral (<1.5%); consistent with iter4/iter17 findings
+28	(discarded)	47.39	2.379	-	224.64	3.469	-	3005.53	19.705	-	-	-	discard	multi_stream_mla_attn: tpot@c1 +6.2% worse than iter8
+29	(discarded)	-	-	-	-	-	-	-	-	-	-	-	discard	insert_cached_residual_add: ISL=2048 batch neutral (<1.5%)
+30	(discarded)	-	-	-	-	-	-	-	-	-	-	-	discard	all stream transforms combined: ISL=2048 batch neutral
+31	(ref)	53.48	2.385	-	194.25	3.440	-	3629.25	21.004	-	-	-	ref	baseline 30-req at ISL=2048 (different conditions, not comparable to iter8)
+32	(discarded)	46.55	2.320	-	125.71	3.265	-	1011.35	17.621	-	-	-	discard	fuse_gelu_mul (FlashInfer gelu_tanh_and_mul): tpot@c1 +0.9% worse — GELU not bottleneck
+33	(crash)	-	-	-	-	-	-	-	-	-	-	discard	piecewise_num_tokens=32: CRASH (piecewise_num_tokens must be a list, not int)
+34	bc89a89e15	45.96	2.264	432.1	122.69	3.255	4730.9	3594.74	18.059	11513.6	-	keep	iter39: adaptive Triton/flashinfer dispatch — tpot@c1 -1.5% vs iter25, c16 flat, c256 +3.8% (investigate)
+35	(discarded)	46.30	2.355	414.1	124.68	3.521	4397.7	3702.15	18.573	11232.4	-	discard	iter40: dual_norm+norm_add2 — tpot@c1 +4.0%, c16 +8.2% REGRESSION; root cause: dual_norm serializes multi_stream_moe (both MLP+MoE streams now wait for 1 fused op)
+36	(discarded)	55.35	5.357	186.7	536.09	12.470	80.2	96639.86	18.906	52.9	-	discard	iter41: fused QKV norm (tuple custom_op) — tpot@c1 +137%, c16 +295% REGRESSION; root cause: tuple-return custom_op not captured in CUDA graph, 30 graph exit/reentry per decode step
+37	(pending)	-	-	-	-	-	-	-	-	-	-	pending	iter42: fuse dense+MoE add with post-feedforward norm (single-tensor return, CUDA-graph-safe)

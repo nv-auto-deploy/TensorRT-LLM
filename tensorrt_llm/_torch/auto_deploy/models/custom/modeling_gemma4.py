@@ -48,6 +48,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_fusions import (
+    gemma4_post_add_norm_add_scale,
     gemma4_post_norm_add,
     gemma4_post_norm_add_scale,
 )
@@ -599,7 +600,16 @@ class Gemma4TextDecoderLayer(nn.Module):
             hs_moe = hs_moe.reshape(hidden_states.shape)
             hs_moe = self.post_feedforward_layernorm_2(hs_moe)
 
-            hidden_states = hs_dense + hs_moe
+            # Fused: dense+MoE combine + post_feedforward_norm + residual + scale -> 2 kernels -> 1
+            hidden_states = gemma4_post_add_norm_add_scale(
+                hs_dense,
+                hs_moe,
+                residual,
+                self.post_feedforward_layernorm.weight,
+                self.post_feedforward_layernorm.eps,
+                self.layer_scalar,
+            )
+            return hidden_states
         else:
             hidden_states = self.pre_feedforward_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)

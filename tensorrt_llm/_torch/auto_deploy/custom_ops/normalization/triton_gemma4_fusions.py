@@ -109,6 +109,51 @@ def _post_norm_add_scale_kernel(
     tl.store(out_ptr + row * H + offs, out.to(tl.bfloat16), mask=mask)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 4096}, num_warps=4),
+        triton.Config({"BLOCK_H": 4096}, num_warps=8),
+        triton.Config({"BLOCK_H": 4096}, num_warps=16),
+    ],
+    key=["H"],
+)
+@triton.jit
+def _post_add_norm_add_scale_kernel(
+    a_ptr,
+    b_ptr,
+    residual_ptr,
+    weight_ptr,
+    scalar_ptr,
+    out_ptr,
+    H: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Fused: out[row] = (rms_norm(a[row]+b[row], weight, eps) + residual[row]) * scalar.
+
+    Combines the dense+MoE element-wise add with the subsequent post-feedforward
+    norm+residual+scale, saving 1 kernel launch per MoE layer (30 layers = 30 savings).
+    Safe to fuse: a and b are already synchronized (multi_stream_moe join point).
+    """
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+
+    a = tl.load(a_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(b_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+    x = a + b  # dense MLP + MoE combine
+    residual = tl.load(residual_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(weight_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+    scalar = tl.load(scalar_ptr).to(tl.float32)
+
+    var = tl.sum(x * x) / H
+    inv_rms = tl.rsqrt(var + eps)
+    normed = x * inv_rms * weight
+
+    out = (normed + residual) * scalar
+    tl.store(out_ptr + row * H + offs, out.to(tl.bfloat16), mask=mask)
+
+
 # ---------------------------------------------------------------------------
 # Custom op registration for torch.export / FakeTensor tracing
 # ---------------------------------------------------------------------------
@@ -209,3 +254,57 @@ def _gemma4_post_norm_add_scale_fake(
     scalar: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(x)
+
+
+@torch.library.custom_op(
+    "auto_deploy::gemma4_post_add_norm_add_scale", mutates_args=(), device_types="cuda"
+)
+def gemma4_post_add_norm_add_scale(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    scalar: torch.Tensor,
+) -> torch.Tensor:
+    """Fused MoE combine + post-norm: (rms_norm(a+b, weight, eps) + residual) * scalar.
+
+    Merges the dense+MoE element-wise add with post_norm_add_scale into one kernel,
+    saving 1 launch per MoE layer (30 layers × 1 = 30 launches at T≤8).
+    Safe: a and b are already synchronized at the multi_stream_moe join point.
+    """
+    import flashinfer
+
+    H = a.shape[-1]
+    out = torch.empty_like(a)
+    a_2d = a.view(-1, H)
+    b_2d = b.view(-1, H)
+    residual_2d = residual.view(-1, H)
+    T_flat = a_2d.shape[0]
+    out_2d = out.view(-1, H)
+
+    if T_flat <= _TRITON_T_THRESHOLD:
+        _post_add_norm_add_scale_kernel[(T_flat,)](
+            a_2d, b_2d, residual_2d, weight, scalar.view(-1), out_2d, H=H, eps=eps
+        )
+    else:
+        x_2d = a_2d + b_2d
+        torch.mul(
+            flashinfer.norm.rmsnorm(x_2d, weight, eps) + residual_2d,
+            scalar,
+            out=out_2d,
+        )
+
+    return out
+
+
+@gemma4_post_add_norm_add_scale.register_fake
+def _gemma4_post_add_norm_add_scale_fake(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    scalar: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(a)
