@@ -1,9 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Gemma 4 MoE (26B total, 4B activated) — text-only AD export path.
-# Uses triton paged attention backend: supports head_dim=512 (global_head_dim),
-# paged KV cache, CUDA-graph-compatible, FlashDecoding for decode.
+# Control config for Gemma 4 MoE without the MPK compile-stage translator.
 model_factory: Gemma4ForConditionalGeneration
 tokenizer: google/gemma-4-26B-A4B-it
 attn_backend: triton_paged
@@ -19,12 +17,10 @@ model_kwargs:
     num_hidden_layers: 30
 kv_cache_config:
   enable_block_reuse: false
-  free_gpu_memory_fraction: 0.4
+  free_gpu_memory_fraction: 0.8
 transforms:
   lower_to_mpk:
-    enabled: true
-    dry_run_only: true
-    debug_dump_plan_path: ./gemma_mpk_plan.json
+    enabled: false
   compile_model:
     piecewise_enabled: true
   mlir_elementwise_fusion:
@@ -33,6 +29,3 @@ transforms:
     enabled: true
   fuse_gemms:
     enabled: true
-  #TODO(suyogg): Enable when https://github.com/NVIDIA/TensorRT-LLM/issues/12954 is resolved
-  multi_stream_moe:
-    enabled: false

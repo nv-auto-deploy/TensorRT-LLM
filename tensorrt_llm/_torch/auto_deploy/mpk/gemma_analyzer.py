@@ -48,6 +48,12 @@ _PASSTHROUGH_CALL_METHODS = {
     "unsqueeze",
     "squeeze",
 }
+_PASSTHROUGH_CALL_FUNCTION_TARGETS = {
+    "flashinfer_rope",
+    "split_output",
+}
+
+_RMS_NORM_TARGETS = ("flashinfer_rms_norm", "torch_rmsnorm")
 
 
 def _iter_node_inputs(node: Node) -> Iterable[Node]:
@@ -74,6 +80,12 @@ def _qualified_target_name(node: Node) -> str:
     if hasattr(target, "__qualname__"):
         return target.__qualname__
     return str(target)
+
+
+def _is_rms_norm_node(node: Node) -> bool:
+    return node.op == "call_function" and any(
+        target in _qualified_target_name(node) for target in _RMS_NORM_TARGETS
+    )
 
 
 def _extract_layer_idx_from_text(text: str) -> Optional[int]:
@@ -136,7 +148,16 @@ def _find_ancestor(
 
         is_passthrough = (
             input_node.op == "call_method" and input_node.target in _PASSTHROUGH_CALL_METHODS
-        ) or (input_node.op == "call_function" and input_node.target is operator.getitem)
+        ) or (
+            input_node.op == "call_function"
+            and (
+                input_node.target is operator.getitem
+                or any(
+                    target in _qualified_target_name(input_node)
+                    for target in _PASSTHROUGH_CALL_FUNCTION_TARGETS
+                )
+            )
+        )
 
         if is_passthrough:
             found = _find_ancestor(
@@ -167,6 +188,23 @@ class GemmaGraphAnalyzer:
 
     def __init__(self, *, require_no_mlir_fusion: bool = True):
         self.require_no_mlir_fusion = require_no_mlir_fusion
+
+    def _find_ancestor(
+        self,
+        node: Node,
+        predicate,
+        *,
+        stop_nodes: Optional[Set[Node]] = None,
+        max_depth: int = 32,
+    ) -> Optional[Node]:
+        """Instance wrapper around the shared recursive ancestor search."""
+
+        return _find_ancestor(
+            node,
+            predicate,
+            stop_nodes=stop_nodes,
+            max_depth=max_depth,
+        )
 
     def analyze(self, gm: GraphModule) -> GemmaGraphInfo:
         self._validate_supported_surface(gm)
@@ -317,22 +355,20 @@ class GemmaGraphAnalyzer:
             raise ValueError(f"Layer {layer_idx} missing router projection.")
         layer_info.anchors["router_proj"] = _node_ref(router_proj, layer_idx)
 
-        ffn_down = self._find_ancestor(
-            moe_node,
-            lambda node: node.name.startswith(
-                f"model_language_model_layers_{layer_idx}_mlp_down_proj"
-            )
-            and "torch_linear_simple" in _qualified_target_name(node),
+        ffn_down = self._find_unique_layer_node(
+            attention_node.graph.nodes,
+            layer_idx,
+            name_substr="mlp_down_proj",
+            target_substr="torch_linear_simple",
         )
         if ffn_down is None:
             raise ValueError(f"Layer {layer_idx} missing FFN down projection.")
         layer_info.anchors["ffn_down"] = _node_ref(ffn_down, layer_idx)
 
-        ffn_gate_up = self._find_ancestor(
+        ffn_gate_up = self._find_upstream_call_function(
             ffn_down,
-            lambda node: node.op == "call_function"
-            and "torch_linear_simple" in _qualified_target_name(node),
-            stop_nodes={ffn_down},
+            "torch_linear_simple",
+            exclude={ffn_down},
         )
         if ffn_gate_up is None:
             raise ValueError(f"Layer {layer_idx} missing FFN gate/up projection.")
@@ -376,20 +412,27 @@ class GemmaGraphAnalyzer:
         return layer_info
 
     def _find_rms_norm_source(self, node: Node, layer_idx: int) -> Node:
-        target_name = _qualified_target_name(node)
-        if node.op == "call_function" and "flashinfer_rms_norm" in target_name:
+        if _is_rms_norm_node(node):
             return node
 
         rms_node = self._find_ancestor(
             node,
-            lambda candidate: candidate.op == "call_function"
-            and "flashinfer_rms_norm" in _qualified_target_name(candidate)
+            lambda candidate: _is_rms_norm_node(candidate)
             and _extract_layer_idx_from_node(candidate) == layer_idx,
         )
+        if rms_node is not None:
+            return rms_node
+
+        # Some late compile-stage Gemma graphs preserve the correct local
+        # RMSNorm ancestry but drop layer-identifying text from the norm node
+        # names themselves (for example: flashinfer_rms_norm_1). In that case
+        # we still want the nearest RMSNorm on the q/k/v path.
+        rms_node = self._find_ancestor(
+            node,
+            lambda candidate: _is_rms_norm_node(candidate),
+        )
         if rms_node is None:
-            raise ValueError(
-                f"Layer {layer_idx} missing flashinfer_rms_norm ancestor for node {node.name}."
-            )
+            raise ValueError(f"Layer {layer_idx} missing RMSNorm ancestor for node {node.name}.")
         return rms_node
 
     def _find_rope_source(self, node: Node, layer_idx: int) -> Node:
@@ -404,14 +447,24 @@ class GemmaGraphAnalyzer:
 
     def _find_linear_source(self, source_name: str, *, gm_node: Node) -> Node:
         source_node = next(node for node in gm_node.graph.nodes if node.name == source_name)
-        linear_node = self._find_ancestor(
-            source_node,
-            lambda candidate: candidate.op == "call_function"
-            and "torch_linear_simple" in _qualified_target_name(candidate),
-        )
-        if linear_node is None:
-            raise ValueError(f"Could not find torch_linear_simple ancestor for node {source_name}.")
-        return linear_node
+        queue: List[Node] = [source_node]
+        seen: Set[Node] = set()
+        while queue:
+            current = queue.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            for input_node in _iter_node_inputs(current):
+                if input_node in seen:
+                    continue
+                if (
+                    input_node.op == "call_function"
+                    and "torch_linear_simple" in _qualified_target_name(input_node)
+                ):
+                    return input_node
+                queue.append(input_node)
+
+        raise ValueError(f"Could not find torch_linear_simple ancestor for node {source_name}.")
 
     def _find_first_user_with_target(self, node: Node, target_substr: str) -> Optional[Node]:
         queue: List[Node] = list(node.users)
@@ -424,6 +477,51 @@ class GemmaGraphAnalyzer:
             if user.op == "call_function" and target_substr in _qualified_target_name(user):
                 return user
             queue.extend(user.users)
+        return None
+
+    def _find_unique_layer_node(
+        self,
+        nodes: Sequence[Node],
+        layer_idx: int,
+        *,
+        name_substr: str,
+        target_substr: str,
+    ) -> Optional[Node]:
+        matches = [
+            node
+            for node in nodes
+            if node.op == "call_function"
+            and name_substr in node.name
+            and f"model_language_model_layers_{layer_idx}_" in node.name
+            and target_substr in _qualified_target_name(node)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _find_upstream_call_function(
+        self,
+        start_node: Node,
+        target_substr: str,
+        *,
+        exclude: Optional[Set[Node]] = None,
+    ) -> Optional[Node]:
+        queue: List[Node] = [start_node]
+        seen: Set[Node] = set()
+        excluded = exclude or set()
+        while queue:
+            current = queue.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            for input_node in _iter_node_inputs(current):
+                if input_node in seen or input_node in excluded:
+                    continue
+                if input_node.op == "call_function" and target_substr in _qualified_target_name(
+                    input_node
+                ):
+                    return input_node
+                queue.append(input_node)
         return None
 
     def _find_moe_for_layer(self, nodes: Sequence[Node], layer_idx: int) -> Node:
