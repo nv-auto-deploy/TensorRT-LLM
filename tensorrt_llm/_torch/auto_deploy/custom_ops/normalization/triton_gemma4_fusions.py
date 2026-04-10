@@ -404,9 +404,13 @@ def gemma4_post_norm_add_and_pre_ff_norm(
             eps=eps,
         )
     else:
-        hs_2d = flashinfer.norm.rmsnorm(attn_2d, post_attn_weight, eps) + residual_2d
-        packed_flat[0].copy_(hs_2d)
-        packed_flat[1].copy_(flashinfer.norm.rmsnorm(hs_2d, pre_ff_weight, eps))
+        # Use out= to write hs directly into packed_flat[0], avoiding one extra allocation
+        torch.add(
+            flashinfer.norm.rmsnorm(attn_2d, post_attn_weight, eps),
+            residual_2d,
+            out=packed_flat[0],
+        )
+        packed_flat[1].copy_(flashinfer.norm.rmsnorm(packed_flat[0], pre_ff_weight, eps))
 
     return packed_flat.reshape(2, *attn_out.shape)
 
