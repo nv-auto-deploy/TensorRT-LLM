@@ -340,12 +340,12 @@ def gemma4_post_add_norm_add_scale(
             a_2d, b_2d, residual_2d, weight, scalar.view(-1), out_2d, H=H, eps=eps
         )
     else:
-        x_2d = a_2d + b_2d
-        torch.mul(
-            flashinfer.norm.rmsnorm(x_2d, weight, eps) + residual_2d,
-            scalar,
-            out=out_2d,
-        )
+        # fused_add_rmsnorm(a, b): 1 kernel instead of 2 (separate add + rmsnorm).
+        # Modifies in-place: b_2d ← a+b, a_2d ← rmsnorm(a+b).
+        # Both a and b are consumed here and not used downstream — safe to mutate.
+        flashinfer.norm.fused_add_rmsnorm(a_2d, b_2d, weight, eps)
+        torch.add(a_2d, residual_2d, out=out_2d)
+        out_2d.mul_(scalar)
 
     return out
 
