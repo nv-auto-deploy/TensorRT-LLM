@@ -244,7 +244,10 @@ def gemma4_post_norm_add(
     if T_flat <= _TRITON_T_THRESHOLD:
         _post_norm_add_kernel[(T_flat,)](x_2d, residual_2d, weight, out_2d, H=H, eps=eps)
     else:
-        torch.add(flashinfer.norm.rmsnorm(x_2d, weight, eps), residual_2d, out=out_2d)
+        # Write rmsnorm directly to out (no norm_out temp), then add residual in-place.
+        # Saves 1 T×H intermediate allocation and 2T×H memory traffic vs 2-step approach.
+        flashinfer.norm.rmsnorm(x_2d, weight, eps, out=out_2d)
+        out_2d.add_(residual_2d)
 
     return out
 
@@ -288,11 +291,11 @@ def gemma4_post_norm_add_scale(
             x_2d, residual_2d, weight, scalar.view(-1), out_2d, H=H, eps=eps
         )
     else:
-        torch.mul(
-            flashinfer.norm.rmsnorm(x_2d, weight, eps) + residual_2d,
-            scalar,
-            out=out_2d,
-        )
+        # Write rmsnorm directly to out (no norm_out temp), then add+scale in-place.
+        # Eliminates 2 intermediate T×H allocations and 2T×H memory traffic vs 3-step approach.
+        flashinfer.norm.rmsnorm(x_2d, weight, eps, out=out_2d)
+        out_2d.add_(residual_2d)
+        out_2d.mul_(scalar)
 
     return out
 
@@ -404,13 +407,12 @@ def gemma4_post_norm_add_and_pre_ff_norm(
             eps=eps,
         )
     else:
-        # Use out= to write hs directly into packed_flat[0], avoiding one extra allocation
-        torch.add(
-            flashinfer.norm.rmsnorm(attn_2d, post_attn_weight, eps),
-            residual_2d,
-            out=packed_flat[0],
-        )
-        packed_flat[1].copy_(flashinfer.norm.rmsnorm(packed_flat[0], pre_ff_weight, eps))
+        # Write rmsnorm directly to packed_flat[0], add residual in-place, then
+        # write second rmsnorm directly to packed_flat[1].
+        # Saves 2 T×H intermediate allocations and 3T×H memory traffic vs prior 4-op approach.
+        flashinfer.norm.rmsnorm(attn_2d, post_attn_weight, eps, out=packed_flat[0])
+        packed_flat[0].add_(residual_2d)
+        flashinfer.norm.rmsnorm(packed_flat[0], pre_ff_weight, eps, out=packed_flat[1])
 
     return packed_flat.reshape(2, *attn_out.shape)
 
