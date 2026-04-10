@@ -290,6 +290,13 @@ transforms:
   multi_stream_gemm:
     stage: compile
     enabled: false
+  lower_to_mpk:
+    stage: compile
+    run_per_gm: false
+    enabled: false
+    dry_run_only: true
+    require_no_mlir_fusion: true
+    model_family: gemma4moe
   compile_model:
     stage: compile
     expect_mem_change: true
