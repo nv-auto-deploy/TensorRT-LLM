@@ -33,9 +33,10 @@ from typing import Optional, Tuple, Type
 
 import torch.nn as nn
 from pydantic import Field
-from torch.fx import GraphModule
+from torch.fx import Graph, GraphModule
 
 from ...models.factory import ModelFactory
+from ...mpk.runtime_wrapper import GemmaMpkRuntimeWrapper
 from ...mpk.translator import GemmaMpkTranslator
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -114,12 +115,6 @@ class LowerToMpk(BaseTransform):
             dump_path.write_text(json.dumps(plan.to_dict(), indent=2))
             ad_logger.info(f"Dumped Gemma MPK translation plan to {dump_path}")
 
-        if not self.config.dry_run_only:
-            raise NotImplementedError(
-                "lower_to_mpk runtime/module replacement is not implemented yet. "
-                "Set dry_run_only=true to run analyzer-backed planning."
-            )
-
         summary = plan.summary()
         graph_summary = summary["graph"]
         ad_logger.info(
@@ -133,5 +128,54 @@ class LowerToMpk(BaseTransform):
             f"{summary['num_partial_steps']} partial steps"
         )
 
+        if not self.config.dry_run_only:
+            model = self._wrap_graphmodule_with_runtime_wrapper(model, plan.to_dict())
+            wrapped_meta = self._get_autodeploy_meta(model)
+            wrapped_meta["mpk_runtime_mode"] = "fallback_wrapper"
+            self._set_autodeploy_meta(model, wrapped_meta)
+            ad_logger.info(
+                "Gemma MPK runtime wrapper installed as a GraphModule call_module with eager fallback"
+            )
+
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
         return model, info
+
+    def _wrap_graphmodule_with_runtime_wrapper(
+        self,
+        model: GraphModule,
+        translation_plan: dict,
+    ) -> GraphModule:
+        """Wrap the full graph in a runtime wrapper while preserving GraphModule shape.
+
+        The wrapper is the first concrete runtime integration point for MPK. Today it
+        forwards to the original graph via eager fallback. Later, ``mpk_callable`` can
+        be populated with a live Mirage-backed executable without changing the outer FX
+        contract seen by downstream compile stages.
+        """
+
+        wrapper = GemmaMpkRuntimeWrapper(
+            eager_fallback=model,
+            mpk_callable=None,
+            translation_plan=translation_plan,
+            input_names=[node.name for node in model.graph.nodes if node.op == "placeholder"],
+        )
+
+        outer_root = nn.Module()
+        outer_root.add_module("gemma_mpk_runtime", wrapper)
+
+        outer_graph = Graph()
+        placeholder_nodes = []
+        for node in model.graph.nodes:
+            if node.op != "placeholder":
+                continue
+            placeholder = outer_graph.placeholder(node.name)
+            placeholder.meta = dict(getattr(node, "meta", {}))
+            placeholder_nodes.append(placeholder)
+
+        wrapper_out = outer_graph.call_module("gemma_mpk_runtime", args=tuple(placeholder_nodes))
+        output_node = outer_graph.output(wrapper_out)
+        output_node.meta = {}
+
+        wrapped_model = GraphModule(outer_root, outer_graph)
+        wrapped_model.meta = dict(getattr(model, "meta", {}))
+        return wrapped_model

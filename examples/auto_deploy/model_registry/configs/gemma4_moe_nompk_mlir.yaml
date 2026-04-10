@@ -1,9 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Gemma 4 MoE (26B total, 4B activated) — text-only AD export path.
-# Uses triton paged attention backend: supports head_dim=512 (global_head_dim),
-# paged KV cache, CUDA-graph-compatible, FlashDecoding for decode.
 model_factory: Gemma4ForConditionalGeneration
 tokenizer: google/gemma-4-26B-A4B-it
 attn_backend: triton_paged
@@ -22,13 +19,11 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.8
 transforms:
   lower_to_mpk:
-    enabled: true
-    dry_run_only: true
-    debug_dump_plan_path: ./gemma_mpk_plan.json
+    enabled: false
   compile_model:
     piecewise_enabled: true
   mlir_elementwise_fusion:
-    enabled: false
+    enabled: true
   gather_logits_before_lm_head:
     enabled: true
   fuse_gemms:

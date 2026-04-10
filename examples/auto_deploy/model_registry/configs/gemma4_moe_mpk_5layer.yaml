@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+model_kwargs:
+  text_config:
+    num_hidden_layers: 5
+transforms:
+  lower_to_mpk:
+    enabled: true
+    dry_run_only: false
+    debug_dump_plan_path: ./gemma_mpk_plan_5layer.json
+  mlir_elementwise_fusion:
+    enabled: false

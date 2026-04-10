@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+prompt:
+  batch_size: 1
+  queries:
+    - messages:
+        - role: user
+          content: "How big is the universe?"
+      prompt: "Placeholder prompt for HF chat template."
+  sp_kwargs:
+    max_tokens: 32
+    temperature: 0.0

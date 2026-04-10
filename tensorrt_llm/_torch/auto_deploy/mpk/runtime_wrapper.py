@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import torch.nn as nn
 
@@ -39,16 +39,21 @@ class GemmaMpkRuntimeWrapper(nn.Module):
         eager_fallback: Optional[nn.Module] = None,
         mpk_callable: Optional[Callable[..., Any]] = None,
         translation_plan: Optional[Dict[str, Any]] = None,
+        input_names: Optional[Sequence[str]] = None,
     ) -> None:
         super().__init__()
         self.eager_fallback = eager_fallback
         self.mpk_callable = mpk_callable
         self.translation_plan = translation_plan or {}
+        self.input_names = tuple(input_names or ())
 
     def forward(self, *args, **kwargs):
         if self.mpk_callable is not None:
             return self.mpk_callable(*args, **kwargs)
         if self.eager_fallback is not None:
+            if not kwargs and self.input_names and len(args) == len(self.input_names):
+                kwargs = dict(zip(self.input_names, args))
+                args = ()
             return self.eager_fallback(*args, **kwargs)
         raise RuntimeError(
             "GemmaMpkRuntimeWrapper has neither an MPK callable nor an eager fallback."
@@ -57,4 +62,4 @@ class GemmaMpkRuntimeWrapper(nn.Module):
     def extra_repr(self) -> str:
         mode = "mpk" if self.mpk_callable is not None else "fallback"
         has_plan = bool(self.translation_plan)
-        return f"mode={mode}, has_plan={has_plan}"
+        return f"mode={mode}, has_plan={has_plan}, num_inputs={len(self.input_names)}"
