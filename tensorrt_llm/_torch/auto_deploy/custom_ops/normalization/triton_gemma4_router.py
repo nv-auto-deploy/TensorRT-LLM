@@ -220,9 +220,18 @@ def gemma4_router(
     Registered as a torch custom op so that FakeTensor / meta-tensor tracing
     during torch.export sees only shape inference (via ``register_fake``) rather
     than the actual Triton kernel, which cannot execute on meta tensors.
+
+    Kernel parameters are selected based on T for optimal throughput:
+    - T < 256: bh=512, nw=8 (best for decode batch sizes 1–128)
+    - T >= 256: bh=256, nw=4 (29% faster for large-batch decode / prefill)
     """
     proj_T = proj_weight.t().contiguous()
-    return gemma4_router_triton(hidden, scale, proj_T, root_size, eps, top_k)
+    T = hidden.shape[0]
+    num_warps = 4 if T >= 256 else 8
+    block_h = 256 if T >= 256 else 512
+    return gemma4_router_triton(
+        hidden, scale, proj_T, root_size, eps, top_k, num_warps=num_warps, block_h=block_h
+    )
 
 
 @gemma4_router.register_fake

@@ -18,6 +18,7 @@ kv_cache_config:
 transforms:
   compile_model:
     piecewise_enabled: true
+    piecewise_num_tokens: [64, 128, 256, 512, 1000, 1536, 2048, 3072, 4096, 8192]
   mlir_elementwise_fusion:
     enabled: false
   gather_logits_before_lm_head:
