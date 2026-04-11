@@ -35,7 +35,7 @@ Key architectural features of Gemma 4 vs standard transformers:
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 
 import torch
 from tokenizers import Tokenizer
@@ -49,6 +49,7 @@ from transformers.utils import ModelOutput, cached_file
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_fusions import (
     gemma4_fused_post_3norm_add_scale,
+    gemma4_fused_post_3norm_add_scale_and_input_ln,
     gemma4_post_norm_add,
     gemma4_post_norm_add_and_pre_ff_2norm,
     gemma4_post_norm_add_scale,
@@ -578,10 +579,16 @@ class Gemma4TextDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
+        pre_normed_hidden_states: Optional[torch.Tensor] = None,
+        next_input_ln_weight: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # Self-attention
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        # iter102: skip input_layernorm if pre-normed was passed from the previous layer
+        if pre_normed_hidden_states is None:
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states = pre_normed_hidden_states
         hidden_states = self.self_attn(hidden_states, position_embeddings)
 
         # Feed-forward (dense MLP ± MoE)
@@ -613,20 +620,35 @@ class Gemma4TextDecoderLayer(nn.Module):
             hs_moe = self.moe(hs_moe, top_k_index, top_k_weights)
             hs_moe = hs_moe.reshape(hidden_states.shape)
 
-            # Fused 3-norm: rms_norm(rms_norm(hs_dense,w1) + rms_norm(hs_moe,w2), w) + res → scale
-            # Absorbs post_feedforward_layernorm_1 + post_feedforward_layernorm_2 into 1 kernel,
-            # saving 2 kernel dispatches per MoE layer × 30 layers = 60 launches ≈ 78µs at c=1.
-            hidden_states = gemma4_fused_post_3norm_add_scale(
-                hs_dense,
-                hs_moe,
-                residual,
-                self.post_feedforward_layernorm_1.weight,
-                self.post_feedforward_layernorm_2.weight,
-                self.post_feedforward_layernorm.weight,
-                self.post_feedforward_layernorm.eps,
-                self.layer_scalar,
-            )
-            return hidden_states
+            if next_input_ln_weight is not None:
+                # iter102: fuse next layer's input_layernorm into the 3-norm kernel.
+                # Returns packed2[0]=hidden_states, packed2[1]=input_normed_for_next_layer.
+                # Saves 1 kernel launch × 29 inter-layer transitions ≈ 38µs at c=1 (decode).
+                packed2 = gemma4_fused_post_3norm_add_scale_and_input_ln(
+                    hs_dense,
+                    hs_moe,
+                    residual,
+                    self.post_feedforward_layernorm_1.weight,
+                    self.post_feedforward_layernorm_2.weight,
+                    self.post_feedforward_layernorm.weight,
+                    self.post_feedforward_layernorm.eps,
+                    self.layer_scalar,
+                    next_input_ln_weight,
+                )
+                return packed2[0], packed2[1]
+            else:
+                # Last layer (no next input_ln) or non-MoE fallback
+                hidden_states = gemma4_fused_post_3norm_add_scale(
+                    hs_dense,
+                    hs_moe,
+                    residual,
+                    self.post_feedforward_layernorm_1.weight,
+                    self.post_feedforward_layernorm_2.weight,
+                    self.post_feedforward_layernorm.weight,
+                    self.post_feedforward_layernorm.eps,
+                    self.layer_scalar,
+                )
+                return hidden_states
         else:
             # Fused: post_attention_layernorm + residual add -> 2 kernels -> 1
             hidden_states = gemma4_post_norm_add(
@@ -735,12 +757,26 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
         pos_emb_local = self.rotary_emb_local(inputs_embeds, position_ids)
 
         hidden_states = inputs_embeds
-        for decoder_layer in self.layers:
+        n_layers = len(self.layers)
+        pre_normed_hs: Optional[torch.Tensor] = None
+        for i, decoder_layer in enumerate(self.layers):
             if decoder_layer.attention_type == "sliding_attention":
                 pos_emb = pos_emb_local
             else:
                 pos_emb = pos_emb_global
-            hidden_states = decoder_layer(hidden_states, pos_emb)
+            # iter102: pass next layer's input_ln weight (None for last layer) so the
+            # 3-norm kernel pre-computes input_normed for the next layer, eliminating
+            # one flashinfer kernel launch per inter-layer boundary (29 savings).
+            is_last = i == n_layers - 1
+            next_ln_w: Optional[torch.Tensor] = (
+                None if is_last else self.layers[i + 1].input_layernorm.weight
+            )
+            result = decoder_layer(hidden_states, pos_emb, pre_normed_hs, next_ln_w)
+            if isinstance(result, tuple):
+                hidden_states, pre_normed_hs = result
+            else:
+                hidden_states = result
+                pre_normed_hs = None
 
         hidden_states = self.norm(hidden_states)
         return Gemma4TextOutput(last_hidden_state=hidden_states)
