@@ -1,3 +1,7 @@
+# BENCH: CUDA_VISIBLE_DEVICES=<N> bench-sweep --model google/gemma-4-26B-A4B-it --concurrencies "1 16 256" --isl 1000 --osl 1000 --config-path reduced_config_gemma4.yaml --server-type trtllm-autodeploy --extra-aiperf-args="--tokenizer /home/chengzhang/tokenizers/gemma-4-26B-A4B-it --use-server-token-count"
+# ACCURACY: CUDA_VISIBLE_DEVICES=<N> pytest tests/integration/defs/accuracy/test_llm_api_autodeploy.py::TestGemma4MoE::test_bf16 -s -v
+# MODEL: ALL rows use REDUCED 6-layer model (reduced_config_gemma4.yaml).
+# NOTE: iter0-iter59 measured WITHOUT --use-server-token-count (client overcounts by ~16%, TPOT appears lower). iter60+ measured WITH --use-server-token-count.
 iter	commit	ttft_c1	tpot_c1	tps_c1	ttft_c16	tpot_c16	tps_c16	ttft_c256	tpot_c256	tps_c256	correctness	status	description
 0	12e9b34e30	71.24	2.443	397.0	341.42	3.720	3934.8	3346.67	18.264	33498.2	-	keep	baseline (reduced 6-layer)
 1	ebaf35d380 (discarded)	-	-	-	-	-	-	-	-	-	-	discard	fuse_add_rms_norm: no effect on Gemma4 pattern
@@ -52,3 +56,13 @@ iter	commit	ttft_c1	tpot_c1	tps_c1	ttft_c16	tpot_c16	tps_c16	ttft_c256	tpot_c256
 # --- iter51-redux (extend post_norm_add_and_pre_ff_norm to 3-output) ABORTED: would duplicate iter46 (already DISCARDed) ---
 47	763ca34603	44.89	2.174	430.7	114.90	3.203	4655.5	18.570	18.697	11341.5	-	discard	iter51: fused QKV RMSNorm (q_norm+k_norm+v_norm → 1 Triton launch) — final v3/v4 (fixed code): tpot_c1 avg=2.174ms (+1.62% REGRESSION vs iter44 2.139ms); root cause: 32-block Triton kernel with 3-way conditional + small tiles slower than 3 flashinfer calls; DISCARD
 48	30e4f06a37	47.01	2.159	433.6	116.55	3.212	4643.7	18.722	18.619	11379.0	pass	discard	iter52: extend post_norm_add_and_pre_ff_norm to dense layers — avg tpot_c1=2.159ms (+0.92% REGRESSION vs iter44 2.139ms, 4 runs: -0.80/+1.33/+1.86/+1.28%); root cause: dense pre_ff_norm was already in CUDA graph (fast native op), fusion replaced it with slower Triton dual-reduction; DISCARD
+# --- From iter53 onward: CPU scheduling overhead reduction; iter44 is the best prior GPU-kernel commit ---
+49	0618f1e53a	45.28	2.267	431.7	119.03	3.311	4657.1	3482.60	18.003	11594.7	-	keep	iter55+56: batched cache lookup (n>=64) + get_last_tokens (1-call vs 2) + input_pos cache — c1 flat (2.267ms), c256 -3.6% vs iter44 (18.003ms)
+50	d2f6d21f9b	45.53	2.250	434.8	122.88	3.324	4635.0	3308.11	17.925	11746.0	pass	keep	iter57: remove redundant position_ids computation in nest_sequences — c1 flat (2.250ms), c256 -4.0% vs iter44 (17.925ms); accuracy PASSED
+51	(discarded)	45.25	2.237	437.2	125.72	3.328	4625.4	3673.58	18.834	11092.9	-	discard	iter58: lower batch_cache threshold 64→2 — c256 +5.1% REGRESSION (18.834ms); DISCARD
+52	(discarded)	46.92	2.241	436.3	122.29	3.319	4642.3	3224.03	18.368	11580.0	-	discard	iter59: cache max_beam_num_tokens for overlap path (dict-based) — c256 +2.5% REGRESSION (18.368ms); DISCARD
+# --- From iter60 onward: measured WITH --use-server-token-count ---
+53	b25dc6d894	46.28	2.210	431.8	120.18	3.200	4674.8	2999.05	18.410	11561.7	-	keep	iter60: fused_add_rmsnorm for large-T gemma4_post_add_norm_add_scale — eliminates a+b→x temp read, 4→3 kernels, 0 temp allocs; BEST STATE
+54	71014e1c8b	45.66	2.140	437.1	113.59	3.190	4694.0	2881.06	18.290	11662.7	pass	keep	iter61: rmsnorm out= for all 3 large-T paths — eliminates 1-2 T×H temp allocs + better L2 reuse; c1 -3.2% (2.210→2.140ms), c16 -0.3% noise, c256 -0.7% noise; accuracy PASSED; BEST STATE
+55	ad6e010958	45.92	2.160	435.1	123.00	3.198	4584.7	2865.09	18.681	11477.4	pass	discard	iter62: revert iter55+56 — confirmed NO REAL EFFECT (WITH=2.14ms vs WITHOUT=2.12ms, within noise); apparent regression vs iter61 was apples-to-oranges (different token counting); DISCARD
+56	9cfa9670d3	46.55	2.202	443.8	123.72	3.290	4678.4	3474.87	18.051	11567.6	pass	keep	iter63: raise garbage_collection_gen0_threshold 20000->200000 — paired live A/B vs fresh same-HEAD baseline improved tpot at all concs (c1 -5.0%, c16 -3.9%, c256 -3.8%); main-worktree confirmation 2.246/3.308/17.974; accuracy PASSED
