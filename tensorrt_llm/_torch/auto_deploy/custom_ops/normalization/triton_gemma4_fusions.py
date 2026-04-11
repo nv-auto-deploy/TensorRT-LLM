@@ -213,6 +213,12 @@ def _post_add_norm_add_scale_kernel(
 # Threshold: use Triton fused kernel for T ≤ this value; use flashinfer for T > this.
 # At small T (≤ 8) each kernel launch costs ~200-300ns in a CUDA graph; fusing
 # 2 launches into 1 saves ~250ns × 2 sites × 30 layers ≈ 15µs at c=1.
+# Standalone device-side benchmarks (CUDA events) show FlashInfer 1.4-2× faster
+# than Triton for all T, but this is dominated by serial scheduling overhead that
+# does NOT exist in CUDA graphs. In-graph, Triton's single kernel per fusion site
+# beats 2-3 FlashInfer kernels due to lower graph dispatch overhead.
+# Verified: threshold=0 (always FlashInfer) caused +1.4%/+0.7% regression vs
+# threshold=8 at c=1/c=256 in the CUDA-graph decode path (iter92 vs iter82 baseline).
 # At large T (> 8) flashinfer's vectorised RMSNorm + elementwise add outperform
 # the Triton kernel (which wastes 31% of elements due to BLOCK_H=4096 > H=2816).
 _TRITON_T_THRESHOLD = 8
