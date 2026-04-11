@@ -13,6 +13,7 @@ from _model_test_utils import FakeFP8Linear
 from _torch_test_utils import all_close, fp8_compatible, reset_parameters
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, TransformRegistry
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 
@@ -595,3 +596,277 @@ def test_fuse_gemms_mixed_children(dtype: str):
     reset_parameters(gm_transformed)
     y_random = gm_transformed(x)
     assert not all_close(y_model, y_random)
+
+
+# ===========================================================================
+# Tests for FX graph visibility after GEMM fusion (meta["val"] propagation)
+# ===========================================================================
+
+
+def _check_all_nodes_have_meta_val(gm) -> bool:
+    """Verify that every computation node has meta['val'] after fusion."""
+    for node in gm.graph.nodes:
+        if node.op in ("placeholder", "output", "get_attr"):
+            continue
+        if "val" not in node.meta or node.meta["val"] is None:
+            return False
+    return True
+
+
+def _count_contiguous_nodes(gm) -> int:
+    return sum(1 for n in gm.graph.nodes if n.op == "call_method" and n.target == "contiguous")
+
+
+class QKVLikeModel(TestModel):
+    """Three linears (QKV-like) sharing the same input with a non-linear user."""
+
+    def __init__(self, batch_size=2, seq_len=8, in_features=64, out_q=32, out_k=32, out_v=48):
+        super().__init__()
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.in_features = in_features
+        self.q_proj = nn.Linear(in_features, out_q, bias=False)
+        self.k_proj = nn.Linear(in_features, out_k, bias=False)
+        self.v_proj = nn.Linear(in_features, out_v, bias=False)
+
+    def get_input(self, **kwargs):
+        return torch.randn(self.batch_size, self.seq_len, self.in_features, **kwargs)
+
+    @property
+    def keys_to_pop(self):
+        return ("q_proj.weight", "k_proj.weight", "v_proj.weight")
+
+    @property
+    def num_gemms_after_fusion(self) -> int:
+        return 1
+
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape  # non-linear user forces mixed_children path
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        return q.sum(-1, keepdim=True) + k.sum(-1, keepdim=True) + v.sum(-1, keepdim=True)
+
+
+@pytest.mark.parametrize(
+    "model_cls,expected_narrows",
+    [
+        (GdnLikeFusableModel, 4),
+        (QKVLikeModel, 3),
+    ],
+)
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@torch.inference_mode()
+def test_fuse_gemms_mixed_children_meta_val(model_cls, expected_narrows, dtype):
+    """After FuseGemmsMixedChildren, all narrow+contiguous nodes must have meta['val'].
+
+    Before the fix, the allow_not_contigous=False path used an opaque split_output
+    closure that produced nodes without meta['val'], breaking downstream transforms
+    (fuse_rmsnorm, piecewise CUDA graph splitting).
+    """
+    torch_dtype = getattr(torch, dtype)
+    model = model_cls().to(device="cuda", dtype=torch_dtype)
+    x = model.get_input(device="cuda", dtype=torch_dtype)
+    y_ref = model(x)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_fused = InferenceOptimizer(
+        None,
+        {"fuse_gemms_mixed_children": {"stage": "post_load_fusion"}},
+    )(None, gm)
+
+    # Should produce 1 fused linear
+    num_linears = sum(is_linear_op(n) for n in gm_fused.graph.nodes)
+    assert num_linears == 1, f"Expected 1 fused linear, got {num_linears}"
+
+    # Should have narrow nodes for each original linear
+    num_narrows = _count_split_output_views(gm_fused)
+    assert num_narrows == expected_narrows, (
+        f"Expected {expected_narrows} narrow nodes, got {num_narrows}"
+    )
+
+    # allow_not_contigous=False → each narrow should have a .contiguous() call
+    num_contigs = _count_contiguous_nodes(gm_fused)
+    assert num_contigs == expected_narrows, (
+        f"Expected {expected_narrows} contiguous nodes, got {num_contigs}"
+    )
+
+    # Core assertion: all nodes must have meta["val"]
+    assert _check_all_nodes_have_meta_val(gm_fused), (
+        "Some nodes are missing meta['val'] after GEMM fusion. "
+        "This breaks downstream transforms (fuse_rmsnorm, piecewise CUDA graph)."
+    )
+
+    # Verify narrow node meta["val"] shapes are consistent
+    for node in gm_fused.graph.nodes:
+        if node.op == "call_function" and node.target is torch.narrow:
+            val = node.meta["val"]
+            assert len(val.shape) == 3, f"Expected 3D shape, got {val.shape}"
+
+    # Numerical correctness
+    gm_fused = gm_fused.to("cuda")
+    y_fused = gm_fused(x)
+    torch.testing.assert_close(y_ref, y_fused, atol=1e-3, rtol=1e-3)
+
+
+@torch.inference_mode()
+def test_fuse_gemms_mixed_children_has_valid_shapes():
+    """FuseGemmsMixedChildren must report has_valid_shapes=True after fusion.
+
+    Before the fix, it reported has_valid_shapes=(num_matches == 0), forcing
+    an expensive run_shape_prop re-run after every fusion.
+    """
+    model = GdnLikeFusableModel().to(device="cuda", dtype=torch.float16)
+    x = model.get_input(device="cuda", dtype=torch.float16)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    shared_config = SharedConfig(local_rank=0, world_size=1)
+    config_cls = TransformRegistry.get_config_class("fuse_gemms_mixed_children")
+    config = config_cls(stage="post_load_fusion")
+    transform = TransformRegistry.get("fuse_gemms_mixed_children")(config)
+    gm, info = transform._apply(gm, cm=None, factory=None, shared_config=shared_config)
+
+    assert info.num_matches > 0, "Expected at least one fusion match"
+    assert info.has_valid_shapes is True, (
+        "FuseGemmsMixedChildren should report has_valid_shapes=True "
+        "since all nodes now have proper meta['val']"
+    )
+
+
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires FP8 support (Hopper+)")
+@torch.inference_mode()
+def test_fuse_gemms_mixed_children_fp8_meta_val():
+    """FP8 quantized GEMM fusion should also preserve meta['val'] on all nodes."""
+
+    class FP8MixedChildrenModel(TestModel):
+        def __init__(self, batch_size=2, seq_len=8, in_features=2048, out1=128, out2=128):
+            super().__init__()
+            self.batch_size = batch_size
+            self.seq_len = seq_len
+            self.in_features = in_features
+            self.fc1 = FakeFP8Linear(in_features, out1, bias=False)
+            self.fc2 = FakeFP8Linear(in_features, out2, bias=False)
+
+        def get_input(self, **kwargs):
+            return torch.randn(self.batch_size, self.seq_len, self.in_features, **kwargs)
+
+        @property
+        def keys_to_pop(self):
+            return ("fc1.weight", "fc2.weight")
+
+        @property
+        def num_gemms_after_fusion(self) -> int:
+            return 1
+
+        def forward(self, x):
+            batch_size, seq_len, _ = x.shape  # non-linear user
+            y1 = self.fc1(x)
+            y2 = self.fc2(x)
+            return y1.sum(-1, keepdim=True) + y2.sum(-1, keepdim=True)
+
+    model = FP8MixedChildrenModel().to(device="cuda")
+    x = model.get_input(device="cuda", dtype=torch.half)
+    y_ref = model(x)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_fused = InferenceOptimizer(
+        None,
+        {"fuse_gemms_mixed_children": {"stage": "post_load_fusion"}},
+    )(None, gm)
+
+    assert _check_all_nodes_have_meta_val(gm_fused), (
+        "Some nodes missing meta['val'] after FP8 GEMM fusion"
+    )
+
+    gm_fused = gm_fused.to("cuda")
+    y_fused = gm_fused(x)
+    torch.testing.assert_close(y_ref, y_fused, atol=5e-3, rtol=5e-3)
+
+
+# ===========================================================================
+# Tests for _ensure_tma_col_major (scale layout restoration after fusion)
+# ===========================================================================
+
+
+class TestEnsureTmaColMajor:
+    """Unit tests for _ensure_tma_col_major in fuse_swiglu.py.
+
+    On Blackwell, post_load_hook converts weight scales to UE8M0 (torch.int)
+    with TMA-aligned column-major layout (stride(-2)==1). torch.cat during
+    gate+up or QKV fusion produces row-major output, breaking DeepGEMM's
+    stride requirement. _ensure_tma_col_major restores the column-major layout.
+    """
+
+    @staticmethod
+    def _get_fn():
+        from tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu import (
+            _ensure_tma_col_major,
+        )
+
+        return _ensure_tma_col_major
+
+    def test_noop_for_non_int_dtype(self):
+        """Should return input unchanged if dtype is not torch.int (not UE8M0)."""
+        fn = self._get_fn()
+        t = torch.randn(4, 8, dtype=torch.float32)
+        result = fn(t)
+        assert result is t
+
+    def test_noop_for_already_col_major(self):
+        """Should return input unchanged if already column-major (stride(-2)==1)."""
+        fn = self._get_fn()
+        t = torch.transpose(torch.empty(8, 4, dtype=torch.int), 0, 1)
+        assert t.stride(-2) == 1
+        result = fn(t)
+        assert result is t
+
+    def test_restores_col_major_2d(self):
+        """torch.cat on 2D column-major tensors → should restore layout."""
+        fn = self._get_fn()
+
+        mn, k = 4, 8
+        aligned_mn = ((mn + 3) // 4) * 4
+        col_a = torch.transpose(torch.ones(k, aligned_mn, dtype=torch.int), 0, 1)[:mn, :]
+        col_b = torch.transpose(torch.full((k, aligned_mn), 2, dtype=torch.int), 0, 1)[:mn, :]
+
+        catted = torch.cat([col_a, col_b], dim=0)
+        assert catted.stride(-2) != 1, "Precondition: cat should produce row-major"
+
+        result = fn(catted)
+        assert result.stride(-2) == 1, f"Expected col-major, got stride={result.stride()}"
+        assert result.shape == (2 * mn, k)
+        assert result.dtype == torch.int
+
+    def test_restores_col_major_3d(self):
+        """Should handle 3D (batched) tensors."""
+        fn = self._get_fn()
+
+        b, mn, k = 2, 4, 8
+        aligned_mn = ((mn + 3) // 4) * 4
+        col = torch.transpose(torch.ones(b, k, aligned_mn, dtype=torch.int), 1, 2)[:, :mn, :]
+
+        catted = torch.cat([col, col], dim=1)
+        assert catted.stride(-2) != 1
+
+        result = fn(catted)
+        assert result.stride(-2) == 1
+        assert result.shape == (b, 2 * mn, k)
+
+    def test_data_preserved(self):
+        """Data values should be preserved after layout restoration."""
+        fn = self._get_fn()
+
+        mn, k = 4, 8
+        aligned_mn = ((mn + 3) // 4) * 4
+        raw = torch.arange(mn * k, dtype=torch.int).reshape(mn, k)
+
+        col = torch.transpose(torch.empty(k, aligned_mn, dtype=torch.int), 0, 1)
+        col[:mn, :] = raw
+        col = col[:mn, :]
+
+        catted = torch.cat([col, col], dim=0)
+        result = fn(catted)
+
+        torch.testing.assert_close(result[:mn, :], raw)
+        torch.testing.assert_close(result[mn:, :], raw)
