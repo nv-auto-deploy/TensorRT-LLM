@@ -715,3 +715,275 @@ def _gemma4_qkv_norm_fake(
     eps: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+# ---------------------------------------------------------------------------
+# Fused QKV RMSNorm + RoPE — eliminates the separate rope kernel launch
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _qkv_norm_rope_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    w_q_ptr,
+    w_k_ptr,
+    w_v_ptr,
+    cos_ptr,
+    sin_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    N_Q,
+    N_KV,
+    N_QH: tl.constexpr,
+    N_KVH: tl.constexpr,
+    H: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Single-kernel fused RMSNorm + RoPE for Q, K, V.
+
+    Grid: (N_Q + 2*N_KV,) — one program per head row.
+    Programs [0, N_Q)        → Q rows: RMSNorm(w_q) + RoPE rotation.
+    Programs [N_Q, N_Q+N_KV) → K rows: RMSNorm(w_k) + RoPE rotation.
+    Programs [N_Q+N_KV, ...)  → V rows: RMSNorm(w_v), no rotation.
+
+    BLOCK_H = H // 2: each program loads the first and second halves of the head
+    separately so that rotate_half can be computed as a direct in-register operation:
+      out_lo = n_lo * cos_lo - n_hi * sin_lo
+      out_hi = n_hi * cos_hi + n_lo * sin_hi
+    For V rows, cos/sin loads use mask=False → other=1.0/0.0, giving cos=1, sin=0
+    so the rotation formula passes the normed value through unchanged.
+
+    This kernel NEVER calls another custom op — all computation is inline Triton,
+    avoiding the eager-kernel explosion caused by nested custom op calls.
+    """
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)  # [0..H/2 - 1]
+
+    is_q = row < N_Q
+    is_k = (row >= N_Q) & (row < N_Q + N_KV)
+    is_v = ~is_q & ~is_k
+
+    kv_row = row - N_Q
+    v_row = row - N_Q - N_KV
+    kv_row_safe = tl.where(is_k, kv_row, 0)
+    v_row_safe = tl.where(is_v, v_row, 0)
+
+    # ---- Load first and second halves of each input ----
+    xq_lo = tl.load(q_ptr + row * H + offs, mask=is_q, other=0.0).to(tl.float32)
+    xq_hi = tl.load(q_ptr + row * H + offs + BLOCK_H, mask=is_q, other=0.0).to(tl.float32)
+    xk_lo = tl.load(k_ptr + kv_row_safe * H + offs, mask=is_k, other=0.0).to(tl.float32)
+    xk_hi = tl.load(k_ptr + kv_row_safe * H + offs + BLOCK_H, mask=is_k, other=0.0).to(tl.float32)
+    xv_lo = tl.load(v_ptr + v_row_safe * H + offs, mask=is_v, other=0.0).to(tl.float32)
+    xv_hi = tl.load(v_ptr + v_row_safe * H + offs + BLOCK_H, mask=is_v, other=0.0).to(tl.float32)
+    x_lo = xq_lo + xk_lo + xv_lo
+    x_hi = xq_hi + xk_hi + xv_hi
+
+    # ---- Load weights (half each) ----
+    wq_lo = tl.load(w_q_ptr + offs, mask=is_q, other=0.0).to(tl.float32)
+    wq_hi = tl.load(w_q_ptr + offs + BLOCK_H, mask=is_q, other=0.0).to(tl.float32)
+    wk_lo = tl.load(w_k_ptr + offs, mask=is_k, other=0.0).to(tl.float32)
+    wk_hi = tl.load(w_k_ptr + offs + BLOCK_H, mask=is_k, other=0.0).to(tl.float32)
+    wv_lo = tl.load(w_v_ptr + offs, mask=is_v, other=0.0).to(tl.float32)
+    wv_hi = tl.load(w_v_ptr + offs + BLOCK_H, mask=is_v, other=0.0).to(tl.float32)
+    w_lo = wq_lo + wk_lo + wv_lo
+    w_hi = wq_hi + wk_hi + wv_hi
+
+    # ---- RMSNorm over all H = BLOCK_H * 2 elements ----
+    var = (tl.sum(x_lo * x_lo) + tl.sum(x_hi * x_hi)) / H
+    inv_rms = tl.rsqrt(var + eps)
+    n_lo = x_lo * inv_rms * w_lo
+    n_hi = x_hi * inv_rms * w_hi
+
+    # ---- RoPE for Q and K rows; identity for V ----
+    token = tl.where(is_q, row // N_QH, kv_row_safe // N_KVH)
+    # For V rows: mask=False → other=1.0 (cos) / 0.0 (sin) → rotation is identity
+    need_rope = is_q | is_k
+    cos_lo = tl.load(cos_ptr + token * H + offs, mask=need_rope, other=1.0).to(tl.float32)
+    cos_hi = tl.load(cos_ptr + token * H + offs + BLOCK_H, mask=need_rope, other=1.0).to(tl.float32)
+    sin_lo = tl.load(sin_ptr + token * H + offs, mask=need_rope, other=0.0).to(tl.float32)
+    sin_hi = tl.load(sin_ptr + token * H + offs + BLOCK_H, mask=need_rope, other=0.0).to(tl.float32)
+
+    # rotate_half: rh_lo = -n_hi, rh_hi = n_lo
+    # out_lo = n_lo*cos_lo - n_hi*sin_lo  (same formula works for V: cos=1,sin=0 → out=n)
+    # out_hi = n_hi*cos_hi + n_lo*sin_hi
+    out_lo = n_lo * cos_lo - n_hi * sin_lo
+    out_hi = n_hi * cos_hi + n_lo * sin_hi
+
+    # ---- Store ----
+    tl.store(q_out_ptr + row * H + offs, out_lo.to(tl.bfloat16), mask=is_q)
+    tl.store(q_out_ptr + row * H + offs + BLOCK_H, out_hi.to(tl.bfloat16), mask=is_q)
+    tl.store(k_out_ptr + kv_row_safe * H + offs, out_lo.to(tl.bfloat16), mask=is_k)
+    tl.store(k_out_ptr + kv_row_safe * H + offs + BLOCK_H, out_hi.to(tl.bfloat16), mask=is_k)
+    tl.store(v_out_ptr + v_row_safe * H + offs, out_lo.to(tl.bfloat16), mask=is_v)
+    tl.store(v_out_ptr + v_row_safe * H + offs + BLOCK_H, out_hi.to(tl.bfloat16), mask=is_v)
+
+
+@triton.jit
+def _rope_qk_kernel(
+    q_ptr,
+    k_ptr,
+    cos_ptr,
+    sin_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    N_Q,
+    N_KV,
+    N_QH: tl.constexpr,
+    N_KVH: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Apply RoPE rotation to pre-normed Q and K (no V).
+
+    Grid: (N_Q + N_KV,) — one program per q or k head row.
+    Used in the large-T fallback of gemma4_qkv_norm_rope after flashinfer
+    has already applied the per-head RMSNorm to q and k.
+    Same half-split approach as _qkv_norm_rope_kernel.
+    """
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+
+    is_q = row < N_Q
+    kv_row = row - N_Q
+    kv_row_safe = tl.where(is_q, 0, kv_row)
+
+    # Load first/second half of q or k
+    xq_lo = tl.load(q_ptr + row * H + offs, mask=is_q, other=0.0).to(tl.float32)
+    xq_hi = tl.load(q_ptr + row * H + offs + BLOCK_H, mask=is_q, other=0.0).to(tl.float32)
+    xk_lo = tl.load(k_ptr + kv_row_safe * H + offs, mask=~is_q, other=0.0).to(tl.float32)
+    xk_hi = tl.load(k_ptr + kv_row_safe * H + offs + BLOCK_H, mask=~is_q, other=0.0).to(tl.float32)
+    x_lo = xq_lo + xk_lo
+    x_hi = xq_hi + xk_hi
+
+    # Token index and cos/sin
+    token = tl.where(is_q, row // N_QH, kv_row_safe // N_KVH)
+    cos_lo = tl.load(cos_ptr + token * H + offs).to(tl.float32)
+    cos_hi = tl.load(cos_ptr + token * H + offs + BLOCK_H).to(tl.float32)
+    sin_lo = tl.load(sin_ptr + token * H + offs).to(tl.float32)
+    sin_hi = tl.load(sin_ptr + token * H + offs + BLOCK_H).to(tl.float32)
+
+    out_lo = x_lo * cos_lo - x_hi * sin_lo
+    out_hi = x_hi * cos_hi + x_lo * sin_hi
+
+    tl.store(q_out_ptr + row * H + offs, out_lo.to(tl.bfloat16), mask=is_q)
+    tl.store(q_out_ptr + row * H + offs + BLOCK_H, out_hi.to(tl.bfloat16), mask=is_q)
+    tl.store(k_out_ptr + kv_row_safe * H + offs, out_lo.to(tl.bfloat16), mask=~is_q)
+    tl.store(k_out_ptr + kv_row_safe * H + offs + BLOCK_H, out_hi.to(tl.bfloat16), mask=~is_q)
+
+
+@torch.library.custom_op("auto_deploy::gemma4_qkv_norm_rope", mutates_args=(), device_types="cuda")
+def gemma4_qkv_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    w_q: torch.Tensor,
+    w_k: torch.Tensor,
+    w_v: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused per-head RMSNorm + RoPE for Q, K, V: one Triton kernel instead of ~3.
+
+    Replaces three torch_rmsnorm calls and the torch_rope_with_explicit_cos_sin call
+    with a single fused Triton kernel. Expected savings at c=1 (decode T=1):
+    2 fewer kernel dispatches per layer × 30 layers = 60 × 1.3µs = 78µs ≈ 1.4%.
+
+    Small T (total QKV rows ≤ _QKV_TRITON_THRESHOLD): pure inline Triton kernel —
+    both RMSNorm and RoPE rotation computed in a single pass, no nested custom op calls.
+
+    Large T: gemma4_qkv_norm (flashinfer, 3 kernels) + Triton rope-only kernel (1 kernel).
+    Large-T rope uses a dedicated _rope_qk_kernel to avoid the eager-explosion
+    caused by calling torch_rope_with_explicit_cos_sin from inside a custom op body.
+
+    cos/sin shape: [BS, seq_len, head_dim] (already indexed by position_ids).
+    Both tensors are 2D-flattened to [T, H] inside the kernel (T = BS*seq_len).
+    """
+    import flashinfer as _flashinfer
+
+    H = q.shape[-1]
+    q_2d = q.reshape(-1, H)
+    k_2d = k.reshape(-1, H)
+    v_2d = v.reshape(-1, H)
+    N_Q = q_2d.shape[0]
+    N_KV = k_2d.shape[0]
+    N_QH = N_Q // max(cos.reshape(-1, H).shape[0], 1)  # q heads per token
+    N_KVH = N_KV // max(cos.reshape(-1, H).shape[0], 1)  # kv heads per token
+    cos_2d = cos.reshape(-1, H)
+    sin_2d = sin.reshape(-1, H)
+
+    q_out = torch.empty_like(q_2d)
+    k_out = torch.empty_like(k_2d)
+    v_out = torch.empty_like(v_2d)
+
+    total_rows = N_Q + 2 * N_KV
+    if total_rows <= _QKV_TRITON_THRESHOLD:
+        H_half = H // 2
+        _qkv_norm_rope_kernel[(total_rows,)](
+            q_2d,
+            k_2d,
+            v_2d,
+            w_q,
+            w_k,
+            w_v,
+            cos_2d,
+            sin_2d,
+            q_out,
+            k_out,
+            v_out,
+            N_Q=N_Q,
+            N_KV=N_KV,
+            N_QH=N_QH,
+            N_KVH=N_KVH,
+            H=H,
+            eps=eps,
+            BLOCK_H=H_half,
+            num_warps=8,
+        )
+    else:
+        # Large T: flashinfer per-head RMSNorm then Triton rope (1 kernel for q+k)
+        _flashinfer.norm.rmsnorm(q_2d, w_q, eps, out=q_out)
+        _flashinfer.norm.rmsnorm(k_2d, w_k, eps, out=k_out)
+        _flashinfer.norm.rmsnorm(v_2d, w_v, eps, out=v_out)
+        # Apply RoPE to q_out and k_out in-place via Triton kernel (avoids eager explosion)
+        q_roped = torch.empty_like(q_out)
+        k_roped = torch.empty_like(k_out)
+        H_half = H // 2
+        _rope_qk_kernel[(N_Q + N_KV,)](
+            q_out,
+            k_out,
+            cos_2d,
+            sin_2d,
+            q_roped,
+            k_roped,
+            N_Q=N_Q,
+            N_KV=N_KV,
+            N_QH=N_QH,
+            N_KVH=N_KVH,
+            H=H,
+            BLOCK_H=H_half,
+            num_warps=8,
+        )
+        q_out = q_roped
+        k_out = k_roped
+
+    return q_out.reshape(q.shape), k_out.reshape(k.shape), v_out.reshape(v.shape)
+
+
+@gemma4_qkv_norm_rope.register_fake
+def _gemma4_qkv_norm_rope_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    w_q: torch.Tensor,
+    w_k: torch.Tensor,
+    w_v: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
