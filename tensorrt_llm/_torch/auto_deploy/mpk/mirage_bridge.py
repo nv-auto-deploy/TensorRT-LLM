@@ -26,6 +26,7 @@ the installed Mirage Python surface before full artifact emission is added.
 
 from __future__ import annotations
 
+import ctypes
 import importlib
 import importlib.util
 import os
@@ -43,6 +44,7 @@ from typing import Any, Callable, Dict, Optional
 
 import torch
 import torch.nn.functional as F
+from torch.fx import GraphModule, Node
 
 from .types import GemmaLayerLoweringPlan, GemmaLoweringStatus
 
@@ -53,6 +55,8 @@ _COMPOSED_STEP_METHODS: Dict[str, tuple[str, ...]] = {
 }
 
 _MIRAGE_RUNTIME_EXTENSION_CACHE: Dict[str, Any] = {}
+_MIRAGE_LINEAR_MAX_CAPACITY = 16
+_MIRAGE_MOE_W2_MAX_CAPACITY = 16
 
 _NORM_LINEAR_WRAPPER_SOURCE = """
 #include "bfloat16.h"
@@ -671,10 +675,22 @@ def _find_mirage_package_dir() -> Optional[Path]:
 
 
 def _bootstrap_mirage_namespace(package_dir: Path) -> None:
-    if "mirage" not in sys.modules:
-        mirage_pkg = types.ModuleType("mirage")
-        mirage_pkg.__path__ = [str(package_dir)]
+    existing_pkg = sys.modules.get("mirage")
+    if existing_pkg is None or not hasattr(existing_pkg, "new_kernel_graph"):
+        sys.modules.pop("mirage", None)
+        init_py = package_dir / "__init__.py"
+        if not init_py.is_file():
+            raise RuntimeError(f"Mirage package init not found: {init_py}")
+        spec = importlib.util.spec_from_file_location(
+            "mirage",
+            init_py,
+            submodule_search_locations=[str(package_dir)],
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load Mirage package spec from {init_py}")
+        mirage_pkg = importlib.util.module_from_spec(spec)
         sys.modules["mirage"] = mirage_pkg
+        spec.loader.exec_module(mirage_pkg)
 
     if "mirage.mpk" not in sys.modules:
         mirage_mpk_pkg = types.ModuleType("mirage.mpk")
@@ -682,16 +698,42 @@ def _bootstrap_mirage_namespace(package_dir: Path) -> None:
         sys.modules["mirage.mpk"] = mirage_mpk_pkg
 
 
+def _preload_z3_shared_library() -> None:
+    try:
+        import z3
+    except ImportError:
+        return
+
+    z3_lib_dir = Path(z3.__file__).resolve().parent / "lib"
+    current_ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if str(z3_lib_dir) not in current_ld_library_path.split(":"):
+        os.environ["LD_LIBRARY_PATH"] = (
+            f"{z3_lib_dir}:{current_ld_library_path}"
+            if current_ld_library_path
+            else str(z3_lib_dir)
+        )
+
+    for lib_name in ("libz3.so.4.16", "libz3.so"):
+        lib_path = z3_lib_dir / lib_name
+        if not lib_path.is_file():
+            continue
+        try:
+            ctypes.CDLL(str(lib_path), mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            continue
+        break
+
+
 def _require_mirage():
+    _preload_z3_shared_library()
     try:
         from mirage.mpk.persistent_kernel import PersistentKernel
     except ImportError as exc:  # pragma: no cover - exercised only in Mirage-enabled envs
-        if isinstance(exc, ModuleNotFoundError) and exc.name == "z3":
-            package_dir = _find_mirage_package_dir()
-            if package_dir is not None:
-                _bootstrap_mirage_namespace(package_dir)
-                module = importlib.import_module("mirage.mpk.persistent_kernel")
-                return getattr(module, "PersistentKernel")
+        package_dir = _find_mirage_package_dir()
+        if package_dir is not None:
+            _bootstrap_mirage_namespace(package_dir)
+            module = importlib.import_module("mirage.mpk.persistent_kernel")
+            return getattr(module, "PersistentKernel")
 
         raise RuntimeError(
             "Mirage is not importable. Ensure the mirage Python package is installed "
@@ -701,15 +743,32 @@ def _require_mirage():
 
 
 def _require_mirage_compile_support():
+    _preload_z3_shared_library()
     try:
         persistent_kernel_mod = importlib.import_module("mirage.mpk.persistent_kernel")
         kernel_mod = importlib.import_module("mirage.kernel")
     except ImportError as exc:  # pragma: no cover - exercised only in Mirage-enabled envs
+        package_dir = _find_mirage_package_dir()
+        if package_dir is not None:
+            _bootstrap_mirage_namespace(package_dir)
+            persistent_kernel_mod = importlib.import_module("mirage.mpk.persistent_kernel")
+            kernel_mod = importlib.import_module("mirage.kernel")
+            return persistent_kernel_mod, kernel_mod
         raise RuntimeError(
             "Mirage compile helpers are not importable. Ensure mirage.mpk.persistent_kernel "
             "and mirage.kernel are available on PYTHONPATH."
         ) from exc
     return persistent_kernel_mod, kernel_mod
+
+
+def _mpk_debug_enabled() -> bool:
+    value = os.environ.get("AD_MPK_DEBUG", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _mpk_debug(message: str) -> None:
+    if _mpk_debug_enabled():
+        print(f"[AD_MPK_DEBUG] {message}", flush=True)
 
 
 def _mirage_repo_root() -> Path:
@@ -1007,11 +1066,12 @@ class MirageBindingResult:
 def _rms_norm(input_tensor: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Apply a small RMSNorm helper for reference execution."""
 
+    output_dtype = input_tensor.dtype
     input_fp32 = input_tensor.float()
     weight_fp32 = weight.float()
     variance = input_fp32.square().mean(dim=-1, keepdim=True)
     normalized = input_fp32 * torch.rsqrt(variance + eps)
-    return normalized * weight_fp32
+    return (normalized * weight_fp32).to(dtype=output_dtype)
 
 
 def _apply_rope(input_tensor: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -1044,6 +1104,16 @@ def _expert_gated_activation(input_tensor: torch.Tensor, *, act_fn: str) -> torc
     else:
         activated = F.gelu(gate)
     return activated * up
+
+
+def _extract_ranked_experts(routing_indices: torch.Tensor, topk: int) -> list[int]:
+    selected_experts = []
+    for expert_index in range(int(routing_indices.shape[0])):
+        rank = int(routing_indices[expert_index, 0].item())
+        if rank != 0:
+            selected_experts.append((expert_index, rank))
+    selected_experts = sorted(selected_experts, key=lambda item: item[1])
+    return [expert for expert, _ in selected_experts[:topk]]
 
 
 def execute_layer_plan_reference(
@@ -3415,7 +3485,7 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         up: torch.Tensor,
         *,
         stage_prefix: str,
-    ) -> torch.Tensor:
+    ) -> Dict[str, torch.Tensor]:
         kernel_mod = importlib.import_module("mirage.kernel")
         graph = mirage.new_kernel_graph()
         gate_in = graph.new_input(tuple(gate.shape), dtype=mirage.bfloat16)
@@ -4277,35 +4347,1099 @@ def _moe_expert_grid_dim(pk, *, w13_linear: bool) -> tuple[int, int, int]:
     return (expert_stride, 1, 1)
 
 
+def _node_arg_getattr_target(node: Node, arg_idx: int) -> str:
+    arg = node.args[arg_idx]
+    if not isinstance(arg, Node) or arg.op != "get_attr":
+        raise ValueError(
+            f"Expected get_attr argument at index {arg_idx} for node {node.name}, got {type(arg)}"
+        )
+    return str(arg.target)
+
+
+def _lookup_tensor_attr(source_model: GraphModule, attr_name: str) -> torch.Tensor:
+    candidate_names = [attr_name]
+    flattened_attr_name = attr_name.replace(".", "_")
+    if flattened_attr_name != attr_name:
+        candidate_names.append(flattened_attr_name)
+
+    for candidate_name in candidate_names:
+        tensor = getattr(source_model, candidate_name, None)
+        if isinstance(tensor, torch.Tensor):
+            return tensor
+
+    for candidate_name in candidate_names:
+        try:
+            tensor = source_model.get_parameter(candidate_name)
+        except AttributeError:
+            tensor = None
+        if isinstance(tensor, torch.Tensor):
+            return tensor
+
+        try:
+            tensor = source_model.get_buffer(candidate_name)
+        except AttributeError:
+            tensor = None
+        if isinstance(tensor, torch.Tensor):
+            return tensor
+
+    raise AttributeError(f"Missing expected GraphModule attribute: {attr_name}")
+
+
+def _node_target_name(node: Node) -> str:
+    return getattr(node.target, "__name__", str(node.target))
+
+
+def _node_target_matches_any(node: Node, *target_substrs: str) -> bool:
+    target_name = _node_target_name(node)
+    return any(target_substr in target_name for target_substr in target_substrs)
+
+
+def _find_direct_user(node: Node, target_substr: str) -> Node:
+    for user in node.users:
+        if target_substr in _node_target_name(user):
+            return user
+    raise ValueError(
+        f"Could not find direct user containing '{target_substr}' for node {node.name}"
+    )
+
+
+def _find_user_through_passthrough(node: Node, target_substr: str, max_depth: int = 4) -> Node:
+    frontier = [node]
+    visited = {id(node)}
+    for _ in range(max_depth):
+        next_frontier = []
+        for current in frontier:
+            for user in current.users:
+                if id(user) in visited:
+                    continue
+                visited.add(id(user))
+                if target_substr in _node_target_name(user):
+                    return user
+                next_frontier.append(user)
+        frontier = next_frontier
+    raise ValueError(f"Could not find user containing '{target_substr}' reachable from {node.name}")
+
+
+def _extract_router_aux_attr_names(router_proj_node: Node) -> tuple[str, str]:
+    router_scale_mul = router_proj_node.args[0]
+    if not isinstance(router_scale_mul, Node):
+        raise ValueError("Expected router projection input to be a node")
+    router_scale_to = router_scale_mul.args[1]
+    if not isinstance(router_scale_to, Node):
+        raise ValueError("Expected router scale input conversion node")
+    router_scale_name = _node_arg_getattr_target(router_scale_to, 0)
+
+    router_root_mul = router_scale_mul.args[0]
+    if not isinstance(router_root_mul, Node):
+        raise ValueError("Expected router root-size multiply node")
+    router_root_to = router_root_mul.args[1]
+    if not isinstance(router_root_to, Node):
+        raise ValueError("Expected router root-size conversion node")
+    router_root_size_name = _node_arg_getattr_target(router_root_to, 0)
+    return router_root_size_name, router_scale_name
+
+
+@dataclass
+class _GemmaRuntimeLayerSpec:
+    layer_index: int
+    q_heads: int
+    kv_heads: int
+    head_dim: int
+    topk: int
+    sliding_window: Optional[int]
+    qkv_weight: torch.Tensor
+    qkv_shared_kv: bool
+    input_layernorm_weight: torch.Tensor
+    q_norm_weight: torch.Tensor
+    k_norm_weight: torch.Tensor
+    v_norm_weight: torch.Tensor
+    o_proj_weight: torch.Tensor
+    post_attention_layernorm_weight: torch.Tensor
+    pre_feedforward_layernorm_weight: torch.Tensor
+    ffn_gate_up_weight: torch.Tensor
+    ffn_down_weight: torch.Tensor
+    post_feedforward_layernorm_1_weight: torch.Tensor
+    router_proj_weight: torch.Tensor
+    router_root_size: torch.Tensor
+    router_scale: torch.Tensor
+    pre_feedforward_layernorm_2_weight: torch.Tensor
+    moe_gate_weight: torch.Tensor
+    moe_up_weight: torch.Tensor
+    moe_w2_weight: torch.Tensor
+    post_feedforward_layernorm_2_weight: torch.Tensor
+    post_feedforward_layernorm_weight: torch.Tensor
+    layer_scalar: torch.Tensor
+
+
+def _build_gemma_runtime_specs(
+    source_model: GraphModule,
+    translation_plan: Dict[str, Any],
+) -> list[_GemmaRuntimeLayerSpec]:
+    node_map = {node.name: node for node in source_model.graph.nodes}
+    layer_infos = translation_plan["graph_info"]["layer_infos"]
+    layer_specs: list[_GemmaRuntimeLayerSpec] = []
+
+    for layer_info in layer_infos:
+        layer_idx = int(layer_info["layer_index"])
+        anchors = layer_info["anchors"]
+
+        qkv_node = node_map[anchors["qkv_linear"]["name"]]
+        ffn_gate_up_node = node_map[anchors["ffn_gate_up"]["name"]]
+        ffn_down_node = node_map[anchors["ffn_down"]["name"]]
+        o_proj_node = node_map[anchors["o_proj"]["name"]]
+        topk_node = node_map[anchors["topk"]["name"]]
+        router_proj_node = node_map[anchors["router_proj"]["name"]]
+        moe_fused_node = node_map[anchors["moe_fused"]["name"]]
+        cached_attention_node = node_map[anchors["cached_attention"]["name"]]
+        q_norm_node = node_map[anchors["q_norm"]["name"]]
+        k_norm_node = node_map[anchors["k_norm"]["name"]]
+        v_norm_node = node_map[anchors["v_norm"]["name"]]
+
+        qkv_weight_name = _node_arg_getattr_target(qkv_node, 1)
+        ffn_gate_up_weight_name = _node_arg_getattr_target(ffn_gate_up_node, 1)
+        ffn_down_weight_name = _node_arg_getattr_target(ffn_down_node, 1)
+        o_proj_weight_name = _node_arg_getattr_target(o_proj_node, 1)
+        router_proj_weight_name = _node_arg_getattr_target(router_proj_node, 1)
+        q_norm_weight_name = _node_arg_getattr_target(q_norm_node, 1)
+        k_norm_weight_name = _node_arg_getattr_target(k_norm_node, 1)
+        v_norm_weight_name = _node_arg_getattr_target(v_norm_node, 1)
+        topk = int(topk_node.args[1])
+        sliding_window = None
+        if len(cached_attention_node.args) >= 16 and cached_attention_node.args[15] is not None:
+            sliding_window = int(cached_attention_node.args[15])
+
+        input_layernorm_node = qkv_node.args[0]
+        if not isinstance(input_layernorm_node, Node):
+            raise ValueError("Expected qkv linear input to be a norm node")
+        input_layernorm_weight_name = _node_arg_getattr_target(input_layernorm_node, 1)
+
+        post_attention_layernorm_node = _find_direct_user(o_proj_node, "flashinfer_rms_norm")
+        post_attention_layernorm_weight_name = _node_arg_getattr_target(
+            post_attention_layernorm_node, 1
+        )
+
+        pre_feedforward_layernorm_node = ffn_gate_up_node.args[0]
+        if not isinstance(pre_feedforward_layernorm_node, Node):
+            raise ValueError("Expected FFN gate/up input to be a norm node")
+        pre_feedforward_layernorm_weight_name = _node_arg_getattr_target(
+            pre_feedforward_layernorm_node, 1
+        )
+
+        post_feedforward_layernorm_1_node = _find_direct_user(ffn_down_node, "flashinfer_rms_norm")
+        post_feedforward_layernorm_1_weight_name = _node_arg_getattr_target(
+            post_feedforward_layernorm_1_node, 1
+        )
+
+        router_root_size_name, router_scale_name = _extract_router_aux_attr_names(router_proj_node)
+
+        pre_feedforward_layernorm_2_to = moe_fused_node.args[0]
+        if not isinstance(pre_feedforward_layernorm_2_to, Node):
+            raise ValueError("Expected MoE fused input to be a cast node")
+        pre_feedforward_layernorm_2_node = pre_feedforward_layernorm_2_to.args[0]
+        if not isinstance(pre_feedforward_layernorm_2_node, Node):
+            raise ValueError("Expected MoE fused cast input to be a norm node")
+        pre_feedforward_layernorm_2_weight_name = _node_arg_getattr_target(
+            pre_feedforward_layernorm_2_node, 1
+        )
+
+        moe_w13_name = _node_arg_getattr_target(moe_fused_node, 3)
+        moe_w2_name = _node_arg_getattr_target(moe_fused_node, 4)
+        post_feedforward_layernorm_2_node = _find_user_through_passthrough(
+            moe_fused_node, "flashinfer_rms_norm"
+        )
+        post_feedforward_layernorm_2_weight_name = _node_arg_getattr_target(
+            post_feedforward_layernorm_2_node, 1
+        )
+
+        ffn_moe_add_node = next(
+            user
+            for user in post_feedforward_layernorm_1_node.users
+            if user in post_feedforward_layernorm_2_node.users
+        )
+        post_feedforward_layernorm_node = _find_direct_user(ffn_moe_add_node, "flashinfer_rms_norm")
+        post_feedforward_layernorm_weight_name = _node_arg_getattr_target(
+            post_feedforward_layernorm_node, 1
+        )
+        post_attention_residual_node = next(
+            user
+            for user in post_attention_layernorm_node.users
+            if _node_target_matches_any(user, "aten.add", "add.Tensor", "add")
+        )
+        final_add_node = next(
+            user
+            for user in post_feedforward_layernorm_node.users
+            if _node_target_matches_any(user, "aten.add", "add.Tensor", "add")
+            and any(
+                isinstance(arg, Node) and arg is post_attention_residual_node for arg in user.args
+            )
+        )
+        layer_scalar_mul_node = next(
+            user
+            for user in final_add_node.users
+            if _node_target_matches_any(user, "aten.mul", "mul.Tensor", "mul")
+        )
+        layer_scalar_name = _node_arg_getattr_target(layer_scalar_mul_node, 1)
+
+        q_heads = int(layer_info["q_heads"])
+        kv_heads = int(layer_info["kv_heads"])
+        head_dim = int(layer_info["head_dim"])
+        q_size = q_heads * head_dim
+        kv_size = kv_heads * head_dim
+        qkv_weight = _lookup_tensor_attr(source_model, qkv_weight_name)
+        qkv_shared_kv = int(qkv_weight.shape[0]) == q_size + kv_size
+
+        moe_w13_stacked = _lookup_tensor_attr(source_model, moe_w13_name)
+        gate_weight, up_weight = torch.chunk(moe_w13_stacked, 2, dim=1)
+
+        layer_specs.append(
+            _GemmaRuntimeLayerSpec(
+                layer_index=layer_idx,
+                q_heads=q_heads,
+                kv_heads=kv_heads,
+                head_dim=head_dim,
+                topk=topk,
+                sliding_window=sliding_window,
+                qkv_weight=qkv_weight,
+                qkv_shared_kv=qkv_shared_kv,
+                input_layernorm_weight=_lookup_tensor_attr(
+                    source_model, input_layernorm_weight_name
+                ),
+                q_norm_weight=_lookup_tensor_attr(source_model, q_norm_weight_name),
+                k_norm_weight=_lookup_tensor_attr(source_model, k_norm_weight_name),
+                v_norm_weight=_lookup_tensor_attr(source_model, v_norm_weight_name),
+                o_proj_weight=_lookup_tensor_attr(source_model, o_proj_weight_name),
+                post_attention_layernorm_weight=_lookup_tensor_attr(
+                    source_model, post_attention_layernorm_weight_name
+                ),
+                pre_feedforward_layernorm_weight=_lookup_tensor_attr(
+                    source_model, pre_feedforward_layernorm_weight_name
+                ),
+                ffn_gate_up_weight=_lookup_tensor_attr(source_model, ffn_gate_up_weight_name),
+                ffn_down_weight=_lookup_tensor_attr(source_model, ffn_down_weight_name),
+                post_feedforward_layernorm_1_weight=_lookup_tensor_attr(
+                    source_model, post_feedforward_layernorm_1_weight_name
+                ),
+                router_proj_weight=_lookup_tensor_attr(source_model, router_proj_weight_name),
+                router_root_size=_lookup_tensor_attr(source_model, router_root_size_name),
+                router_scale=_lookup_tensor_attr(source_model, router_scale_name),
+                pre_feedforward_layernorm_2_weight=_lookup_tensor_attr(
+                    source_model, pre_feedforward_layernorm_2_weight_name
+                ),
+                moe_gate_weight=gate_weight,
+                moe_up_weight=up_weight,
+                moe_w2_weight=_lookup_tensor_attr(source_model, moe_w2_name),
+                post_feedforward_layernorm_2_weight=_lookup_tensor_attr(
+                    source_model, post_feedforward_layernorm_2_weight_name
+                ),
+                post_feedforward_layernorm_weight=_lookup_tensor_attr(
+                    source_model, post_feedforward_layernorm_weight_name
+                ),
+                layer_scalar=_lookup_tensor_attr(source_model, layer_scalar_name),
+            )
+        )
+
+    return layer_specs
+
+
+class _MirageLinearExecutor:
+    def __init__(self, *, capacity: int, in_dim: int, out_dim: int, name: str):
+        self.capacity = capacity
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.pk = create_test_persistent_kernel(
+            max_seq_length=max(128, capacity),
+            max_num_batched_requests=1,
+            max_num_batched_tokens=capacity,
+            max_num_pages=8,
+            page_size=64,
+            use_cutlass_kernel=False,
+        )
+        self.input = torch.empty((capacity, in_dim), device="cuda", dtype=torch.bfloat16)
+        self.weight = torch.empty((out_dim, in_dim), device="cuda", dtype=torch.bfloat16)
+        self.output = torch.empty((capacity, out_dim), device="cuda", dtype=torch.bfloat16)
+        input_dt = self.pk.attach_input(self.input, name=f"{name}_input")
+        weight_dt = self.pk.attach_input(self.weight, name=f"{name}_weight")
+        output_dt = self.pk.attach_input(self.output, name=f"{name}_output")
+        self.pk.linear_layer(
+            input=input_dt,
+            weight=weight_dt,
+            output=output_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        compile_persistent_kernel_with_patches(self.pk)
+
+    def __call__(self, input_tensor: torch.Tensor, weight_tensor: torch.Tensor) -> torch.Tensor:
+        self.input.copy_(input_tensor.contiguous().view(self.capacity, self.in_dim))
+        self.weight.copy_(weight_tensor.contiguous())
+        _reset_pk_runtime_state(self.pk, active_tokens=self.capacity)
+        self.pk()
+        torch.cuda.synchronize()
+        return self.output
+
+
+class _MirageRouterExecutor:
+    def __init__(self, *, capacity: int, hidden_size: int, num_experts: int, topk: int):
+        self.capacity = capacity
+        self.hidden_size = hidden_size
+        self.num_experts = num_experts
+        self.topk = topk
+        self.pk = create_test_persistent_kernel(
+            max_seq_length=max(128, capacity),
+            max_num_batched_requests=1,
+            max_num_batched_tokens=capacity,
+            max_num_pages=8,
+            page_size=64,
+            use_cutlass_kernel=False,
+        )
+        self.hidden = torch.empty((capacity, hidden_size), device="cuda", dtype=torch.bfloat16)
+        self.weight = torch.empty((num_experts, hidden_size), device="cuda", dtype=torch.bfloat16)
+        self.logits = torch.empty((capacity, num_experts), device="cuda", dtype=torch.bfloat16)
+        self.topk_weight = torch.empty((capacity, topk), device="cuda", dtype=torch.float32)
+        self.routing_indices = torch.empty(
+            (num_experts, capacity), device="cuda", dtype=torch.int32
+        )
+        self.routing_mask = torch.empty((num_experts + 1,), device="cuda", dtype=torch.int32)
+        hidden_dt = self.pk.attach_input(self.hidden, name="router_hidden")
+        weight_dt = self.pk.attach_input(self.weight, name="router_weight")
+        logits_dt = self.pk.attach_input(self.logits, name="router_logits")
+        topk_weight_dt = self.pk.attach_input(self.topk_weight, name="router_topk_weight")
+        routing_indices_dt = self.pk.attach_input(
+            self.routing_indices, name="router_routing_indices"
+        )
+        routing_mask_dt = self.pk.attach_input(self.routing_mask, name="router_routing_mask")
+        self.pk.linear_layer(
+            input=hidden_dt,
+            weight=weight_dt,
+            output=logits_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        self.pk.moe_topk_softmax_routing_layer(
+            input=logits_dt,
+            output=(topk_weight_dt, routing_indices_dt, routing_mask_dt),
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        compile_persistent_kernel_with_patches(self.pk)
+
+    def __call__(
+        self, hidden_tensor: torch.Tensor, weight_tensor: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self.hidden.copy_(hidden_tensor.contiguous().view(self.capacity, self.hidden_size))
+        self.weight.copy_(weight_tensor.contiguous())
+        _reset_pk_runtime_state(self.pk, active_tokens=self.capacity)
+        self.pk()
+        torch.cuda.synchronize()
+        return self.topk_weight, self.routing_indices, self.routing_mask
+
+
+class _MirageMoeW13Executor:
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        topk: int,
+    ):
+        self.capacity = capacity
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+        self.topk = topk
+        self.pk = create_test_persistent_kernel(
+            max_seq_length=max(128, capacity),
+            max_num_batched_requests=1,
+            max_num_batched_tokens=capacity,
+            max_num_pages=8,
+            page_size=64,
+            use_cutlass_kernel=False,
+        )
+        self.hidden = torch.empty((capacity, hidden_size), device="cuda", dtype=torch.bfloat16)
+        self.gate_weight = torch.empty(
+            (num_experts, intermediate_size, hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.up_weight = torch.empty_like(self.gate_weight)
+        self.routing_indices = torch.empty(
+            (num_experts, capacity), device="cuda", dtype=torch.int32
+        )
+        self.routing_mask = torch.empty((num_experts + 1,), device="cuda", dtype=torch.int32)
+        self.gate_out = torch.empty(
+            (capacity, topk, intermediate_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.up_out = torch.empty_like(self.gate_out)
+        hidden_dt = self.pk.attach_input(self.hidden, name="moe_w13_hidden")
+        gate_weight_dt = self.pk.attach_input(self.gate_weight, name="moe_w13_gate_weight")
+        up_weight_dt = self.pk.attach_input(self.up_weight, name="moe_w13_up_weight")
+        routing_indices_dt = self.pk.attach_input(
+            self.routing_indices, name="moe_w13_routing_indices"
+        )
+        routing_mask_dt = self.pk.attach_input(self.routing_mask, name="moe_w13_routing_mask")
+        gate_out_dt = self.pk.attach_input(self.gate_out, name="moe_w13_gate_out")
+        up_out_dt = self.pk.attach_input(self.up_out, name="moe_w13_up_out")
+        self.pk.moe_w13_linear_layer(
+            input=hidden_dt,
+            weight=gate_weight_dt,
+            moe_routing_indices=routing_indices_dt,
+            moe_mask=routing_mask_dt,
+            output=gate_out_dt,
+            grid_dim=_moe_expert_grid_dim(self.pk, w13_linear=True),
+            block_dim=(128, 1, 1),
+        )
+        self.pk.moe_w13_linear_layer(
+            input=hidden_dt,
+            weight=up_weight_dt,
+            moe_routing_indices=routing_indices_dt,
+            moe_mask=routing_mask_dt,
+            output=up_out_dt,
+            grid_dim=_moe_expert_grid_dim(self.pk, w13_linear=True),
+            block_dim=(128, 1, 1),
+        )
+        compile_persistent_kernel_with_patches(self.pk)
+
+    def __call__(
+        self,
+        hidden_tensor: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        routing_indices: torch.Tensor,
+        routing_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.hidden.copy_(hidden_tensor.contiguous().view(self.capacity, self.hidden_size))
+        self.gate_weight.copy_(gate_weight.contiguous())
+        self.up_weight.copy_(up_weight.contiguous())
+        self.routing_indices.copy_(routing_indices)
+        self.routing_mask.copy_(routing_mask)
+        _reset_pk_runtime_state(self.pk, active_tokens=self.capacity)
+        self.pk()
+        torch.cuda.synchronize()
+        return self.gate_out, self.up_out
+
+
+class _MirageMoeW2ReduceExecutor:
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        topk: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+    ):
+        self.capacity = capacity
+        self.topk = topk
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+        self.pk = create_test_persistent_kernel(
+            max_seq_length=max(128, capacity),
+            max_num_batched_requests=1,
+            max_num_batched_tokens=capacity,
+            max_num_pages=8,
+            page_size=64,
+            use_cutlass_kernel=False,
+        )
+        self.act = torch.empty(
+            (capacity, topk, intermediate_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.weight = torch.empty(
+            (num_experts, hidden_size, intermediate_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.routing_indices = torch.empty(
+            (num_experts, capacity), device="cuda", dtype=torch.int32
+        )
+        self.routing_mask = torch.empty((num_experts + 1,), device="cuda", dtype=torch.int32)
+        self.topk_weight = torch.empty((capacity, topk), device="cuda", dtype=torch.float32)
+        self.residual = torch.empty((capacity, hidden_size), device="cuda", dtype=torch.bfloat16)
+        self.w2_out = torch.empty(
+            (capacity, topk, hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.output = torch.empty((capacity, hidden_size), device="cuda", dtype=torch.bfloat16)
+        act_dt = self.pk.attach_input(self.act, name="moe_w2_act")
+        weight_dt = self.pk.attach_input(self.weight, name="moe_w2_weight")
+        routing_indices_dt = self.pk.attach_input(self.routing_indices, name="moe_w2_indices")
+        routing_mask_dt = self.pk.attach_input(self.routing_mask, name="moe_w2_mask")
+        topk_weight_dt = self.pk.attach_input(self.topk_weight, name="moe_w2_topk_weight")
+        residual_dt = self.pk.attach_input(self.residual, name="moe_w2_residual")
+        w2_out_dt = self.pk.attach_input(self.w2_out, name="moe_w2_out")
+        output_dt = self.pk.attach_input(self.output, name="moe_w2_output")
+        self.pk.moe_w2_linear_layer(
+            input=act_dt,
+            weight=weight_dt,
+            moe_routing_indices=routing_indices_dt,
+            moe_mask=routing_mask_dt,
+            output=w2_out_dt,
+            grid_dim=_moe_expert_grid_dim(self.pk, w13_linear=False),
+            block_dim=(128, 1, 1),
+        )
+        self.pk.moe_mul_sum_add_layer(
+            input=w2_out_dt,
+            weight=topk_weight_dt,
+            residual=residual_dt,
+            output=output_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        compile_persistent_kernel_with_patches(self.pk)
+
+    def __call__(
+        self,
+        act_tensor: torch.Tensor,
+        weight_tensor: torch.Tensor,
+        routing_indices: torch.Tensor,
+        routing_mask: torch.Tensor,
+        topk_weight: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        self.act.copy_(act_tensor.contiguous())
+        self.weight.copy_(weight_tensor.contiguous())
+        self.routing_indices.copy_(routing_indices)
+        self.routing_mask.copy_(routing_mask)
+        self.topk_weight.copy_(topk_weight)
+        self.residual.copy_(residual.contiguous().view(self.capacity, self.hidden_size))
+        _reset_pk_runtime_state(self.pk, active_tokens=self.capacity)
+        self.pk()
+        torch.cuda.synchronize()
+        return self.output
+
+
+class _MirageGeluMulExecutor:
+    def __init__(self, *, shape: tuple[int, ...]):
+        _require_mirage()
+        import mirage
+
+        self.shape = shape
+        self.graph = mirage.new_kernel_graph()
+        gate_in = self.graph.new_input(shape, dtype=mirage.bfloat16)
+        up_in = self.graph.new_input(shape, dtype=mirage.bfloat16)
+        out = self.graph.mul(self.graph.gelu(gate_in), up_in)
+        self.graph.mark_output(out)
+        self._compiled = False
+
+    def __call__(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        if not self._compiled:
+            self.graph.compile(inputs=[gate, up], target_cc=90)
+            self._compiled = True
+        return self.graph(inputs=[gate, up], target_cc=90)[0]
+
+
+class _MirageMatmulExecutor:
+    def __init__(self, *, m: int, k: int, n: int):
+        _require_mirage()
+        import mirage
+
+        self.shape_a = (m, k)
+        self.shape_b = (k, n)
+        self.graph = mirage.new_kernel_graph()
+        a_in = self.graph.new_input(self.shape_a, dtype=mirage.bfloat16)
+        b_in = self.graph.new_input(self.shape_b, dtype=mirage.bfloat16)
+        out = self.graph.matmul(a_in, b_in)
+        self.graph.mark_output(out)
+        self._compiled = False
+
+    def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        if not self._compiled:
+            self.graph.compile(inputs=[a, b], target_cc=90)
+            self._compiled = True
+        return self.graph(inputs=[a, b], target_cc=90)[0]
+
+
+class _GemmaMirageRuntime:
+    def __init__(self, source_model: GraphModule, translation_plan: Dict[str, Any]) -> None:
+        self.source_model = source_model
+        self.translation_plan = translation_plan
+        self.layer_specs = _build_gemma_runtime_specs(source_model, translation_plan)
+        node_map = {node.name: node for node in source_model.graph.nodes}
+
+        embed_node = node_map["model_language_model_embed_tokens_embedding"]
+        self.embed_weight = _lookup_tensor_attr(
+            source_model, _node_arg_getattr_target(embed_node, 0)
+        )
+
+        embed_scale_to_node = node_map["model_language_model_embed_tokens_to"]
+        self.embed_scale = _lookup_tensor_attr(
+            source_model, _node_arg_getattr_target(embed_scale_to_node, 0)
+        )
+
+        gather_tokens_node = next(
+            node for node in source_model.graph.nodes if "gather_tokens" in _node_target_name(node)
+        )
+        final_norm_node = gather_tokens_node.args[0]
+        if not isinstance(final_norm_node, Node):
+            raise ValueError("Expected gather_tokens input to be final norm node")
+        self.final_norm_weight = _lookup_tensor_attr(
+            source_model, _node_arg_getattr_target(final_norm_node, 1)
+        )
+
+        local_cos_index_node = next(
+            node for node in source_model.graph.nodes if "rotary_emb_local_index_2" in node.name
+        )
+        local_sin_index_node = next(
+            node for node in source_model.graph.nodes if "rotary_emb_local_index_3" in node.name
+        )
+        self.local_cos = _lookup_tensor_attr(
+            source_model, _node_arg_getattr_target(local_cos_index_node, 0)
+        )
+        self.local_sin = _lookup_tensor_attr(
+            source_model, _node_arg_getattr_target(local_sin_index_node, 0)
+        )
+
+        global_cos_node = next(
+            (
+                node
+                for node in source_model.graph.nodes
+                if "rotary_emb_global" in node.name and "__ad_cos_cached" in _node_target_name(node)
+            ),
+            None,
+        )
+        global_sin_node = next(
+            (
+                node
+                for node in source_model.graph.nodes
+                if "rotary_emb_global" in node.name and "__ad_sin_cached" in _node_target_name(node)
+            ),
+            None,
+        )
+        self.global_cos = (
+            _lookup_tensor_attr(source_model, _node_arg_getattr_target(global_cos_node, 0))
+            if global_cos_node is not None
+            else self.local_cos
+        )
+        self.global_sin = (
+            _lookup_tensor_attr(source_model, _node_arg_getattr_target(global_sin_node, 0))
+            if global_sin_node is not None
+            else self.local_sin
+        )
+        self._linear_cache: Dict[tuple[int, int, int, str], _MirageLinearExecutor] = {}
+        self._router_cache: Dict[tuple[int, int, int, int], _MirageRouterExecutor] = {}
+        self._moe_w13_cache: Dict[tuple[int, int, int, int, int], _MirageMoeW13Executor] = {}
+        self._moe_w2_cache: Dict[tuple[int, int, int, int, int], _MirageMoeW2ReduceExecutor] = {}
+        self._gelu_cache: Dict[tuple[int, ...], _MirageGeluMulExecutor] = {}
+        self._matmul_cache: Dict[tuple[int, int, int], _MirageMatmulExecutor] = {}
+
+    def _linear(
+        self,
+        *,
+        name: str,
+        input_tensor: torch.Tensor,
+        weight_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        capacity = int(input_tensor.shape[0])
+        if capacity > _MIRAGE_LINEAR_MAX_CAPACITY:
+            outputs = []
+            for start in range(0, capacity, _MIRAGE_LINEAR_MAX_CAPACITY):
+                end = min(start + _MIRAGE_LINEAR_MAX_CAPACITY, capacity)
+                outputs.append(
+                    self._linear(
+                        name=f"{name}_chunk_{start}_{end}",
+                        input_tensor=input_tensor[start:end].contiguous(),
+                        weight_tensor=weight_tensor,
+                    )
+                )
+            return torch.cat(outputs, dim=0)
+
+        in_dim = int(weight_tensor.shape[1])
+        out_dim = int(weight_tensor.shape[0])
+        key = (capacity, in_dim, out_dim)
+        executor = self._linear_cache.get(key)
+        if executor is None:
+            _mpk_debug(
+                f"compile linear executor capacity={capacity} in_dim={in_dim} out_dim={out_dim} name={name}"
+            )
+            executor = _MirageLinearExecutor(
+                capacity=capacity,
+                in_dim=in_dim,
+                out_dim=out_dim,
+                name=f"linear_{capacity}_{in_dim}_{out_dim}",
+            )
+            self._linear_cache[key] = executor
+        return executor(input_tensor, weight_tensor)
+
+    def _router(
+        self,
+        *,
+        hidden_tensor: torch.Tensor,
+        weight_tensor: torch.Tensor,
+        topk: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        capacity = int(hidden_tensor.shape[0])
+        num_experts = int(weight_tensor.shape[0])
+        key = (capacity, int(hidden_tensor.shape[1]), num_experts, topk)
+        executor = self._router_cache.get(key)
+        if executor is None:
+            _mpk_debug(
+                "compile router executor "
+                f"capacity={capacity} hidden={int(hidden_tensor.shape[1])} "
+                f"num_experts={num_experts} topk={topk}"
+            )
+            executor = _MirageRouterExecutor(
+                capacity=capacity,
+                hidden_size=int(hidden_tensor.shape[1]),
+                num_experts=num_experts,
+                topk=topk,
+            )
+            self._router_cache[key] = executor
+        return executor(hidden_tensor, weight_tensor)
+
+    def _moe_w13(
+        self,
+        *,
+        hidden_tensor: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        routing_indices: torch.Tensor,
+        routing_mask: torch.Tensor,
+        topk: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        capacity = int(hidden_tensor.shape[0])
+        key = (
+            capacity,
+            int(hidden_tensor.shape[1]),
+            int(gate_weight.shape[1]),
+            int(gate_weight.shape[0]),
+            topk,
+        )
+        executor = self._moe_w13_cache.get(key)
+        if executor is None:
+            _mpk_debug(
+                "compile moe_w13 executor "
+                f"capacity={capacity} hidden={int(hidden_tensor.shape[1])} "
+                f"intermediate={int(gate_weight.shape[1])} num_experts={int(gate_weight.shape[0])} "
+                f"topk={topk}"
+            )
+            executor = _MirageMoeW13Executor(
+                capacity=capacity,
+                hidden_size=int(hidden_tensor.shape[1]),
+                intermediate_size=int(gate_weight.shape[1]),
+                num_experts=int(gate_weight.shape[0]),
+                topk=topk,
+            )
+            self._moe_w13_cache[key] = executor
+        return executor(hidden_tensor, gate_weight, up_weight, routing_indices, routing_mask)
+
+    def _moe_w2_reduce(
+        self,
+        *,
+        act_tensor: torch.Tensor,
+        weight_tensor: torch.Tensor,
+        routing_indices: torch.Tensor,
+        routing_mask: torch.Tensor,
+        topk_weight: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        capacity, topk, intermediate = [int(dim) for dim in act_tensor.shape]
+        if (
+            capacity > _MIRAGE_MOE_W2_MAX_CAPACITY
+            and topk == 1
+            and int(weight_tensor.shape[0]) == 1
+            and int(routing_indices.shape[0]) == 1
+            and int(topk_weight.shape[1]) == 1
+            and int(routing_mask.numel()) == 2
+        ):
+            outputs = []
+            for start in range(0, capacity, _MIRAGE_MOE_W2_MAX_CAPACITY):
+                end = min(start + _MIRAGE_MOE_W2_MAX_CAPACITY, capacity)
+                chunk_capacity = end - start
+                chunk_mask = torch.tensor(
+                    [0, chunk_capacity],
+                    device=routing_mask.device,
+                    dtype=torch.int32,
+                )
+                outputs.append(
+                    self._moe_w2_reduce(
+                        act_tensor=act_tensor[start:end].contiguous(),
+                        weight_tensor=weight_tensor,
+                        routing_indices=routing_indices[:, start:end].contiguous(),
+                        routing_mask=chunk_mask,
+                        topk_weight=topk_weight[start:end].contiguous(),
+                        residual=residual[start:end].contiguous(),
+                    )
+                )
+            return torch.cat(outputs, dim=0)
+
+        key = (
+            capacity,
+            topk,
+            int(weight_tensor.shape[1]),
+            intermediate,
+            int(weight_tensor.shape[0]),
+        )
+        executor = self._moe_w2_cache.get(key)
+        if executor is None:
+            _mpk_debug(
+                "compile moe_w2 executor "
+                f"capacity={capacity} topk={topk} hidden={int(weight_tensor.shape[1])} "
+                f"intermediate={intermediate} num_experts={int(weight_tensor.shape[0])}"
+            )
+            executor = _MirageMoeW2ReduceExecutor(
+                capacity=capacity,
+                topk=topk,
+                hidden_size=int(weight_tensor.shape[1]),
+                intermediate_size=intermediate,
+                num_experts=int(weight_tensor.shape[0]),
+            )
+            self._moe_w2_cache[key] = executor
+        return executor(
+            act_tensor,
+            weight_tensor,
+            routing_indices,
+            routing_mask,
+            topk_weight,
+            residual,
+        )
+
+    def _gelu_mul(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        key = tuple(int(dim) for dim in gate.shape)
+        executor = self._gelu_cache.get(key)
+        if executor is None:
+            _mpk_debug(f"compile gelu executor shape={key}")
+            executor = _MirageGeluMulExecutor(shape=key)
+            self._gelu_cache[key] = executor
+        return executor(gate.contiguous(), up.contiguous())
+
+    def _matmul(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        key = (int(a.shape[0]), int(a.shape[1]), int(b.shape[1]))
+        executor = self._matmul_cache.get(key)
+        if executor is None:
+            _mpk_debug(f"compile matmul executor shape_a={tuple(a.shape)} shape_b={tuple(b.shape)}")
+            executor = _MirageMatmulExecutor(m=key[0], k=key[1], n=key[2])
+            self._matmul_cache[key] = executor
+        return executor(a.contiguous(), b.contiguous())
+
+    def _cos_sin_cache(self, head_dim: int) -> torch.Tensor:
+        if head_dim == 256:
+            return torch.cat(
+                (self.local_cos[:, : head_dim // 2], self.local_sin[:, : head_dim // 2]), dim=-1
+            ).to(torch.float32)
+        if head_dim == 512:
+            return torch.cat(
+                (self.global_cos[:, : head_dim // 2], self.global_sin[:, : head_dim // 2]), dim=-1
+            ).to(torch.float32)
+        raise ValueError(f"Unsupported Gemma head_dim for rotary cache: {head_dim}")
+
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        token_gather_indices: torch.Tensor,
+        batch_info_host: torch.Tensor,
+        cu_seqlen_host: torch.Tensor,
+        cu_num_pages: torch.Tensor,
+        cu_num_pages_host: torch.Tensor,
+        cache_loc: torch.Tensor,
+        last_page_len: torch.Tensor,
+        last_page_len_host: torch.Tensor,
+        seq_len_with_cache_host: torch.Tensor,
+        cu_seqlen: torch.Tensor,
+        seq_len_with_cache: torch.Tensor,
+        *kv_caches: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, seq_len = [int(dim) for dim in input_ids.shape]
+        hidden = F.embedding(input_ids, self.embed_weight).to(torch.bfloat16)
+        hidden = hidden * self.embed_scale.to(dtype=hidden.dtype)
+
+        triton_batch_indices, triton_positions = (
+            torch.ops.auto_deploy.triton_paged_prepare_metadata.default(
+                position_ids,
+                batch_info_host,
+                cu_seqlen,
+                seq_len_with_cache,
+            )
+        )
+        batch_info = __import__(
+            "tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface",
+            fromlist=["BatchInfo"],
+        ).BatchInfo(batch_info_host)
+        num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
+
+        for layer_spec, kv_cache in zip(self.layer_specs, kv_caches):
+            _mpk_debug(
+                "enter layer "
+                f"{layer_spec.layer_index} batch={batch_size} seq={seq_len} "
+                f"prefill={num_prefill} prefill_tokens={num_prefill_tokens} decode={num_decode}"
+            )
+            attn_in = _rms_norm(hidden, layer_spec.input_layernorm_weight).reshape(
+                batch_size * seq_len, -1
+            )
+            qkv_packed = self._linear(
+                name=f"layer_{layer_spec.layer_index}_qkv",
+                input_tensor=attn_in,
+                weight_tensor=layer_spec.qkv_weight,
+            )
+
+            q_size = layer_spec.q_heads * layer_spec.head_dim
+            kv_size = layer_spec.kv_heads * layer_spec.head_dim
+            if layer_spec.qkv_shared_kv:
+                q_flat = qkv_packed[:, :q_size]
+                shared_kv = qkv_packed[:, q_size : q_size + kv_size]
+                k_flat = shared_kv
+                v_flat = shared_kv
+            else:
+                q_flat = qkv_packed[:, :q_size]
+                k_flat = qkv_packed[:, q_size : q_size + kv_size]
+                v_flat = qkv_packed[:, q_size + kv_size : q_size + 2 * kv_size]
+
+            q = q_flat.view(batch_size, seq_len, layer_spec.q_heads, layer_spec.head_dim)
+            k = k_flat.view(batch_size, seq_len, layer_spec.kv_heads, layer_spec.head_dim)
+            v = v_flat.view(batch_size, seq_len, layer_spec.kv_heads, layer_spec.head_dim)
+            q = _rms_norm(q, layer_spec.q_norm_weight)
+            k = _rms_norm(k, layer_spec.k_norm_weight)
+            v = _rms_norm(v, layer_spec.v_norm_weight)
+            cos_sin_cache = self._cos_sin_cache(layer_spec.head_dim)
+            q_rope, k_rope = torch.ops.auto_deploy.flashinfer_rope.default(
+                q,
+                k,
+                position_ids,
+                cos_sin_cache,
+                True,
+            )
+            attn_out = torch.ops.auto_deploy.triton_paged_mha_with_cache.default(
+                q_rope,
+                k_rope,
+                v,
+                batch_info_host,
+                cu_seqlen_host,
+                cu_num_pages,
+                cu_num_pages_host,
+                cache_loc,
+                last_page_len,
+                last_page_len_host,
+                seq_len_with_cache_host,
+                triton_batch_indices,
+                triton_positions,
+                kv_cache,
+                1.0,
+                layer_spec.sliding_window,
+            )
+            attn_out_flat = attn_out.reshape(batch_size * seq_len, -1).contiguous()
+            o_proj = self._linear(
+                name=f"layer_{layer_spec.layer_index}_o_proj",
+                input_tensor=attn_out_flat,
+                weight_tensor=layer_spec.o_proj_weight,
+            )
+            o_proj = o_proj.view(batch_size, seq_len, -1)
+            post_attn = _rms_norm(o_proj, layer_spec.post_attention_layernorm_weight) + hidden
+
+            ffn_in = _rms_norm(post_attn, layer_spec.pre_feedforward_layernorm_weight).reshape(
+                batch_size * seq_len, -1
+            )
+            ffn_gate_up = self._linear(
+                name=f"layer_{layer_spec.layer_index}_ffn_gate_up",
+                input_tensor=ffn_in,
+                weight_tensor=layer_spec.ffn_gate_up_weight,
+            )
+            ffn_gate, ffn_up = torch.chunk(ffn_gate_up, 2, dim=-1)
+            ffn_act = self._gelu_mul(
+                ffn_gate.view(batch_size * seq_len, 1, -1),
+                ffn_up.view(batch_size * seq_len, 1, -1),
+            )
+            ffn_down = self._matmul(
+                ffn_act.view(batch_size * seq_len, -1),
+                layer_spec.ffn_down_weight.transpose(0, 1).contiguous(),
+            ).view(batch_size, seq_len, -1)
+            ffn_norm = _rms_norm(ffn_down, layer_spec.post_feedforward_layernorm_1_weight)
+
+            post_attn_flat = post_attn.reshape(batch_size * seq_len, -1).contiguous()
+            moe_token_outputs = []
+            for token_idx in range(batch_size * seq_len):
+                token_hidden = post_attn_flat[token_idx : token_idx + 1].contiguous()
+                router_in = token_hidden.float()
+                router_mean = router_in.pow(2).mean(dim=-1, keepdim=True)
+                router_in = router_in * torch.rsqrt(router_mean + 1e-6)
+                router_in = router_in.to(torch.bfloat16)
+                router_in = router_in * layer_spec.router_root_size.to(dtype=router_in.dtype)
+                router_in = router_in * layer_spec.router_scale.to(dtype=router_in.dtype)
+                topk_weight, routing_indices, routing_mask = self._router(
+                    hidden_tensor=router_in,
+                    weight_tensor=layer_spec.router_proj_weight,
+                    topk=layer_spec.topk,
+                )
+
+                moe_in = _rms_norm(token_hidden, layer_spec.pre_feedforward_layernorm_2_weight)
+                experts = _extract_ranked_experts(routing_indices, layer_spec.topk)
+                moe_gate_rows = []
+                moe_up_rows = []
+                for rank, expert_index in enumerate(experts):
+                    moe_gate_rows.append(
+                        self._linear(
+                            name=f"layer_{layer_spec.layer_index}_moe_gate_rank_{rank}",
+                            input_tensor=moe_in,
+                            weight_tensor=layer_spec.moe_gate_weight[expert_index],
+                        )[0]
+                    )
+                    moe_up_rows.append(
+                        self._linear(
+                            name=f"layer_{layer_spec.layer_index}_moe_up_rank_{rank}",
+                            input_tensor=moe_in,
+                            weight_tensor=layer_spec.moe_up_weight[expert_index],
+                        )[0]
+                    )
+
+                moe_gate = torch.stack(moe_gate_rows, dim=0).unsqueeze(0).to(torch.bfloat16)
+                moe_up = torch.stack(moe_up_rows, dim=0).unsqueeze(0).to(torch.bfloat16)
+                moe_act = self._gelu_mul(moe_gate, moe_up)
+                moe_token_out = self._moe_w2_reduce(
+                    act_tensor=moe_act.contiguous(),
+                    weight_tensor=layer_spec.moe_w2_weight,
+                    routing_indices=routing_indices,
+                    routing_mask=routing_mask,
+                    topk_weight=topk_weight,
+                    residual=torch.zeros_like(token_hidden),
+                )
+                moe_token_outputs.append(moe_token_out[0])
+
+            moe_out = torch.stack(moe_token_outputs, dim=0).view(batch_size, seq_len, -1)
+            moe_norm = _rms_norm(moe_out, layer_spec.post_feedforward_layernorm_2_weight)
+            hidden = post_attn + _rms_norm(
+                ffn_norm + moe_norm, layer_spec.post_feedforward_layernorm_weight
+            )
+            hidden = hidden * layer_spec.layer_scalar.view(1, 1, -1)
+            _mpk_debug(f"exit layer {layer_spec.layer_index}")
+
+        hidden = _rms_norm(hidden, self.final_norm_weight)
+        gathered = torch.ops.auto_deploy.gather_tokens.default(
+            hidden,
+            token_gather_indices,
+            batch_info_host,
+        )
+        logits = gathered @ self.embed_weight.transpose(0, 1)
+        logits = torch.tanh(logits / 30.0) * 30.0
+        logits = logits.view(*gathered.shape[:-1], logits.shape[-1])
+        _mpk_debug(f"return logits shape={tuple(logits.shape)}")
+        return {"logits": logits}
+
+
 def build_gemma_mirage_runtime_callable(
     translation_plan: Dict[str, Any],
+    source_model: Optional[GraphModule] = None,
 ) -> Callable[..., Any]:
     """Build the live Gemma MPK runtime callable.
 
-    The current implementation is intentionally strict: once the MPK path is
-    selected, execution must go through a Mirage-backed callable rather than an
-    eager fallback. Until the full-model Mirage emission path exists, this
-    callable raises with an explicit summary of the remaining lowering gaps.
+    The runtime path is intentionally strict: once selected, execution must go
+    through the Mirage-backed callable rather than an eager fallback.
     """
+    if source_model is None:
+        layer_lowerings = translation_plan.get("layer_lowerings", [])
+        num_gap_steps = 0
+        num_partial_steps = 0
+        for layer in layer_lowerings:
+            for step in layer.get("mpk_steps", []):
+                status = str(step.get("status", ""))
+                if status == GemmaLoweringStatus.GAP.value:
+                    num_gap_steps += 1
+                elif status == GemmaLoweringStatus.PARTIAL.value:
+                    num_partial_steps += 1
 
-    layer_lowerings = translation_plan.get("layer_lowerings", [])
-    num_gap_steps = 0
-    num_partial_steps = 0
-    for layer in layer_lowerings:
-        for step in layer.get("mpk_steps", []):
-            status = str(step.get("status", ""))
-            if status == GemmaLoweringStatus.GAP.value:
-                num_gap_steps += 1
-            elif status == GemmaLoweringStatus.PARTIAL.value:
-                num_partial_steps += 1
+        def _missing_model_runtime_callable(*args, **kwargs):
+            raise NotImplementedError(
+                "Live Mirage execution for the full Gemma MPK path requires the source GraphModule. "
+                f"Current plan has {num_gap_steps} gap steps and {num_partial_steps} partial steps."
+            )
 
-    def _runtime_callable(*args, **kwargs):
-        raise NotImplementedError(
-            "Live Mirage execution for the full Gemma MPK path is not implemented yet. "
-            f"Current plan has {num_gap_steps} gap steps and {num_partial_steps} partial steps."
-        )
-
-    return _runtime_callable
+        return _missing_model_runtime_callable
+    return _GemmaMirageRuntime(source_model, translation_plan)
 
 
 def create_test_persistent_kernel(

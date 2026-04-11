@@ -154,7 +154,10 @@ class LowerToMpk(BaseTransform):
         """
 
         wrapper = GemmaMpkRuntimeWrapper(
-            mpk_callable=build_gemma_mirage_runtime_callable(translation_plan),
+            mpk_callable=build_gemma_mirage_runtime_callable(
+                translation_plan,
+                source_model=model,
+            ),
             translation_plan=translation_plan,
             input_names=[node.name for node in model.graph.nodes if node.op == "placeholder"],
         )

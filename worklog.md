@@ -521,6 +521,200 @@ Fix:
   - `moe_w13_linear_layer`
   - `moe_w2_linear_layer`
 
+## 2026-04-10 Full Live-Layer Bringup Learnings
+
+This round closed an important live-Mirage blocker in the synthetic Gemma full
+layer path.
+
+### 1. The original full-layer stall was not just "compile is slow"
+
+We first measured the standalone compile costs directly:
+
+- generic Mirage `gelu + mul`: about `11.8 - 12.0 s`
+- small MPK `PersistentKernel` compile: about `22.3 s`
+
+Then we added stage-by-stage timing to the synthetic full-layer helper in:
+
+- [mirage_bridge.py](/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/dev_feat1/TensorRT-LLM/tensorrt_llm/_torch/auto_deploy/mpk/mirage_bridge.py)
+
+and recorded the flow in:
+
+- [mpk_workflow_and_compile_profile.md](/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/dev_feat1/TensorRT-LLM/mpk_workflow_and_compile_profile.md)
+
+The key finding was:
+
+- front-half stages were expensive but finite
+- the long tail after `ffn_phase2_compile_s` was a runtime stall in
+  `torch.cuda.synchronize()`
+- so the full-layer issue was not purely compile time
+
+### 2. The real failing stage was FFN down projection
+
+By progressively shrinking the reproducer, we found:
+
+- generic Mirage `gelu * mul` activation completed successfully
+- PK compile for FFN down completed successfully
+- the process hung at the PK launch/sync for FFN down
+
+Then we reduced it even further:
+
+- plain PK `linear_layer` with shape `1 x 64 -> 1 x 512`
+- with random input
+- and with different `grid_dim.x` choices
+
+This still hung at launch.
+
+Conclusion:
+
+- the problem is not specific to the generic activation handoff
+- the problematic piece is the PK `linear_layer` specialization for the FFN
+  down-projection shape itself
+
+### 3. Generic Mirage matmul was not a drop-in replacement
+
+We tested whether generic Mirage `KNGraph.matmul` could cover the FFN-down
+projection live.
+
+Result:
+
+- it did not hang in the same way
+- but it failed with `CUBLAS_STATUS_INVALID_VALUE`
+
+Conclusion:
+
+- generic Mirage `matmul` is not a ready-made substitute for this shape/path in
+  our current bridge setup
+
+### 4. A working live workaround exists: express FFN down as top-k=1 `moe_w2`
+
+The most important new result is that FFN down-projection can be executed live
+and correctly by re-expressing it as:
+
+```text
+topk = 1
+num_experts = 1
+moe_w2_linear_layer
+-> moe_mul_sum_add_layer
+```
+
+This works because the FFN down math matches the same tensor contraction shape:
+
+```text
+(batch, 1, intermediate) x (1, hidden, intermediate) -> (batch, 1, hidden)
+```
+
+Using the standard MPK routing encoding:
+
+- `routing_indices[0, 0] = 1`
+- `routing_mask[0] = 0`
+- `routing_mask[num_experts] = 1`
+- `topk_weight = 1`
+- zero residual
+
+Result:
+
+- live execution succeeded
+- numerical correctness was good
+- this held both for random input and for generic activation-produced input
+
+Helper added:
+
+- `run_mirage_ffn_down_via_moe_w2_forward_correctness(...)`
+
+### 5. The synthetic full live layer now completes end to end
+
+After swapping FFN phase 2 from broken PK `linear_layer` to the top-k=1
+`moe_w2` workaround, the stage profile completed through all stages:
+
+- `attn_pk`
+- `ffn_phase1`
+- `ffn_activation`
+- `ffn_phase2`
+- `router_pk`
+- `expert_pk`
+- `moe_activation`
+- `phase3`
+
+Representative stage timings from the successful profile:
+
+- `attn_pk_compile_s ~= 26.9 s`
+- `ffn_phase1_compile_s ~= 26.8 s`
+- `ffn_activation_compile_s ~= 12.0 s`
+- `ffn_phase2_compile_s ~= 30.9 s`
+- `router_pk_compile_s ~= 31.2 s`
+- `expert_pk_compile_s ~= 32.2 s`
+- `moe_activation_compile_s ~= 11.8 s`
+- `phase3_compile_s ~= 31.7 s`
+
+All corresponding launch times were small, roughly `0.02 - 0.15 s`.
+
+### 6. The full live layer is now numerically sane enough to test
+
+The full synthetic live layer now returns finite, bounded errors instead of
+hanging.
+
+Observed result snapshot:
+
+- `post_attn_max_abs ~= 0.050`
+- `post_attn_mean_abs ~= 0.0086`
+- `ffn_down_max_abs ~= 0.0064`
+- `ffn_down_mean_abs ~= 0.00165`
+- `topk_weight_max_abs ~= 0.00195`
+- `topk_weight_mean_abs ~= 0.00074`
+- `routing_overlap_count = 8`
+- `moe_act_max_abs ~= 0.143`
+- `moe_act_mean_abs ~= 0.0071`
+- `w2_max_abs ~= 0.0527`
+- `w2_mean_abs ~= 0.0076`
+- `hidden_out_max_abs ~= 0.0216`
+- `hidden_out_mean_abs ~= 0.0058`
+
+Interpretation:
+
+- FFN down is no longer the dominant error or a runtime blocker
+- the remaining larger error bars are now on:
+  - attention approximation
+  - MoE activation
+  - MoE W2
+
+That is a much healthier debugging position.
+
+### 7. New practical best practice
+
+For Gemma-style GELU FFN lowering in the current Mirage bridge:
+
+- do not use PK `linear_layer` directly for the `1 x 64 -> 1 x 512` FFN down
+  projection
+- prefer the proven top-k=1 `moe_w2_linear + moe_mul_sum_add` composition
+
+This is now the bridge-side best practice until the underlying PK
+`linear_layer` specialization is fixed for that shape.
+
+### 8. Planner / translation implication
+
+The dry-run plan previously marked:
+
+- `dense_ffn_activation`
+
+as a hard backend `GAP`.
+
+That is no longer fully accurate.
+
+Current better status:
+
+- `dense_ffn_gate_up` is supported
+- `dense_ffn_activation` is partially supported through a bridge-side lowering:
+  - generic `gelu * mul`
+  - top-k=1 `moe_w2_linear`
+  - `moe_mul_sum_add`
+
+So this step should be treated as:
+
+- not a native one-op MPK task match
+- but no longer a complete execution blocker either
+  - `moe_w13_linear_layer`
+  - `moe_w2_linear_layer`
+
 Effect:
 
 - `w2` and final block-output error dropped from clearly broken to acceptably
