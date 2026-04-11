@@ -5208,6 +5208,38 @@ class _GemmaMirageRuntime:
             self._matmul_cache[key] = executor
         return executor(a.contiguous(), b.contiguous())
 
+    def _ffn_down_decode(
+        self,
+        *,
+        act_tensor: torch.Tensor,
+        weight_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """Execute the decode FFN down projection through the stable ``moe_w2`` path.
+
+        The generic Mirage matmul path is currently unstable for the single-token
+        Gemma decode specialization. Decode runtime is now generate-only, so we
+        intentionally use the proven ``topk=1 / num_experts=1`` ``moe_w2``
+        reduction path here instead.
+        """
+
+        capacity = int(act_tensor.shape[0])
+        hidden_size = int(weight_tensor.shape[0])
+        device = act_tensor.device
+
+        routing_indices = torch.ones((1, capacity), device=device, dtype=torch.int32)
+        routing_mask = torch.tensor([0, capacity], device=device, dtype=torch.int32)
+        topk_weight = torch.ones((capacity, 1), device=device, dtype=torch.float32)
+        residual = torch.zeros((capacity, hidden_size), device=device, dtype=torch.bfloat16)
+
+        return self._moe_w2_reduce(
+            act_tensor=act_tensor.view(capacity, 1, -1).contiguous(),
+            weight_tensor=weight_tensor.unsqueeze(0).contiguous(),
+            routing_indices=routing_indices,
+            routing_mask=routing_mask,
+            topk_weight=topk_weight,
+            residual=residual,
+        )
+
     def _cos_sin_cache(self, head_dim: int) -> torch.Tensor:
         if head_dim == 256:
             return torch.cat(
@@ -5335,9 +5367,9 @@ class _GemmaMirageRuntime:
                 ffn_gate.view(batch_size * seq_len, 1, -1),
                 ffn_up.view(batch_size * seq_len, 1, -1),
             )
-            ffn_down = self._matmul(
-                ffn_act.view(batch_size * seq_len, -1),
-                layer_spec.ffn_down_weight.transpose(0, 1).contiguous(),
+            ffn_down = self._ffn_down_decode(
+                act_tensor=ffn_act.view(batch_size * seq_len, -1),
+                weight_tensor=layer_spec.ffn_down_weight,
             ).view(batch_size, seq_len, -1)
             ffn_norm = _rms_norm(ffn_down, layer_spec.post_feedforward_layernorm_1_weight)
 

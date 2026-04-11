@@ -135,7 +135,8 @@ class LowerToMpk(BaseTransform):
             wrapped_meta["mpk_runtime_mode"] = "mirage_runtime"
             self._set_autodeploy_meta(model, wrapped_meta)
             ad_logger.info(
-                "Gemma MPK runtime wrapper installed as a GraphModule call_module without eager fallback"
+                "Gemma MPK runtime wrapper installed with decode-only Mirage routing and "
+                "original-graph execution for non-generate-only batches"
             )
 
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
@@ -149,8 +150,8 @@ class LowerToMpk(BaseTransform):
         """Wrap the full graph in a runtime wrapper while preserving GraphModule shape.
 
         The wrapper is the first strict runtime integration point for MPK.
-        Once this path is selected, execution must go through an MPK callable
-        instead of silently falling back to the original graph.
+        Generate-only batches are routed to the Mirage-backed decode runtime,
+        while prefill and mixed batches continue through the original graph.
         """
 
         wrapper = GemmaMpkRuntimeWrapper(
@@ -158,6 +159,7 @@ class LowerToMpk(BaseTransform):
                 translation_plan,
                 source_model=model,
             ),
+            original_model=model,
             translation_plan=translation_plan,
             input_names=[node.name for node in model.graph.nodes if node.op == "placeholder"],
         )
