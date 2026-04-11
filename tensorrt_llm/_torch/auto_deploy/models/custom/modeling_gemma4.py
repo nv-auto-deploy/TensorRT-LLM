@@ -48,7 +48,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_fusions import (
-    gemma4_post_add_norm_add_scale,
+    gemma4_fused_post_3norm_add_scale,
     gemma4_post_norm_add,
     gemma4_post_norm_add_and_pre_ff_norm,
     gemma4_post_norm_add_scale,
@@ -600,24 +600,26 @@ class Gemma4TextDecoderLayer(nn.Module):
             hidden_states = packed[0]
             residual = hidden_states
 
-            # Dense MLP path
+            # Dense MLP path (produce un-normed output — norm absorbed into 3-norm fusion below)
             hs_dense = packed[1]
             hs_dense = self.mlp(hs_dense)
-            hs_dense = self.post_feedforward_layernorm_1(hs_dense)
 
-            # MoE path
+            # MoE path (produce un-normed output — norm absorbed into 3-norm fusion below)
             hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             top_k_weights, top_k_index = self.router(hs_flat)
             hs_moe = self.pre_feedforward_layernorm_2(hs_flat)
             hs_moe = self.moe(hs_moe, top_k_index, top_k_weights)
             hs_moe = hs_moe.reshape(hidden_states.shape)
-            hs_moe = self.post_feedforward_layernorm_2(hs_moe)
 
-            # Fused: dense+MoE combine + post_feedforward_norm + residual + scale -> 2 kernels -> 1
-            hidden_states = gemma4_post_add_norm_add_scale(
+            # Fused 3-norm: rms_norm(rms_norm(hs_dense,w1) + rms_norm(hs_moe,w2), w) + res → scale
+            # Absorbs post_feedforward_layernorm_1 + post_feedforward_layernorm_2 into 1 kernel,
+            # saving 2 kernel dispatches per MoE layer × 30 layers = 60 launches ≈ 78µs at c=1.
+            hidden_states = gemma4_fused_post_3norm_add_scale(
                 hs_dense,
                 hs_moe,
                 residual,
+                self.post_feedforward_layernorm_1.weight,
+                self.post_feedforward_layernorm_2.weight,
                 self.post_feedforward_layernorm.weight,
                 self.post_feedforward_layernorm.eps,
                 self.layer_scalar,
