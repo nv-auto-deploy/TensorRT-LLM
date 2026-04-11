@@ -2,7 +2,7 @@ runtime: trtllm
 compile_backend: torch-cudagraph
 attn_backend: trtllm
 max_batch_size: 256
-max_seq_len: 4096
+max_seq_len: 8192
 enable_chunked_prefill: true
 cuda_graph_config:
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
@@ -32,4 +32,4 @@ transforms:
   gather_logits_before_lm_head:
     enabled: true
   compile_model:
-    piecewise_enabled: true
+    piecewise_enabled: false
