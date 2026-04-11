@@ -50,7 +50,7 @@ from transformers.utils import ModelOutput, cached_file
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_fusions import (
     gemma4_fused_post_3norm_add_scale,
     gemma4_post_norm_add,
-    gemma4_post_norm_add_and_pre_ff_norm,
+    gemma4_post_norm_add_and_pre_ff_2norm,
     gemma4_post_norm_add_scale,
     gemma4_qkv_norm_rope,
 )
@@ -586,15 +586,17 @@ class Gemma4TextDecoderLayer(nn.Module):
 
         # Feed-forward (dense MLP ± MoE)
         if self.enable_moe_block:
-            # Fused: post_attention_layernorm + residual_add + pre_feedforward_layernorm
-            # → 2 kernels → 1 packed-tensor kernel; saves 1 kernel launch per MoE layer.
+            # Fused: post_attention_layernorm + residual_add + pre_ff_norm + pre_ff_2_norm
+            # → 3 kernels → 1 packed-tensor kernel; saves 2 kernel launches per MoE layer.
             # packed[0] = rms_norm(attn_out, post_attn_w) + residual  (hidden_states)
             # packed[1] = rms_norm(packed[0], pre_ff_w)               (dense MLP input)
-            packed = gemma4_post_norm_add_and_pre_ff_norm(
+            # packed[2] = rms_norm(packed[0], pre_ff_2_w)             (MoE expert input)
+            packed = gemma4_post_norm_add_and_pre_ff_2norm(
                 hidden_states,
                 residual,
                 self.post_attention_layernorm.weight,
                 self.pre_feedforward_layernorm.weight,
+                self.pre_feedforward_layernorm_2.weight,
                 self.post_attention_layernorm.eps,
             )
             hidden_states = packed[0]
@@ -607,7 +609,7 @@ class Gemma4TextDecoderLayer(nn.Module):
             # MoE path (produce un-normed output — norm absorbed into 3-norm fusion below)
             hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             top_k_weights, top_k_index = self.router(hs_flat)
-            hs_moe = self.pre_feedforward_layernorm_2(hs_flat)
+            hs_moe = packed[2].reshape(hs_flat.shape)
             hs_moe = self.moe(hs_moe, top_k_index, top_k_weights)
             hs_moe = hs_moe.reshape(hidden_states.shape)
 

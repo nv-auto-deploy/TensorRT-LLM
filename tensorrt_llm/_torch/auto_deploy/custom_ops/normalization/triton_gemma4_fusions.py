@@ -172,6 +172,65 @@ def _post_norm_add_and_pre_ff_norm_kernel(
     key=["H"],
 )
 @triton.jit
+def _post_norm_add_and_pre_ff_2norm_kernel(
+    attn_out_ptr,
+    residual_ptr,
+    w_post_attn_ptr,
+    w_pre_ff_ptr,
+    w_pre_ff_2_ptr,
+    out_hs_ptr,
+    out_pre_ff_ptr,
+    out_pre_ff_2_ptr,
+    H: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Fused post-attention norm + two pre-feedforward norms in one kernel.
+
+    Computes:
+      out_hs[row]       = rms_norm(attn_out[row], w_post_attn, eps) + residual[row]
+      out_pre_ff[row]   = rms_norm(out_hs[row],   w_pre_ff,    eps)   (dense MLP input)
+      out_pre_ff_2[row] = rms_norm(out_hs[row],   w_pre_ff_2,  eps)   (MoE input)
+
+    Both pre_ff and pre_ff_2 share the same variance (both normalize out_hs), so
+    inv_rms2 is computed once and applied twice with different weight vectors.
+    Eliminates 1 extra kernel launch vs the 2-output version (pre_feedforward_layernorm_2).
+    """
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+
+    attn_out = tl.load(attn_out_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+    residual = tl.load(residual_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+    w1 = tl.load(w_post_attn_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+    w2 = tl.load(w_pre_ff_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+    w3 = tl.load(w_pre_ff_2_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+
+    # Step 1: post-attention RMSNorm + residual add → hidden_states
+    var1 = tl.sum(attn_out * attn_out) / H
+    inv_rms1 = tl.rsqrt(var1 + eps)
+    hs = attn_out * inv_rms1 * w1 + residual
+
+    # Step 2: pre-feedforward norms — both use the same variance over hs
+    var2 = tl.sum(hs * hs) / H
+    inv_rms2 = tl.rsqrt(var2 + eps)
+    pre_ff = hs * inv_rms2 * w2  # dense MLP input
+    pre_ff_2 = hs * inv_rms2 * w3  # MoE input (frees pre_feedforward_layernorm_2 kernel)
+
+    tl.store(out_hs_ptr + row * H + offs, hs.to(tl.bfloat16), mask=mask)
+    tl.store(out_pre_ff_ptr + row * H + offs, pre_ff.to(tl.bfloat16), mask=mask)
+    tl.store(out_pre_ff_2_ptr + row * H + offs, pre_ff_2.to(tl.bfloat16), mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 4096}, num_warps=4),
+        triton.Config({"BLOCK_H": 4096}, num_warps=8),
+        triton.Config({"BLOCK_H": 4096}, num_warps=16),
+    ],
+    key=["H"],
+)
+@triton.jit
 def _post_add_norm_add_scale_kernel(
     a_ptr,
     b_ptr,
@@ -559,6 +618,73 @@ def _gemma4_post_norm_add_and_pre_ff_norm_fake(
     eps: float,
 ) -> torch.Tensor:
     return torch.empty(2, *attn_out.shape, dtype=torch.bfloat16, device=attn_out.device)
+
+
+@torch.library.custom_op(
+    "auto_deploy::gemma4_post_norm_add_and_pre_ff_2norm", mutates_args=(), device_types="cuda"
+)
+def gemma4_post_norm_add_and_pre_ff_2norm(
+    attn_out: torch.Tensor,
+    residual: torch.Tensor,
+    post_attn_weight: torch.Tensor,
+    pre_ff_weight: torch.Tensor,
+    pre_ff_2_weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Fused post-attention norm + two pre-feedforward norms: saves 2 kernel launches per layer.
+
+    Returns a packed tensor of shape (3, *attn_out.shape) where:
+      packed[0] = rms_norm(attn_out, post_attn_weight, eps) + residual  (hidden_states)
+      packed[1] = rms_norm(packed[0], pre_ff_weight, eps)               (dense MLP input)
+      packed[2] = rms_norm(packed[0], pre_ff_2_weight, eps)             (MoE input)
+
+    Both packed[1] and packed[2] share the same variance computation over packed[0],
+    so the second norm is nearly free. Eliminates one extra kernel vs the 2-output version
+    (the separate pre_feedforward_layernorm_2 call in the MoE path).
+
+    Expected savings vs iter100: 1 kernel × 30 layers × 1.3µs = 39µs at c=1.
+    """
+    import flashinfer
+
+    H = attn_out.shape[-1]
+    T_flat = attn_out.numel() // H
+    attn_2d = attn_out.reshape(T_flat, H)
+    residual_2d = residual.reshape(T_flat, H)
+
+    packed_flat = torch.empty(3, T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
+
+    if T_flat <= _TRITON_T_THRESHOLD:
+        _post_norm_add_and_pre_ff_2norm_kernel[(T_flat,)](
+            attn_2d,
+            residual_2d,
+            post_attn_weight,
+            pre_ff_weight,
+            pre_ff_2_weight,
+            packed_flat[0],
+            packed_flat[1],
+            packed_flat[2],
+            H=H,
+            eps=eps,
+        )
+    else:
+        flashinfer.norm.rmsnorm(attn_2d, post_attn_weight, eps, out=packed_flat[0])
+        packed_flat[0].add_(residual_2d)
+        flashinfer.norm.rmsnorm(packed_flat[0], pre_ff_weight, eps, out=packed_flat[1])
+        flashinfer.norm.rmsnorm(packed_flat[0], pre_ff_2_weight, eps, out=packed_flat[2])
+
+    return packed_flat.reshape(3, *attn_out.shape)
+
+
+@gemma4_post_norm_add_and_pre_ff_2norm.register_fake
+def _gemma4_post_norm_add_and_pre_ff_2norm_fake(
+    attn_out: torch.Tensor,
+    residual: torch.Tensor,
+    post_attn_weight: torch.Tensor,
+    pre_ff_weight: torch.Tensor,
+    pre_ff_2_weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    return torch.empty(3, *attn_out.shape, dtype=torch.bfloat16, device=attn_out.device)
 
 
 # ---------------------------------------------------------------------------
