@@ -2999,6 +2999,74 @@ def run_mirage_ffn_down_via_moe_w2_forward_correctness(
     }
 
 
+def run_mirage_gemma_decode_ffn_down_direct_matmul_forward_correctness(
+    *,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Run the exact Gemma decode FFN-down shape through direct Mirage matmul.
+
+    This mirrors the historical direct decode path: ``(1, 2112) x (2112, 2816)``.
+    It is intended to be exercised in a subprocess because the current runtime
+    behavior may terminate the process instead of returning a clean numerical
+    result.
+    """
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    act = torch.randn((1, 2112), device="cuda", dtype=torch.bfloat16) / 8.0
+    weight = torch.randn((2816, 2112), device="cuda", dtype=torch.bfloat16) / 16.0
+    ref = act.float() @ weight.float().transpose(0, 1)
+
+    executor = _MirageMatmulExecutor(m=1, k=2112, n=2816)
+    out = executor(act, weight.transpose(0, 1).contiguous())
+    torch.cuda.synchronize()
+
+    diff = (out.float() - ref).abs()
+    return {
+        "out_max_abs": float(diff.max().item()),
+        "out_mean_abs": float(diff.mean().item()),
+    }
+
+
+def run_mirage_gemma_decode_ffn_down_via_moe_w2_forward_correctness(
+    *,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Run the exact Gemma decode FFN-down shape through the ``moe_w2`` workaround."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    act_flat = torch.randn((1, 2112), device="cuda", dtype=torch.bfloat16) / 8.0
+    weight_flat = torch.randn((2816, 2112), device="cuda", dtype=torch.bfloat16) / 16.0
+    act = act_flat.view(1, 1, 2112).contiguous()
+    weight = weight_flat.unsqueeze(0).contiguous()
+    routing_indices = torch.ones((1, 1), device="cuda", dtype=torch.int32)
+    routing_mask = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    topk_weight = torch.ones((1, 1), device="cuda", dtype=torch.float32)
+    residual = torch.zeros((1, 2816), device="cuda", dtype=torch.bfloat16)
+    ref = act_flat.float() @ weight_flat.float().transpose(0, 1)
+
+    executor = _MirageMoeW2ReduceExecutor(
+        capacity=1,
+        topk=1,
+        hidden_size=2816,
+        intermediate_size=2112,
+        num_experts=1,
+    )
+    out = executor(act, weight, routing_indices, routing_mask, topk_weight, residual)
+    torch.cuda.synchronize()
+
+    diff = (out.float() - ref).abs()
+    return {
+        "out_max_abs": float(diff.max().item()),
+        "out_mean_abs": float(diff.mean().item()),
+    }
+
+
 def run_mirage_moe_gelu_split_dense_block_forward_correctness(
     *,
     seed: int = 0,
@@ -4589,7 +4657,12 @@ def _build_gemma_runtime_specs(
         qkv_shared_kv = int(qkv_weight.shape[0]) == q_size + kv_size
 
         moe_w13_stacked = _lookup_tensor_attr(source_model, moe_w13_name)
-        gate_weight, up_weight = torch.chunk(moe_w13_stacked, 2, dim=1)
+        # The fused MoE stack uses TRT-LLM's ``w3_w1`` layout:
+        # first half is the up projection (w3), second half is the gate
+        # projection (w1). Gemma's expert activation is ``gelu(gate) * up``,
+        # so preserve that semantic mapping here instead of reusing the
+        # physical stack order directly.
+        up_weight, gate_weight = torch.chunk(moe_w13_stacked, 2, dim=1)
 
         layer_specs.append(
             _GemmaRuntimeLayerSpec(
@@ -4951,6 +5024,7 @@ class _GemmaMirageRuntime:
         self.source_model = source_model
         self.translation_plan = translation_plan
         self.layer_specs = _build_gemma_runtime_specs(source_model, translation_plan)
+        self._force_torch_executors = os.getenv("AD_MPK_FORCE_TORCH_EXECUTORS", "0") == "1"
         node_map = {node.name: node for node in source_model.graph.nodes}
 
         embed_node = node_map["model_language_model_embed_tokens_embedding"]
@@ -5026,6 +5100,9 @@ class _GemmaMirageRuntime:
         input_tensor: torch.Tensor,
         weight_tensor: torch.Tensor,
     ) -> torch.Tensor:
+        if self._force_torch_executors:
+            return (input_tensor.float() @ weight_tensor.float().transpose(0, 1)).to(torch.bfloat16)
+
         capacity = int(input_tensor.shape[0])
         if capacity > _MIRAGE_LINEAR_MAX_CAPACITY:
             outputs = []
@@ -5064,6 +5141,33 @@ class _GemmaMirageRuntime:
         weight_tensor: torch.Tensor,
         topk: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._force_torch_executors:
+            logits = hidden_tensor.float() @ weight_tensor.float().transpose(0, 1)
+            topk_weight, topk_indices = torch.topk(logits, k=topk, dim=-1)
+            topk_weight = torch.softmax(topk_weight, dim=-1)
+            capacity = int(hidden_tensor.shape[0])
+            num_experts = int(weight_tensor.shape[0])
+            routing_indices = torch.zeros(
+                (num_experts, capacity), device=hidden_tensor.device, dtype=torch.int32
+            )
+            per_expert_counts = torch.zeros(
+                (num_experts,), device=hidden_tensor.device, dtype=torch.int32
+            )
+            for token_idx in range(capacity):
+                for rank_idx in range(topk):
+                    expert_idx = int(topk_indices[token_idx, rank_idx].item())
+                    routing_indices[expert_idx, token_idx] = rank_idx + 1
+                    per_expert_counts[expert_idx] += 1
+            routing_mask = torch.zeros(
+                (num_experts + 1,), device=hidden_tensor.device, dtype=torch.int32
+            )
+            routing_mask[1:] = torch.cumsum(per_expert_counts, dim=0)
+            return (
+                topk_weight.to(torch.float32),
+                routing_indices,
+                routing_mask,
+            )
+
         capacity = int(hidden_tensor.shape[0])
         num_experts = int(weight_tensor.shape[0])
         key = (capacity, int(hidden_tensor.shape[1]), num_experts, topk)
@@ -5093,6 +5197,29 @@ class _GemmaMirageRuntime:
         routing_mask: torch.Tensor,
         topk: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._force_torch_executors:
+            capacity = int(hidden_tensor.shape[0])
+            gate_out = torch.zeros(
+                (capacity, topk, int(gate_weight.shape[1])),
+                device=hidden_tensor.device,
+                dtype=torch.bfloat16,
+            )
+            up_out = torch.zeros_like(gate_out)
+            for token_idx in range(capacity):
+                selected_experts = _extract_ranked_experts(
+                    routing_indices[:, token_idx : token_idx + 1], topk
+                )
+                for route_idx, expert_index in enumerate(selected_experts):
+                    gate_out[token_idx, route_idx] = (
+                        hidden_tensor[token_idx].float()
+                        @ gate_weight[expert_index].float().transpose(0, 1)
+                    ).to(torch.bfloat16)
+                    up_out[token_idx, route_idx] = (
+                        hidden_tensor[token_idx].float()
+                        @ up_weight[expert_index].float().transpose(0, 1)
+                    ).to(torch.bfloat16)
+            return gate_out, up_out
+
         capacity = int(hidden_tensor.shape[0])
         key = (
             capacity,
@@ -5129,6 +5256,26 @@ class _GemmaMirageRuntime:
         topk_weight: torch.Tensor,
         residual: torch.Tensor,
     ) -> torch.Tensor:
+        if self._force_torch_executors:
+            capacity, topk, intermediate = [int(dim) for dim in act_tensor.shape]
+            hidden_size = int(weight_tensor.shape[1])
+            out = residual.float().clone()
+            for token_idx in range(capacity):
+                for expert_idx in range(int(weight_tensor.shape[0])):
+                    rank = int(routing_indices[expert_idx, token_idx].item())
+                    if rank == 0:
+                        continue
+                    route_idx = rank - 1
+                    if route_idx >= topk:
+                        continue
+                    expert_out = act_tensor[token_idx, route_idx].float() @ weight_tensor[
+                        expert_idx
+                    ].float().transpose(0, 1)
+                    out[token_idx, :hidden_size] += (
+                        expert_out * topk_weight[token_idx, route_idx].float()
+                    )
+            return out.to(torch.bfloat16)
+
         capacity, topk, intermediate = [int(dim) for dim in act_tensor.shape]
         if (
             capacity > _MIRAGE_MOE_W2_MAX_CAPACITY
@@ -5191,6 +5338,9 @@ class _GemmaMirageRuntime:
         )
 
     def _gelu_mul(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        if self._force_torch_executors:
+            return (F.gelu(gate.float()) * up.float()).to(torch.bfloat16)
+
         key = tuple(int(dim) for dim in gate.shape)
         executor = self._gelu_cache.get(key)
         if executor is None:
@@ -5200,6 +5350,9 @@ class _GemmaMirageRuntime:
         return executor(gate.contiguous(), up.contiguous())
 
     def _matmul(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        if self._force_torch_executors:
+            return (a.float() @ b.float()).to(torch.bfloat16)
+
         key = (int(a.shape[0]), int(a.shape[1]), int(b.shape[1]))
         executor = self._matmul_cache.get(key)
         if executor is None:
@@ -5240,16 +5393,29 @@ class _GemmaMirageRuntime:
             residual=residual,
         )
 
-    def _cos_sin_cache(self, head_dim: int) -> torch.Tensor:
+    def _rope_inputs(
+        self,
+        *,
+        position_ids: torch.Tensor,
+        head_dim: int,
+        batch_size: int,
+        seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = batch_size * seq_len
         if head_dim == 256:
-            return torch.cat(
-                (self.local_cos[:, : head_dim // 2], self.local_sin[:, : head_dim // 2]), dim=-1
-            ).to(torch.float32)
-        if head_dim == 512:
-            return torch.cat(
-                (self.global_cos[:, : head_dim // 2], self.global_sin[:, : head_dim // 2]), dim=-1
-            ).to(torch.float32)
-        raise ValueError(f"Unsupported Gemma head_dim for rotary cache: {head_dim}")
+            cos = self.local_cos[position_ids][..., : head_dim // 2]
+            sin = self.local_sin[position_ids][..., : head_dim // 2]
+        elif head_dim == 512:
+            cos = self.global_cos[position_ids][..., : head_dim // 2]
+            sin = self.global_sin[position_ids][..., : head_dim // 2]
+        else:
+            raise ValueError(f"Unsupported Gemma head_dim for rotary cache: {head_dim}")
+
+        cos_sin_cache = (
+            torch.cat((cos, sin), dim=-1).reshape(num_tokens, head_dim).to(torch.float32)
+        )
+        rope_positions = torch.arange(num_tokens, device=position_ids.device, dtype=torch.int32)
+        return rope_positions, cos_sin_cache
 
     def __call__(
         self,
@@ -5271,6 +5437,7 @@ class _GemmaMirageRuntime:
         batch_size, seq_len = [int(dim) for dim in input_ids.shape]
         hidden = F.embedding(input_ids, self.embed_weight).to(torch.bfloat16)
         hidden = hidden * self.embed_scale.to(dtype=hidden.dtype)
+        debug_tensors = {} if os.getenv("AD_MPK_COMPARE_LAYER0_DEBUG", "0") == "1" else None
 
         triton_batch_indices, triton_positions = (
             torch.ops.auto_deploy.triton_paged_prepare_metadata.default(
@@ -5300,6 +5467,7 @@ class _GemmaMirageRuntime:
                 input_tensor=attn_in,
                 weight_tensor=layer_spec.qkv_weight,
             )
+            qkv_packed_view = qkv_packed.view(batch_size, seq_len, -1)
 
             q_size = layer_spec.q_heads * layer_spec.head_dim
             kv_size = layer_spec.kv_heads * layer_spec.head_dim
@@ -5319,11 +5487,16 @@ class _GemmaMirageRuntime:
             q = _rms_norm(q, layer_spec.q_norm_weight)
             k = _rms_norm(k, layer_spec.k_norm_weight)
             v = _rms_norm(v, layer_spec.v_norm_weight)
-            cos_sin_cache = self._cos_sin_cache(layer_spec.head_dim)
+            rope_positions, cos_sin_cache = self._rope_inputs(
+                position_ids=position_ids,
+                head_dim=layer_spec.head_dim,
+                batch_size=batch_size,
+                seq_len=seq_len,
+            )
             q_rope, k_rope = torch.ops.auto_deploy.flashinfer_rope.default(
                 q,
                 k,
-                position_ids,
+                rope_positions,
                 cos_sin_cache,
                 True,
             )
@@ -5346,6 +5519,7 @@ class _GemmaMirageRuntime:
                 layer_spec.sliding_window,
             )
             attn_out_flat = attn_out.reshape(batch_size * seq_len, -1).contiguous()
+            attn_out_view = attn_out_flat.view(batch_size, seq_len, -1)
             o_proj = self._linear(
                 name=f"layer_{layer_spec.layer_index}_o_proj",
                 input_tensor=attn_out_flat,
@@ -5391,26 +5565,37 @@ class _GemmaMirageRuntime:
 
                 moe_in = _rms_norm(token_hidden, layer_spec.pre_feedforward_layernorm_2_weight)
                 experts = _extract_ranked_experts(routing_indices, layer_spec.topk)
-                moe_gate_rows = []
-                moe_up_rows = []
-                for rank, expert_index in enumerate(experts):
-                    moe_gate_rows.append(
-                        self._linear(
-                            name=f"layer_{layer_spec.layer_index}_moe_gate_rank_{rank}",
-                            input_tensor=moe_in,
-                            weight_tensor=layer_spec.moe_gate_weight[expert_index],
-                        )[0]
+                if debug_tensors is not None and layer_spec.layer_index == 0 and token_idx == 0:
+                    router_logits = self._linear(
+                        name=f"layer_{layer_spec.layer_index}_router_proj_debug",
+                        input_tensor=router_in,
+                        weight_tensor=layer_spec.router_proj_weight,
                     )
-                    moe_up_rows.append(
-                        self._linear(
-                            name=f"layer_{layer_spec.layer_index}_moe_up_rank_{rank}",
-                            input_tensor=moe_in,
-                            weight_tensor=layer_spec.moe_up_weight[expert_index],
-                        )[0]
+                    debug_tensors["layer_0_router_in"] = (
+                        router_in.detach().clone().view(batch_size, seq_len, -1)
                     )
-
-                moe_gate = torch.stack(moe_gate_rows, dim=0).unsqueeze(0).to(torch.bfloat16)
-                moe_up = torch.stack(moe_up_rows, dim=0).unsqueeze(0).to(torch.bfloat16)
+                    debug_tensors["layer_0_router_logits"] = (
+                        router_logits.detach().clone().view(batch_size, seq_len, -1)
+                    )
+                    debug_tensors["layer_0_router_topk_weight"] = (
+                        topk_weight.detach().clone().view(batch_size, seq_len, -1)
+                    )
+                    debug_tensors["layer_0_router_topk_indices"] = torch.tensor(
+                        experts,
+                        device=routing_indices.device,
+                        dtype=torch.int32,
+                    ).view(batch_size, seq_len, -1)
+                    debug_tensors["layer_0_moe_in"] = (
+                        moe_in.detach().clone().view(batch_size, seq_len, -1)
+                    )
+                moe_gate, moe_up = self._moe_w13(
+                    hidden_tensor=moe_in,
+                    gate_weight=layer_spec.moe_gate_weight,
+                    up_weight=layer_spec.moe_up_weight,
+                    routing_indices=routing_indices,
+                    routing_mask=routing_mask,
+                    topk=layer_spec.topk,
+                )
                 moe_act = self._gelu_mul(moe_gate, moe_up)
                 moe_token_out = self._moe_w2_reduce(
                     act_tensor=moe_act.contiguous(),
@@ -5424,10 +5609,27 @@ class _GemmaMirageRuntime:
 
             moe_out = torch.stack(moe_token_outputs, dim=0).view(batch_size, seq_len, -1)
             moe_norm = _rms_norm(moe_out, layer_spec.post_feedforward_layernorm_2_weight)
-            hidden = post_attn + _rms_norm(
-                ffn_norm + moe_norm, layer_spec.post_feedforward_layernorm_weight
-            )
+            ffn_moe_add = ffn_norm + moe_norm
+            ffn_moe_norm = _rms_norm(ffn_moe_add, layer_spec.post_feedforward_layernorm_weight)
+            hidden = post_attn + ffn_moe_norm
             hidden = hidden * layer_spec.layer_scalar.view(1, 1, -1)
+            if debug_tensors is not None and layer_spec.layer_index == 0:
+                debug_tensors["layer_0_qkv_packed"] = qkv_packed_view.detach().clone()
+                debug_tensors["layer_0_q_norm"] = q.detach().clone()
+                debug_tensors["layer_0_k_norm"] = k.detach().clone()
+                debug_tensors["layer_0_v_norm"] = v.detach().clone()
+                debug_tensors["layer_0_q_rope"] = q_rope.detach().clone()
+                debug_tensors["layer_0_k_rope"] = k_rope.detach().clone()
+                debug_tensors["layer_0_attn_out"] = attn_out_view.detach().clone()
+                debug_tensors["layer_0_o_proj"] = o_proj.detach().clone()
+                debug_tensors["layer_0_post_attn"] = post_attn.detach().clone()
+                debug_tensors["layer_0_ffn_down"] = ffn_down.detach().clone()
+                debug_tensors["layer_0_ffn_norm"] = ffn_norm.detach().clone()
+                debug_tensors["layer_0_moe_out"] = moe_out.detach().clone()
+                debug_tensors["layer_0_moe_norm"] = moe_norm.detach().clone()
+                debug_tensors["layer_0_ffn_moe_add"] = ffn_moe_add.detach().clone()
+                debug_tensors["layer_0_ffn_moe_norm"] = ffn_moe_norm.detach().clone()
+                debug_tensors["layer_0_hidden"] = hidden.detach().clone()
             _mpk_debug(f"exit layer {layer_spec.layer_index}")
 
         hidden = _rms_norm(hidden, self.final_norm_weight)
@@ -5440,7 +5642,10 @@ class _GemmaMirageRuntime:
         logits = torch.tanh(logits / 30.0) * 30.0
         logits = logits.view(*gathered.shape[:-1], logits.shape[-1])
         _mpk_debug(f"return logits shape={tuple(logits.shape)}")
-        return {"logits": logits}
+        output = {"logits": logits}
+        if debug_tensors is not None:
+            output["_debug_tensors"] = debug_tensors
+        return output
 
 
 def build_gemma_mirage_runtime_callable(

@@ -17,9 +17,13 @@
 
 from __future__ import annotations
 
+import copy
+import os
 from typing import Any, Callable, Dict, Optional, Sequence
 
+import torch
 import torch.nn as nn
+from torch.fx import GraphModule
 
 from ..custom_ops.attention_interface import BatchInfo
 
@@ -50,6 +54,156 @@ class GemmaMpkRuntimeWrapper(nn.Module):
         self.translation_plan = translation_plan or {}
         self.input_names = tuple(input_names or ())
         self.batch_info_input_name = batch_info_input_name
+        self._compare_decode_logits_once_done = False
+
+    def _extract_logits(self, model_output: Any) -> torch.Tensor:
+        if isinstance(model_output, dict):
+            return model_output["logits"]
+        if isinstance(model_output, (tuple, list)):
+            return model_output[0]
+        return model_output
+
+    def _clone_bound_inputs_for_reference(self, bound_inputs: Dict[str, Any]) -> Dict[str, Any]:
+        cloned_inputs: Dict[str, Any] = {}
+        for name, value in bound_inputs.items():
+            if torch.is_tensor(value):
+                cloned_inputs[name] = value.clone()
+            else:
+                cloned_inputs[name] = value
+        return cloned_inputs
+
+    def _build_intermediate_graphmodule(
+        self,
+        node_name_map: Dict[str, str | Sequence[str]],
+    ) -> Optional[GraphModule]:
+        if self.original_model is None:
+            return None
+
+        gm = copy.deepcopy(self.original_model)
+        original_graph = gm.graph
+        original_nodes = {node.name: node for node in original_graph.nodes}
+        target_nodes = {}
+        for alias, node_name_or_candidates in node_name_map.items():
+            candidates = (
+                tuple(node_name_or_candidates)
+                if isinstance(node_name_or_candidates, (tuple, list))
+                else (node_name_or_candidates,)
+            )
+            node = None
+            for node_name in candidates:
+                node = original_nodes.get(node_name)
+                if node is not None:
+                    break
+            if node is None:
+                return None
+            target_nodes[alias] = node
+
+        new_graph = torch.fx.Graph()
+        env: Dict[torch.fx.Node, torch.fx.Node] = {}
+        for node in original_graph.nodes:
+            if node.op == "output":
+                new_graph.output({alias: env[target] for alias, target in target_nodes.items()})
+                break
+            env[node] = new_graph.node_copy(node, lambda n: env[n])
+
+        intermediate_gm = GraphModule(gm, new_graph)
+        intermediate_gm.recompile()
+        return intermediate_gm
+
+    def _maybe_compare_layer0_debug_tensors(
+        self,
+        *,
+        mpk_output: Any,
+        reference_inputs: Dict[str, Any],
+    ) -> None:
+        if os.getenv("AD_MPK_COMPARE_LAYER0_DEBUG", "0") != "1":
+            return
+        if self.original_model is None or not isinstance(mpk_output, dict):
+            return
+
+        debug_tensors = mpk_output.get("_debug_tensors")
+        if not isinstance(debug_tensors, dict):
+            return
+
+        node_name_map = {
+            "layer_0_qkv_packed": "torch_linear_simple_default",
+            "layer_0_q_norm": "flashinfer_rms_norm_1",
+            "layer_0_k_norm": "flashinfer_rms_norm_2",
+            "layer_0_v_norm": "flashinfer_rms_norm_3",
+            "layer_0_q_rope": ("getitem_180", "getitem_30"),
+            "layer_0_k_rope": ("getitem_181", "getitem_31"),
+            "layer_0_attn_out": "model_language_model_layers_0_self_attn_reshape",
+            "layer_0_o_proj": "model_language_model_layers_0_self_attn_o_proj_torch_linear_simple_3",
+            "layer_0_post_attn": "model_language_model_layers_0_add",
+            "layer_0_ffn_down": "model_language_model_layers_0_mlp_down_proj_torch_linear_simple_6",
+            "layer_0_ffn_norm": "flashinfer_rms_norm_6",
+            "layer_0_router_in": "model_language_model_layers_0_router_mul_4",
+            "layer_0_router_logits": "model_language_model_layers_0_router_proj_torch_linear_simple_7",
+            "layer_0_router_topk_weight": ("getitem_20", "getitem_120"),
+            "layer_0_router_topk_indices": ("getitem_21", "getitem_121"),
+            "layer_0_moe_in": "flashinfer_rms_norm_7",
+            "layer_0_moe_out": "model_language_model_layers_0_reshape_2",
+            "layer_0_moe_norm": "flashinfer_rms_norm_8",
+            "layer_0_ffn_moe_add": "model_language_model_layers_0_add_2",
+            "layer_0_ffn_moe_norm": "flashinfer_rms_norm_9",
+            "layer_0_hidden": "model_language_model_layers_0_mul_5",
+        }
+        intermediate_gm = self._build_intermediate_graphmodule(node_name_map)
+        if intermediate_gm is None:
+            print("[AD_MPK_COMPARE_LAYER0] intermediate graph build skipped", flush=True)
+            return
+
+        ref_outputs = intermediate_gm(**reference_inputs)
+        for alias, ref_tensor in ref_outputs.items():
+            mpk_tensor = debug_tensors.get(alias)
+            if mpk_tensor is None:
+                continue
+            diff = (mpk_tensor.float() - ref_tensor.float()).abs()
+            print(
+                "[AD_MPK_COMPARE_LAYER0] "
+                f"{alias} shape={tuple(ref_tensor.shape)} "
+                f"max_abs={float(diff.max().item()):.6f} "
+                f"mean_abs={float(diff.mean().item()):.6f}",
+                flush=True,
+            )
+
+    def _maybe_compare_decode_logits(
+        self,
+        *,
+        mpk_output: Any,
+        reference_inputs: Dict[str, Any],
+    ) -> None:
+        if os.getenv("AD_MPK_COMPARE_DECODE_LOGITS", "0") != "1":
+            return
+        if self._compare_decode_logits_once_done:
+            return
+        if self.original_model is None:
+            return
+
+        ref_output = self.original_model(**reference_inputs)
+        mpk_logits = self._extract_logits(mpk_output).float()
+        ref_logits = self._extract_logits(ref_output).float()
+        logits_abs = (mpk_logits - ref_logits).abs()
+        topk = min(5, int(mpk_logits.shape[-1]))
+        mpk_topk = torch.topk(mpk_logits.reshape(-1, mpk_logits.shape[-1]), k=topk, dim=-1).indices
+        ref_topk = torch.topk(ref_logits.reshape(-1, ref_logits.shape[-1]), k=topk, dim=-1).indices
+        top1_match = bool(torch.equal(mpk_topk[:, :1], ref_topk[:, :1]))
+        top5_overlap = int(
+            sum(
+                len(set(mpk_row.tolist()) & set(ref_row.tolist()))
+                for mpk_row, ref_row in zip(mpk_topk, ref_topk)
+            )
+        )
+        print(
+            "[AD_MPK_COMPARE] "
+            f"logits_shape={tuple(mpk_logits.shape)} "
+            f"max_abs={float(logits_abs.max().item()):.6f} "
+            f"mean_abs={float(logits_abs.mean().item()):.6f} "
+            f"top1_match={top1_match} "
+            f"top{topk}_overlap={top5_overlap}",
+            flush=True,
+        )
+        self._compare_decode_logits_once_done = True
 
     def _bind_inputs(self, args, kwargs) -> Dict[str, Any]:
         if len(args) > len(self.input_names):
@@ -77,7 +231,22 @@ class GemmaMpkRuntimeWrapper(nn.Module):
         bound_inputs = self._bind_inputs(args, kwargs)
         if self._is_generate_only(bound_inputs):
             if self.mpk_callable is not None:
-                return self.mpk_callable(*args, **kwargs)
+                reference_inputs = None
+                if (
+                    os.getenv("AD_MPK_COMPARE_DECODE_LOGITS", "0") == "1"
+                    and not self._compare_decode_logits_once_done
+                    and self.original_model is not None
+                ):
+                    reference_inputs = self._clone_bound_inputs_for_reference(bound_inputs)
+                mpk_output = self.mpk_callable(*args, **kwargs)
+                if reference_inputs is not None:
+                    self._maybe_compare_decode_logits(
+                        mpk_output=mpk_output, reference_inputs=reference_inputs
+                    )
+                    self._maybe_compare_layer0_debug_tensors(
+                        mpk_output=mpk_output, reference_inputs=reference_inputs
+                    )
+                return mpk_output
             raise RuntimeError(
                 "GemmaMpkRuntimeWrapper was invoked on a generate-only batch without a live MPK "
                 "callable. The Gemma MPK path no longer supports eager fallback for decode."

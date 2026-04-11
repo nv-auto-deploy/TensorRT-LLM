@@ -412,6 +412,29 @@ class GemmaGraphAnalyzer:
         return layer_info
 
     def _find_rms_norm_source(self, node: Node, layer_idx: int) -> Node:
+        # q/k arrive at cached attention through getitem(flashinfer_rope, idx).
+        # A generic ancestor walk will hit q_norm first for both branches, so
+        # resolve the rope output index explicitly when possible.
+        if node.op == "call_function" and node.target is operator.getitem and len(node.args) >= 2:
+            rope_node = node.args[0]
+            rope_output_idx = node.args[1]
+            if (
+                isinstance(rope_node, Node)
+                and rope_node.op == "call_function"
+                and "flashinfer_rope" in _qualified_target_name(rope_node)
+                and rope_output_idx in (0, 1)
+            ):
+                rope_input = rope_node.args[int(rope_output_idx)]
+                if isinstance(rope_input, Node):
+                    if _is_rms_norm_node(rope_input):
+                        return rope_input
+                    rms_node = self._find_ancestor(
+                        rope_input,
+                        lambda candidate: _is_rms_norm_node(candidate),
+                    )
+                    if rms_node is not None:
+                        return rms_node
+
         if _is_rms_norm_node(node):
             return node
 

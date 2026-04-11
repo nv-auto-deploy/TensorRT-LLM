@@ -778,6 +778,143 @@ def test_mirage_ffn_down_via_moe_w2_matches_reference():
     assert "w2_max_abs" in proc.stdout
 
 
+def test_mirage_gemma_decode_ffn_down_via_moe_w2_matches_reference():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_gemma_decode_ffn_down_via_moe_w2_forward_correctness; "
+                "result = run_mirage_gemma_decode_ffn_down_via_moe_w2_forward_correctness(); "
+                "print(result); "
+                "assert result['out_max_abs'] < 0.01; "
+                "assert result['out_mean_abs'] < 0.001"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=180,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "out_max_abs" in proc.stdout
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Direct decode FFN-down PK linear specialization remains unstable for the "
+        "single-token Gemma decode shape; keep the moe_w2 workaround until this "
+        "path becomes reliable."
+    ),
+)
+def test_mirage_direct_ffn_down_decode_path_regression():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_ffn_down_projection_forward_correctness; "
+                "result = run_mirage_ffn_down_projection_forward_correctness("
+                "use_generic_activation_input=True, repack_after_activation=True); "
+                "print(result); "
+                "assert result['out_max_abs'] < 0.01; "
+                "assert result['out_mean_abs'] < 0.003"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=90,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "out_max_abs" in proc.stdout
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Exact Gemma decode direct matmul path remains unstable for the real "
+        "single-token FFN-down shape (1 x 2112 -> 2816); keep the moe_w2 "
+        "workaround until this path is proven reliable."
+    ),
+)
+def test_mirage_gemma_decode_direct_ffn_down_matmul_regression():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_gemma_decode_ffn_down_direct_matmul_forward_correctness; "
+                "result = run_mirage_gemma_decode_ffn_down_direct_matmul_forward_correctness(); "
+                "print(result); "
+                "assert result['out_max_abs'] < 0.01; "
+                "assert result['out_mean_abs'] < 0.001"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=180,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "out_max_abs" in proc.stdout
+
+
 def test_mirage_gemma_full_live_layer_matches_reference():
     try:
         _require_mirage()

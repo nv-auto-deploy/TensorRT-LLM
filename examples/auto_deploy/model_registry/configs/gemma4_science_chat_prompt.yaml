@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+prompt:
+  batch_size: 1
+  queries:
+    - messages:
+        - role: user
+          content: "Why is the sky blue?"
+      prompt: "Science prompt for HF chat template."
+  sp_kwargs:
+    max_tokens: 40
+    temperature: 0.0
