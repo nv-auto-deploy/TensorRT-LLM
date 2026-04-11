@@ -15,6 +15,7 @@
 
 from types import SimpleNamespace
 
+import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.auto_deploy.mpk import (
@@ -29,25 +30,69 @@ class _DummyModule(nn.Module):
         super().__init__()
         self.meta = {}
 
+    def forward(self, **kwargs):
+        return {"logits": kwargs["input_ids"] + 1}
+
 
 class _InfoShouldNotReset:
     def reset(self):
         raise AssertionError("compile_model should not reset sequence info in Mirage runtime mode")
 
 
+def _make_batch_info_host(*, num_prefill: int = 0, num_extend: int = 0, num_decode: int = 0):
+    batch_info_host = torch.zeros(12, dtype=torch.int32)
+    batch_info_host[0] = num_prefill
+    batch_info_host[2] = num_extend
+    batch_info_host[4] = num_decode
+    return batch_info_host
+
+
 def test_gemma_mpk_runtime_wrapper_requires_live_callable():
     wrapper = GemmaMpkRuntimeWrapper(
         mpk_callable=None,
         translation_plan={"layer_lowerings": []},
-        input_names=("input_ids",),
+        input_names=("input_ids", "batch_info_host"),
     )
 
     try:
-        wrapper("fake_input")
+        wrapper(torch.tensor([1]), _make_batch_info_host(num_decode=1))
     except RuntimeError as exc:
-        assert "no longer supports eager fallback" in str(exc)
+        assert "no longer supports eager fallback for decode" in str(exc)
     else:
         raise AssertionError("Expected strict MPK wrapper to reject missing runtime callable.")
+
+
+def test_gemma_mpk_runtime_wrapper_routes_generate_only_to_mirage():
+    calls = []
+
+    def _mpk_callable(*args, **kwargs):
+        calls.append(("mpk", len(args), sorted(kwargs)))
+        return {"logits": torch.tensor([7.0])}
+
+    wrapper = GemmaMpkRuntimeWrapper(
+        mpk_callable=_mpk_callable,
+        original_model=_DummyModule(),
+        translation_plan={"layer_lowerings": []},
+        input_names=("input_ids", "batch_info_host"),
+    )
+
+    output = wrapper(torch.tensor([1.0]), _make_batch_info_host(num_decode=1))
+
+    assert calls == [("mpk", 2, [])]
+    assert torch.equal(output["logits"], torch.tensor([7.0]))
+
+
+def test_gemma_mpk_runtime_wrapper_routes_prefill_to_original_model():
+    wrapper = GemmaMpkRuntimeWrapper(
+        mpk_callable=lambda *args, **kwargs: {"logits": torch.tensor([-1.0])},
+        original_model=_DummyModule(),
+        translation_plan={"layer_lowerings": []},
+        input_names=("input_ids", "batch_info_host"),
+    )
+
+    output = wrapper(torch.tensor([3.0]), _make_batch_info_host(num_prefill=1))
+
+    assert torch.equal(output["logits"], torch.tensor([4.0]))
 
 
 def test_gemma_mirage_runtime_callable_reports_remaining_lowering_gaps():
