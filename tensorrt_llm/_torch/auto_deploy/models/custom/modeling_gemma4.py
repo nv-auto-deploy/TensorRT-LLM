@@ -52,6 +52,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_fusi
     gemma4_post_norm_add,
     gemma4_post_norm_add_and_pre_ff_norm,
     gemma4_post_norm_add_scale,
+    gemma4_qkv_norm,
 )
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_router import (
     gemma4_router,
@@ -468,9 +469,15 @@ class Gemma4TextAttention(nn.Module):
         else:
             v = k  # K=V: reuse key as value
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        v = self.v_norm(v)
+        q, k, v = gemma4_qkv_norm(
+            q,
+            k,
+            v,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.v_norm.weight,
+            self.q_norm.eps,
+        )
 
         cos, sin = position_embeddings
         q, k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 2)

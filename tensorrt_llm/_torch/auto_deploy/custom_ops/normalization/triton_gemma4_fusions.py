@@ -27,6 +27,8 @@ The fused kernels are:
   - gemma4_post_norm_add_scale: (norm(x, w) + residual) * scalar  (post-ffn pattern)
 """
 
+from typing import Tuple
+
 import torch
 import triton
 import triton.language as tl
@@ -432,3 +434,159 @@ def _gemma4_post_norm_add_and_pre_ff_norm_fake(
     eps: float,
 ) -> torch.Tensor:
     return torch.empty(2, *attn_out.shape, dtype=torch.bfloat16, device=attn_out.device)
+
+
+# ---------------------------------------------------------------------------
+# Fused Q/K/V RMSNorm — replaces 3 separate torch_rmsnorm launches with 1
+# ---------------------------------------------------------------------------
+
+# Use Triton fused kernel when total QKV head-rows ≤ this value.
+# At BS=8, local (N_H=16, N_KV=8): N_Q=128, N_KV=64, total=256.
+# Matches _TRITON_T_THRESHOLD=8 spirit but expressed in total rows.
+_QKV_TRITON_THRESHOLD = 256
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 512}, num_warps=4),
+        triton.Config({"BLOCK_H": 512}, num_warps=8),
+        triton.Config({"BLOCK_H": 512}, num_warps=16),
+    ],
+    key=["H"],
+)
+@triton.jit
+def _qkv_norm_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    w_q_ptr,
+    w_k_ptr,
+    w_v_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    N_Q,
+    N_KV,
+    H: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Single-kernel fused RMSNorm for Q, K, V head tensors.
+
+    Grid: (N_Q + 2*N_KV,) — one program instance per head row.
+    Programs [0, N_Q)         process q rows with w_q weights.
+    Programs [N_Q, N_Q+N_KV)  process k rows with w_k weights.
+    Programs [N_Q+N_KV, ...)   process v rows with w_v weights.
+
+    Inactive tensor loads are predicated (mask=False → other=0.0 → no mem access).
+    Because the masks are mutually exclusive, x = xq + xk + xv equals the active
+    tensor's data for every thread. Same logic applies to the weight vector.
+    OOB pointer arithmetic (negative kv_row / v_row for q/k blocks) is safe because
+    CUDA predicated loads/stores never dereference the address when the mask is False.
+    """
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+
+    is_q = row < N_Q
+    is_k = (row >= N_Q) & (row < N_Q + N_KV)
+    is_v = ~is_q & ~is_k  # row >= N_Q + N_KV
+
+    kv_row = row - N_Q  # index into k; may be negative for q-blocks (predicated out)
+    v_row = row - N_Q - N_KV  # index into v; may be negative for q/k-blocks (predicated out)
+
+    # Load input — exactly one of the three is non-zero for a given block
+    xq = tl.load(q_ptr + row * H + offs, mask=mask & is_q, other=0.0).to(tl.float32)
+    xk = tl.load(k_ptr + kv_row * H + offs, mask=mask & is_k, other=0.0).to(tl.float32)
+    xv = tl.load(v_ptr + v_row * H + offs, mask=mask & is_v, other=0.0).to(tl.float32)
+    x = xq + xk + xv
+
+    # Load weight — one of w_q, w_k, w_v; inactive tensors contribute 0 via other=0.0
+    wq = tl.load(w_q_ptr + offs, mask=mask & is_q, other=0.0).to(tl.float32)
+    wk = tl.load(w_k_ptr + offs, mask=mask & is_k, other=0.0).to(tl.float32)
+    wv = tl.load(w_v_ptr + offs, mask=mask & is_v, other=0.0).to(tl.float32)
+    w = wq + wk + wv
+
+    # RMSNorm: normalize x, then scale by the learned weight
+    var = tl.sum(x * x) / H
+    inv_rms = tl.rsqrt(var + eps)
+    normed = (x * inv_rms * w).to(tl.bfloat16)
+
+    # Store to the correct output tensor (predicated)
+    tl.store(q_out_ptr + row * H + offs, normed, mask=mask & is_q)
+    tl.store(k_out_ptr + kv_row * H + offs, normed, mask=mask & is_k)
+    tl.store(v_out_ptr + v_row * H + offs, normed, mask=mask & is_v)
+
+
+@torch.library.custom_op("auto_deploy::gemma4_qkv_norm", mutates_args=(), device_types="cuda")
+def gemma4_qkv_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    w_q: torch.Tensor,
+    w_k: torch.Tensor,
+    w_v: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused per-head RMSNorm for Q, K, V: one Triton kernel instead of 3.
+
+    Replaces three separate torch_rmsnorm calls (one per Q/K/V head group) with a
+    single fused Triton kernel, saving 2 kernel-launch overheads per decoder layer.
+    At 30 layers the savings are ~30µs at c=1 (30 × ~1µs avoided CG dispatch).
+
+    Small T (total QKV rows ≤ _QKV_TRITON_THRESHOLD): fused Triton kernel.
+    Large T: three separate flashinfer.norm.rmsnorm calls (bandwidth-optimal).
+
+    K=V sharing (global layers where v = k before normalization): safe — the kernel
+    reads k_ptr and v_ptr independently (both point to the same pre-norm data) and
+    writes to separate output buffers using distinct weights (w_k vs w_v).
+    """
+    import flashinfer as _flashinfer
+
+    H = q.shape[-1]
+    q_2d = q.reshape(-1, H)
+    k_2d = k.reshape(-1, H)
+    v_2d = v.reshape(-1, H)
+    N_Q = q_2d.shape[0]
+    N_KV = k_2d.shape[0]
+
+    q_out = torch.empty_like(q_2d)
+    k_out = torch.empty_like(k_2d)
+    v_out = torch.empty_like(v_2d)
+
+    total_rows = N_Q + 2 * N_KV
+    if total_rows <= _QKV_TRITON_THRESHOLD:
+        _qkv_norm_kernel[(total_rows,)](
+            q_2d,
+            k_2d,
+            v_2d,
+            w_q,
+            w_k,
+            w_v,
+            q_out,
+            k_out,
+            v_out,
+            N_Q=N_Q,
+            N_KV=N_KV,
+            H=H,
+            eps=eps,
+        )
+    else:
+        _flashinfer.norm.rmsnorm(q_2d, w_q, eps, out=q_out)
+        _flashinfer.norm.rmsnorm(k_2d, w_k, eps, out=k_out)
+        _flashinfer.norm.rmsnorm(v_2d, w_v, eps, out=v_out)
+
+    return q_out.reshape(q.shape), k_out.reshape(k.shape), v_out.reshape(v.shape)
+
+
+@gemma4_qkv_norm.register_fake
+def _gemma4_qkv_norm_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    w_q: torch.Tensor,
+    w_k: torch.Tensor,
+    w_v: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
