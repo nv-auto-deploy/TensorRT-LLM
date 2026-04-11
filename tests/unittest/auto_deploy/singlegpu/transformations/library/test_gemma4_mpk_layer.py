@@ -736,6 +736,98 @@ def test_mirage_moe_gelu_split_dense_block_matches_reference():
     assert "routing_overlap_count" in proc.stdout
 
 
+def test_mirage_ffn_down_via_moe_w2_matches_reference():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_ffn_down_via_moe_w2_forward_correctness; "
+                "result = run_mirage_ffn_down_via_moe_w2_forward_correctness("
+                "use_generic_activation_input=True, repack_after_activation=True); "
+                "print(result); "
+                "assert result['w2_max_abs'] < 0.001; "
+                "assert result['w2_mean_abs'] < 0.0002; "
+                "assert result['out_max_abs'] < 0.001; "
+                "assert result['out_mean_abs'] < 0.0002"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "w2_max_abs" in proc.stdout
+
+
+def test_mirage_gemma_full_live_layer_matches_reference():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_gemma_full_layer_split_dense_forward_correctness; "
+                "result = run_mirage_gemma_full_layer_split_dense_forward_correctness(); "
+                "print(result); "
+                "assert result['post_attn_max_abs'] < 0.06; "
+                "assert result['post_attn_mean_abs'] < 0.01; "
+                "assert result['ffn_down_max_abs'] < 0.01; "
+                "assert result['ffn_down_mean_abs'] < 0.003; "
+                "assert result['topk_weight_max_abs'] < 0.005; "
+                "assert result['topk_weight_mean_abs'] < 0.002; "
+                "assert result['routing_overlap_count'] >= 8.0; "
+                "assert result['moe_act_max_abs'] < 0.2; "
+                "assert result['moe_act_mean_abs'] < 0.02; "
+                "assert result['w2_max_abs'] < 0.07; "
+                "assert result['w2_mean_abs'] < 0.01; "
+                "assert result['hidden_out_max_abs'] < 0.03; "
+                "assert result['hidden_out_mean_abs'] < 0.01"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "hidden_out_max_abs" in proc.stdout
+
+
 def test_gemma4_translated_attention_block_matches_reference():
     layer_plan = GemmaLayerLoweringPlanner().build(_make_gemma4_layer_info())
     hidden_in, weights = _make_reference_inputs()
