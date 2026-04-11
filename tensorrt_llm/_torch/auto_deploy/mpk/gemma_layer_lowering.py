@@ -177,11 +177,15 @@ class GemmaLayerLoweringPlanner:
                 mpk_method=None,
                 inputs=[f"layer_{layer_idx}_ffn_gate_up"],
                 outputs=[f"layer_{layer_idx}_ffn_down"],
-                status=GemmaLoweringStatus.GAP,
-                params={"observed_activation": "gelu_mul"},
+                status=GemmaLoweringStatus.PARTIAL,
+                params={"observed_activation": "gelu_mul", "downproj_lowering": "topk1_moe_w2"},
                 notes=[
                     "Observed FX graph uses gelu(gate) * up before the down projection.",
                     "MPK currently exposes silu_mul_layer but no matching gelu_mul_layer task.",
+                    (
+                        "Bridge-side live workaround is generic gelu*mul followed by a "
+                        "top-k=1 moe_w2_linear + moe_mul_sum_add composition for the down projection."
+                    ),
                 ],
             ),
             GemmaMpkStep(

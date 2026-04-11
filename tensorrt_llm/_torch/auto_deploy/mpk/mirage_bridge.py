@@ -35,6 +35,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import time
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,7 @@ from .types import GemmaLayerLoweringPlan, GemmaLoweringStatus
 _COMPOSED_STEP_METHODS: Dict[str, tuple[str, ...]] = {
     "attn_rmsnorm_linear": ("rmsnorm_layer", "linear_layer"),
     "dense_ffn_gate_up": ("rmsnorm_layer", "linear_layer"),
+    "dense_ffn_activation": ("moe_w2_linear_layer", "moe_mul_sum_add_layer"),
 }
 
 _MIRAGE_RUNTIME_EXTENSION_CACHE: Dict[str, Any] = {}
@@ -2759,6 +2761,174 @@ def run_mirage_moe_split_dense_w2_reduce_forward_correctness(
     }
 
 
+def run_mirage_ffn_down_projection_forward_correctness(
+    *,
+    seed: int = 0,
+    grid_dim_x: int = 1,
+    use_generic_activation_input: bool = True,
+    repack_after_activation: bool = True,
+) -> Dict[str, float]:
+    """Run the Gemma FFN down projection as a standalone live PK linear stage."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    num_tokens = 1
+    intermediate = 64
+    hidden = 512
+
+    if use_generic_activation_input:
+        import mirage
+
+        graph = mirage.new_kernel_graph()
+        gate = torch.randn((num_tokens, 1, intermediate), device="cuda", dtype=torch.bfloat16) / 8.0
+        up = torch.randn((num_tokens, 1, intermediate), device="cuda", dtype=torch.bfloat16) / 8.0
+        gate_in = graph.new_input(tuple(gate.shape), dtype=mirage.bfloat16)
+        up_in = graph.new_input(tuple(up.shape), dtype=mirage.bfloat16)
+        out = graph.mul(graph.gelu(gate_in), up_in)
+        graph.mark_output(out)
+        act_in = graph(inputs=[gate, up], target_cc=90)[0].squeeze(1).contiguous()
+    else:
+        act_in = torch.randn((num_tokens, intermediate), device="cuda", dtype=torch.bfloat16) / 8.0
+
+    if repack_after_activation:
+        packed = torch.empty_like(act_in)
+        packed.copy_(act_in)
+        act_in = packed
+
+    weight = torch.randn((hidden, intermediate), device="cuda", dtype=torch.bfloat16) / 16.0
+    out = torch.zeros((num_tokens, hidden), device="cuda", dtype=torch.bfloat16)
+    pk = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    act_dt = pk.attach_input(act_in, name="dbg_ffn_down_act")
+    weight_dt = pk.attach_input(weight.contiguous(), name="dbg_ffn_down_weight")
+    out_dt = pk.attach_input(out, name="dbg_ffn_down_out")
+    pk.linear_layer(
+        input=act_dt,
+        weight=weight_dt,
+        output=out_dt,
+        grid_dim=(grid_dim_x, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(pk)
+    _reset_pk_runtime_state(pk, active_tokens=1)
+    pk()
+    torch.cuda.synchronize()
+
+    ref = act_in.float() @ weight.float().transpose(0, 1)
+    return {
+        "out_max_abs": float((out.float() - ref).abs().max().item()),
+        "out_mean_abs": float((out.float() - ref).abs().mean().item()),
+    }
+
+
+def run_mirage_ffn_down_via_moe_w2_forward_correctness(
+    *,
+    seed: int = 0,
+    use_generic_activation_input: bool = True,
+    repack_after_activation: bool = True,
+) -> Dict[str, float]:
+    """Run FFN down projection through live ``moe_w2`` + reduction with top-k 1."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    num_tokens = 1
+    topk = 1
+    num_experts = 1
+    intermediate = 64
+    hidden = 512
+
+    if use_generic_activation_input:
+        import mirage
+
+        graph = mirage.new_kernel_graph()
+        gate = torch.randn((num_tokens, 1, intermediate), device="cuda", dtype=torch.bfloat16) / 8.0
+        up = torch.randn((num_tokens, 1, intermediate), device="cuda", dtype=torch.bfloat16) / 8.0
+        gate_in = graph.new_input(tuple(gate.shape), dtype=mirage.bfloat16)
+        up_in = graph.new_input(tuple(up.shape), dtype=mirage.bfloat16)
+        out = graph.mul(graph.gelu(gate_in), up_in)
+        graph.mark_output(out)
+        act_in = graph(inputs=[gate, up], target_cc=90)[0].contiguous()
+    else:
+        act_in = (
+            torch.randn((num_tokens, topk, intermediate), device="cuda", dtype=torch.bfloat16) / 8.0
+        )
+
+    if repack_after_activation:
+        packed = torch.empty_like(act_in)
+        packed.copy_(act_in)
+        act_in = packed
+
+    weight = (
+        torch.randn((num_experts, hidden, intermediate), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+    routing_indices = torch.zeros((num_experts, num_tokens), device="cuda", dtype=torch.int32)
+    routing_mask = torch.zeros((num_experts + 1,), device="cuda", dtype=torch.int32)
+    routing_indices[0, 0] = 1
+    routing_mask[0] = 0
+    routing_mask[num_experts] = 1
+    topk_weight = torch.ones((num_tokens, topk), device="cuda", dtype=torch.float32)
+    residual = torch.zeros((num_tokens, hidden), device="cuda", dtype=torch.bfloat16)
+    w2_out = torch.zeros((num_tokens, topk, hidden), device="cuda", dtype=torch.bfloat16)
+    out = torch.zeros((num_tokens, hidden), device="cuda", dtype=torch.bfloat16)
+
+    pk = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+    act_dt = pk.attach_input(act_in, name="dbg_ffn_moe_w2_act")
+    weight_dt = pk.attach_input(weight.contiguous(), name="dbg_ffn_moe_w2_weight")
+    routing_indices_dt = pk.attach_input(routing_indices, name="dbg_ffn_moe_w2_routing_indices")
+    routing_mask_dt = pk.attach_input(routing_mask, name="dbg_ffn_moe_w2_routing_mask")
+    topk_weight_dt = pk.attach_input(topk_weight, name="dbg_ffn_moe_w2_topk_weight")
+    residual_dt = pk.attach_input(residual, name="dbg_ffn_moe_w2_residual")
+    w2_out_dt = pk.attach_input(w2_out, name="dbg_ffn_moe_w2_out")
+    out_dt = pk.attach_input(out, name="dbg_ffn_moe_w2_hidden_out")
+
+    pk.moe_w2_linear_layer(
+        input=act_dt,
+        weight=weight_dt,
+        moe_routing_indices=routing_indices_dt,
+        moe_mask=routing_mask_dt,
+        output=w2_out_dt,
+        grid_dim=_moe_expert_grid_dim(pk, w13_linear=False),
+        block_dim=(128, 1, 1),
+    )
+    pk.moe_mul_sum_add_layer(
+        input=w2_out_dt,
+        weight=topk_weight_dt,
+        residual=residual_dt,
+        output=out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(pk)
+    _reset_pk_runtime_state(pk, active_tokens=1)
+    pk()
+    torch.cuda.synchronize()
+
+    ref = act_in[:, 0, :].float() @ weight[0].float().transpose(0, 1)
+    return {
+        "w2_max_abs": float((w2_out[:, 0, :].float() - ref).abs().max().item()),
+        "w2_mean_abs": float((w2_out[:, 0, :].float() - ref).abs().mean().item()),
+        "out_max_abs": float((out.float() - ref).abs().max().item()),
+        "out_mean_abs": float((out.float() - ref).abs().mean().item()),
+    }
+
+
 def run_mirage_moe_gelu_split_dense_block_forward_correctness(
     *,
     seed: int = 0,
@@ -3202,6 +3372,7 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
     *,
     eps: float = 1e-5,
     seed: int = 0,
+    verbose: bool = False,
 ) -> Dict[str, float]:
     """Run a synthetic Gemma-style layer live through attention, FFN, and MoE."""
 
@@ -3211,6 +3382,7 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
     import mirage
 
     torch.manual_seed(seed)
+    stage_timings: Dict[str, float] = {}
     num_tokens = 1
     hidden_size = 512
     qo_heads = 4
@@ -3223,13 +3395,85 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
     intermediate = 64
     ffn_intermediate = 64
 
-    def _run_gelu_mul_kernel(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    def _timed_call(
+        stage_name: str,
+        fn: Callable[[], Any],
+        *,
+        cuda_sync: bool = False,
+    ) -> Any:
+        start = time.perf_counter()
+        result = fn()
+        if cuda_sync:
+            torch.cuda.synchronize()
+        stage_timings[stage_name] = time.perf_counter() - start
+        if verbose:
+            print(f"{stage_name}={stage_timings[stage_name]:.3f}s", flush=True)
+        return result
+
+    def _run_gelu_mul_kernel(
+        gate: torch.Tensor,
+        up: torch.Tensor,
+        *,
+        stage_prefix: str,
+    ) -> torch.Tensor:
+        kernel_mod = importlib.import_module("mirage.kernel")
         graph = mirage.new_kernel_graph()
         gate_in = graph.new_input(tuple(gate.shape), dtype=mirage.bfloat16)
         up_in = graph.new_input(tuple(up.shape), dtype=mirage.bfloat16)
         out = graph.mul(graph.gelu(gate_in), up_in)
         graph.mark_output(out)
-        return graph(inputs=[gate, up], target_cc=90)[0]
+
+        original_generate_cuda_program = kernel_mod.generate_cuda_program
+        original_check_call = subprocess.check_call
+        codegen_s: Optional[float] = None
+        nvcc_s: Optional[float] = None
+
+        def _timed_generate_cuda_program(*args, **kwargs):
+            nonlocal codegen_s
+            start = time.perf_counter()
+            result = original_generate_cuda_program(*args, **kwargs)
+            codegen_s = time.perf_counter() - start
+            return result
+
+        def _timed_check_call(*args, **kwargs):
+            nonlocal nvcc_s
+            start = time.perf_counter()
+            result = original_check_call(*args, **kwargs)
+            nvcc_s = time.perf_counter() - start
+            return result
+
+        compile_start = time.perf_counter()
+        try:
+            kernel_mod.generate_cuda_program = _timed_generate_cuda_program
+            subprocess.check_call = _timed_check_call
+            graph.compile(inputs=[gate, up], target_cc=90)
+        finally:
+            kernel_mod.generate_cuda_program = original_generate_cuda_program
+            subprocess.check_call = original_check_call
+
+        stage_timings[f"{stage_prefix}_compile_s"] = time.perf_counter() - compile_start
+        if codegen_s is not None:
+            stage_timings[f"{stage_prefix}_codegen_s"] = codegen_s
+        if nvcc_s is not None:
+            stage_timings[f"{stage_prefix}_nvcc_s"] = nvcc_s
+        if verbose:
+            print(
+                f"{stage_prefix}_compile_s={stage_timings[f'{stage_prefix}_compile_s']:.3f}s "
+                f"(codegen={codegen_s if codegen_s is not None else float('nan'):.3f}s, "
+                f"nvcc={nvcc_s if nvcc_s is not None else float('nan'):.3f}s)",
+                flush=True,
+            )
+
+        launch_start = time.perf_counter()
+        outputs = graph(inputs=[gate, up], target_cc=90)
+        torch.cuda.synchronize()
+        stage_timings[f"{stage_prefix}_launch_s"] = time.perf_counter() - launch_start
+        if verbose:
+            print(
+                f"{stage_prefix}_launch_s={stage_timings[f'{stage_prefix}_launch_s']:.3f}s",
+                flush=True,
+            )
+        return outputs[0]
 
     # Attention sublayer.
     attn_pk = create_test_persistent_kernel(
@@ -3325,7 +3569,7 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         grid_dim=(1, 1, 1),
         block_dim=(128, 1, 1),
     )
-    compile_persistent_kernel_with_patches(attn_pk)
+    _timed_call("attn_pk_compile_s", lambda: compile_persistent_kernel_with_patches(attn_pk))
     _reset_pk_runtime_state(
         attn_pk,
         active_tokens=num_tokens,
@@ -3334,8 +3578,7 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         paged_kv_indices=paged_kv_indices,
         paged_kv_last_page_len=paged_kv_last_page_len,
     )
-    attn_pk()
-    torch.cuda.synchronize()
+    _timed_call("attn_pk_launch_s", attn_pk, cuda_sync=True)
 
     qkv_variance = hidden_in.float().pow(2).mean(dim=-1, keepdim=True)
     qkv_ref = (hidden_in.float() * torch.rsqrt(qkv_variance + eps)) * attn_norm_weight.float()
@@ -3409,10 +3652,9 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         grid_dim=(1, 1, 1),
         block_dim=(128, 1, 1),
     )
-    compile_persistent_kernel_with_patches(ffn_phase1)
+    _timed_call("ffn_phase1_compile_s", lambda: compile_persistent_kernel_with_patches(ffn_phase1))
     _reset_pk_runtime_state(ffn_phase1, active_tokens=1)
-    ffn_phase1()
-    torch.cuda.synchronize()
+    _timed_call("ffn_phase1_launch_s", ffn_phase1, cuda_sync=True)
 
     ffn_gate_live, ffn_up_live = torch.chunk(ffn_gate_up, 2, dim=-1)
     packed_ffn_gate = torch.empty(
@@ -3426,7 +3668,11 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
     # The 3D MoE-shaped activation path compiles much faster than the 2D
     # variant for this small FFN case, so route the FFN activation through the
     # same kernel shape and squeeze it back.
-    ffn_act = _run_gelu_mul_kernel(ffn_gate_live.unsqueeze(1), ffn_up_live.unsqueeze(1))
+    ffn_act = _run_gelu_mul_kernel(
+        ffn_gate_live.unsqueeze(1),
+        ffn_up_live.unsqueeze(1),
+        stage_prefix="ffn_activation",
+    )
     ffn_act = ffn_act.squeeze(1).contiguous()
 
     ffn_phase2 = create_test_persistent_kernel(
@@ -3437,23 +3683,65 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         page_size=64,
         use_cutlass_kernel=False,
     )
-    ffn_act_dt = ffn_phase2.attach_input(ffn_act, name="full_layer_ffn_act")
+    ffn_act_moe = torch.empty(
+        (num_tokens, 1, ffn_intermediate), device="cuda", dtype=torch.bfloat16
+    )
+    ffn_act_moe[:, 0, :].copy_(ffn_act)
+    ffn_routing_indices = torch.zeros((1, num_tokens), device="cuda", dtype=torch.int32)
+    ffn_routing_mask = torch.zeros((2,), device="cuda", dtype=torch.int32)
+    ffn_topk_weight = torch.ones((num_tokens, 1), device="cuda", dtype=torch.float32)
+    ffn_residual_zero = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_w2_weight = torch.empty(
+        (1, hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16
+    )
+    ffn_w2_weight[0].copy_(ffn_down_weight)
+    ffn_intermediate_out = torch.zeros(
+        (num_tokens, 1, hidden_size), device="cuda", dtype=torch.bfloat16
+    )
+
+    ffn_routing_indices[0, 0] = 1
+    ffn_routing_mask[0] = 0
+    ffn_routing_mask[1] = 1
+
+    ffn_act_dt = ffn_phase2.attach_input(ffn_act_moe, name="full_layer_ffn_act")
     ffn_down_weight_dt = ffn_phase2.attach_input(
-        ffn_down_weight.contiguous(), name="full_layer_ffn_down_weight"
+        ffn_w2_weight.contiguous(), name="full_layer_ffn_down_weight"
+    )
+    ffn_routing_indices_dt = ffn_phase2.attach_input(
+        ffn_routing_indices, name="full_layer_ffn_routing_indices"
+    )
+    ffn_routing_mask_dt = ffn_phase2.attach_input(
+        ffn_routing_mask, name="full_layer_ffn_routing_mask"
+    )
+    ffn_topk_weight_dt = ffn_phase2.attach_input(ffn_topk_weight, name="full_layer_ffn_topk_weight")
+    ffn_residual_zero_dt = ffn_phase2.attach_input(
+        ffn_residual_zero, name="full_layer_ffn_zero_residual"
     )
     ffn_down = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_intermediate_out_dt = ffn_phase2.attach_input(
+        ffn_intermediate_out, name="full_layer_ffn_w2_out"
+    )
     ffn_down_dt = ffn_phase2.attach_input(ffn_down, name="full_layer_ffn_down")
-    ffn_phase2.linear_layer(
+    ffn_phase2.moe_w2_linear_layer(
         input=ffn_act_dt,
         weight=ffn_down_weight_dt,
+        moe_routing_indices=ffn_routing_indices_dt,
+        moe_mask=ffn_routing_mask_dt,
+        output=ffn_intermediate_out_dt,
+        grid_dim=_moe_expert_grid_dim(ffn_phase2, w13_linear=False),
+        block_dim=(128, 1, 1),
+    )
+    ffn_phase2.moe_mul_sum_add_layer(
+        input=ffn_intermediate_out_dt,
+        weight=ffn_topk_weight_dt,
+        residual=ffn_residual_zero_dt,
         output=ffn_down_dt,
         grid_dim=(1, 1, 1),
         block_dim=(128, 1, 1),
     )
-    compile_persistent_kernel_with_patches(ffn_phase2)
+    _timed_call("ffn_phase2_compile_s", lambda: compile_persistent_kernel_with_patches(ffn_phase2))
     _reset_pk_runtime_state(ffn_phase2, active_tokens=1)
-    ffn_phase2()
-    torch.cuda.synchronize()
+    _timed_call("ffn_phase2_launch_s", ffn_phase2, cuda_sync=True)
 
     ffn_norm_ref = _rms_norm(post_attn_live, ffn_norm_weight, eps=eps)
     ffn_gate_up_ref = ffn_norm_ref @ ffn_gate_up_weight.float().transpose(0, 1)
@@ -3512,10 +3800,9 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         grid_dim=(1, 1, 1),
         block_dim=(128, 1, 1),
     )
-    compile_persistent_kernel_with_patches(router_pk)
+    _timed_call("router_pk_compile_s", lambda: compile_persistent_kernel_with_patches(router_pk))
     _reset_pk_runtime_state(router_pk, active_tokens=1)
-    router_pk()
-    torch.cuda.synchronize()
+    _timed_call("router_pk_launch_s", router_pk, cuda_sync=True)
 
     selected_experts = []
     for expert_index in range(num_experts):
@@ -3566,10 +3853,9 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         gate_outs.append(gate_out)
         up_outs.append(up_out)
 
-    compile_persistent_kernel_with_patches(expert_pk)
+    _timed_call("expert_pk_compile_s", lambda: compile_persistent_kernel_with_patches(expert_pk))
     _reset_pk_runtime_state(expert_pk, active_tokens=1)
-    expert_pk()
-    torch.cuda.synchronize()
+    _timed_call("expert_pk_launch_s", expert_pk, cuda_sync=True)
 
     gate_live = torch.stack([tensor[0].float() for tensor in gate_outs], dim=0).unsqueeze(0)
     up_live = torch.stack([tensor[0].float() for tensor in up_outs], dim=0).unsqueeze(0)
@@ -3577,7 +3863,11 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
     moe_up_in = torch.empty((num_tokens, topk, intermediate), device="cuda", dtype=torch.bfloat16)
     moe_gate_in.copy_(gate_live.to(torch.bfloat16))
     moe_up_in.copy_(up_live.to(torch.bfloat16))
-    moe_act = _run_gelu_mul_kernel(moe_gate_in, moe_up_in).contiguous()
+    moe_act = _run_gelu_mul_kernel(
+        moe_gate_in,
+        moe_up_in,
+        stage_prefix="moe_activation",
+    ).contiguous()
 
     phase3 = create_test_persistent_kernel(
         max_seq_length=128,
@@ -3616,10 +3906,9 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         grid_dim=(1, 1, 1),
         block_dim=(128, 1, 1),
     )
-    compile_persistent_kernel_with_patches(phase3)
+    _timed_call("phase3_compile_s", lambda: compile_persistent_kernel_with_patches(phase3))
     _reset_pk_runtime_state(phase3, active_tokens=1)
-    phase3()
-    torch.cuda.synchronize()
+    _timed_call("phase3_launch_s", phase3, cuda_sync=True)
 
     ref_logits = post_attn_live @ router_weight.float().transpose(0, 1)
     ref_topk_values, ref_topk_indices = torch.topk(ref_logits, k=topk, dim=-1)
@@ -3644,6 +3933,7 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
     ref_hidden_out = (ref_w2 * ref_topk_weight.unsqueeze(-1)).sum(dim=1) + ffn_down_ref
 
     return {
+        **stage_timings,
         "post_attn_max_abs": float((post_attn_live - post_attn_ref).abs().max().item()),
         "post_attn_mean_abs": float((post_attn_live - post_attn_ref).abs().mean().item()),
         "ffn_down_max_abs": float((ffn_down.float() - ffn_down_ref).abs().max().item()),
@@ -3657,6 +3947,29 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         "w2_mean_abs": float((w2_out.float() - ref_w2).abs().mean().item()),
         "hidden_out_max_abs": float((hidden_out.float() - ref_hidden_out).abs().max().item()),
         "hidden_out_mean_abs": float((hidden_out.float() - ref_hidden_out).abs().mean().item()),
+    }
+
+
+def profile_mirage_gemma_full_layer_split_dense_compile_stages(
+    *,
+    eps: float = 1e-5,
+    seed: int = 0,
+    verbose: bool = False,
+) -> Dict[str, float]:
+    """Return only timing metrics for the synthetic full live-layer helper."""
+
+    results = run_mirage_gemma_full_layer_split_dense_forward_correctness(
+        eps=eps,
+        seed=seed,
+        verbose=verbose,
+    )
+    return {
+        key: value
+        for key, value in results.items()
+        if key.endswith("_compile_s")
+        or key.endswith("_codegen_s")
+        or key.endswith("_nvcc_s")
+        or key.endswith("_launch_s")
     }
 
 
