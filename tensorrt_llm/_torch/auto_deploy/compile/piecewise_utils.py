@@ -99,17 +99,17 @@ _STREAM_SWITCH_FUNCTION_NAMES = frozenset(
     }
 )
 
-# Partition-boundary ops: mathematical no-ops decorated with @torch._dynamo.disable
-# solely to force a piecewise-graph split at a specific point.  They carry
-# no compute but allow a preceding static region to be CUDA-graph-captured
-# independently of a following dynamic region that contains stream switches.
-# These ops do NOT need MetadataWrapper or out= buffers (they are identity
-# passthroughs — the output IS the input tensor).
-# NOTE: use bare function names (no namespace prefix) because @dynamo.disable
-# functions appear via __qualname__, not via an OpOverload .name().
-_PARTITION_BOUNDARY_OPS = [
-    "gemma4_router_fence",
-]
+# Partition-boundary ops: reserved for mathematical no-ops decorated with
+# @torch._dynamo.disable that should force a piecewise-graph split at a
+# specific point (e.g. to isolate a region for independent CUDA graph capture).
+# Currently empty: gemma4_router_fence was removed (iter112) because the fence
+# was creating 30 extra dynamic-eager dispatch calls per step (~150µs overhead)
+# with no corresponding benefit — the router output is already correctly
+# positioned before attention by the iter107 reorder, so no forced split is
+# needed for correctness.  The fence op remains in the model graph (still carries
+# the @dynamo.disable attribute) but is treated as a static identity passthrough
+# that merges into its surrounding static partition.
+_PARTITION_BOUNDARY_OPS: list = []
 
 
 def _get_all_dynamic_op_names() -> Set[str]:
@@ -321,24 +321,8 @@ def split_graph_at_dynamic_ops(gm: GraphModule) -> SplitInfo:
             partition_counter[0] += 1
             node_to_partition[node] = partition_counter[0]
             dynamic_partitions.add(partition_counter[0])
-            # Partition-boundary ops (e.g. gemma4_router_fence) are no-op identity
-            # functions whose only purpose is to mark a split point.  Keep the
-            # partition open so the immediately following ops (e.g.
-            # begin_aux_stream_passthrough) join the same partition instead of
-            # creating a separate trivial 1-op dynamic-eager partition.  This
-            # eliminates ~30 single-op dynamic-eager dispatch calls per decode
-            # step (~150µs saved) by merging each fence partition into the
-            # following dynamic-wrapped MoE partition.
-            target = node.target
-            op_name = (
-                target.name()
-                if hasattr(target, "name")
-                else getattr(target, "__qualname__", str(target))
-            )
-            is_open_boundary = any(b in op_name for b in _PARTITION_BOUNDARY_OPS)
-            if not is_open_boundary:
-                # Standard dynamic op: next static region gets a new partition
-                partition_counter[0] += 1
+            # Next static region gets a new partition
+            partition_counter[0] += 1
         else:
             # Static op joins the current static partition
             node_to_partition[node] = partition_counter[0]
