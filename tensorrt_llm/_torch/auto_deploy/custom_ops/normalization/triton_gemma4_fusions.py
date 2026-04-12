@@ -272,17 +272,17 @@ def _post_add_norm_add_scale_kernel(
 # ---------------------------------------------------------------------------
 
 # Threshold: use Triton fused kernel for T ≤ this value; use flashinfer for T > this.
-# At small T (≤ 8) each kernel launch costs ~200-300ns in a CUDA graph; fusing
-# 2 launches into 1 saves ~250ns × 2 sites × 30 layers ≈ 15µs at c=1.
-# Standalone device-side benchmarks (CUDA events) show FlashInfer 1.4-2× faster
-# than Triton for all T, but this is dominated by serial scheduling overhead that
-# does NOT exist in CUDA graphs. In-graph, Triton's single kernel per fusion site
-# beats 2-3 FlashInfer kernels due to lower graph dispatch overhead.
-# Verified: threshold=0 (always FlashInfer) caused +1.4%/+0.7% regression vs
-# threshold=8 at c=1/c=256 in the CUDA-graph decode path (iter92 vs iter82 baseline).
-# At large T (> 8) flashinfer's vectorised RMSNorm + elementwise add outperform
-# the Triton kernel (which wastes 31% of elements due to BLOCK_H=4096 > H=2816).
-_TRITON_T_THRESHOLD = 8
+# iter103 finding: CUDA-graph benchmark (torch.cuda.CUDAGraph) shows Triton is
+# 2.5-3.8× faster than FlashInfer for ALL T from 1 to 256, due to node dispatch
+# overhead dominating over device compute time at all batch sizes.
+# - post_norm_add_pre_ff_2norm at T=256: Triton=2.17µs vs FI=5.86µs → 2.7× faster
+# - 3-norm-scale at T=256: Triton=3.33µs vs FI=11.0µs → 3.3× faster
+# Raised from 8 → 512 to cover all decode batch sizes (max_batch_size=512).
+# FlashInfer fallback kept for very large T (prefill ISL > 512) where Triton's
+# BLOCK_H=4096 wastes >31% bandwidth relative to H=2816 hidden size.
+# Original threshold=8 was set based on eager-mode (non-graph) benchmarks at
+# iter92 which measure Python/CUDA-runtime overhead, not CUDA-graph node overhead.
+_TRITON_T_THRESHOLD = 512
 
 
 @torch.library.custom_op("auto_deploy::gemma4_post_norm_add", mutates_args=(), device_types="cuda")
@@ -854,9 +854,13 @@ def _gemma4_post_norm_add_and_pre_ff_2norm_fake(
 # ---------------------------------------------------------------------------
 
 # Use Triton fused kernel when total QKV head-rows ≤ this value.
-# At BS=8, local (N_H=16, N_KV=8): N_Q=128, N_KV=64, total=256.
-# Matches _TRITON_T_THRESHOLD=8 spirit but expressed in total rows.
-_QKV_TRITON_THRESHOLD = 256
+# iter103: CUDA-graph benchmark shows Triton is 2.1-4.6× faster than FlashInfer
+# for ALL batch sizes due to graph node dispatch overhead dominating compute.
+# Raised from 256 → 20000 to cover all decode batch sizes up to max_batch_size=512:
+#   - Local (H=256,NQ=16,NKV=8) BS=512: total_rows=512×16+2×512×8=16384; Triton 2.1× faster
+#   - Global (H=512,NQ=16,NKV=2) BS=512: total_rows=512×16+2×512×2=10240; Triton 2.2× faster
+# FlashInfer fallback kept for very large T prefills (total_rows > 20000).
+_QKV_TRITON_THRESHOLD = 20000
 
 
 @triton.autotune(
