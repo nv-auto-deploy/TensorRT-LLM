@@ -26,5 +26,7 @@ transforms:
     enabled: true
   fuse_gemms:
     enabled: true
+  fuse_gelu_tanh_mul:
+    enabled: true
   multi_stream_moe:
     enabled: true
