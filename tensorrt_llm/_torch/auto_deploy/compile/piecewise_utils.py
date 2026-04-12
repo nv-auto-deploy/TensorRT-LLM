@@ -99,17 +99,19 @@ _STREAM_SWITCH_FUNCTION_NAMES = frozenset(
     }
 )
 
-# Partition-boundary ops: reserved for mathematical no-ops decorated with
-# @torch._dynamo.disable that should force a piecewise-graph split at a
-# specific point (e.g. to isolate a region for independent CUDA graph capture).
-# Currently empty: gemma4_router_fence was removed (iter112) because the fence
-# was creating 30 extra dynamic-eager dispatch calls per step (~150µs overhead)
-# with no corresponding benefit — the router output is already correctly
-# positioned before attention by the iter107 reorder, so no forced split is
-# needed for correctness.  The fence op remains in the model graph (still carries
-# the @dynamo.disable attribute) but is treated as a static identity passthrough
-# that merges into its surrounding static partition.
-_PARTITION_BOUNDARY_OPS: list = []
+# Static-boundary ops: mathematical no-ops decorated with @torch._dynamo.disable
+# that force a piecewise-graph split at a specific point WITHOUT creating a new
+# dynamic partition.  Unlike fully dynamic ops (attention, SSM, etc.) these ops:
+#   (a) stay in the CURRENT static partition (not isolated in their own partition),
+#   (b) increment the counter so the FOLLOWING ops start a NEW static partition.
+# This cleanly separates a preceding CUDA-graph-captured static region from a
+# following region that contains stream-switches (and would be reclassified as
+# dynamic-eager), without creating a third "fence-only" dynamic-eager partition.
+# NOTE: use bare function names (no namespace prefix) because @dynamo.disable
+# functions appear via __qualname__, not via an OpOverload .name().
+_STATIC_BOUNDARY_OPS = [
+    "gemma4_router_fence",
+]
 
 
 def _get_all_dynamic_op_names() -> Set[str]:
@@ -122,8 +124,31 @@ def _get_all_dynamic_op_names() -> Set[str]:
         + _METADATA_PREP_OPS
         + _LOGITS_GATHER_OPS
         + _PERSISTENT_BUFFER_OPS
-        + _PARTITION_BOUNDARY_OPS
+        # NOTE: _STATIC_BOUNDARY_OPS are intentionally NOT included here.
+        # Static-boundary ops force a partition split but remain in the preceding
+        # static partition — they are NOT dynamic and do NOT need out= buffers.
     )
+
+
+def is_static_boundary_op(node: Node) -> bool:
+    """Check if a node is a static-boundary op.
+
+    Static-boundary ops are mathematical no-ops (@torch._dynamo.disable) that
+    force a piecewise-graph partition split while remaining in the CURRENT
+    (preceding) static partition.  They do NOT get their own isolated partition
+    and are NOT dynamic — the following ops start a fresh static partition that
+    can be CUDA-graph-captured independently.
+    """
+    if node.op != "call_function":
+        return False
+    target = node.target
+    op_name = (
+        target.name() if hasattr(target, "name") else getattr(target, "__qualname__", str(target))
+    )
+    for boundary_op in _STATIC_BOUNDARY_OPS:
+        if boundary_op in op_name:
+            return True
+    return False
 
 
 def is_dynamic_cached_op(node: Node) -> bool:
@@ -211,7 +236,7 @@ _SKIP_OUT_DYNAMIC_OPS: Set[str] = (
     | set(_METADATA_PREP_OPS)
     | set(_LOGITS_GATHER_OPS)
     | set(_PERSISTENT_BUFFER_OPS)
-    | set(_PARTITION_BOUNDARY_OPS)
+    # NOTE: _STATIC_BOUNDARY_OPS are not dynamic and never need out= buffers.
 )
 
 
@@ -317,12 +342,22 @@ def split_graph_at_dynamic_ops(gm: GraphModule) -> SplitInfo:
             continue
 
         if is_dynamic_cached_op(node):
-            # Dynamic op gets its own partition
+            # Dynamic op gets its own isolated partition
             partition_counter[0] += 1
             node_to_partition[node] = partition_counter[0]
             dynamic_partitions.add(partition_counter[0])
             # Next static region gets a new partition
             partition_counter[0] += 1
+        elif is_static_boundary_op(node):
+            # Static-boundary op: stays in the CURRENT static partition but
+            # ends it — the following ops start a fresh static partition.
+            # This avoids creating a fence-only dynamic-eager partition while
+            # preserving the CUDA-graph boundary between the preceding static
+            # region (e.g. post-attn + 3-norm + router + fence) and the
+            # following region that may contain stream-switch functions
+            # (and would be reclassified as dynamic-eager).
+            node_to_partition[node] = partition_counter[0]
+            partition_counter[0] += 1  # next ops get a new partition
         else:
             # Static op joins the current static partition
             node_to_partition[node] = partition_counter[0]
