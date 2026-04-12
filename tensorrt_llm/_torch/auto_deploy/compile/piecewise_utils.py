@@ -321,8 +321,24 @@ def split_graph_at_dynamic_ops(gm: GraphModule) -> SplitInfo:
             partition_counter[0] += 1
             node_to_partition[node] = partition_counter[0]
             dynamic_partitions.add(partition_counter[0])
-            # Next static region gets a new partition
-            partition_counter[0] += 1
+            # Partition-boundary ops (e.g. gemma4_router_fence) are no-op identity
+            # functions whose only purpose is to mark a split point.  Keep the
+            # partition open so the immediately following ops (e.g.
+            # begin_aux_stream_passthrough) join the same partition instead of
+            # creating a separate trivial 1-op dynamic-eager partition.  This
+            # eliminates ~30 single-op dynamic-eager dispatch calls per decode
+            # step (~150µs saved) by merging each fence partition into the
+            # following dynamic-wrapped MoE partition.
+            target = node.target
+            op_name = (
+                target.name()
+                if hasattr(target, "name")
+                else getattr(target, "__qualname__", str(target))
+            )
+            is_open_boundary = any(b in op_name for b in _PARTITION_BOUNDARY_OPS)
+            if not is_open_boundary:
+                # Standard dynamic op: next static region gets a new partition
+                partition_counter[0] += 1
         else:
             # Static op joins the current static partition
             node_to_partition[node] = partition_counter[0]
