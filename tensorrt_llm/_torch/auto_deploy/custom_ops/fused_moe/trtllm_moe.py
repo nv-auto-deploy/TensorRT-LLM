@@ -449,7 +449,6 @@ def trtllm_moe_fused(
         output_dtype=x.dtype,
         quant_scales=quant_scales,
         activation_type=activation_type,
-        min_latency_mode=True,
     )[0].view(x_shape)
 
 
