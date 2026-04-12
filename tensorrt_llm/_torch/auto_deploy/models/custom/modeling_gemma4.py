@@ -609,13 +609,17 @@ class Gemma4TextDecoderLayer(nn.Module):
             hidden_states = packed[0]
             residual = hidden_states
 
+            # MoE path (router first — MUST precede mlp so begin_aux_stream_passthrough is
+            # inserted after the router in the FX graph, allowing multi_stream_moe transform
+            # to place a gemma4_router_fence partition boundary between them.  This keeps the
+            # router in a static CUDA-graph-captured partition, eliminating Python dispatch
+            # overhead and enabling multi-SM speedup.  See iter107.)
+            hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            top_k_weights, top_k_index = self.router(hs_flat)
+
             # Dense MLP path (produce un-normed output — norm absorbed into 3-norm fusion below)
             hs_dense = packed[1]
             hs_dense = self.mlp(hs_dense)
-
-            # MoE path (produce un-normed output — norm absorbed into 3-norm fusion below)
-            hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-            top_k_weights, top_k_index = self.router(hs_flat)
             hs_moe = packed[2].reshape(hs_flat.shape)
             hs_moe = self.moe(hs_moe, top_k_index, top_k_weights)
             hs_moe = hs_moe.reshape(hidden_states.shape)
