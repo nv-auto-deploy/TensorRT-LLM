@@ -109,13 +109,13 @@ token counting and reduced model).
 |---|---|---|---|---|---|
 | 0 | ref | 2.443 | 3.720 | 18.264 | 6L baseline |
 | 1 | discard | — | — | — | `fuse_add_rms_norm`: no effect on Gemma4 residual-add pattern |
-| 2 | keep | 2.362 | 3.710 | 18.220 | `multi_stream_moe` enabled: shared expert moves to aux CUDA stream, +3.3% c1 |
+| 2 | keep | 2.362 | 3.710 | 18.220 | `multi_stream_moe` enabled: shared expert moves to aux CUDA stream, −3.3% c1 |
 | 3 | keep | 2.340 | 3.716 | 18.381 | Accuracy fix: `caller_stream.synchronize()` + piecewise reclassification of stream-switch partitions as dynamic |
 | 4 | discard | 2.395 | 3.715 | 18.480 | `fuse_gemms_mixed_children`: −2.3% vs iter3 (worse) |
 | 5 | discard | 2.385 | 3.739 | 18.916 | `multi_stream_gemm`: −1.9% vs iter3 (worse) |
 | 6 | crash | — | — | — | TRTLLM `attn_backend`: CRASH — MMHA does not support head_dim=512 |
 | 7 | crash | — | — | — | FlashInfer `attn_backend`: CRASH — head_dim=512 not supported in prefill kernel |
-| 8 | keep | 2.241 | 3.372 | 19.132 | **Disable `mlir_elementwise_fusion`**: +4.2% c1, +9.2% c16. MLIR was serializing multi-stream MoE path |
+| 8 | keep | 2.241 | 3.372 | 19.132 | **Disable `mlir_elementwise_fusion`**: −4.2% c1, −9.2% c16. MLIR was serializing multi-stream MoE path |
 | 9 | discard | 2.387 | 3.717 | 18.951 | `rmsnorm_backend=triton`: −2.0% vs iter3 |
 | 10 | discard | 2.408 | 3.703 | 18.761 | `piecewise_enabled=false`: −2.9% (confirms piecewise helps) |
 | 11 | discard | 2.419 | 3.751 | 19.574 | `gather_logits_before_lm_head=false`: −3.4% |
@@ -127,12 +127,12 @@ token counting and reduced model).
 | 17 | discard | 2.281 | 3.367 | 18.935 | `fuse_gemms_mixed` + no MLIR: −1.8% |
 | 18 | discard | 2.415 | 3.810 | 19.260 | MLIR shape propagation: −7.8% |
 | 19 | discard | 2.279 | 3.382 | 18.410 | `multi_stream_gemm` + no MLIR: −1.7% |
-| 20 | discard | 2.314 | 3.388 | 18.442 | Skip `begin_aux` CPU sync: −3.3% c1 (c256 +3.8% better, tradeoff not worth it) |
+| 20 | discard | 2.314 | 3.388 | 18.442 | Skip `begin_aux` CPU sync: +3.3% c1 REGRESSION (c256 −3.8%, tradeoff not worth it) |
 | 21 | discard | 2.321 | 3.388 | 18.798 | `fuse_add_rms_norm` + no MLIR: −3.6%, TTFT +52% |
 | 22 | profile | — | — | — | NSys profile run (overhead active, not perf data) |
 | 23 | discard | 2.268 | 3.395 | 18.398 | Skip CPU sync + `fuse_add_rms`: −1.2% |
 | 24 | discard | 2.322 | 3.377 | 18.180 | No piecewise + no MLIR: −3.6% c1, c256 −5% (piecewise trades c1 for c256) |
-| 25 | keep | 2.299 | 3.257 | 17.396 | **Fused Triton router**: c16 +3.4%, c256 +9.1% (batched router dispatch, fewer kernel launches) |
+| 25 | keep | 2.299 | 3.257 | 17.396 | **Fused Triton router**: c16 −3.4%, c256 −9.1% (batched router dispatch, fewer kernel launches) |
 | 26 | discard | — | — | — | `multi_stream_gemm` at ISL=2048: neutral (<1.5%) |
 | 27 | discard | — | — | — | `fuse_gemms_mixed_children` at ISL=2048: neutral |
 | 28 | discard | 2.379 | 3.469 | 19.705 | `multi_stream_mla_attn`: −6.2% c1 (wrong for non-MLA model) |
@@ -150,7 +150,7 @@ Starting from iter8/iter25 config. Exploring fused kernel ideas in the attention
 | Iter | Status | TPOT c1 | TPOT c16 | TPOT c256 | Description |
 |---|---|---|---|---|---|
 | 33 | crash | — | — | — | `piecewise_num_tokens=32` (int): CRASH (must be a list) |
-| 34 (iter39) | keep | 2.264 | 3.255 | 18.059 | **Adaptive Triton/FlashInfer dispatch**: −1.5% c1 vs iter25; c16 flat; c256 +3.8% |
+| 34 (iter39) | keep | 2.264 | 3.255 | 18.059 | **Adaptive Triton/FlashInfer dispatch**: −1.5% c1 vs iter25; c16 flat; c256 +3.8% REGRESSION |
 | 35 (iter40) | discard | 2.355 | 3.521 | 18.573 | `dual_norm+norm_add2`: +4.0% c1, +8.2% c16 REGRESSION. Root cause: dual norm serializes multi-stream MoE (both streams wait for 1 fused op before forking) |
 | 36 (iter41) | discard | 5.357 | 12.470 | 18.906 | Fused QKV-norm (tuple return): +137% c1, +295% c16. Root cause: tuple-return custom op NOT captured in CUDA graph → 30 graph exit/re-entry per step |
 | 37 | discard | — | — | — | Accidental full-model run (wrong config); results discarded |
@@ -225,7 +225,7 @@ The **baseline** for this phase is iter86 (commit `641e3aca63`): c1=5.613ms, c16
 ## Working Optimizations — Detailed Analysis
 
 ### 1. Disable mlir_elementwise_fusion (iter8, permanent config)
-**c1 +4.2%, c16 +9.2%**
+**c1 −4.2%, c16 −9.2%**
 
 MLIR was fusing elementwise ops that occurred at the fork/join points of the
 multi-stream MoE path. This serialized the shared expert (MLP) and the routed
@@ -235,7 +235,7 @@ MLIR restores the fork/join structure that multi-stream relies on.
 ---
 
 ### 2. Fused Triton Router (iter25, commit `0dc1d9d4b8`)
-**c16 +3.4%, c256 +9.1%**
+**c16 −3.4%, c256 −9.1%**
 
 The router for each of the 30 MoE layers dispatches `hidden_size×num_experts`
 (2816×128) GEMM. The baseline called this as individual ops. The fused Triton
