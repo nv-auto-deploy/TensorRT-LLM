@@ -5,6 +5,7 @@ max_batch_size: 256
 max_seq_len: 8192
 enable_chunked_prefill: true
 cuda_graph_config:
+  max_batch_size: 256
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
 kv_cache_config:
   tokens_per_block: 32
@@ -32,4 +33,5 @@ transforms:
   gather_logits_before_lm_head:
     enabled: true
   compile_model:
-    piecewise_enabled: false
+    piecewise_enabled: true
+    piecewise_num_tokens: [512, 2048, 8192]
