@@ -29,6 +29,7 @@ from __future__ import annotations
 import ctypes
 import importlib
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -40,7 +41,7 @@ import time
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 import torch
 import torch.nn.functional as F
@@ -775,6 +776,52 @@ def _mpk_debug(message: str) -> None:
         print(f"[AD_MPK_DEBUG +{elapsed_s:8.3f}s] {message}", flush=True)
 
 
+def _mpk_profile_blocks_enabled() -> bool:
+    value = os.environ.get("AD_MPK_PROFILE_BLOCKS", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _mpk_sync_each_block_enabled() -> bool:
+    value = os.environ.get("AD_MPK_SYNC_EVERY_BLOCK", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _mpk_profile_executors_enabled() -> bool:
+    value = os.environ.get("AD_MPK_PROFILE_EXECUTORS", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _mpk_profile(message: str) -> None:
+    if _mpk_profile_blocks_enabled():
+        elapsed_s = time.perf_counter() - _MPK_DEBUG_START_TIME
+        print(f"[AD_MPK_PROFILE +{elapsed_s:8.3f}s] {message}", flush=True)
+
+
+_T = TypeVar("_T")
+
+
+def _mpk_run_profiled(label: str, fn: Callable[[], _T]) -> _T:
+    if not _mpk_profile_blocks_enabled():
+        return fn()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    result = fn()
+    torch.cuda.synchronize()
+    _mpk_profile(f"{label} elapsed_s={time.perf_counter() - start:.6f}")
+    return result
+
+
+def _mpk_profile_executor(label: str, fn: Callable[[], _T]) -> _T:
+    if not _mpk_profile_executors_enabled():
+        return fn()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    result = fn()
+    torch.cuda.synchronize()
+    _mpk_profile(f"{label} elapsed_s={time.perf_counter() - start:.6f}")
+    return result
+
+
 def _mirage_repo_root() -> Path:
     package_dir = _find_mirage_package_dir()
     if package_dir is None:
@@ -929,41 +976,92 @@ def patch_generated_mirage_cuda_source(cuda_code: str) -> str:
     return cuda_code
 
 
+def _normalize_mpk_cache_source(cuda_code: str) -> str:
+    """Normalize generated CUDA text for cache-key stability.
+
+    Mirage can emit concrete device pointer literals into the generated launcher
+    source for ``attach_input``-bound tensors. Those pointers are runtime
+    instance details rather than structural compile inputs, so they should not
+    force a cache miss.
+    """
+
+    return re.sub(r"0x[0-9a-fA-F]+", "0x__MIRAGE_PTR__", cuda_code)
+
+
+def _rebind_compiled_pk_named_bindings(pk) -> None:
+    """Rebind current named tensors/meta after loading or compiling a launcher."""
+
+    bind_tensor = getattr(pk, "bind_tensor_func", None)
+    if bind_tensor is not None:
+        for name, tensor in getattr(pk, "_bound_tensors", {}).items():
+            bind_tensor(name, tensor.data_ptr())
+
+    bind_meta = getattr(pk, "bind_meta_func", None)
+    if bind_meta is not None:
+        for name, tensor in getattr(pk, "_bound_meta_tensors", {}).items():
+            bind_meta(name, tensor.data_ptr())
+
+
+def _load_cached_launcher_isolated(
+    pk,
+    cache_paths: dict[str, str],
+    output_dir: Optional[str],
+    export_compile_artifacts_fn: Callable[[str, Optional[str], int], None],
+) -> bool:
+    """Load a cached launcher through a per-instance copied module path.
+
+    Mirage launcher modules hold process-global runtime state. Loading the same
+    cached ``.so`` into multiple fresh PK objects in one interpreter can cause
+    teardown collisions on shutdown. Copying the cached launcher to a unique
+    per-instance path keeps the compile cache benefit while isolating module
+    state for each PK instance.
+    """
+
+    if not os.path.isfile(cache_paths["module"]):
+        return False
+
+    ext_suffix = os.path.splitext(cache_paths["module"])[1]
+    isolated_dir = tempfile.mkdtemp(prefix="mirage_pk_cached_load_")
+    isolated_module_path = os.path.join(isolated_dir, f"launcher{ext_suffix}")
+    shutil.copy2(cache_paths["module"], isolated_module_path)
+    pk._bridge_cached_module_dir = isolated_dir
+    pk._load_launcher_from_path(isolated_module_path)
+    export_compile_artifacts_fn(cache_paths["dir"], output_dir, pk.mpi_rank)
+    print(f"Loaded cached megakernel from {cache_paths['dir']}")
+    return True
+
+
 def compile_persistent_kernel_with_patches(
     pk,
     *,
     output_dir: Optional[str] = None,
 ):
-    """Compile a Mirage ``PersistentKernel`` via a bridge-side patched codegen path."""
+    """Compile a Mirage ``PersistentKernel`` via the patched bridge cache path."""
 
     persistent_kernel_mod, kernel_mod = _require_mirage_compile_support()
     hard_code = getattr(persistent_kernel_mod, "HARD_CODE")
+    mpk_version = getattr(persistent_kernel_mod, "__version__")
+    mpk_cache_version = getattr(persistent_kernel_mod, "MPK_CACHE_VERSION")
+    mpk_cache_source_name = getattr(persistent_kernel_mod, "MPK_CACHE_SOURCE_NAME")
+    mpk_cache_task_graph_name = getattr(persistent_kernel_mod, "MPK_CACHE_TASK_GRAPH_NAME")
+    mpk_cache_module_stem = getattr(persistent_kernel_mod, "MPK_CACHE_MODULE_STEM")
     get_compile_command = getattr(persistent_kernel_mod, "get_compile_command")
+    export_compile_artifacts = getattr(persistent_kernel_mod, "_export_compile_artifacts")
+    is_mpk_cache_enabled = getattr(persistent_kernel_mod, "_is_mpk_cache_enabled")
+    get_mpk_cache_root = getattr(persistent_kernel_mod, "_get_mpk_cache_root")
+    build_cache_key = getattr(persistent_kernel_mod, "_build_cache_key")
+    cache_entry_paths = getattr(persistent_kernel_mod, "_cache_entry_paths")
+    cache_entry_complete = getattr(persistent_kernel_mod, "_cache_entry_complete")
+    readable_nvcc_version = getattr(persistent_kernel_mod, "_readable_nvcc_version")
+    sha256_text = getattr(persistent_kernel_mod, "_sha256_text")
     get_key_paths = getattr(kernel_mod, "get_key_paths")
 
     if pk._is_compiled:
         return pk
 
-    # Use a fresh build directory for every compile. Reusing a stable
-    # ``test.so`` path under online modes can cause stale launcher binaries to
-    # be reloaded across repeated experiments in the same process.
-    tempdir = tempfile.mkdtemp(prefix="mirage_pk_")
     results = pk.kn_graph.generate_task_graph(num_gpus=pk.world_size, my_gpu_id=pk.mpi_rank)
-
+    task_graph_json = results["json_file"]
     cuda_code = patch_generated_mirage_cuda_source(results["cuda_code"] + hard_code)
-    cuda_code_path = os.path.join(tempdir, "test.cu")
-    so_path = os.path.join(tempdir, "test" + sysconfig.get_config_var("EXT_SUFFIX"))
-    json_file_path = os.path.join(tempdir, "task_graph.json")
-
-    with open(json_file_path, "w", encoding="utf-8") as f:
-        f.write(results["json_file"])
-    with open(cuda_code_path, "w", encoding="utf-8") as f:
-        f.write(cuda_code)
-
-    if output_dir is not None:
-        os.makedirs(output_dir, exist_ok=True)
-        shutil.copy(cuda_code_path, os.path.join(output_dir, f"test_rank{pk.mpi_rank}.cu"))
-        shutil.copy(json_file_path, os.path.join(output_dir, f"task_graph_rank{pk.mpi_rank}.json"))
 
     cc = shutil.which("nvcc")
     if cc is None:
@@ -976,15 +1074,110 @@ def compile_persistent_kernel_with_patches(
     if scheme == "posix_local":
         scheme = "posix_prefix"
     py_include_dir = sysconfig.get_paths(scheme=scheme)["include"]
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
 
     mirage_root, include_path, deps_path = get_key_paths()
+    mirage_home_path = os.environ.get("MIRAGE_HOME", mirage_root)
+
+    normalized_cc_cmd = get_compile_command(
+        mpk=pk,
+        target_cc=pk.target_cc,
+        cc=cc,
+        file_name="__MIRAGE_MPK_SOURCE__",
+        py_include_dir=py_include_dir,
+        mirage_home_path=mirage_home_path,
+        mirage_inc_path=include_path,
+        mirage_deps_path=deps_path,
+        nvshmem_inc_path=None,
+        nvshmem_lib_path=None,
+        mpi_inc_path=None,
+        mpi_lib_path=None,
+        py_so_path="__MIRAGE_MPK_OUTPUT__" + ext_suffix,
+        profiling=True if pk.profiler_tensor is not None else False,
+        use_nvshmem=pk.use_nvshmem,
+        num_workers=pk.num_workers,
+        num_local_schedulers=pk.num_local_schedulers,
+        num_remote_schedulers=pk.num_remote_schedulers,
+        use_cutlass_kernel=pk.use_cutlass_kernel,
+    )
+    if pk.target_cc == 90:
+        normalized_cc_cmd = [arg for arg in normalized_cc_cmd if arg != "-arch=sm_90a"]
+
+    cache_key_material = {
+        "cache_version": mpk_cache_version,
+        "mirage_version": mpk_version,
+        "ext_suffix": ext_suffix,
+        "target_cc": pk.target_cc,
+        "mode": pk.mode,
+        "use_nvshmem": pk.use_nvshmem,
+        "nvcc_path": cc,
+        "nvcc_version": readable_nvcc_version(cc),
+        "compile_command": normalized_cc_cmd,
+        "bridge_patch_version": 2,
+    }
+    cache_key = build_cache_key(
+        key_material=cache_key_material,
+        cuda_code=_normalize_mpk_cache_source(cuda_code),
+        task_graph_json=task_graph_json,
+    )
+
+    cache_paths = None
+    tempdir = None
+    use_cache = is_mpk_cache_enabled()
+    if use_cache:
+        try:
+            cache_root = get_mpk_cache_root()
+            os.makedirs(cache_root, exist_ok=True)
+            cache_paths = cache_entry_paths(os.path.join(cache_root, cache_key), ext_suffix)
+            if cache_entry_complete(cache_paths):
+                try:
+                    if _load_cached_launcher_isolated(
+                        pk,
+                        cache_paths,
+                        output_dir,
+                        export_compile_artifacts,
+                    ):
+                        pk._initialize_compiled_launcher()
+                        _rebind_compiled_pk_named_bindings(pk)
+                        pk._is_compiled = True
+                        return pk
+                except Exception as exc:
+                    print(
+                        f"Failed to load cached MPK entry at {cache_paths['dir']} ({exc}); recompiling."
+                    )
+                    shutil.rmtree(cache_paths["dir"], ignore_errors=True)
+            if os.path.isdir(cache_paths["dir"]) and not cache_entry_complete(cache_paths):
+                shutil.rmtree(cache_paths["dir"], ignore_errors=True)
+            tempdir = cache_paths["dir"]
+            os.makedirs(tempdir, exist_ok=True)
+        except OSError:
+            cache_paths = None
+            use_cache = False
+
+    if tempdir is None:
+        tempdir = tempfile.mkdtemp(prefix="mirage_pk_")
+
+    cuda_code_path = os.path.join(tempdir, mpk_cache_source_name)
+    so_path = os.path.join(tempdir, mpk_cache_module_stem + ext_suffix)
+    json_file_path = os.path.join(tempdir, mpk_cache_task_graph_name)
+
+    with open(json_file_path, "w", encoding="utf-8") as f:
+        f.write(task_graph_json)
+    with open(cuda_code_path, "w", encoding="utf-8") as f:
+        f.write(cuda_code)
+
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        shutil.copy(cuda_code_path, os.path.join(output_dir, f"test_rank{pk.mpi_rank}.cu"))
+        shutil.copy(json_file_path, os.path.join(output_dir, f"task_graph_rank{pk.mpi_rank}.json"))
+
     cc_cmd = get_compile_command(
         mpk=pk,
         target_cc=pk.target_cc,
         cc=cc,
         file_name=cuda_code_path,
         py_include_dir=py_include_dir,
-        mirage_home_path=os.environ.get("MIRAGE_HOME", mirage_root),
+        mirage_home_path=mirage_home_path,
         mirage_inc_path=include_path,
         mirage_deps_path=deps_path,
         nvshmem_inc_path=None,
@@ -1026,6 +1219,27 @@ def compile_persistent_kernel_with_patches(
     cc_cmd[insertion_index:insertion_index] = include_args
     subprocess.check_call(cc_cmd)
 
+    artifact_dir = tempdir
+    if use_cache and cache_paths is not None:
+        metadata = {
+            "cache_key": cache_key,
+            "cache_version": mpk_cache_version,
+            "mirage_version": mpk_version,
+            "target_cc": pk.target_cc,
+            "mode": pk.mode,
+            "use_nvshmem": pk.use_nvshmem,
+            "nvcc_path": cc,
+            "nvcc_version": cache_key_material["nvcc_version"],
+            "compile_command": normalized_cc_cmd,
+            "source_sha256": sha256_text(cuda_code),
+            "task_graph_sha256": sha256_text(task_graph_json),
+            "hard_code_sha256": sha256_text(hard_code),
+            "bridge_patch_version": cache_key_material["bridge_patch_version"],
+        }
+        metadata_path = os.path.join(artifact_dir, "metadata.json")
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, sort_keys=True, indent=2)
+
     spec = importlib.util.spec_from_file_location("__mirage_launcher", so_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load Mirage launcher module from {so_path}")
@@ -1034,7 +1248,10 @@ def compile_persistent_kernel_with_patches(
     pk.init_func = getattr(mod, "init_func")
     pk.launch_func = getattr(mod, "launch_func")
     pk.init_request_func = getattr(mod, "init_request_func")
+    pk.bind_tensor_func = getattr(mod, "bind_tensor_func", None)
+    pk.bind_meta_func = getattr(mod, "bind_meta_func", None)
     pk.finalize_func = getattr(mod, "finalize_func")
+    export_compile_artifacts(artifact_dir, output_dir, pk.mpi_rank)
 
     meta_tensors = [
         pk.meta_tensors["step"],
@@ -1062,6 +1279,7 @@ def compile_persistent_kernel_with_patches(
         pk.eos_token_id,
         pk.allocate_nvshmem_teams,
     )
+    _rebind_compiled_pk_named_bindings(pk)
     pk._is_compiled = True
     return pk
 
@@ -4093,6 +4311,7 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         dim=0,
     ).unsqueeze(0)
     ref_hidden_out = (ref_w2.float() * topk_weight.float().unsqueeze(-1)).sum(dim=1) + ffn_down_ref
+    live_moe_act_ref = (F.gelu(gate_live) * up_live).contiguous()
 
     return {
         **stage_timings,
@@ -4103,6 +4322,12 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         "topk_weight_max_abs": float((topk_weight.float() - ref_topk_weight).abs().max().item()),
         "topk_weight_mean_abs": float((topk_weight.float() - ref_topk_weight).abs().mean().item()),
         "routing_overlap_count": float(len(set(experts) & set(ref_ids))),
+        "moe_act_live_inputs_max_abs": float(
+            (moe_act.float() - live_moe_act_ref).abs().max().item()
+        ),
+        "moe_act_live_inputs_mean_abs": float(
+            (moe_act.float() - live_moe_act_ref).abs().mean().item()
+        ),
         "moe_act_max_abs": float((moe_act.float() - ref_moe_act).abs().max().item()),
         "moe_act_mean_abs": float((moe_act.float() - ref_moe_act).abs().mean().item()),
         "w2_max_abs": float((w2_out.float() - ref_w2).abs().max().item()),
@@ -6277,33 +6502,49 @@ class _GemmaDecodeLayerBlock:
         kv_cache: torch.Tensor,
         capture_debug: bool,
     ) -> _GemmaLayerBlockResult:
-        qkv_outputs = self.qkv_block(hidden=hidden)
-        attention_outputs = self.attention_block(
-            q=qkv_outputs.q,
-            k=qkv_outputs.k,
-            v=qkv_outputs.v,
-            position_ids=position_ids,
-            batch_info_host=batch_info_host,
-            cu_seqlen_host=cu_seqlen_host,
-            cu_num_pages=cu_num_pages,
-            cu_num_pages_host=cu_num_pages_host,
-            cache_loc=cache_loc,
-            last_page_len=last_page_len,
-            last_page_len_host=last_page_len_host,
-            seq_len_with_cache_host=seq_len_with_cache_host,
-            triton_batch_indices=triton_batch_indices,
-            triton_positions=triton_positions,
-            kv_cache=kv_cache,
+        layer_label = f"layer_{self.layer_spec.layer_index}"
+        qkv_outputs = _mpk_run_profiled(
+            f"{layer_label}.qkv",
+            lambda: self.qkv_block(hidden=hidden),
         )
-        attention_output = self.attention_output_block(
-            hidden=hidden,
-            attn_out_flat=attention_outputs.attn_out_flat,
+        attention_outputs = _mpk_run_profiled(
+            f"{layer_label}.attention",
+            lambda: self.attention_block(
+                q=qkv_outputs.q,
+                k=qkv_outputs.k,
+                v=qkv_outputs.v,
+                position_ids=position_ids,
+                batch_info_host=batch_info_host,
+                cu_seqlen_host=cu_seqlen_host,
+                cu_num_pages=cu_num_pages,
+                cu_num_pages_host=cu_num_pages_host,
+                cache_loc=cache_loc,
+                last_page_len=last_page_len,
+                last_page_len_host=last_page_len_host,
+                seq_len_with_cache_host=seq_len_with_cache_host,
+                triton_batch_indices=triton_batch_indices,
+                triton_positions=triton_positions,
+                kv_cache=kv_cache,
+            ),
         )
-        dense_ffn_output = self.dense_ffn_block(post_attn=attention_output.post_attn)
-        moe_output = self.moe_block(
-            post_attn=attention_output.post_attn,
-            ffn_norm=dense_ffn_output.ffn_norm,
-            capture_debug=capture_debug,
+        attention_output = _mpk_run_profiled(
+            f"{layer_label}.attn_out",
+            lambda: self.attention_output_block(
+                hidden=hidden,
+                attn_out_flat=attention_outputs.attn_out_flat,
+            ),
+        )
+        dense_ffn_output = _mpk_run_profiled(
+            f"{layer_label}.dense_ffn",
+            lambda: self.dense_ffn_block(post_attn=attention_output.post_attn),
+        )
+        moe_output = _mpk_run_profiled(
+            f"{layer_label}.moe",
+            lambda: self.moe_block(
+                post_attn=attention_output.post_attn,
+                ffn_norm=dense_ffn_output.ffn_norm,
+                capture_debug=capture_debug,
+            ),
         )
 
         debug_tensors: Dict[str, torch.Tensor] = {}
@@ -6334,6 +6575,8 @@ class _MirageLinearExecutor:
         self.capacity = capacity
         self.in_dim = in_dim
         self.out_dim = out_dim
+        self.input_name = f"{name}_input"
+        self.weight_name = f"{name}_weight"
         self.pk = create_test_persistent_kernel(
             max_seq_length=max(128, capacity),
             max_num_batched_requests=1,
@@ -6345,8 +6588,8 @@ class _MirageLinearExecutor:
         self.input = torch.empty((capacity, in_dim), device="cuda", dtype=torch.bfloat16)
         self.weight = torch.empty((out_dim, in_dim), device="cuda", dtype=torch.bfloat16)
         self.output = torch.empty((capacity, out_dim), device="cuda", dtype=torch.bfloat16)
-        input_dt = self.pk.attach_input(self.input, name=f"{name}_input")
-        weight_dt = self.pk.attach_input(self.weight, name=f"{name}_weight")
+        input_dt = self.pk.attach_input(self.input, name=self.input_name)
+        weight_dt = self.pk.attach_input(self.weight, name=self.weight_name)
         output_dt = self.pk.attach_input(self.output, name=f"{name}_output")
         self.pk.linear_layer(
             input=input_dt,
@@ -6358,11 +6601,21 @@ class _MirageLinearExecutor:
         compile_persistent_kernel_with_patches(self.pk)
 
     def __call__(self, input_tensor: torch.Tensor, weight_tensor: torch.Tensor) -> torch.Tensor:
-        self.input.copy_(input_tensor.contiguous().view(self.capacity, self.in_dim))
-        self.weight.copy_(weight_tensor.contiguous())
+        input_binding = input_tensor.contiguous().view(self.capacity, self.in_dim)
+        weight_binding = weight_tensor.contiguous()
         _reset_pk_runtime_state(self.pk, active_tokens=self.capacity)
-        self.pk()
-        torch.cuda.synchronize()
+        _mpk_profile_executor(
+            f"linear.launch capacity={self.capacity} in_dim={self.in_dim} out_dim={self.out_dim}",
+            lambda: self.pk.run(
+                dynamic_inputs={
+                    self.input_name: input_binding,
+                    self.weight_name: weight_binding,
+                },
+                reset_runtime_state=False,
+            ),
+        )
+        if _mpk_sync_each_block_enabled():
+            torch.cuda.synchronize()
         return self.output
 
 
@@ -6372,6 +6625,8 @@ class _MirageRouterExecutor:
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.topk = topk
+        self.hidden_name = "router_hidden"
+        self.weight_name = "router_weight"
         self.pk = create_test_persistent_kernel(
             max_seq_length=max(128, capacity),
             max_num_batched_requests=1,
@@ -6388,8 +6643,8 @@ class _MirageRouterExecutor:
             (num_experts, capacity), device="cuda", dtype=torch.int32
         )
         self.routing_mask = torch.empty((num_experts + 1,), device="cuda", dtype=torch.int32)
-        hidden_dt = self.pk.attach_input(self.hidden, name="router_hidden")
-        weight_dt = self.pk.attach_input(self.weight, name="router_weight")
+        hidden_dt = self.pk.attach_input(self.hidden, name=self.hidden_name)
+        weight_dt = self.pk.attach_input(self.weight, name=self.weight_name)
         logits_dt = self.pk.attach_input(self.logits, name="router_logits")
         topk_weight_dt = self.pk.attach_input(self.topk_weight, name="router_topk_weight")
         routing_indices_dt = self.pk.attach_input(
@@ -6414,11 +6669,21 @@ class _MirageRouterExecutor:
     def __call__(
         self, hidden_tensor: torch.Tensor, weight_tensor: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        self.hidden.copy_(hidden_tensor.contiguous().view(self.capacity, self.hidden_size))
-        self.weight.copy_(weight_tensor.contiguous())
+        hidden_binding = hidden_tensor.contiguous().view(self.capacity, self.hidden_size)
+        weight_binding = weight_tensor.contiguous()
         _reset_pk_runtime_state(self.pk, active_tokens=self.capacity)
-        self.pk()
-        torch.cuda.synchronize()
+        _mpk_profile_executor(
+            f"router.launch capacity={self.capacity} hidden={self.hidden_size} experts={self.num_experts}",
+            lambda: self.pk.run(
+                dynamic_inputs={
+                    self.hidden_name: hidden_binding,
+                    self.weight_name: weight_binding,
+                },
+                reset_runtime_state=False,
+            ),
+        )
+        if _mpk_sync_each_block_enabled():
+            torch.cuda.synchronize()
         return self.topk_weight, self.routing_indices, self.routing_mask
 
 
@@ -6437,6 +6702,11 @@ class _MirageMoeW13Executor:
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
         self.topk = topk
+        self.hidden_name = "moe_w13_hidden"
+        self.gate_weight_name = "moe_w13_gate_weight"
+        self.up_weight_name = "moe_w13_up_weight"
+        self.routing_indices_name = "moe_w13_routing_indices"
+        self.routing_mask_name = "moe_w13_routing_mask"
         self.pk = create_test_persistent_kernel(
             max_seq_length=max(128, capacity),
             max_num_batched_requests=1,
@@ -6454,17 +6724,17 @@ class _MirageMoeW13Executor:
             (num_experts, capacity), device="cuda", dtype=torch.int32
         )
         self.routing_mask = torch.empty((num_experts + 1,), device="cuda", dtype=torch.int32)
-        self.gate_out = torch.empty(
+        self.gate_out = torch.zeros(
             (capacity, topk, intermediate_size), device="cuda", dtype=torch.bfloat16
         )
         self.up_out = torch.empty_like(self.gate_out)
-        hidden_dt = self.pk.attach_input(self.hidden, name="moe_w13_hidden")
-        gate_weight_dt = self.pk.attach_input(self.gate_weight, name="moe_w13_gate_weight")
-        up_weight_dt = self.pk.attach_input(self.up_weight, name="moe_w13_up_weight")
+        hidden_dt = self.pk.attach_input(self.hidden, name=self.hidden_name)
+        gate_weight_dt = self.pk.attach_input(self.gate_weight, name=self.gate_weight_name)
+        up_weight_dt = self.pk.attach_input(self.up_weight, name=self.up_weight_name)
         routing_indices_dt = self.pk.attach_input(
-            self.routing_indices, name="moe_w13_routing_indices"
+            self.routing_indices, name=self.routing_indices_name
         )
-        routing_mask_dt = self.pk.attach_input(self.routing_mask, name="moe_w13_routing_mask")
+        routing_mask_dt = self.pk.attach_input(self.routing_mask, name=self.routing_mask_name)
         gate_out_dt = self.pk.attach_input(self.gate_out, name="moe_w13_gate_out")
         up_out_dt = self.pk.attach_input(self.up_out, name="moe_w13_up_out")
         self.pk.moe_w13_linear_layer(
@@ -6495,14 +6765,27 @@ class _MirageMoeW13Executor:
         routing_indices: torch.Tensor,
         routing_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        self.hidden.copy_(hidden_tensor.contiguous().view(self.capacity, self.hidden_size))
-        self.gate_weight.copy_(gate_weight.contiguous())
-        self.up_weight.copy_(up_weight.contiguous())
-        self.routing_indices.copy_(routing_indices)
-        self.routing_mask.copy_(routing_mask)
+        hidden_binding = hidden_tensor.contiguous().view(self.capacity, self.hidden_size)
+        gate_weight_binding = gate_weight.contiguous()
+        up_weight_binding = up_weight.contiguous()
+        routing_indices_binding = routing_indices.contiguous()
+        routing_mask_binding = routing_mask.contiguous()
+        self.hidden.copy_(hidden_binding)
+        self.gate_weight.copy_(gate_weight_binding)
+        self.up_weight.copy_(up_weight_binding)
+        self.routing_indices.copy_(routing_indices_binding)
+        self.routing_mask.copy_(routing_mask_binding)
         _reset_pk_runtime_state(self.pk, active_tokens=self.capacity)
-        self.pk()
-        torch.cuda.synchronize()
+        self.gate_out.zero_()
+        self.up_out.zero_()
+        _mpk_profile_executor(
+            "moe_w13.launch "
+            f"capacity={self.capacity} hidden={self.hidden_size} "
+            f"intermediate={self.intermediate_size} experts={self.num_experts} topk={self.topk}",
+            lambda: self.pk(),
+        )
+        if _mpk_sync_each_block_enabled():
+            torch.cuda.synchronize()
         return self.gate_out, self.up_out
 
 
@@ -6521,6 +6804,12 @@ class _MirageMoeW2ReduceExecutor:
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
+        self.act_name = "moe_w2_act"
+        self.weight_name = "moe_w2_weight"
+        self.routing_indices_name = "moe_w2_indices"
+        self.routing_mask_name = "moe_w2_mask"
+        self.topk_weight_name = "moe_w2_topk_weight"
+        self.residual_name = "moe_w2_residual"
         self.pk = create_test_persistent_kernel(
             max_seq_length=max(128, capacity),
             max_num_batched_requests=1,
@@ -6541,16 +6830,18 @@ class _MirageMoeW2ReduceExecutor:
         self.routing_mask = torch.empty((num_experts + 1,), device="cuda", dtype=torch.int32)
         self.topk_weight = torch.empty((capacity, topk), device="cuda", dtype=torch.float32)
         self.residual = torch.empty((capacity, hidden_size), device="cuda", dtype=torch.bfloat16)
-        self.w2_out = torch.empty(
+        self.w2_out = torch.zeros(
             (capacity, topk, hidden_size), device="cuda", dtype=torch.bfloat16
         )
-        self.output = torch.empty((capacity, hidden_size), device="cuda", dtype=torch.bfloat16)
-        act_dt = self.pk.attach_input(self.act, name="moe_w2_act")
-        weight_dt = self.pk.attach_input(self.weight, name="moe_w2_weight")
-        routing_indices_dt = self.pk.attach_input(self.routing_indices, name="moe_w2_indices")
-        routing_mask_dt = self.pk.attach_input(self.routing_mask, name="moe_w2_mask")
-        topk_weight_dt = self.pk.attach_input(self.topk_weight, name="moe_w2_topk_weight")
-        residual_dt = self.pk.attach_input(self.residual, name="moe_w2_residual")
+        self.output = torch.zeros((capacity, hidden_size), device="cuda", dtype=torch.bfloat16)
+        act_dt = self.pk.attach_input(self.act, name=self.act_name)
+        weight_dt = self.pk.attach_input(self.weight, name=self.weight_name)
+        routing_indices_dt = self.pk.attach_input(
+            self.routing_indices, name=self.routing_indices_name
+        )
+        routing_mask_dt = self.pk.attach_input(self.routing_mask, name=self.routing_mask_name)
+        topk_weight_dt = self.pk.attach_input(self.topk_weight, name=self.topk_weight_name)
+        residual_dt = self.pk.attach_input(self.residual, name=self.residual_name)
         w2_out_dt = self.pk.attach_input(self.w2_out, name="moe_w2_out")
         output_dt = self.pk.attach_input(self.output, name="moe_w2_output")
         self.pk.moe_w2_linear_layer(
@@ -6581,15 +6872,33 @@ class _MirageMoeW2ReduceExecutor:
         topk_weight: torch.Tensor,
         residual: torch.Tensor,
     ) -> torch.Tensor:
-        self.act.copy_(act_tensor.contiguous())
-        self.weight.copy_(weight_tensor.contiguous())
-        self.routing_indices.copy_(routing_indices)
-        self.routing_mask.copy_(routing_mask)
-        self.topk_weight.copy_(topk_weight)
-        self.residual.copy_(residual.contiguous().view(self.capacity, self.hidden_size))
+        act_binding = act_tensor.contiguous()
+        weight_binding = weight_tensor.contiguous()
+        routing_indices_binding = routing_indices.contiguous()
+        routing_mask_binding = routing_mask.contiguous()
+        topk_weight_binding = topk_weight.contiguous()
+        residual_binding = residual.contiguous().view(self.capacity, self.hidden_size)
         _reset_pk_runtime_state(self.pk, active_tokens=self.capacity)
-        self.pk()
-        torch.cuda.synchronize()
+        self.w2_out.zero_()
+        self.output.zero_()
+        _mpk_profile_executor(
+            "moe_w2.launch "
+            f"capacity={self.capacity} topk={self.topk} hidden={self.hidden_size} "
+            f"intermediate={self.intermediate_size} experts={self.num_experts}",
+            lambda: self.pk.run(
+                dynamic_inputs={
+                    self.act_name: act_binding,
+                    self.weight_name: weight_binding,
+                    self.routing_indices_name: routing_indices_binding,
+                    self.routing_mask_name: routing_mask_binding,
+                    self.topk_weight_name: topk_weight_binding,
+                    self.residual_name: residual_binding,
+                },
+                reset_runtime_state=False,
+            ),
+        )
+        if _mpk_sync_each_block_enabled():
+            torch.cuda.synchronize()
         return self.output
 
 
@@ -8192,6 +8501,7 @@ class _GemmaMirageRuntime:
             _mpk_debug(
                 f"compile linear executor capacity={capacity} in_dim={in_dim} out_dim={out_dim} name={name}"
             )
+            build_start = time.perf_counter()
             executor = _MirageLinearExecutor(
                 capacity=capacity,
                 in_dim=in_dim,
@@ -8199,6 +8509,11 @@ class _GemmaMirageRuntime:
                 name=f"linear_{capacity}_{in_dim}_{out_dim}",
             )
             self._linear_cache[key] = executor
+            _mpk_profile(
+                "build linear executor "
+                f"capacity={capacity} in_dim={in_dim} out_dim={out_dim} "
+                f"elapsed_s={time.perf_counter() - build_start:.6f}"
+            )
         return executor(input_tensor, weight_tensor)
 
     def _router(
@@ -8245,6 +8560,7 @@ class _GemmaMirageRuntime:
                 f"capacity={capacity} hidden={int(hidden_tensor.shape[1])} "
                 f"num_experts={num_experts} topk={topk}"
             )
+            build_start = time.perf_counter()
             executor = _MirageRouterExecutor(
                 capacity=capacity,
                 hidden_size=int(hidden_tensor.shape[1]),
@@ -8252,6 +8568,12 @@ class _GemmaMirageRuntime:
                 topk=topk,
             )
             self._router_cache[key] = executor
+            _mpk_profile(
+                "build router executor "
+                f"capacity={capacity} hidden={int(hidden_tensor.shape[1])} "
+                f"num_experts={num_experts} topk={topk} "
+                f"elapsed_s={time.perf_counter() - build_start:.6f}"
+            )
         return executor(hidden_tensor, weight_tensor)
 
     def _moe_w13(
@@ -8303,6 +8625,7 @@ class _GemmaMirageRuntime:
                 f"intermediate={int(gate_weight.shape[1])} num_experts={int(gate_weight.shape[0])} "
                 f"topk={topk}"
             )
+            build_start = time.perf_counter()
             executor = _MirageMoeW13Executor(
                 capacity=capacity,
                 hidden_size=int(hidden_tensor.shape[1]),
@@ -8311,6 +8634,13 @@ class _GemmaMirageRuntime:
                 topk=topk,
             )
             self._moe_w13_cache[key] = executor
+            _mpk_profile(
+                "build moe_w13 executor "
+                f"capacity={capacity} hidden={int(hidden_tensor.shape[1])} "
+                f"intermediate={int(gate_weight.shape[1])} "
+                f"num_experts={int(gate_weight.shape[0])} topk={topk} "
+                f"elapsed_s={time.perf_counter() - build_start:.6f}"
+            )
         return executor(hidden_tensor, gate_weight, up_weight, routing_indices, routing_mask)
 
     def _moe_w2_reduce(
@@ -8387,6 +8717,7 @@ class _GemmaMirageRuntime:
                 f"capacity={capacity} topk={topk} hidden={int(weight_tensor.shape[1])} "
                 f"intermediate={intermediate} num_experts={int(weight_tensor.shape[0])}"
             )
+            build_start = time.perf_counter()
             executor = _MirageMoeW2ReduceExecutor(
                 capacity=capacity,
                 topk=topk,
@@ -8395,6 +8726,12 @@ class _GemmaMirageRuntime:
                 num_experts=int(weight_tensor.shape[0]),
             )
             self._moe_w2_cache[key] = executor
+            _mpk_profile(
+                "build moe_w2 executor "
+                f"capacity={capacity} topk={topk} hidden={int(weight_tensor.shape[1])} "
+                f"intermediate={intermediate} num_experts={int(weight_tensor.shape[0])} "
+                f"elapsed_s={time.perf_counter() - build_start:.6f}"
+            )
         return executor(
             act_tensor,
             weight_tensor,
@@ -8412,8 +8749,12 @@ class _GemmaMirageRuntime:
         executor = self._gelu_cache.get(key)
         if executor is None:
             _mpk_debug(f"compile gelu executor shape={key}")
+            build_start = time.perf_counter()
             executor = _MirageGeluMulExecutor(shape=key)
             self._gelu_cache[key] = executor
+            _mpk_profile(
+                f"build gelu executor shape={key} elapsed_s={time.perf_counter() - build_start:.6f}"
+            )
         return executor(gate.contiguous(), up.contiguous())
 
     def _matmul(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -8424,8 +8765,14 @@ class _GemmaMirageRuntime:
         executor = self._matmul_cache.get(key)
         if executor is None:
             _mpk_debug(f"compile matmul executor shape_a={tuple(a.shape)} shape_b={tuple(b.shape)}")
+            build_start = time.perf_counter()
             executor = _MirageMatmulExecutor(m=key[0], k=key[1], n=key[2])
             self._matmul_cache[key] = executor
+            _mpk_profile(
+                "build matmul executor "
+                f"shape_a={tuple(a.shape)} shape_b={tuple(b.shape)} "
+                f"elapsed_s={time.perf_counter() - build_start:.6f}"
+            )
         return executor(a.contiguous(), b.contiguous())
 
     def _ffn_down_decode(
@@ -8568,34 +8915,46 @@ class _GemmaMirageRuntime:
                 ).view(batch_size, seq_len, -1)
                 _mpk_debug(f"exit layer {layer_spec.layer_index} [single-pk]")
                 continue
-            layer_outputs = layer_block(
-                hidden=hidden,
-                position_ids=position_ids,
-                batch_info_host=batch_info_host,
-                cu_seqlen_host=cu_seqlen_host,
-                cu_num_pages=cu_num_pages,
-                cu_num_pages_host=cu_num_pages_host,
-                cache_loc=cache_loc,
-                last_page_len=last_page_len,
-                last_page_len_host=last_page_len_host,
-                seq_len_with_cache_host=seq_len_with_cache_host,
-                triton_batch_indices=triton_batch_indices,
-                triton_positions=triton_positions,
-                kv_cache=kv_cache,
-                capture_debug=debug_tensors is not None and layer_spec.layer_index == 0,
+            layer_outputs = _mpk_run_profiled(
+                f"layer_{layer_spec.layer_index}.total",
+                lambda: layer_block(
+                    hidden=hidden,
+                    position_ids=position_ids,
+                    batch_info_host=batch_info_host,
+                    cu_seqlen_host=cu_seqlen_host,
+                    cu_num_pages=cu_num_pages,
+                    cu_num_pages_host=cu_num_pages_host,
+                    cache_loc=cache_loc,
+                    last_page_len=last_page_len,
+                    last_page_len_host=last_page_len_host,
+                    seq_len_with_cache_host=seq_len_with_cache_host,
+                    triton_batch_indices=triton_batch_indices,
+                    triton_positions=triton_positions,
+                    kv_cache=kv_cache,
+                    capture_debug=debug_tensors is not None and layer_spec.layer_index == 0,
+                ),
             )
             hidden = layer_outputs.hidden
             if debug_tensors is not None and layer_spec.layer_index == 0:
                 debug_tensors.update(layer_outputs.debug_tensors)
             _mpk_debug(f"exit layer {layer_spec.layer_index}")
 
-        hidden = _rms_norm(hidden, self.final_norm_weight)
-        gathered = torch.ops.auto_deploy.gather_tokens.default(
-            hidden,
-            token_gather_indices,
-            batch_info_host,
+        hidden = _mpk_run_profiled(
+            "final.rmsnorm",
+            lambda: _rms_norm(hidden, self.final_norm_weight),
         )
-        logits = gathered @ self.embed_weight.transpose(0, 1)
+        gathered = _mpk_run_profiled(
+            "final.gather_tokens",
+            lambda: torch.ops.auto_deploy.gather_tokens.default(
+                hidden,
+                token_gather_indices,
+                batch_info_host,
+            ),
+        )
+        logits = _mpk_run_profiled(
+            "final.lm_head",
+            lambda: gathered @ self.embed_weight.transpose(0, 1),
+        )
         logits = torch.tanh(logits / 30.0) * 30.0
         logits = logits.view(*gathered.shape[:-1], logits.shape[-1])
         _mpk_debug(f"return logits shape={tuple(logits.shape)}")
