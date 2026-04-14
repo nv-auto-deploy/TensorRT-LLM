@@ -22,6 +22,7 @@ from tensorrt_llm._torch.auto_deploy.mpk import (
     GemmaMpkRuntimeWrapper,
     build_gemma_mirage_runtime_callable,
 )
+from tensorrt_llm._torch.auto_deploy.mpk.mirage_bridge import _should_use_single_pk_layer
 from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import CompileModel
 
 
@@ -136,3 +137,14 @@ def test_compile_model_skips_when_mirage_runtime_mode_is_active():
     assert compiled_mod is mod
     assert info.skipped is True
     assert info.is_clean is True
+
+
+def test_single_pk_layer_path_is_opt_in(monkeypatch):
+    monkeypatch.delenv("AD_MPK_ENABLE_SINGLE_PK_LAYER", raising=False)
+    assert _should_use_single_pk_layer(batch_size=1, seq_len=1, num_prefill=0) is False
+
+    monkeypatch.setenv("AD_MPK_ENABLE_SINGLE_PK_LAYER", "1")
+    assert _should_use_single_pk_layer(batch_size=1, seq_len=1, num_prefill=0) is True
+    assert _should_use_single_pk_layer(batch_size=1, seq_len=2, num_prefill=0) is False
+    assert _should_use_single_pk_layer(batch_size=2, seq_len=1, num_prefill=0) is False
+    assert _should_use_single_pk_layer(batch_size=1, seq_len=1, num_prefill=1) is False

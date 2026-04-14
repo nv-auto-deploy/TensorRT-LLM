@@ -135,8 +135,9 @@ class LowerToMpk(BaseTransform):
             wrapped_meta["mpk_runtime_mode"] = "mirage_runtime"
             self._set_autodeploy_meta(model, wrapped_meta)
             ad_logger.info(
-                "Gemma MPK runtime wrapper installed with decode-only Mirage routing and "
-                "original-graph execution for non-generate-only batches"
+                "Gemma MPK blockwise decode runtime installed with generate-only Mirage routing, "
+                "original-graph execution for non-generate-only batches, and single-PK layers "
+                "kept behind explicit opt-in"
             )
 
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)

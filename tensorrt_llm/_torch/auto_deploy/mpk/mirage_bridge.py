@@ -3909,8 +3909,6 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
 
     live_ffn_gate, live_ffn_up = torch.chunk(ffn_gate_up.float(), 2, dim=-1)
     ffn_down_ref = (F.gelu(live_ffn_gate) * live_ffn_up) @ ffn_down_weight.float().transpose(0, 1)
-    ffn_norm_ref = _rms_norm(post_attn_live, ffn_norm_weight, eps=eps)
-    ffn_gate_up_ref = ffn_norm_ref @ ffn_gate_up_weight.float().transpose(0, 1)
 
     # MoE branch from the same live attention output.
     router_weight = (
@@ -4094,7 +4092,7 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         ],
         dim=0,
     ).unsqueeze(0)
-    ref_hidden_out = (moe_w2_out.float() * topk_weight.float().unsqueeze(-1)).sum(dim=1) + ffn_down_ref
+    ref_hidden_out = (ref_w2.float() * topk_weight.float().unsqueeze(-1)).sum(dim=1) + ffn_down_ref
 
     return {
         **stage_timings,
@@ -4185,21 +4183,19 @@ def run_mirage_gemma_full_layer_single_pk_forward_correctness(
     post_attn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
     pre_ffn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
     ffn_gate_up_weight = (
-        torch.randn((2 * ffn_intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
-        / 16.0
+        torch.randn((2 * ffn_intermediate, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
     )
     ffn_down_weight = (
-        torch.randn((hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16)
-        / 16.0
+        torch.randn((hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16) / 16.0
     )
     post_ffn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
     router_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
     router_root_size = (
         0.9 + 0.2 * torch.rand((hidden_size,), device="cuda", dtype=torch.float32)
     ).to(torch.bfloat16)
-    router_scale = (
-        0.9 + 0.2 * torch.rand((hidden_size,), device="cuda", dtype=torch.float32)
-    ).to(torch.bfloat16)
+    router_scale = (0.9 + 0.2 * torch.rand((hidden_size,), device="cuda", dtype=torch.float32)).to(
+        torch.bfloat16
+    )
     router_weight = (
         torch.randn((num_experts, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
     )
@@ -4224,9 +4220,9 @@ def run_mirage_gemma_full_layer_single_pk_forward_correctness(
     )
     post_moe_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
     post_merge_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
-    layer_scalar = (
-        0.9 + 0.2 * torch.rand((hidden_size,), device="cuda", dtype=torch.float32)
-    ).to(torch.bfloat16)
+    layer_scalar = (0.9 + 0.2 * torch.rand((hidden_size,), device="cuda", dtype=torch.float32)).to(
+        torch.bfloat16
+    )
     identity_weight = torch.eye(hidden_size, device="cuda", dtype=torch.bfloat16)
     layer_scale_weight = torch.diag(layer_scalar.float()).to(torch.bfloat16)
 
@@ -4249,7 +4245,9 @@ def run_mirage_gemma_full_layer_single_pk_forward_correctness(
     ffn_routing_mask = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
     ffn_topk_weight = torch.ones((num_tokens, 1), device="cuda", dtype=torch.float32)
     zero_residual = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
-    ffn_w2_weight = torch.empty((1, hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16)
+    ffn_w2_weight = torch.empty(
+        (1, hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16
+    )
     ffn_w2_weight[0].copy_(ffn_down_weight)
     ffn_w2_out = torch.zeros((num_tokens, 1, hidden_size), device="cuda", dtype=torch.bfloat16)
     ffn_down = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
@@ -4288,7 +4286,9 @@ def run_mirage_gemma_full_layer_single_pk_forward_correctness(
         post_attn_norm_weight.contiguous(), name="single_pk_post_attn_norm_weight"
     )
     post_attn_norm_dt = pk.attach_input(post_attn_norm, name="single_pk_post_attn_norm")
-    identity_weight_dt = pk.attach_input(identity_weight.contiguous(), name="single_pk_identity_weight")
+    identity_weight_dt = pk.attach_input(
+        identity_weight.contiguous(), name="single_pk_identity_weight"
+    )
     post_attn_dt = pk.attach_input(post_attn, name="single_pk_post_attn")
     pre_ffn_norm_weight_dt = pk.attach_input(
         pre_ffn_norm_weight.contiguous(), name="single_pk_pre_ffn_norm_weight"
@@ -4358,9 +4358,7 @@ def run_mirage_gemma_full_layer_single_pk_forward_correctness(
             moe_w13_weight.contiguous(), name="single_pk_moe_w13_weight"
         )
         moe_act_dt = pk.attach_input(moe_act, name="single_pk_moe_act")
-        moe_w2_weight_dt = pk.attach_input(
-            w2_weight.contiguous(), name="single_pk_moe_w2_weight"
-        )
+        moe_w2_weight_dt = pk.attach_input(w2_weight.contiguous(), name="single_pk_moe_w2_weight")
         moe_w2_out_dt = pk.attach_input(moe_w2_out, name="single_pk_moe_w2_out")
         moe_out_dt = pk.attach_input(moe_out, name="single_pk_moe_out")
         post_moe_norm_weight_dt = pk.attach_input(
@@ -4688,8 +4686,12 @@ def run_mirage_gemma_full_layer_single_pk_forward_correctness(
 
     results.update(
         {
-            "topk_weight_max_abs": float((topk_weight.float() - ref_topk_weight).abs().max().item()),
-            "topk_weight_mean_abs": float((topk_weight.float() - ref_topk_weight).abs().mean().item()),
+            "topk_weight_max_abs": float(
+                (topk_weight.float() - ref_topk_weight).abs().max().item()
+            ),
+            "topk_weight_mean_abs": float(
+                (topk_weight.float() - ref_topk_weight).abs().mean().item()
+            ),
             "routing_overlap_count": float(len(set(experts) & set(ref_ids))),
             "moe_act_max_abs": float((moe_act.float() - ref_moe_act).abs().max().item()),
             "moe_act_mean_abs": float((moe_act.float() - ref_moe_act).abs().mean().item()),
@@ -4760,12 +4762,10 @@ def run_mirage_attention_ffn_fused_single_pk_forward_correctness(
     )
     ffn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
     ffn_gate_up_weight = (
-        torch.randn((2 * ffn_intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
-        / 16.0
+        torch.randn((2 * ffn_intermediate, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
     )
     ffn_down_weight = (
-        torch.randn((hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16)
-        / 16.0
+        torch.randn((hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16) / 16.0
     )
 
     rmsnorm_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
@@ -4802,9 +4802,7 @@ def run_mirage_attention_ffn_fused_single_pk_forward_correctness(
         ffn_gate_up_weight.contiguous(), name="attn_ffn_gate_up_weight"
     )
     ffn_gate_up_dt = pk.attach_input(ffn_gate_up, name="attn_ffn_gate_up")
-    ffn_down_weight_dt = pk.attach_input(
-        ffn_down_weight.contiguous(), name="attn_ffn_down_weight"
-    )
+    ffn_down_weight_dt = pk.attach_input(ffn_down_weight.contiguous(), name="attn_ffn_down_weight")
     ffn_down_residual_dt = pk.attach_input(ffn_down_residual, name="attn_ffn_down_residual")
     ffn_down_dt = pk.attach_input(ffn_down, name="attn_ffn_down")
 
@@ -4911,9 +4909,9 @@ def run_mirage_attention_ffn_fused_single_pk_forward_correctness(
     ffn_down_silu_ref = (F.silu(live_ffn_gate) * live_ffn_up) @ ffn_down_weight.float().transpose(
         0, 1
     )
-    ffn_down_swapped_ref = (F.gelu(live_ffn_up) * live_ffn_gate) @ ffn_down_weight.float().transpose(
-        0, 1
-    )
+    ffn_down_swapped_ref = (
+        F.gelu(live_ffn_up) * live_ffn_gate
+    ) @ ffn_down_weight.float().transpose(0, 1)
 
     return {
         "post_attn_max_abs": float((post_attn_live - post_attn_ref).abs().max().item()),
@@ -4924,8 +4922,12 @@ def run_mirage_attention_ffn_fused_single_pk_forward_correctness(
         "ffn_down_mean_abs": float((ffn_down.float() - ffn_down_ref).abs().mean().item()),
         "ffn_down_silu_max_abs": float((ffn_down.float() - ffn_down_silu_ref).abs().max().item()),
         "ffn_down_silu_mean_abs": float((ffn_down.float() - ffn_down_silu_ref).abs().mean().item()),
-        "ffn_down_swapped_max_abs": float((ffn_down.float() - ffn_down_swapped_ref).abs().max().item()),
-        "ffn_down_swapped_mean_abs": float((ffn_down.float() - ffn_down_swapped_ref).abs().mean().item()),
+        "ffn_down_swapped_max_abs": float(
+            (ffn_down.float() - ffn_down_swapped_ref).abs().max().item()
+        ),
+        "ffn_down_swapped_mean_abs": float(
+            (ffn_down.float() - ffn_down_swapped_ref).abs().mean().item()
+        ),
     }
 
 
@@ -4954,16 +4956,19 @@ def run_mirage_linear_residual_ffn_fused_single_pk_forward_correctness(
     )
 
     input_hidden = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
-    proj_weight = torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    proj_weight = (
+        torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
     residual = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
     post_linear = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
     ffn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
     ffn_normed = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
     ffn_gate_up_weight = (
-        torch.randn((2 * ffn_intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
-        / 16.0
+        torch.randn((2 * ffn_intermediate, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
     )
-    ffn_gate_up = torch.zeros((num_tokens, 2 * ffn_intermediate), device="cuda", dtype=torch.bfloat16)
+    ffn_gate_up = torch.zeros(
+        (num_tokens, 2 * ffn_intermediate), device="cuda", dtype=torch.bfloat16
+    )
     ffn_down_weight = (
         torch.randn((hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16) / 16.0
     )
@@ -4974,7 +4979,9 @@ def run_mirage_linear_residual_ffn_fused_single_pk_forward_correctness(
     proj_weight_dt = pk.attach_input(proj_weight.contiguous(), name="linear_ffn_proj_weight")
     residual_dt = pk.attach_input(residual.contiguous(), name="linear_ffn_residual")
     post_linear_dt = pk.attach_input(post_linear, name="linear_ffn_post_linear")
-    ffn_norm_weight_dt = pk.attach_input(ffn_norm_weight.contiguous(), name="linear_ffn_norm_weight")
+    ffn_norm_weight_dt = pk.attach_input(
+        ffn_norm_weight.contiguous(), name="linear_ffn_norm_weight"
+    )
     ffn_normed_dt = pk.attach_input(ffn_normed, name="linear_ffn_normed")
     ffn_gate_up_weight_dt = pk.attach_input(
         ffn_gate_up_weight.contiguous(), name="linear_ffn_gate_up_weight"
@@ -5096,14 +5103,14 @@ def run_mirage_attention_ffn_moew2_single_pk_forward_correctness(
     )
     ffn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
     ffn_gate_up_weight = (
-        torch.randn((2 * ffn_intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
-        / 16.0
+        torch.randn((2 * ffn_intermediate, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
     )
     ffn_down_weight = (
-        torch.randn((hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16)
-        / 16.0
+        torch.randn((hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16) / 16.0
     )
-    ffn_w2_weight = torch.empty((1, hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16)
+    ffn_w2_weight = torch.empty(
+        (1, hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16
+    )
     ffn_w2_weight[0].copy_(ffn_down_weight)
 
     rmsnorm_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
@@ -5149,9 +5156,7 @@ def run_mirage_attention_ffn_moew2_single_pk_forward_correctness(
     ffn_gate_up_moe_dt = pk.attach_input(ffn_gate_up_storage, name="attn_moew2_gate_up_moe")
     ffn_act_dt = pk.attach_input(ffn_act, name="attn_moew2_act")
     ffn_w2_weight_dt = pk.attach_input(ffn_w2_weight.contiguous(), name="attn_moew2_w2_weight")
-    ffn_routing_indices_dt = pk.attach_input(
-        ffn_routing_indices, name="attn_moew2_routing_indices"
-    )
+    ffn_routing_indices_dt = pk.attach_input(ffn_routing_indices, name="attn_moew2_routing_indices")
     ffn_routing_mask_dt = pk.attach_input(ffn_routing_mask, name="attn_moew2_routing_mask")
     ffn_topk_weight_dt = pk.attach_input(ffn_topk_weight, name="attn_moew2_topk_weight")
     ffn_residual_zero_dt = pk.attach_input(ffn_residual_zero, name="attn_moew2_zero_residual")
@@ -5943,6 +5948,387 @@ def _build_gemma_runtime_specs(
     return layer_specs
 
 
+def _should_use_single_pk_layer(
+    *,
+    batch_size: int,
+    seq_len: int,
+    num_prefill: int,
+) -> bool:
+    return (
+        os.getenv("AD_MPK_ENABLE_SINGLE_PK_LAYER", "0") == "1"
+        and batch_size == 1
+        and seq_len == 1
+        and num_prefill == 0
+    )
+
+
+@dataclass
+class _GemmaQkvBlockResult:
+    qkv_packed_view: torch.Tensor
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+
+
+@dataclass
+class _GemmaAttentionBlockResult:
+    q_rope: torch.Tensor
+    k_rope: torch.Tensor
+    attn_out_view: torch.Tensor
+    attn_out_flat: torch.Tensor
+
+
+@dataclass
+class _GemmaAttentionOutputBlockResult:
+    o_proj: torch.Tensor
+    post_attn: torch.Tensor
+
+
+@dataclass
+class _GemmaDenseFfnBlockResult:
+    ffn_down: torch.Tensor
+    ffn_norm: torch.Tensor
+
+
+@dataclass
+class _GemmaMoeBlockResult:
+    moe_out: torch.Tensor
+    moe_norm: torch.Tensor
+    ffn_moe_add: torch.Tensor
+    ffn_moe_norm: torch.Tensor
+    hidden: torch.Tensor
+    debug_tensors: Dict[str, torch.Tensor]
+
+
+@dataclass
+class _GemmaLayerBlockResult:
+    hidden: torch.Tensor
+    debug_tensors: Dict[str, torch.Tensor]
+
+
+class _GemmaQkvBlock:
+    def __init__(self, runtime: "_GemmaMirageRuntime", layer_spec: _GemmaRuntimeLayerSpec) -> None:
+        self.runtime = runtime
+        self.layer_spec = layer_spec
+
+    def __call__(self, *, hidden: torch.Tensor) -> _GemmaQkvBlockResult:
+        batch_size, seq_len = [int(dim) for dim in hidden.shape[:2]]
+        attn_in = _rms_norm(hidden, self.layer_spec.input_layernorm_weight).reshape(
+            batch_size * seq_len, -1
+        )
+        qkv_packed = self.runtime._linear(
+            name=f"layer_{self.layer_spec.layer_index}_qkv",
+            input_tensor=attn_in,
+            weight_tensor=self.layer_spec.qkv_weight,
+        )
+        qkv_packed_view = qkv_packed.view(batch_size, seq_len, -1)
+
+        q_size = self.layer_spec.q_heads * self.layer_spec.head_dim
+        kv_size = self.layer_spec.kv_heads * self.layer_spec.head_dim
+        if self.layer_spec.qkv_shared_kv:
+            q_flat = qkv_packed[:, :q_size]
+            shared_kv = qkv_packed[:, q_size : q_size + kv_size]
+            k_flat = shared_kv
+            v_flat = shared_kv
+        else:
+            q_flat = qkv_packed[:, :q_size]
+            k_flat = qkv_packed[:, q_size : q_size + kv_size]
+            v_flat = qkv_packed[:, q_size + kv_size : q_size + 2 * kv_size]
+
+        q = q_flat.view(batch_size, seq_len, self.layer_spec.q_heads, self.layer_spec.head_dim)
+        k = k_flat.view(batch_size, seq_len, self.layer_spec.kv_heads, self.layer_spec.head_dim)
+        v = v_flat.view(batch_size, seq_len, self.layer_spec.kv_heads, self.layer_spec.head_dim)
+        q = _rms_norm(q, self.layer_spec.q_norm_weight)
+        k = _rms_norm(k, self.layer_spec.k_norm_weight)
+        v = _rms_norm(v, self.layer_spec.v_norm_weight)
+        return _GemmaQkvBlockResult(qkv_packed_view=qkv_packed_view, q=q, k=k, v=v)
+
+
+class _GemmaAttentionBlock:
+    def __init__(self, runtime: "_GemmaMirageRuntime", layer_spec: _GemmaRuntimeLayerSpec) -> None:
+        self.runtime = runtime
+        self.layer_spec = layer_spec
+
+    def __call__(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        position_ids: torch.Tensor,
+        batch_info_host: torch.Tensor,
+        cu_seqlen_host: torch.Tensor,
+        cu_num_pages: torch.Tensor,
+        cu_num_pages_host: torch.Tensor,
+        cache_loc: torch.Tensor,
+        last_page_len: torch.Tensor,
+        last_page_len_host: torch.Tensor,
+        seq_len_with_cache_host: torch.Tensor,
+        triton_batch_indices: torch.Tensor,
+        triton_positions: torch.Tensor,
+        kv_cache: torch.Tensor,
+    ) -> _GemmaAttentionBlockResult:
+        batch_size, seq_len = [int(dim) for dim in q.shape[:2]]
+        rope_positions, cos_sin_cache = self.runtime._rope_inputs(
+            position_ids=position_ids,
+            head_dim=self.layer_spec.head_dim,
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
+        q_rope, k_rope = torch.ops.auto_deploy.flashinfer_rope.default(
+            q,
+            k,
+            rope_positions,
+            cos_sin_cache,
+            True,
+        )
+        attn_out = torch.ops.auto_deploy.triton_paged_mha_with_cache.default(
+            q_rope,
+            k_rope,
+            v,
+            batch_info_host,
+            cu_seqlen_host,
+            cu_num_pages,
+            cu_num_pages_host,
+            cache_loc,
+            last_page_len,
+            last_page_len_host,
+            seq_len_with_cache_host,
+            triton_batch_indices,
+            triton_positions,
+            kv_cache,
+            1.0,
+            self.layer_spec.sliding_window,
+        )
+        attn_out_flat = attn_out.reshape(batch_size * seq_len, -1).contiguous()
+        return _GemmaAttentionBlockResult(
+            q_rope=q_rope,
+            k_rope=k_rope,
+            attn_out_view=attn_out_flat.view(batch_size, seq_len, -1),
+            attn_out_flat=attn_out_flat,
+        )
+
+
+class _GemmaAttentionOutputBlock:
+    def __init__(self, runtime: "_GemmaMirageRuntime", layer_spec: _GemmaRuntimeLayerSpec) -> None:
+        self.runtime = runtime
+        self.layer_spec = layer_spec
+
+    def __call__(
+        self,
+        *,
+        hidden: torch.Tensor,
+        attn_out_flat: torch.Tensor,
+    ) -> _GemmaAttentionOutputBlockResult:
+        batch_size, seq_len = [int(dim) for dim in hidden.shape[:2]]
+        o_proj = self.runtime._linear(
+            name=f"layer_{self.layer_spec.layer_index}_o_proj",
+            input_tensor=attn_out_flat,
+            weight_tensor=self.layer_spec.o_proj_weight,
+        ).view(batch_size, seq_len, -1)
+        post_attn = _rms_norm(o_proj, self.layer_spec.post_attention_layernorm_weight) + hidden
+        return _GemmaAttentionOutputBlockResult(o_proj=o_proj, post_attn=post_attn)
+
+
+class _GemmaDenseFfnBlock:
+    def __init__(self, runtime: "_GemmaMirageRuntime", layer_spec: _GemmaRuntimeLayerSpec) -> None:
+        self.runtime = runtime
+        self.layer_spec = layer_spec
+
+    def __call__(self, *, post_attn: torch.Tensor) -> _GemmaDenseFfnBlockResult:
+        batch_size, seq_len = [int(dim) for dim in post_attn.shape[:2]]
+        ffn_in = _rms_norm(post_attn, self.layer_spec.pre_feedforward_layernorm_weight).reshape(
+            batch_size * seq_len, -1
+        )
+        ffn_gate_up = self.runtime._linear(
+            name=f"layer_{self.layer_spec.layer_index}_ffn_gate_up",
+            input_tensor=ffn_in,
+            weight_tensor=self.layer_spec.ffn_gate_up_weight,
+        )
+        ffn_gate, ffn_up = torch.chunk(ffn_gate_up, 2, dim=-1)
+        ffn_act = self.runtime._gelu_mul(
+            ffn_gate.view(batch_size * seq_len, 1, -1),
+            ffn_up.view(batch_size * seq_len, 1, -1),
+        )
+        ffn_down = self.runtime._ffn_down_decode(
+            act_tensor=ffn_act.view(batch_size * seq_len, -1),
+            weight_tensor=self.layer_spec.ffn_down_weight,
+        ).view(batch_size, seq_len, -1)
+        ffn_norm = _rms_norm(ffn_down, self.layer_spec.post_feedforward_layernorm_1_weight)
+        return _GemmaDenseFfnBlockResult(ffn_down=ffn_down, ffn_norm=ffn_norm)
+
+
+class _GemmaMoeBlock:
+    def __init__(self, runtime: "_GemmaMirageRuntime", layer_spec: _GemmaRuntimeLayerSpec) -> None:
+        self.runtime = runtime
+        self.layer_spec = layer_spec
+
+    def __call__(
+        self,
+        *,
+        post_attn: torch.Tensor,
+        ffn_norm: torch.Tensor,
+        capture_debug: bool,
+    ) -> _GemmaMoeBlockResult:
+        batch_size, seq_len = [int(dim) for dim in post_attn.shape[:2]]
+        post_attn_flat = post_attn.reshape(batch_size * seq_len, -1).contiguous()
+        moe_token_outputs = []
+        debug_tensors: Dict[str, torch.Tensor] = {}
+
+        for token_idx in range(batch_size * seq_len):
+            token_hidden = post_attn_flat[token_idx : token_idx + 1].contiguous()
+            router_in = token_hidden.float()
+            router_mean = router_in.pow(2).mean(dim=-1, keepdim=True)
+            router_in = router_in * torch.rsqrt(router_mean + 1e-6)
+            router_in = router_in.to(torch.bfloat16)
+            router_in = router_in * self.layer_spec.router_root_size.to(dtype=router_in.dtype)
+            router_in = router_in * self.layer_spec.router_scale.to(dtype=router_in.dtype)
+            topk_weight, routing_indices, routing_mask = self.runtime._router(
+                hidden_tensor=router_in,
+                weight_tensor=self.layer_spec.router_proj_weight,
+                topk=self.layer_spec.topk,
+            )
+
+            moe_in = _rms_norm(token_hidden, self.layer_spec.pre_feedforward_layernorm_2_weight)
+            experts = _extract_ranked_experts(routing_indices, self.layer_spec.topk)
+            if capture_debug and token_idx == 0:
+                router_logits = self.runtime._linear(
+                    name=f"layer_{self.layer_spec.layer_index}_router_proj_debug",
+                    input_tensor=router_in,
+                    weight_tensor=self.layer_spec.router_proj_weight,
+                )
+                debug_tensors["layer_0_router_in"] = (
+                    router_in.detach().clone().view(batch_size, seq_len, -1)
+                )
+                debug_tensors["layer_0_router_logits"] = (
+                    router_logits.detach().clone().view(batch_size, seq_len, -1)
+                )
+                debug_tensors["layer_0_router_topk_weight"] = (
+                    topk_weight.detach().clone().view(batch_size, seq_len, -1)
+                )
+                debug_tensors["layer_0_router_topk_indices"] = torch.tensor(
+                    experts,
+                    device=routing_indices.device,
+                    dtype=torch.int32,
+                ).view(batch_size, seq_len, -1)
+                debug_tensors["layer_0_moe_in"] = (
+                    moe_in.detach().clone().view(batch_size, seq_len, -1)
+                )
+
+            moe_gate, moe_up = self.runtime._moe_w13(
+                hidden_tensor=moe_in,
+                gate_weight=self.layer_spec.moe_gate_weight,
+                up_weight=self.layer_spec.moe_up_weight,
+                routing_indices=routing_indices,
+                routing_mask=routing_mask,
+                topk=self.layer_spec.topk,
+            )
+            moe_act = self.runtime._gelu_mul(moe_gate, moe_up)
+            moe_token_out = self.runtime._moe_w2_reduce(
+                act_tensor=moe_act.contiguous(),
+                weight_tensor=self.layer_spec.moe_w2_weight,
+                routing_indices=routing_indices,
+                routing_mask=routing_mask,
+                topk_weight=topk_weight,
+                residual=torch.zeros_like(token_hidden),
+            )
+            moe_token_outputs.append(moe_token_out[0])
+
+        moe_out = torch.stack(moe_token_outputs, dim=0).view(batch_size, seq_len, -1)
+        moe_norm = _rms_norm(moe_out, self.layer_spec.post_feedforward_layernorm_2_weight)
+        ffn_moe_add = ffn_norm + moe_norm
+        ffn_moe_norm = _rms_norm(ffn_moe_add, self.layer_spec.post_feedforward_layernorm_weight)
+        hidden = post_attn + ffn_moe_norm
+        hidden = hidden * self.layer_spec.layer_scalar.view(1, 1, -1)
+        return _GemmaMoeBlockResult(
+            moe_out=moe_out,
+            moe_norm=moe_norm,
+            ffn_moe_add=ffn_moe_add,
+            ffn_moe_norm=ffn_moe_norm,
+            hidden=hidden,
+            debug_tensors=debug_tensors,
+        )
+
+
+class _GemmaDecodeLayerBlock:
+    def __init__(self, runtime: "_GemmaMirageRuntime", layer_spec: _GemmaRuntimeLayerSpec) -> None:
+        self.layer_spec = layer_spec
+        self.qkv_block = _GemmaQkvBlock(runtime, layer_spec)
+        self.attention_block = _GemmaAttentionBlock(runtime, layer_spec)
+        self.attention_output_block = _GemmaAttentionOutputBlock(runtime, layer_spec)
+        self.dense_ffn_block = _GemmaDenseFfnBlock(runtime, layer_spec)
+        self.moe_block = _GemmaMoeBlock(runtime, layer_spec)
+
+    def __call__(
+        self,
+        *,
+        hidden: torch.Tensor,
+        position_ids: torch.Tensor,
+        batch_info_host: torch.Tensor,
+        cu_seqlen_host: torch.Tensor,
+        cu_num_pages: torch.Tensor,
+        cu_num_pages_host: torch.Tensor,
+        cache_loc: torch.Tensor,
+        last_page_len: torch.Tensor,
+        last_page_len_host: torch.Tensor,
+        seq_len_with_cache_host: torch.Tensor,
+        triton_batch_indices: torch.Tensor,
+        triton_positions: torch.Tensor,
+        kv_cache: torch.Tensor,
+        capture_debug: bool,
+    ) -> _GemmaLayerBlockResult:
+        qkv_outputs = self.qkv_block(hidden=hidden)
+        attention_outputs = self.attention_block(
+            q=qkv_outputs.q,
+            k=qkv_outputs.k,
+            v=qkv_outputs.v,
+            position_ids=position_ids,
+            batch_info_host=batch_info_host,
+            cu_seqlen_host=cu_seqlen_host,
+            cu_num_pages=cu_num_pages,
+            cu_num_pages_host=cu_num_pages_host,
+            cache_loc=cache_loc,
+            last_page_len=last_page_len,
+            last_page_len_host=last_page_len_host,
+            seq_len_with_cache_host=seq_len_with_cache_host,
+            triton_batch_indices=triton_batch_indices,
+            triton_positions=triton_positions,
+            kv_cache=kv_cache,
+        )
+        attention_output = self.attention_output_block(
+            hidden=hidden,
+            attn_out_flat=attention_outputs.attn_out_flat,
+        )
+        dense_ffn_output = self.dense_ffn_block(post_attn=attention_output.post_attn)
+        moe_output = self.moe_block(
+            post_attn=attention_output.post_attn,
+            ffn_norm=dense_ffn_output.ffn_norm,
+            capture_debug=capture_debug,
+        )
+
+        debug_tensors: Dict[str, torch.Tensor] = {}
+        if capture_debug:
+            debug_tensors["layer_0_qkv_packed"] = qkv_outputs.qkv_packed_view.detach().clone()
+            debug_tensors["layer_0_q_norm"] = qkv_outputs.q.detach().clone()
+            debug_tensors["layer_0_k_norm"] = qkv_outputs.k.detach().clone()
+            debug_tensors["layer_0_v_norm"] = qkv_outputs.v.detach().clone()
+            debug_tensors["layer_0_q_rope"] = attention_outputs.q_rope.detach().clone()
+            debug_tensors["layer_0_k_rope"] = attention_outputs.k_rope.detach().clone()
+            debug_tensors["layer_0_attn_out"] = attention_outputs.attn_out_view.detach().clone()
+            debug_tensors["layer_0_o_proj"] = attention_output.o_proj.detach().clone()
+            debug_tensors["layer_0_post_attn"] = attention_output.post_attn.detach().clone()
+            debug_tensors["layer_0_ffn_down"] = dense_ffn_output.ffn_down.detach().clone()
+            debug_tensors["layer_0_ffn_norm"] = dense_ffn_output.ffn_norm.detach().clone()
+            debug_tensors["layer_0_moe_out"] = moe_output.moe_out.detach().clone()
+            debug_tensors["layer_0_moe_norm"] = moe_output.moe_norm.detach().clone()
+            debug_tensors["layer_0_ffn_moe_add"] = moe_output.ffn_moe_add.detach().clone()
+            debug_tensors["layer_0_ffn_moe_norm"] = moe_output.ffn_moe_norm.detach().clone()
+            debug_tensors["layer_0_hidden"] = moe_output.hidden.detach().clone()
+            debug_tensors.update(moe_output.debug_tensors)
+
+        return _GemmaLayerBlockResult(hidden=moe_output.hidden, debug_tensors=debug_tensors)
+
+
 class _MirageLinearExecutor:
     def __init__(self, *, capacity: int, in_dim: int, out_dim: int, name: str):
         self.capacity = capacity
@@ -6396,7 +6782,9 @@ class _MirageGemmaLayerSinglePkExecutor:
                     start = split_idx * target_q_per_kv
                     end = start + target_q_per_kv
                     grouped_rows.append(
-                        q_weight[kv_idx, start:end].reshape(target_q_per_kv * int(layer_spec.head_dim), self.hidden_size)
+                        q_weight[kv_idx, start:end].reshape(
+                            target_q_per_kv * int(layer_spec.head_dim), self.hidden_size
+                        )
                     )
                     grouped_rows.append(shared_kv_weight[kv_idx])
                     grouped_rows.append(shared_kv_weight[kv_idx])
@@ -6436,7 +6824,9 @@ class _MirageGemmaLayerSinglePkExecutor:
         device = layer_spec.o_proj_weight.device
         self.hidden_in = torch.empty((1, self.hidden_size), device=device, dtype=torch.bfloat16)
         self.rmsnorm_out = torch.empty_like(self.hidden_in)
-        self.qkv_out = torch.empty((1, int(self.attn_qkv_weight.shape[0])), device=device, dtype=torch.bfloat16)
+        self.qkv_out = torch.empty(
+            (1, int(self.attn_qkv_weight.shape[0])), device=device, dtype=torch.bfloat16
+        )
         self.k_cache = torch.empty(
             (self.max_num_pages, self.page_size, self.attn_kv_heads, self.head_dim),
             device=device,
@@ -6452,12 +6842,18 @@ class _MirageGemmaLayerSinglePkExecutor:
             (1, 1, 2 * self.ffn_intermediate), device=device, dtype=torch.bfloat16
         )
         self.ffn_gate_up = self.ffn_gate_up_storage.view(1, 2 * self.ffn_intermediate)
-        self.ffn_act = torch.empty((1, 1, self.ffn_intermediate), device=device, dtype=torch.bfloat16)
+        self.ffn_act = torch.empty(
+            (1, 1, self.ffn_intermediate), device=device, dtype=torch.bfloat16
+        )
         self.ffn_routing_indices = torch.ones((1, 1), device=device, dtype=torch.int32)
         self.ffn_routing_mask = torch.tensor([0, 1], device=device, dtype=torch.int32)
         self.ffn_topk_weight = torch.ones((1, 1), device=device, dtype=torch.float32)
         self.zero_residual = torch.zeros((1, self.hidden_size), device=device, dtype=torch.bfloat16)
-        self.ffn_w2_weight = torch.empty((1, self.hidden_size, self.ffn_intermediate), device=device, dtype=torch.bfloat16)
+        self.ffn_w2_weight = torch.empty(
+            (1, self.hidden_size, self.ffn_intermediate),
+            device=device,
+            dtype=torch.bfloat16,
+        )
         self.ffn_w2_weight[0].copy_(layer_spec.ffn_down_weight)
         self.ffn_w2_out = torch.empty((1, 1, self.hidden_size), device=device, dtype=torch.bfloat16)
         self.ffn_down = torch.empty_like(self.hidden_in)
@@ -6468,8 +6864,12 @@ class _MirageGemmaLayerSinglePkExecutor:
         self.routing_indices = torch.empty((self.num_experts, 1), device=device, dtype=torch.int32)
         self.routing_mask = torch.empty((self.num_experts + 1,), device=device, dtype=torch.int32)
         self.moe_in = torch.empty_like(self.hidden_in)
-        self.moe_act = torch.empty((1, self.topk, self.intermediate), device=device, dtype=torch.bfloat16)
-        self.moe_w2_out = torch.empty((1, self.topk, self.hidden_size), device=device, dtype=torch.bfloat16)
+        self.moe_act = torch.empty(
+            (1, self.topk, self.intermediate), device=device, dtype=torch.bfloat16
+        )
+        self.moe_w2_out = torch.empty(
+            (1, self.topk, self.hidden_size), device=device, dtype=torch.bfloat16
+        )
         self.moe_out = torch.empty_like(self.hidden_in)
         self.moe_norm = torch.empty_like(self.hidden_in)
         self.ffn_moe_add = torch.empty_like(self.hidden_in)
@@ -6479,7 +6879,9 @@ class _MirageGemmaLayerSinglePkExecutor:
         self.hidden_out = torch.empty_like(self.hidden_in)
         _constructor_probe("post_alloc")
 
-        hidden_dt = self.pk.attach_input(self.hidden_in, name=f"layer_{layer_spec.layer_index}_hidden")
+        hidden_dt = self.pk.attach_input(
+            self.hidden_in, name=f"layer_{layer_spec.layer_index}_hidden"
+        )
         attn_norm_dt = self.pk.attach_input(
             layer_spec.input_layernorm_weight.contiguous(),
             name=f"layer_{layer_spec.layer_index}_attn_norm_weight",
@@ -6487,8 +6889,12 @@ class _MirageGemmaLayerSinglePkExecutor:
         qkv_weight_dt = self.pk.attach_input(
             self.attn_qkv_weight, name=f"layer_{layer_spec.layer_index}_qkv_weight"
         )
-        rmsnorm_out_dt = self.pk.attach_input(self.rmsnorm_out, name=f"layer_{layer_spec.layer_index}_rmsnorm_out")
-        qkv_out_dt = self.pk.attach_input(self.qkv_out, name=f"layer_{layer_spec.layer_index}_qkv_out")
+        rmsnorm_out_dt = self.pk.attach_input(
+            self.rmsnorm_out, name=f"layer_{layer_spec.layer_index}_rmsnorm_out"
+        )
+        qkv_out_dt = self.pk.attach_input(
+            self.qkv_out, name=f"layer_{layer_spec.layer_index}_qkv_out"
+        )
         q_norm_dt = self.pk.attach_input(
             layer_spec.q_norm_weight.contiguous(), name=f"layer_{layer_spec.layer_index}_q_norm"
         )
@@ -6497,9 +6903,15 @@ class _MirageGemmaLayerSinglePkExecutor:
         )
         cos_dt = self.pk.attach_input(cos.contiguous(), name=f"layer_{layer_spec.layer_index}_cos")
         sin_dt = self.pk.attach_input(sin.contiguous(), name=f"layer_{layer_spec.layer_index}_sin")
-        k_cache_dt = self.pk.attach_input(self.k_cache, name=f"layer_{layer_spec.layer_index}_k_cache")
-        v_cache_dt = self.pk.attach_input(self.v_cache, name=f"layer_{layer_spec.layer_index}_v_cache")
-        attn_out_dt = self.pk.attach_input(self.attn_out, name=f"layer_{layer_spec.layer_index}_attn_out")
+        k_cache_dt = self.pk.attach_input(
+            self.k_cache, name=f"layer_{layer_spec.layer_index}_k_cache"
+        )
+        v_cache_dt = self.pk.attach_input(
+            self.v_cache, name=f"layer_{layer_spec.layer_index}_v_cache"
+        )
+        attn_out_dt = self.pk.attach_input(
+            self.attn_out, name=f"layer_{layer_spec.layer_index}_attn_out"
+        )
         lse_dt = None
         attn_out_tmp_dt = None
         if self.use_split_kv_attention:
@@ -6541,7 +6953,8 @@ class _MirageGemmaLayerSinglePkExecutor:
                 io_category="cuda_tensor",
             )
         o_proj_weight_dt = self.pk.attach_input(
-            layer_spec.o_proj_weight.contiguous(), name=f"layer_{layer_spec.layer_index}_o_proj_weight"
+            layer_spec.o_proj_weight.contiguous(),
+            name=f"layer_{layer_spec.layer_index}_o_proj_weight",
         )
         o_proj_dt = self.pk.attach_input(self.o_proj, name=f"layer_{layer_spec.layer_index}_o_proj")
         post_attn_norm_weight_dt = self.pk.attach_input(
@@ -6551,22 +6964,32 @@ class _MirageGemmaLayerSinglePkExecutor:
         post_attn_norm_dt = self.pk.attach_input(
             self.post_attn_norm, name=f"layer_{layer_spec.layer_index}_post_attn_norm"
         )
-        identity_weight_dt = self.pk.attach_input(identity_weight, name=f"layer_{layer_spec.layer_index}_identity")
-        post_attn_dt = self.pk.attach_input(self.post_attn, name=f"layer_{layer_spec.layer_index}_post_attn")
+        identity_weight_dt = self.pk.attach_input(
+            identity_weight, name=f"layer_{layer_spec.layer_index}_identity"
+        )
+        post_attn_dt = self.pk.attach_input(
+            self.post_attn, name=f"layer_{layer_spec.layer_index}_post_attn"
+        )
         pre_ffn_norm_weight_dt = self.pk.attach_input(
             layer_spec.pre_feedforward_layernorm_weight.contiguous(),
             name=f"layer_{layer_spec.layer_index}_pre_ffn_norm_weight",
         )
-        ffn_normed_dt = self.pk.attach_input(self.ffn_normed, name=f"layer_{layer_spec.layer_index}_ffn_normed")
+        ffn_normed_dt = self.pk.attach_input(
+            self.ffn_normed, name=f"layer_{layer_spec.layer_index}_ffn_normed"
+        )
         ffn_gate_up_weight_dt = self.pk.attach_input(
             layer_spec.ffn_gate_up_weight.contiguous(),
             name=f"layer_{layer_spec.layer_index}_ffn_gate_up_weight",
         )
-        ffn_gate_up_dt = self.pk.attach_input(self.ffn_gate_up, name=f"layer_{layer_spec.layer_index}_ffn_gate_up")
+        ffn_gate_up_dt = self.pk.attach_input(
+            self.ffn_gate_up, name=f"layer_{layer_spec.layer_index}_ffn_gate_up"
+        )
         ffn_gate_up_moe_dt = self.pk.attach_input(
             self.ffn_gate_up_storage, name=f"layer_{layer_spec.layer_index}_ffn_gate_up_moe"
         )
-        ffn_act_dt = self.pk.attach_input(self.ffn_act, name=f"layer_{layer_spec.layer_index}_ffn_act")
+        ffn_act_dt = self.pk.attach_input(
+            self.ffn_act, name=f"layer_{layer_spec.layer_index}_ffn_act"
+        )
         ffn_routing_indices_dt = self.pk.attach_input(
             self.ffn_routing_indices, name=f"layer_{layer_spec.layer_index}_ffn_routing_indices"
         )
@@ -6582,17 +7005,25 @@ class _MirageGemmaLayerSinglePkExecutor:
         ffn_w2_weight_dt = self.pk.attach_input(
             self.ffn_w2_weight, name=f"layer_{layer_spec.layer_index}_ffn_w2_weight"
         )
-        ffn_w2_out_dt = self.pk.attach_input(self.ffn_w2_out, name=f"layer_{layer_spec.layer_index}_ffn_w2_out")
-        ffn_down_dt = self.pk.attach_input(self.ffn_down, name=f"layer_{layer_spec.layer_index}_ffn_down")
+        ffn_w2_out_dt = self.pk.attach_input(
+            self.ffn_w2_out, name=f"layer_{layer_spec.layer_index}_ffn_w2_out"
+        )
+        ffn_down_dt = self.pk.attach_input(
+            self.ffn_down, name=f"layer_{layer_spec.layer_index}_ffn_down"
+        )
         post_ffn_norm_weight_dt = self.pk.attach_input(
             layer_spec.post_feedforward_layernorm_1_weight.contiguous(),
             name=f"layer_{layer_spec.layer_index}_post_ffn_norm_weight",
         )
-        ffn_norm_dt = self.pk.attach_input(self.ffn_norm, name=f"layer_{layer_spec.layer_index}_ffn_norm")
+        ffn_norm_dt = self.pk.attach_input(
+            self.ffn_norm, name=f"layer_{layer_spec.layer_index}_ffn_norm"
+        )
         router_norm_weight_dt = self.pk.attach_input(
             router_norm_weight, name=f"layer_{layer_spec.layer_index}_router_norm_weight"
         )
-        router_in_dt = self.pk.attach_input(self.router_in, name=f"layer_{layer_spec.layer_index}_router_in")
+        router_in_dt = self.pk.attach_input(
+            self.router_in, name=f"layer_{layer_spec.layer_index}_router_in"
+        )
         router_weight_dt = self.pk.attach_input(
             router_weight_scaled.contiguous(), name=f"layer_{layer_spec.layer_index}_router_weight"
         )
@@ -6604,7 +7035,9 @@ class _MirageGemmaLayerSinglePkExecutor:
             name=f"layer_{layer_spec.layer_index}_moe_in_norm_weight",
         )
         moe_in_dt = self.pk.attach_input(self.moe_in, name=f"layer_{layer_spec.layer_index}_moe_in")
-        topk_weight_dt = self.pk.attach_input(self.topk_weight, name=f"layer_{layer_spec.layer_index}_topk_weight")
+        topk_weight_dt = self.pk.attach_input(
+            self.topk_weight, name=f"layer_{layer_spec.layer_index}_topk_weight"
+        )
         routing_indices_dt = self.pk.attach_input(
             self.routing_indices, name=f"layer_{layer_spec.layer_index}_routing_indices"
         )
@@ -6615,17 +7048,26 @@ class _MirageGemmaLayerSinglePkExecutor:
             layer_spec.moe_w13_stacked_weight.contiguous(),
             name=f"layer_{layer_spec.layer_index}_moe_w13_weight",
         )
-        moe_act_dt = self.pk.attach_input(self.moe_act, name=f"layer_{layer_spec.layer_index}_moe_act")
-        moe_w2_weight_dt = self.pk.attach_input(
-            layer_spec.moe_w2_weight.contiguous(), name=f"layer_{layer_spec.layer_index}_moe_w2_weight"
+        moe_act_dt = self.pk.attach_input(
+            self.moe_act, name=f"layer_{layer_spec.layer_index}_moe_act"
         )
-        moe_w2_out_dt = self.pk.attach_input(self.moe_w2_out, name=f"layer_{layer_spec.layer_index}_moe_w2_out")
-        moe_out_dt = self.pk.attach_input(self.moe_out, name=f"layer_{layer_spec.layer_index}_moe_out")
+        moe_w2_weight_dt = self.pk.attach_input(
+            layer_spec.moe_w2_weight.contiguous(),
+            name=f"layer_{layer_spec.layer_index}_moe_w2_weight",
+        )
+        moe_w2_out_dt = self.pk.attach_input(
+            self.moe_w2_out, name=f"layer_{layer_spec.layer_index}_moe_w2_out"
+        )
+        moe_out_dt = self.pk.attach_input(
+            self.moe_out, name=f"layer_{layer_spec.layer_index}_moe_out"
+        )
         post_moe_norm_weight_dt = self.pk.attach_input(
             layer_spec.post_feedforward_layernorm_2_weight.contiguous(),
             name=f"layer_{layer_spec.layer_index}_post_moe_norm_weight",
         )
-        moe_norm_dt = self.pk.attach_input(self.moe_norm, name=f"layer_{layer_spec.layer_index}_moe_norm")
+        moe_norm_dt = self.pk.attach_input(
+            self.moe_norm, name=f"layer_{layer_spec.layer_index}_moe_norm"
+        )
         ffn_moe_add_dt = self.pk.attach_input(
             self.ffn_moe_add, name=f"layer_{layer_spec.layer_index}_ffn_moe_add"
         )
@@ -6643,9 +7085,12 @@ class _MirageGemmaLayerSinglePkExecutor:
             self.scaled_post_attn, name=f"layer_{layer_spec.layer_index}_scaled_post_attn"
         )
         layer_scale_weight_dt = self.pk.attach_input(
-            layer_scale_weight.contiguous(), name=f"layer_{layer_spec.layer_index}_layer_scale_weight"
+            layer_scale_weight.contiguous(),
+            name=f"layer_{layer_spec.layer_index}_layer_scale_weight",
         )
-        hidden_out_dt = self.pk.attach_input(self.hidden_out, name=f"layer_{layer_spec.layer_index}_hidden_out")
+        hidden_out_dt = self.pk.attach_input(
+            self.hidden_out, name=f"layer_{layer_spec.layer_index}_hidden_out"
+        )
 
         self.pk.rmsnorm_layer(
             input=hidden_dt,
@@ -6940,7 +7385,9 @@ class _MirageGemmaLayerSinglePkExecutor:
                                     self.pk.linear_with_residual_layer(
                                         input=ffn_moe_norm_dt,
                                         weight=identity_weight_dt,
-                                        residual=zero_residual_dt if disable_final_residual else post_attn_dt,
+                                        residual=zero_residual_dt
+                                        if disable_final_residual
+                                        else post_attn_dt,
                                         output=hidden_out_dt,
                                         grid_dim=(1, 1, 1),
                                         block_dim=(128, 1, 1),
@@ -6949,7 +7396,9 @@ class _MirageGemmaLayerSinglePkExecutor:
                                     self.pk.linear_with_residual_layer(
                                         input=hidden_pre_scale_dt,
                                         weight=identity_weight_dt,
-                                        residual=zero_residual_dt if disable_final_residual else scaled_post_attn_dt,
+                                        residual=zero_residual_dt
+                                        if disable_final_residual
+                                        else scaled_post_attn_dt,
                                         output=hidden_out_dt,
                                         grid_dim=(1, 1, 1),
                                         block_dim=(128, 1, 1),
@@ -6961,7 +7410,10 @@ class _MirageGemmaLayerSinglePkExecutor:
         _constructor_probe("post_compile")
 
     def supports(self, kv_cache: torch.Tensor, *, total_tokens: Optional[int] = None) -> bool:
-        if tuple(int(dim) for dim in kv_cache.shape) != self.kv_cache_shape or kv_cache.dtype != self.kv_cache_dtype:
+        if (
+            tuple(int(dim) for dim in kv_cache.shape) != self.kv_cache_shape
+            or kv_cache.dtype != self.kv_cache_dtype
+        ):
             return False
         if total_tokens is not None and int(total_tokens) > self.max_seq_length:
             return False
@@ -7008,7 +7460,9 @@ class _MirageGemmaLayerSinglePkExecutor:
                 f"Internal KV page count {internal_page_count} exceeds allocated max {self.max_num_pages}."
             )
 
-        used_page_ids = cache_loc[:external_page_count].to(device=hidden.device, dtype=torch.long).contiguous()
+        used_page_ids = (
+            cache_loc[:external_page_count].to(device=hidden.device, dtype=torch.long).contiguous()
+        )
         used_k = (
             kv_cache.index_select(0, used_page_ids)[:, 0]
             .permute(0, 2, 1, 3)
@@ -7034,8 +7488,12 @@ class _MirageGemmaLayerSinglePkExecutor:
             :total_tokens
         ].copy_(used_v[:total_tokens])
 
-        paged_kv_indptr = torch.tensor([0, internal_page_count], device=hidden.device, dtype=torch.int32)
-        paged_kv_indices = torch.arange(internal_page_count, device=hidden.device, dtype=torch.int32)
+        paged_kv_indptr = torch.tensor(
+            [0, internal_page_count], device=hidden.device, dtype=torch.int32
+        )
+        paged_kv_indices = torch.arange(
+            internal_page_count, device=hidden.device, dtype=torch.int32
+        )
         paged_kv_last_page_len = torch.tensor(
             [total_tokens - (internal_page_count - 1) * self.page_size],
             device=hidden.device,
@@ -7084,7 +7542,9 @@ def _make_synthetic_gemma_runtime_layer_spec(
     weight_denom: float = 16.0,
     qkv_shared_kv: bool = False,
 ) -> _GemmaRuntimeLayerSpec:
-    qkv_rows = (q_heads + kv_heads) * head_dim if qkv_shared_kv else (q_heads + 2 * kv_heads) * head_dim
+    qkv_rows = (
+        (q_heads + kv_heads) * head_dim if qkv_shared_kv else (q_heads + 2 * kv_heads) * head_dim
+    )
     moe_up_weight = (
         torch.randn((num_experts, intermediate, hidden_size), device=device, dtype=torch.bfloat16)
         / weight_denom
@@ -7130,12 +7590,12 @@ def _make_synthetic_gemma_runtime_layer_spec(
             (num_experts, hidden_size), device=device, dtype=torch.bfloat16
         )
         / weight_denom,
-        router_root_size=(0.9 + 0.2 * torch.rand((hidden_size,), device=device, dtype=torch.float32)).to(
-            torch.bfloat16
-        ),
-        router_scale=(0.9 + 0.2 * torch.rand((hidden_size,), device=device, dtype=torch.float32)).to(
-            torch.bfloat16
-        ),
+        router_root_size=(
+            0.9 + 0.2 * torch.rand((hidden_size,), device=device, dtype=torch.float32)
+        ).to(torch.bfloat16),
+        router_scale=(
+            0.9 + 0.2 * torch.rand((hidden_size,), device=device, dtype=torch.float32)
+        ).to(torch.bfloat16),
         pre_feedforward_layernorm_2_weight=torch.ones(
             (hidden_size,), device=device, dtype=torch.bfloat16
         ),
@@ -7237,6 +7697,7 @@ def run_mirage_gemma_layer_single_pk_executor_external_page32_smoke(
         identity_weight=identity_weight,
     )
     hidden = torch.randn((1, hidden_size), device=device, dtype=torch.bfloat16) / hidden_denom
+    external_last_page_len = total_tokens - (external_page_count - 1) * external_page_size
     cache_loc = torch.arange(external_page_count, device=device, dtype=torch.int32)
     cu_num_pages = torch.tensor([0, external_page_count], device=device, dtype=torch.int32)
     last_page_len = torch.tensor([external_last_page_len], device=device, dtype=torch.int32)
@@ -7319,8 +7780,12 @@ def run_mirage_gemma_global_layer_single_pk_smoke(
         page_start = page_idx * external_page_size
         page_end = min(page_start + external_page_size, total_tokens)
         page_tokens = page_end - page_start
-        kv_cache[page_idx, 0, :, :page_tokens, :].copy_(used_k[page_start:page_end].permute(1, 0, 2))
-        kv_cache[page_idx, 1, :, :page_tokens, :].copy_(used_v[page_start:page_end].permute(1, 0, 2))
+        kv_cache[page_idx, 0, :, :page_tokens, :].copy_(
+            used_k[page_start:page_end].permute(1, 0, 2)
+        )
+        kv_cache[page_idx, 1, :, :page_tokens, :].copy_(
+            used_v[page_start:page_end].permute(1, 0, 2)
+        )
 
     executor = _MirageGemmaLayerSinglePkExecutor(
         layer_spec=layer_spec,
@@ -7389,9 +7854,13 @@ def run_mirage_gemma_global_attention_single_pk_smoke(
     qkv_rows = (q_heads + 2 * kv_heads) * head_dim
     hidden_in = torch.randn((1, hidden_size), device=device, dtype=torch.bfloat16) / hidden_denom
     attn_norm_weight = torch.ones((hidden_size,), device=device, dtype=torch.bfloat16)
-    q_weight = torch.randn((q_heads * head_dim, hidden_size), device=device, dtype=torch.bfloat16) / weight_denom
+    q_weight = (
+        torch.randn((q_heads * head_dim, hidden_size), device=device, dtype=torch.bfloat16)
+        / weight_denom
+    )
     shared_kv_weight = (
-        torch.randn((kv_heads * head_dim, hidden_size), device=device, dtype=torch.bfloat16) / weight_denom
+        torch.randn((kv_heads * head_dim, hidden_size), device=device, dtype=torch.bfloat16)
+        / weight_denom
     )
     q_per_kv = q_heads // kv_heads
     q_weight_grouped = q_weight.view(kv_heads, q_per_kv, head_dim, hidden_size)
@@ -7409,7 +7878,9 @@ def run_mirage_gemma_global_attention_single_pk_smoke(
     qkv_out = torch.zeros((1, qkv_rows), device=device, dtype=torch.bfloat16)
     rmsnorm_out = torch.zeros((1, hidden_size), device=device, dtype=torch.bfloat16)
     attn_out = torch.zeros((1, q_heads * head_dim), device=device, dtype=torch.bfloat16)
-    k_cache = torch.zeros((max_num_pages, page_size, kv_heads, head_dim), device=device, dtype=torch.bfloat16)
+    k_cache = torch.zeros(
+        (max_num_pages, page_size, kv_heads, head_dim), device=device, dtype=torch.bfloat16
+    )
     v_cache = torch.zeros_like(k_cache)
     used_k = kv_base + kv_noise * torch.randn(
         (total_tokens, kv_heads, head_dim), device=device, dtype=torch.bfloat16
@@ -7418,7 +7889,6 @@ def run_mirage_gemma_global_attention_single_pk_smoke(
         (total_tokens, kv_heads, head_dim), device=device, dtype=torch.bfloat16
     )
     external_page_count = (total_tokens + external_page_size - 1) // external_page_size
-    external_last_page_len = total_tokens - (external_page_count - 1) * external_page_size
     for page_idx in range(external_page_count):
         page_start = page_idx * external_page_size
         page_end = min(page_start + external_page_size, total_tokens)
@@ -7470,7 +7940,8 @@ def run_mirage_gemma_global_attention_single_pk_smoke(
     if include_o_proj:
         o_proj = torch.zeros((1, hidden_size), device=device, dtype=torch.bfloat16)
         o_proj_weight = (
-            torch.randn((hidden_size, q_heads * head_dim), device=device, dtype=torch.bfloat16) / weight_denom
+            torch.randn((hidden_size, q_heads * head_dim), device=device, dtype=torch.bfloat16)
+            / weight_denom
         )
         o_proj_weight_dt = pk.attach_input(o_proj_weight, name="global_attn_o_proj_weight")
         o_proj_dt = pk.attach_input(o_proj, name="global_attn_o_proj")
@@ -7506,10 +7977,7 @@ def run_mirage_gemma_global_attention_single_pk_smoke(
         ),
         reinit_request_resources=False,
     )
-    _mpk_debug(
-        "global-attn-single-pk launch-start "
-        f"include_o_proj={include_o_proj}"
-    )
+    _mpk_debug(f"global-attn-single-pk launch-start include_o_proj={include_o_proj}")
     launch_start = time.perf_counter()
     pk()
     _mpk_debug(
@@ -7544,6 +8012,9 @@ class _GemmaMirageRuntime:
         self.source_model = source_model
         self.translation_plan = translation_plan
         self.layer_specs = _build_gemma_runtime_specs(source_model, translation_plan)
+        self.layer_blocks = [
+            _GemmaDecodeLayerBlock(self, layer_spec) for layer_spec in self.layer_specs
+        ]
         self._force_torch_executors = os.getenv("AD_MPK_FORCE_TORCH_EXECUTORS", "0") == "1"
         node_map = {node.name: node for node in source_model.graph.nodes}
 
@@ -7619,14 +8090,20 @@ class _GemmaMirageRuntime:
 
         cos = self.local_cos if layer_spec.head_dim == 256 else self.global_cos
         sin = self.local_sin if layer_spec.head_dim == 256 else self.global_sin
-        if int(cos.shape[1]) != int(layer_spec.head_dim) or int(sin.shape[1]) != int(layer_spec.head_dim):
+        if int(cos.shape[1]) != int(layer_spec.head_dim) or int(sin.shape[1]) != int(
+            layer_spec.head_dim
+        ):
             raise ValueError(
                 f"RoPE cache width mismatch for layer {layer_spec.layer_index}: "
                 f"expected {int(layer_spec.head_dim)}, got cos={tuple(int(dim) for dim in cos.shape)} "
                 f"sin={tuple(int(dim) for dim in sin.shape)}."
             )
-        identity = self._single_pk_identity(int(layer_spec.o_proj_weight.shape[0]), layer_spec.o_proj_weight.device)
-        min_capacity = 256 if (layer_spec.qkv_shared_kv and int(layer_spec.head_dim) == 512) else 128
+        identity = self._single_pk_identity(
+            int(layer_spec.o_proj_weight.shape[0]), layer_spec.o_proj_weight.device
+        )
+        min_capacity = (
+            256 if (layer_spec.qkv_shared_kv and int(layer_spec.head_dim) == 512) else 128
+        )
         requested_capacity = max(
             min_capacity,
             ((int(total_tokens) + self._single_pk_page_size() - 1) // self._single_pk_page_size())
@@ -8043,18 +8520,27 @@ class _GemmaMirageRuntime:
         ).BatchInfo(batch_info_host)
         num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
 
-        for layer_spec, kv_cache in zip(self.layer_specs, kv_caches):
+        for layer_block, kv_cache in zip(self.layer_blocks, kv_caches):
+            layer_spec = layer_block.layer_spec
             _mpk_debug(
                 "enter layer "
                 f"{layer_spec.layer_index} batch={batch_size} seq={seq_len} "
                 f"prefill={num_prefill} prefill_tokens={num_prefill_tokens} decode={num_decode}"
             )
-            if batch_size == 1 and seq_len == 1 and num_prefill == 0:
+            if _should_use_single_pk_layer(
+                batch_size=batch_size,
+                seq_len=seq_len,
+                num_prefill=num_prefill,
+            ):
                 external_page_count = int(cu_num_pages[1].item())
                 if external_page_count <= 0:
-                    raise ValueError(f"Expected at least one external KV page, got {external_page_count}.")
+                    raise ValueError(
+                        f"Expected at least one external KV page, got {external_page_count}."
+                    )
                 external_last_page_len = int(last_page_len[0].item())
-                total_tokens = (external_page_count - 1) * int(kv_cache.shape[3]) + external_last_page_len
+                total_tokens = (external_page_count - 1) * int(
+                    kv_cache.shape[3]
+                ) + external_last_page_len
                 if total_tokens <= 0:
                     raise ValueError(f"Expected positive live KV token count, got {total_tokens}.")
                 if os.getenv("AD_MPK_SINGLE_PK_DEBUG_META", "0") == "1":
@@ -8082,178 +8568,25 @@ class _GemmaMirageRuntime:
                 ).view(batch_size, seq_len, -1)
                 _mpk_debug(f"exit layer {layer_spec.layer_index} [single-pk]")
                 continue
-
-            attn_in = _rms_norm(hidden, layer_spec.input_layernorm_weight).reshape(
-                batch_size * seq_len, -1
-            )
-            qkv_packed = self._linear(
-                name=f"layer_{layer_spec.layer_index}_qkv",
-                input_tensor=attn_in,
-                weight_tensor=layer_spec.qkv_weight,
-            )
-            qkv_packed_view = qkv_packed.view(batch_size, seq_len, -1)
-
-            q_size = layer_spec.q_heads * layer_spec.head_dim
-            kv_size = layer_spec.kv_heads * layer_spec.head_dim
-            if layer_spec.qkv_shared_kv:
-                q_flat = qkv_packed[:, :q_size]
-                shared_kv = qkv_packed[:, q_size : q_size + kv_size]
-                k_flat = shared_kv
-                v_flat = shared_kv
-            else:
-                q_flat = qkv_packed[:, :q_size]
-                k_flat = qkv_packed[:, q_size : q_size + kv_size]
-                v_flat = qkv_packed[:, q_size + kv_size : q_size + 2 * kv_size]
-
-            q = q_flat.view(batch_size, seq_len, layer_spec.q_heads, layer_spec.head_dim)
-            k = k_flat.view(batch_size, seq_len, layer_spec.kv_heads, layer_spec.head_dim)
-            v = v_flat.view(batch_size, seq_len, layer_spec.kv_heads, layer_spec.head_dim)
-            q = _rms_norm(q, layer_spec.q_norm_weight)
-            k = _rms_norm(k, layer_spec.k_norm_weight)
-            v = _rms_norm(v, layer_spec.v_norm_weight)
-            rope_positions, cos_sin_cache = self._rope_inputs(
+            layer_outputs = layer_block(
+                hidden=hidden,
                 position_ids=position_ids,
-                head_dim=layer_spec.head_dim,
-                batch_size=batch_size,
-                seq_len=seq_len,
+                batch_info_host=batch_info_host,
+                cu_seqlen_host=cu_seqlen_host,
+                cu_num_pages=cu_num_pages,
+                cu_num_pages_host=cu_num_pages_host,
+                cache_loc=cache_loc,
+                last_page_len=last_page_len,
+                last_page_len_host=last_page_len_host,
+                seq_len_with_cache_host=seq_len_with_cache_host,
+                triton_batch_indices=triton_batch_indices,
+                triton_positions=triton_positions,
+                kv_cache=kv_cache,
+                capture_debug=debug_tensors is not None and layer_spec.layer_index == 0,
             )
-            q_rope, k_rope = torch.ops.auto_deploy.flashinfer_rope.default(
-                q,
-                k,
-                rope_positions,
-                cos_sin_cache,
-                True,
-            )
-            attn_out = torch.ops.auto_deploy.triton_paged_mha_with_cache.default(
-                q_rope,
-                k_rope,
-                v,
-                batch_info_host,
-                cu_seqlen_host,
-                cu_num_pages,
-                cu_num_pages_host,
-                cache_loc,
-                last_page_len,
-                last_page_len_host,
-                seq_len_with_cache_host,
-                triton_batch_indices,
-                triton_positions,
-                kv_cache,
-                1.0,
-                layer_spec.sliding_window,
-            )
-            attn_out_flat = attn_out.reshape(batch_size * seq_len, -1).contiguous()
-            attn_out_view = attn_out_flat.view(batch_size, seq_len, -1)
-            o_proj = self._linear(
-                name=f"layer_{layer_spec.layer_index}_o_proj",
-                input_tensor=attn_out_flat,
-                weight_tensor=layer_spec.o_proj_weight,
-            )
-            o_proj = o_proj.view(batch_size, seq_len, -1)
-            post_attn = _rms_norm(o_proj, layer_spec.post_attention_layernorm_weight) + hidden
-
-            ffn_in = _rms_norm(post_attn, layer_spec.pre_feedforward_layernorm_weight).reshape(
-                batch_size * seq_len, -1
-            )
-            ffn_gate_up = self._linear(
-                name=f"layer_{layer_spec.layer_index}_ffn_gate_up",
-                input_tensor=ffn_in,
-                weight_tensor=layer_spec.ffn_gate_up_weight,
-            )
-            ffn_gate, ffn_up = torch.chunk(ffn_gate_up, 2, dim=-1)
-            ffn_act = self._gelu_mul(
-                ffn_gate.view(batch_size * seq_len, 1, -1),
-                ffn_up.view(batch_size * seq_len, 1, -1),
-            )
-            ffn_down = self._ffn_down_decode(
-                act_tensor=ffn_act.view(batch_size * seq_len, -1),
-                weight_tensor=layer_spec.ffn_down_weight,
-            ).view(batch_size, seq_len, -1)
-            ffn_norm = _rms_norm(ffn_down, layer_spec.post_feedforward_layernorm_1_weight)
-
-            post_attn_flat = post_attn.reshape(batch_size * seq_len, -1).contiguous()
-            moe_token_outputs = []
-            for token_idx in range(batch_size * seq_len):
-                token_hidden = post_attn_flat[token_idx : token_idx + 1].contiguous()
-                router_in = token_hidden.float()
-                router_mean = router_in.pow(2).mean(dim=-1, keepdim=True)
-                router_in = router_in * torch.rsqrt(router_mean + 1e-6)
-                router_in = router_in.to(torch.bfloat16)
-                router_in = router_in * layer_spec.router_root_size.to(dtype=router_in.dtype)
-                router_in = router_in * layer_spec.router_scale.to(dtype=router_in.dtype)
-                topk_weight, routing_indices, routing_mask = self._router(
-                    hidden_tensor=router_in,
-                    weight_tensor=layer_spec.router_proj_weight,
-                    topk=layer_spec.topk,
-                )
-
-                moe_in = _rms_norm(token_hidden, layer_spec.pre_feedforward_layernorm_2_weight)
-                experts = _extract_ranked_experts(routing_indices, layer_spec.topk)
-                if debug_tensors is not None and layer_spec.layer_index == 0 and token_idx == 0:
-                    router_logits = self._linear(
-                        name=f"layer_{layer_spec.layer_index}_router_proj_debug",
-                        input_tensor=router_in,
-                        weight_tensor=layer_spec.router_proj_weight,
-                    )
-                    debug_tensors["layer_0_router_in"] = (
-                        router_in.detach().clone().view(batch_size, seq_len, -1)
-                    )
-                    debug_tensors["layer_0_router_logits"] = (
-                        router_logits.detach().clone().view(batch_size, seq_len, -1)
-                    )
-                    debug_tensors["layer_0_router_topk_weight"] = (
-                        topk_weight.detach().clone().view(batch_size, seq_len, -1)
-                    )
-                    debug_tensors["layer_0_router_topk_indices"] = torch.tensor(
-                        experts,
-                        device=routing_indices.device,
-                        dtype=torch.int32,
-                    ).view(batch_size, seq_len, -1)
-                    debug_tensors["layer_0_moe_in"] = (
-                        moe_in.detach().clone().view(batch_size, seq_len, -1)
-                    )
-                moe_gate, moe_up = self._moe_w13(
-                    hidden_tensor=moe_in,
-                    gate_weight=layer_spec.moe_gate_weight,
-                    up_weight=layer_spec.moe_up_weight,
-                    routing_indices=routing_indices,
-                    routing_mask=routing_mask,
-                    topk=layer_spec.topk,
-                )
-                moe_act = self._gelu_mul(moe_gate, moe_up)
-                moe_token_out = self._moe_w2_reduce(
-                    act_tensor=moe_act.contiguous(),
-                    weight_tensor=layer_spec.moe_w2_weight,
-                    routing_indices=routing_indices,
-                    routing_mask=routing_mask,
-                    topk_weight=topk_weight,
-                    residual=torch.zeros_like(token_hidden),
-                )
-                moe_token_outputs.append(moe_token_out[0])
-
-            moe_out = torch.stack(moe_token_outputs, dim=0).view(batch_size, seq_len, -1)
-            moe_norm = _rms_norm(moe_out, layer_spec.post_feedforward_layernorm_2_weight)
-            ffn_moe_add = ffn_norm + moe_norm
-            ffn_moe_norm = _rms_norm(ffn_moe_add, layer_spec.post_feedforward_layernorm_weight)
-            hidden = post_attn + ffn_moe_norm
-            hidden = hidden * layer_spec.layer_scalar.view(1, 1, -1)
+            hidden = layer_outputs.hidden
             if debug_tensors is not None and layer_spec.layer_index == 0:
-                debug_tensors["layer_0_qkv_packed"] = qkv_packed_view.detach().clone()
-                debug_tensors["layer_0_q_norm"] = q.detach().clone()
-                debug_tensors["layer_0_k_norm"] = k.detach().clone()
-                debug_tensors["layer_0_v_norm"] = v.detach().clone()
-                debug_tensors["layer_0_q_rope"] = q_rope.detach().clone()
-                debug_tensors["layer_0_k_rope"] = k_rope.detach().clone()
-                debug_tensors["layer_0_attn_out"] = attn_out_view.detach().clone()
-                debug_tensors["layer_0_o_proj"] = o_proj.detach().clone()
-                debug_tensors["layer_0_post_attn"] = post_attn.detach().clone()
-                debug_tensors["layer_0_ffn_down"] = ffn_down.detach().clone()
-                debug_tensors["layer_0_ffn_norm"] = ffn_norm.detach().clone()
-                debug_tensors["layer_0_moe_out"] = moe_out.detach().clone()
-                debug_tensors["layer_0_moe_norm"] = moe_norm.detach().clone()
-                debug_tensors["layer_0_ffn_moe_add"] = ffn_moe_add.detach().clone()
-                debug_tensors["layer_0_ffn_moe_norm"] = ffn_moe_norm.detach().clone()
-                debug_tensors["layer_0_hidden"] = hidden.detach().clone()
+                debug_tensors.update(layer_outputs.debug_tensors)
             _mpk_debug(f"exit layer {layer_spec.layer_index}")
 
         hidden = _rms_norm(hidden, self.final_norm_weight)
@@ -8278,8 +8611,10 @@ def build_gemma_mirage_runtime_callable(
 ) -> Callable[..., Any]:
     """Build the live Gemma MPK runtime callable.
 
-    The runtime path is intentionally strict: once selected, execution must go
-    through the Mirage-backed callable rather than an eager fallback.
+    The runtime path is intentionally strict: once selected, generate-only
+    execution must go through the Mirage-backed callable rather than an eager
+    fallback. The default decode path is blockwise hybrid execution; the
+    single-PK per-layer path remains an explicit opt-in.
     """
     if source_model is None:
         layer_lowerings = translation_plan.get("layer_lowerings", [])
