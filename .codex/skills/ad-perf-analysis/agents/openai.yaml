@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+display_name: AutoDeploy Perf Analysis
+short_description: Analyze AutoDeploy traces, graph dumps, host waits, and config choices.
+default_prompt: Analyze this AutoDeploy performance run, correlate host and GPU work, and propose the next experiment.
