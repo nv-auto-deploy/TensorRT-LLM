@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import copy
+import os
 import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
@@ -1320,6 +1321,12 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         spec_resource_manager=spec_resource_manager,
     )
 
+    model_meta = getattr(engine.model, "meta", {})
+    autodeploy_meta = model_meta.get("_autodeploy", {}) if isinstance(model_meta, dict) else {}
+    hang_detection_timeout = None
+    if autodeploy_meta.get("mpk_runtime_mode") == "mirage_runtime":
+        hang_detection_timeout = int(os.getenv("AD_MPK_STALL_DETECTION_TIMEOUT_S", "3600"))
+
     # creating the executor object
     py_executor = PyExecutor(
         resource_manager,
@@ -1336,5 +1343,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         max_beam_width=ad_config.max_beam_width,
         guided_decoder=guided_decoder,
         drafter=drafter,
+        hang_detection_timeout=hang_detection_timeout,
     )
     return py_executor

@@ -820,3 +820,280 @@ Most likely directions:
    that Mirage handles more predictably
 3. only after the synthetic live full-layer helper finishes and is numerically
    bounded should we wire the same structure into the real runtime path
+
+## 2026-04-11 Gemma4MoE Decode-Only Mirage Runtime Status
+
+### Final status
+
+Gemma4MoE now works end to end on the decode-only Mirage/MPK path and produces
+coherent text on the full 30-layer configuration.
+
+The strongest proof run is:
+
+- `gemma_moe_mpk_live30_after_moe_block.log`
+
+Prompt:
+
+- chat-formatted `How big is the universe?`
+
+Observed output start:
+
+- `Because we cannot see everything in existence, astronomers distinguish between two different concepts...`
+
+This means the intended v1 boundary is now real:
+
+- generate-only / decode-only batches -> Mirage runtime path
+- non-generate-only batches -> original AutoDeploy path
+- `compile_model` / cudagraph remains bypassed for Mirage mode
+
+### What bug fixes actually mattered
+
+#### 1. Attention K-path analyzer bug
+
+The analyzer was incorrectly binding `k_norm` to the same node as `q_norm`.
+
+Evidence:
+
+- `layer_0_q_norm` and `layer_0_v_norm` were near exact
+- `layer_0_k_norm` and `layer_0_k_rope` were catastrophically wrong
+
+Fix:
+
+- special-case `getitem(flashinfer_rope, 0/1)` in the analyzer so q and k trace
+  back to the correct norm sources
+
+Effect:
+
+- attention-side drift collapsed
+- first-token compare moved from clearly wrong to mostly downstream-MoE error
+
+#### 2. MoE stacked weight order bug
+
+The fused MoE stack is in TRT-LLM `w3_w1` order:
+
+- first half = up projection
+- second half = gate projection
+
+The runtime had been interpreting the first half as gate and the second as up.
+
+Fix:
+
+- unpack the stacked tensor as `up_weight, gate_weight = chunk(...)`
+
+Effect:
+
+- `layer_0_moe_out`, `layer_0_moe_norm`, and downstream hidden-state error
+  dropped dramatically in the torch-shadow compare
+- first-token logits moved to:
+  - `top1_match=True`
+  - `top5_overlap=5`
+  - much smaller mean error
+
+#### 3. Use the proven MoE block composition in the runtime
+
+The runtime originally used a per-expert loop of separate dense linears.
+
+The more reliable path was the already-proven split-dense MoE composition:
+
+- router
+- `moe_w13_linear`
+- GELU gate/up activation
+- `moe_w2_reduce`
+
+Fix:
+
+- switch the live runtime to the same semantic MoE block structure that the
+  synthetic passing helper already used
+
+Effect:
+
+- real-Mirage first-token compare improved to:
+  - `max_abs=7.343750`
+  - `mean_abs=0.197819`
+  - `top1_match=True`
+  - `top5_overlap=5`
+- layer-0 router indices matched exactly
+- MoE output and hidden-state drift became small enough for coherent
+  end-to-end generation
+
+### Runtime policy that now works
+
+The current wrapper policy is:
+
+- if `BatchInfo.is_generate_only()`:
+  - run the live Mirage runtime
+- else:
+  - run the original AutoDeploy graph
+
+This is the right v1 shape for Gemma4MoE:
+
+- Mirage is a decode-only acceleration path
+- prefill / mixed non-generate-only work stays on the normal AutoDeploy path
+- cudagraph integration is not required for Mirage correctness
+
+### Validation summary
+
+Verified runtime-contract tests:
+
+- `bash -ic 'f1 && python3 -m pytest -q tests/unittest/auto_deploy/singlegpu/transformations/library/test_mpk_runtime_contract.py'`
+  - result: `5 passed`
+
+Verified first-token debug/compare shape after the final fixes:
+
+- real Mirage:
+  - logits compare:
+    - `max_abs=7.343750`
+    - `mean_abs=0.197819`
+    - `top1_match=True`
+    - `top5_overlap=5`
+  - layer 0:
+    - router indices exact
+    - MoE output numerically close
+    - final hidden-state drift small enough for coherent decode
+
+Verified full end-to-end decode-only run:
+
+- full 30-layer Gemma4MoE
+- coherent answer on a real chat prompt
+
+### Remaining caveats
+
+This path is correct enough for coherent generation, but not yet optimized.
+
+Known non-goals / remaining work:
+
+- first-use compile cost is still very high
+- per-token execution still involves many Python-orchestrated kernel calls
+- mixed-step decode-subset offload is not implemented
+- cudagraph integration for Mirage is still intentionally out of scope
+
+### Recommended next steps
+
+1. Preserve the decode-only boundary and avoid expanding scope to mixed-step
+   decode-subset offload yet.
+2. Add one lightweight repeatable regression driver for coherent decode-only
+   generation.
+3. Focus next on compile/execution efficiency:
+   - persistent compile caching
+   - fewer per-layer/per-token kernel objects
+   - more fused / prebuilt executors
+
+## 2026-04-13 Gemma4MoE Single-PK Global Attention Status
+
+This round finally separated the remaining single-PK issue into a clean
+Mirage-local pass/fail split.
+
+### 1. The raw global `single_batch_extend` kernel now passes on the current Mirage checkout
+
+We verified the installed Mirage path:
+
+- `/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/common/mirage`
+
+and confirmed Python imports from:
+
+- `/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/common/mirage/python/mirage/__init__.py`
+
+The exact Mirage-local repro:
+
+- `/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/common/mirage/gemma_global_single_batch_extend_exact_repro.py`
+
+now succeeds on the current checkout for:
+
+- `q_heads = 16`
+- `kv_heads = 2`
+- `head_dim = 512`
+- grouped fused `Q + K + V`
+- `grid_dim = (1, 2, 1)`
+- `block_dim = (256, 1, 1)`
+
+Observed outcome:
+
+- `compile_ok = true`
+- `launch_ok = true`
+- `sync_ok = true`
+
+So the old conclusion "raw single_batch_extend is still broken on latest
+Mirage" is now stale.
+
+### 2. The remaining standalone failure is the next composition step
+
+We then created a stricter Mirage-local repro for:
+
+- `rmsnorm_layer`
+- `linear_layer`
+- `single_batch_extend_attention_layer`
+
+File:
+
+- `/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/common/mirage/gemma_global_rmsnorm_linear_single_batch_extend_repro.py`
+
+This one reproduces the remaining failure cleanly:
+
+1. `compile-finished`
+2. `launch-start`
+3. `launch-returned`
+4. then no `sync-done` before timeout
+
+That means the current blocker is not the raw global attention kernel anymore.
+It is the standalone Mirage-local composition:
+
+```text
+rmsnorm -> linear -> single_batch_extend
+```
+
+for the real Gemma global geometry.
+
+### 3. TensorRT-LLM-side helpers agree with the Mirage-local split
+
+Against the same current Mirage checkout:
+
+- the pure Mirage-local exact attention repro passes
+- the TensorRT-LLM-side `run_mirage_gemma_global_attention_single_pk_smoke(...)`
+  still times out
+- the TensorRT-LLM-side `run_mirage_gemma_global_layer_single_pk_smoke(...)`
+  still times out
+
+This is consistent with the standalone Mirage-local composition repro above.
+
+### 4. Bridge-side contract fixes that were necessary, but not sufficient
+
+Before reaching this split, several real integration bugs were fixed:
+
+- `single_batch_extend` grid now uses KV-head count
+- `single_batch_extend` block now matches Mirage demos:
+  - `block_dim = (256, 1, 1)`
+- shared-KV global layers now expand to grouped fused `Q + K + V`
+- grouped rows are ordered per KV head, not packed as all-Q/all-K/all-V
+- internal page metadata in the synthetic helper now uses real internal page
+  count and last-page length
+
+Those fixes were all correct and required. But they were not enough to solve the
+composition failure.
+
+### 5. New practical rule for Mirage bring-up
+
+Do not stop at either of these extremes:
+
+- "raw kernel passes, so Mirage is fine"
+- "repo runtime fails, so the raw kernel must be broken"
+
+Add a standalone composition rung in between:
+
+1. raw Mirage kernel repro
+2. Mirage-local semantic composition repro
+3. repo-side helper
+4. layer runtime
+5. model runtime
+
+For the Gemma global layer, the working split is now:
+
+1. raw `single_batch_extend_attention_layer`
+   - passes
+2. `rmsnorm -> linear -> single_batch_extend`
+   - fails as a standalone Mirage-local repro
+3. TensorRT-LLM global-attention single-PK helper
+   - fails
+4. TensorRT-LLM full global-layer single-PK helper
+   - fails
+
+This is the cleanest escalation point we have had so far for Mirage-side fixes.

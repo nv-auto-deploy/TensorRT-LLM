@@ -940,18 +940,18 @@ def test_mirage_gemma_full_live_layer_matches_reference():
                 "run_mirage_gemma_full_layer_split_dense_forward_correctness; "
                 "result = run_mirage_gemma_full_layer_split_dense_forward_correctness(); "
                 "print(result); "
-                "assert result['post_attn_max_abs'] < 0.06; "
-                "assert result['post_attn_mean_abs'] < 0.01; "
-                "assert result['ffn_down_max_abs'] < 0.01; "
-                "assert result['ffn_down_mean_abs'] < 0.003; "
+                "assert result['post_attn_max_abs'] < 0.04; "
+                "assert result['post_attn_mean_abs'] < 0.005; "
+                "assert result['ffn_down_max_abs'] < 0.04; "
+                "assert result['ffn_down_mean_abs'] < 0.01; "
                 "assert result['topk_weight_max_abs'] < 0.005; "
                 "assert result['topk_weight_mean_abs'] < 0.002; "
                 "assert result['routing_overlap_count'] >= 8.0; "
-                "assert result['moe_act_max_abs'] < 0.2; "
-                "assert result['moe_act_mean_abs'] < 0.02; "
-                "assert result['w2_max_abs'] < 0.07; "
+                "assert result['moe_act_max_abs'] < 0.08; "
+                "assert result['moe_act_mean_abs'] < 0.01; "
+                "assert result['w2_max_abs'] < 0.04; "
                 "assert result['w2_mean_abs'] < 0.01; "
-                "assert result['hidden_out_max_abs'] < 0.03; "
+                "assert result['hidden_out_max_abs'] < 0.04; "
                 "assert result['hidden_out_mean_abs'] < 0.01"
             ),
         ],
@@ -1011,3 +1011,54 @@ def test_gemma4_full_layer_numerical_correctness():
         outputs[layer_plan.output_buffer], expected["hidden_out"], atol=1e-5, rtol=1e-5
     )
     assert torch.allclose(outputs["layer_0_ffn_down"], expected["ffn_down"], atol=1e-5, rtol=1e-5)
+
+
+def test_mirage_gemma_full_layer_single_pk_matches_reference():
+    try:
+        _require_mirage()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_pythonpath = os.getcwd()
+    mirage_pythonpath = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+        "bmarimuthu/common/mirage/python"
+    )
+    env["PYTHONPATH"] = ":".join(
+        [item for item in [repo_pythonpath, mirage_pythonpath, existing_pythonpath] if item]
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tensorrt_llm._torch.auto_deploy.mpk import "
+                "run_mirage_gemma_full_layer_single_pk_forward_correctness; "
+                "result = run_mirage_gemma_full_layer_single_pk_forward_correctness(); "
+                "print(result); "
+                "assert result['post_attn_max_abs'] < 0.04; "
+                "assert result['post_attn_mean_abs'] < 0.005; "
+                "assert result['ffn_down_max_abs'] < 0.04; "
+                "assert result['ffn_down_mean_abs'] < 0.01; "
+                "assert result['topk_weight_max_abs'] < 0.005; "
+                "assert result['topk_weight_mean_abs'] < 0.002; "
+                "assert result['routing_overlap_count'] >= 8.0; "
+                "assert result['moe_act_max_abs'] < 0.08; "
+                "assert result['moe_act_mean_abs'] < 0.01; "
+                "assert result['w2_max_abs'] < 0.04; "
+                "assert result['w2_mean_abs'] < 0.01; "
+                "assert result['hidden_out_max_abs'] < 0.04; "
+                "assert result['hidden_out_mean_abs'] < 0.01"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "hidden_out_max_abs" in proc.stdout

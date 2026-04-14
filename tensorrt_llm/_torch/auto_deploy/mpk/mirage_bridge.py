@@ -766,9 +766,13 @@ def _mpk_debug_enabled() -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+_MPK_DEBUG_START_TIME = time.perf_counter()
+
+
 def _mpk_debug(message: str) -> None:
     if _mpk_debug_enabled():
-        print(f"[AD_MPK_DEBUG] {message}", flush=True)
+        elapsed_s = time.perf_counter() - _MPK_DEBUG_START_TIME
+        print(f"[AD_MPK_DEBUG +{elapsed_s:8.3f}s] {message}", flush=True)
 
 
 def _mirage_repo_root() -> Path:
@@ -885,21 +889,26 @@ def _load_mirage_attention_single_token_extension() -> Any:
 def patch_generated_mirage_cuda_source(cuda_code: str) -> str:
     """Patch known Mirage-generated CUDA source compatibility gaps.
 
-    Current Mirage task registration can emit calls to ``norm_linear_task_impl``
-    on the Ampere runtime path without including the corresponding task header in
+    Current Mirage task registration can emit calls to task implementations on
+    the Ampere runtime path without including the corresponding task header in
     ``task_header.cuh``. Until that is fixed upstream, patch the generated CUDA
     source locally before invoking ``nvcc``.
     """
 
     anchor = '#include "persistent_kernel.cuh"\n'
-    compat_headers = (
-        '#include "persistent_kernel.cuh"\n'
-        '#include "tasks/ampere/norm_linear.cuh"\n'
-        '#include "tasks/ampere/norm_linear_new.cuh"\n'
-    )
+    missing_headers: list[str] = []
     if "norm_linear_task_impl" in cuda_code and "norm_linear_new.cuh" not in cuda_code:
-        if anchor in cuda_code:
-            cuda_code = cuda_code.replace(anchor, compat_headers, 1)
+        missing_headers.extend(
+            [
+                '#include "tasks/ampere/norm_linear.cuh"\n',
+                '#include "tasks/ampere/norm_linear_new.cuh"\n',
+            ]
+        )
+    if "single_batch_extend_kernel" in cuda_code and "single_batch_extend.cuh" not in cuda_code:
+        missing_headers.append('#include "tasks/ampere/single_batch_extend.cuh"\n')
+    if missing_headers and anchor in cuda_code:
+        compat_headers = anchor + "".join(missing_headers)
+        cuda_code = cuda_code.replace(anchor, compat_headers, 1)
 
     # Mirage's SM90 MoE linear task registration currently emits the expert-mask
     # layout with ``num_experts`` entries even though the kernel reads the final
@@ -935,13 +944,10 @@ def compile_persistent_kernel_with_patches(
     if pk._is_compiled:
         return pk
 
-    if pk.mode in {"online_notoken", "online", "multi_turn"}:
-        tempdir = "./permanent_output_dir/"
-    else:
-        tempdir_obj = tempfile.TemporaryDirectory()
-        tempdir = tempdir_obj.name
-
-    os.makedirs(tempdir, exist_ok=True)
+    # Use a fresh build directory for every compile. Reusing a stable
+    # ``test.so`` path under online modes can cause stale launcher binaries to
+    # be reloaded across repeated experiments in the same process.
+    tempdir = tempfile.mkdtemp(prefix="mirage_pk_")
     results = pk.kn_graph.generate_task_graph(num_gpus=pk.world_size, my_gpu_id=pk.mpi_rank)
 
     cuda_code = patch_generated_mirage_cuda_source(results["cuda_code"] + hard_code)
@@ -1003,6 +1009,21 @@ def compile_persistent_kernel_with_patches(
     # stray PTX target while preserving the intended Hopper cubin.
     if pk.target_cc == 90:
         cc_cmd = [arg for arg in cc_cmd if arg != "-arch=sm_90a"]
+
+    extra_include_dirs = [
+        os.path.join(include_path, "mirage", "persistent_kernel", "tasks", "common"),
+        os.path.join(include_path, "mirage", "persistent_kernel", "tasks", "ampere"),
+        os.path.join(include_path, "mirage", "transpiler"),
+    ]
+    insertion_index = 0
+    for i, arg in enumerate(cc_cmd):
+        if arg.startswith("-D"):
+            insertion_index = i
+            break
+    else:
+        insertion_index = len(cc_cmd)
+    include_args = [f"-I{path}" for path in extra_include_dirs if f"-I{path}" not in cc_cmd]
+    cc_cmd[insertion_index:insertion_index] = include_args
     subprocess.check_call(cc_cmd)
 
     spec = importlib.util.spec_from_file_location("__mirage_launcher", so_path)
@@ -1766,7 +1787,8 @@ def run_mirage_attention_sublayer_pk_forward_correctness(
     qkv_out = torch.zeros(
         (num_tokens, (qo_heads + 2 * kv_heads) * head_dim), device="cuda", dtype=torch.bfloat16
     )
-    attn_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    attn_out_size = qo_heads * head_dim
+    attn_out = torch.zeros((num_tokens, attn_out_size), device="cuda", dtype=torch.bfloat16)
     block_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
 
     hidden_dt = pk.attach_input(hidden_in.contiguous(), name="pk_attn_hidden")
@@ -1962,7 +1984,8 @@ def run_mirage_attention_block_pk_forward_correctness(
     o_proj_weight = (
         torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
     )
-    attn_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    attn_out_size = qo_heads * head_dim
+    attn_out = torch.zeros((num_tokens, attn_out_size), device="cuda", dtype=torch.bfloat16)
     block_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
 
     qkv_dt = pk.attach_input(qkv_in.contiguous(), name="pk_attn_block_qkv")
@@ -2539,7 +2562,8 @@ def run_mirage_moe_gelu_split_dense_projection_forward_correctness(
     qkv_out = torch.zeros(
         (num_tokens, (qo_heads + 2 * kv_heads) * head_dim), device="cuda", dtype=torch.bfloat16
     )
-    attn_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    attn_out_size = qo_heads * head_dim
+    attn_out = torch.zeros((num_tokens, attn_out_size), device="cuda", dtype=torch.bfloat16)
     post_attn = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
 
     hidden_dt = pk.attach_input(hidden_in.contiguous(), name="dbg_split_dense_hidden")
@@ -3152,7 +3176,8 @@ def run_mirage_moe_gelu_split_dense_block_forward_correctness(
     qkv_out = torch.zeros(
         (num_tokens, (qo_heads + 2 * kv_heads) * head_dim), device="cuda", dtype=torch.bfloat16
     )
-    attn_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    attn_out_size = qo_heads * head_dim
+    attn_out = torch.zeros((num_tokens, attn_out_size), device="cuda", dtype=torch.bfloat16)
     post_attn = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
 
     hidden_dt = pk.attach_input(hidden_in.contiguous(), name="dbg_split_dense_block_hidden")
@@ -3531,7 +3556,7 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
     num_experts = 128
     topk = 8
     intermediate = 64
-    ffn_intermediate = 64
+    ffn_intermediate = 256
 
     def _timed_call(
         stage_name: str,
@@ -3655,7 +3680,8 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
     qkv_out = torch.zeros(
         (num_tokens, (qo_heads + 2 * kv_heads) * head_dim), device="cuda", dtype=torch.bfloat16
     )
-    attn_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    attn_out_size = qo_heads * head_dim
+    attn_out = torch.zeros((num_tokens, attn_out_size), device="cuda", dtype=torch.bfloat16)
     post_attn = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
 
     hidden_dt = attn_pk.attach_input(hidden_in.contiguous(), name="full_layer_hidden")
@@ -3881,10 +3907,10 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
     _reset_pk_runtime_state(ffn_phase2, active_tokens=1)
     _timed_call("ffn_phase2_launch_s", ffn_phase2, cuda_sync=True)
 
+    live_ffn_gate, live_ffn_up = torch.chunk(ffn_gate_up.float(), 2, dim=-1)
+    ffn_down_ref = (F.gelu(live_ffn_gate) * live_ffn_up) @ ffn_down_weight.float().transpose(0, 1)
     ffn_norm_ref = _rms_norm(post_attn_live, ffn_norm_weight, eps=eps)
     ffn_gate_up_ref = ffn_norm_ref @ ffn_gate_up_weight.float().transpose(0, 1)
-    ffn_gate_ref, ffn_up_ref = torch.chunk(ffn_gate_up_ref, 2, dim=-1)
-    ffn_down_ref = (F.gelu(ffn_gate_ref) * ffn_up_ref) @ ffn_down_weight.float().transpose(0, 1)
 
     # MoE branch from the same live attention output.
     router_weight = (
@@ -4068,7 +4094,7 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         ],
         dim=0,
     ).unsqueeze(0)
-    ref_hidden_out = (ref_w2 * ref_topk_weight.unsqueeze(-1)).sum(dim=1) + ffn_down_ref
+    ref_hidden_out = (moe_w2_out.float() * topk_weight.float().unsqueeze(-1)).sum(dim=1) + ffn_down_ref
 
     return {
         **stage_timings,
@@ -4085,6 +4111,1176 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         "w2_mean_abs": float((w2_out.float() - ref_w2).abs().mean().item()),
         "hidden_out_max_abs": float((hidden_out.float() - ref_hidden_out).abs().max().item()),
         "hidden_out_mean_abs": float((hidden_out.float() - ref_hidden_out).abs().mean().item()),
+    }
+
+
+def run_mirage_gemma_full_layer_single_pk_forward_correctness(
+    *,
+    eps: float = 1e-5,
+    seed: int = 0,
+    output_dir: Optional[str] = None,
+    launch: bool = True,
+    include_moe_tail: bool = True,
+    use_patched_compile: bool = True,
+) -> Dict[str, float]:
+    """Run a synthetic Gemma-style decode layer through one PersistentKernel.
+
+    This mirrors the working decode runtime semantics closely while still using
+    the proven top-k=1 MoE path for the dense FFN down projection.
+    """
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    num_tokens = 1
+    hidden_size = 512
+    qo_heads = 4
+    kv_heads = 1
+    head_dim = 128
+    page_size = 64
+    max_num_pages = 64
+    num_experts = 128
+    topk = 8
+    intermediate = 64
+    ffn_intermediate = 256
+
+    pk = create_test_persistent_kernel(
+        max_seq_length=512,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=num_tokens,
+        max_num_pages=max_num_pages,
+        page_size=page_size,
+        use_cutlass_kernel=False,
+    )
+
+    qo_indptr = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
+    paged_kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    paged_kv_indices = torch.arange(max_num_pages, device="cuda", dtype=torch.int32)
+    paged_kv_last_page_len = torch.tensor([8 + num_tokens], device="cuda", dtype=torch.int32)
+
+    hidden_in = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
+    attn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    qkv_weight = (
+        torch.randn(
+            ((qo_heads + 2 * kv_heads) * head_dim, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 16.0
+    )
+    q_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    k_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    cos = torch.ones((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    sin = torch.zeros((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    k_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    v_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    o_proj_weight = (
+        torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+    post_attn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    pre_ffn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    ffn_gate_up_weight = (
+        torch.randn((2 * ffn_intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    ffn_down_weight = (
+        torch.randn((hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    post_ffn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    router_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    router_root_size = (
+        0.9 + 0.2 * torch.rand((hidden_size,), device="cuda", dtype=torch.float32)
+    ).to(torch.bfloat16)
+    router_scale = (
+        0.9 + 0.2 * torch.rand((hidden_size,), device="cuda", dtype=torch.float32)
+    ).to(torch.bfloat16)
+    router_weight = (
+        torch.randn((num_experts, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+    router_weight_scaled = (
+        router_weight.float()
+        * router_root_size.float().view(1, -1)
+        * router_scale.float().view(1, -1)
+    ).to(torch.bfloat16)
+    pre_moe_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    gate_weight = (
+        torch.randn((num_experts, intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    up_weight = (
+        torch.randn((num_experts, intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    moe_w13_weight = torch.cat((up_weight, gate_weight), dim=1).contiguous()
+    w2_weight = (
+        torch.randn((num_experts, hidden_size, intermediate), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    post_moe_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    post_merge_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    layer_scalar = (
+        0.9 + 0.2 * torch.rand((hidden_size,), device="cuda", dtype=torch.float32)
+    ).to(torch.bfloat16)
+    identity_weight = torch.eye(hidden_size, device="cuda", dtype=torch.bfloat16)
+    layer_scale_weight = torch.diag(layer_scalar.float()).to(torch.bfloat16)
+
+    rmsnorm_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    qkv_out = torch.zeros(
+        (num_tokens, (qo_heads + 2 * kv_heads) * head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    attn_out_size = qo_heads * head_dim
+    attn_out = torch.zeros((num_tokens, attn_out_size), device="cuda", dtype=torch.bfloat16)
+    o_proj = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    post_attn_norm = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    post_attn = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_normed = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_gate_up_storage = torch.zeros(
+        (num_tokens, 1, 2 * ffn_intermediate), device="cuda", dtype=torch.bfloat16
+    )
+    ffn_gate_up = ffn_gate_up_storage.view(num_tokens, 2 * ffn_intermediate)
+    ffn_act = torch.zeros((num_tokens, 1, ffn_intermediate), device="cuda", dtype=torch.bfloat16)
+    ffn_routing_indices = torch.ones((1, num_tokens), device="cuda", dtype=torch.int32)
+    ffn_routing_mask = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
+    ffn_topk_weight = torch.ones((num_tokens, 1), device="cuda", dtype=torch.float32)
+    zero_residual = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_w2_weight = torch.empty((1, hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16)
+    ffn_w2_weight[0].copy_(ffn_down_weight)
+    ffn_w2_out = torch.zeros((num_tokens, 1, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_down = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_norm = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    router_in = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    router_logits = torch.zeros((num_tokens, num_experts), device="cuda", dtype=torch.bfloat16)
+    topk_weight = torch.zeros((num_tokens, topk), device="cuda", dtype=torch.float32)
+    routing_indices = torch.zeros((num_experts, num_tokens), device="cuda", dtype=torch.int32)
+    routing_mask = torch.zeros((num_experts + 1,), device="cuda", dtype=torch.int32)
+    moe_in = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    moe_act = torch.zeros((num_tokens, topk, intermediate), device="cuda", dtype=torch.bfloat16)
+    moe_w2_out = torch.zeros((num_tokens, topk, hidden_size), device="cuda", dtype=torch.bfloat16)
+    moe_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    moe_norm = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_moe_add = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_moe_norm = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    hidden_pre_scale = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    scaled_post_attn = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    hidden_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+
+    hidden_dt = pk.attach_input(hidden_in.contiguous(), name="single_pk_hidden")
+    attn_norm_dt = pk.attach_input(attn_norm_weight.contiguous(), name="single_pk_attn_norm")
+    qkv_weight_dt = pk.attach_input(qkv_weight.contiguous(), name="single_pk_qkv_weight")
+    rmsnorm_out_dt = pk.attach_input(rmsnorm_out, name="single_pk_rmsnorm_out")
+    qkv_out_dt = pk.attach_input(qkv_out, name="single_pk_qkv_out")
+    q_norm_dt = pk.attach_input(q_norm_weight.contiguous(), name="single_pk_q_norm")
+    k_norm_dt = pk.attach_input(k_norm_weight.contiguous(), name="single_pk_k_norm")
+    cos_dt = pk.attach_input(cos.contiguous(), name="single_pk_cos")
+    sin_dt = pk.attach_input(sin.contiguous(), name="single_pk_sin")
+    k_cache_dt = pk.attach_input(k_cache.contiguous(), name="single_pk_k_cache")
+    v_cache_dt = pk.attach_input(v_cache.contiguous(), name="single_pk_v_cache")
+    attn_out_dt = pk.attach_input(attn_out, name="single_pk_attn_out")
+    o_proj_weight_dt = pk.attach_input(o_proj_weight.contiguous(), name="single_pk_o_proj_weight")
+    o_proj_dt = pk.attach_input(o_proj, name="single_pk_o_proj")
+    post_attn_norm_weight_dt = pk.attach_input(
+        post_attn_norm_weight.contiguous(), name="single_pk_post_attn_norm_weight"
+    )
+    post_attn_norm_dt = pk.attach_input(post_attn_norm, name="single_pk_post_attn_norm")
+    identity_weight_dt = pk.attach_input(identity_weight.contiguous(), name="single_pk_identity_weight")
+    post_attn_dt = pk.attach_input(post_attn, name="single_pk_post_attn")
+    pre_ffn_norm_weight_dt = pk.attach_input(
+        pre_ffn_norm_weight.contiguous(), name="single_pk_pre_ffn_norm_weight"
+    )
+    ffn_normed_dt = pk.attach_input(ffn_normed, name="single_pk_ffn_normed")
+    ffn_gate_up_weight_dt = pk.attach_input(
+        ffn_gate_up_weight.contiguous(), name="single_pk_ffn_gate_up_weight"
+    )
+    ffn_gate_up_dt = pk.attach_input(ffn_gate_up, name="single_pk_ffn_gate_up")
+    ffn_gate_up_moe_dt = pk.attach_input(ffn_gate_up_storage, name="single_pk_ffn_gate_up_moe")
+    ffn_act_dt = pk.attach_input(ffn_act, name="single_pk_ffn_act")
+    ffn_routing_indices_dt = pk.attach_input(
+        ffn_routing_indices, name="single_pk_ffn_routing_indices"
+    )
+    ffn_routing_mask_dt = pk.attach_input(ffn_routing_mask, name="single_pk_ffn_routing_mask")
+    ffn_topk_weight_dt = pk.attach_input(ffn_topk_weight, name="single_pk_ffn_topk_weight")
+    zero_residual_dt = pk.attach_input(zero_residual, name="single_pk_zero_residual")
+    ffn_w2_weight_dt = pk.attach_input(ffn_w2_weight.contiguous(), name="single_pk_ffn_w2_weight")
+    ffn_w2_out_dt = pk.attach_input(ffn_w2_out, name="single_pk_ffn_w2_out")
+    ffn_down_dt = pk.attach_input(ffn_down, name="single_pk_ffn_down")
+    post_ffn_norm_weight_dt = pk.attach_input(
+        post_ffn_norm_weight.contiguous(), name="single_pk_post_ffn_norm_weight"
+    )
+    ffn_norm_dt = pk.attach_input(ffn_norm, name="single_pk_ffn_norm")
+
+    router_norm_weight_dt = None
+    router_in_dt = None
+    router_weight_dt = None
+    router_logits_dt = None
+    moe_in_norm_weight_dt = None
+    moe_in_dt = None
+    topk_weight_dt = None
+    routing_indices_dt = None
+    routing_mask_dt = None
+    moe_w13_weight_dt = None
+    moe_act_dt = None
+    moe_w2_weight_dt = None
+    moe_w2_out_dt = None
+    moe_out_dt = None
+    post_moe_norm_weight_dt = None
+    moe_norm_dt = None
+    ffn_moe_add_dt = None
+    post_merge_norm_weight_dt = None
+    ffn_moe_norm_dt = None
+    hidden_pre_scale_dt = None
+    scaled_post_attn_dt = None
+    layer_scale_weight_dt = None
+    hidden_out_dt = None
+
+    if include_moe_tail:
+        router_norm_weight_dt = pk.attach_input(
+            router_norm_weight.contiguous(), name="single_pk_router_norm_weight"
+        )
+        router_in_dt = pk.attach_input(router_in, name="single_pk_router_in")
+        router_weight_dt = pk.attach_input(
+            router_weight_scaled.contiguous(), name="single_pk_router_weight"
+        )
+        router_logits_dt = pk.attach_input(router_logits, name="single_pk_router_logits")
+        moe_in_norm_weight_dt = pk.attach_input(
+            pre_moe_norm_weight.contiguous(), name="single_pk_moe_in_norm_weight"
+        )
+        moe_in_dt = pk.attach_input(moe_in, name="single_pk_moe_in")
+        topk_weight_dt = pk.attach_input(topk_weight, name="single_pk_topk_weight")
+        routing_indices_dt = pk.attach_input(routing_indices, name="single_pk_routing_indices")
+        routing_mask_dt = pk.attach_input(routing_mask, name="single_pk_routing_mask")
+        moe_w13_weight_dt = pk.attach_input(
+            moe_w13_weight.contiguous(), name="single_pk_moe_w13_weight"
+        )
+        moe_act_dt = pk.attach_input(moe_act, name="single_pk_moe_act")
+        moe_w2_weight_dt = pk.attach_input(
+            w2_weight.contiguous(), name="single_pk_moe_w2_weight"
+        )
+        moe_w2_out_dt = pk.attach_input(moe_w2_out, name="single_pk_moe_w2_out")
+        moe_out_dt = pk.attach_input(moe_out, name="single_pk_moe_out")
+        post_moe_norm_weight_dt = pk.attach_input(
+            post_moe_norm_weight.contiguous(), name="single_pk_post_moe_norm_weight"
+        )
+        moe_norm_dt = pk.attach_input(moe_norm, name="single_pk_moe_norm")
+        ffn_moe_add_dt = pk.attach_input(ffn_moe_add, name="single_pk_ffn_moe_add")
+        post_merge_norm_weight_dt = pk.attach_input(
+            post_merge_norm_weight.contiguous(), name="single_pk_post_merge_norm_weight"
+        )
+        ffn_moe_norm_dt = pk.attach_input(ffn_moe_norm, name="single_pk_ffn_moe_norm")
+        hidden_pre_scale_dt = pk.attach_input(hidden_pre_scale, name="single_pk_hidden_pre_scale")
+        scaled_post_attn_dt = pk.attach_input(scaled_post_attn, name="single_pk_scaled_post_attn")
+        layer_scale_weight_dt = pk.attach_input(
+            layer_scale_weight.contiguous(), name="single_pk_layer_scale_weight"
+        )
+        hidden_out_dt = pk.attach_input(hidden_out, name="single_pk_hidden_out")
+
+    pk.rmsnorm_layer(
+        input=hidden_dt,
+        weight=attn_norm_dt,
+        output=rmsnorm_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_layer(
+        input=rmsnorm_out_dt,
+        weight=qkv_weight_dt,
+        output=qkv_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.paged_attention_layer(
+        input=qkv_out_dt,
+        k_cache=k_cache_dt,
+        v_cache=v_cache_dt,
+        q_norm=q_norm_dt,
+        k_norm=k_norm_dt,
+        cos_pos_embed=cos_dt,
+        sin_pos_embed=sin_dt,
+        output=attn_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_layer(
+        input=attn_out_dt,
+        weight=o_proj_weight_dt,
+        output=o_proj_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.rmsnorm_layer(
+        input=o_proj_dt,
+        weight=post_attn_norm_weight_dt,
+        output=post_attn_norm_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_with_residual_layer(
+        input=post_attn_norm_dt,
+        weight=identity_weight_dt,
+        residual=hidden_dt,
+        output=post_attn_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.rmsnorm_layer(
+        input=post_attn_dt,
+        weight=pre_ffn_norm_weight_dt,
+        output=ffn_normed_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_layer(
+        input=ffn_normed_dt,
+        weight=ffn_gate_up_weight_dt,
+        output=ffn_gate_up_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.moe_gelu_mul_layer(
+        input=ffn_gate_up_moe_dt,
+        output=ffn_act_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.moe_w2_linear_layer(
+        input=ffn_act_dt,
+        weight=ffn_w2_weight_dt,
+        moe_routing_indices=ffn_routing_indices_dt,
+        moe_mask=ffn_routing_mask_dt,
+        output=ffn_w2_out_dt,
+        grid_dim=_moe_expert_grid_dim(pk, w13_linear=False),
+        block_dim=(128, 1, 1),
+    )
+    pk.moe_mul_sum_add_layer(
+        input=ffn_w2_out_dt,
+        weight=ffn_topk_weight_dt,
+        residual=zero_residual_dt,
+        output=ffn_down_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.rmsnorm_layer(
+        input=ffn_down_dt,
+        weight=post_ffn_norm_weight_dt,
+        output=ffn_norm_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+
+    if include_moe_tail:
+        pk.rmsnorm_layer(
+            input=post_attn_dt,
+            weight=router_norm_weight_dt,
+            output=router_in_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        pk.linear_layer(
+            input=router_in_dt,
+            weight=router_weight_dt,
+            output=router_logits_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        pk.moe_topk_softmax_routing_layer(
+            input=router_logits_dt,
+            output=(topk_weight_dt, routing_indices_dt, routing_mask_dt),
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        pk.rmsnorm_layer(
+            input=post_attn_dt,
+            weight=moe_in_norm_weight_dt,
+            output=moe_in_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        pk.moe_w13_gelu_mul_layer(
+            input=moe_in_dt,
+            weight=moe_w13_weight_dt,
+            moe_routing_indices=routing_indices_dt,
+            moe_mask=routing_mask_dt,
+            output=moe_act_dt,
+            grid_dim=_moe_expert_grid_dim(pk, w13_linear=True),
+            block_dim=(128, 1, 1),
+        )
+        pk.moe_w2_linear_layer(
+            input=moe_act_dt,
+            weight=moe_w2_weight_dt,
+            moe_routing_indices=routing_indices_dt,
+            moe_mask=routing_mask_dt,
+            output=moe_w2_out_dt,
+            grid_dim=_moe_expert_grid_dim(pk, w13_linear=False),
+            block_dim=(128, 1, 1),
+        )
+        pk.moe_mul_sum_add_layer(
+            input=moe_w2_out_dt,
+            weight=topk_weight_dt,
+            residual=zero_residual_dt,
+            output=moe_out_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        pk.rmsnorm_layer(
+            input=moe_out_dt,
+            weight=post_moe_norm_weight_dt,
+            output=moe_norm_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        pk.linear_with_residual_layer(
+            input=ffn_norm_dt,
+            weight=identity_weight_dt,
+            residual=moe_norm_dt,
+            output=ffn_moe_add_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        pk.rmsnorm_layer(
+            input=ffn_moe_add_dt,
+            weight=post_merge_norm_weight_dt,
+            output=ffn_moe_norm_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        pk.linear_layer(
+            input=ffn_moe_norm_dt,
+            weight=layer_scale_weight_dt,
+            output=hidden_pre_scale_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        pk.linear_layer(
+            input=post_attn_dt,
+            weight=layer_scale_weight_dt,
+            output=scaled_post_attn_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        pk.linear_with_residual_layer(
+            input=hidden_pre_scale_dt,
+            weight=identity_weight_dt,
+            residual=scaled_post_attn_dt,
+            output=hidden_out_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+    if use_patched_compile:
+        compile_persistent_kernel_with_patches(pk, output_dir=output_dir)
+    else:
+        pk.compile(output_dir=output_dir)
+    _reset_pk_runtime_state(
+        pk,
+        active_tokens=num_tokens,
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=paged_kv_indptr,
+        paged_kv_indices=paged_kv_indices,
+        paged_kv_last_page_len=paged_kv_last_page_len,
+    )
+    if not launch:
+        return {"compiled_only": 1.0}
+
+    pk()
+    torch.cuda.synchronize()
+
+    qkv_variance = hidden_in.float().pow(2).mean(dim=-1, keepdim=True)
+    qkv_ref = (hidden_in.float() * torch.rsqrt(qkv_variance + eps)) * attn_norm_weight.float()
+    qkv_ref = qkv_ref @ qkv_weight.float().transpose(0, 1)
+    torch_k_cache = k_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    torch_v_cache = v_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    q = qkv_ref[:, : qo_heads * head_dim].view(num_tokens, qo_heads, head_dim)
+    k = qkv_ref[:, qo_heads * head_dim : qo_heads * head_dim + kv_heads * head_dim]
+    v = qkv_ref[:, qo_heads * head_dim + kv_heads * head_dim :]
+    page_idx = int(paged_kv_indices[0].item())
+    page_offset = int(paged_kv_last_page_len[0].item()) - num_tokens
+    torch_k_cache[page_idx, page_offset : page_offset + num_tokens] = k
+    torch_v_cache[page_idx, page_offset : page_offset + num_tokens] = v
+    ref_attn = _reference_multitoken_paged_attention(
+        q=q,
+        paged_k_cache=torch_k_cache,
+        paged_v_cache=torch_v_cache,
+        qo_heads=qo_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        num_tokens=num_tokens,
+        paged_kv_indptr_buffer=paged_kv_indptr,
+        paged_kv_indices_buffer=paged_kv_indices,
+        paged_kv_last_page_len_buffer=paged_kv_last_page_len,
+    ).reshape(num_tokens, hidden_size)
+
+    o_proj_ref = ref_attn @ o_proj_weight.float().transpose(0, 1)
+    o_proj_var = o_proj_ref.pow(2).mean(dim=-1, keepdim=True)
+    post_attn_ref = (
+        (o_proj_ref * torch.rsqrt(o_proj_var + eps)) * post_attn_norm_weight.float()
+    ) + hidden_in.float()
+    ffn_in_var = post_attn_ref.pow(2).mean(dim=-1, keepdim=True)
+    ffn_in_ref = (post_attn_ref * torch.rsqrt(ffn_in_var + eps)) * pre_ffn_norm_weight.float()
+    ffn_gate_up_ref = ffn_in_ref @ ffn_gate_up_weight.float().transpose(0, 1)
+    ffn_gate_ref, ffn_up_ref = torch.chunk(ffn_gate_up_ref, 2, dim=-1)
+    ffn_down_ref = (F.gelu(ffn_gate_ref) * ffn_up_ref) @ ffn_down_weight.float().transpose(0, 1)
+    ffn_down_var = ffn_down_ref.pow(2).mean(dim=-1, keepdim=True)
+    ffn_norm_ref = (ffn_down_ref * torch.rsqrt(ffn_down_var + eps)) * post_ffn_norm_weight.float()
+
+    results = {
+        "post_attn_max_abs": float((post_attn.float() - post_attn_ref).abs().max().item()),
+        "post_attn_mean_abs": float((post_attn.float() - post_attn_ref).abs().mean().item()),
+        "ffn_down_max_abs": float((ffn_down.float() - ffn_down_ref).abs().max().item()),
+        "ffn_down_mean_abs": float((ffn_down.float() - ffn_down_ref).abs().mean().item()),
+        "ffn_gate_up_max_abs": float((ffn_gate_up.float() - ffn_gate_up_ref).abs().max().item()),
+        "ffn_gate_up_mean_abs": float((ffn_gate_up.float() - ffn_gate_up_ref).abs().mean().item()),
+        "include_moe_tail": float(include_moe_tail),
+    }
+    if not include_moe_tail:
+        return results
+
+    router_in_var = post_attn_ref.pow(2).mean(dim=-1, keepdim=True)
+    router_in_ref = (
+        (post_attn_ref * torch.rsqrt(router_in_var + 1e-6))
+        * router_root_size.float().view(1, -1)
+        * router_scale.float().view(1, -1)
+    )
+    ref_logits = router_in_ref @ router_weight.float().transpose(0, 1)
+    ref_topk_values, ref_topk_indices = torch.topk(ref_logits, k=topk, dim=-1)
+    ref_topk_weight = torch.softmax(ref_topk_values, dim=-1)
+    ref_ids = ref_topk_indices[0].cpu().tolist()
+    selected_experts = []
+    for expert_index in range(num_experts):
+        rank = int(routing_indices[expert_index, 0].item())
+        if rank != 0:
+            selected_experts.append((expert_index, rank))
+    selected_experts = sorted(selected_experts, key=lambda item: item[1])
+    experts = [expert for expert, _ in selected_experts[:topk]]
+
+    moe_in_var = post_attn_ref.pow(2).mean(dim=-1, keepdim=True)
+    moe_in_ref = (post_attn_ref * torch.rsqrt(moe_in_var + eps)) * pre_moe_norm_weight.float()
+    gate_ref = torch.stack(
+        [moe_in_ref[0] @ gate_weight[expert].float().transpose(0, 1) for expert in experts],
+        dim=0,
+    ).unsqueeze(0)
+    up_ref = torch.stack(
+        [moe_in_ref[0] @ up_weight[expert].float().transpose(0, 1) for expert in experts],
+        dim=0,
+    ).unsqueeze(0)
+    ref_moe_act = (F.gelu(gate_ref) * up_ref).contiguous()
+    ref_w2 = torch.stack(
+        [
+            ref_moe_act[0, rank] @ w2_weight[expert].float().transpose(0, 1)
+            for rank, expert in enumerate(experts)
+        ],
+        dim=0,
+    ).unsqueeze(0)
+    ref_moe_out = (ref_w2 * ref_topk_weight.unsqueeze(-1)).sum(dim=1)
+    ref_moe_var = ref_moe_out.pow(2).mean(dim=-1, keepdim=True)
+    ref_moe_norm = (ref_moe_out * torch.rsqrt(ref_moe_var + eps)) * post_moe_norm_weight.float()
+    ref_ffn_moe_add = ffn_norm_ref + ref_moe_norm
+    ref_ffn_moe_var = ref_ffn_moe_add.pow(2).mean(dim=-1, keepdim=True)
+    ref_ffn_moe_norm = (
+        ref_ffn_moe_add * torch.rsqrt(ref_ffn_moe_var + eps)
+    ) * post_merge_norm_weight.float()
+    ref_hidden_out = (post_attn_ref + ref_ffn_moe_norm) * layer_scalar.float().view(1, -1)
+
+    results.update(
+        {
+            "topk_weight_max_abs": float((topk_weight.float() - ref_topk_weight).abs().max().item()),
+            "topk_weight_mean_abs": float((topk_weight.float() - ref_topk_weight).abs().mean().item()),
+            "routing_overlap_count": float(len(set(experts) & set(ref_ids))),
+            "moe_act_max_abs": float((moe_act.float() - ref_moe_act).abs().max().item()),
+            "moe_act_mean_abs": float((moe_act.float() - ref_moe_act).abs().mean().item()),
+            "w2_max_abs": float((moe_w2_out.float() - ref_w2).abs().max().item()),
+            "w2_mean_abs": float((moe_w2_out.float() - ref_w2).abs().mean().item()),
+            "hidden_out_max_abs": float((hidden_out.float() - ref_hidden_out).abs().max().item()),
+            "hidden_out_mean_abs": float((hidden_out.float() - ref_hidden_out).abs().mean().item()),
+        }
+    )
+    return results
+
+
+def run_mirage_attention_ffn_fused_single_pk_forward_correctness(
+    *,
+    eps: float = 1e-5,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Run attention + dense FFN fused-down in one PersistentKernel."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    num_tokens = 1
+    hidden_size = 512
+    qo_heads = 4
+    kv_heads = 1
+    head_dim = 128
+    page_size = 64
+    max_num_pages = 64
+    ffn_intermediate = 256
+
+    pk = create_test_persistent_kernel(
+        max_seq_length=512,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=num_tokens,
+        max_num_pages=max_num_pages,
+        page_size=page_size,
+        use_cutlass_kernel=False,
+    )
+    qo_indptr = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
+    paged_kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    paged_kv_indices = torch.arange(max_num_pages, device="cuda", dtype=torch.int32)
+    paged_kv_last_page_len = torch.tensor([8 + num_tokens], device="cuda", dtype=torch.int32)
+
+    hidden_in = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
+    attn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    qkv_weight = (
+        torch.randn(
+            ((qo_heads + 2 * kv_heads) * head_dim, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 16.0
+    )
+    q_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    k_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    cos = torch.ones((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    sin = torch.zeros((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    k_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    v_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    o_proj_weight = (
+        torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+    ffn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    ffn_gate_up_weight = (
+        torch.randn((2 * ffn_intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    ffn_down_weight = (
+        torch.randn((hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+
+    rmsnorm_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    qkv_out = torch.zeros(
+        (num_tokens, (qo_heads + 2 * kv_heads) * head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    attn_out_size = qo_heads * head_dim
+    attn_out = torch.zeros((num_tokens, attn_out_size), device="cuda", dtype=torch.bfloat16)
+    post_attn = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_normed = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_gate_up = torch.zeros(
+        (num_tokens, 2 * ffn_intermediate), device="cuda", dtype=torch.bfloat16
+    )
+    ffn_down = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_down_residual = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+
+    hidden_dt = pk.attach_input(hidden_in.contiguous(), name="attn_ffn_hidden")
+    attn_norm_dt = pk.attach_input(attn_norm_weight.contiguous(), name="attn_ffn_attn_norm")
+    qkv_weight_dt = pk.attach_input(qkv_weight.contiguous(), name="attn_ffn_qkv_weight")
+    rmsnorm_out_dt = pk.attach_input(rmsnorm_out, name="attn_ffn_rmsnorm_out")
+    qkv_out_dt = pk.attach_input(qkv_out, name="attn_ffn_qkv_out")
+    q_norm_dt = pk.attach_input(q_norm_weight.contiguous(), name="attn_ffn_q_norm")
+    k_norm_dt = pk.attach_input(k_norm_weight.contiguous(), name="attn_ffn_k_norm")
+    cos_dt = pk.attach_input(cos.contiguous(), name="attn_ffn_cos")
+    sin_dt = pk.attach_input(sin.contiguous(), name="attn_ffn_sin")
+    k_cache_dt = pk.attach_input(k_cache.contiguous(), name="attn_ffn_k_cache")
+    v_cache_dt = pk.attach_input(v_cache.contiguous(), name="attn_ffn_v_cache")
+    attn_out_dt = pk.attach_input(attn_out, name="attn_ffn_attn_out")
+    o_proj_weight_dt = pk.attach_input(o_proj_weight.contiguous(), name="attn_ffn_o_proj_weight")
+    post_attn_dt = pk.attach_input(post_attn, name="attn_ffn_post_attn")
+    ffn_norm_dt = pk.attach_input(ffn_norm_weight.contiguous(), name="attn_ffn_ffn_norm")
+    ffn_normed_dt = pk.attach_input(ffn_normed, name="attn_ffn_ffn_normed")
+    ffn_gate_up_weight_dt = pk.attach_input(
+        ffn_gate_up_weight.contiguous(), name="attn_ffn_gate_up_weight"
+    )
+    ffn_gate_up_dt = pk.attach_input(ffn_gate_up, name="attn_ffn_gate_up")
+    ffn_down_weight_dt = pk.attach_input(
+        ffn_down_weight.contiguous(), name="attn_ffn_down_weight"
+    )
+    ffn_down_residual_dt = pk.attach_input(ffn_down_residual, name="attn_ffn_down_residual")
+    ffn_down_dt = pk.attach_input(ffn_down, name="attn_ffn_down")
+
+    pk.rmsnorm_layer(
+        input=hidden_dt,
+        weight=attn_norm_dt,
+        output=rmsnorm_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_layer(
+        input=rmsnorm_out_dt,
+        weight=qkv_weight_dt,
+        output=qkv_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.paged_attention_layer(
+        input=qkv_out_dt,
+        k_cache=k_cache_dt,
+        v_cache=v_cache_dt,
+        q_norm=q_norm_dt,
+        k_norm=k_norm_dt,
+        cos_pos_embed=cos_dt,
+        sin_pos_embed=sin_dt,
+        output=attn_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_with_residual_layer(
+        input=attn_out_dt,
+        weight=o_proj_weight_dt,
+        residual=hidden_dt,
+        output=post_attn_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.rmsnorm_layer(
+        input=post_attn_dt,
+        weight=ffn_norm_dt,
+        output=ffn_normed_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_layer(
+        input=ffn_normed_dt,
+        weight=ffn_gate_up_weight_dt,
+        output=ffn_gate_up_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.gelu_mul_linear_with_residual_layer(
+        input=ffn_gate_up_dt,
+        weight=ffn_down_weight_dt,
+        residual=ffn_down_residual_dt,
+        output=ffn_down_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(pk)
+    _reset_pk_runtime_state(
+        pk,
+        active_tokens=num_tokens,
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=paged_kv_indptr,
+        paged_kv_indices=paged_kv_indices,
+        paged_kv_last_page_len=paged_kv_last_page_len,
+    )
+    pk()
+    torch.cuda.synchronize()
+
+    qkv_variance = hidden_in.float().pow(2).mean(dim=-1, keepdim=True)
+    qkv_ref = (hidden_in.float() * torch.rsqrt(qkv_variance + eps)) * attn_norm_weight.float()
+    qkv_ref = qkv_ref @ qkv_weight.float().transpose(0, 1)
+    torch_k_cache = k_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    torch_v_cache = v_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    q = qkv_ref[:, : qo_heads * head_dim].view(num_tokens, qo_heads, head_dim)
+    k = qkv_ref[:, qo_heads * head_dim : qo_heads * head_dim + kv_heads * head_dim]
+    v = qkv_ref[:, qo_heads * head_dim + kv_heads * head_dim :]
+    page_idx = int(paged_kv_indices[0].item())
+    page_offset = int(paged_kv_last_page_len[0].item()) - num_tokens
+    torch_k_cache[page_idx, page_offset : page_offset + num_tokens] = k
+    torch_v_cache[page_idx, page_offset : page_offset + num_tokens] = v
+    ref_attn = _reference_multitoken_paged_attention(
+        q=q,
+        paged_k_cache=torch_k_cache,
+        paged_v_cache=torch_v_cache,
+        qo_heads=qo_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        num_tokens=num_tokens,
+        paged_kv_indptr_buffer=paged_kv_indptr,
+        paged_kv_indices_buffer=paged_kv_indices,
+        paged_kv_last_page_len_buffer=paged_kv_last_page_len,
+    ).reshape(num_tokens, hidden_size)
+    post_attn_ref = ref_attn @ o_proj_weight.float().transpose(0, 1) + hidden_in.float()
+    post_attn_live = post_attn.float()
+    ffn_variance = post_attn_live.pow(2).mean(dim=-1, keepdim=True)
+    ffn_norm_ref = (post_attn_live * torch.rsqrt(ffn_variance + eps)) * ffn_norm_weight.float()
+    ffn_gate_up_ref = ffn_norm_ref @ ffn_gate_up_weight.float().transpose(0, 1)
+    live_ffn_gate, live_ffn_up = torch.chunk(ffn_gate_up.float(), 2, dim=-1)
+    ffn_down_ref = (F.gelu(live_ffn_gate) * live_ffn_up) @ ffn_down_weight.float().transpose(0, 1)
+    ffn_down_silu_ref = (F.silu(live_ffn_gate) * live_ffn_up) @ ffn_down_weight.float().transpose(
+        0, 1
+    )
+    ffn_down_swapped_ref = (F.gelu(live_ffn_up) * live_ffn_gate) @ ffn_down_weight.float().transpose(
+        0, 1
+    )
+
+    return {
+        "post_attn_max_abs": float((post_attn_live - post_attn_ref).abs().max().item()),
+        "post_attn_mean_abs": float((post_attn_live - post_attn_ref).abs().mean().item()),
+        "ffn_gate_up_max_abs": float((ffn_gate_up.float() - ffn_gate_up_ref).abs().max().item()),
+        "ffn_gate_up_mean_abs": float((ffn_gate_up.float() - ffn_gate_up_ref).abs().mean().item()),
+        "ffn_down_max_abs": float((ffn_down.float() - ffn_down_ref).abs().max().item()),
+        "ffn_down_mean_abs": float((ffn_down.float() - ffn_down_ref).abs().mean().item()),
+        "ffn_down_silu_max_abs": float((ffn_down.float() - ffn_down_silu_ref).abs().max().item()),
+        "ffn_down_silu_mean_abs": float((ffn_down.float() - ffn_down_silu_ref).abs().mean().item()),
+        "ffn_down_swapped_max_abs": float((ffn_down.float() - ffn_down_swapped_ref).abs().max().item()),
+        "ffn_down_swapped_mean_abs": float((ffn_down.float() - ffn_down_swapped_ref).abs().mean().item()),
+    }
+
+
+def run_mirage_linear_residual_ffn_fused_single_pk_forward_correctness(
+    *,
+    eps: float = 1e-5,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Run linear-with-residual + dense FFN fused-down in one PersistentKernel."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    num_tokens = 1
+    hidden_size = 512
+    ffn_intermediate = 256
+
+    pk = create_test_persistent_kernel(
+        max_seq_length=128,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=num_tokens,
+        max_num_pages=8,
+        page_size=64,
+        use_cutlass_kernel=False,
+    )
+
+    input_hidden = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
+    proj_weight = torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    residual = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
+    post_linear = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    ffn_normed = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_gate_up_weight = (
+        torch.randn((2 * ffn_intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    ffn_gate_up = torch.zeros((num_tokens, 2 * ffn_intermediate), device="cuda", dtype=torch.bfloat16)
+    ffn_down_weight = (
+        torch.randn((hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+    ffn_down_residual = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_down = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+
+    input_dt = pk.attach_input(input_hidden.contiguous(), name="linear_ffn_input")
+    proj_weight_dt = pk.attach_input(proj_weight.contiguous(), name="linear_ffn_proj_weight")
+    residual_dt = pk.attach_input(residual.contiguous(), name="linear_ffn_residual")
+    post_linear_dt = pk.attach_input(post_linear, name="linear_ffn_post_linear")
+    ffn_norm_weight_dt = pk.attach_input(ffn_norm_weight.contiguous(), name="linear_ffn_norm_weight")
+    ffn_normed_dt = pk.attach_input(ffn_normed, name="linear_ffn_normed")
+    ffn_gate_up_weight_dt = pk.attach_input(
+        ffn_gate_up_weight.contiguous(), name="linear_ffn_gate_up_weight"
+    )
+    ffn_gate_up_dt = pk.attach_input(ffn_gate_up, name="linear_ffn_gate_up")
+    ffn_down_weight_dt = pk.attach_input(
+        ffn_down_weight.contiguous(), name="linear_ffn_down_weight"
+    )
+    ffn_down_residual_dt = pk.attach_input(ffn_down_residual, name="linear_ffn_down_residual")
+    ffn_down_dt = pk.attach_input(ffn_down, name="linear_ffn_down")
+
+    pk.linear_with_residual_layer(
+        input=input_dt,
+        weight=proj_weight_dt,
+        residual=residual_dt,
+        output=post_linear_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.rmsnorm_layer(
+        input=post_linear_dt,
+        weight=ffn_norm_weight_dt,
+        output=ffn_normed_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_layer(
+        input=ffn_normed_dt,
+        weight=ffn_gate_up_weight_dt,
+        output=ffn_gate_up_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.gelu_mul_linear_with_residual_layer(
+        input=ffn_gate_up_dt,
+        weight=ffn_down_weight_dt,
+        residual=ffn_down_residual_dt,
+        output=ffn_down_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(pk)
+    _reset_pk_runtime_state(pk, active_tokens=num_tokens)
+    pk()
+    torch.cuda.synchronize()
+
+    post_linear_ref = input_hidden.float() @ proj_weight.float().transpose(0, 1) + residual.float()
+    variance = post_linear.float().pow(2).mean(dim=-1, keepdim=True)
+    ffn_norm_ref = (post_linear.float() * torch.rsqrt(variance + eps)) * ffn_norm_weight.float()
+    ffn_gate_up_ref = ffn_norm_ref @ ffn_gate_up_weight.float().transpose(0, 1)
+    live_ffn_gate, live_ffn_up = torch.chunk(ffn_gate_up.float(), 2, dim=-1)
+    ffn_down_ref = (F.gelu(live_ffn_gate) * live_ffn_up) @ ffn_down_weight.float().transpose(0, 1)
+
+    return {
+        "post_linear_max_abs": float((post_linear.float() - post_linear_ref).abs().max().item()),
+        "post_linear_mean_abs": float((post_linear.float() - post_linear_ref).abs().mean().item()),
+        "ffn_gate_up_max_abs": float((ffn_gate_up.float() - ffn_gate_up_ref).abs().max().item()),
+        "ffn_gate_up_mean_abs": float((ffn_gate_up.float() - ffn_gate_up_ref).abs().mean().item()),
+        "ffn_down_max_abs": float((ffn_down.float() - ffn_down_ref).abs().max().item()),
+        "ffn_down_mean_abs": float((ffn_down.float() - ffn_down_ref).abs().mean().item()),
+    }
+
+
+def run_mirage_attention_ffn_moew2_single_pk_forward_correctness(
+    *,
+    eps: float = 1e-5,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Run attention + dense FFN-down via top-k=1 MoE kernels in one PersistentKernel."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    num_tokens = 1
+    hidden_size = 512
+    qo_heads = 4
+    kv_heads = 1
+    head_dim = 128
+    page_size = 64
+    max_num_pages = 64
+    ffn_intermediate = 256
+
+    pk = create_test_persistent_kernel(
+        max_seq_length=512,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=num_tokens,
+        max_num_pages=max_num_pages,
+        page_size=page_size,
+        use_cutlass_kernel=False,
+    )
+    qo_indptr = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
+    paged_kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    paged_kv_indices = torch.arange(max_num_pages, device="cuda", dtype=torch.int32)
+    paged_kv_last_page_len = torch.tensor([8 + num_tokens], device="cuda", dtype=torch.int32)
+
+    hidden_in = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16) / 8.0
+    attn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    qkv_weight = (
+        torch.randn(
+            ((qo_heads + 2 * kv_heads) * head_dim, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 16.0
+    )
+    q_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    k_norm_weight = torch.ones((head_dim,), device="cuda", dtype=torch.bfloat16)
+    cos = torch.ones((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    sin = torch.zeros((513, head_dim), device="cuda", dtype=torch.bfloat16)
+    k_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    v_cache = 0.2 + 0.1 * torch.randn(
+        (max_num_pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    o_proj_weight = (
+        torch.randn((hidden_size, hidden_size), device="cuda", dtype=torch.bfloat16) / 16.0
+    )
+    ffn_norm_weight = torch.ones((hidden_size,), device="cuda", dtype=torch.bfloat16)
+    ffn_gate_up_weight = (
+        torch.randn((2 * ffn_intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    ffn_down_weight = (
+        torch.randn((hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16)
+        / 16.0
+    )
+    ffn_w2_weight = torch.empty((1, hidden_size, ffn_intermediate), device="cuda", dtype=torch.bfloat16)
+    ffn_w2_weight[0].copy_(ffn_down_weight)
+
+    rmsnorm_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    qkv_out = torch.zeros(
+        (num_tokens, (qo_heads + 2 * kv_heads) * head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    attn_out_size = qo_heads * head_dim
+    attn_out = torch.zeros((num_tokens, attn_out_size), device="cuda", dtype=torch.bfloat16)
+    post_attn = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_normed = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_gate_up_storage = torch.zeros(
+        (num_tokens, 1, 2 * ffn_intermediate), device="cuda", dtype=torch.bfloat16
+    )
+    ffn_gate_up = ffn_gate_up_storage.view(num_tokens, 2 * ffn_intermediate)
+    ffn_act = torch.zeros((num_tokens, 1, ffn_intermediate), device="cuda", dtype=torch.bfloat16)
+    ffn_routing_indices = torch.tensor([[1]], device="cuda", dtype=torch.int32)
+    ffn_routing_mask = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    ffn_topk_weight = torch.ones((num_tokens, 1), device="cuda", dtype=torch.float32)
+    ffn_residual_zero = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_w2_out = torch.zeros((num_tokens, 1, hidden_size), device="cuda", dtype=torch.bfloat16)
+    ffn_down = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+
+    hidden_dt = pk.attach_input(hidden_in.contiguous(), name="attn_moew2_hidden")
+    attn_norm_dt = pk.attach_input(attn_norm_weight.contiguous(), name="attn_moew2_attn_norm")
+    qkv_weight_dt = pk.attach_input(qkv_weight.contiguous(), name="attn_moew2_qkv_weight")
+    rmsnorm_out_dt = pk.attach_input(rmsnorm_out, name="attn_moew2_rmsnorm_out")
+    qkv_out_dt = pk.attach_input(qkv_out, name="attn_moew2_qkv_out")
+    q_norm_dt = pk.attach_input(q_norm_weight.contiguous(), name="attn_moew2_q_norm")
+    k_norm_dt = pk.attach_input(k_norm_weight.contiguous(), name="attn_moew2_k_norm")
+    cos_dt = pk.attach_input(cos.contiguous(), name="attn_moew2_cos")
+    sin_dt = pk.attach_input(sin.contiguous(), name="attn_moew2_sin")
+    k_cache_dt = pk.attach_input(k_cache.contiguous(), name="attn_moew2_k_cache")
+    v_cache_dt = pk.attach_input(v_cache.contiguous(), name="attn_moew2_v_cache")
+    attn_out_dt = pk.attach_input(attn_out, name="attn_moew2_attn_out")
+    o_proj_weight_dt = pk.attach_input(o_proj_weight.contiguous(), name="attn_moew2_o_proj_weight")
+    post_attn_dt = pk.attach_input(post_attn, name="attn_moew2_post_attn")
+    ffn_norm_dt = pk.attach_input(ffn_norm_weight.contiguous(), name="attn_moew2_ffn_norm")
+    ffn_normed_dt = pk.attach_input(ffn_normed, name="attn_moew2_ffn_normed")
+    ffn_gate_up_weight_dt = pk.attach_input(
+        ffn_gate_up_weight.contiguous(), name="attn_moew2_gate_up_weight"
+    )
+    ffn_gate_up_dt = pk.attach_input(ffn_gate_up, name="attn_moew2_gate_up")
+    ffn_gate_up_moe_dt = pk.attach_input(ffn_gate_up_storage, name="attn_moew2_gate_up_moe")
+    ffn_act_dt = pk.attach_input(ffn_act, name="attn_moew2_act")
+    ffn_w2_weight_dt = pk.attach_input(ffn_w2_weight.contiguous(), name="attn_moew2_w2_weight")
+    ffn_routing_indices_dt = pk.attach_input(
+        ffn_routing_indices, name="attn_moew2_routing_indices"
+    )
+    ffn_routing_mask_dt = pk.attach_input(ffn_routing_mask, name="attn_moew2_routing_mask")
+    ffn_topk_weight_dt = pk.attach_input(ffn_topk_weight, name="attn_moew2_topk_weight")
+    ffn_residual_zero_dt = pk.attach_input(ffn_residual_zero, name="attn_moew2_zero_residual")
+    ffn_w2_out_dt = pk.attach_input(ffn_w2_out, name="attn_moew2_w2_out")
+    ffn_down_dt = pk.attach_input(ffn_down, name="attn_moew2_down")
+
+    pk.rmsnorm_layer(
+        input=hidden_dt,
+        weight=attn_norm_dt,
+        output=rmsnorm_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_layer(
+        input=rmsnorm_out_dt,
+        weight=qkv_weight_dt,
+        output=qkv_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.paged_attention_layer(
+        input=qkv_out_dt,
+        k_cache=k_cache_dt,
+        v_cache=v_cache_dt,
+        q_norm=q_norm_dt,
+        k_norm=k_norm_dt,
+        cos_pos_embed=cos_dt,
+        sin_pos_embed=sin_dt,
+        output=attn_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_with_residual_layer(
+        input=attn_out_dt,
+        weight=o_proj_weight_dt,
+        residual=hidden_dt,
+        output=post_attn_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.rmsnorm_layer(
+        input=post_attn_dt,
+        weight=ffn_norm_dt,
+        output=ffn_normed_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_layer(
+        input=ffn_normed_dt,
+        weight=ffn_gate_up_weight_dt,
+        output=ffn_gate_up_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.moe_gelu_mul_layer(
+        input=ffn_gate_up_moe_dt,
+        output=ffn_act_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.moe_w2_linear_layer(
+        input=ffn_act_dt,
+        weight=ffn_w2_weight_dt,
+        moe_routing_indices=ffn_routing_indices_dt,
+        moe_mask=ffn_routing_mask_dt,
+        output=ffn_w2_out_dt,
+        grid_dim=_moe_expert_grid_dim(pk, w13_linear=False),
+        block_dim=(128, 1, 1),
+    )
+    pk.moe_mul_sum_add_layer(
+        input=ffn_w2_out_dt,
+        weight=ffn_topk_weight_dt,
+        residual=ffn_residual_zero_dt,
+        output=ffn_down_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    compile_persistent_kernel_with_patches(pk)
+    _reset_pk_runtime_state(
+        pk,
+        active_tokens=num_tokens,
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=paged_kv_indptr,
+        paged_kv_indices=paged_kv_indices,
+        paged_kv_last_page_len=paged_kv_last_page_len,
+    )
+    pk()
+    torch.cuda.synchronize()
+
+    qkv_variance = hidden_in.float().pow(2).mean(dim=-1, keepdim=True)
+    qkv_ref = (hidden_in.float() * torch.rsqrt(qkv_variance + eps)) * attn_norm_weight.float()
+    qkv_ref = qkv_ref @ qkv_weight.float().transpose(0, 1)
+    torch_k_cache = k_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    torch_v_cache = v_cache.reshape(max_num_pages, page_size, kv_heads * head_dim).clone()
+    q = qkv_ref[:, : qo_heads * head_dim].view(num_tokens, qo_heads, head_dim)
+    k = qkv_ref[:, qo_heads * head_dim : qo_heads * head_dim + kv_heads * head_dim]
+    v = qkv_ref[:, qo_heads * head_dim + kv_heads * head_dim :]
+    page_idx = int(paged_kv_indices[0].item())
+    page_offset = int(paged_kv_last_page_len[0].item()) - num_tokens
+    torch_k_cache[page_idx, page_offset : page_offset + num_tokens] = k
+    torch_v_cache[page_idx, page_offset : page_offset + num_tokens] = v
+    ref_attn = _reference_multitoken_paged_attention(
+        q=q,
+        paged_k_cache=torch_k_cache,
+        paged_v_cache=torch_v_cache,
+        qo_heads=qo_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        num_tokens=num_tokens,
+        paged_kv_indptr_buffer=paged_kv_indptr,
+        paged_kv_indices_buffer=paged_kv_indices,
+        paged_kv_last_page_len_buffer=paged_kv_last_page_len,
+    ).reshape(num_tokens, hidden_size)
+    post_attn_ref = ref_attn @ o_proj_weight.float().transpose(0, 1) + hidden_in.float()
+    post_attn_live = post_attn.float()
+    ffn_variance = post_attn_live.pow(2).mean(dim=-1, keepdim=True)
+    ffn_norm_ref = (post_attn_live * torch.rsqrt(ffn_variance + eps)) * ffn_norm_weight.float()
+    ffn_gate_up_ref = ffn_norm_ref @ ffn_gate_up_weight.float().transpose(0, 1)
+    live_ffn_gate, live_ffn_up = torch.chunk(ffn_gate_up.float(), 2, dim=-1)
+    ffn_down_ref = (F.gelu(live_ffn_gate) * live_ffn_up) @ ffn_down_weight.float().transpose(0, 1)
+
+    return {
+        "post_attn_max_abs": float((post_attn_live - post_attn_ref).abs().max().item()),
+        "post_attn_mean_abs": float((post_attn_live - post_attn_ref).abs().mean().item()),
+        "ffn_gate_up_max_abs": float((ffn_gate_up.float() - ffn_gate_up_ref).abs().max().item()),
+        "ffn_gate_up_mean_abs": float((ffn_gate_up.float() - ffn_gate_up_ref).abs().mean().item()),
+        "ffn_down_max_abs": float((ffn_down.float() - ffn_down_ref).abs().max().item()),
+        "ffn_down_mean_abs": float((ffn_down.float() - ffn_down_ref).abs().mean().item()),
     }
 
 
@@ -4371,6 +5567,7 @@ def _reset_pk_runtime_state(
     paged_kv_indptr: Optional[torch.Tensor] = None,
     paged_kv_indices: Optional[torch.Tensor] = None,
     paged_kv_last_page_len: Optional[torch.Tensor] = None,
+    reinit_request_resources: bool = True,
 ) -> None:
     pk.meta_tensors["step"].zero_()
     pk.meta_tensors["tokens"].zero_()
@@ -4396,7 +5593,11 @@ def _reset_pk_runtime_state(
         pk.meta_tensors["paged_kv_last_page_len_buffer"][: paged_kv_last_page_len.numel()] = (
             paged_kv_last_page_len
         )
-    if hasattr(pk, "init_request_func") and pk.init_request_func is not None:
+    if (
+        reinit_request_resources
+        and hasattr(pk, "init_request_func")
+        and pk.init_request_func is not None
+    ):
         pk.init_request_func()
 
 
@@ -4451,6 +5652,32 @@ def _lookup_tensor_attr(source_model: GraphModule, attr_name: str) -> torch.Tens
             return tensor
 
     raise AttributeError(f"Missing expected GraphModule attribute: {attr_name}")
+
+
+def _find_tensor_attr_by_substrings(
+    source_model: GraphModule,
+    *substrings: str,
+) -> torch.Tensor:
+    normalized = tuple(substrings)
+    for name, tensor in source_model.named_buffers():
+        flat_name = name.replace(".", "_")
+        if all(substr in name or substr in flat_name for substr in normalized):
+            return tensor
+    for name, tensor in source_model.named_parameters():
+        flat_name = name.replace(".", "_")
+        if all(substr in name or substr in flat_name for substr in normalized):
+            return tensor
+    for candidate_name in dir(source_model):
+        flat_name = candidate_name.replace(".", "_")
+        if not all(substr in candidate_name or substr in flat_name for substr in normalized):
+            continue
+        tensor = getattr(source_model, candidate_name, None)
+        if isinstance(tensor, torch.Tensor):
+            return tensor
+    raise AttributeError(
+        "Missing GraphModule tensor attribute containing substrings: "
+        + ", ".join(repr(substr) for substr in normalized)
+    )
 
 
 def _node_target_name(node: Node) -> str:
@@ -4531,6 +5758,7 @@ class _GemmaRuntimeLayerSpec:
     router_root_size: torch.Tensor
     router_scale: torch.Tensor
     pre_feedforward_layernorm_2_weight: torch.Tensor
+    moe_w13_stacked_weight: torch.Tensor
     moe_gate_weight: torch.Tensor
     moe_up_weight: torch.Tensor
     moe_w2_weight: torch.Tensor
@@ -4698,6 +5926,7 @@ def _build_gemma_runtime_specs(
                 pre_feedforward_layernorm_2_weight=_lookup_tensor_attr(
                     source_model, pre_feedforward_layernorm_2_weight_name
                 ),
+                moe_w13_stacked_weight=moe_w13_stacked,
                 moe_gate_weight=gate_weight,
                 moe_up_weight=up_weight,
                 moe_w2_weight=_lookup_tensor_attr(source_model, moe_w2_name),
@@ -5019,6 +6248,1297 @@ class _MirageMatmulExecutor:
         return self.graph(inputs=[a, b], target_cc=90)[0]
 
 
+def _expand_hidden_param(param: torch.Tensor, hidden_size: int) -> torch.Tensor:
+    flat = param.detach().reshape(-1).to(torch.bfloat16)
+    if flat.numel() == 1:
+        return flat.expand(hidden_size).clone()
+    if flat.numel() != hidden_size:
+        raise ValueError(
+            f"Expected hidden-sized parameter with {hidden_size} elements, got {tuple(param.shape)}."
+        )
+    return flat.contiguous()
+
+
+class _MirageGemmaLayerSinglePkExecutor:
+    def __init__(
+        self,
+        *,
+        layer_spec: _GemmaRuntimeLayerSpec,
+        kv_cache: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        identity_weight: torch.Tensor,
+        max_seq_length: Optional[int] = None,
+    ) -> None:
+        disable_moe_tail = os.getenv("AD_MPK_SINGLE_PK_DISABLE_MOE_TAIL", "0") == "1"
+        disable_ffn_tail = os.getenv("AD_MPK_SINGLE_PK_DISABLE_FFN_TAIL", "0") == "1"
+        disable_post_attn_tail = os.getenv("AD_MPK_SINGLE_PK_DISABLE_POST_ATTN_TAIL", "0") == "1"
+        disable_moe_exec = os.getenv("AD_MPK_SINGLE_PK_DISABLE_MOE_EXEC", "0") == "1"
+        disable_moe_merge = os.getenv("AD_MPK_SINGLE_PK_DISABLE_MOE_MERGE", "0") == "1"
+        disable_post_merge_norm = os.getenv("AD_MPK_SINGLE_PK_DISABLE_POST_MERGE_NORM", "0") == "1"
+        disable_final_residual = os.getenv("AD_MPK_SINGLE_PK_DISABLE_FINAL_RESIDUAL", "0") == "1"
+        disable_final_scale = os.getenv("AD_MPK_SINGLE_PK_DISABLE_FINAL_SCALE", "0") == "1"
+
+        def _constructor_probe(stage: str) -> None:
+            if os.getenv("AD_MPK_SINGLE_PK_CONSTRUCTOR_DEBUG", "0") != "1":
+                return
+            free_mem, total_mem = torch.cuda.mem_get_info(device=layer_spec.o_proj_weight.device)
+            _mpk_debug(
+                "single-pk ctor "
+                f"stage={stage} free_gb={free_mem / (1024**3):.2f} total_gb={total_mem / (1024**3):.2f}"
+            )
+            torch.cuda.synchronize()
+            torch.zeros((1,), device=layer_spec.o_proj_weight.device, dtype=torch.float32)
+            torch.cuda.synchronize()
+
+        if kv_cache.dim() != 5 or int(kv_cache.shape[1]) != 2:
+            raise ValueError(
+                "Expected combined HND KV cache with shape [pages, 2, kv_heads, page_size, head_dim], "
+                f"got {tuple(kv_cache.shape)}."
+            )
+
+        self.layer_spec = layer_spec
+        self.hidden_size = int(layer_spec.o_proj_weight.shape[0])
+        self.attn_out_size = int(layer_spec.q_heads) * int(layer_spec.head_dim)
+        self.ffn_intermediate = int(layer_spec.ffn_down_weight.shape[1])
+        self.intermediate = int(layer_spec.moe_w2_weight.shape[2])
+        self.num_experts = int(layer_spec.moe_w2_weight.shape[0])
+        self.topk = int(layer_spec.topk)
+        self.external_max_num_pages = int(kv_cache.shape[0])
+        self.external_page_size = int(kv_cache.shape[3])
+        page_size_override = os.getenv("AD_MPK_SINGLE_PK_PAGE_SIZE", "")
+        if page_size_override:
+            self.page_size = int(page_size_override)
+        else:
+            self.page_size = 64
+        rope_max_seq_length = max(1, int(cos.shape[0]) - 1)
+        if max_seq_length is None:
+            env_limit = os.getenv("AD_MPK_SINGLE_PK_MAX_SEQ_LENGTH", "")
+            if env_limit:
+                requested_max_seq_length = int(env_limit)
+            else:
+                requested_max_seq_length = rope_max_seq_length
+        else:
+            requested_max_seq_length = int(max_seq_length)
+        self.max_seq_length = max(1, min(rope_max_seq_length, requested_max_seq_length))
+        self.max_num_pages = max(
+            1,
+            (self.max_seq_length + self.page_size - 1) // self.page_size,
+        )
+        self.kv_heads = int(kv_cache.shape[2])
+        self.head_dim = int(kv_cache.shape[4])
+        self.kv_cache_shape = tuple(int(dim) for dim in kv_cache.shape)
+        self.kv_cache_dtype = kv_cache.dtype
+        self.use_single_batch_extend_attention = bool(
+            layer_spec.qkv_shared_kv and int(layer_spec.head_dim) == 512
+        )
+        self.attn_kv_expand_factor = 1
+        self.attn_kv_heads = self.kv_heads
+        self.attn_qkv_weight = layer_spec.qkv_weight.contiguous()
+        if layer_spec.qkv_shared_kv and self.use_single_batch_extend_attention:
+            q_size = int(layer_spec.q_heads) * int(layer_spec.head_dim)
+            kv_size = int(layer_spec.kv_heads) * int(layer_spec.head_dim)
+            q_per_kv = int(layer_spec.q_heads) // int(layer_spec.kv_heads)
+            q_weight = layer_spec.qkv_weight[:q_size].view(
+                int(layer_spec.kv_heads),
+                q_per_kv,
+                int(layer_spec.head_dim),
+                self.hidden_size,
+            )
+            shared_kv_weight = layer_spec.qkv_weight[q_size : q_size + kv_size].view(
+                int(layer_spec.kv_heads),
+                int(layer_spec.head_dim),
+                self.hidden_size,
+            )
+            grouped_rows = []
+            for kv_idx in range(int(layer_spec.kv_heads)):
+                grouped_rows.append(
+                    q_weight[kv_idx].reshape(q_per_kv * int(layer_spec.head_dim), self.hidden_size)
+                )
+                grouped_rows.append(shared_kv_weight[kv_idx])
+                grouped_rows.append(shared_kv_weight[kv_idx])
+            self.attn_qkv_weight = torch.cat(grouped_rows, dim=0).contiguous()
+        elif layer_spec.qkv_shared_kv and not self.use_single_batch_extend_attention:
+            q_per_kv = int(layer_spec.q_heads) // int(layer_spec.kv_heads)
+            max_q_per_kv_override = os.getenv("AD_MPK_SINGLE_PK_MAX_Q_PER_KV", "")
+            if max_q_per_kv_override:
+                target_q_per_kv = min(q_per_kv, int(max_q_per_kv_override))
+            else:
+                # Hopper paged attention overflows shared memory for Gemma's
+                # global layers when q-heads-per-kv stays too large at head_dim=512.
+                # Keep the per-KV query grouping roughly bounded by 1024 features.
+                target_q_per_kv = max(1, min(q_per_kv, 1024 // int(layer_spec.head_dim)))
+            while q_per_kv % target_q_per_kv != 0 and target_q_per_kv > 1:
+                target_q_per_kv -= 1
+            if q_per_kv % target_q_per_kv != 0:
+                raise ValueError(
+                    f"Unsupported shared-KV q-head grouping: q_heads={layer_spec.q_heads}, "
+                    f"kv_heads={layer_spec.kv_heads}, target_q_per_kv={target_q_per_kv}."
+                )
+            self.attn_kv_expand_factor = q_per_kv // target_q_per_kv
+            self.attn_kv_heads = self.kv_heads * self.attn_kv_expand_factor
+            q_size = int(layer_spec.q_heads) * int(layer_spec.head_dim)
+            kv_size = int(layer_spec.kv_heads) * int(layer_spec.head_dim)
+            q_weight = layer_spec.qkv_weight[:q_size].view(
+                int(layer_spec.kv_heads),
+                q_per_kv,
+                int(layer_spec.head_dim),
+                self.hidden_size,
+            )
+            shared_kv_weight = layer_spec.qkv_weight[q_size : q_size + kv_size].view(
+                int(layer_spec.kv_heads),
+                int(layer_spec.head_dim),
+                self.hidden_size,
+            )
+            grouped_rows = []
+            for kv_idx in range(int(layer_spec.kv_heads)):
+                for split_idx in range(self.attn_kv_expand_factor):
+                    start = split_idx * target_q_per_kv
+                    end = start + target_q_per_kv
+                    grouped_rows.append(
+                        q_weight[kv_idx, start:end].reshape(target_q_per_kv * int(layer_spec.head_dim), self.hidden_size)
+                    )
+                    grouped_rows.append(shared_kv_weight[kv_idx])
+                    grouped_rows.append(shared_kv_weight[kv_idx])
+            self.attn_qkv_weight = torch.cat(grouped_rows, dim=0).contiguous()
+        disable_split_kv = os.getenv("AD_MPK_SINGLE_PK_DISABLE_SPLIT_KV", "0") == "1"
+        force_split_kv = os.getenv("AD_MPK_SINGLE_PK_FORCE_SPLIT_KV", "0") == "1"
+        self.use_split_kv_attention = force_split_kv and not disable_split_kv
+        split_kv_chunks_override = os.getenv("AD_MPK_SINGLE_PK_NUM_KV_CHUNKS", "")
+        if split_kv_chunks_override:
+            self.num_kv_cache_chunks = max(1, int(split_kv_chunks_override))
+        else:
+            self.num_kv_cache_chunks = max(1, self.max_seq_length // 256)
+        self.num_kv_cache_chunks = min(self.num_kv_cache_chunks, self.max_num_pages)
+
+        router_root_size = _expand_hidden_param(layer_spec.router_root_size, self.hidden_size)
+        router_scale = _expand_hidden_param(layer_spec.router_scale, self.hidden_size)
+        router_weight_scaled = (
+            layer_spec.router_proj_weight.float()
+            * router_root_size.float().view(1, -1)
+            * router_scale.float().view(1, -1)
+        ).to(torch.bfloat16)
+        layer_scalar = _expand_hidden_param(layer_spec.layer_scalar, self.hidden_size)
+        layer_scale_weight = torch.diag(layer_scalar.float()).to(torch.bfloat16)
+        router_norm_weight = torch.ones(
+            (self.hidden_size,), device=layer_spec.o_proj_weight.device, dtype=torch.bfloat16
+        )
+
+        self.pk = create_test_persistent_kernel(
+            max_seq_length=max(128, self.max_num_pages * self.page_size),
+            max_num_batched_requests=1,
+            max_num_batched_tokens=1,
+            max_num_pages=self.max_num_pages,
+            page_size=self.page_size,
+            use_cutlass_kernel=False,
+        )
+
+        device = layer_spec.o_proj_weight.device
+        self.hidden_in = torch.empty((1, self.hidden_size), device=device, dtype=torch.bfloat16)
+        self.rmsnorm_out = torch.empty_like(self.hidden_in)
+        self.qkv_out = torch.empty((1, int(self.attn_qkv_weight.shape[0])), device=device, dtype=torch.bfloat16)
+        self.k_cache = torch.empty(
+            (self.max_num_pages, self.page_size, self.attn_kv_heads, self.head_dim),
+            device=device,
+            dtype=kv_cache.dtype,
+        )
+        self.v_cache = torch.empty_like(self.k_cache)
+        self.attn_out = torch.empty((1, self.attn_out_size), device=device, dtype=torch.bfloat16)
+        self.o_proj = torch.empty_like(self.hidden_in)
+        self.post_attn_norm = torch.empty_like(self.hidden_in)
+        self.post_attn = torch.empty_like(self.hidden_in)
+        self.ffn_normed = torch.empty_like(self.hidden_in)
+        self.ffn_gate_up_storage = torch.empty(
+            (1, 1, 2 * self.ffn_intermediate), device=device, dtype=torch.bfloat16
+        )
+        self.ffn_gate_up = self.ffn_gate_up_storage.view(1, 2 * self.ffn_intermediate)
+        self.ffn_act = torch.empty((1, 1, self.ffn_intermediate), device=device, dtype=torch.bfloat16)
+        self.ffn_routing_indices = torch.ones((1, 1), device=device, dtype=torch.int32)
+        self.ffn_routing_mask = torch.tensor([0, 1], device=device, dtype=torch.int32)
+        self.ffn_topk_weight = torch.ones((1, 1), device=device, dtype=torch.float32)
+        self.zero_residual = torch.zeros((1, self.hidden_size), device=device, dtype=torch.bfloat16)
+        self.ffn_w2_weight = torch.empty((1, self.hidden_size, self.ffn_intermediate), device=device, dtype=torch.bfloat16)
+        self.ffn_w2_weight[0].copy_(layer_spec.ffn_down_weight)
+        self.ffn_w2_out = torch.empty((1, 1, self.hidden_size), device=device, dtype=torch.bfloat16)
+        self.ffn_down = torch.empty_like(self.hidden_in)
+        self.ffn_norm = torch.empty_like(self.hidden_in)
+        self.router_in = torch.empty_like(self.hidden_in)
+        self.router_logits = torch.empty((1, self.num_experts), device=device, dtype=torch.bfloat16)
+        self.topk_weight = torch.empty((1, self.topk), device=device, dtype=torch.float32)
+        self.routing_indices = torch.empty((self.num_experts, 1), device=device, dtype=torch.int32)
+        self.routing_mask = torch.empty((self.num_experts + 1,), device=device, dtype=torch.int32)
+        self.moe_in = torch.empty_like(self.hidden_in)
+        self.moe_act = torch.empty((1, self.topk, self.intermediate), device=device, dtype=torch.bfloat16)
+        self.moe_w2_out = torch.empty((1, self.topk, self.hidden_size), device=device, dtype=torch.bfloat16)
+        self.moe_out = torch.empty_like(self.hidden_in)
+        self.moe_norm = torch.empty_like(self.hidden_in)
+        self.ffn_moe_add = torch.empty_like(self.hidden_in)
+        self.ffn_moe_norm = torch.empty_like(self.hidden_in)
+        self.hidden_pre_scale = torch.empty_like(self.hidden_in)
+        self.scaled_post_attn = torch.empty_like(self.hidden_in)
+        self.hidden_out = torch.empty_like(self.hidden_in)
+        _constructor_probe("post_alloc")
+
+        hidden_dt = self.pk.attach_input(self.hidden_in, name=f"layer_{layer_spec.layer_index}_hidden")
+        attn_norm_dt = self.pk.attach_input(
+            layer_spec.input_layernorm_weight.contiguous(),
+            name=f"layer_{layer_spec.layer_index}_attn_norm_weight",
+        )
+        qkv_weight_dt = self.pk.attach_input(
+            self.attn_qkv_weight, name=f"layer_{layer_spec.layer_index}_qkv_weight"
+        )
+        rmsnorm_out_dt = self.pk.attach_input(self.rmsnorm_out, name=f"layer_{layer_spec.layer_index}_rmsnorm_out")
+        qkv_out_dt = self.pk.attach_input(self.qkv_out, name=f"layer_{layer_spec.layer_index}_qkv_out")
+        q_norm_dt = self.pk.attach_input(
+            layer_spec.q_norm_weight.contiguous(), name=f"layer_{layer_spec.layer_index}_q_norm"
+        )
+        k_norm_dt = self.pk.attach_input(
+            layer_spec.k_norm_weight.contiguous(), name=f"layer_{layer_spec.layer_index}_k_norm"
+        )
+        cos_dt = self.pk.attach_input(cos.contiguous(), name=f"layer_{layer_spec.layer_index}_cos")
+        sin_dt = self.pk.attach_input(sin.contiguous(), name=f"layer_{layer_spec.layer_index}_sin")
+        k_cache_dt = self.pk.attach_input(self.k_cache, name=f"layer_{layer_spec.layer_index}_k_cache")
+        v_cache_dt = self.pk.attach_input(self.v_cache, name=f"layer_{layer_spec.layer_index}_v_cache")
+        attn_out_dt = self.pk.attach_input(self.attn_out, name=f"layer_{layer_spec.layer_index}_attn_out")
+        lse_dt = None
+        attn_out_tmp_dt = None
+        if self.use_split_kv_attention:
+            import mirage
+
+            lse_dt = self.pk.new_tensor(
+                dims=(
+                    1,
+                    self.num_kv_cache_chunks * int(layer_spec.q_heads) // self.attn_kv_heads,
+                    self.attn_kv_heads,
+                ),
+                strides=(
+                    self.num_kv_cache_chunks * int(layer_spec.q_heads),
+                    1,
+                    self.num_kv_cache_chunks * int(layer_spec.q_heads) // self.attn_kv_heads,
+                ),
+                dtype=mirage.float32,
+                name=f"layer_{layer_spec.layer_index}_attn_lse",
+                io_category="cuda_tensor",
+            )
+            attn_out_tmp_dt = self.pk.new_tensor(
+                dims=(
+                    1,
+                    self.num_kv_cache_chunks
+                    * int(layer_spec.q_heads)
+                    // self.attn_kv_heads
+                    * int(layer_spec.head_dim),
+                    self.attn_kv_heads,
+                ),
+                strides=(
+                    self.num_kv_cache_chunks * int(layer_spec.q_heads),
+                    1,
+                    self.num_kv_cache_chunks
+                    * int(layer_spec.q_heads)
+                    // self.attn_kv_heads
+                    * int(layer_spec.head_dim),
+                ),
+                name=f"layer_{layer_spec.layer_index}_attn_out_tmp",
+                io_category="cuda_tensor",
+            )
+        o_proj_weight_dt = self.pk.attach_input(
+            layer_spec.o_proj_weight.contiguous(), name=f"layer_{layer_spec.layer_index}_o_proj_weight"
+        )
+        o_proj_dt = self.pk.attach_input(self.o_proj, name=f"layer_{layer_spec.layer_index}_o_proj")
+        post_attn_norm_weight_dt = self.pk.attach_input(
+            layer_spec.post_attention_layernorm_weight.contiguous(),
+            name=f"layer_{layer_spec.layer_index}_post_attn_norm_weight",
+        )
+        post_attn_norm_dt = self.pk.attach_input(
+            self.post_attn_norm, name=f"layer_{layer_spec.layer_index}_post_attn_norm"
+        )
+        identity_weight_dt = self.pk.attach_input(identity_weight, name=f"layer_{layer_spec.layer_index}_identity")
+        post_attn_dt = self.pk.attach_input(self.post_attn, name=f"layer_{layer_spec.layer_index}_post_attn")
+        pre_ffn_norm_weight_dt = self.pk.attach_input(
+            layer_spec.pre_feedforward_layernorm_weight.contiguous(),
+            name=f"layer_{layer_spec.layer_index}_pre_ffn_norm_weight",
+        )
+        ffn_normed_dt = self.pk.attach_input(self.ffn_normed, name=f"layer_{layer_spec.layer_index}_ffn_normed")
+        ffn_gate_up_weight_dt = self.pk.attach_input(
+            layer_spec.ffn_gate_up_weight.contiguous(),
+            name=f"layer_{layer_spec.layer_index}_ffn_gate_up_weight",
+        )
+        ffn_gate_up_dt = self.pk.attach_input(self.ffn_gate_up, name=f"layer_{layer_spec.layer_index}_ffn_gate_up")
+        ffn_gate_up_moe_dt = self.pk.attach_input(
+            self.ffn_gate_up_storage, name=f"layer_{layer_spec.layer_index}_ffn_gate_up_moe"
+        )
+        ffn_act_dt = self.pk.attach_input(self.ffn_act, name=f"layer_{layer_spec.layer_index}_ffn_act")
+        ffn_routing_indices_dt = self.pk.attach_input(
+            self.ffn_routing_indices, name=f"layer_{layer_spec.layer_index}_ffn_routing_indices"
+        )
+        ffn_routing_mask_dt = self.pk.attach_input(
+            self.ffn_routing_mask, name=f"layer_{layer_spec.layer_index}_ffn_routing_mask"
+        )
+        ffn_topk_weight_dt = self.pk.attach_input(
+            self.ffn_topk_weight, name=f"layer_{layer_spec.layer_index}_ffn_topk_weight"
+        )
+        zero_residual_dt = self.pk.attach_input(
+            self.zero_residual, name=f"layer_{layer_spec.layer_index}_zero_residual"
+        )
+        ffn_w2_weight_dt = self.pk.attach_input(
+            self.ffn_w2_weight, name=f"layer_{layer_spec.layer_index}_ffn_w2_weight"
+        )
+        ffn_w2_out_dt = self.pk.attach_input(self.ffn_w2_out, name=f"layer_{layer_spec.layer_index}_ffn_w2_out")
+        ffn_down_dt = self.pk.attach_input(self.ffn_down, name=f"layer_{layer_spec.layer_index}_ffn_down")
+        post_ffn_norm_weight_dt = self.pk.attach_input(
+            layer_spec.post_feedforward_layernorm_1_weight.contiguous(),
+            name=f"layer_{layer_spec.layer_index}_post_ffn_norm_weight",
+        )
+        ffn_norm_dt = self.pk.attach_input(self.ffn_norm, name=f"layer_{layer_spec.layer_index}_ffn_norm")
+        router_norm_weight_dt = self.pk.attach_input(
+            router_norm_weight, name=f"layer_{layer_spec.layer_index}_router_norm_weight"
+        )
+        router_in_dt = self.pk.attach_input(self.router_in, name=f"layer_{layer_spec.layer_index}_router_in")
+        router_weight_dt = self.pk.attach_input(
+            router_weight_scaled.contiguous(), name=f"layer_{layer_spec.layer_index}_router_weight"
+        )
+        router_logits_dt = self.pk.attach_input(
+            self.router_logits, name=f"layer_{layer_spec.layer_index}_router_logits"
+        )
+        moe_in_norm_weight_dt = self.pk.attach_input(
+            layer_spec.pre_feedforward_layernorm_2_weight.contiguous(),
+            name=f"layer_{layer_spec.layer_index}_moe_in_norm_weight",
+        )
+        moe_in_dt = self.pk.attach_input(self.moe_in, name=f"layer_{layer_spec.layer_index}_moe_in")
+        topk_weight_dt = self.pk.attach_input(self.topk_weight, name=f"layer_{layer_spec.layer_index}_topk_weight")
+        routing_indices_dt = self.pk.attach_input(
+            self.routing_indices, name=f"layer_{layer_spec.layer_index}_routing_indices"
+        )
+        routing_mask_dt = self.pk.attach_input(
+            self.routing_mask, name=f"layer_{layer_spec.layer_index}_routing_mask"
+        )
+        moe_w13_weight_dt = self.pk.attach_input(
+            layer_spec.moe_w13_stacked_weight.contiguous(),
+            name=f"layer_{layer_spec.layer_index}_moe_w13_weight",
+        )
+        moe_act_dt = self.pk.attach_input(self.moe_act, name=f"layer_{layer_spec.layer_index}_moe_act")
+        moe_w2_weight_dt = self.pk.attach_input(
+            layer_spec.moe_w2_weight.contiguous(), name=f"layer_{layer_spec.layer_index}_moe_w2_weight"
+        )
+        moe_w2_out_dt = self.pk.attach_input(self.moe_w2_out, name=f"layer_{layer_spec.layer_index}_moe_w2_out")
+        moe_out_dt = self.pk.attach_input(self.moe_out, name=f"layer_{layer_spec.layer_index}_moe_out")
+        post_moe_norm_weight_dt = self.pk.attach_input(
+            layer_spec.post_feedforward_layernorm_2_weight.contiguous(),
+            name=f"layer_{layer_spec.layer_index}_post_moe_norm_weight",
+        )
+        moe_norm_dt = self.pk.attach_input(self.moe_norm, name=f"layer_{layer_spec.layer_index}_moe_norm")
+        ffn_moe_add_dt = self.pk.attach_input(
+            self.ffn_moe_add, name=f"layer_{layer_spec.layer_index}_ffn_moe_add"
+        )
+        post_merge_norm_weight_dt = self.pk.attach_input(
+            layer_spec.post_feedforward_layernorm_weight.contiguous(),
+            name=f"layer_{layer_spec.layer_index}_post_merge_norm_weight",
+        )
+        ffn_moe_norm_dt = self.pk.attach_input(
+            self.ffn_moe_norm, name=f"layer_{layer_spec.layer_index}_ffn_moe_norm"
+        )
+        hidden_pre_scale_dt = self.pk.attach_input(
+            self.hidden_pre_scale, name=f"layer_{layer_spec.layer_index}_hidden_pre_scale"
+        )
+        scaled_post_attn_dt = self.pk.attach_input(
+            self.scaled_post_attn, name=f"layer_{layer_spec.layer_index}_scaled_post_attn"
+        )
+        layer_scale_weight_dt = self.pk.attach_input(
+            layer_scale_weight.contiguous(), name=f"layer_{layer_spec.layer_index}_layer_scale_weight"
+        )
+        hidden_out_dt = self.pk.attach_input(self.hidden_out, name=f"layer_{layer_spec.layer_index}_hidden_out")
+
+        self.pk.rmsnorm_layer(
+            input=hidden_dt,
+            weight=attn_norm_dt,
+            output=rmsnorm_out_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        self.pk.linear_layer(
+            input=rmsnorm_out_dt,
+            weight=qkv_weight_dt,
+            output=qkv_out_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        if self.use_single_batch_extend_attention:
+            self.pk.single_batch_extend_attention_layer(
+                input=qkv_out_dt,
+                k_cache=k_cache_dt,
+                v_cache=v_cache_dt,
+                q_norm=q_norm_dt,
+                k_norm=k_norm_dt,
+                cos_pos_embed=cos_dt,
+                sin_pos_embed=sin_dt,
+                output=attn_out_dt,
+                grid_dim=(1, self.attn_kv_heads, 1),
+                block_dim=(256, 1, 1),
+            )
+        elif self.use_split_kv_attention:
+            assert lse_dt is not None
+            assert attn_out_tmp_dt is not None
+            self.pk.paged_attention_split_kv_layer(
+                input=qkv_out_dt,
+                k_cache=k_cache_dt,
+                v_cache=v_cache_dt,
+                q_norm=q_norm_dt,
+                k_norm=k_norm_dt,
+                cos_pos_embed=cos_dt,
+                sin_pos_embed=sin_dt,
+                lse=lse_dt,
+                output=attn_out_tmp_dt,
+                attention_params=(int(layer_spec.q_heads), self.num_kv_cache_chunks),
+                grid_dim=(1, self.attn_kv_heads, self.num_kv_cache_chunks),
+                block_dim=(256, 1, 1),
+            )
+            self.pk.paged_attention_split_kv_merge_layer(
+                lse=lse_dt,
+                output_tmp=attn_out_tmp_dt,
+                output=attn_out_dt,
+                attention_params=(int(layer_spec.q_heads), int(layer_spec.head_dim)),
+                grid_dim=(1, self.attn_kv_heads, 1),
+                block_dim=(256, 1, 1),
+            )
+        else:
+            self.pk.paged_attention_layer(
+                input=qkv_out_dt,
+                k_cache=k_cache_dt,
+                v_cache=v_cache_dt,
+                q_norm=q_norm_dt,
+                k_norm=k_norm_dt,
+                cos_pos_embed=cos_dt,
+                sin_pos_embed=sin_dt,
+                output=attn_out_dt,
+                grid_dim=(1, self.attn_kv_heads, 1),
+                block_dim=(128, 1, 1),
+            )
+        self.pk.linear_layer(
+            input=attn_out_dt,
+            weight=o_proj_weight_dt,
+            output=o_proj_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        if disable_post_attn_tail:
+            self.pk.linear_with_residual_layer(
+                input=o_proj_dt,
+                weight=identity_weight_dt,
+                residual=zero_residual_dt,
+                output=hidden_out_dt,
+                grid_dim=(1, 1, 1),
+                block_dim=(128, 1, 1),
+            )
+        else:
+            self.pk.rmsnorm_layer(
+                input=o_proj_dt,
+                weight=post_attn_norm_weight_dt,
+                output=post_attn_norm_dt,
+                grid_dim=(1, 1, 1),
+                block_dim=(128, 1, 1),
+            )
+            self.pk.linear_with_residual_layer(
+                input=post_attn_norm_dt,
+                weight=identity_weight_dt,
+                residual=hidden_dt,
+                output=post_attn_dt,
+                grid_dim=(1, 1, 1),
+                block_dim=(128, 1, 1),
+            )
+            self.pk.rmsnorm_layer(
+                input=post_attn_dt,
+                weight=pre_ffn_norm_weight_dt,
+                output=ffn_normed_dt,
+                block_dim=(128, 1, 1),
+                grid_dim=(1, 1, 1),
+            )
+            self.pk.linear_layer(
+                input=ffn_normed_dt,
+                weight=ffn_gate_up_weight_dt,
+                output=ffn_gate_up_dt,
+                grid_dim=(1, 1, 1),
+                block_dim=(128, 1, 1),
+            )
+            if disable_ffn_tail:
+                self.pk.linear_with_residual_layer(
+                    input=post_attn_dt,
+                    weight=identity_weight_dt,
+                    residual=zero_residual_dt,
+                    output=hidden_out_dt,
+                    grid_dim=(1, 1, 1),
+                    block_dim=(128, 1, 1),
+                )
+            else:
+                self.pk.moe_gelu_mul_layer(
+                    input=ffn_gate_up_moe_dt,
+                    output=ffn_act_dt,
+                    grid_dim=(1, 1, 1),
+                    block_dim=(128, 1, 1),
+                )
+                self.pk.moe_w2_linear_layer(
+                    input=ffn_act_dt,
+                    weight=ffn_w2_weight_dt,
+                    moe_routing_indices=ffn_routing_indices_dt,
+                    moe_mask=ffn_routing_mask_dt,
+                    output=ffn_w2_out_dt,
+                    grid_dim=_moe_expert_grid_dim(self.pk, w13_linear=False),
+                    block_dim=(128, 1, 1),
+                )
+                self.pk.moe_mul_sum_add_layer(
+                    input=ffn_w2_out_dt,
+                    weight=ffn_topk_weight_dt,
+                    residual=zero_residual_dt,
+                    output=ffn_down_dt,
+                    grid_dim=(1, 1, 1),
+                    block_dim=(128, 1, 1),
+                )
+                self.pk.rmsnorm_layer(
+                    input=ffn_down_dt,
+                    weight=post_ffn_norm_weight_dt,
+                    output=ffn_norm_dt,
+                    grid_dim=(1, 1, 1),
+                    block_dim=(128, 1, 1),
+                )
+                if disable_moe_tail:
+                    self.pk.linear_with_residual_layer(
+                        input=ffn_norm_dt,
+                        weight=identity_weight_dt,
+                        residual=zero_residual_dt,
+                        output=hidden_out_dt,
+                        grid_dim=(1, 1, 1),
+                        block_dim=(128, 1, 1),
+                    )
+                else:
+                    self.pk.rmsnorm_layer(
+                        input=post_attn_dt,
+                        weight=router_norm_weight_dt,
+                        output=router_in_dt,
+                        grid_dim=(1, 1, 1),
+                        block_dim=(128, 1, 1),
+                    )
+                    self.pk.linear_layer(
+                        input=router_in_dt,
+                        weight=router_weight_dt,
+                        output=router_logits_dt,
+                        grid_dim=(1, 1, 1),
+                        block_dim=(128, 1, 1),
+                    )
+                    self.pk.moe_topk_softmax_routing_layer(
+                        input=router_logits_dt,
+                        output=(topk_weight_dt, routing_indices_dt, routing_mask_dt),
+                        grid_dim=(1, 1, 1),
+                        block_dim=(128, 1, 1),
+                    )
+                    if disable_moe_exec:
+                        self.pk.linear_with_residual_layer(
+                            input=ffn_norm_dt,
+                            weight=identity_weight_dt,
+                            residual=zero_residual_dt,
+                            output=hidden_out_dt,
+                            grid_dim=(1, 1, 1),
+                            block_dim=(128, 1, 1),
+                        )
+                    else:
+                        self.pk.rmsnorm_layer(
+                            input=post_attn_dt,
+                            weight=moe_in_norm_weight_dt,
+                            output=moe_in_dt,
+                            grid_dim=(1, 1, 1),
+                            block_dim=(128, 1, 1),
+                        )
+                        self.pk.moe_w13_gelu_mul_layer(
+                            input=moe_in_dt,
+                            weight=moe_w13_weight_dt,
+                            moe_routing_indices=routing_indices_dt,
+                            moe_mask=routing_mask_dt,
+                            output=moe_act_dt,
+                            grid_dim=_moe_expert_grid_dim(self.pk, w13_linear=True),
+                            block_dim=(128, 1, 1),
+                        )
+                        self.pk.moe_w2_linear_layer(
+                            input=moe_act_dt,
+                            weight=moe_w2_weight_dt,
+                            moe_routing_indices=routing_indices_dt,
+                            moe_mask=routing_mask_dt,
+                            output=moe_w2_out_dt,
+                            grid_dim=_moe_expert_grid_dim(self.pk, w13_linear=False),
+                            block_dim=(128, 1, 1),
+                        )
+                        self.pk.moe_mul_sum_add_layer(
+                            input=moe_w2_out_dt,
+                            weight=topk_weight_dt,
+                            residual=zero_residual_dt,
+                            output=moe_out_dt,
+                            grid_dim=(1, 1, 1),
+                            block_dim=(128, 1, 1),
+                        )
+                        self.pk.rmsnorm_layer(
+                            input=moe_out_dt,
+                            weight=post_moe_norm_weight_dt,
+                            output=moe_norm_dt,
+                            grid_dim=(1, 1, 1),
+                            block_dim=(128, 1, 1),
+                        )
+                        if disable_moe_merge:
+                            self.pk.linear_with_residual_layer(
+                                input=ffn_norm_dt,
+                                weight=identity_weight_dt,
+                                residual=zero_residual_dt,
+                                output=hidden_out_dt,
+                                grid_dim=(1, 1, 1),
+                                block_dim=(128, 1, 1),
+                            )
+                        else:
+                            self.pk.linear_with_residual_layer(
+                                input=ffn_norm_dt,
+                                weight=identity_weight_dt,
+                                residual=moe_norm_dt,
+                                output=ffn_moe_add_dt,
+                                grid_dim=(1, 1, 1),
+                                block_dim=(128, 1, 1),
+                            )
+                            if disable_post_merge_norm:
+                                self.pk.linear_with_residual_layer(
+                                    input=ffn_moe_add_dt,
+                                    weight=identity_weight_dt,
+                                    residual=zero_residual_dt,
+                                    output=hidden_out_dt,
+                                    grid_dim=(1, 1, 1),
+                                    block_dim=(128, 1, 1),
+                                )
+                            else:
+                                self.pk.rmsnorm_layer(
+                                    input=ffn_moe_add_dt,
+                                    weight=post_merge_norm_weight_dt,
+                                    output=ffn_moe_norm_dt,
+                                    grid_dim=(1, 1, 1),
+                                    block_dim=(128, 1, 1),
+                                )
+                                if disable_final_residual:
+                                    self.pk.linear_layer(
+                                        input=ffn_moe_norm_dt,
+                                        weight=layer_scale_weight_dt,
+                                        output=hidden_pre_scale_dt,
+                                        grid_dim=(1, 1, 1),
+                                        block_dim=(128, 1, 1),
+                                    )
+                                else:
+                                    self.pk.linear_layer(
+                                        input=ffn_moe_norm_dt,
+                                        weight=layer_scale_weight_dt,
+                                        output=hidden_pre_scale_dt,
+                                        grid_dim=(1, 1, 1),
+                                        block_dim=(128, 1, 1),
+                                    )
+                                    self.pk.linear_layer(
+                                        input=post_attn_dt,
+                                        weight=layer_scale_weight_dt,
+                                        output=scaled_post_attn_dt,
+                                        grid_dim=(1, 1, 1),
+                                        block_dim=(128, 1, 1),
+                                    )
+                                if disable_final_scale:
+                                    self.pk.linear_with_residual_layer(
+                                        input=ffn_moe_norm_dt,
+                                        weight=identity_weight_dt,
+                                        residual=zero_residual_dt if disable_final_residual else post_attn_dt,
+                                        output=hidden_out_dt,
+                                        grid_dim=(1, 1, 1),
+                                        block_dim=(128, 1, 1),
+                                    )
+                                else:
+                                    self.pk.linear_with_residual_layer(
+                                        input=hidden_pre_scale_dt,
+                                        weight=identity_weight_dt,
+                                        residual=zero_residual_dt if disable_final_residual else scaled_post_attn_dt,
+                                        output=hidden_out_dt,
+                                        grid_dim=(1, 1, 1),
+                                        block_dim=(128, 1, 1),
+                                    )
+        _constructor_probe("pre_compile")
+        compile_persistent_kernel_with_patches(self.pk)
+        if hasattr(self.pk, "init_request_func") and self.pk.init_request_func is not None:
+            self.pk.init_request_func()
+        _constructor_probe("post_compile")
+
+    def supports(self, kv_cache: torch.Tensor, *, total_tokens: Optional[int] = None) -> bool:
+        if tuple(int(dim) for dim in kv_cache.shape) != self.kv_cache_shape or kv_cache.dtype != self.kv_cache_dtype:
+            return False
+        if total_tokens is not None and int(total_tokens) > self.max_seq_length:
+            return False
+        return True
+
+    def __call__(
+        self,
+        *,
+        hidden: torch.Tensor,
+        kv_cache: torch.Tensor,
+        cache_loc: torch.Tensor,
+        cu_num_pages: torch.Tensor,
+        last_page_len: torch.Tensor,
+    ) -> torch.Tensor:
+        if hidden.numel() != self.hidden_size:
+            raise ValueError(
+                f"Expected hidden tensor with {self.hidden_size} elements, got {tuple(hidden.shape)}."
+            )
+        if not self.supports(kv_cache):
+            raise ValueError(
+                f"KV cache shape changed from {self.kv_cache_shape} to {tuple(kv_cache.shape)}."
+            )
+        if os.getenv("AD_MPK_SINGLE_PK_SYNC_AT_CALL", "0") == "1":
+            torch.cuda.synchronize()
+
+        self.hidden_in.copy_(hidden.reshape(1, self.hidden_size).contiguous())
+        external_page_count = int(cu_num_pages[1].item())
+        if external_page_count <= 0:
+            raise ValueError(f"Expected at least one external KV page, got {external_page_count}.")
+
+        external_last_page_len = int(last_page_len[0].item())
+        total_tokens = (external_page_count - 1) * self.external_page_size + external_last_page_len
+        if total_tokens <= 0:
+            raise ValueError(f"Expected positive live KV token count, got {total_tokens}.")
+
+        _mpk_debug(
+            "single-pk call-start "
+            f"layer={self.layer_spec.layer_index} total_tokens={total_tokens} "
+            f"external_page_count={external_page_count} internal_page_size={self.page_size}"
+        )
+        internal_page_count = (total_tokens + self.page_size - 1) // self.page_size
+        if internal_page_count > self.max_num_pages:
+            raise ValueError(
+                f"Internal KV page count {internal_page_count} exceeds allocated max {self.max_num_pages}."
+            )
+
+        used_page_ids = cache_loc[:external_page_count].to(device=hidden.device, dtype=torch.long).contiguous()
+        used_k = (
+            kv_cache.index_select(0, used_page_ids)[:, 0]
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(external_page_count * self.external_page_size, self.kv_heads, self.head_dim)
+        )
+        used_v = (
+            kv_cache.index_select(0, used_page_ids)[:, 1]
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(external_page_count * self.external_page_size, self.kv_heads, self.head_dim)
+        )
+        if self.attn_kv_expand_factor > 1:
+            used_k = used_k.repeat_interleave(self.attn_kv_expand_factor, dim=1)
+            used_v = used_v.repeat_interleave(self.attn_kv_expand_factor, dim=1)
+
+        self.k_cache.zero_()
+        self.v_cache.zero_()
+        self.k_cache.view(self.max_num_pages * self.page_size, self.attn_kv_heads, self.head_dim)[
+            :total_tokens
+        ].copy_(used_k[:total_tokens])
+        self.v_cache.view(self.max_num_pages * self.page_size, self.attn_kv_heads, self.head_dim)[
+            :total_tokens
+        ].copy_(used_v[:total_tokens])
+
+        paged_kv_indptr = torch.tensor([0, internal_page_count], device=hidden.device, dtype=torch.int32)
+        paged_kv_indices = torch.arange(internal_page_count, device=hidden.device, dtype=torch.int32)
+        paged_kv_last_page_len = torch.tensor(
+            [total_tokens - (internal_page_count - 1) * self.page_size],
+            device=hidden.device,
+            dtype=torch.int32,
+        )
+        _reset_pk_runtime_state(
+            self.pk,
+            active_tokens=1,
+            qo_indptr=torch.tensor([0, 1], device=hidden.device, dtype=torch.int32),
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            reinit_request_resources=False,
+        )
+        _mpk_debug(
+            "single-pk launch-start "
+            f"layer={self.layer_spec.layer_index} internal_page_count={internal_page_count} "
+            f"last_page_len={int(paged_kv_last_page_len[0].item())}"
+        )
+        launch_start = time.perf_counter()
+        self.pk()
+        _mpk_debug(
+            "single-pk launch-returned "
+            f"layer={self.layer_spec.layer_index} launch_s={time.perf_counter() - launch_start:.3f}"
+        )
+        sync_start = time.perf_counter()
+        torch.cuda.synchronize()
+        _mpk_debug(
+            "single-pk sync-done "
+            f"layer={self.layer_spec.layer_index} sync_s={time.perf_counter() - sync_start:.3f}"
+        )
+        return self.hidden_out
+
+
+def _make_synthetic_gemma_runtime_layer_spec(
+    *,
+    hidden_size: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    topk: int,
+    num_experts: int,
+    intermediate: int,
+    ffn_intermediate: int,
+    device: torch.device,
+    weight_denom: float = 16.0,
+    qkv_shared_kv: bool = False,
+) -> _GemmaRuntimeLayerSpec:
+    qkv_rows = (q_heads + kv_heads) * head_dim if qkv_shared_kv else (q_heads + 2 * kv_heads) * head_dim
+    moe_up_weight = (
+        torch.randn((num_experts, intermediate, hidden_size), device=device, dtype=torch.bfloat16)
+        / weight_denom
+    )
+    moe_gate_weight = (
+        torch.randn((num_experts, intermediate, hidden_size), device=device, dtype=torch.bfloat16)
+        / weight_denom
+    )
+    return _GemmaRuntimeLayerSpec(
+        layer_index=0,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        topk=topk,
+        sliding_window=None,
+        qkv_weight=torch.randn((qkv_rows, hidden_size), device=device, dtype=torch.bfloat16)
+        / weight_denom,
+        qkv_shared_kv=qkv_shared_kv,
+        input_layernorm_weight=torch.ones((hidden_size,), device=device, dtype=torch.bfloat16),
+        q_norm_weight=torch.ones((head_dim,), device=device, dtype=torch.bfloat16),
+        k_norm_weight=torch.ones((head_dim,), device=device, dtype=torch.bfloat16),
+        v_norm_weight=torch.ones((head_dim,), device=device, dtype=torch.bfloat16),
+        o_proj_weight=torch.randn((hidden_size, hidden_size), device=device, dtype=torch.bfloat16)
+        / weight_denom,
+        post_attention_layernorm_weight=torch.ones(
+            (hidden_size,), device=device, dtype=torch.bfloat16
+        ),
+        pre_feedforward_layernorm_weight=torch.ones(
+            (hidden_size,), device=device, dtype=torch.bfloat16
+        ),
+        ffn_gate_up_weight=torch.randn(
+            (2 * ffn_intermediate, hidden_size), device=device, dtype=torch.bfloat16
+        )
+        / weight_denom,
+        ffn_down_weight=torch.randn(
+            (hidden_size, ffn_intermediate), device=device, dtype=torch.bfloat16
+        )
+        / weight_denom,
+        post_feedforward_layernorm_1_weight=torch.ones(
+            (hidden_size,), device=device, dtype=torch.bfloat16
+        ),
+        router_proj_weight=torch.randn(
+            (num_experts, hidden_size), device=device, dtype=torch.bfloat16
+        )
+        / weight_denom,
+        router_root_size=(0.9 + 0.2 * torch.rand((hidden_size,), device=device, dtype=torch.float32)).to(
+            torch.bfloat16
+        ),
+        router_scale=(0.9 + 0.2 * torch.rand((hidden_size,), device=device, dtype=torch.float32)).to(
+            torch.bfloat16
+        ),
+        pre_feedforward_layernorm_2_weight=torch.ones(
+            (hidden_size,), device=device, dtype=torch.bfloat16
+        ),
+        moe_w13_stacked_weight=torch.cat((moe_up_weight, moe_gate_weight), dim=1).contiguous(),
+        moe_gate_weight=moe_gate_weight,
+        moe_up_weight=moe_up_weight,
+        moe_w2_weight=torch.randn(
+            (num_experts, hidden_size, intermediate), device=device, dtype=torch.bfloat16
+        )
+        / weight_denom,
+        post_feedforward_layernorm_2_weight=torch.ones(
+            (hidden_size,), device=device, dtype=torch.bfloat16
+        ),
+        post_feedforward_layernorm_weight=torch.ones(
+            (hidden_size,), device=device, dtype=torch.bfloat16
+        ),
+        layer_scalar=torch.ones((hidden_size,), device=device, dtype=torch.bfloat16),
+    )
+
+
+def run_mirage_gemma_layer_single_pk_executor_external_page32_smoke(
+    *,
+    seed: int = 0,
+    gemma_like_shapes: bool = False,
+    external_page_size: int = 32,
+) -> Dict[str, float]:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    if gemma_like_shapes:
+        hidden_size = 2816
+        q_heads = 16
+        kv_heads = 8
+        head_dim = 256
+        topk = 8
+        num_experts = 128
+        intermediate = 704
+        ffn_intermediate = 2112
+        weight_denom = 64.0
+        hidden_denom = 32.0
+        kv_base = 0.05
+        kv_noise = 0.02
+    else:
+        hidden_size = 512
+        q_heads = 4
+        kv_heads = 1
+        head_dim = 128
+        topk = 8
+        num_experts = 128
+        intermediate = 64
+        ffn_intermediate = 256
+        weight_denom = 16.0
+        hidden_denom = 8.0
+        kv_base = 0.2
+        kv_noise = 0.1
+
+    layer_spec = _make_synthetic_gemma_runtime_layer_spec(
+        hidden_size=hidden_size,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        topk=topk,
+        num_experts=num_experts,
+        intermediate=intermediate,
+        ffn_intermediate=ffn_intermediate,
+        device=device,
+        weight_denom=weight_denom,
+    )
+    identity_weight = torch.eye(hidden_size, device=device, dtype=torch.bfloat16)
+    cos = torch.ones((513, head_dim), device=device, dtype=torch.bfloat16)
+    sin = torch.zeros((513, head_dim), device=device, dtype=torch.bfloat16)
+
+    external_max_num_pages = 8
+    total_tokens = 9
+    external_page_count = (total_tokens + external_page_size - 1) // external_page_size
+    external_last_page_len = total_tokens - (external_page_count - 1) * external_page_size
+
+    kv_cache = torch.zeros(
+        (external_max_num_pages, 2, kv_heads, external_page_size, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    used_k = kv_base + kv_noise * torch.randn(
+        (total_tokens, kv_heads, head_dim), device=device, dtype=torch.bfloat16
+    )
+    used_v = kv_base + kv_noise * torch.randn(
+        (total_tokens, kv_heads, head_dim), device=device, dtype=torch.bfloat16
+    )
+    kv_cache[0, 0, :, :total_tokens, :].copy_(used_k.permute(1, 0, 2))
+    kv_cache[0, 1, :, :total_tokens, :].copy_(used_v.permute(1, 0, 2))
+
+    executor = _MirageGemmaLayerSinglePkExecutor(
+        layer_spec=layer_spec,
+        kv_cache=kv_cache,
+        cos=cos,
+        sin=sin,
+        identity_weight=identity_weight,
+    )
+    hidden = torch.randn((1, hidden_size), device=device, dtype=torch.bfloat16) / hidden_denom
+    cache_loc = torch.arange(external_page_count, device=device, dtype=torch.int32)
+    cu_num_pages = torch.tensor([0, external_page_count], device=device, dtype=torch.int32)
+    last_page_len = torch.tensor([external_last_page_len], device=device, dtype=torch.int32)
+
+    hidden_out = executor(
+        hidden=hidden,
+        kv_cache=kv_cache,
+        cache_loc=cache_loc,
+        cu_num_pages=cu_num_pages,
+        last_page_len=last_page_len,
+    )
+    torch.cuda.synchronize()
+    return {
+        "hidden_out_absmax": float(hidden_out.float().abs().max().item()),
+        "hidden_out_norm": float(hidden_out.float().norm().item()),
+        "hidden_out_has_nan": float(torch.isnan(hidden_out).any().item()),
+        "external_page_size": float(external_page_size),
+        "external_page_count": float(external_page_count),
+        "external_last_page_len": float(external_last_page_len),
+    }
+
+
+def run_mirage_gemma_global_layer_single_pk_smoke(
+    *,
+    seed: int = 0,
+    external_page_size: int = 32,
+    total_tokens: int = 20,
+) -> Dict[str, float]:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    hidden_size = 2816
+    q_heads = 16
+    kv_heads = 2
+    head_dim = 512
+    topk = 8
+    num_experts = 128
+    intermediate = 704
+    ffn_intermediate = 2112
+    weight_denom = 64.0
+    hidden_denom = 32.0
+    kv_base = 0.05
+    kv_noise = 0.02
+
+    layer_spec = _make_synthetic_gemma_runtime_layer_spec(
+        hidden_size=hidden_size,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        topk=topk,
+        num_experts=num_experts,
+        intermediate=intermediate,
+        ffn_intermediate=ffn_intermediate,
+        device=device,
+        weight_denom=weight_denom,
+        qkv_shared_kv=True,
+    )
+    identity_weight = torch.eye(hidden_size, device=device, dtype=torch.bfloat16)
+    cos = torch.ones((513, head_dim), device=device, dtype=torch.bfloat16)
+    sin = torch.zeros((513, head_dim), device=device, dtype=torch.bfloat16)
+
+    external_max_num_pages = 64
+    external_page_count = (total_tokens + external_page_size - 1) // external_page_size
+    external_last_page_len = total_tokens - (external_page_count - 1) * external_page_size
+
+    kv_cache = torch.zeros(
+        (external_max_num_pages, 2, kv_heads, external_page_size, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    used_k = kv_base + kv_noise * torch.randn(
+        (total_tokens, kv_heads, head_dim), device=device, dtype=torch.bfloat16
+    )
+    used_v = kv_base + kv_noise * torch.randn(
+        (total_tokens, kv_heads, head_dim), device=device, dtype=torch.bfloat16
+    )
+    for page_idx in range(external_page_count):
+        page_start = page_idx * external_page_size
+        page_end = min(page_start + external_page_size, total_tokens)
+        page_tokens = page_end - page_start
+        kv_cache[page_idx, 0, :, :page_tokens, :].copy_(used_k[page_start:page_end].permute(1, 0, 2))
+        kv_cache[page_idx, 1, :, :page_tokens, :].copy_(used_v[page_start:page_end].permute(1, 0, 2))
+
+    executor = _MirageGemmaLayerSinglePkExecutor(
+        layer_spec=layer_spec,
+        kv_cache=kv_cache,
+        cos=cos,
+        sin=sin,
+        identity_weight=identity_weight,
+        max_seq_length=256,
+    )
+    hidden = torch.randn((1, hidden_size), device=device, dtype=torch.bfloat16) / hidden_denom
+    cache_loc = torch.arange(external_page_count, device=device, dtype=torch.int32)
+    cu_num_pages = torch.tensor([0, external_page_count], device=device, dtype=torch.int32)
+    last_page_len = torch.tensor([external_last_page_len], device=device, dtype=torch.int32)
+
+    hidden_out = executor(
+        hidden=hidden,
+        kv_cache=kv_cache,
+        cache_loc=cache_loc,
+        cu_num_pages=cu_num_pages,
+        last_page_len=last_page_len,
+    )
+    torch.cuda.synchronize()
+    return {
+        "hidden_out_absmax": float(hidden_out.float().abs().max().item()),
+        "hidden_out_norm": float(hidden_out.float().norm().item()),
+        "hidden_out_has_nan": float(torch.isnan(hidden_out).any().item()),
+        "external_page_size": float(external_page_size),
+        "external_page_count": float(external_page_count),
+        "external_last_page_len": float(external_last_page_len),
+        "total_tokens": float(total_tokens),
+    }
+
+
+def run_mirage_gemma_global_attention_single_pk_smoke(
+    *,
+    seed: int = 0,
+    external_page_size: int = 32,
+    total_tokens: int = 20,
+    include_o_proj: bool = False,
+) -> Dict[str, float]:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    hidden_size = 2816
+    q_heads = 16
+    kv_heads = 2
+    head_dim = 512
+    page_size = 64
+    max_num_pages = 4
+    weight_denom = 64.0
+    hidden_denom = 32.0
+    kv_base = 0.05
+    kv_noise = 0.02
+
+    pk = create_test_persistent_kernel(
+        max_seq_length=256,
+        max_num_batched_requests=1,
+        max_num_batched_tokens=1,
+        max_num_pages=max_num_pages,
+        page_size=page_size,
+        use_cutlass_kernel=False,
+    )
+
+    qkv_rows = (q_heads + 2 * kv_heads) * head_dim
+    hidden_in = torch.randn((1, hidden_size), device=device, dtype=torch.bfloat16) / hidden_denom
+    attn_norm_weight = torch.ones((hidden_size,), device=device, dtype=torch.bfloat16)
+    q_weight = torch.randn((q_heads * head_dim, hidden_size), device=device, dtype=torch.bfloat16) / weight_denom
+    shared_kv_weight = (
+        torch.randn((kv_heads * head_dim, hidden_size), device=device, dtype=torch.bfloat16) / weight_denom
+    )
+    q_per_kv = q_heads // kv_heads
+    q_weight_grouped = q_weight.view(kv_heads, q_per_kv, head_dim, hidden_size)
+    shared_kv_weight_grouped = shared_kv_weight.view(kv_heads, head_dim, hidden_size)
+    grouped_rows = []
+    for kv_idx in range(kv_heads):
+        grouped_rows.append(q_weight_grouped[kv_idx].reshape(q_per_kv * head_dim, hidden_size))
+        grouped_rows.append(shared_kv_weight_grouped[kv_idx])
+        grouped_rows.append(shared_kv_weight_grouped[kv_idx])
+    qkv_weight = torch.cat(grouped_rows, dim=0).contiguous()
+    q_norm_weight = torch.ones((head_dim,), device=device, dtype=torch.bfloat16)
+    k_norm_weight = torch.ones((head_dim,), device=device, dtype=torch.bfloat16)
+    cos = torch.ones((513, head_dim), device=device, dtype=torch.bfloat16)
+    sin = torch.zeros((513, head_dim), device=device, dtype=torch.bfloat16)
+    qkv_out = torch.zeros((1, qkv_rows), device=device, dtype=torch.bfloat16)
+    rmsnorm_out = torch.zeros((1, hidden_size), device=device, dtype=torch.bfloat16)
+    attn_out = torch.zeros((1, q_heads * head_dim), device=device, dtype=torch.bfloat16)
+    k_cache = torch.zeros((max_num_pages, page_size, kv_heads, head_dim), device=device, dtype=torch.bfloat16)
+    v_cache = torch.zeros_like(k_cache)
+    used_k = kv_base + kv_noise * torch.randn(
+        (total_tokens, kv_heads, head_dim), device=device, dtype=torch.bfloat16
+    )
+    used_v = kv_base + kv_noise * torch.randn(
+        (total_tokens, kv_heads, head_dim), device=device, dtype=torch.bfloat16
+    )
+    external_page_count = (total_tokens + external_page_size - 1) // external_page_size
+    external_last_page_len = total_tokens - (external_page_count - 1) * external_page_size
+    for page_idx in range(external_page_count):
+        page_start = page_idx * external_page_size
+        page_end = min(page_start + external_page_size, total_tokens)
+        page_tokens = page_end - page_start
+        k_cache[page_idx, :page_tokens].copy_(used_k[page_start:page_end])
+        v_cache[page_idx, :page_tokens].copy_(used_v[page_start:page_end])
+
+    hidden_dt = pk.attach_input(hidden_in, name="global_attn_hidden")
+    attn_norm_dt = pk.attach_input(attn_norm_weight, name="global_attn_norm_weight")
+    qkv_weight_dt = pk.attach_input(qkv_weight, name="global_attn_qkv_weight")
+    rmsnorm_out_dt = pk.attach_input(rmsnorm_out, name="global_attn_rmsnorm_out")
+    qkv_out_dt = pk.attach_input(qkv_out, name="global_attn_qkv_out")
+    q_norm_dt = pk.attach_input(q_norm_weight, name="global_attn_q_norm")
+    k_norm_dt = pk.attach_input(k_norm_weight, name="global_attn_k_norm")
+    cos_dt = pk.attach_input(cos, name="global_attn_cos")
+    sin_dt = pk.attach_input(sin, name="global_attn_sin")
+    k_cache_dt = pk.attach_input(k_cache, name="global_attn_k_cache")
+    v_cache_dt = pk.attach_input(v_cache, name="global_attn_v_cache")
+    attn_out_dt = pk.attach_input(attn_out, name="global_attn_out")
+
+    pk.rmsnorm_layer(
+        input=hidden_dt,
+        weight=attn_norm_dt,
+        output=rmsnorm_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.linear_layer(
+        input=rmsnorm_out_dt,
+        weight=qkv_weight_dt,
+        output=qkv_out_dt,
+        grid_dim=(1, 1, 1),
+        block_dim=(128, 1, 1),
+    )
+    pk.single_batch_extend_attention_layer(
+        input=qkv_out_dt,
+        k_cache=k_cache_dt,
+        v_cache=v_cache_dt,
+        q_norm=q_norm_dt,
+        k_norm=k_norm_dt,
+        cos_pos_embed=cos_dt,
+        sin_pos_embed=sin_dt,
+        output=attn_out_dt,
+        grid_dim=(1, kv_heads, 1),
+        block_dim=(256, 1, 1),
+    )
+
+    o_proj = None
+    if include_o_proj:
+        o_proj = torch.zeros((1, hidden_size), device=device, dtype=torch.bfloat16)
+        o_proj_weight = (
+            torch.randn((hidden_size, q_heads * head_dim), device=device, dtype=torch.bfloat16) / weight_denom
+        )
+        o_proj_weight_dt = pk.attach_input(o_proj_weight, name="global_attn_o_proj_weight")
+        o_proj_dt = pk.attach_input(o_proj, name="global_attn_o_proj")
+        pk.linear_layer(
+            input=attn_out_dt,
+            weight=o_proj_weight_dt,
+            output=o_proj_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+    _mpk_debug(
+        "global-attn-single-pk compile-start "
+        f"include_o_proj={include_o_proj} q_heads={q_heads} kv_heads={kv_heads} head_dim={head_dim}"
+    )
+    compile_start = time.perf_counter()
+    compile_persistent_kernel_with_patches(pk)
+    _mpk_debug(
+        "global-attn-single-pk compile-finished "
+        f"include_o_proj={include_o_proj} compile_s={time.perf_counter() - compile_start:.3f}"
+    )
+    internal_page_count = (total_tokens + page_size - 1) // page_size
+    _reset_pk_runtime_state(
+        pk,
+        active_tokens=1,
+        qo_indptr=torch.tensor([0, 1], device=device, dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, internal_page_count], device=device, dtype=torch.int32),
+        paged_kv_indices=torch.arange(internal_page_count, device=device, dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor(
+            [total_tokens - (internal_page_count - 1) * page_size],
+            device=device,
+            dtype=torch.int32,
+        ),
+        reinit_request_resources=False,
+    )
+    _mpk_debug(
+        "global-attn-single-pk launch-start "
+        f"include_o_proj={include_o_proj}"
+    )
+    launch_start = time.perf_counter()
+    pk()
+    _mpk_debug(
+        "global-attn-single-pk launch-returned "
+        f"include_o_proj={include_o_proj} launch_s={time.perf_counter() - launch_start:.3f}"
+    )
+    sync_start = time.perf_counter()
+    torch.cuda.synchronize()
+    _mpk_debug(
+        "global-attn-single-pk sync-done "
+        f"include_o_proj={include_o_proj} sync_s={time.perf_counter() - sync_start:.3f}"
+    )
+    result = {
+        "attn_out_absmax": float(attn_out.float().abs().max().item()),
+        "attn_out_norm": float(attn_out.float().norm().item()),
+        "attn_has_nan": float(torch.isnan(attn_out).any().item()),
+        "include_o_proj": float(include_o_proj),
+    }
+    if include_o_proj and o_proj is not None:
+        result.update(
+            {
+                "o_proj_absmax": float(o_proj.float().abs().max().item()),
+                "o_proj_norm": float(o_proj.float().norm().item()),
+                "o_proj_has_nan": float(torch.isnan(o_proj).any().item()),
+            }
+        )
+    return result
+
+
 class _GemmaMirageRuntime:
     def __init__(self, source_model: GraphModule, translation_plan: Dict[str, Any]) -> None:
         self.source_model = source_model
@@ -5047,51 +7567,121 @@ class _GemmaMirageRuntime:
             source_model, _node_arg_getattr_target(final_norm_node, 1)
         )
 
-        local_cos_index_node = next(
-            node for node in source_model.graph.nodes if "rotary_emb_local_index_2" in node.name
+        self.local_cos = _find_tensor_attr_by_substrings(
+            source_model, "rotary_emb_local", "ad_cos_cached"
         )
-        local_sin_index_node = next(
-            node for node in source_model.graph.nodes if "rotary_emb_local_index_3" in node.name
+        self.local_sin = _find_tensor_attr_by_substrings(
+            source_model, "rotary_emb_local", "ad_sin_cached"
         )
-        self.local_cos = _lookup_tensor_attr(
-            source_model, _node_arg_getattr_target(local_cos_index_node, 0)
-        )
-        self.local_sin = _lookup_tensor_attr(
-            source_model, _node_arg_getattr_target(local_sin_index_node, 0)
-        )
-
-        global_cos_node = next(
-            (
-                node
-                for node in source_model.graph.nodes
-                if "rotary_emb_global" in node.name and "__ad_cos_cached" in _node_target_name(node)
-            ),
-            None,
-        )
-        global_sin_node = next(
-            (
-                node
-                for node in source_model.graph.nodes
-                if "rotary_emb_global" in node.name and "__ad_sin_cached" in _node_target_name(node)
-            ),
-            None,
-        )
-        self.global_cos = (
-            _lookup_tensor_attr(source_model, _node_arg_getattr_target(global_cos_node, 0))
-            if global_cos_node is not None
-            else self.local_cos
-        )
-        self.global_sin = (
-            _lookup_tensor_attr(source_model, _node_arg_getattr_target(global_sin_node, 0))
-            if global_sin_node is not None
-            else self.local_sin
-        )
+        try:
+            self.global_cos = _find_tensor_attr_by_substrings(
+                source_model, "rotary_emb_global", "ad_cos_cached"
+            )
+        except AttributeError:
+            self.global_cos = self.local_cos
+        try:
+            self.global_sin = _find_tensor_attr_by_substrings(
+                source_model, "rotary_emb_global", "ad_sin_cached"
+            )
+        except AttributeError:
+            self.global_sin = self.local_sin
         self._linear_cache: Dict[tuple[int, int, int, str], _MirageLinearExecutor] = {}
         self._router_cache: Dict[tuple[int, int, int, int], _MirageRouterExecutor] = {}
         self._moe_w13_cache: Dict[tuple[int, int, int, int, int], _MirageMoeW13Executor] = {}
         self._moe_w2_cache: Dict[tuple[int, int, int, int, int], _MirageMoeW2ReduceExecutor] = {}
         self._gelu_cache: Dict[tuple[int, ...], _MirageGeluMulExecutor] = {}
         self._matmul_cache: Dict[tuple[int, int, int], _MirageMatmulExecutor] = {}
+        self._single_pk_identity_cache: Dict[int, torch.Tensor] = {}
+        self._single_pk_layer_cache: Dict[int, _MirageGemmaLayerSinglePkExecutor] = {}
+
+    def _single_pk_identity(self, hidden_size: int, device: torch.device) -> torch.Tensor:
+        identity = self._single_pk_identity_cache.get(hidden_size)
+        if identity is None:
+            identity = torch.eye(hidden_size, device=device, dtype=torch.bfloat16)
+            self._single_pk_identity_cache[hidden_size] = identity
+        return identity
+
+    def _get_single_pk_layer_executor(
+        self,
+        *,
+        layer_spec: _GemmaRuntimeLayerSpec,
+        kv_cache: torch.Tensor,
+        total_tokens: int,
+    ) -> _MirageGemmaLayerSinglePkExecutor:
+        executor = self._single_pk_layer_cache.get(layer_spec.layer_index)
+        if executor is not None and executor.supports(kv_cache, total_tokens=total_tokens):
+            _mpk_debug(
+                "single-pk cache-hit "
+                f"layer={layer_spec.layer_index} total_tokens={int(total_tokens)} "
+                f"max_seq_length={int(executor.max_seq_length)}"
+            )
+            return executor
+
+        cos = self.local_cos if layer_spec.head_dim == 256 else self.global_cos
+        sin = self.local_sin if layer_spec.head_dim == 256 else self.global_sin
+        if int(cos.shape[1]) != int(layer_spec.head_dim) or int(sin.shape[1]) != int(layer_spec.head_dim):
+            raise ValueError(
+                f"RoPE cache width mismatch for layer {layer_spec.layer_index}: "
+                f"expected {int(layer_spec.head_dim)}, got cos={tuple(int(dim) for dim in cos.shape)} "
+                f"sin={tuple(int(dim) for dim in sin.shape)}."
+            )
+        identity = self._single_pk_identity(int(layer_spec.o_proj_weight.shape[0]), layer_spec.o_proj_weight.device)
+        min_capacity = 256 if (layer_spec.qkv_shared_kv and int(layer_spec.head_dim) == 512) else 128
+        requested_capacity = max(
+            min_capacity,
+            ((int(total_tokens) + self._single_pk_page_size() - 1) // self._single_pk_page_size())
+            * self._single_pk_page_size(),
+        )
+        _mpk_debug(
+            "single-pk build-start "
+            f"layer={layer_spec.layer_index} total_tokens={int(total_tokens)} "
+            f"requested_capacity={requested_capacity} kv_cache_shape={tuple(int(dim) for dim in kv_cache.shape)} "
+            f"q_heads={int(layer_spec.q_heads)} kv_heads={int(layer_spec.kv_heads)} "
+            f"head_dim={int(layer_spec.head_dim)} shared_kv={bool(layer_spec.qkv_shared_kv)}"
+        )
+        build_start = time.perf_counter()
+        executor = _MirageGemmaLayerSinglePkExecutor(
+            layer_spec=layer_spec,
+            kv_cache=kv_cache,
+            cos=cos,
+            sin=sin,
+            identity_weight=identity,
+            max_seq_length=requested_capacity,
+        )
+        _mpk_debug(
+            "single-pk build-finished "
+            f"layer={layer_spec.layer_index} build_s={time.perf_counter() - build_start:.3f}"
+        )
+        sync_start = time.perf_counter()
+        torch.cuda.synchronize()
+        _mpk_debug(
+            "single-pk build-sync-done "
+            f"layer={layer_spec.layer_index} sync_s={time.perf_counter() - sync_start:.3f}"
+        )
+        if os.getenv("AD_MPK_SINGLE_PK_SELFTEST", "0") == "1":
+            zero_hidden = torch.zeros(
+                (1, int(layer_spec.o_proj_weight.shape[0])),
+                device=layer_spec.o_proj_weight.device,
+                dtype=torch.bfloat16,
+            )
+            executor(
+                hidden=zero_hidden,
+                kv_cache=kv_cache,
+                cache_loc=torch.zeros((1,), device=kv_cache.device, dtype=torch.int32),
+                cu_num_pages=torch.tensor([0, 1], device=kv_cache.device, dtype=torch.int32),
+                last_page_len=torch.tensor([1], device=kv_cache.device, dtype=torch.int32),
+            )
+            selftest_sync_start = time.perf_counter()
+            torch.cuda.synchronize()
+            _mpk_debug(
+                "single-pk selftest-sync-done "
+                f"layer={layer_spec.layer_index} sync_s={time.perf_counter() - selftest_sync_start:.3f}"
+            )
+        self._single_pk_layer_cache[layer_spec.layer_index] = executor
+        return executor
+
+    def _single_pk_page_size(self) -> int:
+        return 64
 
     def _linear(
         self,
@@ -5459,6 +8049,40 @@ class _GemmaMirageRuntime:
                 f"{layer_spec.layer_index} batch={batch_size} seq={seq_len} "
                 f"prefill={num_prefill} prefill_tokens={num_prefill_tokens} decode={num_decode}"
             )
+            if batch_size == 1 and seq_len == 1 and num_prefill == 0:
+                external_page_count = int(cu_num_pages[1].item())
+                if external_page_count <= 0:
+                    raise ValueError(f"Expected at least one external KV page, got {external_page_count}.")
+                external_last_page_len = int(last_page_len[0].item())
+                total_tokens = (external_page_count - 1) * int(kv_cache.shape[3]) + external_last_page_len
+                if total_tokens <= 0:
+                    raise ValueError(f"Expected positive live KV token count, got {total_tokens}.")
+                if os.getenv("AD_MPK_SINGLE_PK_DEBUG_META", "0") == "1":
+                    _mpk_debug(
+                        "single-pk meta "
+                        f"layer={layer_spec.layer_index} "
+                        f"kv_cache_shape={tuple(int(dim) for dim in kv_cache.shape)} "
+                        f"cache_loc_head={cache_loc[:8].tolist()} "
+                        f"cu_num_pages={cu_num_pages.tolist()} "
+                        f"last_page_len={last_page_len.tolist()}"
+                    )
+                if os.getenv("AD_MPK_SINGLE_PK_PRECALL_SYNC", "0") == "1":
+                    torch.cuda.synchronize()
+                layer_executor = self._get_single_pk_layer_executor(
+                    layer_spec=layer_spec,
+                    kv_cache=kv_cache,
+                    total_tokens=total_tokens,
+                )
+                hidden = layer_executor(
+                    hidden=hidden.reshape(1, -1),
+                    kv_cache=kv_cache,
+                    cache_loc=cache_loc,
+                    cu_num_pages=cu_num_pages,
+                    last_page_len=last_page_len,
+                ).view(batch_size, seq_len, -1)
+                _mpk_debug(f"exit layer {layer_spec.layer_index} [single-pk]")
+                continue
+
             attn_in = _rms_norm(hidden, layer_spec.input_layernorm_weight).reshape(
                 batch_size * seq_len, -1
             )

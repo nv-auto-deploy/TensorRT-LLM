@@ -126,6 +126,25 @@ For a new model, the recommended first goal is:
 
 This is the cleanest target because AutoDeploy already treats decode as a distinct runtime regime.
 
+One more operational rule helps a lot:
+
+```text
+raw Mirage kernel
+  -> Mirage-local semantic composition
+  -> repo-side helper
+  -> layer runtime
+  -> model runtime
+```
+
+The Gemma global-layer bring-up showed why this matters:
+
+- raw `single_batch_extend_attention_layer` now passes on the current Mirage checkout
+- the next standalone composition,
+  `rmsnorm -> linear -> single_batch_extend`,
+  still fails
+
+So "kernel passes" is not the same thing as "the next semantic composition is safe."
+
 ## Current Support Shape
 
 What is already proven in this repo:
@@ -143,13 +162,17 @@ What is not fully complete yet:
 - mixed-batch decode-subset offload inside a single mixed iteration
 - a stable generic solution for every decode-time FFN specialization
 
-Known current live blocker during Gemma decode:
+Latest Gemma single-PK/global-layer finding:
 
-- single-token decode FFN-down generic Mirage matmul path
-- current symptom: `CUBLAS_STATUS_INVALID_VALUE` on the generic matmul executor
+- raw Mirage-local `single_batch_extend_attention_layer` for the exact global
+  geometry now succeeds on the installed Mirage checkout
+- the next Mirage-local composition,
+  `rmsnorm_layer -> linear_layer -> single_batch_extend_attention_layer`,
+  still fails after `launch-returned`
 
-Do not overgeneralize from that blocker. It is a decode specialization issue, not evidence that the
-overall integration shape is wrong.
+So the current blocker is not "raw global attention kernel is broken." It is a
+standalone semantic composition failure, which is a much better escalation
+target.
 
 ## Where Mirage Hooks Into AutoDeploy
 
@@ -360,6 +383,7 @@ For each live block you onboard, prove numerical correctness before composing it
 The safest order is:
 
 - one live block
+- one Mirage-local semantic composition
 - one live composed sublayer
 - one live full layer
 - one live decode loop
@@ -378,6 +402,19 @@ The generated:
 - `task_graph_rank0.json`
 
 are often the fastest way to confirm whether the runtime wiring is what you think it is.
+
+### Build standalone Mirage repros early
+
+If a repo-side helper still fails after the obvious launch-contract fixes, do
+not jump straight to full runtime debugging. First try to construct:
+
+- a raw Mirage-local kernel repro
+- then the smallest Mirage-local semantic composition repro
+
+The Gemma global-layer work used exactly this split:
+
+- raw `single_batch_extend_attention_layer` passes
+- standalone `rmsnorm -> linear -> single_batch_extend` fails
 
 ### Match AutoDeploy’s runtime contract exactly
 
@@ -404,6 +441,7 @@ Current known pitfalls from the Gemma path:
   site
 - compile latency can be significant enough to hide the real next failure unless you inspect worker
   processes directly
+- raw-kernel success does not guarantee the next semantic composition is valid
 
 ## Testing Ladder
 
@@ -423,27 +461,41 @@ Pass means:
 - the planned steps map to real Mirage APIs
 - task graph generation succeeds
 
-### 3. Live single-block correctness test
+### 3. Raw Mirage-local kernel repro
+
+Pass means:
+
+- the exact target kernel family works on the intended geometry
+- compile / launch / sync all complete
+
+### 4. Mirage-local semantic composition repro
+
+Pass means:
+
+- the smallest standalone composition above the raw kernel also works
+- any remaining failure is no longer hidden behind full-runtime complexity
+
+### 5. Live single-block correctness test
 
 Pass means:
 
 - Mirage block output matches torch reference closely
 - repeat launches are stable
 
-### 4. Live full-layer correctness test
+### 6. Live full-layer correctness test
 
 Pass means:
 
 - layer output matches the reference path
 - no hidden launch/reuse instability remains
 
-### 5. Decode-only forward test
+### 7. Decode-only forward test
 
 Pass means:
 
 - the runtime produces logits with the correct shape and contract
 
-### 6. Decode generation loop test
+### 8. Decode generation loop test
 
 Pass means:
 
@@ -451,7 +503,7 @@ Pass means:
 - decode begins
 - tokens are sampled without contract/rank errors
 
-### 7. End-to-end coherence test
+### 9. End-to-end coherence test
 
 Pass means:
 
