@@ -7831,6 +7831,7 @@ class _MirageGemmaLayerSinglePkExecutor:
             (self.hidden_size,), device=layer_spec.o_proj_weight.device, dtype=torch.bfloat16
         )
 
+        use_static = os.getenv("AD_MPK_SINGLE_PK_STATIC_SCHEDULE", "1") == "1"
         self.pk = create_test_persistent_kernel(
             max_seq_length=max(128, self.max_num_pages * self.page_size),
             max_num_batched_requests=1,
@@ -7838,6 +7839,7 @@ class _MirageGemmaLayerSinglePkExecutor:
             max_num_pages=self.max_num_pages,
             page_size=self.page_size,
             use_cutlass_kernel=False,
+            schedule_mode="static" if use_static else "dynamic",
         )
 
         device = layer_spec.o_proj_weight.device
@@ -10380,6 +10382,7 @@ def create_test_persistent_kernel(
     use_cutlass_kernel: bool = True,
     target_cc_override: Optional[int] = None,
     enable_profiler: bool = False,
+    schedule_mode: str = "dynamic",
 ):
     """Create a tiny Mirage ``PersistentKernel`` suitable for task-registration smoke tests."""
 
@@ -10405,24 +10408,28 @@ def create_test_persistent_kernel(
     profiler_tensor = (
         torch.zeros((1,), dtype=torch.int32, device="cuda") if enable_profiler else None
     )
-    pk = PersistentKernel(
-        mode="offline",
-        world_size=1,
-        mpi_rank=0,
-        num_workers=1,
-        num_local_schedulers=1,
-        num_remote_schedulers=0,
-        max_seq_length=max_seq_length,
-        max_num_batched_requests=max_num_batched_requests,
-        max_num_batched_tokens=max_num_batched_tokens,
-        max_num_pages=max_num_pages,
-        page_size=page_size,
-        meta_tensors=meta_tensors,
-        profiler_tensor=profiler_tensor,
-        trace_name="gemma_mpk_bridge_smoke",
-        spec_decode_config=None,
-        use_cutlass_kernel=use_cutlass_kernel,
-    )
+    is_static = schedule_mode == "static"
+    pk_kwargs: Dict[str, Any] = {
+        "mode": "offline",
+        "world_size": 1,
+        "mpi_rank": 0,
+        "num_workers": 1,
+        "num_local_schedulers": 0 if is_static else 1,
+        "num_remote_schedulers": 0,
+        "max_seq_length": max_seq_length,
+        "max_num_batched_requests": max_num_batched_requests,
+        "max_num_batched_tokens": max_num_batched_tokens,
+        "max_num_pages": max_num_pages,
+        "page_size": page_size,
+        "meta_tensors": meta_tensors,
+        "profiler_tensor": profiler_tensor,
+        "trace_name": "gemma_mpk_bridge_smoke",
+        "spec_decode_config": None,
+        "use_cutlass_kernel": use_cutlass_kernel,
+    }
+    if is_static:
+        pk_kwargs["schedule_mode"] = "static"
+    pk = PersistentKernel(**pk_kwargs)
     if target_cc_override is not None:
         pk.target_cc = target_cc_override
     return pk
