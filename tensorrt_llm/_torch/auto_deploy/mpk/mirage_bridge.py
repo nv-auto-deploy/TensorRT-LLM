@@ -1250,6 +1250,7 @@ def compile_persistent_kernel_with_patches(
     pk.init_request_func = getattr(mod, "init_request_func")
     pk.bind_tensor_func = getattr(mod, "bind_tensor_func", None)
     pk.bind_meta_func = getattr(mod, "bind_meta_func", None)
+    pk.update_dynamic_dims_func = getattr(mod, "update_dynamic_dims_func", None)
     pk.finalize_func = getattr(mod, "finalize_func")
     export_compile_artifacts(artifact_dir, output_dir, pk.mpi_rank)
 
@@ -2486,6 +2487,122 @@ def run_mirage_moe_silu_block_forward_correctness(
         "w2_mean_abs": float(moe_w2_diff.mean().item()),
         "out_max_abs": float(hidden_out_diff.max().item()),
         "out_mean_abs": float(hidden_out_diff.mean().item()),
+    }
+
+
+def run_mirage_moe_gelu_fused_block_forward_correctness(
+    *,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Run the fused Gemma-style GELU MoE block and compare against torch."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Mirage kernel correctness tests.")
+
+    torch.manual_seed(seed)
+    batch = 1
+    hidden = 2816
+    intermediate = 256
+    num_experts = 128
+    topk = 8
+
+    hidden_in = torch.randn((batch, hidden), device="cuda", dtype=torch.bfloat16) / 8
+    moe_up_weight = (
+        torch.randn((num_experts, intermediate, hidden), device="cuda", dtype=torch.bfloat16) / 16
+    )
+    moe_gate_weight = (
+        torch.randn((num_experts, intermediate, hidden), device="cuda", dtype=torch.bfloat16) / 16
+    )
+    moe_w13_weight = torch.cat((moe_up_weight, moe_gate_weight), dim=1).contiguous()
+    moe_w2_weight = (
+        torch.randn((num_experts, hidden, intermediate), device="cuda", dtype=torch.bfloat16) / 16
+    )
+
+    ref_logits = torch.randn((batch, num_experts), device="cuda", dtype=torch.float32)
+    ref_topk_values, ref_topk_indices = torch.topk(ref_logits, k=topk, dim=-1)
+    topk_weight = torch.softmax(ref_topk_values, dim=-1).contiguous()
+    routing_indices = torch.zeros((num_experts, batch), device="cuda", dtype=torch.int32)
+    selected_experts = ref_topk_indices[0].tolist()
+    for route_idx, expert_idx in enumerate(selected_experts):
+        routing_indices[expert_idx, 0] = route_idx + 1
+    routing_mask = torch.zeros((num_experts + 1,), device="cuda", dtype=torch.int32)
+    for mask_idx, expert_idx in enumerate(sorted(selected_experts)):
+        routing_mask[mask_idx] = expert_idx
+    routing_mask[num_experts] = len(selected_experts)
+
+    executor = _MirageFusedMoeExecutor(
+        capacity=batch,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_experts=num_experts,
+        topk=topk,
+    )
+    hidden_out = executor(
+        hidden_in,
+        moe_w13_weight,
+        routing_indices,
+        routing_mask,
+        moe_w2_weight,
+        topk_weight,
+    )
+    torch.cuda.synchronize()
+
+    ref_moe_act = []
+    ref_moe_act_swapped = []
+    ref_moe_w2 = []
+    ref_moe_w2_swapped = []
+    for expert_idx in selected_experts:
+        fused = hidden_in[0].float() @ moe_w13_weight[expert_idx].float().transpose(0, 1)
+        up, gate = torch.chunk(fused, 2, dim=-1)
+        act = F.gelu(gate) * up
+        swapped_act = F.gelu(up) * gate
+        ref_moe_act.append(act)
+        ref_moe_act_swapped.append(swapped_act)
+        ref_moe_w2.append(act @ moe_w2_weight[expert_idx].float().transpose(0, 1))
+        ref_moe_w2_swapped.append(swapped_act @ moe_w2_weight[expert_idx].float().transpose(0, 1))
+    ref_moe_act = torch.stack(ref_moe_act, dim=0).unsqueeze(0)
+    ref_moe_act_swapped = torch.stack(ref_moe_act_swapped, dim=0).unsqueeze(0)
+    ref_moe_w2 = torch.stack(ref_moe_w2, dim=0).unsqueeze(0)
+    ref_moe_w2_swapped = torch.stack(ref_moe_w2_swapped, dim=0).unsqueeze(0)
+    ref_hidden_out = (ref_moe_w2 * topk_weight.unsqueeze(-1)).sum(dim=1)
+    ref_hidden_out_swapped = (ref_moe_w2_swapped * topk_weight.unsqueeze(-1)).sum(dim=1)
+    sorted_experts = sorted(selected_experts)
+    expert_to_rank = {expert_idx: rank for rank, expert_idx in enumerate(selected_experts)}
+    sorted_rank_indices = [expert_to_rank[expert_idx] for expert_idx in sorted_experts]
+    ref_moe_act_sorted = ref_moe_act[:, sorted_rank_indices]
+    ref_moe_w2_sorted = ref_moe_w2[:, sorted_rank_indices]
+
+    act_diff = (executor.moe_act.float() - ref_moe_act).abs()
+    w2_diff = (executor.moe_w2_out.float() - ref_moe_w2).abs()
+    out_diff = (hidden_out.float() - ref_hidden_out).abs()
+    swapped_out_diff = (hidden_out.float() - ref_hidden_out_swapped).abs()
+    return {
+        "act_max_abs": float(act_diff.max().item()),
+        "act_mean_abs": float(act_diff.mean().item()),
+        "act_swapped_max_abs": float(
+            (executor.moe_act.float() - ref_moe_act_swapped).abs().max().item()
+        ),
+        "act_swapped_mean_abs": float(
+            (executor.moe_act.float() - ref_moe_act_swapped).abs().mean().item()
+        ),
+        "act_sorted_max_abs": float(
+            (executor.moe_act.float() - ref_moe_act_sorted).abs().max().item()
+        ),
+        "act_sorted_mean_abs": float(
+            (executor.moe_act.float() - ref_moe_act_sorted).abs().mean().item()
+        ),
+        "w2_max_abs": float(w2_diff.max().item()),
+        "w2_mean_abs": float(w2_diff.mean().item()),
+        "w2_sorted_max_abs": float(
+            (executor.moe_w2_out.float() - ref_moe_w2_sorted).abs().max().item()
+        ),
+        "w2_sorted_mean_abs": float(
+            (executor.moe_w2_out.float() - ref_moe_w2_sorted).abs().mean().item()
+        ),
+        "out_max_abs": float(out_diff.max().item()),
+        "out_mean_abs": float(out_diff.mean().item()),
+        "out_swapped_max_abs": float(swapped_out_diff.max().item()),
+        "out_swapped_mean_abs": float(swapped_out_diff.mean().item()),
     }
 
 
@@ -6362,23 +6479,27 @@ class _GemmaDenseFfnBlock:
 
     def __call__(self, *, post_attn: torch.Tensor) -> _GemmaDenseFfnBlockResult:
         batch_size, seq_len = [int(dim) for dim in post_attn.shape[:2]]
-        ffn_in = _rms_norm(post_attn, self.layer_spec.pre_feedforward_layernorm_weight).reshape(
-            batch_size * seq_len, -1
-        )
-        ffn_gate_up = self.runtime._linear(
-            name=f"layer_{self.layer_spec.layer_index}_ffn_gate_up",
-            input_tensor=ffn_in,
-            weight_tensor=self.layer_spec.ffn_gate_up_weight,
-        )
-        ffn_gate, ffn_up = torch.chunk(ffn_gate_up, 2, dim=-1)
-        ffn_act = self.runtime._gelu_mul(
-            ffn_gate.view(batch_size * seq_len, 1, -1),
-            ffn_up.view(batch_size * seq_len, 1, -1),
-        )
-        ffn_down = self.runtime._ffn_down_decode(
-            act_tensor=ffn_act.view(batch_size * seq_len, -1),
-            weight_tensor=self.layer_spec.ffn_down_weight,
-        ).view(batch_size, seq_len, -1)
+        post_attn_flat = post_attn.reshape(batch_size * seq_len, -1)
+        if self.runtime._disable_fused_dense_ffn:
+            ffn_normed = _rms_norm(post_attn_flat, self.layer_spec.pre_feedforward_layernorm_weight)
+            ffn_gate_up = self.runtime._linear(
+                name=f"layer_{self.layer_spec.layer_index}_ffn_gate_up_unfused",
+                input_tensor=ffn_normed,
+                weight_tensor=self.layer_spec.ffn_gate_up_weight,
+            )
+            ffn_gate, ffn_up = torch.chunk(ffn_gate_up, 2, dim=-1)
+            ffn_act = self.runtime._gelu_mul(ffn_gate, ffn_up)
+            ffn_down = self.runtime._ffn_down_decode(
+                act_tensor=ffn_act,
+                weight_tensor=self.layer_spec.ffn_down_weight,
+            ).view(batch_size, seq_len, -1)
+        else:
+            ffn_down = self.runtime._dense_ffn(
+                post_attn_tensor=post_attn_flat,
+                norm_weight_tensor=self.layer_spec.pre_feedforward_layernorm_weight,
+                gate_up_weight_tensor=self.layer_spec.ffn_gate_up_weight,
+                down_weight_tensor=self.layer_spec.ffn_down_weight,
+            ).view(batch_size, seq_len, -1)
         ffn_norm = _rms_norm(ffn_down, self.layer_spec.post_feedforward_layernorm_1_weight)
         return _GemmaDenseFfnBlockResult(ffn_down=ffn_down, ffn_norm=ffn_norm)
 
@@ -6440,23 +6561,24 @@ class _GemmaMoeBlock:
                     moe_in.detach().clone().view(batch_size, seq_len, -1)
                 )
 
-            moe_gate, moe_up = self.runtime._moe_w13(
-                hidden_tensor=moe_in,
-                gate_weight=self.layer_spec.moe_gate_weight,
-                up_weight=self.layer_spec.moe_up_weight,
-                routing_indices=routing_indices,
-                routing_mask=routing_mask,
-                topk=self.layer_spec.topk,
-            )
-            moe_act = self.runtime._gelu_mul(moe_gate, moe_up)
-            moe_token_out = self.runtime._moe_w2_reduce(
-                act_tensor=moe_act.contiguous(),
-                weight_tensor=self.layer_spec.moe_w2_weight,
-                routing_indices=routing_indices,
-                routing_mask=routing_mask,
-                topk_weight=topk_weight,
-                residual=torch.zeros_like(token_hidden),
-            )
+            if self.runtime._disable_fused_moe:
+                moe_token_out = self.runtime._split_moe(
+                    hidden_tensor=moe_in,
+                    w13_weight_tensor=self.layer_spec.moe_w13_stacked_weight,
+                    routing_indices=routing_indices,
+                    routing_mask=routing_mask,
+                    w2_weight_tensor=self.layer_spec.moe_w2_weight,
+                    topk_weight_tensor=topk_weight,
+                )
+            else:
+                moe_token_out = self.runtime._fused_moe(
+                    hidden_tensor=moe_in,
+                    w13_weight_tensor=self.layer_spec.moe_w13_stacked_weight,
+                    routing_indices=routing_indices,
+                    routing_mask=routing_mask,
+                    topk_weight_tensor=topk_weight,
+                    w2_weight_tensor=self.layer_spec.moe_w2_weight,
+                )
             moe_token_outputs.append(moe_token_out[0])
 
         moe_out = torch.stack(moe_token_outputs, dim=0).view(batch_size, seq_len, -1)
@@ -6575,6 +6697,7 @@ class _MirageLinearExecutor:
         self.capacity = capacity
         self.in_dim = in_dim
         self.out_dim = out_dim
+        self._last_actual_batch: Optional[int] = None
         self.input_name = f"{name}_input"
         self.weight_name = f"{name}_weight"
         self.pk = create_test_persistent_kernel(
@@ -6600,12 +6723,38 @@ class _MirageLinearExecutor:
         )
         compile_persistent_kernel_with_patches(self.pk)
 
-    def __call__(self, input_tensor: torch.Tensor, weight_tensor: torch.Tensor) -> torch.Tensor:
-        input_binding = input_tensor.contiguous().view(self.capacity, self.in_dim)
+    def _update_dynamic_batch(self, actual_batch: int) -> None:
+        """Patch the PK for a new actual batch size if it changed."""
+        if actual_batch == self._last_actual_batch:
+            return
+        if hasattr(self.pk, "update_dynamic_dims"):
+            self.pk.update_dynamic_dims(actual_batch=actual_batch)
+        self._last_actual_batch = actual_batch
+
+    def __call__(
+        self,
+        input_tensor: torch.Tensor,
+        weight_tensor: torch.Tensor,
+        actual_batch: Optional[int] = None,
+    ) -> torch.Tensor:
+        if actual_batch is None:
+            actual_batch = self.capacity
+        # Pad batch-dependent inputs to compiled capacity for dynamic_inputs binding.
+        # The PK's update_dynamic_dims handles kernel-level early-exit, but
+        # dynamic_inputs must match the compiled tensor shapes.
+        cap = self.capacity
+        if actual_batch < cap:
+            input_binding = torch.zeros(
+                (cap, self.in_dim), device=input_tensor.device, dtype=input_tensor.dtype
+            )
+            input_binding[:actual_batch] = input_tensor.contiguous().view(actual_batch, self.in_dim)
+        else:
+            input_binding = input_tensor.contiguous().view(actual_batch, self.in_dim)
         weight_binding = weight_tensor.contiguous()
-        _reset_pk_runtime_state(self.pk, active_tokens=self.capacity)
+        self._update_dynamic_batch(actual_batch)
+        _reset_pk_runtime_state(self.pk, active_tokens=actual_batch)
         _mpk_profile_executor(
-            f"linear.launch capacity={self.capacity} in_dim={self.in_dim} out_dim={self.out_dim}",
+            f"linear.launch capacity={self.capacity} actual={actual_batch} in_dim={self.in_dim} out_dim={self.out_dim}",
             lambda: self.pk.run(
                 dynamic_inputs={
                     self.input_name: input_binding,
@@ -6616,7 +6765,7 @@ class _MirageLinearExecutor:
         )
         if _mpk_sync_each_block_enabled():
             torch.cuda.synchronize()
-        return self.output
+        return self.output[:actual_batch]
 
 
 class _MirageRouterExecutor:
@@ -6625,6 +6774,7 @@ class _MirageRouterExecutor:
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.topk = topk
+        self._last_actual_batch: Optional[int] = None
         self.hidden_name = "router_hidden"
         self.weight_name = "router_weight"
         self.pk = create_test_persistent_kernel(
@@ -6666,14 +6816,40 @@ class _MirageRouterExecutor:
         )
         compile_persistent_kernel_with_patches(self.pk)
 
+    def _update_dynamic_batch(self, actual_batch: int) -> None:
+        if actual_batch == self._last_actual_batch:
+            return
+        if hasattr(self.pk, "update_dynamic_dims"):
+            self.pk.update_dynamic_dims(actual_batch=actual_batch)
+        self._last_actual_batch = actual_batch
+
     def __call__(
-        self, hidden_tensor: torch.Tensor, weight_tensor: torch.Tensor
+        self,
+        hidden_tensor: torch.Tensor,
+        weight_tensor: torch.Tensor,
+        actual_batch: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden_binding = hidden_tensor.contiguous().view(self.capacity, self.hidden_size)
+        if actual_batch is None:
+            actual_batch = self.capacity
+        # Pad batch-dependent inputs to compiled capacity for dynamic_inputs binding.
+        # The PK's update_dynamic_dims handles kernel-level early-exit, but
+        # dynamic_inputs must match the compiled tensor shapes.
+        cap = self.capacity
+        if actual_batch < cap:
+            hidden_binding = torch.zeros(
+                (cap, self.hidden_size), device=hidden_tensor.device, dtype=hidden_tensor.dtype
+            )
+            hidden_binding[:actual_batch] = hidden_tensor.contiguous().view(
+                actual_batch, self.hidden_size
+            )
+        else:
+            hidden_binding = hidden_tensor.contiguous().view(actual_batch, self.hidden_size)
         weight_binding = weight_tensor.contiguous()
-        _reset_pk_runtime_state(self.pk, active_tokens=self.capacity)
+        self._update_dynamic_batch(actual_batch)
+        _reset_pk_runtime_state(self.pk, active_tokens=actual_batch)
         _mpk_profile_executor(
-            f"router.launch capacity={self.capacity} hidden={self.hidden_size} experts={self.num_experts}",
+            f"router.launch capacity={self.capacity} actual={actual_batch} "
+            f"hidden={self.hidden_size} experts={self.num_experts}",
             lambda: self.pk.run(
                 dynamic_inputs={
                     self.hidden_name: hidden_binding,
@@ -6684,7 +6860,11 @@ class _MirageRouterExecutor:
         )
         if _mpk_sync_each_block_enabled():
             torch.cuda.synchronize()
-        return self.topk_weight, self.routing_indices, self.routing_mask
+        return (
+            self.topk_weight[:actual_batch],
+            self.routing_indices[:, :actual_batch],
+            self.routing_mask,
+        )
 
 
 class _MirageMoeW13Executor:
@@ -6702,6 +6882,7 @@ class _MirageMoeW13Executor:
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
         self.topk = topk
+        self._last_actual_batch: Optional[int] = None
         self.hidden_name = "moe_w13_hidden"
         self.gate_weight_name = "moe_w13_gate_weight"
         self.up_weight_name = "moe_w13_up_weight"
@@ -6757,6 +6938,13 @@ class _MirageMoeW13Executor:
         )
         compile_persistent_kernel_with_patches(self.pk)
 
+    def _update_dynamic_batch(self, actual_batch: int) -> None:
+        if actual_batch == self._last_actual_batch:
+            return
+        if hasattr(self.pk, "update_dynamic_dims"):
+            self.pk.update_dynamic_dims(actual_batch=actual_batch)
+        self._last_actual_batch = actual_batch
+
     def __call__(
         self,
         hidden_tensor: torch.Tensor,
@@ -6764,29 +6952,166 @@ class _MirageMoeW13Executor:
         up_weight: torch.Tensor,
         routing_indices: torch.Tensor,
         routing_mask: torch.Tensor,
+        actual_batch: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_binding = hidden_tensor.contiguous().view(self.capacity, self.hidden_size)
+        if actual_batch is None:
+            actual_batch = self.capacity
+        # Pad batch-dependent inputs to compiled capacity for dynamic_inputs binding.
+        # The PK's update_dynamic_dims handles kernel-level early-exit, but
+        # dynamic_inputs must match the compiled tensor shapes.
+        cap = self.capacity
+        if actual_batch < cap:
+            hidden_binding = torch.zeros(
+                (cap, self.hidden_size), device=hidden_tensor.device, dtype=hidden_tensor.dtype
+            )
+            hidden_binding[:actual_batch] = hidden_tensor.contiguous().view(
+                actual_batch, self.hidden_size
+            )
+            ri_padded = torch.zeros(
+                (self.num_experts, cap), device=routing_indices.device, dtype=routing_indices.dtype
+            )
+            ri_padded[:, :actual_batch] = routing_indices[:, :actual_batch]
+            routing_indices_binding = ri_padded
+        else:
+            hidden_binding = hidden_tensor.contiguous().view(actual_batch, self.hidden_size)
+            routing_indices_binding = routing_indices.contiguous()
         gate_weight_binding = gate_weight.contiguous()
         up_weight_binding = up_weight.contiguous()
-        routing_indices_binding = routing_indices.contiguous()
         routing_mask_binding = routing_mask.contiguous()
-        self.hidden.copy_(hidden_binding)
-        self.gate_weight.copy_(gate_weight_binding)
-        self.up_weight.copy_(up_weight_binding)
-        self.routing_indices.copy_(routing_indices_binding)
-        self.routing_mask.copy_(routing_mask_binding)
-        _reset_pk_runtime_state(self.pk, active_tokens=self.capacity)
+        self._update_dynamic_batch(actual_batch)
+        _reset_pk_runtime_state(self.pk, active_tokens=actual_batch)
         self.gate_out.zero_()
         self.up_out.zero_()
         _mpk_profile_executor(
             "moe_w13.launch "
-            f"capacity={self.capacity} hidden={self.hidden_size} "
+            f"capacity={self.capacity} actual={actual_batch} hidden={self.hidden_size} "
             f"intermediate={self.intermediate_size} experts={self.num_experts} topk={self.topk}",
-            lambda: self.pk(),
+            lambda: self.pk.run(
+                dynamic_inputs={
+                    self.hidden_name: hidden_binding,
+                    self.gate_weight_name: gate_weight_binding,
+                    self.up_weight_name: up_weight_binding,
+                    self.routing_indices_name: routing_indices_binding,
+                    self.routing_mask_name: routing_mask_binding,
+                },
+                reset_runtime_state=False,
+            ),
         )
         if _mpk_sync_each_block_enabled():
             torch.cuda.synchronize()
-        return self.gate_out, self.up_out
+        return self.gate_out[:actual_batch], self.up_out[:actual_batch]
+
+
+class _MirageDenseFfnExecutor:
+    def __init__(self, *, capacity: int, hidden_size: int, intermediate_size: int):
+        self.capacity = capacity
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self._last_actual_batch: Optional[int] = None
+        self.input_name = "dense_ffn_input"
+        self.norm_weight_name = "dense_ffn_norm_weight"
+        self.gate_up_weight_name = "dense_ffn_gate_up_weight"
+        self.down_weight_name = "dense_ffn_down_weight"
+        self.pk = create_test_persistent_kernel(
+            max_seq_length=max(128, capacity),
+            max_num_batched_requests=1,
+            max_num_batched_tokens=capacity,
+            max_num_pages=8,
+            page_size=64,
+            use_cutlass_kernel=False,
+        )
+        self.input = torch.empty((capacity, hidden_size), device="cuda", dtype=torch.bfloat16)
+        self.norm_weight = torch.empty((hidden_size,), device="cuda", dtype=torch.bfloat16)
+        self.gate_up_weight = torch.empty(
+            (2 * intermediate_size, hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.down_weight = torch.empty(
+            (hidden_size, intermediate_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.gate_up = torch.empty(
+            (capacity, 2 * intermediate_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.zero_residual = torch.zeros(
+            (capacity, hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.output = torch.empty((capacity, hidden_size), device="cuda", dtype=torch.bfloat16)
+        input_dt = self.pk.attach_input(self.input, name=self.input_name)
+        norm_weight_dt = self.pk.attach_input(self.norm_weight, name=self.norm_weight_name)
+        gate_up_weight_dt = self.pk.attach_input(self.gate_up_weight, name=self.gate_up_weight_name)
+        down_weight_dt = self.pk.attach_input(self.down_weight, name=self.down_weight_name)
+        gate_up_dt = self.pk.attach_input(self.gate_up, name="dense_ffn_gate_up")
+        zero_residual_dt = self.pk.attach_input(self.zero_residual, name="dense_ffn_zero_residual")
+        output_dt = self.pk.attach_input(self.output, name="dense_ffn_output")
+        self.pk.rmsnorm_linear_layer(
+            input=input_dt,
+            weight_norm=norm_weight_dt,
+            weight_linear=gate_up_weight_dt,
+            output=gate_up_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        self.pk.gelu_mul_linear_with_residual_layer(
+            input=gate_up_dt,
+            weight=down_weight_dt,
+            residual=zero_residual_dt,
+            output=output_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        compile_persistent_kernel_with_patches(self.pk)
+
+    def _update_dynamic_batch(self, actual_batch: int) -> None:
+        if actual_batch == self._last_actual_batch:
+            return
+        if hasattr(self.pk, "update_dynamic_dims"):
+            self.pk.update_dynamic_dims(actual_batch=actual_batch)
+        self._last_actual_batch = actual_batch
+
+    def __call__(
+        self,
+        input_tensor: torch.Tensor,
+        norm_weight_tensor: torch.Tensor,
+        gate_up_weight_tensor: torch.Tensor,
+        down_weight_tensor: torch.Tensor,
+        actual_batch: Optional[int] = None,
+    ) -> torch.Tensor:
+        if actual_batch is None:
+            actual_batch = self.capacity
+        # Pad batch-dependent inputs to compiled capacity for dynamic_inputs binding.
+        # The PK's update_dynamic_dims handles kernel-level early-exit, but
+        # dynamic_inputs must match the compiled tensor shapes.
+        cap = self.capacity
+        if actual_batch < cap:
+            input_binding = torch.zeros(
+                (cap, self.hidden_size), device=input_tensor.device, dtype=input_tensor.dtype
+            )
+            input_binding[:actual_batch] = input_tensor.contiguous().view(
+                actual_batch, self.hidden_size
+            )
+        else:
+            input_binding = input_tensor.contiguous().view(actual_batch, self.hidden_size)
+        norm_weight_binding = norm_weight_tensor.contiguous().view(self.hidden_size)
+        gate_up_weight_binding = gate_up_weight_tensor.contiguous()
+        down_weight_binding = down_weight_tensor.contiguous()
+        self._update_dynamic_batch(actual_batch)
+        _reset_pk_runtime_state(self.pk, active_tokens=actual_batch)
+        _mpk_profile_executor(
+            "dense_ffn.launch "
+            f"capacity={self.capacity} actual={actual_batch} "
+            f"hidden={self.hidden_size} intermediate={self.intermediate_size}",
+            lambda: self.pk.run(
+                dynamic_inputs={
+                    self.input_name: input_binding,
+                    self.norm_weight_name: norm_weight_binding,
+                    self.gate_up_weight_name: gate_up_weight_binding,
+                    self.down_weight_name: down_weight_binding,
+                },
+                reset_runtime_state=False,
+            ),
+        )
+        if _mpk_sync_each_block_enabled():
+            torch.cuda.synchronize()
+        return self.output[:actual_batch]
 
 
 class _MirageMoeW2ReduceExecutor:
@@ -6804,6 +7129,7 @@ class _MirageMoeW2ReduceExecutor:
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
+        self._last_actual_batch: Optional[int] = None
         self.act_name = "moe_w2_act"
         self.weight_name = "moe_w2_weight"
         self.routing_indices_name = "moe_w2_indices"
@@ -6863,6 +7189,13 @@ class _MirageMoeW2ReduceExecutor:
         )
         compile_persistent_kernel_with_patches(self.pk)
 
+    def _update_dynamic_batch(self, actual_batch: int) -> None:
+        if actual_batch == self._last_actual_batch:
+            return
+        if hasattr(self.pk, "update_dynamic_dims"):
+            self.pk.update_dynamic_dims(actual_batch=actual_batch)
+        self._last_actual_batch = actual_batch
+
     def __call__(
         self,
         act_tensor: torch.Tensor,
@@ -6871,19 +7204,51 @@ class _MirageMoeW2ReduceExecutor:
         routing_mask: torch.Tensor,
         topk_weight: torch.Tensor,
         residual: torch.Tensor,
+        actual_batch: Optional[int] = None,
     ) -> torch.Tensor:
-        act_binding = act_tensor.contiguous()
+        if actual_batch is None:
+            actual_batch = self.capacity
+        # Pad batch-dependent inputs to compiled capacity for dynamic_inputs binding.
+        # The PK's update_dynamic_dims handles kernel-level early-exit, but
+        # dynamic_inputs must match the compiled tensor shapes.
+        cap = self.capacity
+        if actual_batch < cap:
+            act_binding = torch.zeros(
+                (cap, self.topk, self.intermediate_size),
+                device=act_tensor.device,
+                dtype=act_tensor.dtype,
+            )
+            act_binding[:actual_batch] = act_tensor[:actual_batch]
+            ri_padded = torch.zeros(
+                (self.num_experts, cap), device=routing_indices.device, dtype=routing_indices.dtype
+            )
+            ri_padded[:, :actual_batch] = routing_indices[:, :actual_batch]
+            routing_indices_binding = ri_padded
+            tw_padded = torch.zeros(
+                (cap, self.topk), device=topk_weight.device, dtype=topk_weight.dtype
+            )
+            tw_padded[:actual_batch] = topk_weight[:actual_batch]
+            topk_weight_binding = tw_padded
+            residual_binding = torch.zeros(
+                (cap, self.hidden_size), device=residual.device, dtype=residual.dtype
+            )
+            residual_binding[:actual_batch] = residual.contiguous().view(
+                actual_batch, self.hidden_size
+            )
+        else:
+            act_binding = act_tensor.contiguous()
+            routing_indices_binding = routing_indices.contiguous()
+            topk_weight_binding = topk_weight.contiguous()
+            residual_binding = residual.contiguous().view(actual_batch, self.hidden_size)
         weight_binding = weight_tensor.contiguous()
-        routing_indices_binding = routing_indices.contiguous()
         routing_mask_binding = routing_mask.contiguous()
-        topk_weight_binding = topk_weight.contiguous()
-        residual_binding = residual.contiguous().view(self.capacity, self.hidden_size)
-        _reset_pk_runtime_state(self.pk, active_tokens=self.capacity)
+        self._update_dynamic_batch(actual_batch)
+        _reset_pk_runtime_state(self.pk, active_tokens=actual_batch)
         self.w2_out.zero_()
         self.output.zero_()
         _mpk_profile_executor(
             "moe_w2.launch "
-            f"capacity={self.capacity} topk={self.topk} hidden={self.hidden_size} "
+            f"capacity={self.capacity} actual={actual_batch} topk={self.topk} hidden={self.hidden_size} "
             f"intermediate={self.intermediate_size} experts={self.num_experts}",
             lambda: self.pk.run(
                 dynamic_inputs={
@@ -6899,7 +7264,352 @@ class _MirageMoeW2ReduceExecutor:
         )
         if _mpk_sync_each_block_enabled():
             torch.cuda.synchronize()
-        return self.output
+        return self.output[:actual_batch]
+
+
+class _MirageSplitMoeExecutor:
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        topk: int,
+    ):
+        self.capacity = capacity
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+        self.topk = topk
+        self._last_actual_batch: Optional[int] = None
+        self.hidden_name = "split_moe_hidden"
+        self.w13_weight_name = "split_moe_w13_weight"
+        self.routing_indices_name = "split_moe_indices"
+        self.routing_mask_name = "split_moe_mask"
+        self.w2_weight_name = "split_moe_w2_weight"
+        self.topk_weight_name = "split_moe_topk_weight"
+        self.residual_name = "split_moe_residual"
+        self.pk = create_test_persistent_kernel(
+            max_seq_length=max(128, capacity),
+            max_num_batched_requests=1,
+            max_num_batched_tokens=capacity,
+            max_num_pages=8,
+            page_size=64,
+            use_cutlass_kernel=False,
+        )
+        self.hidden = torch.empty((capacity, hidden_size), device="cuda", dtype=torch.bfloat16)
+        self.w13_weight = torch.empty(
+            (num_experts, 2 * intermediate_size, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        self.routing_indices = torch.empty(
+            (num_experts, capacity), device="cuda", dtype=torch.int32
+        )
+        self.routing_mask = torch.empty((num_experts + 1,), device="cuda", dtype=torch.int32)
+        self.w2_weight = torch.empty(
+            (num_experts, hidden_size, intermediate_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.topk_weight = torch.empty((capacity, topk), device="cuda", dtype=torch.float32)
+        self.zero_residual = torch.zeros(
+            (capacity, hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.moe_w13_out = torch.empty(
+            (capacity, topk, 2 * intermediate_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.moe_act = torch.empty(
+            (capacity, topk, intermediate_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.moe_w2_out = torch.zeros(
+            (capacity, topk, hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.output = torch.zeros((capacity, hidden_size), device="cuda", dtype=torch.bfloat16)
+        hidden_dt = self.pk.attach_input(self.hidden, name=self.hidden_name)
+        w13_weight_dt = self.pk.attach_input(self.w13_weight, name=self.w13_weight_name)
+        routing_indices_dt = self.pk.attach_input(
+            self.routing_indices, name=self.routing_indices_name
+        )
+        routing_mask_dt = self.pk.attach_input(self.routing_mask, name=self.routing_mask_name)
+        w2_weight_dt = self.pk.attach_input(self.w2_weight, name=self.w2_weight_name)
+        topk_weight_dt = self.pk.attach_input(self.topk_weight, name=self.topk_weight_name)
+        residual_dt = self.pk.attach_input(self.zero_residual, name=self.residual_name)
+        moe_w13_out_dt = self.pk.attach_input(self.moe_w13_out, name="split_moe_w13_out")
+        moe_act_dt = self.pk.attach_input(self.moe_act, name="split_moe_act")
+        moe_w2_out_dt = self.pk.attach_input(self.moe_w2_out, name="split_moe_w2_out")
+        output_dt = self.pk.attach_input(self.output, name="split_moe_output")
+        self.pk.moe_w13_linear_layer(
+            input=hidden_dt,
+            weight=w13_weight_dt,
+            moe_routing_indices=routing_indices_dt,
+            moe_mask=routing_mask_dt,
+            output=moe_w13_out_dt,
+            grid_dim=_moe_expert_grid_dim(self.pk, w13_linear=True),
+            block_dim=(128, 1, 1),
+        )
+        self.pk.moe_gelu_mul_swapped_layer(
+            input=moe_w13_out_dt,
+            output=moe_act_dt,
+            grid_dim=(capacity, topk, 1),
+            block_dim=(128, 1, 1),
+        )
+        self.pk.moe_w2_linear_layer(
+            input=moe_act_dt,
+            weight=w2_weight_dt,
+            moe_routing_indices=routing_indices_dt,
+            moe_mask=routing_mask_dt,
+            output=moe_w2_out_dt,
+            grid_dim=_moe_expert_grid_dim(self.pk, w13_linear=False),
+            block_dim=(128, 1, 1),
+        )
+        self.pk.moe_mul_sum_add_layer(
+            input=moe_w2_out_dt,
+            weight=topk_weight_dt,
+            residual=residual_dt,
+            output=output_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        compile_persistent_kernel_with_patches(self.pk)
+
+    def _update_dynamic_batch(self, actual_batch: int) -> None:
+        if actual_batch == self._last_actual_batch:
+            return
+        if hasattr(self.pk, "update_dynamic_dims"):
+            self.pk.update_dynamic_dims(actual_batch=actual_batch)
+        self._last_actual_batch = actual_batch
+
+    def __call__(
+        self,
+        hidden_tensor: torch.Tensor,
+        w13_weight_tensor: torch.Tensor,
+        routing_indices: torch.Tensor,
+        routing_mask: torch.Tensor,
+        w2_weight_tensor: torch.Tensor,
+        topk_weight_tensor: torch.Tensor,
+        actual_batch: Optional[int] = None,
+    ) -> torch.Tensor:
+        if actual_batch is None:
+            actual_batch = self.capacity
+        # Pad batch-dependent inputs to compiled capacity for dynamic_inputs binding.
+        # The PK's update_dynamic_dims handles kernel-level early-exit, but
+        # dynamic_inputs must match the compiled tensor shapes.
+        cap = self.capacity
+        if actual_batch < cap:
+            hidden_binding = torch.zeros(
+                (cap, self.hidden_size), device=hidden_tensor.device, dtype=hidden_tensor.dtype
+            )
+            hidden_binding[:actual_batch] = hidden_tensor.contiguous().view(
+                actual_batch, self.hidden_size
+            )
+            ri_padded = torch.zeros(
+                (self.num_experts, cap), device=routing_indices.device, dtype=routing_indices.dtype
+            )
+            ri_padded[:, :actual_batch] = routing_indices[:, :actual_batch]
+            routing_indices_binding = ri_padded
+            tw_padded = torch.zeros(
+                (cap, self.topk), device=topk_weight_tensor.device, dtype=topk_weight_tensor.dtype
+            )
+            tw_padded[:actual_batch] = topk_weight_tensor[:actual_batch]
+            topk_weight_binding = tw_padded
+        else:
+            hidden_binding = hidden_tensor.contiguous().view(actual_batch, self.hidden_size)
+            routing_indices_binding = routing_indices.contiguous()
+            topk_weight_binding = topk_weight_tensor.contiguous()
+        w13_weight_binding = w13_weight_tensor.contiguous()
+        routing_mask_binding = routing_mask.contiguous()
+        w2_weight_binding = w2_weight_tensor.contiguous()
+        self._update_dynamic_batch(actual_batch)
+        _reset_pk_runtime_state(self.pk, active_tokens=actual_batch)
+        self.moe_w13_out.zero_()
+        self.moe_w2_out.zero_()
+        self.output.zero_()
+        _mpk_profile_executor(
+            "split_moe.launch "
+            f"capacity={self.capacity} actual={actual_batch} hidden={self.hidden_size} "
+            f"intermediate={self.intermediate_size} experts={self.num_experts} topk={self.topk}",
+            lambda: self.pk.run(
+                dynamic_inputs={
+                    self.hidden_name: hidden_binding,
+                    self.w13_weight_name: w13_weight_binding,
+                    self.routing_indices_name: routing_indices_binding,
+                    self.routing_mask_name: routing_mask_binding,
+                    self.w2_weight_name: w2_weight_binding,
+                    self.topk_weight_name: topk_weight_binding,
+                },
+                reset_runtime_state=False,
+            ),
+        )
+        if _mpk_sync_each_block_enabled():
+            torch.cuda.synchronize()
+        return self.output[:actual_batch]
+
+
+class _MirageFusedMoeExecutor:
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        topk: int,
+    ):
+        self.capacity = capacity
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+        self.topk = topk
+        self._last_actual_batch: Optional[int] = None
+        self.hidden_name = "fused_moe_hidden"
+        self.w13_weight_name = "fused_moe_w13_weight"
+        self.routing_indices_name = "fused_moe_indices"
+        self.routing_mask_name = "fused_moe_mask"
+        self.w2_weight_name = "fused_moe_w2_weight"
+        self.topk_weight_name = "fused_moe_topk_weight"
+        self.residual_name = "fused_moe_residual"
+        self.pk = create_test_persistent_kernel(
+            max_seq_length=max(128, capacity),
+            max_num_batched_requests=1,
+            max_num_batched_tokens=capacity,
+            max_num_pages=8,
+            page_size=64,
+            use_cutlass_kernel=False,
+        )
+        self.hidden = torch.empty((capacity, hidden_size), device="cuda", dtype=torch.bfloat16)
+        self.w13_weight = torch.empty(
+            (num_experts, 2 * intermediate_size, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        self.routing_indices = torch.empty(
+            (num_experts, capacity), device="cuda", dtype=torch.int32
+        )
+        self.routing_mask = torch.empty((num_experts + 1,), device="cuda", dtype=torch.int32)
+        self.w2_weight = torch.empty(
+            (num_experts, hidden_size, intermediate_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.topk_weight = torch.empty((capacity, topk), device="cuda", dtype=torch.float32)
+        self.zero_residual = torch.zeros(
+            (capacity, hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.moe_act = torch.empty(
+            (capacity, topk, intermediate_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.moe_w2_out = torch.zeros(
+            (capacity, topk, hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.output = torch.zeros((capacity, hidden_size), device="cuda", dtype=torch.bfloat16)
+        hidden_dt = self.pk.attach_input(self.hidden, name=self.hidden_name)
+        w13_weight_dt = self.pk.attach_input(self.w13_weight, name=self.w13_weight_name)
+        routing_indices_dt = self.pk.attach_input(
+            self.routing_indices, name=self.routing_indices_name
+        )
+        routing_mask_dt = self.pk.attach_input(self.routing_mask, name=self.routing_mask_name)
+        w2_weight_dt = self.pk.attach_input(self.w2_weight, name=self.w2_weight_name)
+        topk_weight_dt = self.pk.attach_input(self.topk_weight, name=self.topk_weight_name)
+        residual_dt = self.pk.attach_input(self.zero_residual, name=self.residual_name)
+        moe_act_dt = self.pk.attach_input(self.moe_act, name="fused_moe_act")
+        moe_w2_out_dt = self.pk.attach_input(self.moe_w2_out, name="fused_moe_w2_out")
+        output_dt = self.pk.attach_input(self.output, name="fused_moe_output")
+        self.pk.moe_w13_gelu_mul_layer(
+            input=hidden_dt,
+            weight=w13_weight_dt,
+            moe_routing_indices=routing_indices_dt,
+            moe_mask=routing_mask_dt,
+            output=moe_act_dt,
+            grid_dim=_moe_expert_grid_dim(self.pk, w13_linear=True),
+            block_dim=(128, 1, 1),
+        )
+        self.pk.moe_w2_linear_layer(
+            input=moe_act_dt,
+            weight=w2_weight_dt,
+            moe_routing_indices=routing_indices_dt,
+            moe_mask=routing_mask_dt,
+            output=moe_w2_out_dt,
+            grid_dim=_moe_expert_grid_dim(self.pk, w13_linear=False),
+            block_dim=(128, 1, 1),
+        )
+        self.pk.moe_mul_sum_add_layer(
+            input=moe_w2_out_dt,
+            weight=topk_weight_dt,
+            residual=residual_dt,
+            output=output_dt,
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        compile_persistent_kernel_with_patches(self.pk)
+
+    def _update_dynamic_batch(self, actual_batch: int) -> None:
+        if actual_batch == self._last_actual_batch:
+            return
+        if hasattr(self.pk, "update_dynamic_dims"):
+            self.pk.update_dynamic_dims(actual_batch=actual_batch)
+        self._last_actual_batch = actual_batch
+
+    def __call__(
+        self,
+        hidden_tensor: torch.Tensor,
+        w13_weight_tensor: torch.Tensor,
+        routing_indices: torch.Tensor,
+        routing_mask: torch.Tensor,
+        w2_weight_tensor: torch.Tensor,
+        topk_weight_tensor: torch.Tensor,
+        actual_batch: Optional[int] = None,
+    ) -> torch.Tensor:
+        if actual_batch is None:
+            actual_batch = self.capacity
+        # Pad batch-dependent inputs to compiled capacity for dynamic_inputs binding.
+        # The PK's update_dynamic_dims handles kernel-level early-exit, but
+        # dynamic_inputs must match the compiled tensor shapes.
+        cap = self.capacity
+        if actual_batch < cap:
+            hidden_binding = torch.zeros(
+                (cap, self.hidden_size), device=hidden_tensor.device, dtype=hidden_tensor.dtype
+            )
+            hidden_binding[:actual_batch] = hidden_tensor.contiguous().view(
+                actual_batch, self.hidden_size
+            )
+            ri_padded = torch.zeros(
+                (self.num_experts, cap), device=routing_indices.device, dtype=routing_indices.dtype
+            )
+            ri_padded[:, :actual_batch] = routing_indices[:, :actual_batch]
+            routing_indices_binding = ri_padded
+            tw_padded = torch.zeros(
+                (cap, self.topk), device=topk_weight_tensor.device, dtype=topk_weight_tensor.dtype
+            )
+            tw_padded[:actual_batch] = topk_weight_tensor[:actual_batch]
+            topk_weight_binding = tw_padded
+        else:
+            hidden_binding = hidden_tensor.contiguous().view(actual_batch, self.hidden_size)
+            routing_indices_binding = routing_indices.contiguous()
+            topk_weight_binding = topk_weight_tensor.contiguous()
+        w13_weight_binding = w13_weight_tensor.contiguous()
+        routing_mask_binding = routing_mask.contiguous()
+        w2_weight_binding = w2_weight_tensor.contiguous()
+        self._update_dynamic_batch(actual_batch)
+        _reset_pk_runtime_state(self.pk, active_tokens=actual_batch)
+        self.moe_w2_out.zero_()
+        self.output.zero_()
+        _mpk_profile_executor(
+            "fused_moe.launch "
+            f"capacity={self.capacity} actual={actual_batch} hidden={self.hidden_size} "
+            f"intermediate={self.intermediate_size} experts={self.num_experts} topk={self.topk}",
+            lambda: self.pk.run(
+                dynamic_inputs={
+                    self.hidden_name: hidden_binding,
+                    self.w13_weight_name: w13_weight_binding,
+                    self.routing_indices_name: routing_indices_binding,
+                    self.routing_mask_name: routing_mask_binding,
+                    self.w2_weight_name: w2_weight_binding,
+                    self.topk_weight_name: topk_weight_binding,
+                },
+                reset_runtime_state=False,
+            ),
+        )
+        if _mpk_sync_each_block_enabled():
+            torch.cuda.synchronize()
+        return self.output[:actual_batch]
 
 
 class _MirageGeluMulExecutor:
@@ -8317,14 +9027,30 @@ def run_mirage_gemma_global_attention_single_pk_smoke(
 
 
 class _GemmaMirageRuntime:
-    def __init__(self, source_model: GraphModule, translation_plan: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        source_model: GraphModule,
+        translation_plan: Dict[str, Any],
+        max_batch_size: Optional[int] = None,
+        max_seq_length: Optional[int] = None,
+    ) -> None:
         self.source_model = source_model
         self.translation_plan = translation_plan
+        self._max_batch_size = max_batch_size
+        self._max_seq_length = max_seq_length
         self.layer_specs = _build_gemma_runtime_specs(source_model, translation_plan)
         self.layer_blocks = [
             _GemmaDecodeLayerBlock(self, layer_spec) for layer_spec in self.layer_specs
         ]
         self._force_torch_executors = os.getenv("AD_MPK_FORCE_TORCH_EXECUTORS", "0") == "1"
+        self._disable_fused_dense_ffn = os.getenv("AD_MPK_DISABLE_FUSED_DENSE_FFN", "0") == "1"
+        self._disable_fused_moe = os.getenv("AD_MPK_DISABLE_FUSED_MOE", "0") == "1"
+        if self._max_batch_size is not None and self._disable_fused_dense_ffn:
+            print(
+                "WARNING: AD_MPK_DISABLE_FUSED_DENSE_FFN=1 with max_batch_size set. "
+                "The unfused FFN path uses _gelu_mul which recompiles per shape. "
+                "Use the fused dense FFN path (default) for one-time compilation."
+            )
         node_map = {node.name: node for node in source_model.graph.nodes}
 
         embed_node = node_map["model_language_model_embed_tokens_embedding"]
@@ -8365,14 +9091,152 @@ class _GemmaMirageRuntime:
             )
         except AttributeError:
             self.global_sin = self.local_sin
-        self._linear_cache: Dict[tuple[int, int, int, str], _MirageLinearExecutor] = {}
+        self._linear_cache: Dict[tuple[int, int, int], _MirageLinearExecutor] = {}
+        self._dense_ffn_cache: Dict[tuple[int, int, int], _MirageDenseFfnExecutor] = {}
         self._router_cache: Dict[tuple[int, int, int, int], _MirageRouterExecutor] = {}
         self._moe_w13_cache: Dict[tuple[int, int, int, int, int], _MirageMoeW13Executor] = {}
         self._moe_w2_cache: Dict[tuple[int, int, int, int, int], _MirageMoeW2ReduceExecutor] = {}
+        self._split_moe_cache: Dict[tuple[int, int, int, int, int], _MirageSplitMoeExecutor] = {}
+        self._fused_moe_cache: Dict[tuple[int, int, int, int, int], _MirageFusedMoeExecutor] = {}
         self._gelu_cache: Dict[tuple[int, ...], _MirageGeluMulExecutor] = {}
         self._matmul_cache: Dict[tuple[int, int, int], _MirageMatmulExecutor] = {}
         self._single_pk_identity_cache: Dict[int, torch.Tensor] = {}
         self._single_pk_layer_cache: Dict[int, _MirageGemmaLayerSinglePkExecutor] = {}
+
+    def prewarm_decode_executors(self) -> None:
+        if self._force_torch_executors:
+            _mpk_debug("skip prewarm because torch executor mode is enabled")
+            return
+
+        prewarm_start = time.perf_counter()
+        # When _max_batch_size is set, cache keys don't include capacity,
+        # so prewarm keys track (dims_only) to avoid duplicate compiles.
+        warmed_linear_keys: set[tuple] = set()
+        warmed_dense_ffn_keys: set[tuple] = set()
+        warmed_router_keys: set[tuple] = set()
+        warmed_split_moe_keys: set[tuple] = set()
+        warmed_fused_moe_keys: set[tuple] = set()
+
+        for layer_spec in self.layer_specs:
+            device = layer_spec.qkv_weight.device
+            hidden_size = int(layer_spec.input_layernorm_weight.numel())
+            qkv_out_dim = int(layer_spec.qkv_weight.shape[0])
+            o_proj_in_dim = int(layer_spec.o_proj_weight.shape[1])
+            o_proj_out_dim = int(layer_spec.o_proj_weight.shape[0])
+            dense_intermediate = int(layer_spec.ffn_down_weight.shape[1])
+            num_experts = int(layer_spec.moe_w2_weight.shape[0])
+            moe_intermediate = int(layer_spec.moe_w2_weight.shape[2])
+            topk = int(layer_spec.topk)
+
+            hidden = torch.zeros((1, hidden_size), device=device, dtype=torch.bfloat16)
+            attn_out_hidden = torch.zeros((1, o_proj_in_dim), device=device, dtype=torch.bfloat16)
+            router_hidden = torch.zeros((1, hidden_size), device=device, dtype=torch.bfloat16)
+            router_hidden[0, 0] = 1.0
+            moe_hidden = torch.zeros((1, hidden_size), device=device, dtype=torch.bfloat16)
+            moe_hidden[0, 0] = 1.0
+
+            # Key structure: (dims_only) when dynamic, (capacity, dims) when legacy
+            if self._max_batch_size is not None:
+                linear_key_qkv = (hidden_size, qkv_out_dim)
+                linear_key_oproj = (o_proj_in_dim, o_proj_out_dim)
+                dense_key = (hidden_size, dense_intermediate)
+                router_key = (hidden_size, num_experts, topk)
+                moe_key = (hidden_size, moe_intermediate, num_experts, topk)
+            else:
+                linear_key_qkv = (1, hidden_size, qkv_out_dim)
+                linear_key_oproj = (1, o_proj_in_dim, o_proj_out_dim)
+                dense_key = (1, hidden_size, dense_intermediate)
+                router_key = (1, hidden_size, num_experts, topk)
+                moe_key = (1, hidden_size, moe_intermediate, num_experts, topk)
+
+            if linear_key_qkv not in warmed_linear_keys:
+                self._linear(
+                    name=f"prewarm_layer_{layer_spec.layer_index}_qkv",
+                    input_tensor=hidden,
+                    weight_tensor=layer_spec.qkv_weight,
+                )
+                warmed_linear_keys.add(linear_key_qkv)
+
+            if linear_key_oproj not in warmed_linear_keys:
+                self._linear(
+                    name=f"prewarm_layer_{layer_spec.layer_index}_o_proj",
+                    input_tensor=attn_out_hidden,
+                    weight_tensor=layer_spec.o_proj_weight,
+                )
+                warmed_linear_keys.add(linear_key_oproj)
+
+            if dense_key not in warmed_dense_ffn_keys:
+                if self._disable_fused_dense_ffn:
+                    ffn_normed = _rms_norm(hidden, layer_spec.pre_feedforward_layernorm_weight)
+                    gate_up = self._linear(
+                        name=f"prewarm_layer_{layer_spec.layer_index}_ffn_gate_up_unfused",
+                        input_tensor=ffn_normed,
+                        weight_tensor=layer_spec.ffn_gate_up_weight,
+                    )
+                    gate, up = torch.chunk(gate_up, 2, dim=-1)
+                    act = self._gelu_mul(gate, up)
+                    self._ffn_down_decode(
+                        act_tensor=act,
+                        weight_tensor=layer_spec.ffn_down_weight,
+                    )
+                else:
+                    self._dense_ffn(
+                        post_attn_tensor=hidden,
+                        norm_weight_tensor=layer_spec.pre_feedforward_layernorm_weight,
+                        gate_up_weight_tensor=layer_spec.ffn_gate_up_weight,
+                        down_weight_tensor=layer_spec.ffn_down_weight,
+                    )
+                warmed_dense_ffn_keys.add(dense_key)
+
+            topk_weight = routing_indices = routing_mask = None
+            if router_key not in warmed_router_keys:
+                topk_weight, routing_indices, routing_mask = self._router(
+                    hidden_tensor=router_hidden,
+                    weight_tensor=layer_spec.router_proj_weight,
+                    topk=topk,
+                )
+                warmed_router_keys.add(router_key)
+
+            if self._disable_fused_moe:
+                already_warmed = moe_key in warmed_split_moe_keys
+            else:
+                already_warmed = moe_key in warmed_fused_moe_keys
+            if not already_warmed:
+                if topk_weight is None or routing_indices is None or routing_mask is None:
+                    topk_weight, routing_indices, routing_mask = self._router(
+                        hidden_tensor=router_hidden,
+                        weight_tensor=layer_spec.router_proj_weight,
+                        topk=topk,
+                    )
+                if self._disable_fused_moe:
+                    self._split_moe(
+                        hidden_tensor=moe_hidden,
+                        w13_weight_tensor=layer_spec.moe_w13_stacked_weight,
+                        routing_indices=routing_indices,
+                        routing_mask=routing_mask,
+                        w2_weight_tensor=layer_spec.moe_w2_weight,
+                        topk_weight_tensor=topk_weight,
+                    )
+                    warmed_split_moe_keys.add(moe_key)
+                else:
+                    self._fused_moe(
+                        hidden_tensor=moe_hidden,
+                        w13_weight_tensor=layer_spec.moe_w13_stacked_weight,
+                        routing_indices=routing_indices,
+                        routing_mask=routing_mask,
+                        w2_weight_tensor=layer_spec.moe_w2_weight,
+                        topk_weight_tensor=topk_weight,
+                    )
+                    warmed_fused_moe_keys.add(moe_key)
+
+        torch.cuda.synchronize()
+        _mpk_debug(
+            "prewarm decode executors finished "
+            f"linear={len(warmed_linear_keys)} dense_ffn={len(warmed_dense_ffn_keys)} "
+            f"router={len(warmed_router_keys)} split_moe={len(warmed_split_moe_keys)} "
+            f"fused_moe={len(warmed_fused_moe_keys)} "
+            f"elapsed_s={time.perf_counter() - prewarm_start:.3f}"
+        )
 
     def _single_pk_identity(self, hidden_size: int, device: torch.device) -> torch.Tensor:
         identity = self._single_pk_identity_cache.get(hidden_size)
@@ -8413,11 +9277,23 @@ class _GemmaMirageRuntime:
         min_capacity = (
             256 if (layer_spec.qkv_shared_kv and int(layer_spec.head_dim) == 512) else 128
         )
-        requested_capacity = max(
-            min_capacity,
-            ((int(total_tokens) + self._single_pk_page_size() - 1) // self._single_pk_page_size())
-            * self._single_pk_page_size(),
-        )
+        # When max_seq_length is configured, compile at the full envelope to avoid
+        # recompilation as sequences grow during serving.
+        if self._max_seq_length is not None:
+            page_size = self._single_pk_page_size()
+            requested_capacity = max(
+                min_capacity,
+                ((self._max_seq_length + page_size - 1) // page_size) * page_size,
+            )
+        else:
+            requested_capacity = max(
+                min_capacity,
+                (
+                    (int(total_tokens) + self._single_pk_page_size() - 1)
+                    // self._single_pk_page_size()
+                )
+                * self._single_pk_page_size(),
+            )
         _mpk_debug(
             "single-pk build-start "
             f"layer={layer_spec.layer_index} total_tokens={int(total_tokens)} "
@@ -8479,11 +9355,52 @@ class _GemmaMirageRuntime:
         if self._force_torch_executors:
             return (input_tensor.float() @ weight_tensor.float().transpose(0, 1)).to(torch.bfloat16)
 
-        capacity = int(input_tensor.shape[0])
-        if capacity > _MIRAGE_LINEAR_MAX_CAPACITY:
+        actual_batch = int(input_tensor.shape[0])
+        in_dim = int(weight_tensor.shape[1])
+        out_dim = int(weight_tensor.shape[0])
+
+        if self._max_batch_size is not None:
+            # Dynamic batch path: one executor per (in_dim, out_dim), compiled at max_batch
+            max_cap = self._max_batch_size
+            if actual_batch > max_cap:
+                outputs = []
+                for start in range(0, actual_batch, max_cap):
+                    end = min(start + max_cap, actual_batch)
+                    outputs.append(
+                        self._linear(
+                            name=f"{name}_chunk_{start}_{end}",
+                            input_tensor=input_tensor[start:end].contiguous(),
+                            weight_tensor=weight_tensor,
+                        )
+                    )
+                return torch.cat(outputs, dim=0)
+
+            key = (in_dim, out_dim)
+            executor = self._linear_cache.get(key)
+            if executor is None:
+                _mpk_debug(
+                    f"compile linear executor max_batch={max_cap} in_dim={in_dim} out_dim={out_dim} name={name}"
+                )
+                build_start = time.perf_counter()
+                executor = _MirageLinearExecutor(
+                    capacity=max_cap,
+                    in_dim=in_dim,
+                    out_dim=out_dim,
+                    name=f"linear_{max_cap}_{in_dim}_{out_dim}",
+                )
+                self._linear_cache[key] = executor
+                _mpk_profile(
+                    "build linear executor "
+                    f"max_batch={max_cap} in_dim={in_dim} out_dim={out_dim} "
+                    f"elapsed_s={time.perf_counter() - build_start:.6f}"
+                )
+            return executor(input_tensor, weight_tensor, actual_batch=actual_batch)
+
+        # Legacy path: one executor per exact (capacity, in_dim, out_dim)
+        if actual_batch > _MIRAGE_LINEAR_MAX_CAPACITY:
             outputs = []
-            for start in range(0, capacity, _MIRAGE_LINEAR_MAX_CAPACITY):
-                end = min(start + _MIRAGE_LINEAR_MAX_CAPACITY, capacity)
+            for start in range(0, actual_batch, _MIRAGE_LINEAR_MAX_CAPACITY):
+                end = min(start + actual_batch, _MIRAGE_LINEAR_MAX_CAPACITY)
                 outputs.append(
                     self._linear(
                         name=f"{name}_chunk_{start}_{end}",
@@ -8493,25 +9410,23 @@ class _GemmaMirageRuntime:
                 )
             return torch.cat(outputs, dim=0)
 
-        in_dim = int(weight_tensor.shape[1])
-        out_dim = int(weight_tensor.shape[0])
-        key = (capacity, in_dim, out_dim)
+        key = (actual_batch, in_dim, out_dim)
         executor = self._linear_cache.get(key)
         if executor is None:
             _mpk_debug(
-                f"compile linear executor capacity={capacity} in_dim={in_dim} out_dim={out_dim} name={name}"
+                f"compile linear executor capacity={actual_batch} in_dim={in_dim} out_dim={out_dim} name={name}"
             )
             build_start = time.perf_counter()
             executor = _MirageLinearExecutor(
-                capacity=capacity,
+                capacity=actual_batch,
                 in_dim=in_dim,
                 out_dim=out_dim,
-                name=f"linear_{capacity}_{in_dim}_{out_dim}",
+                name=f"linear_{actual_batch}_{in_dim}_{out_dim}",
             )
             self._linear_cache[key] = executor
             _mpk_profile(
                 "build linear executor "
-                f"capacity={capacity} in_dim={in_dim} out_dim={out_dim} "
+                f"capacity={actual_batch} in_dim={in_dim} out_dim={out_dim} "
                 f"elapsed_s={time.perf_counter() - build_start:.6f}"
             )
         return executor(input_tensor, weight_tensor)
@@ -8532,18 +9447,16 @@ class _GemmaMirageRuntime:
             routing_indices = torch.zeros(
                 (num_experts, capacity), device=hidden_tensor.device, dtype=torch.int32
             )
-            per_expert_counts = torch.zeros(
-                (num_experts,), device=hidden_tensor.device, dtype=torch.int32
-            )
             for token_idx in range(capacity):
                 for rank_idx in range(topk):
                     expert_idx = int(topk_indices[token_idx, rank_idx].item())
                     routing_indices[expert_idx, token_idx] = rank_idx + 1
-                    per_expert_counts[expert_idx] += 1
             routing_mask = torch.zeros(
                 (num_experts + 1,), device=hidden_tensor.device, dtype=torch.int32
             )
-            routing_mask[1:] = torch.cumsum(per_expert_counts, dim=0)
+            active_experts = torch.nonzero(routing_indices.any(dim=1), as_tuple=False).flatten()
+            routing_mask[: active_experts.numel()] = active_experts.to(torch.int32)
+            routing_mask[num_experts] = int(active_experts.numel())
             return (
                 topk_weight.to(torch.float32),
                 routing_indices,
@@ -8552,6 +9465,36 @@ class _GemmaMirageRuntime:
 
         capacity = int(hidden_tensor.shape[0])
         num_experts = int(weight_tensor.shape[0])
+
+        if self._max_batch_size is not None:
+            # Dynamic batch path: one executor per (hidden, num_experts, topk)
+            max_cap = self._max_batch_size
+            actual_batch = capacity
+            key = (int(hidden_tensor.shape[1]), num_experts, topk)
+            executor = self._router_cache.get(key)
+            if executor is None:
+                _mpk_debug(
+                    "compile router executor "
+                    f"max_batch={max_cap} hidden={int(hidden_tensor.shape[1])} "
+                    f"num_experts={num_experts} topk={topk}"
+                )
+                build_start = time.perf_counter()
+                executor = _MirageRouterExecutor(
+                    capacity=max_cap,
+                    hidden_size=int(hidden_tensor.shape[1]),
+                    num_experts=num_experts,
+                    topk=topk,
+                )
+                self._router_cache[key] = executor
+                _mpk_profile(
+                    "build router executor "
+                    f"max_batch={max_cap} hidden={int(hidden_tensor.shape[1])} "
+                    f"num_experts={num_experts} topk={topk} "
+                    f"elapsed_s={time.perf_counter() - build_start:.6f}"
+                )
+            return executor(hidden_tensor, weight_tensor, actual_batch=actual_batch)
+
+        # Legacy path: one executor per exact (capacity, hidden, num_experts, topk)
         key = (capacity, int(hidden_tensor.shape[1]), num_experts, topk)
         executor = self._router_cache.get(key)
         if executor is None:
@@ -8575,6 +9518,84 @@ class _GemmaMirageRuntime:
                 f"elapsed_s={time.perf_counter() - build_start:.6f}"
             )
         return executor(hidden_tensor, weight_tensor)
+
+    def _dense_ffn(
+        self,
+        *,
+        post_attn_tensor: torch.Tensor,
+        norm_weight_tensor: torch.Tensor,
+        gate_up_weight_tensor: torch.Tensor,
+        down_weight_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._force_torch_executors:
+            normed = _rms_norm(post_attn_tensor, norm_weight_tensor)
+            gate_up = normed.float() @ gate_up_weight_tensor.float().transpose(0, 1)
+            gate, up = torch.chunk(gate_up, 2, dim=-1)
+            return ((F.gelu(gate) * up) @ down_weight_tensor.float().transpose(0, 1)).to(
+                torch.bfloat16
+            )
+
+        capacity = int(post_attn_tensor.shape[0])
+        hidden_size = int(post_attn_tensor.shape[1])
+        intermediate = int(down_weight_tensor.shape[1])
+
+        if self._max_batch_size is not None:
+            # Dynamic batch path: one executor per (hidden_size, intermediate)
+            max_cap = self._max_batch_size
+            actual_batch = capacity
+            key = (hidden_size, intermediate)
+            executor = self._dense_ffn_cache.get(key)
+            if executor is None:
+                _mpk_debug(
+                    "compile dense_ffn executor "
+                    f"max_batch={max_cap} hidden={hidden_size} intermediate={intermediate}"
+                )
+                build_start = time.perf_counter()
+                executor = _MirageDenseFfnExecutor(
+                    capacity=max_cap,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate,
+                )
+                self._dense_ffn_cache[key] = executor
+                _mpk_profile(
+                    "build dense_ffn executor "
+                    f"max_batch={max_cap} hidden={hidden_size} intermediate={intermediate} "
+                    f"elapsed_s={time.perf_counter() - build_start:.6f}"
+                )
+            return executor(
+                post_attn_tensor,
+                norm_weight_tensor,
+                gate_up_weight_tensor,
+                down_weight_tensor,
+                actual_batch=actual_batch,
+            )
+
+        # Legacy path: one executor per exact (capacity, hidden_size, intermediate)
+        key = (capacity, hidden_size, intermediate)
+        executor = self._dense_ffn_cache.get(key)
+        if executor is None:
+            _mpk_debug(
+                "compile dense_ffn executor "
+                f"capacity={capacity} hidden={hidden_size} intermediate={intermediate}"
+            )
+            build_start = time.perf_counter()
+            executor = _MirageDenseFfnExecutor(
+                capacity=capacity,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate,
+            )
+            self._dense_ffn_cache[key] = executor
+            _mpk_profile(
+                "build dense_ffn executor "
+                f"capacity={capacity} hidden={hidden_size} intermediate={intermediate} "
+                f"elapsed_s={time.perf_counter() - build_start:.6f}"
+            )
+        return executor(
+            post_attn_tensor,
+            norm_weight_tensor,
+            gate_up_weight_tensor,
+            down_weight_tensor,
+        )
 
     def _moe_w13(
         self,
@@ -8610,6 +9631,51 @@ class _GemmaMirageRuntime:
             return gate_out, up_out
 
         capacity = int(hidden_tensor.shape[0])
+
+        if self._max_batch_size is not None:
+            # Dynamic batch path: one executor per (hidden, intermediate, num_experts, topk)
+            max_cap = self._max_batch_size
+            actual_batch = capacity
+            key = (
+                int(hidden_tensor.shape[1]),
+                int(gate_weight.shape[1]),
+                int(gate_weight.shape[0]),
+                topk,
+            )
+            executor = self._moe_w13_cache.get(key)
+            if executor is None:
+                _mpk_debug(
+                    "compile moe_w13 executor "
+                    f"max_batch={max_cap} hidden={int(hidden_tensor.shape[1])} "
+                    f"intermediate={int(gate_weight.shape[1])} num_experts={int(gate_weight.shape[0])} "
+                    f"topk={topk}"
+                )
+                build_start = time.perf_counter()
+                executor = _MirageMoeW13Executor(
+                    capacity=max_cap,
+                    hidden_size=int(hidden_tensor.shape[1]),
+                    intermediate_size=int(gate_weight.shape[1]),
+                    num_experts=int(gate_weight.shape[0]),
+                    topk=topk,
+                )
+                self._moe_w13_cache[key] = executor
+                _mpk_profile(
+                    "build moe_w13 executor "
+                    f"max_batch={max_cap} hidden={int(hidden_tensor.shape[1])} "
+                    f"intermediate={int(gate_weight.shape[1])} "
+                    f"num_experts={int(gate_weight.shape[0])} topk={topk} "
+                    f"elapsed_s={time.perf_counter() - build_start:.6f}"
+                )
+            return executor(
+                hidden_tensor,
+                gate_weight,
+                up_weight,
+                routing_indices,
+                routing_mask,
+                actual_batch=actual_batch,
+            )
+
+        # Legacy path: one executor per exact (capacity, hidden, intermediate, num_experts, topk)
         key = (
             capacity,
             int(hidden_tensor.shape[1]),
@@ -8643,6 +9709,220 @@ class _GemmaMirageRuntime:
             )
         return executor(hidden_tensor, gate_weight, up_weight, routing_indices, routing_mask)
 
+    def _fused_moe(
+        self,
+        *,
+        hidden_tensor: torch.Tensor,
+        w13_weight_tensor: torch.Tensor,
+        routing_indices: torch.Tensor,
+        routing_mask: torch.Tensor,
+        w2_weight_tensor: torch.Tensor,
+        topk_weight_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._force_torch_executors:
+            capacity = int(hidden_tensor.shape[0])
+            topk = int(topk_weight_tensor.shape[1])
+            hidden_size = int(w2_weight_tensor.shape[1])
+            out = torch.zeros(
+                (capacity, hidden_size), device=hidden_tensor.device, dtype=torch.float32
+            )
+            for token_idx in range(capacity):
+                selected_experts = _extract_ranked_experts(
+                    routing_indices[:, token_idx : token_idx + 1], topk
+                )
+                for route_idx, expert_index in enumerate(selected_experts):
+                    fused = hidden_tensor[token_idx].float() @ w13_weight_tensor[
+                        expert_index
+                    ].float().transpose(0, 1)
+                    up, gate = torch.chunk(fused, 2, dim=-1)
+                    act = F.gelu(gate) * up
+                    expert_out = act @ w2_weight_tensor[expert_index].float().transpose(0, 1)
+                    out[token_idx] += expert_out * topk_weight_tensor[token_idx, route_idx].float()
+            return out.to(torch.bfloat16)
+
+        capacity = int(hidden_tensor.shape[0])
+        hidden_size = int(hidden_tensor.shape[1])
+        intermediate = int(w2_weight_tensor.shape[2])
+        num_experts = int(w2_weight_tensor.shape[0])
+        topk = int(topk_weight_tensor.shape[1])
+
+        if self._max_batch_size is not None:
+            # Dynamic batch path: one executor per (hidden, intermediate, num_experts, topk)
+            max_cap = self._max_batch_size
+            actual_batch = capacity
+            key = (hidden_size, intermediate, num_experts, topk)
+            executor = self._fused_moe_cache.get(key)
+            if executor is None:
+                _mpk_debug(
+                    "compile fused_moe executor "
+                    f"max_batch={max_cap} hidden={hidden_size} intermediate={intermediate} "
+                    f"num_experts={num_experts} topk={topk}"
+                )
+                build_start = time.perf_counter()
+                executor = _MirageFusedMoeExecutor(
+                    capacity=max_cap,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate,
+                    num_experts=num_experts,
+                    topk=topk,
+                )
+                self._fused_moe_cache[key] = executor
+                _mpk_profile(
+                    "build fused_moe executor "
+                    f"max_batch={max_cap} hidden={hidden_size} intermediate={intermediate} "
+                    f"num_experts={num_experts} topk={topk} "
+                    f"elapsed_s={time.perf_counter() - build_start:.6f}"
+                )
+            return executor(
+                hidden_tensor,
+                w13_weight_tensor,
+                routing_indices,
+                routing_mask,
+                w2_weight_tensor,
+                topk_weight_tensor,
+                actual_batch=actual_batch,
+            )
+
+        # Legacy path: one executor per exact (capacity, hidden, intermediate, num_experts, topk)
+        key = (capacity, hidden_size, intermediate, num_experts, topk)
+        executor = self._fused_moe_cache.get(key)
+        if executor is None:
+            _mpk_debug(
+                "compile fused_moe executor "
+                f"capacity={capacity} hidden={hidden_size} intermediate={intermediate} "
+                f"num_experts={num_experts} topk={topk}"
+            )
+            build_start = time.perf_counter()
+            executor = _MirageFusedMoeExecutor(
+                capacity=capacity,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate,
+                num_experts=num_experts,
+                topk=topk,
+            )
+            self._fused_moe_cache[key] = executor
+            _mpk_profile(
+                "build fused_moe executor "
+                f"capacity={capacity} hidden={hidden_size} intermediate={intermediate} "
+                f"num_experts={num_experts} topk={topk} "
+                f"elapsed_s={time.perf_counter() - build_start:.6f}"
+            )
+        return executor(
+            hidden_tensor,
+            w13_weight_tensor,
+            routing_indices,
+            routing_mask,
+            w2_weight_tensor,
+            topk_weight_tensor,
+        )
+
+    def _split_moe(
+        self,
+        *,
+        hidden_tensor: torch.Tensor,
+        w13_weight_tensor: torch.Tensor,
+        routing_indices: torch.Tensor,
+        routing_mask: torch.Tensor,
+        w2_weight_tensor: torch.Tensor,
+        topk_weight_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._force_torch_executors:
+            capacity = int(hidden_tensor.shape[0])
+            topk = int(topk_weight_tensor.shape[1])
+            hidden_size = int(w2_weight_tensor.shape[1])
+            out = torch.zeros(
+                (capacity, hidden_size), device=hidden_tensor.device, dtype=torch.float32
+            )
+            for token_idx in range(capacity):
+                selected_experts = _extract_ranked_experts(
+                    routing_indices[:, token_idx : token_idx + 1], topk
+                )
+                for route_idx, expert_index in enumerate(selected_experts):
+                    fused = hidden_tensor[token_idx].float() @ w13_weight_tensor[
+                        expert_index
+                    ].float().transpose(0, 1)
+                    up, gate = torch.chunk(fused, 2, dim=-1)
+                    act = F.gelu(gate) * up
+                    expert_out = act @ w2_weight_tensor[expert_index].float().transpose(0, 1)
+                    out[token_idx] += expert_out * topk_weight_tensor[token_idx, route_idx].float()
+            return out.to(torch.bfloat16)
+
+        capacity = int(hidden_tensor.shape[0])
+        hidden_size = int(hidden_tensor.shape[1])
+        intermediate = int(w2_weight_tensor.shape[2])
+        num_experts = int(w2_weight_tensor.shape[0])
+        topk = int(topk_weight_tensor.shape[1])
+
+        if self._max_batch_size is not None:
+            # Dynamic batch path: one executor per (hidden, intermediate, num_experts, topk)
+            max_cap = self._max_batch_size
+            actual_batch = capacity
+            key = (hidden_size, intermediate, num_experts, topk)
+            executor = self._split_moe_cache.get(key)
+            if executor is None:
+                _mpk_debug(
+                    "compile split_moe executor "
+                    f"max_batch={max_cap} hidden={hidden_size} intermediate={intermediate} "
+                    f"num_experts={num_experts} topk={topk}"
+                )
+                build_start = time.perf_counter()
+                executor = _MirageSplitMoeExecutor(
+                    capacity=max_cap,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate,
+                    num_experts=num_experts,
+                    topk=topk,
+                )
+                self._split_moe_cache[key] = executor
+                _mpk_profile(
+                    "build split_moe executor "
+                    f"max_batch={max_cap} hidden={hidden_size} intermediate={intermediate} "
+                    f"num_experts={num_experts} topk={topk} "
+                    f"elapsed_s={time.perf_counter() - build_start:.6f}"
+                )
+            return executor(
+                hidden_tensor,
+                w13_weight_tensor,
+                routing_indices,
+                routing_mask,
+                w2_weight_tensor,
+                topk_weight_tensor,
+                actual_batch=actual_batch,
+            )
+
+        # Legacy path: one executor per exact (capacity, hidden, intermediate, num_experts, topk)
+        key = (capacity, hidden_size, intermediate, num_experts, topk)
+        executor = self._split_moe_cache.get(key)
+        if executor is None:
+            _mpk_debug(
+                "compile split_moe executor "
+                f"capacity={capacity} hidden={hidden_size} intermediate={intermediate} "
+                f"num_experts={num_experts} topk={topk}"
+            )
+            build_start = time.perf_counter()
+            executor = _MirageSplitMoeExecutor(
+                capacity=capacity,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate,
+                num_experts=num_experts,
+                topk=topk,
+            )
+            self._split_moe_cache[key] = executor
+            _mpk_profile(
+                "build split_moe executor "
+                f"capacity={capacity} hidden={hidden_size} intermediate={intermediate} "
+                f"num_experts={num_experts} topk={topk} "
+                f"elapsed_s={time.perf_counter() - build_start:.6f}"
+            )
+        return executor(
+            hidden_tensor,
+            w13_weight_tensor,
+            routing_indices,
+            routing_mask,
+            w2_weight_tensor,
+            topk_weight_tensor,
+        )
+
     def _moe_w2_reduce(
         self,
         *,
@@ -8674,6 +9954,73 @@ class _GemmaMirageRuntime:
             return out.to(torch.bfloat16)
 
         capacity, topk, intermediate = [int(dim) for dim in act_tensor.shape]
+
+        if self._max_batch_size is not None:
+            # Dynamic batch path: one executor per (topk, hidden, intermediate, num_experts)
+            max_cap = self._max_batch_size
+            actual_batch = capacity
+            if actual_batch > max_cap:
+                # Chunking fallback for actual_batch > max_batch
+                outputs = []
+                for start in range(0, actual_batch, max_cap):
+                    end = min(start + max_cap, actual_batch)
+                    chunk_capacity = end - start
+                    chunk_mask = torch.tensor(
+                        [0, chunk_capacity],
+                        device=routing_mask.device,
+                        dtype=torch.int32,
+                    )
+                    outputs.append(
+                        self._moe_w2_reduce(
+                            act_tensor=act_tensor[start:end].contiguous(),
+                            weight_tensor=weight_tensor,
+                            routing_indices=routing_indices[:, start:end].contiguous(),
+                            routing_mask=chunk_mask,
+                            topk_weight=topk_weight[start:end].contiguous(),
+                            residual=residual[start:end].contiguous(),
+                        )
+                    )
+                return torch.cat(outputs, dim=0)
+
+            key = (
+                topk,
+                int(weight_tensor.shape[1]),
+                intermediate,
+                int(weight_tensor.shape[0]),
+            )
+            executor = self._moe_w2_cache.get(key)
+            if executor is None:
+                _mpk_debug(
+                    "compile moe_w2 executor "
+                    f"max_batch={max_cap} topk={topk} hidden={int(weight_tensor.shape[1])} "
+                    f"intermediate={intermediate} num_experts={int(weight_tensor.shape[0])}"
+                )
+                build_start = time.perf_counter()
+                executor = _MirageMoeW2ReduceExecutor(
+                    capacity=max_cap,
+                    topk=topk,
+                    hidden_size=int(weight_tensor.shape[1]),
+                    intermediate_size=intermediate,
+                    num_experts=int(weight_tensor.shape[0]),
+                )
+                self._moe_w2_cache[key] = executor
+                _mpk_profile(
+                    "build moe_w2 executor "
+                    f"max_batch={max_cap} topk={topk} hidden={int(weight_tensor.shape[1])} "
+                    f"intermediate={intermediate} num_experts={int(weight_tensor.shape[0])} "
+                    f"elapsed_s={time.perf_counter() - build_start:.6f}"
+                )
+            return executor(
+                act_tensor,
+                weight_tensor,
+                routing_indices,
+                routing_mask,
+                topk_weight,
+                residual,
+                actual_batch=actual_batch,
+            )
+
+        # Legacy path: one executor per exact (capacity, topk, hidden, intermediate, num_experts)
         if (
             capacity > _MIRAGE_MOE_W2_MAX_CAPACITY
             and topk == 1
@@ -8745,6 +10092,13 @@ class _GemmaMirageRuntime:
         if self._force_torch_executors:
             return (F.gelu(gate.float()) * up.float()).to(torch.bfloat16)
 
+        # TODO(dynamic-batch): _MirageGeluMulExecutor uses the Mirage graph API
+        # (not PK) and does not support update_dynamic_dims. When _max_batch_size
+        # is set, callers should use the fused dense FFN path
+        # (_MirageDenseFfnExecutor) which handles gelu*mul inside a single PK
+        # with full dynamic batch support. The unfused path
+        # (_disable_fused_dense_ffn=True) will still recompile per shape.
+
         key = tuple(int(dim) for dim in gate.shape)
         executor = self._gelu_cache.get(key)
         if executor is None:
@@ -8760,6 +10114,11 @@ class _GemmaMirageRuntime:
     def _matmul(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         if self._force_torch_executors:
             return (a.float() @ b.float()).to(torch.bfloat16)
+
+        # TODO(dynamic-batch): _MirageMatmulExecutor uses the Mirage graph API
+        # (not PK) and does not support update_dynamic_dims. Not in the main
+        # Gemma4 decode path — _ffn_down_decode routes through _moe_w2_reduce
+        # which has full dynamic batch support.
 
         key = (int(a.shape[0]), int(a.shape[1]), int(b.shape[1]))
         executor = self._matmul_cache.get(key)
@@ -8967,6 +10326,8 @@ class _GemmaMirageRuntime:
 def build_gemma_mirage_runtime_callable(
     translation_plan: Dict[str, Any],
     source_model: Optional[GraphModule] = None,
+    max_batch_size: Optional[int] = None,
+    max_seq_length: Optional[int] = None,
 ) -> Callable[..., Any]:
     """Build the live Gemma MPK runtime callable.
 
@@ -8974,6 +10335,13 @@ def build_gemma_mirage_runtime_callable(
     execution must go through the Mirage-backed callable rather than an eager
     fallback. The default decode path is blockwise hybrid execution; the
     single-PK per-layer path remains an explicit opt-in.
+
+    Args:
+        max_batch_size: If set, executors compile once at this envelope and use
+            pk.update_dynamic_dims() for smaller actual batches at runtime.
+            If None, falls back to per-shape compilation (legacy behavior).
+        max_seq_length: If set, the single-PK layer executor compiles at this
+            envelope so growing sequences don't trigger recompilation.
     """
     if source_model is None:
         layer_lowerings = translation_plan.get("layer_lowerings", [])
@@ -8994,7 +10362,12 @@ def build_gemma_mirage_runtime_callable(
             )
 
         return _missing_model_runtime_callable
-    return _GemmaMirageRuntime(source_model, translation_plan)
+    return _GemmaMirageRuntime(
+        source_model,
+        translation_plan,
+        max_batch_size=max_batch_size,
+        max_seq_length=max_seq_length,
+    )
 
 
 def create_test_persistent_kernel(

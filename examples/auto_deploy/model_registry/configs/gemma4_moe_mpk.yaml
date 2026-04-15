@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Live Gemma 4 MoE blockwise MPK config.
+# This config installs the real lower_to_mpk runtime wrapper, skips compile_model,
+# and forces a stable Mirage MPK cache directory for cross-run reuse.
+model_factory: Gemma4ForConditionalGeneration
+tokenizer: google/gemma-4-26B-A4B-it
+attn_backend: triton_paged
+compile_backend: torch-cudagraph
+cuda_graph_config:
+  batch_sizes: [1]
+max_num_tokens: 512
+max_batch_size: 1
+max_seq_len: 512
+enable_chunked_prefill: true
+model_kwargs:
+  text_config:
+    num_hidden_layers: 30
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.8
+transforms:
+  lower_to_mpk:
+    enabled: true
+    dry_run_only: false
+    debug_dump_plan_path: ./gemma_mpk_plan.json
+    mirage_cache_dir: ./.tmp/gemma4_moe_mpk_cache
+    force_enable_mirage_cache: true
+    prewarm_decode_executors: true
+    max_batch_size: 1
+    max_seq_length: 512
+  compile_model:
+    piecewise_enabled: true
+  mlir_elementwise_fusion:
+    enabled: false
+  gather_logits_before_lm_head:
+    enabled: true
+  fuse_gemms:
+    enabled: true

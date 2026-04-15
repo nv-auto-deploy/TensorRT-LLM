@@ -414,3 +414,215 @@ For Gemma4MoE specifically, the strongest direct matches are:
 - stable bucket/buffer style runtime metadata
 
 So the path forward looks real. The main work is semantic normalization and buffer/metadata schema alignment.
+
+## Dynamic Batch Size Support (Runtime Shape Flexibility)
+
+### Background
+
+The original MPK compilation model was strictly shape-static: every tensor dimension
+— including batch size (num_tokens) — was baked into C++ template parameters and TMA
+descriptor types at compile time. This meant any change to the number of active tokens
+required a full nvcc recompilation, which is incompatible with LLM serving where batch
+size changes every iteration as requests arrive and complete.
+
+As of the April 2026 Mirage update, `PersistentKernel` supports **dynamic batch sizes
+at runtime** without recompilation. This section documents the feature, the API, and
+how to use it correctly from the bridge.
+
+### The Core Idea
+
+Compile the PersistentKernel once for a **maximum batch envelope** (`MAX_BATCH`).
+At runtime, call `pk.update_dynamic_dims(actual_batch=N)` before each launch to set
+the actual token count. The kernel uses `MAX_BATCH` for buffer allocation and template
+instantiation but reads `actual_batch` at runtime for loop bounds and early-exit.
+
+What stays static (compile-time):
+- hidden_size, head_dim, intermediate_size, num_experts, topk, weight dims, page_size
+
+What becomes dynamic (runtime):
+- batch_size / num_tokens / capacity
+- max_seq_length (was already runtime via `RuntimeConfig.max_seq_length`)
+
+### Python API
+
+```python
+# Construction — compile once at MAX_BATCH
+pk = PersistentKernel(
+    max_num_batched_tokens=16,   # MAX_BATCH envelope
+    max_seq_length=8192,
+    ...
+)
+pk.linear_layer(input=input_dt, weight=weight_dt, output=output_dt, ...)
+compile_persistent_kernel_with_patches(pk)
+
+# Runtime — update batch before each launch
+pk.update_dynamic_dims(actual_batch=3)    # host-side, ~μs
+pk.run(dynamic_inputs={...})              # launch kernel
+output = output_buffer[:3]                # slice to actual batch
+```
+
+**`pk.update_dynamic_dims(actual_batch: int)`**:
+- Validates `1 <= actual_batch <= max_num_batched_tokens`
+- **No-op if batch unchanged** — tracks `_last_dynamic_batch` internally
+- Patches `BindingSlotDesc` tensor dims for all batch-dependent binding slots
+- Marks affected tasks as dirty → TMA descriptors re-created on next launch
+- Sets `RuntimeConfig.actual_batch_size` for kernel loop bounds
+
+**Return codes from the C++ layer (`update_dynamic_batch_size`):**
+- `0` — success (or no-op because batch unchanged)
+- `-1` — `actual_batch < 1` (rejected)
+- `-2` — `actual_batch > MPK_MAX_NUM_BATCHED_TOKENS` (rejected)
+
+### How It Works Internally
+
+The implementation uses a **dirty-slot propagation** mechanism:
+
+```
+pk.update_dynamic_dims(actual_batch=N)
+    │
+    ▼
+update_dynamic_batch_size(N)                      [C++ extern "C"]
+    ├─ set RuntimeConfig.actual_batch_size = N
+    └─ mark_dynamic_batch_dirty(N)
+        └─ for each BindingSlotDesc with dynamic_dim >= 0:
+            ├─ update slot.tensor.dim[dynamic_dim] = N
+            └─ mark_slot_dirty(slot_id)
+                └─ flag all tasks using this slot as dirty
+
+launch_persistent_kernel(stream)                  [called by pk.run()]
+    └─ patch_dirty_tasks(stream)                  [BEFORE the PK launch]
+        └─ for each dirty task:
+            ├─ materialize_full_task_desc(task_idx)
+            │     ├─ fill_tensor_desc_from_template() with patched dims
+            │     └─ create_tma_desc_by_task()     [re-encode TMA descriptors]
+            ├─ cudaMemcpyAsync(device task desc)
+            └─ clear dirty flag
+```
+
+Key design points:
+- **Metadata-driven**: `TensorBindingTemplate.dynamic_dim` marks which dimension
+  is batch. `get_dynamic_batch_dim()` maps task types to the correct dim per tensor.
+- **TMA re-creation is automatic**: dirty tasks get their TMA descriptors re-created
+  in `materialize_full_task_desc` → `create_tma_desc_by_task`. Weight TMAs are
+  reused (not batch-dependent). Only activation/output TMAs are re-encoded.
+- **Kernel early-exit**: each kernel reads `actual_batch` as a runtime arg
+  (passed via `runtime_config.actual_batch_size` in generated `_execute_task` code)
+  and either bounds loops or predicates stores:
+  - `linear_swapAB_hopper`: epilogue `if (col >= actual_batch)` zeroes
+  - `norm_linear_new`: `if (row >= num_active_tokens) break`
+  - `mul_sum_add_sm100`: loop bound `for (row = 0; row < actual_batch; ...)`
+  - `moe_linear_sm90`: token-level predication on stores
+
+### Overhead
+
+`update_dynamic_dims` is **host-side work before kernel launch**, not during
+kernel execution:
+
+```
+Host:   [update_dynamic_dims] [pk.run() → patch_dirty + launch]
+         ~0-50μs               ~5-10μs
+GPU:                           [========= kernel execution =========]
+```
+
+| Scenario | Cost |
+|----------|------|
+| Batch unchanged (common case) | <1μs (Python int comparison, no C++ call) |
+| Batch changed, per dirty task | ~1-2μs TMA re-encode + cudaMemcpyAsync per task |
+| Worst case per layer (~6 task types) | ~25-50μs total host overhead |
+
+In steady-state decode the batch often stays constant across iterations, so
+the skip-if-unchanged guard makes most launches zero-cost.
+
+### Usage Guidelines for Bridge Integration
+
+**1. Compile once at model load, not per request.**
+
+```python
+# CORRECT: compile at MAX_BATCH, reuse for all actual batch sizes
+executor.pk = create_persistent_kernel(max_num_batched_tokens=MAX_BATCH, ...)
+compile_persistent_kernel_with_patches(executor.pk)
+
+# WRONG: creating a new PK per batch size (defeats the purpose)
+```
+
+**2. Remove batch size from executor cache keys.**
+
+Old pattern:
+```python
+key = (capacity, in_dim, out_dim)   # triggers new executor per batch size
+```
+
+New pattern:
+```python
+key = (in_dim, out_dim)             # one executor per weight shape
+```
+
+**3. Call `update_dynamic_dims` before `pk.run()`, not before `pk.launch_func`.**
+
+The `pk.run()` method internally calls `launch_persistent_kernel()` which
+calls `patch_dirty_tasks()`. So `update_dynamic_dims` must be called before
+`pk.run()` for the dirty flags to be picked up. Order:
+
+```python
+pk.update_dynamic_dims(actual_batch=N)    # sets dirty flags
+pk.run(dynamic_inputs={...})              # patch_dirty_tasks + launch
+```
+
+**4. Allocate input/output buffers at MAX_BATCH.**
+
+```python
+self.input = torch.empty((MAX_BATCH, in_dim), device="cuda", dtype=torch.bfloat16)
+self.output = torch.empty((MAX_BATCH, out_dim), device="cuda", dtype=torch.bfloat16)
+```
+
+At runtime, write actual data into `self.input[:actual_batch]` and read from
+`self.output[:actual_batch]`. Rows beyond `actual_batch` may contain garbage
+from previous launches — always slice.
+
+**5. Do NOT call `update_dynamic_dims` with 0 or values > max_num_batched_tokens.**
+
+```python
+pk.update_dynamic_dims(actual_batch=0)   # raises ValueError
+pk.update_dynamic_dims(actual_batch=17)  # raises ValueError if max was 16
+```
+
+**6. Wire MAX_BATCH from the serving config.**
+
+The value should come from the AD serving config (e.g., `max_batch_size` or
+`max_num_tokens`) and be plumbed through `LowerToMpkConfig` →
+`build_gemma_mirage_runtime_callable` → `_GemmaMirageRuntime.__init__`. Do not
+hardcode it.
+
+**7. max_seq_length is already runtime — just compile with the serving max.**
+
+`RuntimeConfig.max_seq_length` and the paged KV metadata (`paged_kv_indptr_buffer`,
+etc.) already handle variable sequence lengths. Compile with
+`max_seq_length = serving_config.max_seq_len` and shorter sequences just use
+fewer pages at runtime. No `update_dynamic_dims` needed for seq length.
+
+### Common Pitfalls
+
+| Pitfall | Symptom | Fix |
+|---------|---------|-----|
+| Forgetting `update_dynamic_dims` before `pk.run()` | Kernel processes MAX_BATCH rows, reads garbage in padding region | Always call before run when batch changes |
+| Reading output beyond `[:actual_batch]` | Stale data from previous larger batch | Always slice output |
+| Calling `update_dynamic_dims` after `pk.run()` | Dirty flags cleared by `patch_dirty_tasks` during launch, update has no effect until next launch | Call before, not after |
+| Creating separate executors per batch size | Still works but wastes GPU memory and compile time | Use one executor at MAX_BATCH + dynamic dims |
+| Setting MAX_BATCH too large | Excess shared memory per SM, TMA descriptors sized for max, wasted early-exit tiles | Use the actual serving config max, not an inflated value |
+| Not handling the `actual_batch > max` error | `ValueError` from Python, return code -2 from C++ | Validate or clamp before calling |
+
+### Relationship to Existing Code
+
+The dynamic batch feature replaces the per-shape compilation pattern in these
+bridge components:
+
+| Component | Before | After |
+|-----------|--------|-------|
+| `_MirageLinearExecutor` | One PK per `(capacity, in_dim, out_dim)` | One PK per `(in_dim, out_dim)` at MAX_BATCH |
+| `_MirageRouterExecutor` | One PK per `(capacity, hidden, experts, topk)` | One PK per `(hidden, experts, topk)` at MAX_BATCH |
+| `_MirageDenseFfnExecutor` | One PK per `(capacity, hidden, intermediate)` | One PK per `(hidden, intermediate)` at MAX_BATCH |
+| `_MirageMoeW13Executor` | One PK per `(capacity, hidden, inter, experts, topk)` | One PK per `(hidden, inter, experts, topk)` at MAX_BATCH |
+| `_MirageMoeW2ReduceExecutor` | Same pattern | Same pattern |
+| `_GemmaMirageRuntime._linear_cache` | Key includes capacity | Key excludes capacity |
+| `prewarm_decode_executors` | Warms capacity=1 only | Warms MAX_BATCH once (covers all actual batches) |
+| Chunking (`_MIRAGE_LINEAR_MAX_CAPACITY`) | Splits large batches into chunks of 16 | Still useful if actual_batch > MAX_BATCH, but MAX_BATCH should be set high enough |

@@ -28,6 +28,7 @@ compiling MPK artifacts.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Optional, Tuple, Type
 
@@ -76,6 +77,46 @@ class LowerToMpkConfig(TransformConfig):
         default=None,
         description="Optional path to dump the JSON translation plan for debugging.",
     )
+    mirage_cache_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional cache directory to force MIRAGE_MPK_CACHE_DIR when the live "
+            "Mirage runtime is installed."
+        ),
+    )
+    force_enable_mirage_cache: bool = Field(
+        default=False,
+        description=(
+            "If true, clear MIRAGE_MPK_DISABLE_CACHE and ensure a stable cache root "
+            "is configured for the live Mirage runtime."
+        ),
+    )
+    prewarm_decode_executors: bool = Field(
+        default=False,
+        description=(
+            "If true, prewarm the Gemma decode executor set during lower_to_mpk "
+            "installation so the first request does not discover/compile new MPK "
+            "blocks on the hot path."
+        ),
+    )
+    max_batch_size: Optional[int] = Field(
+        default=None,
+        description=(
+            "Maximum batch size (num_tokens) for the Mirage MPK runtime. "
+            "Executors compile once at this envelope and use "
+            "pk.update_dynamic_dims() for smaller actual batches at runtime. "
+            "If None, falls back to per-shape compilation (legacy behavior)."
+        ),
+    )
+    max_seq_length: Optional[int] = Field(
+        default=None,
+        description=(
+            "Maximum sequence length for the single-PK layer executor. "
+            "The executor compiles once at this envelope so growing sequences "
+            "do not trigger recompilation. If None, the executor grows "
+            "incrementally as sequences get longer (legacy behavior)."
+        ),
+    )
 
 
 @TransformRegistry.register("lower_to_mpk")
@@ -87,6 +128,27 @@ class LowerToMpk(BaseTransform):
     @classmethod
     def get_config_class(cls) -> Type[TransformConfig]:
         return LowerToMpkConfig
+
+    def _configure_mirage_cache_env(self) -> Optional[str]:
+        cache_dir = self.config.mirage_cache_dir
+        if cache_dir is None and not self.config.force_enable_mirage_cache:
+            return None
+
+        resolved_cache_dir: Optional[Path] = None
+        if cache_dir is not None:
+            resolved_cache_dir = Path(cache_dir).expanduser().resolve()
+        else:
+            env_cache_dir = os.environ.get("MIRAGE_MPK_CACHE_DIR")
+            if env_cache_dir:
+                resolved_cache_dir = Path(env_cache_dir).expanduser().resolve()
+            else:
+                resolved_cache_dir = Path(".tmp/mirage_mpk_cache").resolve()
+
+        resolved_cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["MIRAGE_MPK_CACHE_DIR"] = str(resolved_cache_dir)
+        if self.config.force_enable_mirage_cache:
+            os.environ["MIRAGE_MPK_DISABLE_CACHE"] = "0"
+        return str(resolved_cache_dir)
 
     def _apply_to_full_model(
         self,
@@ -123,21 +185,41 @@ class LowerToMpk(BaseTransform):
             f"{graph_summary['num_layers']} layers with schemas {graph_summary['schemas']}"
         )
         ad_logger.info(
-            "Gemma MPK dry-run plan contains "
+            "Gemma MPK translation plan contains "
             f"{summary['num_layer_lowerings']} layer lowerings, "
             f"{summary['num_gap_steps']} gap steps, and "
             f"{summary['num_partial_steps']} partial steps"
         )
 
         if not self.config.dry_run_only:
-            model = self._wrap_graphmodule_with_runtime_wrapper(model, plan.to_dict())
+            cache_dir = self._configure_mirage_cache_env()
+            runtime_callable = build_gemma_mirage_runtime_callable(
+                plan.to_dict(),
+                source_model=model,
+                max_batch_size=self.config.max_batch_size,
+                max_seq_length=self.config.max_seq_length,
+            )
+            if self.config.prewarm_decode_executors:
+                prewarm = getattr(runtime_callable, "prewarm_decode_executors", None)
+                if callable(prewarm):
+                    ad_logger.info("Prewarming Gemma MPK decode executor set...")
+                    prewarm()
+                    ad_logger.info("Gemma MPK decode executor prewarm finished.")
+            model = self._wrap_graphmodule_with_runtime_wrapper(
+                model,
+                plan.to_dict(),
+                runtime_callable=runtime_callable,
+            )
             wrapped_meta = self._get_autodeploy_meta(model)
             wrapped_meta["mpk_runtime_mode"] = "mirage_runtime"
             self._set_autodeploy_meta(model, wrapped_meta)
+            cache_message = (
+                f", Mirage cache enabled at {cache_dir}" if cache_dir is not None else ""
+            )
             ad_logger.info(
                 "Gemma MPK blockwise decode runtime installed with generate-only Mirage routing, "
                 "original-graph execution for non-generate-only batches, and single-PK layers "
-                "kept behind explicit opt-in"
+                f"kept behind explicit opt-in{cache_message}"
             )
 
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
@@ -147,6 +229,7 @@ class LowerToMpk(BaseTransform):
         self,
         model: GraphModule,
         translation_plan: dict,
+        runtime_callable: Optional[nn.Module] = None,
     ) -> GraphModule:
         """Wrap the full graph in a runtime wrapper while preserving GraphModule shape.
 
@@ -156,7 +239,9 @@ class LowerToMpk(BaseTransform):
         """
 
         wrapper = GemmaMpkRuntimeWrapper(
-            mpk_callable=build_gemma_mirage_runtime_callable(
+            mpk_callable=runtime_callable
+            if runtime_callable is not None
+            else build_gemma_mirage_runtime_callable(
                 translation_plan,
                 source_model=model,
             ),

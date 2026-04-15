@@ -9,5 +9,7 @@ transforms:
     enabled: true
     dry_run_only: false
     debug_dump_plan_path: ./gemma_mpk_plan_5layer.json
+    max_batch_size: 16
+    max_seq_length: 512
   mlir_elementwise_fusion:
     enabled: false
