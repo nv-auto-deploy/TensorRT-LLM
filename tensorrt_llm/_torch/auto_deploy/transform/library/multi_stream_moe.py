@@ -69,6 +69,31 @@ def _get_ancestors(node: Node) -> Set[Node]:
     return ancestors
 
 
+def _shared_branch_has_expert_compute(shared_nodes: List[Node]) -> bool:
+    """Return True if the shared branch contains linear/matmul ops.
+
+    A real shared-expert branch (e.g. DeepSeek-V3 style) contains an MLP
+    with linear/matmul operations.  Ancillary computations such as FP8
+    quantization scales can be misidentified as "shared" branches when
+    they appear as ``call_function`` nodes that are neither MoE ancestors
+    nor MoE descendants.  Requiring at least one matmul-class op filters
+    out these false positives.
+    """
+    _MATMUL_OP_NAMES = frozenset({"mm", "linear", "matmul", "addmm", "bmm", "gemm"})
+    for node in shared_nodes:
+        if node.op == "call_function":
+            name = getattr(node.target, "__name__", str(node.target))
+            # Handle qualified names like "aten.mm.default" → "mm"
+            base = name.rsplit(".", 1)[-1] if "." in name else name
+            if base in _MATMUL_OP_NAMES:
+                return True
+            # Also match custom fused ops that contain these keywords
+            name_lower = name.lower()
+            if any(kw in name_lower for kw in ("linear", "matmul", "gemm")):
+                return True
+    return False
+
+
 def _execute_shared_expert_in_aux_stream(
     gm: GraphModule, moe_ops: List[Callable]
 ) -> Tuple[GraphModule, int]:
@@ -174,6 +199,18 @@ def _execute_shared_expert_in_aux_stream(
             ad_logger.warning(
                 f"Could not identify shared-expert subgraph for MoE node "
                 f"{moe_node.name}; skipping multi-stream transform for this node."
+            )
+            continue
+
+        # Validate that the shared branch contains actual expert computation
+        # (linear/matmul ops).  Without this check, ancillary computations
+        # like FP8 quantization scales can be misidentified as shared-expert
+        # branches, causing incorrect stream switching and NaN outputs.
+        if not _shared_branch_has_expert_compute(shared_nodes):
+            ad_logger.info(
+                f"Shared branch for MoE node {moe_node.name} contains no "
+                f"linear/matmul ops ({len(shared_nodes)} node(s)) — not a "
+                f"shared expert; skipping multi-stream transform."
             )
             continue
 
