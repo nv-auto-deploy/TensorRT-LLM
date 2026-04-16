@@ -29,6 +29,7 @@ that performs:
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -36,6 +37,13 @@ import triton
 import triton.language as tl
 
 from ..normalization.triton_rms_norm import rms_norm
+
+
+def _get_env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return int(value)
 
 
 def _reshape_hidden_for_attention(
@@ -106,6 +114,21 @@ def _apply_rmsnorm_halves(
     weight_second = tl.load(weight_ptr + half_d + half_offsets, mask=half_mask, other=0.0).to(
         tl.float32
     )
+    first_f32 = first.to(tl.float32)
+    second_f32 = second.to(tl.float32)
+    out_first = ((first_f32 / denom) * weight_first).to(first.dtype)
+    out_second = ((second_f32 / denom) * weight_second).to(second.dtype)
+    return out_first, out_second
+
+
+@triton.jit
+def _apply_rmsnorm_halves_preloaded(
+    first,
+    second,
+    weight_first,
+    weight_second,
+    denom,
+):
     first_f32 = first.to(tl.float32)
     second_f32 = second.to(tl.float32)
     out_first = ((first_f32 / denom) * weight_first).to(first.dtype)
@@ -211,6 +234,9 @@ def _gemma_kernel_a_decode_single_kernel(
     BLOCK_QKV: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_TC_QKV: tl.constexpr,
+    USE_TC_OPROJ: tl.constexpr,
+    USE_DOT_ATTN: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     d2: tl.constexpr = D_HEAD // 2
@@ -218,6 +244,7 @@ def _gemma_kernel_a_decode_single_kernel(
     d2_mask = d2_offsets < d2
     h_offsets = tl.arange(0, BLOCK_H)
     q_heads_per_kv: tl.constexpr = N_Q_HEADS // N_KV_HEADS
+    q_local_offsets = tl.arange(0, q_heads_per_kv)
     q_base_offset: tl.constexpr = 0
     k_base_offset: tl.constexpr = N_Q_HEADS * D_HEAD
     v_base_offset: tl.constexpr = (N_Q_HEADS + N_KV_HEADS) * D_HEAD
@@ -230,33 +257,77 @@ def _gemma_kernel_a_decode_single_kernel(
     page_end = tl.load(cu_num_pages_ptr + batch_idx + 1).to(tl.int32)
     num_pages = page_end - page_start
     last_page_len = tl.load(last_page_len_ptr + batch_idx).to(tl.int32)
+    cache_row = position.to(tl.int64) * cos_sin_cache_stride_s
+    cos = tl.load(
+        cos_sin_cache_ptr + cache_row + d2_offsets * cos_sin_cache_stride_d,
+        mask=d2_mask,
+        other=0.0,
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_cache_ptr + cache_row + (d2 + d2_offsets) * cos_sin_cache_stride_d,
+        mask=d2_mask,
+        other=0.0,
+    ).to(tl.float32)
+    q_weight_first = tl.load(q_norm_weight_ptr + d2_offsets, mask=d2_mask, other=0.0).to(tl.float32)
+    q_weight_second = tl.load(q_norm_weight_ptr + d2 + d2_offsets, mask=d2_mask, other=0.0).to(
+        tl.float32
+    )
+    k_weight_first = tl.load(k_norm_weight_ptr + d2_offsets, mask=d2_mask, other=0.0).to(tl.float32)
+    k_weight_second = tl.load(k_norm_weight_ptr + d2 + d2_offsets, mask=d2_mask, other=0.0).to(
+        tl.float32
+    )
+    v_weight_first = tl.load(v_norm_weight_ptr + d2_offsets, mask=d2_mask, other=0.0).to(tl.float32)
+    v_weight_second = tl.load(v_norm_weight_ptr + d2 + d2_offsets, mask=d2_mask, other=0.0).to(
+        tl.float32
+    )
     qkv_row_offset = token_id * qkv_scratch_stride_t
 
     qkv_offsets = tl.arange(0, BLOCK_QKV)
     for qkv_start in range(0, QKV_WIDTH, BLOCK_QKV):
         qkv_cols = qkv_start + qkv_offsets
         qkv_mask = qkv_cols < QKV_WIDTH
-        qkv_acc = tl.zeros([BLOCK_QKV], dtype=tl.float32)
+        if USE_TC_QKV:
+            qkv_acc_tc = tl.zeros([1, BLOCK_QKV], dtype=tl.float32)
+        else:
+            qkv_acc = tl.zeros([BLOCK_QKV], dtype=tl.float32)
         for k_start in range(0, HIDDEN_SIZE, BLOCK_K):
             k_offsets = k_start + tl.arange(0, BLOCK_K)
             k_mask = k_offsets < HIDDEN_SIZE
-            x = tl.load(
-                attn_ptr + attn_row_offset + k_offsets * attn_stride_h,
-                mask=k_mask,
-                other=0.0,
-            ).to(tl.float32)
-            w = tl.load(
-                qkv_weight_ptr
-                + qkv_cols[:, None] * qkv_weight_stride_o
-                + k_offsets[None, :] * qkv_weight_stride_i,
-                mask=qkv_mask[:, None] & k_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            qkv_acc += tl.sum(w * x[None, :], axis=1)
+            if USE_TC_QKV:
+                x = tl.expand_dims(
+                    tl.load(
+                        attn_ptr + attn_row_offset + k_offsets * attn_stride_h,
+                        mask=k_mask,
+                        other=0.0,
+                    ),
+                    0,
+                )
+                w = tl.load(
+                    qkv_weight_ptr
+                    + k_offsets[:, None] * qkv_weight_stride_i
+                    + qkv_cols[None, :] * qkv_weight_stride_o,
+                    mask=k_mask[:, None] & qkv_mask[None, :],
+                    other=0.0,
+                )
+                qkv_acc_tc = tl.dot(x, w, acc=qkv_acc_tc)
+            else:
+                x = tl.load(
+                    attn_ptr + attn_row_offset + k_offsets * attn_stride_h,
+                    mask=k_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                w = tl.load(
+                    qkv_weight_ptr
+                    + qkv_cols[:, None] * qkv_weight_stride_o
+                    + k_offsets[None, :] * qkv_weight_stride_i,
+                    mask=qkv_mask[:, None] & k_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                qkv_acc += tl.sum(w * x[None, :], axis=1)
 
         tl.store(
             qkv_scratch_ptr + qkv_row_offset + qkv_cols * qkv_scratch_stride_h,
-            qkv_acc,
+            tl.sum(qkv_acc_tc, axis=0) if USE_TC_QKV else qkv_acc,
             mask=qkv_mask,
         )
 
@@ -303,21 +374,14 @@ def _gemma_kernel_a_decode_single_kernel(
             D_HEAD,
         )
 
-        k_first, k_second = _apply_rmsnorm_halves(
-            k_first, k_second, k_norm_weight_ptr, k_denom, D_HEAD
+        k_first, k_second = _apply_rmsnorm_halves_preloaded(
+            k_first, k_second, k_weight_first, k_weight_second, k_denom
         )
-        v_first, v_second = _apply_rmsnorm_halves(
-            v_first, v_second, v_norm_weight_ptr, v_denom, D_HEAD
+        v_first, v_second = _apply_rmsnorm_halves_preloaded(
+            v_first, v_second, v_weight_first, v_weight_second, v_denom
         )
-        k_rope_first, k_rope_second = _apply_neox_rope_halves(
-            k_first,
-            k_second,
-            cos_sin_cache_ptr,
-            position,
-            cos_sin_cache_stride_s,
-            cos_sin_cache_stride_d,
-            D_HEAD,
-        )
+        k_rope_first = k_first.to(tl.float32) * cos - k_second.to(tl.float32) * sin
+        k_rope_second = k_second.to(tl.float32) * cos + k_first.to(tl.float32) * sin
 
         page_idx_in_seq = position // PAGE_SIZE
         token_offset_in_page = position % PAGE_SIZE
@@ -346,121 +410,171 @@ def _gemma_kernel_a_decode_single_kernel(
             mask=d2_mask,
         )
 
-        for q_local_idx in range(q_heads_per_kv):
-            q_head_idx = kv_head_idx * q_heads_per_kv + q_local_idx
-            global_q_row = token_id * N_Q_HEADS + q_head_idx
-            q_first, q_second = _load_half_vectors(
-                qkv_scratch_ptr,
-                q_base_offset,
-                global_q_row,
-                D_HEAD,
-                d2,
-            )
-            q_denom = _compute_rmsnorm_denom(
-                qkv_scratch_ptr,
-                q_base_offset,
-                global_q_row,
-                D_HEAD,
-                eps,
-                D_HEAD,
-            )
-            q_first, q_second = _apply_rmsnorm_halves(
-                q_first, q_second, q_norm_weight_ptr, q_denom, D_HEAD
-            )
-            q_rope_first, q_rope_second = _apply_neox_rope_halves(
-                q_first,
-                q_second,
-                cos_sin_cache_ptr,
-                position,
-                cos_sin_cache_stride_s,
-                cos_sin_cache_stride_d,
-                D_HEAD,
-            )
+        q_head_indices = kv_head_idx * q_heads_per_kv + q_local_offsets
+        global_q_rows = token_id * N_Q_HEADS + q_head_indices
+        q_first = tl.load(
+            qkv_scratch_ptr + q_base_offset + global_q_rows[:, None] * D_HEAD + d2_offsets[None, :],
+            mask=q_local_offsets[:, None] < q_heads_per_kv,
+            other=0.0,
+        ).to(tl.float32)
+        q_second = tl.load(
+            qkv_scratch_ptr
+            + q_base_offset
+            + global_q_rows[:, None] * D_HEAD
+            + (d2 + d2_offsets)[None, :],
+            mask=q_local_offsets[:, None] < q_heads_per_kv,
+            other=0.0,
+        ).to(tl.float32)
 
-            m_i = float("-inf")
-            l_i = 0.0
-            acc_first = tl.zeros([d2], dtype=tl.float32)
-            acc_second = tl.zeros([d2], dtype=tl.float32)
+        q_var = (tl.sum(q_first * q_first, axis=1) + tl.sum(q_second * q_second, axis=1)) / D_HEAD
+        q_denom = tl.sqrt(q_var + eps)
+        q_first = (q_first / q_denom[:, None]) * q_weight_first[None, :]
+        q_second = (q_second / q_denom[:, None]) * q_weight_second[None, :]
 
-            for page_number in range(MAX_NUM_PAGES):
-                page_valid = page_number < num_pages
-                valid_tokens = tl.where(page_number == (num_pages - 1), last_page_len, PAGE_SIZE)
-                token_offsets = tl.arange(0, PAGE_SIZE)
-                token_mask = page_valid & (token_offsets < valid_tokens)
-                page_physical = tl.load(
-                    cache_loc_ptr + page_start + page_number, mask=page_valid, other=0
-                )
-                page_base = (
-                    page_physical.to(tl.int64) * cache_stride_block
-                    + kv_head_idx * cache_stride_head
-                    + token_offsets[:, None].to(tl.int64) * cache_stride_token
-                )
-                k_page_first = tl.load(
-                    kv_cache_ptr + page_base + d2_offsets[None, :],
-                    mask=token_mask[:, None],
-                    other=0.0,
-                ).to(tl.float32)
-                k_page_second = tl.load(
-                    kv_cache_ptr + page_base + d2 + d2_offsets[None, :],
-                    mask=token_mask[:, None],
-                    other=0.0,
-                ).to(tl.float32)
-                v_page = tl.load(
-                    kv_cache_ptr + page_base + cache_stride_kv + d2_offsets[None, :],
-                    mask=token_mask[:, None] & d2_mask[None, :],
-                    other=0.0,
-                ).to(tl.float32)
-                v_page_second = tl.load(
-                    kv_cache_ptr + page_base + cache_stride_kv + d2 + d2_offsets[None, :],
-                    mask=token_mask[:, None] & d2_mask[None, :],
-                    other=0.0,
-                ).to(tl.float32)
+        q_rope_first = q_first * cos[None, :] - q_second * sin[None, :]
+        q_rope_second = q_second * cos[None, :] + q_first * sin[None, :]
+        if USE_DOT_ATTN:
+            q_rope_first_mat = q_rope_first.to(k_first.dtype)
+            q_rope_second_mat = q_rope_second.to(k_first.dtype)
+
+        m_i = tl.full([q_heads_per_kv], float("-inf"), dtype=tl.float32)
+        l_i = tl.zeros([q_heads_per_kv], dtype=tl.float32)
+        acc_first = tl.zeros([q_heads_per_kv, d2], dtype=tl.float32)
+        acc_second = tl.zeros([q_heads_per_kv, d2], dtype=tl.float32)
+
+        for page_number in range(MAX_NUM_PAGES):
+            page_valid = page_number < num_pages
+            valid_tokens = tl.where(page_number == (num_pages - 1), last_page_len, PAGE_SIZE)
+            token_offsets = tl.arange(0, PAGE_SIZE)
+            token_mask = page_valid & (token_offsets < valid_tokens)
+            page_physical = tl.load(
+                cache_loc_ptr + page_start + page_number, mask=page_valid, other=0
+            )
+            page_base = (
+                page_physical.to(tl.int64) * cache_stride_block
+                + kv_head_idx * cache_stride_head
+                + token_offsets[:, None].to(tl.int64) * cache_stride_token
+            )
+            k_page_first = tl.load(
+                kv_cache_ptr + page_base + d2_offsets[None, :],
+                mask=token_mask[:, None],
+                other=0.0,
+            )
+            k_page_second = tl.load(
+                kv_cache_ptr + page_base + d2 + d2_offsets[None, :],
+                mask=token_mask[:, None],
+                other=0.0,
+            )
+            v_page = tl.load(
+                kv_cache_ptr + page_base + cache_stride_kv + d2_offsets[None, :],
+                mask=token_mask[:, None] & d2_mask[None, :],
+                other=0.0,
+            )
+            v_page_second = tl.load(
+                kv_cache_ptr + page_base + cache_stride_kv + d2 + d2_offsets[None, :],
+                mask=token_mask[:, None] & d2_mask[None, :],
+                other=0.0,
+            )
+            page_has_tokens = tl.sum(token_mask.to(tl.int32), axis=0) > 0
+            if USE_DOT_ATTN:
                 scores = (
-                    tl.sum(k_page_first * q_rope_first[None, :].to(tl.float32), axis=1)
-                    + tl.sum(k_page_second * q_rope_second[None, :].to(tl.float32), axis=1)
+                    tl.dot(q_rope_first_mat, tl.trans(k_page_first))
+                    + tl.dot(q_rope_second_mat, tl.trans(k_page_second))
                 ) * scale
-                scores = tl.where(token_mask, scores, float("-inf"))
-                page_has_tokens = tl.sum(token_mask.to(tl.int32), axis=0) > 0
+                scores = tl.where(token_mask[None, :], scores, float("-inf"))
+                page_m = tl.max(scores, axis=1)
+                new_m = tl.where(page_has_tokens, tl.maximum(m_i, page_m), m_i)
+                alpha = tl.exp(m_i - new_m)
+                probs = tl.where(token_mask[None, :], tl.exp(scores - new_m[:, None]), 0.0)
+                acc_first = tl.dot(
+                    probs.to(v_page.dtype),
+                    v_page,
+                    acc=acc_first * alpha[:, None],
+                )
+                acc_second = tl.dot(
+                    probs.to(v_page_second.dtype),
+                    v_page_second,
+                    acc=acc_second * alpha[:, None],
+                )
+                l_i = l_i * alpha + tl.sum(probs, axis=1)
+            else:
+                k_page_first_f32 = k_page_first.to(tl.float32)
+                k_page_second_f32 = k_page_second.to(tl.float32)
+                v_page_f32 = v_page.to(tl.float32)
+                v_page_second_f32 = v_page_second.to(tl.float32)
+                scores = (
+                    tl.sum(k_page_first_f32[:, None, :] * q_rope_first[None, :, :], axis=2)
+                    + tl.sum(k_page_second_f32[:, None, :] * q_rope_second[None, :, :], axis=2)
+                ) * scale
+                scores = tl.where(token_mask[:, None], scores, float("-inf"))
                 page_m = tl.max(scores, axis=0)
                 new_m = tl.where(page_has_tokens, tl.maximum(m_i, page_m), m_i)
                 alpha = tl.exp(m_i - new_m)
-                probs = tl.where(token_mask, tl.exp(scores - new_m), 0.0)
-                acc_first = acc_first * alpha + tl.sum(probs[:, None] * v_page, axis=0)
-                acc_second = acc_second * alpha + tl.sum(probs[:, None] * v_page_second, axis=0)
+                probs = tl.where(token_mask[:, None], tl.exp(scores - new_m[None, :]), 0.0)
+                acc_first = acc_first * alpha[:, None] + tl.sum(
+                    probs[:, :, None] * v_page_f32[:, None, :], axis=0
+                )
+                acc_second = acc_second * alpha[:, None] + tl.sum(
+                    probs[:, :, None] * v_page_second_f32[:, None, :], axis=0
+                )
                 l_i = l_i * alpha + tl.sum(probs, axis=0)
-                m_i = new_m
+            m_i = new_m
 
-            attn_first = acc_first / l_i
-            attn_second = acc_second / l_i
-            o_proj_col_start = q_head_idx * D_HEAD
+        attn_first = acc_first / l_i[:, None]
+        attn_second = acc_second / l_i[:, None]
 
-            for h_start in range(0, HIDDEN_SIZE, BLOCK_H):
-                hidden_offsets = h_start + h_offsets
-                hidden_mask = hidden_offsets < HIDDEN_SIZE
+        for h_start in range(0, HIDDEN_SIZE, BLOCK_H):
+            hidden_offsets = h_start + h_offsets
+            hidden_mask = hidden_offsets < HIDDEN_SIZE
+            scratch_ptr = (
+                o_proj_scratch_ptr + token_id * scratch_stride_t + hidden_offsets * scratch_stride_h
+            )
+            current = tl.load(scratch_ptr, mask=hidden_mask, other=0.0)
+
+            for q_local_idx in range(q_heads_per_kv):
+                o_proj_col_start = (kv_head_idx * q_heads_per_kv + q_local_idx) * D_HEAD
+                q_local_mask = q_local_offsets == q_local_idx
+                attn_first_local = tl.sum(
+                    tl.where(q_local_mask[:, None], attn_first, 0.0),
+                    axis=0,
+                )
+                attn_second_local = tl.sum(
+                    tl.where(q_local_mask[:, None], attn_second, 0.0),
+                    axis=0,
+                )
                 w_first = tl.load(
                     o_proj_weight_ptr
                     + hidden_offsets[:, None] * o_proj_weight_stride_o
                     + (o_proj_col_start + d2_offsets)[None, :] * o_proj_weight_stride_i,
                     mask=hidden_mask[:, None] & d2_mask[None, :],
                     other=0.0,
-                ).to(tl.float32)
+                )
                 w_second = tl.load(
                     o_proj_weight_ptr
                     + hidden_offsets[:, None] * o_proj_weight_stride_o
                     + (o_proj_col_start + d2 + d2_offsets)[None, :] * o_proj_weight_stride_i,
                     mask=hidden_mask[:, None] & d2_mask[None, :],
                     other=0.0,
-                ).to(tl.float32)
-                partial = tl.sum(w_first * attn_first[None, :], axis=1) + tl.sum(
-                    w_second * attn_second[None, :], axis=1
                 )
-                scratch_ptr = (
-                    o_proj_scratch_ptr
-                    + token_id * scratch_stride_t
-                    + hidden_offsets * scratch_stride_h
-                )
-                current = tl.load(scratch_ptr, mask=hidden_mask, other=0.0)
-                tl.store(scratch_ptr, current + partial, mask=hidden_mask)
+                if USE_TC_OPROJ:
+                    partial_first = tl.dot(
+                        tl.expand_dims(attn_first_local.to(w_first.dtype), 0),
+                        tl.trans(w_first),
+                    )
+                    partial_second = tl.dot(
+                        tl.expand_dims(attn_second_local.to(w_second.dtype), 0),
+                        tl.trans(w_second),
+                    )
+                    partial = tl.sum(partial_first, axis=0) + tl.sum(partial_second, axis=0)
+                else:
+                    w_first_f32 = w_first.to(tl.float32)
+                    w_second_f32 = w_second.to(tl.float32)
+                    partial = tl.sum(w_first_f32 * attn_first_local[None, :], axis=1) + tl.sum(
+                        w_second_f32 * attn_second_local[None, :], axis=1
+                    )
+                current += partial
+
+            tl.store(scratch_ptr, current, mask=hidden_mask)
 
     sumsq_attn = 0.0
     for h_start in range(0, HIDDEN_SIZE, BLOCK_H):
@@ -723,9 +837,38 @@ def triton_gemma_kernel_a_decode(
     page_size = int(kv_cache.shape[3])
     max_seq_with_cache = int(seq_len_with_cache_host.max().item())
     max_num_pages = max(1, (max_seq_with_cache + page_size - 1) // page_size)
+    use_tc_qkv = (
+        hidden_size >= 1024
+        and head_dim >= 128
+        and residual_flat.dtype in (torch.float16, torch.bfloat16)
+    )
+    use_tc_oproj = False
+    use_dot_attn = hidden_size >= 1024 and head_dim >= 128
 
-    block_h = 128 if hidden_size >= 128 else triton.next_power_of_2(hidden_size)
-    block_k = 64 if hidden_size >= 64 else triton.next_power_of_2(hidden_size)
+    block_h = _get_env_int(
+        "AD_GEMMA_KERNEL_A_BLOCK_H",
+        128 if hidden_size >= 128 else triton.next_power_of_2(hidden_size),
+    )
+    block_k = _get_env_int(
+        "AD_GEMMA_KERNEL_A_BLOCK_K",
+        128
+        if hidden_size >= 1024
+        else 64
+        if hidden_size >= 64
+        else triton.next_power_of_2(hidden_size),
+    )
+    block_qkv = _get_env_int("AD_GEMMA_KERNEL_A_BLOCK_QKV", 512 if use_tc_qkv else 128)
+    num_warps = _get_env_int("AD_GEMMA_KERNEL_A_NUM_WARPS", 8 if hidden_size >= 1024 else 4)
+    if "AD_GEMMA_KERNEL_A_USE_TC_PATH" in os.environ:
+        use_tc_override = bool(int(os.environ["AD_GEMMA_KERNEL_A_USE_TC_PATH"]))
+        use_tc_qkv = use_tc_override
+        use_tc_oproj = use_tc_override
+    if "AD_GEMMA_KERNEL_A_USE_TC_QKV" in os.environ:
+        use_tc_qkv = bool(int(os.environ["AD_GEMMA_KERNEL_A_USE_TC_QKV"]))
+    if "AD_GEMMA_KERNEL_A_USE_TC_OPROJ" in os.environ:
+        use_tc_oproj = bool(int(os.environ["AD_GEMMA_KERNEL_A_USE_TC_OPROJ"]))
+    if "AD_GEMMA_KERNEL_A_USE_DOT_ATTN" in os.environ:
+        use_dot_attn = bool(int(os.environ["AD_GEMMA_KERNEL_A_USE_DOT_ATTN"]))
     _gemma_kernel_a_decode_single_kernel[(num_tokens,)](
         residual_flat,
         attn_normed_flat,
@@ -778,10 +921,13 @@ def triton_gemma_kernel_a_decode(
         PAGE_SIZE=page_size,
         MAX_NUM_PAGES=max_num_pages,
         QKV_WIDTH=int(qkv_weight.shape[0]),
-        BLOCK_QKV=128,
+        BLOCK_QKV=block_qkv,
         BLOCK_H=block_h,
         BLOCK_K=block_k,
-        num_warps=4,
+        USE_TC_QKV=use_tc_qkv,
+        USE_TC_OPROJ=use_tc_oproj,
+        USE_DOT_ATTN=use_dot_attn,
+        num_warps=num_warps,
         num_stages=2,
     )
 
