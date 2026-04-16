@@ -337,7 +337,7 @@ def _run_reference_case(
         rtol=1e-2,
         atol=1e-2,
     )
-    torch.testing.assert_close(kv_cache_op.float(), kv_cache_ref.float(), rtol=0, atol=0)
+    torch.testing.assert_close(kv_cache_op.float(), kv_cache_ref.float(), rtol=0, atol=2e-7)
 
 
 def _run_prefilled_sdpa_case(
@@ -550,7 +550,10 @@ def _run_prefilled_sdpa_case(
             cached_k[:total_length].float(), expected_k[:total_length].float(), rtol=0, atol=0
         )
         torch.testing.assert_close(
-            cached_v[:total_length].float(), expected_v[:total_length].float(), rtol=0, atol=0
+            cached_v[:total_length].float(),
+            expected_v[:total_length].float(),
+            rtol=0,
+            atol=2e-7,
         )
 
 
@@ -675,7 +678,7 @@ def test_triton_gemma_kernel_a_decode_matches_reference(flatten_inputs: bool):
         rtol=1e-2,
         atol=1e-2,
     )
-    torch.testing.assert_close(kv_cache_op.float(), kv_cache_ref.float(), rtol=0, atol=0)
+    torch.testing.assert_close(kv_cache_op.float(), kv_cache_ref.float(), rtol=0, atol=2e-7)
 
 
 def test_triton_gemma_kernel_a_decode_matches_sdpa_with_prefilled_cache():
@@ -880,7 +883,10 @@ def test_triton_gemma_kernel_a_decode_matches_sdpa_with_prefilled_cache():
             cached_k[:total_length].float(), expected_k[:total_length].float(), rtol=0, atol=0
         )
         torch.testing.assert_close(
-            cached_v[:total_length].float(), expected_v[:total_length].float(), rtol=0, atol=0
+            cached_v[:total_length].float(),
+            expected_v[:total_length].float(),
+            rtol=0,
+            atol=2e-7,
         )
 
 

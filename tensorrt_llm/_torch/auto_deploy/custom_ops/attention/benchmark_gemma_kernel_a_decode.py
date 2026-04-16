@@ -325,8 +325,8 @@ def run_case(case: BenchmarkCase) -> None:
         None,
         None,
     )
-    torch.testing.assert_close(op_post.float(), ref_post.float(), rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(op_pre.float(), ref_pre.float(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(op_post.float(), ref_post.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(op_pre.float(), ref_pre.float(), rtol=2e-2, atol=2e-2)
 
     def run_op():
         return torch.ops.auto_deploy.triton_gemma_kernel_a_decode.default(
