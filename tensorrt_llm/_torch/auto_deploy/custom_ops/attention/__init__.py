@@ -30,6 +30,7 @@ __all__ = [
     "torch_attention",
     "torch_backend_attention",
     "flashinfer_attention",
+    "triton_gemma_kernel_a_decode",
     "trtllm_attention",
     "triton_attention",
     "triton_attention_with_kv_cache",
