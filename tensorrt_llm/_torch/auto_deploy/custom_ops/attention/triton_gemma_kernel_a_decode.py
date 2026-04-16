@@ -100,85 +100,6 @@ def _load_half_vectors(
 
 
 @triton.jit
-def _apply_rmsnorm_halves(
-    first,
-    second,
-    weight_ptr,
-    denom,
-    D_HEAD: tl.constexpr,
-):
-    half_d: tl.constexpr = D_HEAD // 2
-    half_offsets = tl.arange(0, half_d)
-    half_mask = half_offsets < half_d
-    weight_first = tl.load(weight_ptr + half_offsets, mask=half_mask, other=0.0).to(tl.float32)
-    weight_second = tl.load(weight_ptr + half_d + half_offsets, mask=half_mask, other=0.0).to(
-        tl.float32
-    )
-    first_f32 = first.to(tl.float32)
-    second_f32 = second.to(tl.float32)
-    out_first = ((first_f32 / denom) * weight_first).to(first.dtype)
-    out_second = ((second_f32 / denom) * weight_second).to(second.dtype)
-    return out_first, out_second
-
-
-@triton.jit
-def _apply_rmsnorm_halves_preloaded(
-    first,
-    second,
-    weight_first,
-    weight_second,
-    denom,
-):
-    first_f32 = first.to(tl.float32)
-    second_f32 = second.to(tl.float32)
-    out_first = ((first_f32 / denom) * weight_first).to(first.dtype)
-    out_second = ((second_f32 / denom) * weight_second).to(second.dtype)
-    return out_first, out_second
-
-
-@triton.jit
-def _compute_rmsnorm_denom(
-    scratch_ptr,
-    base_offset,
-    global_row_idx,
-    row_stride,
-    eps,
-    D_HEAD: tl.constexpr,
-):
-    offsets = tl.arange(0, D_HEAD)
-    x = tl.load(
-        scratch_ptr + base_offset + global_row_idx * row_stride + offsets,
-        mask=offsets < D_HEAD,
-        other=0.0,
-    )
-    xf = x.to(tl.float32)
-    var = tl.sum(xf * xf, axis=0) * float(1.0 / D_HEAD)
-    return tl.sqrt(var + eps)
-
-
-@triton.jit
-def _apply_neox_rope_halves(
-    first,
-    second,
-    cos_sin_cache_ptr,
-    position,
-    cache_stride_s,
-    cache_stride_d,
-    D_HEAD: tl.constexpr,
-):
-    d2: tl.constexpr = D_HEAD // 2
-    d2_offsets = tl.arange(0, d2)
-    cache_row = position.to(tl.int64) * cache_stride_s
-    cos = tl.load(cos_sin_cache_ptr + cache_row + d2_offsets * cache_stride_d).to(tl.float32)
-    sin = tl.load(cos_sin_cache_ptr + cache_row + (d2_offsets + d2) * cache_stride_d).to(tl.float32)
-    first_f32 = first.to(tl.float32)
-    second_f32 = second.to(tl.float32)
-    out_first = (first_f32 * cos - second_f32 * sin).to(first.dtype)
-    out_second = (second_f32 * cos + first_f32 * sin).to(second.dtype)
-    return out_first, out_second
-
-
-@triton.jit
 def _gemma_kernel_a_decode_single_kernel(
     residual_ptr,
     attn_ptr,
@@ -197,6 +118,7 @@ def _gemma_kernel_a_decode_single_kernel(
     cos_sin_cache_ptr,
     kv_cache_ptr,
     qkv_scratch_ptr,
+    attn_scratch_ptr,
     o_proj_scratch_ptr,
     post_out_ptr,
     pre_out_ptr,
@@ -216,6 +138,8 @@ def _gemma_kernel_a_decode_single_kernel(
     cos_sin_cache_stride_d,
     qkv_scratch_stride_t,
     qkv_scratch_stride_h,
+    attn_scratch_stride_t,
+    attn_scratch_stride_h,
     scratch_stride_t,
     scratch_stride_h,
     post_out_stride_t,
@@ -237,6 +161,7 @@ def _gemma_kernel_a_decode_single_kernel(
     USE_TC_QKV: tl.constexpr,
     USE_TC_OPROJ: tl.constexpr,
     USE_DOT_ATTN: tl.constexpr,
+    USE_ONE_SHOT_OPROJ: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     d2: tl.constexpr = D_HEAD // 2
@@ -331,14 +256,17 @@ def _gemma_kernel_a_decode_single_kernel(
             mask=qkv_mask,
         )
 
-    for h_start in range(0, HIDDEN_SIZE, BLOCK_H):
-        hidden_offsets = h_start + h_offsets
-        hidden_mask = hidden_offsets < HIDDEN_SIZE
-        tl.store(
-            o_proj_scratch_ptr + token_id * scratch_stride_t + hidden_offsets * scratch_stride_h,
-            0.0,
-            mask=hidden_mask,
-        )
+    if not USE_ONE_SHOT_OPROJ:
+        for h_start in range(0, HIDDEN_SIZE, BLOCK_H):
+            hidden_offsets = h_start + h_offsets
+            hidden_mask = hidden_offsets < HIDDEN_SIZE
+            tl.store(
+                o_proj_scratch_ptr
+                + token_id * scratch_stride_t
+                + hidden_offsets * scratch_stride_h,
+                0.0,
+                mask=hidden_mask,
+            )
 
     for kv_head_idx in range(N_KV_HEADS):
         global_k_row = token_id * N_KV_HEADS + kv_head_idx
@@ -357,29 +285,23 @@ def _gemma_kernel_a_decode_single_kernel(
             D_HEAD,
             d2,
         )
-        k_denom = _compute_rmsnorm_denom(
-            qkv_scratch_ptr,
-            k_base_offset,
-            global_k_row,
-            D_HEAD,
-            eps,
-            D_HEAD,
-        )
-        v_denom = _compute_rmsnorm_denom(
-            qkv_scratch_ptr,
-            v_base_offset,
-            global_k_row,
-            D_HEAD,
-            eps,
-            D_HEAD,
-        )
+        k_first_f32 = k_first.to(tl.float32)
+        k_second_f32 = k_second.to(tl.float32)
+        v_first_f32 = v_first.to(tl.float32)
+        v_second_f32 = v_second.to(tl.float32)
+        k_var = (
+            tl.sum(k_first_f32 * k_first_f32, axis=0) + tl.sum(k_second_f32 * k_second_f32, axis=0)
+        ) / D_HEAD
+        v_var = (
+            tl.sum(v_first_f32 * v_first_f32, axis=0) + tl.sum(v_second_f32 * v_second_f32, axis=0)
+        ) / D_HEAD
+        k_inv_denom = tl.rsqrt(k_var + eps)
+        v_inv_denom = tl.rsqrt(v_var + eps)
 
-        k_first, k_second = _apply_rmsnorm_halves_preloaded(
-            k_first, k_second, k_weight_first, k_weight_second, k_denom
-        )
-        v_first, v_second = _apply_rmsnorm_halves_preloaded(
-            v_first, v_second, v_weight_first, v_weight_second, v_denom
-        )
+        k_first = (k_first_f32 * k_inv_denom * k_weight_first).to(k_first.dtype)
+        k_second = (k_second_f32 * k_inv_denom * k_weight_second).to(k_second.dtype)
+        v_first = (v_first_f32 * v_inv_denom * v_weight_first).to(v_first.dtype)
+        v_second = (v_second_f32 * v_inv_denom * v_weight_second).to(v_second.dtype)
         k_rope_first = k_first.to(tl.float32) * cos - k_second.to(tl.float32) * sin
         k_rope_second = k_second.to(tl.float32) * cos + k_first.to(tl.float32) * sin
 
@@ -523,69 +445,150 @@ def _gemma_kernel_a_decode_single_kernel(
         attn_first = acc_first / l_i[:, None]
         attn_second = acc_second / l_i[:, None]
 
+        if USE_ONE_SHOT_OPROJ:
+            attn_head_offsets = q_head_indices[:, None] * D_HEAD + d2_offsets[None, :]
+            attn_row_offset = token_id * attn_scratch_stride_t
+            attn_mask = q_local_offsets[:, None] < q_heads_per_kv
+            tl.store(
+                attn_scratch_ptr + attn_row_offset + attn_head_offsets * attn_scratch_stride_h,
+                attn_first.to(k_first.dtype),
+                mask=attn_mask,
+            )
+            tl.store(
+                attn_scratch_ptr
+                + attn_row_offset
+                + (q_head_indices[:, None] * D_HEAD + d2 + d2_offsets[None, :])
+                * attn_scratch_stride_h,
+                attn_second.to(k_second.dtype),
+                mask=attn_mask,
+            )
+        else:
+            for h_start in range(0, HIDDEN_SIZE, BLOCK_H):
+                hidden_offsets = h_start + h_offsets
+                hidden_mask = hidden_offsets < HIDDEN_SIZE
+                scratch_ptr = (
+                    o_proj_scratch_ptr
+                    + token_id * scratch_stride_t
+                    + hidden_offsets * scratch_stride_h
+                )
+                current = tl.load(scratch_ptr, mask=hidden_mask, other=0.0)
+
+                for q_local_idx in range(q_heads_per_kv):
+                    o_proj_col_start = (kv_head_idx * q_heads_per_kv + q_local_idx) * D_HEAD
+                    q_local_mask = q_local_offsets == q_local_idx
+                    attn_first_local = tl.sum(
+                        tl.where(q_local_mask[:, None], attn_first, 0.0),
+                        axis=0,
+                    )
+                    attn_second_local = tl.sum(
+                        tl.where(q_local_mask[:, None], attn_second, 0.0),
+                        axis=0,
+                    )
+                    w_first = tl.load(
+                        o_proj_weight_ptr
+                        + hidden_offsets[:, None] * o_proj_weight_stride_o
+                        + (o_proj_col_start + d2_offsets)[None, :] * o_proj_weight_stride_i,
+                        mask=hidden_mask[:, None] & d2_mask[None, :],
+                        other=0.0,
+                    )
+                    w_second = tl.load(
+                        o_proj_weight_ptr
+                        + hidden_offsets[:, None] * o_proj_weight_stride_o
+                        + (o_proj_col_start + d2 + d2_offsets)[None, :] * o_proj_weight_stride_i,
+                        mask=hidden_mask[:, None] & d2_mask[None, :],
+                        other=0.0,
+                    )
+                    if USE_TC_OPROJ:
+                        partial_first = tl.dot(
+                            tl.expand_dims(attn_first_local.to(w_first.dtype), 0),
+                            tl.trans(w_first),
+                        )
+                        partial_second = tl.dot(
+                            tl.expand_dims(attn_second_local.to(w_second.dtype), 0),
+                            tl.trans(w_second),
+                        )
+                        partial = tl.sum(partial_first, axis=0) + tl.sum(partial_second, axis=0)
+                    else:
+                        w_first_f32 = w_first.to(tl.float32)
+                        w_second_f32 = w_second.to(tl.float32)
+                        partial = tl.sum(w_first_f32 * attn_first_local[None, :], axis=1) + tl.sum(
+                            w_second_f32 * attn_second_local[None, :], axis=1
+                        )
+                    current += partial
+
+                tl.store(scratch_ptr, current, mask=hidden_mask)
+
+    sumsq_attn = 0.0
+    if USE_ONE_SHOT_OPROJ:
+        o_proj_offsets = tl.arange(0, BLOCK_QKV)
+        attn_row_offset = token_id * attn_scratch_stride_t
+        q_width: tl.constexpr = N_Q_HEADS * D_HEAD
         for h_start in range(0, HIDDEN_SIZE, BLOCK_H):
             hidden_offsets = h_start + h_offsets
             hidden_mask = hidden_offsets < HIDDEN_SIZE
-            scratch_ptr = (
-                o_proj_scratch_ptr + token_id * scratch_stride_t + hidden_offsets * scratch_stride_h
-            )
-            current = tl.load(scratch_ptr, mask=hidden_mask, other=0.0)
+            if USE_TC_OPROJ:
+                o_proj_acc_tc = tl.zeros([1, BLOCK_H], dtype=tl.float32)
+            else:
+                o_proj_acc = tl.zeros([BLOCK_H], dtype=tl.float32)
 
-            for q_local_idx in range(q_heads_per_kv):
-                o_proj_col_start = (kv_head_idx * q_heads_per_kv + q_local_idx) * D_HEAD
-                q_local_mask = q_local_offsets == q_local_idx
-                attn_first_local = tl.sum(
-                    tl.where(q_local_mask[:, None], attn_first, 0.0),
-                    axis=0,
-                )
-                attn_second_local = tl.sum(
-                    tl.where(q_local_mask[:, None], attn_second, 0.0),
-                    axis=0,
-                )
-                w_first = tl.load(
-                    o_proj_weight_ptr
-                    + hidden_offsets[:, None] * o_proj_weight_stride_o
-                    + (o_proj_col_start + d2_offsets)[None, :] * o_proj_weight_stride_i,
-                    mask=hidden_mask[:, None] & d2_mask[None, :],
-                    other=0.0,
-                )
-                w_second = tl.load(
-                    o_proj_weight_ptr
-                    + hidden_offsets[:, None] * o_proj_weight_stride_o
-                    + (o_proj_col_start + d2 + d2_offsets)[None, :] * o_proj_weight_stride_i,
-                    mask=hidden_mask[:, None] & d2_mask[None, :],
-                    other=0.0,
-                )
+            for q_start in range(0, q_width, BLOCK_QKV):
+                q_cols = q_start + o_proj_offsets
+                q_mask = q_cols < q_width
                 if USE_TC_OPROJ:
-                    partial_first = tl.dot(
-                        tl.expand_dims(attn_first_local.to(w_first.dtype), 0),
-                        tl.trans(w_first),
+                    x = tl.expand_dims(
+                        tl.load(
+                            attn_scratch_ptr + attn_row_offset + q_cols * attn_scratch_stride_h,
+                            mask=q_mask,
+                            other=0.0,
+                        ),
+                        0,
                     )
-                    partial_second = tl.dot(
-                        tl.expand_dims(attn_second_local.to(w_second.dtype), 0),
-                        tl.trans(w_second),
+                    w = tl.load(
+                        o_proj_weight_ptr
+                        + q_cols[:, None] * o_proj_weight_stride_i
+                        + hidden_offsets[None, :] * o_proj_weight_stride_o,
+                        mask=q_mask[:, None] & hidden_mask[None, :],
+                        other=0.0,
                     )
-                    partial = tl.sum(partial_first, axis=0) + tl.sum(partial_second, axis=0)
+                    o_proj_acc_tc = tl.dot(x, w, acc=o_proj_acc_tc)
                 else:
-                    w_first_f32 = w_first.to(tl.float32)
-                    w_second_f32 = w_second.to(tl.float32)
-                    partial = tl.sum(w_first_f32 * attn_first_local[None, :], axis=1) + tl.sum(
-                        w_second_f32 * attn_second_local[None, :], axis=1
-                    )
-                current += partial
+                    x = tl.load(
+                        attn_scratch_ptr + attn_row_offset + q_cols * attn_scratch_stride_h,
+                        mask=q_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    w = tl.load(
+                        o_proj_weight_ptr
+                        + hidden_offsets[:, None] * o_proj_weight_stride_o
+                        + q_cols[None, :] * o_proj_weight_stride_i,
+                        mask=hidden_mask[:, None] & q_mask[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                    o_proj_acc += tl.sum(w * x[None, :], axis=1)
 
-            tl.store(scratch_ptr, current, mask=hidden_mask)
-
-    sumsq_attn = 0.0
-    for h_start in range(0, HIDDEN_SIZE, BLOCK_H):
-        hidden_offsets = h_start + h_offsets
-        hidden_mask = hidden_offsets < HIDDEN_SIZE
-        o_block = tl.load(
-            o_proj_scratch_ptr + token_id * scratch_stride_t + hidden_offsets * scratch_stride_h,
-            mask=hidden_mask,
-            other=0.0,
-        )
-        sumsq_attn += tl.sum(o_block * o_block, axis=0)
+            tl.store(
+                o_proj_scratch_ptr
+                + token_id * scratch_stride_t
+                + hidden_offsets * scratch_stride_h,
+                tl.sum(o_proj_acc_tc, axis=0) if USE_TC_OPROJ else o_proj_acc,
+                mask=hidden_mask,
+            )
+            o_block = tl.sum(o_proj_acc_tc, axis=0) if USE_TC_OPROJ else o_proj_acc
+            o_block_f32 = o_block.to(tl.float32)
+            sumsq_attn += tl.sum(o_block_f32 * o_block_f32, axis=0)
+    else:
+        for h_start in range(0, HIDDEN_SIZE, BLOCK_H):
+            hidden_offsets = h_start + h_offsets
+            hidden_mask = hidden_offsets < HIDDEN_SIZE
+            o_block = tl.load(
+                o_proj_scratch_ptr
+                + token_id * scratch_stride_t
+                + hidden_offsets * scratch_stride_h,
+                mask=hidden_mask,
+                other=0.0,
+            )
+            o_block_f32 = o_block.to(tl.float32)
+            sumsq_attn += tl.sum(o_block_f32 * o_block_f32, axis=0)
     inv_rms_attn = tl.rsqrt(sumsq_attn / HIDDEN_SIZE + eps)
 
     sumsq_post = 0.0
@@ -830,6 +833,11 @@ def triton_gemma_kernel_a_decode(
         device=residual_flat.device,
         dtype=residual_flat.dtype,
     )
+    attn_scratch = torch.empty(
+        (num_tokens, q_width),
+        device=residual_flat.device,
+        dtype=residual_flat.dtype,
+    )
     o_proj_scratch = torch.empty(
         (num_tokens, hidden_size), device=residual_flat.device, dtype=torch.float32
     )
@@ -842,8 +850,13 @@ def triton_gemma_kernel_a_decode(
         and head_dim >= 128
         and residual_flat.dtype in (torch.float16, torch.bfloat16)
     )
-    use_tc_oproj = False
+    use_tc_oproj = (
+        hidden_size >= 1024
+        and head_dim >= 128
+        and residual_flat.dtype in (torch.float16, torch.bfloat16)
+    )
     use_dot_attn = hidden_size >= 1024 and head_dim >= 128
+    use_one_shot_oproj = hidden_size >= 1024 and head_dim >= 128
 
     block_h = _get_env_int(
         "AD_GEMMA_KERNEL_A_BLOCK_H",
@@ -859,6 +872,7 @@ def triton_gemma_kernel_a_decode(
     )
     block_qkv = _get_env_int("AD_GEMMA_KERNEL_A_BLOCK_QKV", 512 if use_tc_qkv else 128)
     num_warps = _get_env_int("AD_GEMMA_KERNEL_A_NUM_WARPS", 8 if hidden_size >= 1024 else 4)
+    num_stages = _get_env_int("AD_GEMMA_KERNEL_A_NUM_STAGES", 2)
     if "AD_GEMMA_KERNEL_A_USE_TC_PATH" in os.environ:
         use_tc_override = bool(int(os.environ["AD_GEMMA_KERNEL_A_USE_TC_PATH"]))
         use_tc_qkv = use_tc_override
@@ -869,6 +883,8 @@ def triton_gemma_kernel_a_decode(
         use_tc_oproj = bool(int(os.environ["AD_GEMMA_KERNEL_A_USE_TC_OPROJ"]))
     if "AD_GEMMA_KERNEL_A_USE_DOT_ATTN" in os.environ:
         use_dot_attn = bool(int(os.environ["AD_GEMMA_KERNEL_A_USE_DOT_ATTN"]))
+    if "AD_GEMMA_KERNEL_A_USE_ONE_SHOT_OPROJ" in os.environ:
+        use_one_shot_oproj = bool(int(os.environ["AD_GEMMA_KERNEL_A_USE_ONE_SHOT_OPROJ"]))
     _gemma_kernel_a_decode_single_kernel[(num_tokens,)](
         residual_flat,
         attn_normed_flat,
@@ -887,6 +903,7 @@ def triton_gemma_kernel_a_decode(
         cos_sin_cache,
         kv_cache,
         qkv_scratch,
+        attn_scratch,
         o_proj_scratch,
         post_attn_flat,
         pre_ffn_flat,
@@ -906,6 +923,8 @@ def triton_gemma_kernel_a_decode(
         cos_sin_cache.stride(1),
         qkv_scratch.stride(0),
         qkv_scratch.stride(1),
+        attn_scratch.stride(0),
+        attn_scratch.stride(1),
         o_proj_scratch.stride(0),
         o_proj_scratch.stride(1),
         post_attn_flat.stride(0),
@@ -927,8 +946,9 @@ def triton_gemma_kernel_a_decode(
         USE_TC_QKV=use_tc_qkv,
         USE_TC_OPROJ=use_tc_oproj,
         USE_DOT_ATTN=use_dot_attn,
+        USE_ONE_SHOT_OPROJ=use_one_shot_oproj,
         num_warps=num_warps,
-        num_stages=2,
+        num_stages=num_stages,
     )
 
     return (
