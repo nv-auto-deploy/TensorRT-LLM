@@ -164,6 +164,7 @@ class InstructionBuilder:
         partial_indices: list[int] | None = None,
         is_single: bool = True,
         barrier: tuple[int, int] | None = None,
+        sliding_window: int = 0,
     ) -> None:
         """Add paged attention instruction.
 
@@ -185,7 +186,7 @@ class InstructionBuilder:
         ):
             self._add_instruction(
                 sm_id,
-                [3, kv_head, token_id, ps, pe, pidx, is_single_val],
+                [3, kv_head, token_id, ps, pe, pidx, is_single_val, sliding_window],
                 barrier_count=bc,
                 barrier_id=bid,
             )

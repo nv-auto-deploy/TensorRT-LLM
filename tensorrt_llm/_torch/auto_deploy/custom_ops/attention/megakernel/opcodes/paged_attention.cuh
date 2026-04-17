@@ -51,6 +51,7 @@ __device__ void handle_paged_attn(
     int const page_range_end = instr.field(4);
     int const partial_idx = instr.field(5);
     int const is_single = instr.field(6);
+    int const sliding_window = instr.field(7); // 0 = full attention, >0 = window size
 
     int const warp_id = threadIdx.x / WARP_SIZE;
     int const lane_id = threadIdx.x % WARP_SIZE;
@@ -81,6 +82,17 @@ __device__ void handle_paged_attn(
     int total_pages = gg.cu_num_pages[batch_idx + 1] - page_start;
     int last_pl = gg.last_page_len[batch_idx];
 
+    // Sliding window: compute the earliest visible token position.
+    // Tokens before earliest_visible are masked out (score = -inf → skipped).
+    int position = gg.triton_positions[token_id];
+    int earliest_visible = 0;
+    int earliest_visible_page = 0;
+    if (sliding_window > 0)
+    {
+        earliest_visible = max(0, position - sliding_window + 1);
+        earliest_visible_page = earliest_visible / gg.page_size;
+    }
+
     // Online softmax state
     float m_i = -1e30f;
     float l_i = 0.0f;
@@ -94,6 +106,10 @@ __device__ void handle_paged_attn(
     {
         if (page_num >= total_pages)
             break;
+        // Skip entire pages before the sliding window
+        if (sliding_window > 0 && page_num < earliest_visible_page)
+            continue;
+
         int phys_page = gg.cache_loc[page_start + page_num];
         int valid_tokens = (page_num == total_pages - 1) ? last_pl : gg.page_size;
 
@@ -104,6 +120,10 @@ __device__ void handle_paged_attn(
 
         for (int t = 0; t < valid_tokens; t++)
         {
+            // Skip tokens before the sliding window boundary
+            int global_token_pos = page_num * gg.page_size + t;
+            if (sliding_window > 0 && global_token_pos < earliest_visible)
+                continue;
             int64_t k_off = k_base + (int64_t) t * gg.cache_stride_token;
             int64_t v_off = v_base + (int64_t) t * gg.cache_stride_token;
 
