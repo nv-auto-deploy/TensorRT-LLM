@@ -45,6 +45,8 @@ __device__ void handle_qkv_post(
     int const head_start = instr.field(1);
     int const head_end = instr.field(2);
     int const token_id = instr.field(3);
+    int const shared_kv = instr.field(4); // 1 = K=V sharing (full-attn layers)
+    int const rope_dim = instr.field(5);  // 0 = full RoPE, >0 = proportional (rotate first rope_dim elements)
 
     int const warp_id = threadIdx.x / WARP_SIZE;
     int const lane_id = threadIdx.x % WARP_SIZE;
@@ -54,6 +56,9 @@ __device__ void handle_qkv_post(
     int const consumer_id = warp_id - FIRST_CONSUMER;
 
     int const half_d = HEAD_DIM / 2; // 128
+    // Proportional RoPE: rotate first rope_dim elements per half, pass-through rest.
+    // rope_dim=0 means full rotation (all half_d elements rotated).
+    int const effective_rope_dim = (rope_dim > 0 && rope_dim < half_d) ? rope_dim : half_d;
 
     // Load per-token metadata
     int position, batch_idx, page_start;
@@ -109,7 +114,7 @@ __device__ void handle_qkv_post(
 
         if (head < NUM_Q_HEADS)
         {
-// ── Q head: RMSNorm + RoPE → Q scratch ──
+            // ── Q head: RMSNorm + RoPE (proportional) → Q scratch ──
 #pragma unroll
             for (int di = 0; di < 4; di++)
             {
@@ -117,10 +122,21 @@ __device__ void handle_qkv_post(
                 int d_second = d_first + half_d;
                 float nf = local_first[di] * inv_rms * gg.q_norm_weight[d_first];
                 float ns = local_second[di] * inv_rms * gg.q_norm_weight[d_second];
-                float cos_d = cos_base[d_first * gg.cos_sin_stride_d];
-                float sin_d = cos_base[(d_first + half_d) * gg.cos_sin_stride_d];
-                float rf = nf * cos_d - ns * sin_d;
-                float rs = ns * cos_d + nf * sin_d;
+                float rf, rs;
+                if (d_first < effective_rope_dim)
+                {
+                    // Rotated dimensions
+                    float cos_d = cos_base[d_first * gg.cos_sin_stride_d];
+                    float sin_d = cos_base[(d_first + half_d) * gg.cos_sin_stride_d];
+                    rf = nf * cos_d - ns * sin_d;
+                    rs = ns * cos_d + nf * sin_d;
+                }
+                else
+                {
+                    // Pass-through (proportional RoPE: unrotated dimensions)
+                    rf = nf;
+                    rs = ns;
+                }
                 int64_t base = (int64_t) token_id * QKV_WIDTH + head_row_start;
                 gg.qkv_scratch[base + d_first] = __float2bfloat16(rf);
                 gg.qkv_scratch[base + d_second] = __float2bfloat16(rs);
@@ -128,9 +144,10 @@ __device__ void handle_qkv_post(
         }
         else if (head < NUM_Q_HEADS + NUM_KV_HEADS)
         {
-            // ── K head: RMSNorm + RoPE → paged KV cache (K slot) ──
+            // ── K head: RMSNorm + RoPE (proportional) → paged KV cache (K slot) ──
+            // If shared_kv=1: also write to V slot (K=V sharing for full-attn layers)
             int kv_head_idx = head - NUM_Q_HEADS;
-            int64_t cache_base = (int64_t) phys_page * gg.cache_stride_block + 0 * gg.cache_stride_kv
+            int64_t k_cache_base = (int64_t) phys_page * gg.cache_stride_block + 0 * gg.cache_stride_kv
                 + (int64_t) kv_head_idx * gg.cache_stride_head + (int64_t) tok_in_page * gg.cache_stride_token;
 
 #pragma unroll
@@ -140,17 +157,40 @@ __device__ void handle_qkv_post(
                 int d_second = d_first + half_d;
                 float nf = local_first[di] * inv_rms * gg.k_norm_weight[d_first];
                 float ns = local_second[di] * inv_rms * gg.k_norm_weight[d_second];
-                float cos_d = cos_base[d_first * gg.cos_sin_stride_d];
-                float sin_d = cos_base[(d_first + half_d) * gg.cos_sin_stride_d];
-                float rf = nf * cos_d - ns * sin_d;
-                float rs = ns * cos_d + nf * sin_d;
-                gg.kv_cache[cache_base + d_first] = __float2bfloat16(rf);
-                gg.kv_cache[cache_base + d_second] = __float2bfloat16(rs);
+                float rf, rs;
+                if (d_first < effective_rope_dim)
+                {
+                    float cos_d = cos_base[d_first * gg.cos_sin_stride_d];
+                    float sin_d = cos_base[(d_first + half_d) * gg.cos_sin_stride_d];
+                    rf = nf * cos_d - ns * sin_d;
+                    rs = ns * cos_d + nf * sin_d;
+                }
+                else
+                {
+                    rf = nf;
+                    rs = ns;
+                }
+                gg.kv_cache[k_cache_base + d_first] = __float2bfloat16(rf);
+                gg.kv_cache[k_cache_base + d_second] = __float2bfloat16(rs);
+
+                // K=V sharing: write normed (pre-RoPE) K values to V cache slot
+                if (shared_kv)
+                {
+                    int64_t v_cache_base = (int64_t) phys_page * gg.cache_stride_block + 1 * gg.cache_stride_kv
+                        + (int64_t) kv_head_idx * gg.cache_stride_head + (int64_t) tok_in_page * gg.cache_stride_token;
+                    // V gets the normed values WITHOUT RoPE
+                    gg.kv_cache[v_cache_base + d_first] = __float2bfloat16(nf);
+                    gg.kv_cache[v_cache_base + d_second] = __float2bfloat16(ns);
+                }
             }
         }
         else
         {
             // ── V head: RMSNorm only → paged KV cache (V slot) ──
+            // Skip if shared_kv=1 (V was already written by K head above)
+            if (shared_kv)
+                continue;
+
             int kv_head_idx = head - NUM_Q_HEADS - NUM_KV_HEADS;
             int64_t cache_base = (int64_t) phys_page * gg.cache_stride_block + 1 * gg.cache_stride_kv
                 + (int64_t) kv_head_idx * gg.cache_stride_head + (int64_t) tok_in_page * gg.cache_stride_token;

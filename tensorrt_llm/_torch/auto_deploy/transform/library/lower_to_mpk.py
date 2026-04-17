@@ -117,6 +117,13 @@ class LowerToMpkConfig(TransformConfig):
             "incrementally as sequences get longer (legacy behavior)."
         ),
     )
+    use_cuda_megakernel: bool = Field(
+        default=False,
+        description=(
+            "Use the CUDA persistent megakernel for decode attention instead of "
+            "Mirage persistent kernels. Requires H100 (sm_90a). No Mirage dependency."
+        ),
+    )
 
 
 @TransformRegistry.register("lower_to_mpk")
@@ -191,7 +198,33 @@ class LowerToMpk(BaseTransform):
             f"{summary['num_partial_steps']} partial steps"
         )
 
-        if not self.config.dry_run_only:
+        if not self.config.dry_run_only and self.config.use_cuda_megakernel:
+            from ...custom_ops.attention.megakernel.megakernel_bridge import (
+                build_megakernel_runtime_callable,
+            )
+
+            runtime_callable = build_megakernel_runtime_callable(
+                plan.to_dict(),
+                source_model=model,
+            )
+            if self.config.prewarm_decode_executors:
+                prewarm = getattr(runtime_callable, "prewarm_decode_executors", None)
+                if callable(prewarm):
+                    prewarm()
+            model = self._wrap_graphmodule_with_runtime_wrapper(
+                model,
+                plan.to_dict(),
+                runtime_callable=runtime_callable,
+            )
+            wrapped_meta = self._get_autodeploy_meta(model)
+            wrapped_meta["mpk_runtime_mode"] = "cuda_megakernel"
+            self._set_autodeploy_meta(model, wrapped_meta)
+            ad_logger.info(
+                "CUDA megakernel decode runtime installed (no Mirage dependency). "
+                "Note: full per-layer megakernel routing is WIP — currently using "
+                "original graph for all batches."
+            )
+        elif not self.config.dry_run_only:
             cache_dir = self._configure_mirage_cache_env()
             runtime_callable = build_gemma_mirage_runtime_callable(
                 plan.to_dict(),

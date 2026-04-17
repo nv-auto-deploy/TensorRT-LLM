@@ -145,14 +145,28 @@ class InstructionBuilder:
         head_ranges: list[tuple[int, int]],
         token_id: int = 0,
         barrier: tuple[int, int] | None = None,
+        shared_kv: bool = False,
+        rope_dim: int = 0,
     ) -> None:
-        """Add QKV post-processing instruction (norms + RoPE + cache write)."""
+        """Add QKV post-processing instruction (norms + RoPE + cache write).
+
+        Args:
+            shared_kv: If True, K values are copied to V cache slot (K=V sharing
+                       for Gemma4 full-attention layers).
+            rope_dim: Number of dimensions per half to rotate. 0 = full rotation
+                      (standard RoPE). >0 = proportional RoPE (e.g., 32 for 25%
+                      of head_dim=256, meaning rotate first 32 of 128 per half).
+        """
         sm_list = list(sm_ids)
         assert len(sm_list) == len(head_ranges)
         bc, bid = barrier if barrier else (0, 0)
+        skv = 1 if shared_kv else 0
         for sm_id, (h_start, h_end) in zip(sm_list, head_ranges):
             self._add_instruction(
-                sm_id, [6, h_start, h_end, token_id], barrier_count=bc, barrier_id=bid
+                sm_id,
+                [6, h_start, h_end, token_id, skv, rope_dim],
+                barrier_count=bc,
+                barrier_id=bid,
             )
 
     def add_paged_attn(

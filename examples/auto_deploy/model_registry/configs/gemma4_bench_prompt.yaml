@@ -1,0 +1,11 @@
+# Benchmark prompt: generate 128 tokens for timing
+prompt:
+  batch_size: 1
+  queries:
+    - messages:
+        - role: user
+          content: "Explain the theory of general relativity in detail."
+      prompt: "Placeholder"
+  sp_kwargs:
+    max_tokens: 128
+    temperature: 0.0
