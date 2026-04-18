@@ -78,7 +78,12 @@ def rope(q, k, cos, sin):
 
 
 def test_full_kernel_a(past_length=128, page_size=16):
-    from launcher import InstructionBuilder, MegakernelLauncher
+    from launcher import (
+        InstructionBuilder,
+        MegakernelLauncher,
+        choose_attention_num_partials,
+        partition_attention_pages,
+    )
 
     torch.manual_seed(42 + past_length)
     dev, dt = "cuda", torch.bfloat16
@@ -159,15 +164,8 @@ def test_full_kernel_a(past_length=128, page_size=16):
     post_out = torch.zeros(1, H, device=dev, dtype=torch.float32)
     pre_out = torch.zeros(1, H, device=dev, dtype=torch.float32)
 
-    # Multi-SM attention scheduling: use multi-SM for all sequences > 2 pages
-    # Single-SM attention wastes 90% of SM bandwidth (only 2/20 warps active).
-    # Multi-SM distributes pages across SMs, then reduces via LSE.
     total_pages = (tl + page_size - 1) // page_size
-    if total_pages > 2:
-        # Target: 2-4 pages per SM-partition
-        num_partials_per_head = min((total_pages + 1) // 2, 16)
-    else:
-        num_partials_per_head = 1
+    num_partials_per_head = choose_attention_num_partials(total_pages)
     use_multi_sm = num_partials_per_head > 1
     total_attn_sms = NKV * num_partials_per_head
     max_partials = total_attn_sms
@@ -196,13 +194,9 @@ def test_full_kernel_a(past_length=128, page_size=16):
         attn_page_ranges = []
         attn_partial_ids = []
         sm_counter = 0
-        pps = (total_pages + num_partials_per_head - 1) // num_partials_per_head
+        ranges = partition_attention_pages(total_pages, num_partials_per_head)
         for kv_h in range(NKV):
-            for pi in range(num_partials_per_head):
-                ps_start = pi * pps
-                ps_end = min(ps_start + pps, total_pages)
-                if ps_start >= total_pages:
-                    break
+            for pi, (ps_start, ps_end) in enumerate(ranges):
                 attn_sm_ids.append(sm_counter)
                 attn_kv_heads.append(kv_h)
                 attn_page_ranges.append((ps_start, ps_end))
@@ -279,7 +273,12 @@ def test_full_kernel_a(past_length=128, page_size=16):
 
 def test_benchmark_kernel_a(past_length=128, page_size=16):
     """Benchmark full Kernel A megakernel vs decomposed."""
-    from launcher import InstructionBuilder, MegakernelLauncher
+    from launcher import (
+        InstructionBuilder,
+        MegakernelLauncher,
+        choose_attention_num_partials,
+        partition_attention_pages,
+    )
 
     torch.manual_seed(42)
     dev, dt = "cuda", torch.bfloat16
@@ -315,13 +314,8 @@ def test_benchmark_kernel_a(past_length=128, page_size=16):
 
     launcher = MegakernelLauncher(num_sms=NUM_SMS)
 
-    # Multi-SM attention scheduling
     total_pages = np_
-    MULTI_SM_THRESHOLD = 16
-    if total_pages > MULTI_SM_THRESHOLD:
-        num_pp = min((total_pages + 7) // 8, 16)
-    else:
-        num_pp = 1
+    num_pp = choose_attention_num_partials(total_pages)
     use_multi = num_pp > 1
     max_part = NKV * num_pp
     partial_scr = (
@@ -338,12 +332,9 @@ def test_benchmark_kernel_a(past_length=128, page_size=16):
         if use_multi:
             sids, khs, prs, pids = [], [], [], []
             sc = 0
-            pps = (total_pages + num_pp - 1) // num_pp
+            ranges = partition_attention_pages(total_pages, num_pp)
             for kh in range(NKV):
-                for pi in range(num_pp):
-                    ps, pe = pi * pps, min(pi * pps + pps, total_pages)
-                    if ps >= total_pages:
-                        break
+                for pi, (ps, pe) in enumerate(ranges):
                     sids.append(sc)
                     khs.append(kh)
                     prs.append((ps, pe))

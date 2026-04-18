@@ -31,21 +31,41 @@ def _source_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+@functools.lru_cache(maxsize=1)
+def _deep_gemm_include_dir() -> Path:
+    repo_root = _source_dir().parents[5]
+    return repo_root / "tensorrt_llm" / "deep_gemm" / "include"
+
+
 def load_megakernel_module() -> Any:
     """JIT-compile and load the megakernel CUDA extension."""
     if "gemma4_megakernel" in _MODULE_CACHE:
         return _MODULE_CACHE["gemma4_megakernel"]
 
+    import hashlib
+
     from torch.utils.cpp_extension import load
 
     src_dir = _source_dir()
+    deep_gemm_include_dir = _deep_gemm_include_dir()
     build_dir = src_dir / "_build"
     build_dir.mkdir(parents=True, exist_ok=True)
 
+    # Hash CUDA source files (excluding _build) to detect changes and force recompilation
+    src_files = [
+        f
+        for f in sorted(src_dir.glob("**/*.cuh")) + sorted(src_dir.glob("**/*.cu"))
+        if "_build" not in str(f)
+    ]
+    hasher = hashlib.md5()
+    for f in src_files:
+        hasher.update(f.read_bytes())
+    src_hash = hasher.hexdigest()[:8]
+
     module = load(
-        name="gemma4_megakernel",
+        name=f"gemma4_megakernel_{src_hash}",
         sources=[str(src_dir / "megakernel_host.cu")],
-        extra_include_paths=[str(src_dir)],
+        extra_include_paths=[str(src_dir), str(deep_gemm_include_dir)],
         extra_cuda_cflags=[
             "-O3",
             "-std=c++17",
@@ -60,6 +80,40 @@ def load_megakernel_module() -> Any:
     return module
 
 
+def choose_attention_num_partials(total_pages: int) -> int:
+    """Choose the multi-SM attention partition count for one KV head.
+
+    Empirically on H100 after the shared-memory page reuse and `cp.async`
+    pipeline work, aggressive partitioning helps only up to a point. Short
+    decode windows still prefer one partial per page, but longer windows now
+    hit a reduction-overhead knee before the old 16-partial cap.
+    """
+    if total_pages <= 2:
+        return 1
+    if total_pages <= 16:
+        return total_pages
+    if total_pages <= 48:
+        return 11
+    return 13
+
+
+def partition_attention_pages(total_pages: int, num_partials: int) -> list[tuple[int, int]]:
+    """Split pages into contiguous non-empty ranges with near-even sizes."""
+    if total_pages <= 0:
+        return []
+    num_partials = max(1, min(num_partials, total_pages))
+    base = total_pages // num_partials
+    remainder = total_pages % num_partials
+    ranges = []
+    start = 0
+    for pi in range(num_partials):
+        size = base + (1 if pi < remainder else 0)
+        end = start + size
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
 class InstructionBuilder:
     """Build per-SM instruction queues for the megakernel.
 
@@ -68,7 +122,7 @@ class InstructionBuilder:
     and a per-SM instruction counter.
     """
 
-    def __init__(self, num_sms: int, max_instructions: int = 64, device: str = "cuda"):
+    def __init__(self, num_sms: int, max_instructions: int = 128, device: str = "cuda"):
         self.num_sms = num_sms
         self.max_instructions = max_instructions
         self.device = device
@@ -334,6 +388,9 @@ class MegakernelLauncher:
         post_attn_out: torch.Tensor | None = None,
         pre_ffn_out: torch.Tensor | None = None,
         partial_attn_scratch: torch.Tensor | None = None,
+        # Pre-allocated barrier/debug tensors (avoids CUDA alloc in hot path)
+        barrier_slots: torch.Tensor | None = None,
+        debug_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Launch the megakernel with Gemma4 globals."""
         import math
@@ -342,12 +399,16 @@ class MegakernelLauncher:
             attn_scale = 1.0 / math.sqrt(256)  # HEAD_DIM
 
         empty = torch.empty(0, device=self.device)
-        barrier_slots = torch.zeros(
-            self.max_barrier_slots,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        debug_output = torch.zeros(self.num_sms, dtype=torch.int32, device=self.device)
+        if barrier_slots is None:
+            barrier_slots = torch.zeros(
+                self.max_barrier_slots, dtype=torch.int32, device=self.device
+            )
+        else:
+            barrier_slots.zero_()
+        if debug_output is None:
+            debug_output = torch.zeros(self.num_sms, dtype=torch.int32, device=self.device)
+        else:
+            debug_output.zero_()
         self._module.launch_gemv_qkv(
             builder.instructions,
             builder.counts,

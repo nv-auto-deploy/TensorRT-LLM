@@ -65,7 +65,11 @@ def _build_kernel_a_instructions(
     rope_dim: int,
 ):
     """Build the instruction stream for one Kernel A decode step."""
-    from .launcher import InstructionBuilder
+    from .launcher import (
+        InstructionBuilder,
+        choose_attention_num_partials,
+        partition_attention_pages,
+    )
 
     builder = InstructionBuilder(num_sms=_NUM_SMS)
     all_sms = range(_NUM_SMS)
@@ -86,22 +90,15 @@ def _build_kernel_a_instructions(
         builder.add_barrier(all_sms, barrier_id=token_id * 10 + 1)
 
         # Phase 2: Attention (multi-SM)
-        if total_pages > 2:
-            num_pp = min((total_pages + 1) // 2, 16)
-        else:
-            num_pp = 1
+        num_pp = choose_attention_num_partials(total_pages)
         use_multi = num_pp > 1
 
         if use_multi:
             sm_ids, kv_heads, page_ranges, partial_ids = [], [], [], []
             sm_counter = 0
-            pps = (total_pages + num_pp - 1) // num_pp
+            ranges = partition_attention_pages(total_pages, num_pp)
             for kv_h in range(_NUM_KV_HEADS):
-                for pi in range(num_pp):
-                    ps_start = pi * pps
-                    ps_end = min(ps_start + pps, total_pages)
-                    if ps_start >= total_pages:
-                        break
+                for pi, (ps_start, ps_end) in enumerate(ranges):
                     sm_ids.append(sm_counter)
                     kv_heads.append(kv_h)
                     page_ranges.append((ps_start, ps_end))
@@ -148,8 +145,9 @@ def _build_kernel_a_instructions(
     return builder, use_multi, max_partials
 
 
-# Lazily initialized launcher (JIT-compiled on first call)
+# Lazily initialized launcher and cached resources
 _launcher = None
+_cached_resources = {}  # keyed by (num_tokens, total_pages, page_size, sliding_window)
 
 
 def _get_launcher():
@@ -159,6 +157,51 @@ def _get_launcher():
 
         _launcher = MegakernelLauncher(num_sms=_NUM_SMS)
     return _launcher
+
+
+def _get_cached_resources(num_tokens, total_pages, page_size, sw, device):
+    """Get or create cached instruction builder + scratch buffers.
+
+    All CUDA allocations happen here on first call. Subsequent calls
+    reuse the cached tensors (no CUDA alloc in the hot path).
+    """
+    key = (num_tokens, total_pages, page_size, sw)
+    if key not in _cached_resources:
+        builder, use_multi, max_partials = _build_kernel_a_instructions(
+            num_tokens=num_tokens,
+            total_pages=total_pages,
+            page_size=page_size,
+            sliding_window=sw,
+            shared_kv=False,
+            rope_dim=0,
+        )
+        hidden_size = _HIDDEN_SIZE
+        dtype = torch.bfloat16
+        scratch = {
+            "builder": builder,
+            "use_multi": use_multi,
+            "max_partials": max_partials,
+            "barrier_slots": torch.zeros(256, dtype=torch.int32, device=device),
+            "debug_output": torch.zeros(_NUM_SMS, dtype=torch.int32, device=device),
+            "qkv_scratch": torch.empty(num_tokens, _QKV_WIDTH, device=device, dtype=dtype),
+            "attn_scratch": torch.empty(num_tokens, _Q_WIDTH, device=device, dtype=dtype),
+            "o_proj_scratch": torch.empty(
+                num_tokens, hidden_size, device=device, dtype=torch.float32
+            ),
+            "post_attn_out": torch.empty(
+                num_tokens, hidden_size, device=device, dtype=torch.float32
+            ),
+            "pre_ffn_out": torch.empty(num_tokens, hidden_size, device=device, dtype=torch.float32),
+            "partial_scr": (
+                torch.zeros(
+                    max_partials, _NUM_Q_HEADS, _HEAD_DIM + 2, device=device, dtype=torch.float32
+                )
+                if use_multi
+                else None
+            ),
+        }
+        _cached_resources[key] = scratch
+    return _cached_resources[key]
 
 
 @torch.library.custom_op(
@@ -191,44 +234,78 @@ def megakernel_gemma_kernel_a_decode(
     sliding_window: Optional[int] = None,
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Execute Gemma's attention half via the persistent CUDA megakernel."""
+    """Execute Gemma's attention half via the persistent CUDA megakernel.
+
+    For decode (num_tokens=1): uses the persistent CUDA megakernel.
+    For prefill (num_tokens>1): falls back to the decomposed reference path.
+    """
     device = residual_in.device
     hidden_size = residual_in.shape[-1]
     num_tokens = residual_in.reshape(-1, hidden_size).shape[0]
     page_size = kv_cache.shape[3]
 
+    # Prefill fallback: megakernel is decode-only (batch_size=1, seq_len=1)
+    if num_tokens > 1:
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_gemma_kernel_a_decode import (
+            _run_reference_kernel_a,
+        )
+
+        original_shape = residual_in.shape
+        ref_post, ref_pre = _run_reference_kernel_a(
+            residual_in.unsqueeze(1) if residual_in.ndim == 2 else residual_in,
+            attn_normed_in.unsqueeze(1) if attn_normed_in.ndim == 2 else attn_normed_in,
+            qkv_weight,
+            o_proj_weight,
+            q_norm_weight.float(),
+            k_norm_weight.float(),
+            v_norm_weight.float(),
+            post_attention_layernorm_weight.float(),
+            pre_feedforward_layernorm_weight.float(),
+            position_ids,
+            cos_sin_cache,
+            batch_info_host,
+            cu_seqlen_host,
+            cu_num_pages,
+            cu_num_pages_host,
+            cache_loc,
+            last_page_len,
+            last_page_len_host,
+            seq_len_with_cache_host,
+            triton_batch_indices,
+            triton_positions,
+            kv_cache,
+            scale,
+            sliding_window,
+            eps,
+        )
+        # Reshape to match the graph's expected shape (same as residual_in)
+        return ref_post.reshape(original_shape), ref_pre.reshape(original_shape)
+
     if scale is None:
         scale = 1.0 / math.sqrt(_HEAD_DIM)
     sw = sliding_window if sliding_window is not None and sliding_window > 0 else 0
 
-    # Compute total pages from metadata
-    max_seq_with_cache = int(seq_len_with_cache_host.max().item())
+    # Compute total pages from host metadata (no device sync)
+    swc = seq_len_with_cache_host
+    if swc.is_cuda:
+        swc = swc.cpu()
+    max_seq_with_cache = int(swc.max())
     total_pages = max(1, (max_seq_with_cache + page_size - 1) // page_size)
 
-    # Build instruction stream
-    builder, use_multi, max_partials = _build_kernel_a_instructions(
-        num_tokens=num_tokens,
-        total_pages=total_pages,
-        page_size=page_size,
-        sliding_window=sw,
-        shared_kv=False,  # TODO: detect from model config
-        rope_dim=0,  # TODO: detect from model config
-    )
+    # Get cached instruction builder + scratch buffers (no CUDA alloc in hot path)
+    cached = _get_cached_resources(num_tokens, total_pages, page_size, sw, device)
+    builder = cached["builder"]
 
-    # Allocate scratch buffers
-    dtype = residual_in.dtype
     flat_residual = residual_in.reshape(num_tokens, hidden_size).contiguous()
     flat_normed = attn_normed_in.reshape(num_tokens, hidden_size).contiguous()
-    qkv_scratch = torch.empty(num_tokens, _QKV_WIDTH, device=device, dtype=dtype)
-    attn_scratch = torch.empty(num_tokens, _Q_WIDTH, device=device, dtype=dtype)
-    o_proj_scratch = torch.empty(num_tokens, hidden_size, device=device, dtype=torch.float32)
-    post_attn_out = torch.empty(num_tokens, hidden_size, device=device, dtype=torch.float32)
-    pre_ffn_out = torch.empty(num_tokens, hidden_size, device=device, dtype=torch.float32)
-    partial_scr = (
-        torch.zeros(max_partials, _NUM_Q_HEADS, _HEAD_DIM + 2, device=device, dtype=torch.float32)
-        if use_multi
-        else None
-    )
+    qkv_scratch = cached["qkv_scratch"]
+    attn_scratch = cached["attn_scratch"]
+    o_proj_scratch = cached["o_proj_scratch"]
+    post_attn_out = cached["post_attn_out"]
+    pre_ffn_out = cached["pre_ffn_out"]
+    partial_scr = cached["partial_scr"]
+    barrier_slots = cached["barrier_slots"]
+    debug_output = cached["debug_output"]
 
     # Launch megakernel
     launcher = _get_launcher()
@@ -236,16 +313,16 @@ def megakernel_gemma_kernel_a_decode(
         builder,
         flat_normed,
         qkv_weight.contiguous(),
-        q_norm_weight,
-        k_norm_weight,
-        v_norm_weight,
+        q_norm_weight.float(),
+        k_norm_weight.float(),
+        v_norm_weight.float(),
         cos_sin_cache,
         kv_cache,
-        cache_loc.to(dtype=torch.int32, device=device),
-        cu_num_pages.to(dtype=torch.int32, device=device),
-        triton_positions.to(dtype=torch.int32, device=device),
-        triton_batch_indices.to(dtype=torch.int32, device=device),
-        last_page_len.to(dtype=torch.int32, device=device),
+        cache_loc,
+        cu_num_pages,
+        triton_positions,
+        triton_batch_indices,
+        last_page_len,
         qkv_scratch,
         attn_scratch,
         eps=eps,
@@ -253,18 +330,27 @@ def megakernel_gemma_kernel_a_decode(
         attn_scale=scale,
         o_proj_weight=o_proj_weight.contiguous(),
         residual=flat_residual,
-        post_attn_norm_weight=post_attention_layernorm_weight,
-        pre_ffn_norm_weight=pre_feedforward_layernorm_weight,
+        post_attn_norm_weight=post_attention_layernorm_weight.float(),
+        pre_ffn_norm_weight=pre_feedforward_layernorm_weight.float(),
         o_proj_scratch=o_proj_scratch,
         post_attn_out=post_attn_out,
         pre_ffn_out=pre_ffn_out,
         partial_attn_scratch=partial_scr,
+        barrier_slots=barrier_slots,
+        debug_output=debug_output,
     )
+
+    # TODO: The megakernel causes illegal memory access when called from the
+    # FX graph in the executor context. This needs debugging with compute-sanitizer.
+    # The graph structure is verified correct (dummy zeros work).
+    # Suspected cause: KV cache page_size=32 (executor default) vs page_size=16
+    # (megakernel test default), or shared memory config not set in child process.
 
     # Convert outputs to bf16 and reshape to match input shape
     original_shape = residual_in.shape
-    post_attn = post_attn_out.to(dtype).reshape(original_shape)
-    pre_ffn = pre_ffn_out.to(dtype).reshape(original_shape)
+    out_dtype = residual_in.dtype
+    post_attn = post_attn_out.to(out_dtype).reshape(original_shape).clone()
+    pre_ffn = pre_ffn_out.to(out_dtype).reshape(original_shape).clone()
 
     return post_attn, pre_ffn
 
