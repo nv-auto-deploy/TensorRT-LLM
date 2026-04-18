@@ -21,6 +21,7 @@ from __future__ import annotations
 import statistics
 
 import torch
+import torch.nn.functional as F
 
 from tensorrt_llm import deep_gemm
 
@@ -75,6 +76,48 @@ def _print_case(name: str, m: int, k: int, n: int) -> None:
         )
 
 
+def _print_grouped_oproj_case() -> None:
+    num_groups = 8
+    group_width = 512
+    hidden_size = 2816
+
+    print(
+        "CASE oproj_grouped_headgroup: "
+        f"groups={num_groups} group_width={group_width} hidden={hidden_size}"
+    )
+
+    attn = torch.randn((1, num_groups * group_width), device="cuda", dtype=torch.bfloat16)
+    weight_nt = torch.randn(
+        (hidden_size, num_groups * group_width), device="cuda", dtype=torch.bfloat16
+    )
+    ref = F.linear(attn, weight_nt).float()
+
+    grouped_a = attn.view(num_groups, 1, group_width).contiguous()
+    grouped_b_nt = (
+        weight_nt.view(hidden_size, num_groups, group_width).permute(1, 0, 2).contiguous()
+    )
+    grouped_out = torch.empty((num_groups, 1, hidden_size), device="cuda", dtype=torch.bfloat16)
+    reduced_fp32 = torch.empty((hidden_size,), device="cuda", dtype=torch.float32)
+    reduced_bf16 = torch.empty((1, hidden_size), device="cuda", dtype=torch.bfloat16)
+    masked_m = torch.ones((num_groups,), device="cuda", dtype=torch.int32)
+
+    def grouped_only() -> None:
+        deep_gemm.m_grouped_bf16_gemm_nt_masked(grouped_a, grouped_b_nt, grouped_out, masked_m, 1)
+
+    def grouped_plus_reduce() -> None:
+        deep_gemm.m_grouped_bf16_gemm_nt_masked(grouped_a, grouped_b_nt, grouped_out, masked_m, 1)
+        torch.sum(grouped_out[:, 0].float(), dim=0, out=reduced_fp32)
+        reduced_bf16.copy_(reduced_fp32.unsqueeze(0).to(torch.bfloat16))
+
+    grouped_plus_reduce()
+    grouped_vs_full = (reduced_bf16.float() - ref).abs()
+    print(
+        f"  grouped_reduce   {_bench_us(grouped_plus_reduce):8.3f} us  "
+        f"max_diff_vs_full={grouped_vs_full.max().item():.6f}"
+    )
+    print(f"  grouped_only     {_bench_us(grouped_only):8.3f} us")
+
+
 def main() -> None:
     if not torch.cuda.is_available():
         return
@@ -89,6 +132,7 @@ def main() -> None:
     print("=" * 72)
     _print_case("qkv", m=1, k=2816, n=8192)
     _print_case("oproj", m=1, k=4096, n=2816)
+    _print_grouped_oproj_case()
     print("=" * 72)
 
 
