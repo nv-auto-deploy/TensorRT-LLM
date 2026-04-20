@@ -52,6 +52,35 @@
 namespace gemma4_megakernel
 {
 
+__device__ __forceinline__ float block_reduce_sum(float value, float* s_reduce, int warp_id, int lane_id)
+{
+#pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+    {
+        value += __shfl_down_sync(0xFFFFFFFF, value, offset);
+    }
+    if (lane_id == 0)
+    {
+        s_reduce[warp_id] = value;
+    }
+    __syncthreads();
+    if (warp_id == 0)
+    {
+        float total = (lane_id < NUM_WARPS) ? s_reduce[lane_id] : 0.0f;
+#pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+        {
+            total += __shfl_down_sync(0xFFFFFFFF, total, offset);
+        }
+        if (lane_id == 0)
+        {
+            s_reduce[0] = total;
+        }
+    }
+    __syncthreads();
+    return s_reduce[0];
+}
+
 __device__ void handle_gemv_oproj(
     MegakernelGlobals const& mg, Gemma4Globals const& gg, Instruction const& instr, int sm_id)
 {
@@ -81,41 +110,46 @@ __device__ void handle_gemv_oproj(
     int const warp_row_start = row_start + warp_id * rows_per_warp;
     int const warp_row_end = min(warp_row_start + rows_per_warp, row_end);
 
-    // 128-bit vectorized dot product for Q_WIDTH=4096
-    // 4096 / (32 lanes × 8 elems) = 16 iterations
+    constexpr int EPL = 8;
+    constexpr int VS = WARP_SIZE * EPL;
+    constexpr int NI = Q_WIDTH / VS;
+
     for (int row = warp_row_start; row < warp_row_end; row++)
     {
         __nv_bfloat16 const* w = gg.o_proj_weight + (int64_t) row * Q_WIDTH;
-        float acc = 0.0f;
-
-        constexpr int EPL = 8;              // elements per lane
-        constexpr int VS = WARP_SIZE * EPL; // 256
-        constexpr int NI = Q_WIDTH / VS;    // 16
+        float sum = 0.0f;
+        float comp = 0.0f;
 
 #pragma unroll
         for (int vi = 0; vi < NI; vi++)
         {
-            int k = vi * VS + lane_id * EPL;
-            uint4 w_vec = *reinterpret_cast<uint4 const*>(&w[k]);
-            uint4 x_vec = *reinterpret_cast<uint4 const*>(&s_input[k]);
+            int const k = vi * VS + lane_id * EPL;
+            uint4 const w_vec = *reinterpret_cast<uint4 const*>(&w[k]);
+            uint4 const x_vec = *reinterpret_cast<uint4 const*>(&s_input[k]);
             __nv_bfloat162 const* w2 = reinterpret_cast<__nv_bfloat162 const*>(&w_vec);
             __nv_bfloat162 const* x2 = reinterpret_cast<__nv_bfloat162 const*>(&x_vec);
 #pragma unroll
             for (int p = 0; p < 4; p++)
             {
-                acc += __low2float(w2[p]) * __low2float(x2[p]) + __high2float(w2[p]) * __high2float(x2[p]);
+                float const prod = __low2float(w2[p]) * __low2float(x2[p]) + __high2float(w2[p]) * __high2float(x2[p]);
+                float const y = prod - comp;
+                float const t = sum + y;
+                comp = (t - sum) - y;
+                sum = t;
             }
         }
+
+        sum = sum - comp;
 
 #pragma unroll
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
         {
-            acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
         }
 
         if (lane_id == 0)
         {
-            gg.o_proj_scratch[(int64_t) token_id * HIDDEN_SIZE + row] = acc;
+            gg.o_proj_scratch[(int64_t) token_id * HIDDEN_SIZE + row] = sum;
         }
     }
 
@@ -129,99 +163,135 @@ __device__ void handle_gemv_oproj(
 // Reads: o_proj_scratch (fp32), residual (bf16), norm weights
 // Writes: post_attn_out (fp32), pre_ffn_out (fp32)
 //
-// This runs on a single SM (or few SMs) because RMSNorm needs
-// the full HIDDEN_SIZE vector for variance computation.
+// Modes:
+//   mode 0: legacy single-SM full epilogue
+//   mode 1: distributed O-proj RMS statistic accumulation
+//   mode 2: distributed post-attention RMSNorm + residual + sumsq(post)
+//   mode 3: distributed pre-FFN RMSNorm
 //
 // Instruction:
 //   word[0] = 7
 //   word[1] = token_id
+//   word[2] = mode
+//   word[3] = row_start (distributed modes)
+//   word[4] = row_end   (distributed modes)
+//   word[5] = num_partials / participating SMs
+//
+// Distributed modes reuse `debug_output` as two float scratch banks:
+//   [0:num_partials) stores O-proj RMS partial sums
+//   [num_partials:2*num_partials) stores post-attention RMS partial sums
 // ──────────────────────────────────────────────────────────────
 __device__ void handle_oproj_post(
     MegakernelGlobals const& mg, Gemma4Globals const& gg, Instruction const& instr, int sm_id)
 {
     int const token_id = instr.field(1);
+    int const mode = instr.field(2);
     int const warp_id = threadIdx.x / WARP_SIZE;
     int const lane_id = threadIdx.x % WARP_SIZE;
     int const tid = threadIdx.x;
 
-    // ALL 20 warps cooperate (was 1 warp → 20x parallelism for memory loads)
     extern __shared__ char smem_raw[];
     float* s_reduce = reinterpret_cast<float*>(smem_raw + SMEM_DATA_OFFSET);
 
     float const* oproj = gg.o_proj_scratch + (int64_t) token_id * HIDDEN_SIZE;
     __nv_bfloat16 const* residual = gg.residual + (int64_t) token_id * HIDDEN_SIZE;
+    float* post_out = gg.post_attn_out + (int64_t) token_id * HIDDEN_SIZE;
+    float* pre_out = gg.pre_ffn_out + (int64_t) token_id * HIDDEN_SIZE;
 
-    // Step 1: Compute sumsq for RMSNorm of O-proj output (all threads participate)
-    float sumsq_attn = 0.0f;
-    for (int h = tid; h < HIDDEN_SIZE; h += THREADS_PER_BLOCK)
+    if (mode == 0)
     {
-        float v = oproj[h];
-        sumsq_attn += v * v;
-    }
-// Warp reduction
-#pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-    {
-        sumsq_attn += __shfl_down_sync(0xFFFFFFFF, sumsq_attn, offset);
-    }
-    if (lane_id == 0)
-        s_reduce[warp_id] = sumsq_attn;
-    __syncthreads();
-    // Final reduction across warps (warp 0)
-    if (warp_id == 0)
-    {
-        float val = (lane_id < NUM_WARPS) ? s_reduce[lane_id] : 0.0f;
-#pragma unroll
-        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+        float sumsq_attn = 0.0f;
+        for (int h = tid; h < HIDDEN_SIZE; h += THREADS_PER_BLOCK)
         {
-            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+            float const v = oproj[h];
+            sumsq_attn += v * v;
         }
-        if (lane_id == 0)
-            s_reduce[0] = val;
-    }
-    __syncthreads();
-    float inv_rms_attn = rsqrtf(s_reduce[0] / HIDDEN_SIZE + gg.eps);
+        float const total_attn = block_reduce_sum(sumsq_attn, s_reduce, warp_id, lane_id);
+        float const inv_rms_attn = rsqrtf(total_attn / HIDDEN_SIZE + gg.eps);
 
-    // Step 2: post_attn = residual + RMSNorm(o_proj) * post_weight + compute sumsq_post
-    float sumsq_post = 0.0f;
-    for (int h = tid; h < HIDDEN_SIZE; h += THREADS_PER_BLOCK)
-    {
-        float o = oproj[h];
-        float r = __bfloat162float(residual[h]);
-        float pw = gg.post_attn_norm_weight[h];
-        float post_val = r + o * inv_rms_attn * pw;
-        gg.post_attn_out[(int64_t) token_id * HIDDEN_SIZE + h] = post_val;
-        sumsq_post += post_val * post_val;
-    }
-// Warp + cross-warp reduction for sumsq_post
-#pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-    {
-        sumsq_post += __shfl_down_sync(0xFFFFFFFF, sumsq_post, offset);
-    }
-    if (lane_id == 0)
-        s_reduce[warp_id] = sumsq_post;
-    __syncthreads();
-    if (warp_id == 0)
-    {
-        float val = (lane_id < NUM_WARPS) ? s_reduce[lane_id] : 0.0f;
-#pragma unroll
-        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+        float sumsq_post = 0.0f;
+        for (int h = tid; h < HIDDEN_SIZE; h += THREADS_PER_BLOCK)
         {
-            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+            float const o = oproj[h];
+            float const r = __bfloat162float(residual[h]);
+            float const pw = gg.post_attn_norm_weight[h];
+            float const post_val = r + o * inv_rms_attn * pw;
+            post_out[h] = post_val;
+            sumsq_post += post_val * post_val;
         }
-        if (lane_id == 0)
-            s_reduce[0] = val;
-    }
-    __syncthreads();
-    float inv_rms_post = rsqrtf(s_reduce[0] / HIDDEN_SIZE + gg.eps);
+        float const total_post = block_reduce_sum(sumsq_post, s_reduce, warp_id, lane_id);
+        float const inv_rms_post = rsqrtf(total_post / HIDDEN_SIZE + gg.eps);
 
-    // Step 3: pre_ffn = RMSNorm(post_attn) * pre_ffn_weight
-    for (int h = tid; h < HIDDEN_SIZE; h += THREADS_PER_BLOCK)
+        for (int h = tid; h < HIDDEN_SIZE; h += THREADS_PER_BLOCK)
+        {
+            float const fw = gg.pre_ffn_norm_weight[h];
+            pre_out[h] = post_out[h] * inv_rms_post * fw;
+        }
+        return;
+    }
+
+    int const row_start = instr.field(3);
+    int const row_end = instr.field(4);
+    int const num_partials = instr.field(5);
+    float* scratch = reinterpret_cast<float*>(mg.debug_output);
+    float* attn_partials = scratch;
+    float* post_partials = scratch + num_partials;
+
+    if (mode == 1)
     {
-        float post_val = gg.post_attn_out[(int64_t) token_id * HIDDEN_SIZE + h];
-        float fw = gg.pre_ffn_norm_weight[h];
-        gg.pre_ffn_out[(int64_t) token_id * HIDDEN_SIZE + h] = post_val * inv_rms_post * fw;
+        float partial = 0.0f;
+        for (int h = row_start + tid; h < row_end; h += THREADS_PER_BLOCK)
+        {
+            float const v = oproj[h];
+            partial += v * v;
+        }
+        float const total = block_reduce_sum(partial, s_reduce, warp_id, lane_id);
+        if (tid == 0)
+        {
+            attn_partials[sm_id] = total;
+        }
+        return;
+    }
+
+    if (mode == 2)
+    {
+        float partial = 0.0f;
+        for (int i = tid; i < num_partials; i += THREADS_PER_BLOCK)
+        {
+            partial += attn_partials[i];
+        }
+        float const total_attn = block_reduce_sum(partial, s_reduce, warp_id, lane_id);
+        float const inv_rms_attn = rsqrtf(total_attn / HIDDEN_SIZE + gg.eps);
+
+        float sumsq_post = 0.0f;
+        for (int h = row_start + tid; h < row_end; h += THREADS_PER_BLOCK)
+        {
+            float const o = oproj[h];
+            float const r = __bfloat162float(residual[h]);
+            float const pw = gg.post_attn_norm_weight[h];
+            float const post_val = r + o * inv_rms_attn * pw;
+            post_out[h] = post_val;
+            sumsq_post += post_val * post_val;
+        }
+        float const total_post = block_reduce_sum(sumsq_post, s_reduce, warp_id, lane_id);
+        if (tid == 0)
+        {
+            post_partials[sm_id] = total_post;
+        }
+        return;
+    }
+
+    float partial = 0.0f;
+    for (int i = tid; i < num_partials; i += THREADS_PER_BLOCK)
+    {
+        partial += post_partials[i];
+    }
+    float const total_post = block_reduce_sum(partial, s_reduce, warp_id, lane_id);
+    float const inv_rms_post = rsqrtf(total_post / HIDDEN_SIZE + gg.eps);
+    for (int h = row_start + tid; h < row_end; h += THREADS_PER_BLOCK)
+    {
+        float const fw = gg.pre_ffn_norm_weight[h];
+        pre_out[h] = post_out[h] * inv_rms_post * fw;
     }
 }
 

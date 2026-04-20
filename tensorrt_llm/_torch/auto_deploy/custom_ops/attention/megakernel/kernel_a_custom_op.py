@@ -41,6 +41,7 @@ _KV_WIDTH = _NUM_KV_HEADS * _HEAD_DIM
 _QKV_WIDTH = _Q_WIDTH + 2 * _KV_WIDTH
 _NUM_SMS = 132
 _TOTAL_HEADS = _NUM_Q_HEADS + 2 * _NUM_KV_HEADS
+_OPROJ_POST_SMS = 32
 
 
 def _dist_rows(total_rows: int, num_sms: int) -> list[tuple[int, int]]:
@@ -74,20 +75,31 @@ def _build_kernel_a_instructions(
     builder = InstructionBuilder(num_sms=_NUM_SMS)
     all_sms = range(_NUM_SMS)
 
+    def add_barrier_noops(active_sms, barrier_id: int) -> None:
+        active_set = set(active_sms)
+        idle_sms = [sm_id for sm_id in all_sms if sm_id not in active_set]
+        if idle_sms:
+            builder.add_noop(idle_sms, barrier=(_NUM_SMS, barrier_id))
+
     for token_id in range(num_tokens):
         # Phase 1a: QKV GEMV
-        builder.add_gemv_qkv(all_sms, _dist_rows(_QKV_WIDTH, _NUM_SMS), token_id=token_id)
-        builder.add_barrier(all_sms, barrier_id=token_id * 10 + 0)
+        builder.add_gemv_qkv(
+            all_sms,
+            _dist_rows(_QKV_WIDTH, _NUM_SMS),
+            token_id=token_id,
+            barrier=(_NUM_SMS, token_id * 10 + 0),
+        )
 
         # Phase 1b: QKV post (norms + RoPE + cache write)
         builder.add_qkv_post(
             range(_TOTAL_HEADS),
             [(h, h + 1) for h in range(_TOTAL_HEADS)],
             token_id=token_id,
+            barrier=(_NUM_SMS, token_id * 10 + 1),
             shared_kv=shared_kv,
             rope_dim=rope_dim,
         )
-        builder.add_barrier(all_sms, barrier_id=token_id * 10 + 1)
+        add_barrier_noops(range(_TOTAL_HEADS), token_id * 10 + 1)
 
         # Phase 2: Attention (multi-SM)
         num_pp = choose_attention_num_partials(total_pages)
@@ -111,9 +123,10 @@ def _build_kernel_a_instructions(
                 page_ranges=page_ranges,
                 partial_indices=partial_ids,
                 is_single=False,
+                barrier=(_NUM_SMS, token_id * 10 + 2),
                 sliding_window=sliding_window,
             )
-            builder.add_barrier(all_sms, barrier_id=token_id * 10 + 2)
+            add_barrier_noops(sm_ids, token_id * 10 + 2)
             partial_starts = [kv_h * num_pp for kv_h in range(_NUM_KV_HEADS)]
             builder.add_attn_reduce(
                 range(_NUM_KV_HEADS),
@@ -121,23 +134,49 @@ def _build_kernel_a_instructions(
                 num_pp,
                 partial_starts=partial_starts,
                 token_id=token_id,
+                barrier=(_NUM_SMS, token_id * 10 + 3),
             )
-            builder.add_barrier(all_sms, barrier_id=token_id * 10 + 3)
+            add_barrier_noops(range(_NUM_KV_HEADS), token_id * 10 + 3)
             next_bid = token_id * 10 + 4
         else:
             builder.add_paged_attn(
                 range(_NUM_KV_HEADS),
                 list(range(_NUM_KV_HEADS)),
                 token_id=token_id,
+                barrier=(_NUM_SMS, token_id * 10 + 2),
                 sliding_window=sliding_window,
             )
-            builder.add_barrier(all_sms, barrier_id=token_id * 10 + 2)
+            add_barrier_noops(range(_NUM_KV_HEADS), token_id * 10 + 2)
             next_bid = token_id * 10 + 3
 
-        # Phase 3: O-proj GEMV + OPROJ_POST
-        builder.add_gemv_oproj(all_sms, _dist_rows(_HIDDEN_SIZE, _NUM_SMS), token_id=token_id)
-        builder.add_barrier(all_sms, barrier_id=next_bid)
-        builder.add_oproj_post(0, token_id=token_id)
+        # Phase 3: O-proj GEMV + distributed OPROJ_POST
+        builder.add_gemv_oproj(
+            all_sms,
+            _dist_rows(_HIDDEN_SIZE, _NUM_SMS),
+            token_id=token_id,
+            barrier=(_NUM_SMS, next_bid),
+        )
+        oproj_post_sms = range(_OPROJ_POST_SMS)
+        oproj_post_rows = _dist_rows(_HIDDEN_SIZE, _OPROJ_POST_SMS)
+        builder.add_oproj_post_stats(
+            oproj_post_sms,
+            oproj_post_rows,
+            token_id=token_id,
+            barrier=(_NUM_SMS, next_bid + 1),
+        )
+        add_barrier_noops(oproj_post_sms, next_bid + 1)
+        builder.add_oproj_post_apply(
+            oproj_post_sms,
+            oproj_post_rows,
+            token_id=token_id,
+            barrier=(_NUM_SMS, next_bid + 2),
+        )
+        add_barrier_noops(oproj_post_sms, next_bid + 2)
+        builder.add_pre_ffn_post(
+            oproj_post_sms,
+            oproj_post_rows,
+            token_id=token_id,
+        )
 
     builder.add_done(all_sms)
 

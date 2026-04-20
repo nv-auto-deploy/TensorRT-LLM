@@ -27,6 +27,10 @@ static constexpr int HIDDEN_SIZE = 2816;
 static constexpr int HEAD_DIM = 256;
 static constexpr int NUM_Q_HEADS = 16;
 static constexpr int NUM_KV_HEADS = 8;
+static constexpr int FFN_INTERMEDIATE = 2112;
+static constexpr int NUM_EXPERTS = 128;
+static constexpr int MOE_TOPK = 8;
+static constexpr int EXPERT_INTERMEDIATE = 704;
 static constexpr int GQA_RATIO = NUM_Q_HEADS / NUM_KV_HEADS; // 2
 static constexpr int Q_WIDTH = NUM_Q_HEADS * HEAD_DIM;       // 4096
 static constexpr int KV_WIDTH = NUM_KV_HEADS * HEAD_DIM;     // 2048
@@ -57,10 +61,10 @@ static constexpr int TOTAL_SMEM = SMEM_PAGE_SIZE * NUM_SMEM_PAGES; // 192 KB
 // Instruction encoding
 // ──────────────────────────────────────────────────────────────
 static constexpr int INSTRUCTION_WORDS = 32; // 128 bytes per instruction
-static constexpr int MAX_INSTRUCTIONS = 64;  // per SM per launch
+static constexpr int MAX_INSTRUCTIONS = 512; // per SM per launch, enough for 30-layer loops
 
 // Instruction preload area at the start of shared memory
-static constexpr int MAX_PRELOAD_INSTRUCTIONS = 16;
+static constexpr int MAX_PRELOAD_INSTRUCTIONS = 24;
 static constexpr int SMEM_INSTR_BYTES = MAX_PRELOAD_INSTRUCTIONS * INSTRUCTION_WORDS * 4; // 2048 bytes
 static constexpr int SMEM_DATA_OFFSET = SMEM_INSTR_BYTES; // Opcode data starts after instructions
 
@@ -68,13 +72,18 @@ static constexpr int SMEM_DATA_OFFSET = SMEM_INSTR_BYTES; // Opcode data starts 
 enum Opcode : int32_t
 {
     OP_NOOP = 0,
-    OP_BARRIER = 1,     // Global SM barrier
-    OP_GEMV_QKV = 2,    // Phase 1: Raw QKV GEMV → scratch
-    OP_QKV_POST = 6,    // Phase 1: Per-head norms + RoPE + cache write (after GEMV barrier)
-    OP_PAGED_ATTN = 3,  // Phase 2: Paged partial attention
-    OP_ATTN_REDUCE = 4, // Phase 2: Attention reduction
-    OP_GEMV_OPROJ = 5,  // Phase 3: Raw O-proj GEMV → scratch
-    OP_OPROJ_POST = 7,  // Phase 3: Norms + residual + pre-FFN norm
+    OP_BARRIER = 1,      // Global SM barrier
+    OP_GEMV_QKV = 2,     // Phase 1: Raw QKV GEMV → scratch
+    OP_QKV_POST = 6,     // Phase 1: Per-head norms + RoPE + cache write (after GEMV barrier)
+    OP_PAGED_ATTN = 3,   // Phase 2: Paged partial attention
+    OP_ATTN_REDUCE = 4,  // Phase 2: Attention reduction
+    OP_GEMV_OPROJ = 5,   // Phase 3: Raw O-proj GEMV → scratch
+    OP_OPROJ_POST = 7,   // Phase 3: Norms + residual + pre-FFN norm
+    OP_FFN_GATEUP = 8,   // Phase 4 / Kernel B: Dense FFN gate+up projection
+    OP_FFN_DOWN = 9,     // Phase 4 / Kernel B: Dense FFN down projection
+    OP_ROUTER_TOPK = 10, // Phase 4 / Kernel B: Router projection + top-k selection
+    OP_MOE = 11,         // Phase 4 / Kernel B: MoE expert execution + merge
+    OP_B_POST = 12,      // Phase 4 / Kernel B: Post-FFN combine + next-layer RMSNorm
     OP_DONE = 255,
 };
 

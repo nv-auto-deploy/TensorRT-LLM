@@ -25,7 +25,11 @@ Instruction stream:
            BARRIER 2
   132 SMs: GEMV_OPROJ    → O-projection to scratch
            BARRIER 3
-    1 SM:  OPROJ_POST    → norms + residual + pre-FFN norm
+   32 SMs: OPROJ_STATS   → distributed RMS(o_proj) partial sums
+           BARRIER 4
+   32 SMs: OPROJ_APPLY   → distributed post-attn norm + residual + RMS(post) partial sums
+           BARRIER 5
+   32 SMs: PREFFN_POST   → distributed pre-FFN RMSNorm
            DONE
 
 Compare post_attn_out and pre_ffn_out against decomposed reference.
@@ -50,6 +54,7 @@ KVW = NKV * D
 QKVW = QW + 2 * KVW
 NUM_SMS = 132
 TH = NQ + 2 * NKV  # 32 total heads
+OPROJ_POST_SMS = 32
 
 
 def dist_rows(n, sms):
@@ -60,6 +65,95 @@ def dist_rows(n, sms):
         r.append((s, s + c))
         s += c
     return r
+
+
+def dist_rows_range(start, end, sms):
+    return [(start + rs, start + re) for rs, re in dist_rows(end - start, sms)]
+
+
+def build_kernel_a_baseline(total_pages, page_size):
+    from launcher import (
+        InstructionBuilder,
+        choose_attention_num_partials,
+        partition_attention_pages,
+    )
+
+    builder = InstructionBuilder(num_sms=NUM_SMS)
+    all_sms = range(NUM_SMS)
+
+    def add_barrier_noops(active_sms, barrier_id):
+        active_set = set(active_sms)
+        idle_sms = [sm_id for sm_id in all_sms if sm_id not in active_set]
+        if idle_sms:
+            builder.add_noop(idle_sms, barrier=(NUM_SMS, barrier_id))
+
+    builder.add_gemv_qkv(all_sms, dist_rows(QKVW, NUM_SMS), token_id=0, barrier=(NUM_SMS, 0))
+    builder.add_qkv_post(
+        range(TH), [(h, h + 1) for h in range(TH)], token_id=0, barrier=(NUM_SMS, 1)
+    )
+    add_barrier_noops(range(TH), 1)
+
+    num_pp = choose_attention_num_partials(total_pages)
+    use_multi = num_pp > 1
+    if use_multi:
+        sids, khs, prs, pids = [], [], [], []
+        sc = 0
+        ranges = partition_attention_pages(total_pages, num_pp)
+        for kh in range(NKV):
+            for pi, (ps, pe) in enumerate(ranges):
+                sids.append(sc)
+                khs.append(kh)
+                prs.append((ps, pe))
+                pids.append(kh * num_pp + pi)
+                sc += 1
+        builder.add_paged_attn(
+            sids,
+            khs,
+            token_id=0,
+            page_ranges=prs,
+            partial_indices=pids,
+            is_single=False,
+            barrier=(NUM_SMS, 2),
+        )
+        add_barrier_noops(sids, 2)
+        pstarts = [kh * num_pp for kh in range(NKV)]
+        builder.add_attn_reduce(
+            range(NKV),
+            list(range(NKV)),
+            num_pp,
+            partial_starts=pstarts,
+            token_id=0,
+            barrier=(NUM_SMS, 3),
+        )
+        add_barrier_noops(range(NKV), 3)
+        next_barrier = 4
+    else:
+        builder.add_paged_attn(range(NKV), list(range(NKV)), token_id=0, barrier=(NUM_SMS, 2))
+        add_barrier_noops(range(NKV), 2)
+        next_barrier = 3
+
+    builder.add_gemv_oproj(
+        all_sms, dist_rows(H, NUM_SMS), token_id=0, barrier=(NUM_SMS, next_barrier)
+    )
+    oproj_post_sms = range(OPROJ_POST_SMS)
+    oproj_post_rows = dist_rows(H, OPROJ_POST_SMS)
+    builder.add_oproj_post_stats(
+        oproj_post_sms,
+        oproj_post_rows,
+        token_id=0,
+        barrier=(NUM_SMS, next_barrier + 1),
+    )
+    add_barrier_noops(oproj_post_sms, next_barrier + 1)
+    builder.add_oproj_post_apply(
+        oproj_post_sms,
+        oproj_post_rows,
+        token_id=0,
+        barrier=(NUM_SMS, next_barrier + 2),
+    )
+    add_barrier_noops(oproj_post_sms, next_barrier + 2)
+    builder.add_pre_ffn_post(oproj_post_sms, oproj_post_rows, token_id=0)
+    builder.add_done(all_sms)
+    return builder, use_multi, num_pp
 
 
 def rms_norm(x, w, eps=1e-6):
@@ -77,13 +171,8 @@ def rope(q, k, cos, sin):
     )
 
 
-def test_full_kernel_a(past_length=128, page_size=16):
-    from launcher import (
-        InstructionBuilder,
-        MegakernelLauncher,
-        choose_attention_num_partials,
-        partition_attention_pages,
-    )
+def test_full_kernel_a(past_length=128, page_size=16, build_fn=build_kernel_a_baseline):
+    from launcher import MegakernelLauncher
 
     torch.manual_seed(42 + past_length)
     dev, dt = "cuda", torch.bfloat16
@@ -165,10 +254,8 @@ def test_full_kernel_a(past_length=128, page_size=16):
     pre_out = torch.zeros(1, H, device=dev, dtype=torch.float32)
 
     total_pages = (tl + page_size - 1) // page_size
-    num_partials_per_head = choose_attention_num_partials(total_pages)
-    use_multi_sm = num_partials_per_head > 1
-    total_attn_sms = NKV * num_partials_per_head
-    max_partials = total_attn_sms
+    builder, use_multi_sm, num_partials_per_head = build_fn(total_pages, page_size)
+    max_partials = NKV * max(num_partials_per_head, 1)
     partial_scr = (
         torch.zeros(max_partials, NQ, D + 2, device=dev, dtype=torch.float32)
         if use_multi_sm
@@ -176,61 +263,6 @@ def test_full_kernel_a(past_length=128, page_size=16):
     )
 
     launcher = MegakernelLauncher(num_sms=NUM_SMS)
-    builder = InstructionBuilder(num_sms=NUM_SMS)
-    all_sms = range(NUM_SMS)
-
-    # Phase 1a: GEMV QKV
-    builder.add_gemv_qkv(all_sms, dist_rows(QKVW, NUM_SMS), token_id=0)
-    builder.add_barrier(all_sms, barrier_id=0)
-
-    # Phase 1b: QKV post
-    builder.add_qkv_post(range(TH), [(h, h + 1) for h in range(TH)], token_id=0)
-    builder.add_barrier(all_sms, barrier_id=1)
-
-    # Phase 2: Attention
-    if use_multi_sm:
-        attn_sm_ids = []
-        attn_kv_heads = []
-        attn_page_ranges = []
-        attn_partial_ids = []
-        sm_counter = 0
-        ranges = partition_attention_pages(total_pages, num_partials_per_head)
-        for kv_h in range(NKV):
-            for pi, (ps_start, ps_end) in enumerate(ranges):
-                attn_sm_ids.append(sm_counter)
-                attn_kv_heads.append(kv_h)
-                attn_page_ranges.append((ps_start, ps_end))
-                attn_partial_ids.append(kv_h * num_partials_per_head + pi)
-                sm_counter += 1
-        builder.add_paged_attn(
-            attn_sm_ids,
-            attn_kv_heads,
-            token_id=0,
-            page_ranges=attn_page_ranges,
-            partial_indices=attn_partial_ids,
-            is_single=False,
-        )
-        builder.add_barrier(all_sms, barrier_id=2)
-        partial_starts = [kv_h * num_partials_per_head for kv_h in range(NKV)]
-        builder.add_attn_reduce(
-            range(NKV),
-            list(range(NKV)),
-            num_partials_per_head,
-            partial_starts=partial_starts,
-            token_id=0,
-        )
-        builder.add_barrier(all_sms, barrier_id=3)
-        next_bid = 4
-    else:
-        builder.add_paged_attn(range(NKV), list(range(NKV)), token_id=0)
-        builder.add_barrier(all_sms, barrier_id=2)
-        next_bid = 3
-
-    # Phase 3: O-proj GEMV + OPROJ_POST
-    builder.add_gemv_oproj(all_sms, dist_rows(H, NUM_SMS), token_id=0)
-    builder.add_barrier(all_sms, barrier_id=next_bid)
-    builder.add_oproj_post(0, token_id=0)
-    builder.add_done(all_sms)
 
     launcher.launch_gemv_qkv(
         builder,
@@ -271,14 +303,9 @@ def test_full_kernel_a(past_length=128, page_size=16):
     return post_max, pre_max
 
 
-def test_benchmark_kernel_a(past_length=128, page_size=16):
+def test_benchmark_kernel_a(past_length=128, page_size=16, build_fn=build_kernel_a_baseline):
     """Benchmark full Kernel A megakernel vs decomposed."""
-    from launcher import (
-        InstructionBuilder,
-        MegakernelLauncher,
-        choose_attention_num_partials,
-        partition_attention_pages,
-    )
+    from launcher import MegakernelLauncher
 
     torch.manual_seed(42)
     dev, dt = "cuda", torch.bfloat16
@@ -315,52 +342,11 @@ def test_benchmark_kernel_a(past_length=128, page_size=16):
     launcher = MegakernelLauncher(num_sms=NUM_SMS)
 
     total_pages = np_
-    num_pp = choose_attention_num_partials(total_pages)
-    use_multi = num_pp > 1
+    builder, use_multi, num_pp = build_fn(total_pages, page_size)
     max_part = NKV * num_pp
     partial_scr = (
         torch.zeros(max_part, NQ, D + 2, device=dev, dtype=torch.float32) if use_multi else None
     )
-
-    def build_instructions():
-        b = InstructionBuilder(num_sms=NUM_SMS)
-        a = range(NUM_SMS)
-        b.add_gemv_qkv(a, dist_rows(QKVW, NUM_SMS), token_id=0)
-        b.add_barrier(a, barrier_id=0)
-        b.add_qkv_post(range(TH), [(h, h + 1) for h in range(TH)], token_id=0)
-        b.add_barrier(a, barrier_id=1)
-        if use_multi:
-            sids, khs, prs, pids = [], [], [], []
-            sc = 0
-            ranges = partition_attention_pages(total_pages, num_pp)
-            for kh in range(NKV):
-                for pi, (ps, pe) in enumerate(ranges):
-                    sids.append(sc)
-                    khs.append(kh)
-                    prs.append((ps, pe))
-                    pids.append(kh * num_pp + pi)
-                    sc += 1
-            b.add_paged_attn(
-                sids, khs, token_id=0, page_ranges=prs, partial_indices=pids, is_single=False
-            )
-            b.add_barrier(a, barrier_id=2)
-            pstarts = [kh * num_pp for kh in range(NKV)]
-            b.add_attn_reduce(
-                range(NKV), list(range(NKV)), num_pp, partial_starts=pstarts, token_id=0
-            )
-            b.add_barrier(a, barrier_id=3)
-            nb = 4
-        else:
-            b.add_paged_attn(range(NKV), list(range(NKV)), token_id=0)
-            b.add_barrier(a, barrier_id=2)
-            nb = 3
-        b.add_gemv_oproj(a, dist_rows(H, NUM_SMS), token_id=0)
-        b.add_barrier(a, barrier_id=nb)
-        b.add_oproj_post(0, token_id=0)
-        b.add_done(a)
-        return b
-
-    builder = build_instructions()
 
     def run_mk():
         launcher.launch_gemv_qkv(

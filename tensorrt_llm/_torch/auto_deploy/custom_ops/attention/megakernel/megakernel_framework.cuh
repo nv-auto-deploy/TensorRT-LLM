@@ -60,8 +60,9 @@ struct GlobalBarrier
 
     __device__ __forceinline__ void arrive_and_wait(int /*sm_id*/, int barrier_id, int expected_count) const
     {
-        atomicAdd(&slots[barrier_id], 1);
+        // Publish all prior global-memory writes before signaling barrier arrival.
         __threadfence();
+        atomicAdd(&slots[barrier_id], 1);
         int32_t volatile* v = reinterpret_cast<int32_t volatile*>(&slots[barrier_id]);
         while (*v < expected_count)
         {
@@ -154,6 +155,25 @@ __device__ void handle_gemv_oproj(
 __device__ void handle_oproj_post(
     MegakernelGlobals const& mg, Gemma4Globals const& gg, Instruction const& instr, int sm_id);
 
+// Phase 4 / Kernel B: Dense FFN gate+up projection
+__device__ void handle_ffn_gateup(
+    MegakernelGlobals const& mg, Gemma4Globals const& gg, Instruction const& instr, int sm_id);
+
+// Phase 4 / Kernel B: Dense FFN down projection
+__device__ void handle_ffn_down(
+    MegakernelGlobals const& mg, Gemma4Globals const& gg, Instruction const& instr, int sm_id);
+
+// Phase 4 / Kernel B: Router projection + top-k selection
+__device__ void handle_router_topk(
+    MegakernelGlobals const& mg, Gemma4Globals const& gg, Instruction const& instr, int sm_id);
+
+// Phase 4 / Kernel B: MoE expert execution + merge
+__device__ void handle_moe(MegakernelGlobals const& mg, Gemma4Globals const& gg, Instruction const& instr, int sm_id);
+
+// Phase 4 / Kernel B: Post-FFN combine + next-layer normalized input
+__device__ void handle_b_post(
+    MegakernelGlobals const& mg, Gemma4Globals const& gg, Instruction const& instr, int sm_id);
+
 // ──────────────────────────────────────────────────────────────
 // Main dispatch loop: the persistent kernel entry point
 // ──────────────────────────────────────────────────────────────
@@ -180,51 +200,76 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 1) megakernel_dispatch(Mega
         s_num_instructions = g.num_instructions_per_sm[sm_id];
     }
     __syncthreads();
-    int const num_instructions = min((int) s_num_instructions, MAX_PRELOAD);
+    int const total_instructions = static_cast<int>(s_num_instructions);
 
-    // All threads cooperate to load instructions (128 bytes each = 32 int32 words)
+    for (int preload_base = 0; preload_base < total_instructions; preload_base += MAX_PRELOAD)
     {
-        int const total_words = num_instructions * INSTRUCTION_WORDS;
-        int32_t const* src = g.instructions + (int64_t) sm_id * MAX_INSTRUCTIONS * INSTRUCTION_WORDS;
-        int32_t* dst = reinterpret_cast<int32_t*>(s_instrs);
-        for (int i = threadIdx.x; i < total_words; i += THREADS_PER_BLOCK)
-        {
-            dst[i] = src[i];
-        }
-    }
-    __syncthreads();
+        int const chunk_instructions = min(total_instructions - preload_base, MAX_PRELOAD);
 
-    for (int i = 0; i < num_instructions; i++)
-    {
-        // Read instruction directly from preloaded shared memory.
-        // All threads read the same words (smem broadcast, no bank conflicts).
-        // No shuffle needed — eliminates 32 __shfl_sync per instruction.
-        Instruction const& sinstr = s_instrs[i];
-        Instruction instr;
-#pragma unroll
-        for (int w = 0; w < 8; w++)
-        { // Only read first 8 words (opcodes use at most 7)
-            instr.words[w] = sinstr.words[w];
-        }
-
-        // Dispatch based on opcode
-        switch (instr.opcode())
+        // All threads cooperate to load one chunk of instructions
+        // (128 bytes each = 32 int32 words) into shared memory.
         {
-        case OP_NOOP: break;
-        case OP_BARRIER: handle_barrier(g, instr, sm_id); break;
-        case OP_GEMV_QKV: handle_gemv_qkv(g, g.gemma, instr, sm_id); break;
-        case OP_QKV_POST: handle_qkv_post(g, g.gemma, instr, sm_id); break;
-        case OP_PAGED_ATTN: handle_paged_attn(g, g.gemma, instr, sm_id); break;
-        case OP_ATTN_REDUCE: handle_attn_reduce(g, g.gemma, instr, sm_id); break;
-        case OP_GEMV_OPROJ: handle_gemv_oproj(g, g.gemma, instr, sm_id); break;
-        case OP_OPROJ_POST: handle_oproj_post(g, g.gemma, instr, sm_id); break;
-        case OP_DONE:
-            if (warp_id == 0 && lane_id == 0 && g.debug_output)
+            int const total_words = chunk_instructions * INSTRUCTION_WORDS;
+            int32_t const* src = g.instructions + (int64_t) sm_id * MAX_INSTRUCTIONS * INSTRUCTION_WORDS
+                + (int64_t) preload_base * INSTRUCTION_WORDS;
+            int32_t* dst = reinterpret_cast<int32_t*>(s_instrs);
+            for (int i = threadIdx.x; i < total_words; i += THREADS_PER_BLOCK)
             {
-                g.debug_output[sm_id] = sm_id + 1;
+                dst[i] = src[i];
             }
-            return;
-        default: break;
+        }
+        __syncthreads();
+
+        for (int i = 0; i < chunk_instructions; i++)
+        {
+            // Read instruction directly from preloaded shared memory.
+            // All threads read the same words (smem broadcast, no bank conflicts).
+            // No shuffle needed — eliminates 32 __shfl_sync per instruction.
+            Instruction const& sinstr = s_instrs[i];
+            Instruction instr;
+#pragma unroll
+            for (int w = 0; w < 8; w++)
+            { // Only read first 8 words (opcodes use at most 7)
+                instr.words[w] = sinstr.words[w];
+            }
+
+            int const tail_barrier_count = sinstr.words[30];
+            int const tail_barrier_id = sinstr.words[31];
+
+            // Dispatch based on opcode
+            switch (instr.opcode())
+            {
+            case OP_NOOP: break;
+            case OP_BARRIER: handle_barrier(g, instr, sm_id); break;
+            case OP_GEMV_QKV: handle_gemv_qkv(g, g.gemma, instr, sm_id); break;
+            case OP_QKV_POST: handle_qkv_post(g, g.gemma, instr, sm_id); break;
+            case OP_PAGED_ATTN: handle_paged_attn(g, g.gemma, instr, sm_id); break;
+            case OP_ATTN_REDUCE: handle_attn_reduce(g, g.gemma, instr, sm_id); break;
+            case OP_GEMV_OPROJ: handle_gemv_oproj(g, g.gemma, instr, sm_id); break;
+            case OP_OPROJ_POST: handle_oproj_post(g, g.gemma, instr, sm_id); break;
+            case OP_FFN_GATEUP: handle_ffn_gateup(g, g.gemma, instr, sm_id); break;
+            case OP_FFN_DOWN: handle_ffn_down(g, g.gemma, instr, sm_id); break;
+            case OP_ROUTER_TOPK: handle_router_topk(g, g.gemma, instr, sm_id); break;
+            case OP_MOE: handle_moe(g, g.gemma, instr, sm_id); break;
+            case OP_B_POST: handle_b_post(g, g.gemma, instr, sm_id); break;
+            case OP_DONE:
+                if (warp_id == 0 && lane_id == 0 && g.debug_output)
+                {
+                    g.debug_output[sm_id] = sm_id + 1;
+                }
+                return;
+            default: break;
+            }
+            __syncthreads();
+
+            if (tail_barrier_count > 0)
+            {
+                if (warp_id == 0 && lane_id == 0)
+                {
+                    g.barrier.arrive_and_wait(sm_id, tail_barrier_id, tail_barrier_count);
+                }
+                __syncthreads();
+            }
         }
         __syncthreads();
     }

@@ -94,7 +94,7 @@ def choose_attention_num_partials(total_pages: int) -> int:
         return total_pages
     if total_pages <= 48:
         return 11
-    return 13
+    return 11
 
 
 def partition_attention_pages(total_pages: int, num_partials: int) -> list[tuple[int, int]]:
@@ -122,7 +122,7 @@ class InstructionBuilder:
     and a per-SM instruction counter.
     """
 
-    def __init__(self, num_sms: int, max_instructions: int = 128, device: str = "cuda"):
+    def __init__(self, num_sms: int, max_instructions: int = 512, device: str = "cuda"):
         self.num_sms = num_sms
         self.max_instructions = max_instructions
         self.device = device
@@ -152,10 +152,15 @@ class InstructionBuilder:
         self._host_counts[sm_id] = idx + 1
         self.counts[sm_id] = idx + 1
 
-    def add_noop(self, sm_ids: list[int] | range) -> None:
+    def add_noop(
+        self,
+        sm_ids: list[int] | range,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
         """Add a no-op instruction to specified SMs."""
+        bc, bid = barrier if barrier else (0, 0)
         for sm_id in sm_ids:
-            self._add_instruction(sm_id, [0])  # OP_NOOP = 0
+            self._add_instruction(sm_id, [0], barrier_count=bc, barrier_id=bid)  # OP_NOOP = 0
 
     def add_barrier(self, sm_ids: list[int] | range, barrier_id: int) -> None:
         """Add a Lamport barrier instruction to specified SMs.
@@ -295,7 +300,251 @@ class InstructionBuilder:
 
     def add_oproj_post(self, sm_id: int, token_id: int = 0) -> None:
         """Add O-proj post-processing (norms + residual). Single SM."""
-        self._add_instruction(sm_id, [7, token_id])  # OP_OPROJ_POST = 7
+        self._add_instruction(sm_id, [7, token_id, 0])  # mode 0 = legacy single-SM path
+
+    def _add_oproj_post_mode(
+        self,
+        sm_ids: list[int] | range,
+        row_ranges: list[tuple[int, int]],
+        token_id: int,
+        mode: int,
+        num_partials: int,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        sm_list = list(sm_ids)
+        assert len(sm_list) == len(row_ranges)
+        bc, bid = barrier if barrier else (0, 0)
+        for sm_id, (row_start, row_end) in zip(sm_list, row_ranges):
+            self._add_instruction(
+                sm_id,
+                [7, token_id, mode, row_start, row_end, num_partials],
+                barrier_count=bc,
+                barrier_id=bid,
+            )
+
+    def add_oproj_post_stats(
+        self,
+        sm_ids: list[int] | range,
+        row_ranges: list[tuple[int, int]],
+        token_id: int = 0,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        """Add distributed O-proj RMS-stat accumulation."""
+        self._add_oproj_post_mode(
+            sm_ids,
+            row_ranges,
+            token_id=token_id,
+            mode=1,
+            num_partials=len(list(sm_ids)),
+            barrier=barrier,
+        )
+
+    def add_oproj_post_apply(
+        self,
+        sm_ids: list[int] | range,
+        row_ranges: list[tuple[int, int]],
+        token_id: int = 0,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        """Add distributed post-attention RMSNorm + residual phase."""
+        self._add_oproj_post_mode(
+            sm_ids,
+            row_ranges,
+            token_id=token_id,
+            mode=2,
+            num_partials=len(list(sm_ids)),
+            barrier=barrier,
+        )
+
+    def add_pre_ffn_post(
+        self,
+        sm_ids: list[int] | range,
+        row_ranges: list[tuple[int, int]],
+        token_id: int = 0,
+    ) -> None:
+        """Add distributed pre-FFN RMSNorm phase."""
+        self._add_oproj_post_mode(
+            sm_ids,
+            row_ranges,
+            token_id=token_id,
+            mode=3,
+            num_partials=len(list(sm_ids)),
+        )
+
+    def add_ffn_gateup(
+        self,
+        sm_ids: list[int] | range,
+        row_ranges: list[tuple[int, int]],
+        token_id: int = 0,
+        layer_id: int = 0,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        """Reserve Kernel B gate/up FFN work in the instruction stream."""
+        sm_list = list(sm_ids)
+        assert len(sm_list) == len(row_ranges)
+        bc, bid = barrier if barrier else (0, 0)
+        for sm_id, (rs, re) in zip(sm_list, row_ranges):
+            self._add_instruction(
+                sm_id,
+                [8, layer_id, rs, re, token_id],
+                barrier_count=bc,
+                barrier_id=bid,
+            )
+
+    def add_ffn_down(
+        self,
+        sm_ids: list[int] | range,
+        row_ranges: list[tuple[int, int]],
+        token_id: int = 0,
+        layer_id: int = 0,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        """Reserve Kernel B down-projection work in the instruction stream."""
+        sm_list = list(sm_ids)
+        assert len(sm_list) == len(row_ranges)
+        bc, bid = barrier if barrier else (0, 0)
+        for sm_id, (rs, re) in zip(sm_list, row_ranges):
+            self._add_instruction(
+                sm_id,
+                [9, layer_id, rs, re, token_id],
+                barrier_count=bc,
+                barrier_id=bid,
+            )
+
+    def add_router_topk(
+        self,
+        sm_ids: list[int] | range,
+        token_id: int = 0,
+        layer_id: int = 0,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        """Reserve Kernel B router/top-k work in the instruction stream."""
+        bc, bid = barrier if barrier else (0, 0)
+        for sm_id in sm_ids:
+            self._add_instruction(
+                sm_id,
+                [10, layer_id, token_id],
+                barrier_count=bc,
+                barrier_id=bid,
+            )
+
+    def add_moe(
+        self,
+        sm_ids: list[int] | range,
+        expert_ranges: list[tuple[int, int]],
+        token_id: int = 0,
+        layer_id: int = 0,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        """Reserve Kernel B MoE expert work in the instruction stream."""
+        sm_list = list(sm_ids)
+        assert len(sm_list) == len(expert_ranges)
+        bc, bid = barrier if barrier else (0, 0)
+        for sm_id, (es, ee) in zip(sm_list, expert_ranges):
+            self._add_instruction(
+                sm_id,
+                [11, layer_id, es, ee, token_id],
+                barrier_count=bc,
+                barrier_id=bid,
+            )
+
+    def add_moe_sharded(
+        self,
+        sm_ids: list[int] | range,
+        slot_indices: list[int],
+        row_ranges: list[tuple[int, int]],
+        token_id: int = 0,
+        mode: int = 0,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        """Add sharded Kernel B MoE work.
+
+        mode 0: expert gate/up rows
+        mode 1: expert down-proj rows
+        """
+        sm_list = list(sm_ids)
+        assert len(sm_list) == len(slot_indices) == len(row_ranges)
+        bc, bid = barrier if barrier else (0, 0)
+        for sm_id, slot_idx, (rs, re) in zip(sm_list, slot_indices, row_ranges):
+            self._add_instruction(
+                sm_id,
+                [11, mode, slot_idx, rs, re, token_id],
+                barrier_count=bc,
+                barrier_id=bid,
+            )
+
+    def add_b_post(
+        self,
+        sm_ids: list[int] | range,
+        token_id: int = 0,
+        layer_id: int = 0,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        """Reserve Kernel B post-processing work in the instruction stream."""
+        bc, bid = barrier if barrier else (0, 0)
+        for sm_id in sm_ids:
+            self._add_instruction(
+                sm_id,
+                [12, token_id, 0],
+                barrier_count=bc,
+                barrier_id=bid,
+            )
+
+    def _add_b_post_mode(
+        self,
+        sm_ids: list[int] | range,
+        row_ranges: list[tuple[int, int]],
+        token_id: int,
+        mode: int,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        sm_list = list(sm_ids)
+        assert len(sm_list) == len(row_ranges)
+        bc, bid = barrier if barrier else (0, 0)
+        num_partials = len(sm_list)
+        for sm_id, (row_start, row_end) in zip(sm_list, row_ranges):
+            self._add_instruction(
+                sm_id,
+                [12, token_id, mode, row_start, row_end, num_partials],
+                barrier_count=bc,
+                barrier_id=bid,
+            )
+
+    def add_b_post_stats(
+        self,
+        sm_ids: list[int] | range,
+        row_ranges: list[tuple[int, int]],
+        token_id: int = 0,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        self._add_b_post_mode(sm_ids, row_ranges, token_id=token_id, mode=1, barrier=barrier)
+
+    def add_b_post_merge(
+        self,
+        sm_ids: list[int] | range,
+        row_ranges: list[tuple[int, int]],
+        token_id: int = 0,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        self._add_b_post_mode(sm_ids, row_ranges, token_id=token_id, mode=2, barrier=barrier)
+
+    def add_b_post_hidden(
+        self,
+        sm_ids: list[int] | range,
+        row_ranges: list[tuple[int, int]],
+        token_id: int = 0,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        self._add_b_post_mode(sm_ids, row_ranges, token_id=token_id, mode=3, barrier=barrier)
+
+    def add_b_post_next_norm(
+        self,
+        sm_ids: list[int] | range,
+        row_ranges: list[tuple[int, int]],
+        token_id: int = 0,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        self._add_b_post_mode(sm_ids, row_ranges, token_id=token_id, mode=4, barrier=barrier)
 
     def add_done(self, sm_ids: list[int] | range) -> None:
         """Add a done instruction (kernel exit) to specified SMs."""
@@ -448,3 +697,87 @@ class MegakernelLauncher:
         result = self.launch(builder)
         torch.cuda.synchronize()
         return result
+
+    def launch_dense_b(
+        self,
+        builder: InstructionBuilder,
+        post_attn_in: torch.Tensor,
+        pre_ffn_in: torch.Tensor,
+        ffn_gate_up_weight: torch.Tensor,
+        ffn_down_weight: torch.Tensor,
+        post_ffn1_norm_weight: torch.Tensor,
+        post_ffn_norm_weight: torch.Tensor,
+        layer_scalar: torch.Tensor,
+        next_input_norm_weight: torch.Tensor,
+        ffn_gate_scratch: torch.Tensor,
+        ffn_up_scratch: torch.Tensor,
+        ffn_down_scratch: torch.Tensor,
+        hidden_out: torch.Tensor,
+        next_attn_normed_out: torch.Tensor,
+        router_proj_weight: torch.Tensor | None = None,
+        router_scale: torch.Tensor | None = None,
+        router_root_size: torch.Tensor | None = None,
+        pre_ffn2_norm_weight: torch.Tensor | None = None,
+        router_topk_weights: torch.Tensor | None = None,
+        router_topk_indices: torch.Tensor | None = None,
+        moe_input_scratch: torch.Tensor | None = None,
+        post_ffn2_norm_weight: torch.Tensor | None = None,
+        moe_w13_stacked_weight: torch.Tensor | None = None,
+        moe_w2_weight: torch.Tensor | None = None,
+        moe_gate_scratch: torch.Tensor | None = None,
+        moe_up_scratch: torch.Tensor | None = None,
+        moe_scratch: torch.Tensor | None = None,
+        eps: float = 1e-6,
+        barrier_slots: torch.Tensor | None = None,
+        debug_output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Launch the dense Kernel B slice on the persistent megakernel."""
+        empty = torch.empty(0, device=self.device)
+        if barrier_slots is None:
+            barrier_slots = torch.zeros(
+                self.max_barrier_slots, dtype=torch.int32, device=self.device
+            )
+        else:
+            barrier_slots.zero_()
+        if debug_output is None:
+            debug_output = torch.zeros(self.num_sms * 5, dtype=torch.int32, device=self.device)
+        else:
+            debug_output.zero_()
+        if moe_scratch is not None:
+            moe_scratch.zero_()
+
+        self._module.launch_dense_b(
+            builder.instructions,
+            builder.counts,
+            barrier_slots,
+            debug_output,
+            self.num_sms,
+            post_attn_in,
+            pre_ffn_in,
+            ffn_gate_up_weight,
+            ffn_down_weight,
+            post_ffn1_norm_weight,
+            post_ffn_norm_weight,
+            layer_scalar,
+            next_input_norm_weight,
+            ffn_gate_scratch,
+            ffn_up_scratch,
+            ffn_down_scratch,
+            hidden_out,
+            next_attn_normed_out,
+            router_proj_weight if router_proj_weight is not None else empty,
+            router_scale if router_scale is not None else empty,
+            router_root_size if router_root_size is not None else empty,
+            pre_ffn2_norm_weight if pre_ffn2_norm_weight is not None else empty,
+            router_topk_weights if router_topk_weights is not None else empty,
+            router_topk_indices if router_topk_indices is not None else empty,
+            moe_input_scratch if moe_input_scratch is not None else empty,
+            post_ffn2_norm_weight if post_ffn2_norm_weight is not None else empty,
+            moe_w13_stacked_weight if moe_w13_stacked_weight is not None else empty,
+            moe_w2_weight if moe_w2_weight is not None else empty,
+            moe_gate_scratch if moe_gate_scratch is not None else empty,
+            moe_up_scratch if moe_up_scratch is not None else empty,
+            moe_scratch if moe_scratch is not None else empty,
+            eps,
+        )
+        return debug_output

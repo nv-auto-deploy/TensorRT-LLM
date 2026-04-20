@@ -19,6 +19,7 @@
 #include "megakernel_framework.cuh"
 #include "opcodes/gemv_oproj.cuh"
 #include "opcodes/gemv_qkv.cuh"
+#include "opcodes/kernel_b_dense.cuh"
 #include "opcodes/paged_attention.cuh"
 #include "opcodes/qkv_post.cuh"
 #include <ATen/cuda/CUDAContext.h>
@@ -162,6 +163,68 @@ torch::Tensor launch_gemv_qkv(torch::Tensor instructions, torch::Tensor num_inst
     return debug_output;
 }
 
+torch::Tensor launch_dense_b(torch::Tensor instructions, torch::Tensor num_instr_per_sm, torch::Tensor barrier_slots,
+    torch::Tensor debug_output, int64_t num_sms, torch::Tensor post_attn_in, torch::Tensor pre_ffn_in,
+    torch::Tensor ffn_gate_up_weight, torch::Tensor ffn_down_weight, torch::Tensor post_ffn1_norm_weight,
+    torch::Tensor post_ffn_norm_weight, torch::Tensor layer_scalar, torch::Tensor next_input_norm_weight,
+    torch::Tensor ffn_gate_scratch, torch::Tensor ffn_up_scratch, torch::Tensor ffn_down_scratch,
+    torch::Tensor hidden_out, torch::Tensor next_attn_normed_out, torch::Tensor router_proj_weight,
+    torch::Tensor router_scale, torch::Tensor router_root_size, torch::Tensor pre_ffn2_norm_weight,
+    torch::Tensor router_topk_weights, torch::Tensor router_topk_indices, torch::Tensor moe_input_scratch,
+    torch::Tensor post_ffn2_norm_weight, torch::Tensor moe_w13_stacked_weight, torch::Tensor moe_w2_weight,
+    torch::Tensor moe_gate_scratch, torch::Tensor moe_up_scratch, torch::Tensor moe_scratch, double eps)
+{
+    gmk::MegakernelGlobals g{};
+    g.instructions = instructions.data_ptr<int32_t>();
+    g.num_instructions_per_sm = num_instr_per_sm.data_ptr<int32_t>();
+    g.barrier.slots = barrier_slots.data_ptr<int32_t>();
+    g.debug_output = debug_output.data_ptr<int32_t>();
+    g.num_sms = static_cast<int32_t>(num_sms);
+
+    auto& gg = g.gemma;
+    gg.b_post_attn_in = post_attn_in.data_ptr<float>();
+    gg.b_pre_ffn_in = pre_ffn_in.data_ptr<float>();
+    gg.ffn_gate_up_weight = reinterpret_cast<__nv_bfloat16 const*>(ffn_gate_up_weight.data_ptr());
+    gg.ffn_down_weight = reinterpret_cast<__nv_bfloat16 const*>(ffn_down_weight.data_ptr());
+    gg.post_ffn1_norm_weight = post_ffn1_norm_weight.data_ptr<float>();
+    gg.post_ffn_norm_weight = post_ffn_norm_weight.data_ptr<float>();
+    gg.layer_scalar = layer_scalar.data_ptr<float>();
+    gg.layer_scalar_size = static_cast<int32_t>(layer_scalar.numel());
+    gg.next_input_norm_weight = next_input_norm_weight.data_ptr<float>();
+    gg.ffn_gate_scratch = reinterpret_cast<__nv_bfloat16*>(ffn_gate_scratch.data_ptr());
+    gg.ffn_up_scratch = reinterpret_cast<__nv_bfloat16*>(ffn_up_scratch.data_ptr());
+    gg.ffn_down_scratch = ffn_down_scratch.data_ptr<float>();
+    gg.hidden_out = hidden_out.data_ptr<float>();
+    gg.next_attn_normed_out = next_attn_normed_out.data_ptr<float>();
+    if (router_proj_weight.numel() > 0)
+    {
+        gg.router_proj_weight = reinterpret_cast<__nv_bfloat16 const*>(router_proj_weight.data_ptr());
+        gg.router_scale = router_scale.data_ptr<float>();
+        gg.router_root_size = router_root_size.data_ptr<float>();
+        gg.pre_ffn2_norm_weight = pre_ffn2_norm_weight.data_ptr<float>();
+        gg.router_topk_weights = router_topk_weights.data_ptr<float>();
+        gg.router_topk_indices = router_topk_indices.data_ptr<int32_t>();
+        gg.moe_input_scratch = reinterpret_cast<__nv_bfloat16*>(moe_input_scratch.data_ptr());
+    }
+    if (moe_w13_stacked_weight.numel() > 0)
+    {
+        gg.post_ffn2_norm_weight = post_ffn2_norm_weight.data_ptr<float>();
+        gg.moe_w13_stacked_weight = reinterpret_cast<__nv_bfloat16 const*>(moe_w13_stacked_weight.data_ptr());
+        gg.moe_w2_weight = reinterpret_cast<__nv_bfloat16 const*>(moe_w2_weight.data_ptr());
+        gg.moe_gate_scratch = reinterpret_cast<__nv_bfloat16*>(moe_gate_scratch.data_ptr());
+        gg.moe_up_scratch = reinterpret_cast<__nv_bfloat16*>(moe_up_scratch.data_ptr());
+        gg.moe_scratch = moe_scratch.data_ptr<float>();
+    }
+    gg.eps = static_cast<float>(eps);
+    gg.num_tokens = static_cast<int32_t>(post_attn_in.size(0));
+
+    configure_smem_once();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    gmk::megakernel_dispatch<<<num_sms, gmk::THREADS_PER_BLOCK, gmk::TOTAL_SMEM, stream>>>(g);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return debug_output;
+}
+
 // ──────────────────────────────────────────────────────────────
 // get_config: Return megakernel configuration as a dict
 // ──────────────────────────────────────────────────────────────
@@ -175,6 +238,7 @@ std::unordered_map<std::string, int64_t> get_config()
         {"instruction_words", gmk::INSTRUCTION_WORDS},
         {"max_instructions", gmk::MAX_INSTRUCTIONS},
         {"hidden_size", gmk::HIDDEN_SIZE},
+        {"ffn_intermediate", gmk::FFN_INTERMEDIATE},
         {"head_dim", gmk::HEAD_DIM},
         {"num_q_heads", gmk::NUM_Q_HEADS},
         {"num_kv_heads", gmk::NUM_KV_HEADS},
@@ -185,6 +249,11 @@ std::unordered_map<std::string, int64_t> get_config()
         {"op_barrier", gmk::OP_BARRIER},
         {"op_gemv_qkv", gmk::OP_GEMV_QKV},
         {"op_qkv_post", gmk::OP_QKV_POST},
+        {"op_ffn_gateup", gmk::OP_FFN_GATEUP},
+        {"op_ffn_down", gmk::OP_FFN_DOWN},
+        {"op_router_topk", gmk::OP_ROUTER_TOPK},
+        {"op_moe", gmk::OP_MOE},
+        {"op_b_post", gmk::OP_B_POST},
         {"op_done", gmk::OP_DONE},
     };
 }
@@ -202,5 +271,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("qkv_scratch"), py::arg("attn_scratch"), py::arg("eps"), py::arg("page_size"), py::arg("attn_scale"),
         py::arg("o_proj_weight"), py::arg("residual"), py::arg("post_attn_norm_weight"), py::arg("pre_ffn_norm_weight"),
         py::arg("o_proj_scratch"), py::arg("post_attn_out"), py::arg("pre_ffn_out"), py::arg("partial_attn_scratch"));
+    m.def("launch_dense_b", &launch_dense_b, "Launch dense Kernel B megakernel slice", py::arg("instructions"),
+        py::arg("num_instr_per_sm"), py::arg("barrier_slots"), py::arg("debug_output"), py::arg("num_sms"),
+        py::arg("post_attn_in"), py::arg("pre_ffn_in"), py::arg("ffn_gate_up_weight"), py::arg("ffn_down_weight"),
+        py::arg("post_ffn1_norm_weight"), py::arg("post_ffn_norm_weight"), py::arg("layer_scalar"),
+        py::arg("next_input_norm_weight"), py::arg("ffn_gate_scratch"), py::arg("ffn_up_scratch"),
+        py::arg("ffn_down_scratch"), py::arg("hidden_out"), py::arg("next_attn_normed_out"),
+        py::arg("router_proj_weight"), py::arg("router_scale"), py::arg("router_root_size"),
+        py::arg("pre_ffn2_norm_weight"), py::arg("router_topk_weights"), py::arg("router_topk_indices"),
+        py::arg("moe_input_scratch"), py::arg("post_ffn2_norm_weight"), py::arg("moe_w13_stacked_weight"),
+        py::arg("moe_w2_weight"), py::arg("moe_gate_scratch"), py::arg("moe_up_scratch"), py::arg("moe_scratch"),
+        py::arg("eps"));
     m.def("get_config", &get_config, "Get megakernel configuration");
 }
