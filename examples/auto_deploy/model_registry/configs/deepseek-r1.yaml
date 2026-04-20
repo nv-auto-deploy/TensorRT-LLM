@@ -32,7 +32,6 @@ transforms:
   fuse_rope_into_trtllm_mla:
     enabled: true
   multi_stream_mla_attn:
-    stage: compile
     enabled: true
   detect_sharding:
     allreduce_strategy: SYMM_MEM
