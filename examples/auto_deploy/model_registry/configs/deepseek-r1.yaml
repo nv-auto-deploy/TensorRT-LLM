@@ -9,6 +9,7 @@ cuda_graph_config:
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 80, 96, 112, 128, 192, 208, 224, 240, 256]
 kv_cache_config:
   tokens_per_block: 32
+  free_gpu_memory_fraction: 0.7
 transforms:
   fuse_gemms_mixed_children:
     enabled: true
