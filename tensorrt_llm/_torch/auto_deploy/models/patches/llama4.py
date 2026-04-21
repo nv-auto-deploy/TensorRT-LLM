@@ -29,7 +29,6 @@ def _forward_with_cond(
     position_ids: Optional[torch.LongTensor] = None,
     past_key_values: Optional[List[torch.FloatTensor]] = None,
     inputs_embeds: Optional[torch.FloatTensor] = None,
-    vision_feature_layer: Optional[Union[int, List[int]]] = None,
     vision_feature_select_strategy: Optional[str] = None,
     labels: Optional[torch.LongTensor] = None,
     use_cache: Optional[bool] = None,
@@ -50,16 +49,6 @@ def _forward_with_cond(
         else self.config.output_hidden_states
     )
     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-    vision_feature_layer = (
-        vision_feature_layer
-        if vision_feature_layer is not None
-        else self.config.vision_config.vision_feature_layer
-    )
-    vision_feature_select_strategy = (
-        vision_feature_select_strategy
-        if vision_feature_select_strategy is not None
-        else self.config.vision_config.vision_feature_select_strategy
-    )
 
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -72,12 +61,14 @@ def _forward_with_cond(
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
     def _vision_branch(inputs_embeds, pixel_values, input_ids):
-        # Updated to match transformers 4.57.1+ signature
-        # get_image_features now takes: (self, pixel_values, vision_feature_select_strategy, **kwargs)
-        image_features = self.get_image_features(
-            pixel_values=pixel_values,
-            vision_feature_select_strategy=vision_feature_select_strategy,
-        )
+        # Call vision_model directly (not self.get_image_features) because the latter
+        # is wrapped by @capture_outputs, which uses ContextVar.set/reset. Dynamo
+        # treats that as mutating a variable from outside the torch.cond branch
+        # ("Mutating a variable from outside the scope of this HOP is not supported").
+        # The vision model's forward is the only thing get_image_features actually
+        # needs, and it is not decorated with capture_outputs.
+        vision_out = self.vision_model(pixel_values)
+        image_features = vision_out.last_hidden_state
 
         vision_flat = image_features.view(-1, image_features.size(-1))
         projected_vision_flat = self.multi_modal_projector(vision_flat).to(

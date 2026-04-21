@@ -6,138 +6,68 @@ produces identical outputs to the original HuggingFace implementation.
 
 import types
 
-import pytest
 import torch
-from test_common.llm_data import hf_id_to_local_model_dir
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import MiniMaxM2Config
+from transformers.models.minimax_m2.modeling_minimax_m2 import MiniMaxM2SparseMoeBlock
 
 # Import custom_ops to register torch.ops.auto_deploy.torch_moe
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.models.patches.minimax_m2 import minimax_m2_moe
 
 
-def _load_minimax_m2_moe_layer(model_name_or_path):
-    """Load the MoE layer from MiniMax-M2 model with a minimal configuration.
+def _build_minimax_m2_moe_layer():
+    """Construct a small MiniMaxM2SparseMoeBlock directly.
 
-    We create a small model to keep tests fast while still exercising the
-    MoE routing and computation logic.
-
-    Parameters:
-        model_name_or_path (str): Path or name of the pretrained model.
-
-    Returns:
-        module: The MiniMaxM2SparseMoeBlock layer.
+    Building the standalone block (rather than loading a full model from a
+    local HF cache) keeps the test hermetic and avoids pitfalls with
+    cached remote-code configs on CI nodes.
     """
-    try:
-        # Load only the model configuration
-        config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+    config = MiniMaxM2Config()
+    config.num_hidden_layers = 1
+    config.use_cache = False
+    config.hidden_size = 16  # Small hidden size
+    config.intermediate_size = 8  # For MLP within experts
+    config.num_local_experts = 4  # Small number of experts
+    config.num_experts_per_tok = 2  # Top-k experts
+    config.router_jitter_noise = 0.0  # Disable jitter for deterministic tests
 
-        # Configure minimal model for fast testing
-        config.num_hidden_layers = 1
-        config.use_cache = False
-        config.hidden_size = 16  # Small hidden size
-        config.intermediate_size = 8  # For MLP within experts
-        config.mlp_intermediate_size = 32
-        config.num_local_experts = 4  # Small number of experts
-        config.num_experts_per_tok = 2  # Top-k experts
-        config.num_attention_heads = 2
-        config.num_key_value_heads = 2
-        config.router_jitter_noise = 0.0  # Disable jitter for deterministic tests
-
-        # Build the model architecture (no weights loaded)
-        # Note: Importing minimax_m2 module auto-patches from_config, so the
-        # instance's forward is already patched. But the CLASS method is still
-        # the original HF implementation, which we use as reference.
-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
-        model.eval()
-
-        # Access the MoE layer — try known paths (name changed across HF versions)
-        candidate_names = [
-            "model.layers.0.block_sparse_moe",
-            "model.layers.0.feed_forward",
-        ]
-        all_modules = dict(model.named_modules())
-        for layer_name in candidate_names:
-            module = all_modules.get(layer_name)
-            if module is not None:
-                print(f"Successfully extracted layer '{layer_name}'.")
-                return module
-
-        # Fallback: search by class name
-        for name, mod in all_modules.items():
-            if "SparseMoeBlock" in type(mod).__name__:
-                print(f"Found MoE layer by class name at '{name}'.")
-                return mod
-
-        print(
-            f"MoE layer not found. Tried: {candidate_names}. "
-            f"Available: {[n for n in all_modules if 'layers.0' in n]}"
-        )
-        return None
-    except Exception as e:
-        print(f"Error extracting layer: {e}")
-        return None
+    module = MiniMaxM2SparseMoeBlock(config)
+    module.eval()
+    # Initialize weights to something non-default so routing exercises the experts.
+    for p in module.parameters():
+        torch.nn.init.normal_(p, mean=0.0, std=0.02)
+    # `e_score_correction_bias` is a buffer that is zero-initialized; that is fine.
+    return module
 
 
-@pytest.mark.parametrize(
-    "model_name",
-    [
-        pytest.param(
-            hf_id_to_local_model_dir("MiniMaxAI/MiniMax-M2"),
-        ),
-    ],
-)
-def test_minimax_m2_moe_patch(model_name):
+def test_minimax_m2_moe_patch():
     """Test that the patched MiniMaxM2SparseMoeBlock forward matches HF implementation.
 
     The patch rewrites the forward to use torch.ops.auto_deploy.torch_moe
     for torch.export compatibility while maintaining numerical equivalence.
-
-    Since importing minimax_m2.py auto-patches module instances, we use the
-    CLASS method (type(module).forward) as the original HF reference.
     """
     # Set seed for reproducibility
     torch.manual_seed(42)
 
-    # Get MoE module (instance is already patched by import side-effect)
-    module = _load_minimax_m2_moe_layer(model_name)
-    assert module is not None, "Failed to load MiniMax-M2 MoE layer"
+    module = _build_minimax_m2_moe_layer()
 
     # Convert module to bfloat16 to match input dtype
     module = module.to(torch.bfloat16)
 
-    # Create test input - same input will be used for both original and patched
-    # hidden_size=16 matches the config in _load_minimax_m2_moe_layer
+    # hidden_size=16 matches the config in _build_minimax_m2_moe_layer
     hidden_size = 16
     inputs = torch.randn(2, 6, hidden_size, dtype=torch.bfloat16)
 
-    # The CLASS method is still the original HuggingFace implementation
-    # (the auto-patch only patches instance methods, not the class)
+    # Reference: original (unpatched) class method. In transformers 5.x this
+    # returns just `hidden_states` (no router_logits).
     original_class_forward = type(module).forward
-
-    # Generate reference output using original HF class method
-    # Uses: same module weights, same input tensor
     with torch.no_grad():
-        ref_output, ref_router_logits = original_class_forward(module, inputs)
+        ref_output = original_class_forward(module, inputs)
 
-    # The instance forward is already patched by the import side-effect,
-    # but let's be explicit and apply our patch function directly
+    # Apply the export-friendly patch and run the same input through it.
     module.forward = types.MethodType(minimax_m2_moe, module)
-
-    # Generate test output using patched implementation
-    # Uses: same module weights, same input tensor
     with torch.no_grad():
-        test_output, test_router_logits = module(inputs)
-
-    # Verify outputs match
-    # Router logits should be identical (same computation path)
-    torch.testing.assert_close(
-        ref_router_logits,
-        test_router_logits,
-        atol=1e-5,
-        rtol=1e-5,
-        msg="Router logits mismatch between original and patched MoE",
-    )
+        test_output = module(inputs)
 
     # Final hidden states should be very close
     # (small tolerance for different computation order in torch_moe)
