@@ -106,7 +106,8 @@ struct Gemma4Globals
     __nv_bfloat16* moe_input_scratch; // [num_tokens, HIDDEN_SIZE]
     __nv_bfloat16* moe_gate_scratch;  // [num_tokens, MOE_TOPK, EXPERT_INTERMEDIATE]
     __nv_bfloat16* moe_up_scratch;    // [num_tokens, MOE_TOPK, EXPERT_INTERMEDIATE]
-    float* moe_scratch;               // [num_tokens, MOE_TOPK, HIDDEN_SIZE]
+    float* moe_scratch;               // [num_tokens, HIDDEN_SIZE, MOE_TOPK]
+    float* moe_merged_scratch;        // [num_tokens, HIDDEN_SIZE]
 
     // ── Attention parameters ──
     float attn_scale;

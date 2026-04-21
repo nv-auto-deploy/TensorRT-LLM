@@ -172,7 +172,8 @@ torch::Tensor launch_dense_b(torch::Tensor instructions, torch::Tensor num_instr
     torch::Tensor router_scale, torch::Tensor router_root_size, torch::Tensor pre_ffn2_norm_weight,
     torch::Tensor router_topk_weights, torch::Tensor router_topk_indices, torch::Tensor moe_input_scratch,
     torch::Tensor post_ffn2_norm_weight, torch::Tensor moe_w13_stacked_weight, torch::Tensor moe_w2_weight,
-    torch::Tensor moe_gate_scratch, torch::Tensor moe_up_scratch, torch::Tensor moe_scratch, double eps)
+    torch::Tensor moe_gate_scratch, torch::Tensor moe_up_scratch, torch::Tensor moe_scratch,
+    torch::Tensor moe_merged_scratch, double eps)
 {
     gmk::MegakernelGlobals g{};
     g.instructions = instructions.data_ptr<int32_t>();
@@ -214,6 +215,10 @@ torch::Tensor launch_dense_b(torch::Tensor instructions, torch::Tensor num_instr
         gg.moe_gate_scratch = reinterpret_cast<__nv_bfloat16*>(moe_gate_scratch.data_ptr());
         gg.moe_up_scratch = reinterpret_cast<__nv_bfloat16*>(moe_up_scratch.data_ptr());
         gg.moe_scratch = moe_scratch.data_ptr<float>();
+        if (moe_merged_scratch.numel() > 0)
+        {
+            gg.moe_merged_scratch = moe_merged_scratch.data_ptr<float>();
+        }
     }
     gg.eps = static_cast<float>(eps);
     gg.num_tokens = static_cast<int32_t>(post_attn_in.size(0));
@@ -281,6 +286,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("pre_ffn2_norm_weight"), py::arg("router_topk_weights"), py::arg("router_topk_indices"),
         py::arg("moe_input_scratch"), py::arg("post_ffn2_norm_weight"), py::arg("moe_w13_stacked_weight"),
         py::arg("moe_w2_weight"), py::arg("moe_gate_scratch"), py::arg("moe_up_scratch"), py::arg("moe_scratch"),
-        py::arg("eps"));
+        py::arg("moe_merged_scratch"), py::arg("eps"));
     m.def("get_config", &get_config, "Get megakernel configuration");
 }

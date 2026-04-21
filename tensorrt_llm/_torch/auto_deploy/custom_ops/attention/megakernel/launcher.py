@@ -473,6 +473,29 @@ class InstructionBuilder:
                 barrier_id=bid,
             )
 
+    def add_moe_merged_down(
+        self,
+        sm_ids: list[int] | range,
+        row_ranges: list[tuple[int, int]],
+        token_id: int = 0,
+        barrier: tuple[int, int] | None = None,
+    ) -> None:
+        """Add merged MoE down-projection work.
+
+        Each CTA owns an output row range and accumulates all selected slots
+        directly into a merged MoE vector, avoiding the [hidden, topk] scratch.
+        """
+        sm_list = list(sm_ids)
+        assert len(sm_list) == len(row_ranges)
+        bc, bid = barrier if barrier else (0, 0)
+        for sm_id, (rs, re) in zip(sm_list, row_ranges):
+            self._add_instruction(
+                sm_id,
+                [11, 2, 0, rs, re, token_id],
+                barrier_count=bc,
+                barrier_id=bid,
+            )
+
     def add_b_post(
         self,
         sm_ids: list[int] | range,
@@ -496,12 +519,13 @@ class InstructionBuilder:
         row_ranges: list[tuple[int, int]],
         token_id: int,
         mode: int,
+        num_partials: int | None = None,
         barrier: tuple[int, int] | None = None,
     ) -> None:
         sm_list = list(sm_ids)
         assert len(sm_list) == len(row_ranges)
         bc, bid = barrier if barrier else (0, 0)
-        num_partials = len(sm_list)
+        num_partials = len(sm_list) if num_partials is None else num_partials
         for sm_id, (row_start, row_end) in zip(sm_list, row_ranges):
             self._add_instruction(
                 sm_id,
@@ -515,36 +539,68 @@ class InstructionBuilder:
         sm_ids: list[int] | range,
         row_ranges: list[tuple[int, int]],
         token_id: int = 0,
+        num_partials: int | None = None,
         barrier: tuple[int, int] | None = None,
     ) -> None:
-        self._add_b_post_mode(sm_ids, row_ranges, token_id=token_id, mode=1, barrier=barrier)
+        self._add_b_post_mode(
+            sm_ids,
+            row_ranges,
+            token_id=token_id,
+            mode=1,
+            num_partials=num_partials,
+            barrier=barrier,
+        )
 
     def add_b_post_merge(
         self,
         sm_ids: list[int] | range,
         row_ranges: list[tuple[int, int]],
         token_id: int = 0,
+        num_partials: int | None = None,
         barrier: tuple[int, int] | None = None,
     ) -> None:
-        self._add_b_post_mode(sm_ids, row_ranges, token_id=token_id, mode=2, barrier=barrier)
+        self._add_b_post_mode(
+            sm_ids,
+            row_ranges,
+            token_id=token_id,
+            mode=2,
+            num_partials=num_partials,
+            barrier=barrier,
+        )
 
     def add_b_post_hidden(
         self,
         sm_ids: list[int] | range,
         row_ranges: list[tuple[int, int]],
         token_id: int = 0,
+        num_partials: int | None = None,
         barrier: tuple[int, int] | None = None,
     ) -> None:
-        self._add_b_post_mode(sm_ids, row_ranges, token_id=token_id, mode=3, barrier=barrier)
+        self._add_b_post_mode(
+            sm_ids,
+            row_ranges,
+            token_id=token_id,
+            mode=3,
+            num_partials=num_partials,
+            barrier=barrier,
+        )
 
     def add_b_post_next_norm(
         self,
         sm_ids: list[int] | range,
         row_ranges: list[tuple[int, int]],
         token_id: int = 0,
+        num_partials: int | None = None,
         barrier: tuple[int, int] | None = None,
     ) -> None:
-        self._add_b_post_mode(sm_ids, row_ranges, token_id=token_id, mode=4, barrier=barrier)
+        self._add_b_post_mode(
+            sm_ids,
+            row_ranges,
+            token_id=token_id,
+            mode=4,
+            num_partials=num_partials,
+            barrier=barrier,
+        )
 
     def add_done(self, sm_ids: list[int] | range) -> None:
         """Add a done instruction (kernel exit) to specified SMs."""
@@ -727,6 +783,7 @@ class MegakernelLauncher:
         moe_gate_scratch: torch.Tensor | None = None,
         moe_up_scratch: torch.Tensor | None = None,
         moe_scratch: torch.Tensor | None = None,
+        moe_merged_scratch: torch.Tensor | None = None,
         eps: float = 1e-6,
         barrier_slots: torch.Tensor | None = None,
         debug_output: torch.Tensor | None = None,
@@ -745,6 +802,8 @@ class MegakernelLauncher:
             debug_output.zero_()
         if moe_scratch is not None:
             moe_scratch.zero_()
+        if moe_merged_scratch is not None:
+            moe_merged_scratch.zero_()
 
         self._module.launch_dense_b(
             builder.instructions,
@@ -778,6 +837,7 @@ class MegakernelLauncher:
             moe_gate_scratch if moe_gate_scratch is not None else empty,
             moe_up_scratch if moe_up_scratch is not None else empty,
             moe_scratch if moe_scratch is not None else empty,
+            moe_merged_scratch if moe_merged_scratch is not None else empty,
             eps,
         )
         return debug_output
