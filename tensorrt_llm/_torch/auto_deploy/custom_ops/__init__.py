@@ -47,9 +47,17 @@ def _is_trtllm_import_error(exc: BaseException) -> bool:
     return False
 
 
+def _should_import(module_name: str, is_pkg: bool) -> bool:
+    if is_pkg:
+        return True
+    return not module_name.rsplit(".", maxsplit=1)[-1].startswith("test_")
+
+
 # Recursively import subpackages and modules so their side-effects (e.g.,
 # op registrations) are applied even when nested in subdirectories.
 for _, full_name, _ in pkgutil.walk_packages(__path__, prefix=f"{__name__}."):
+    if not _should_import(full_name, is_pkg=False):
+        continue
     try:
         importlib.import_module(full_name)
         __all__.append(full_name)

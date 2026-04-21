@@ -199,31 +199,19 @@ class LowerToMpk(BaseTransform):
         )
 
         if not self.config.dry_run_only and self.config.use_cuda_megakernel:
-            from ...custom_ops.attention.megakernel.megakernel_bridge import (
-                build_megakernel_runtime_callable,
+            from ...custom_ops.attention.megakernel.fx_transform import (
+                replace_attention_with_megakernel,
             )
 
-            runtime_callable = build_megakernel_runtime_callable(
-                plan.to_dict(),
-                source_model=model,
-            )
-            if self.config.prewarm_decode_executors:
-                prewarm = getattr(runtime_callable, "prewarm_decode_executors", None)
-                if callable(prewarm):
-                    prewarm()
-            model = self._wrap_graphmodule_with_runtime_wrapper(
-                model,
-                plan.to_dict(),
-                runtime_callable=runtime_callable,
-            )
-            wrapped_meta = self._get_autodeploy_meta(model)
-            wrapped_meta["mpk_runtime_mode"] = "cuda_megakernel"
-            self._set_autodeploy_meta(model, wrapped_meta)
+            ad_logger.info("Replacing attention sublayer nodes with megakernel custom op...")
+            num_replaced = replace_attention_with_megakernel(model, plan.to_dict())
             ad_logger.info(
-                "CUDA megakernel decode runtime installed (no Mirage dependency). "
-                "Note: full per-layer megakernel routing is WIP — currently using "
-                "original graph for all batches."
+                f"CUDA megakernel: replaced {num_replaced} sliding-attention layers "
+                f"in FX graph (in-place, CUDA graph compatible)."
             )
+
+            # Note: no pre-warm here — the executor runs in a child process.
+            # CUDA resources are allocated lazily on first decode call in the child.
         elif not self.config.dry_run_only:
             cache_dir = self._configure_mirage_cache_env()
             runtime_callable = build_gemma_mirage_runtime_callable(

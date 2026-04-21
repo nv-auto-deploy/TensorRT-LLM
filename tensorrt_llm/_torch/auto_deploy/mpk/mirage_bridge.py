@@ -3622,6 +3622,7 @@ def run_mirage_moe_gelu_split_dense_block_forward_correctness(
         torch.randn((num_experts, intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
         / 16.0
     )
+    moe_w13_weight = torch.cat((up_weight, gate_weight), dim=1).contiguous()
     w2_weight = (
         torch.randn((num_experts, hidden_size, intermediate), device="cuda", dtype=torch.bfloat16)
         / 16.0
@@ -4257,6 +4258,7 @@ def run_mirage_gemma_full_layer_split_dense_forward_correctness(
         torch.randn((num_experts, intermediate, hidden_size), device="cuda", dtype=torch.bfloat16)
         / 16.0
     )
+    moe_w13_weight = torch.cat((up_weight, gate_weight), dim=1).contiguous()
     w2_weight = (
         torch.randn((num_experts, hidden_size, intermediate), device="cuda", dtype=torch.bfloat16)
         / 16.0
@@ -4600,6 +4602,9 @@ def run_mirage_gemma_full_layer_single_pk_forward_correctness(
     routing_indices = torch.zeros((num_experts, num_tokens), device="cuda", dtype=torch.int32)
     routing_mask = torch.zeros((num_experts + 1,), device="cuda", dtype=torch.int32)
     moe_in = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+    moe_w13_out = torch.zeros(
+        (num_tokens, topk, 2 * intermediate), device="cuda", dtype=torch.bfloat16
+    )
     moe_act = torch.zeros((num_tokens, topk, intermediate), device="cuda", dtype=torch.bfloat16)
     moe_w2_out = torch.zeros((num_tokens, topk, hidden_size), device="cuda", dtype=torch.bfloat16)
     moe_out = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
@@ -4666,6 +4671,7 @@ def run_mirage_gemma_full_layer_single_pk_forward_correctness(
     routing_indices_dt = None
     routing_mask_dt = None
     moe_w13_weight_dt = None
+    moe_w13_out_dt = None
     moe_act_dt = None
     moe_w2_weight_dt = None
     moe_w2_out_dt = None
@@ -4697,8 +4703,9 @@ def run_mirage_gemma_full_layer_single_pk_forward_correctness(
         routing_indices_dt = pk.attach_input(routing_indices, name="single_pk_routing_indices")
         routing_mask_dt = pk.attach_input(routing_mask, name="single_pk_routing_mask")
         moe_w13_weight_dt = pk.attach_input(
-            moe_w13_weight.contiguous(), name="single_pk_moe_w13_weight"
+            moe_w13_weight, name="single_pk_moe_w13_weight"
         )
+        moe_w13_out_dt = pk.attach_input(moe_w13_out, name="single_pk_moe_w13_out")
         moe_act_dt = pk.attach_input(moe_act, name="single_pk_moe_act")
         moe_w2_weight_dt = pk.attach_input(w2_weight.contiguous(), name="single_pk_moe_w2_weight")
         moe_w2_out_dt = pk.attach_input(moe_w2_out, name="single_pk_moe_w2_out")
@@ -4840,13 +4847,19 @@ def run_mirage_gemma_full_layer_single_pk_forward_correctness(
             grid_dim=(1, 1, 1),
             block_dim=(128, 1, 1),
         )
-        pk.moe_w13_gelu_mul_layer(
+        pk.moe_w13_linear_layer(
             input=moe_in_dt,
             weight=moe_w13_weight_dt,
             moe_routing_indices=routing_indices_dt,
             moe_mask=routing_mask_dt,
-            output=moe_act_dt,
+            output=moe_w13_out_dt,
             grid_dim=_moe_expert_grid_dim(pk, w13_linear=True),
+            block_dim=(128, 1, 1),
+        )
+        pk.moe_gelu_mul_swapped_layer(
+            input=moe_w13_out_dt,
+            output=moe_act_dt,
+            grid_dim=(num_tokens, topk, 1),
             block_dim=(128, 1, 1),
         )
         pk.moe_w2_linear_layer(
@@ -5000,6 +5013,9 @@ def run_mirage_gemma_full_layer_single_pk_forward_correctness(
 
     moe_in_var = post_attn_ref.pow(2).mean(dim=-1, keepdim=True)
     moe_in_ref = (post_attn_ref * torch.rsqrt(moe_in_var + eps)) * pre_moe_norm_weight.float()
+    ref_moe_w13 = torch.stack(
+        [moe_in_ref[0] @ moe_w13_weight[expert].float().transpose(0, 1) for expert in experts], dim=0
+    ).unsqueeze(0)
     gate_ref = torch.stack(
         [moe_in_ref[0] @ gate_weight[expert].float().transpose(0, 1) for expert in experts],
         dim=0,
@@ -5016,6 +5032,12 @@ def run_mirage_gemma_full_layer_single_pk_forward_correctness(
         ],
         dim=0,
     ).unsqueeze(0)
+    sorted_experts = sorted(experts)
+    expert_to_rank = {expert_idx: rank for rank, expert_idx in enumerate(experts)}
+    sorted_rank_indices = [expert_to_rank[expert_idx] for expert_idx in sorted_experts]
+    ref_moe_w13_sorted = ref_moe_w13[:, sorted_rank_indices]
+    ref_moe_act_sorted = ref_moe_act[:, sorted_rank_indices]
+    ref_w2_sorted = ref_w2[:, sorted_rank_indices]
     ref_moe_out = (ref_w2 * ref_topk_weight.unsqueeze(-1)).sum(dim=1)
     ref_moe_var = ref_moe_out.pow(2).mean(dim=-1, keepdim=True)
     ref_moe_norm = (ref_moe_out * torch.rsqrt(ref_moe_var + eps)) * post_moe_norm_weight.float()
@@ -5035,10 +5057,28 @@ def run_mirage_gemma_full_layer_single_pk_forward_correctness(
                 (topk_weight.float() - ref_topk_weight).abs().mean().item()
             ),
             "routing_overlap_count": float(len(set(experts) & set(ref_ids))),
+            "moe_in_max_abs": float((moe_in.float() - moe_in_ref).abs().max().item()),
+            "moe_in_mean_abs": float((moe_in.float() - moe_in_ref).abs().mean().item()),
+            "moe_w13_max_abs": float((moe_w13_out.float() - ref_moe_w13).abs().max().item()),
+            "moe_w13_mean_abs": float((moe_w13_out.float() - ref_moe_w13).abs().mean().item()),
+            "moe_w13_sorted_max_abs": float(
+                (moe_w13_out.float() - ref_moe_w13_sorted).abs().max().item()
+            ),
+            "moe_w13_sorted_mean_abs": float(
+                (moe_w13_out.float() - ref_moe_w13_sorted).abs().mean().item()
+            ),
             "moe_act_max_abs": float((moe_act.float() - ref_moe_act).abs().max().item()),
             "moe_act_mean_abs": float((moe_act.float() - ref_moe_act).abs().mean().item()),
+            "moe_act_sorted_max_abs": float(
+                (moe_act.float() - ref_moe_act_sorted).abs().max().item()
+            ),
+            "moe_act_sorted_mean_abs": float(
+                (moe_act.float() - ref_moe_act_sorted).abs().mean().item()
+            ),
             "w2_max_abs": float((moe_w2_out.float() - ref_w2).abs().max().item()),
             "w2_mean_abs": float((moe_w2_out.float() - ref_w2).abs().mean().item()),
+            "w2_sorted_max_abs": float((moe_w2_out.float() - ref_w2_sorted).abs().max().item()),
+            "w2_sorted_mean_abs": float((moe_w2_out.float() - ref_w2_sorted).abs().mean().item()),
             "hidden_out_max_abs": float((hidden_out.float() - ref_hidden_out).abs().max().item()),
             "hidden_out_mean_abs": float((hidden_out.float() - ref_hidden_out).abs().mean().item()),
         }

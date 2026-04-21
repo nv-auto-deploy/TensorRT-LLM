@@ -1,4 +1,4 @@
-# Debug config: 5 layers, no CUDA graphs, megakernel attention
+# Debug config: 5 layers, torch-simple, megakernel FX transform
 model_factory: Gemma4ForConditionalGeneration
 tokenizer: google/gemma-4-26B-A4B-it
 attn_backend: triton_paged
@@ -22,7 +22,7 @@ transforms:
     dry_run_only: false
     use_cuda_megakernel: true
   compile_model:
-    enabled: false
+    piecewise_enabled: true
   mlir_elementwise_fusion:
     enabled: false
   gather_logits_before_lm_head:
