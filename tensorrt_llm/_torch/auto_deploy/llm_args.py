@@ -413,6 +413,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             moe_tp_size = dist_mapping_config.get("moe_tp", 1)
             moe_ep_size = dist_mapping_config.get("moe_ep", self.world_size)
 
+        allreduce_strategy = sharding_config.get("allreduce_strategy", "NCCL")
+
         try:
             dc = DistConfig(
                 world_size=world_size,
@@ -422,6 +424,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                 moe_ep_size=moe_ep_size,
                 moe_cluster_size=dist_mapping_config.get("moe_cluster", 1),
                 enable_attention_dp=enable_attention_dp,
+                allreduce_strategy=allreduce_strategy,
             )
         except ValueError as e:
             raise ValueError(
