@@ -28,6 +28,7 @@ from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
         ),
     ],
 )
+@pytest.mark.skip(reason="Will be deprecated: https://github.com/NVIDIA/TensorRT-LLM/issues/13353")
 def test_ad_export_onnx(model: str, output_dir: str, num_attn_ops: int):
     """Test ONNX export pipeline for LLM models with attention operations."""
     ad_config = LlmArgs(
