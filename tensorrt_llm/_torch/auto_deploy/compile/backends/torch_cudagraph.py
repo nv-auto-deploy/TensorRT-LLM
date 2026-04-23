@@ -33,6 +33,7 @@ from ..piecewise_runner import (
     MetadataWrapper,
     OutputInfo,
 )
+from ...utils import multi_stream_utils
 from ..piecewise_utils import (
     SplitInfo,
     is_aux_compute_submod,
@@ -656,6 +657,12 @@ class PiecewiseCapturedGraph(nn.Module):
             return
 
         self._allocate_static_input_buffers(get_args_kwargs)
+
+        # Disable multi-stream overlap for the entire piecewise path (warmup,
+        # capture, and replay).  The per-layer caller_stream.synchronize() in
+        # begin_aux_stream_passthrough is too expensive for prefill latency.
+        # Multi-stream overlap is preserved for monolithic decode CUDA graphs.
+        multi_stream_utils.piecewise_no_stream_switch = True
 
         num_tokens_list = sorted(self.piecewise_num_tokens, reverse=True)
         for nt in num_tokens_list:
