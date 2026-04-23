@@ -7,7 +7,10 @@ enable_chunked_prefill: true
 cuda_graph_config:
   max_batch_size: 256
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 80, 96, 112, 128, 192, 208, 224, 240, 256]
+# Route trtllm_mla through the mFP8ContextMLA=true C++ path.  BF16 cache
+# works, but FP8 roughly doubles max cached tokens for the same GPU budget.
 kv_cache_config:
+  dtype: fp8
   tokens_per_block: 32
   free_gpu_memory_fraction: 0.7
 transforms:
