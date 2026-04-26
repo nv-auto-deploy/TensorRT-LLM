@@ -1363,6 +1363,7 @@ def _mla_with_cache_impl(
     scale: Optional[float],
     kv_lora_rank: int,
     rotary_cos_sin: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Shared implementation for both MLA attention ops (with and without fused RoPE).
 
@@ -1485,9 +1486,25 @@ def _mla_with_cache_impl(
     # otherwise identity table so the kernel's RoPE is a no-op.
     decode_rotary_cos_sin = rotary_cos_sin if fused_rope else planner.identity_cos_sin
 
-    # Allocate output with bs rows (may include CG padding); only real-token
-    # positions are filled — padding stays zero, matching the FI MLA pattern.
-    y = torch.zeros(bs, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device)
+    # Allocate output with padding capacity.  Piecewise CUDA graph replay may
+    # pass real-token-shaped inputs while the stable ``out`` buffer is sized to
+    # the bucket captured for the following static segment.
+    if out is not None:
+        y = out.view(-1, num_heads * v_head_dim)
+        output_tokens = y.shape[0]
+        if output_tokens < num_tokens:
+            raise RuntimeError(
+                "trtllm_mla_with_cache out buffer is too small: "
+                f"capacity={output_tokens}, required={num_tokens}"
+            )
+    else:
+        output_tokens = bs
+        y = torch.zeros(
+            output_tokens,
+            num_heads * v_head_dim,
+            dtype=q_nope_flat.dtype,
+            device=q_nope_flat.device,
+        )
 
     if num_prefill > 0:
         y[:num_prefill_tokens] = _handle_prefill_thop(
@@ -1558,6 +1575,11 @@ def _mla_with_cache_impl(
             decode_rotary_cos_sin,
         )
 
+    if out is not None:
+        if num_tokens < output_tokens:
+            y[num_tokens:].zero_()
+        return out.new_empty(0)
+
     return y.view(b, s, num_heads, v_head_dim)
 
 
@@ -1603,6 +1625,7 @@ def trtllm_mla_with_cache(
     scale: Optional[float],
     kv_lora_rank: int,
     rotary_cos_sin: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """TRT-LLM MLA attention with paged latent cache.
 
@@ -1623,6 +1646,7 @@ def trtllm_mla_with_cache(
         scale,
         kv_lora_rank,
         rotary_cos_sin=rotary_cos_sin,
+        out=out,
     )
 
 
@@ -1641,8 +1665,11 @@ def trtllm_mla_with_cache_fake(
     scale: Optional[float],
     kv_lora_rank: int,
     rotary_cos_sin: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
+    if out is not None:
+        return out.new_empty(0)
     return _mla_with_cache_fake_impl(q_nope, kv_b_proj_weight)
 
 

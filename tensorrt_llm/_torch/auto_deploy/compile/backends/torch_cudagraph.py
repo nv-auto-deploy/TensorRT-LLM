@@ -326,6 +326,7 @@ class PiecewiseCapturedGraph(nn.Module):
         self.split_gm: Optional[GraphModule] = None
         self._is_prepared = False
         self._wrapped_dynamic_indices: Set[int] = set()
+        self._static_runners: Dict[int, ADPiecewiseRunner] = {}
         # Pre-allocated static buffers for kwargs whose addresses change between
         # calls.  Allocated during warmup_and_capture, used at runtime to ensure
         # CUDA graph replay sees stable addresses.
@@ -419,6 +420,7 @@ class PiecewiseCapturedGraph(nn.Module):
             )
             setattr(self.split_gm, submod_name, runner)
             runner_by_idx[idx] = runner
+            self._static_runners[idx] = runner
             num_wrapped_static += 1
 
         # Phase 2: wrap dynamic ops.
@@ -496,7 +498,8 @@ class PiecewiseCapturedGraph(nn.Module):
             f"PiecewiseCapturedGraph: prepared with {self.split_info.num_submodules} submodules "
             f"({num_wrapped_static} static runners, {num_skipped_static} trivial skipped, "
             f"{num_wrapped_dynamic} dynamic wrapped, {num_metadata_wrapped} metadata wrapped, "
-            f"{num_dynamic_eager} dynamic eager), piecewise_num_tokens={self.piecewise_num_tokens}"
+            f"{num_dynamic_eager} dynamic eager), "
+            f"piecewise_num_tokens={self.piecewise_num_tokens}"
         )
 
     def _discover_dynamic_output_shapes(self, args: Tuple, kwargs: Dict) -> Dict[int, OutputInfo]:
@@ -664,7 +667,11 @@ class PiecewiseCapturedGraph(nn.Module):
 
                 # Capture phase
                 ADPiecewiseRunner.set_current_phase("capture")
-                self.split_gm(*args, **kwargs)
+                try:
+                    self.split_gm(*args, **kwargs)
+                finally:
+                    for runner in self._static_runners.values():
+                        runner.finalize_capture(nt)
 
             ad_logger.info(f"PiecewiseCapturedGraph: captured graphs for num_tokens={nt}")
 
@@ -689,7 +696,12 @@ class PiecewiseCapturedGraph(nn.Module):
             )
             return result
 
-    def forward(self, *args, num_tokens: Optional[int] = None, **kwargs) -> Any:
+    def forward(
+        self,
+        *args,
+        num_tokens: Optional[int] = None,
+        **kwargs,
+    ) -> Any:
         """Forward pass: static segments replay graphs, dynamic segments run eagerly."""
         if self.split_gm is not None:
             self._copy_to_static_buffers(kwargs)
@@ -755,13 +767,16 @@ class DualModeCapturedGraph(nn.Module):
         """Check if the current batch is decode-only using batch_info_host.
 
         batch_info_host is the serialized BatchInfo tensor.
-        Decode-only means num_prefill == 0.
+        Decode-only means there are no prefill or extend requests.
         """
         batch_info = kwargs.get(self.batch_info_kwarg_name)
         if batch_info is not None and isinstance(batch_info, torch.Tensor):
-            # batch_info_host[0] = num_prefill
-            num_prefill = batch_info[0].item()
-            return num_prefill == 0
+            # batch_info_host[0] = num_prefill, [2] = num_extend.
+            # Extend requests still need cached-context handling and must use
+            # the piecewise prefill/mixed path rather than decode CUDA graphs.
+            num_prefill = int(batch_info[0].item())
+            num_extend = int(batch_info[2].item())
+            return num_prefill == 0 and num_extend == 0
 
         # Fallback heuristic: check if first batched input has sequence dim == 1
         # (decode = 1 token per sequence)
@@ -844,7 +859,11 @@ class DualModeCapturedGraph(nn.Module):
         bucket = self._find_nearest_bucket(num_tokens)
         if bucket is not None:
             try:
-                result = self.piecewise(*args, num_tokens=bucket, **kwargs)
+                result = self.piecewise(
+                    *args,
+                    num_tokens=bucket,
+                    **kwargs,
+                )
             finally:
                 ADPiecewiseRunner.set_current_num_tokens(None)
             if bucket > num_tokens:
