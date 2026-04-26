@@ -1156,10 +1156,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         pytest.param(
             "deepseek-ai/DeepSeek-R1-0528",
             {},
-            [
-                # MMLU,
-                GSM8K,
-            ],
+            [MMLU, GSM8K],
             marks=(
                 skip_pre_blackwell,
                 pytest.mark.skip_less_device(8),
