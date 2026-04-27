@@ -11,6 +11,8 @@ kv_cache_config:
   tokens_per_block: 32
   free_gpu_memory_fraction: 0.7
 transforms:
+  optimize_rope:
+    stage: pattern_matcher
   fuse_gemms_mixed_children:
     enabled: true
   mlir_elementwise_fusion:
