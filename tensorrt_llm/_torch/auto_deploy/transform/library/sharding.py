@@ -1483,6 +1483,7 @@ def _get_dist_ops(backend: str, allgather_strategy: AllGatherStrategy = AllGathe
         use_symm_mem_ag = allgather_strategy.upper() == "SYMM_MEM"
 
     if backend == "trtllm":
+        # Force TRT-LLM ops
         ag_op = (
             torch.ops.auto_deploy.symm_mem_all_gather.default
             if use_symm_mem_ag
@@ -1490,6 +1491,7 @@ def _get_dist_ops(backend: str, allgather_strategy: AllGatherStrategy = AllGathe
         )
         return (ag_op, torch.ops.auto_deploy.trtllm_dist_all_reduce.default)
     elif backend == "torch":
+        # Force PyTorch distributed ops
         ag_op = (
             torch.ops.auto_deploy.symm_mem_all_gather_torch.default
             if use_symm_mem_ag
@@ -1497,7 +1499,9 @@ def _get_dist_ops(backend: str, allgather_strategy: AllGatherStrategy = AllGathe
         )
         return (ag_op, torch.ops.auto_deploy.torch_dist_all_reduce.default)
     else:  # auto
+        # Automatically select based on availability
         if is_trtllm_op_available():
+            # Use TRT-LLM optimized ops in MPI mode
             ag_op = (
                 torch.ops.auto_deploy.symm_mem_all_gather.default
                 if use_symm_mem_ag
@@ -1505,6 +1509,7 @@ def _get_dist_ops(backend: str, allgather_strategy: AllGatherStrategy = AllGathe
             )
             return (ag_op, torch.ops.auto_deploy.trtllm_dist_all_reduce.default)
         else:
+            # Use PyTorch distributed ops in demollm mode
             ag_op = (
                 torch.ops.auto_deploy.symm_mem_all_gather_torch.default
                 if use_symm_mem_ag
