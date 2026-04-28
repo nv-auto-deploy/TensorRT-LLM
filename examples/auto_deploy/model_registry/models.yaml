@@ -235,6 +235,11 @@ models:
 # --- MiMo-V2-Flash (Feb 2026) ---
 - name: XiaomiMiMo/MiMo-V2-Flash
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- MiMo-V2.5 (Apr 2026) ---
+- name: XiaomiMiMo/MiMo-V2.5-Base
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'mimo_v2.5.yaml']
+- name: XiaomiMiMo/MiMo-V2.5
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'mimo_v2.5.yaml']
 # --- Kimi-K2.5 (Jan 2026) ---
 - name: moonshotai/Kimi-K2.5
   yaml_extra: ['kimi_k2.yaml']

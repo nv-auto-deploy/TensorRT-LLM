@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from functools import partial
 from typing import Dict, List, Tuple
@@ -865,6 +868,21 @@ class FineGrainedFP8LinearQuantization(Quantization):
     def build_custom_args_for_linear(self, scales: Dict[str, Node]) -> Tuple:
         return ([], [scales["weight_scale_inv"]], [], [])
 
+    def _normalize_weight_scale_inv(
+        self, weight: torch.Tensor, weight_scale_inv: torch.Tensor
+    ) -> torch.Tensor:
+        expected_shape = self.default_scales(tuple(weight.shape))["weight_scale_inv"].shape
+        if tuple(weight_scale_inv.shape) == tuple(expected_shape):
+            return weight_scale_inv
+
+        if weight_scale_inv.ndim == len(expected_shape) and all(
+            actual >= expected for actual, expected in zip(weight_scale_inv.shape, expected_shape)
+        ):
+            scale_slices = tuple(slice(0, dim) for dim in expected_shape)
+            return weight_scale_inv[scale_slices]
+
+        return weight_scale_inv
+
     def load_hook(self, state_dict, prefix, *args, weight_name: str):
         """Load hook to handle FineGrainedFP8 checkpoint format.
 
@@ -881,7 +899,9 @@ class FineGrainedFP8LinearQuantization(Quantization):
             if scale_inv_name in state_dict:
                 # Rename to match our buffer name
                 mod_prefix = weight_name.rsplit(".", 1)[0]
-                state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
+                state_dict[mod_prefix + ".weight_scale_inv"] = self._normalize_weight_scale_inv(
+                    weight, state_dict[scale_inv_name]
+                )
 
     def _apply(
         self,

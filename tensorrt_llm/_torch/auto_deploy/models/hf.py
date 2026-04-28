@@ -21,6 +21,7 @@ from accelerate.utils import modeling
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
 from PIL import Image
+from safetensors import SafetensorError, safe_open
 from torch._prims_common import DeviceLikeType
 from torch.export import Dim
 from torch.fx import GraphModule
@@ -53,8 +54,18 @@ from .factory import (
 from .quant_config_reader import QuantConfigReader, autodetect_quant_config_reader
 
 
+def _load_safetensors_state_dict_keys(
+    checkpoint_file: str, expected_keys: set[str]
+) -> Dict[str, torch.Tensor]:
+    # Keep the filtered shard on CPU so loading a few rank-local tensors does not
+    # transiently duplicate checkpoint tensors on an already-full GPU.
+    with safe_open(checkpoint_file, framework="pt", device="cpu") as f:
+        keys_to_load = sorted(expected_keys.intersection(f.keys()))
+        return {key: f.get_tensor(key) for key in keys_to_load}
+
+
 @contextmanager
-def hf_load_state_dict_with_device(device: DeviceLikeType):
+def hf_load_state_dict_with_device(device: DeviceLikeType, model: Optional[nn.Module] = None):
     """Patch HF loading utilities according to our needs.
 
     Following patches are applied:
@@ -75,8 +86,14 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
     # save the original logger level
     original_logger_level = modeling.logger.level
 
+    # If a model is provided, use its post-hook-adjusted state dict keys to avoid loading
+    # checkpoint tensors that cannot be consumed by this rank's already-sharded module.
+    expected_keys = set(model.state_dict().keys()) if model is not None else None
+
     # Define and apply the patched version
     def load_state_dict_with_device(checkpoint_file, device_map=None):
+        if expected_keys is not None and str(checkpoint_file).endswith(".safetensors"):
+            return _load_safetensors_state_dict_keys(checkpoint_file, expected_keys)
         return original_load_state_dict(checkpoint_file, device_map={"": device})
 
     # Apply the patch
@@ -427,7 +444,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         # now check which is the most relevant checkpoint file
         safe_weights_index_path = os.path.join(checkpoint, SAFE_WEIGHTS_INDEX_NAME)
         if os.path.isfile(safe_weights_index_path):
-            return safe_weights_index_path
+            return self._repair_safetensors_index_if_needed(checkpoint, safe_weights_index_path)
 
         safe_weights_path = os.path.join(checkpoint, SAFE_WEIGHTS_NAME)
         if os.path.isfile(safe_weights_path):
@@ -446,6 +463,93 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
             f"Expected one of the following files: {SAFE_WEIGHTS_INDEX_NAME}, {SAFE_WEIGHTS_NAME}, "
             f"{WEIGHTS_INDEX_NAME}, or {WEIGHTS_NAME}."
         )
+
+    @staticmethod
+    def _repair_safetensors_index_if_needed(checkpoint_dir: str, index_path: str) -> str:
+        """Return a usable safetensors index, repairing stale HF indexes when possible.
+
+        Some Hub repos publish a stale ``model.safetensors.index.json`` whose
+        weight_map points at files that are no longer in the snapshot, while the
+        actual safetensors shards in that snapshot contain regular HF state-dict
+        keys. In that case, build a local generated index from shard metadata so
+        Accelerate/AD can load the published files without guessing names.
+        """
+
+        try:
+            with open(index_path, "r") as f:
+                index = json.load(f)
+            weight_map = index.get("weight_map", index)
+        except (json.JSONDecodeError, OSError, TypeError) as exc:
+            ad_logger.warning(f"Could not inspect safetensors index {index_path}: {exc}")
+            return index_path
+
+        if not isinstance(weight_map, dict):
+            return index_path
+
+        referenced_files = set(weight_map.values())
+        missing_files = sorted(
+            filename
+            for filename in referenced_files
+            if not os.path.isfile(os.path.join(checkpoint_dir, filename))
+        )
+        if not missing_files:
+            return index_path
+
+        generated_index_path = os.path.join(
+            checkpoint_dir, "model.safetensors.auto_deploy.index.json"
+        )
+        if os.path.isfile(generated_index_path):
+            try:
+                with open(generated_index_path, "r") as f:
+                    generated_index = json.load(f)
+                generated_weight_map = generated_index.get("weight_map", {})
+                if generated_weight_map and all(
+                    os.path.isfile(os.path.join(checkpoint_dir, filename))
+                    for filename in set(generated_weight_map.values())
+                ):
+                    return generated_index_path
+            except (json.JSONDecodeError, OSError, TypeError):
+                pass
+
+        shard_files = sorted(
+            filename for filename in os.listdir(checkpoint_dir) if filename.endswith(".safetensors")
+        )
+        if not shard_files:
+            return index_path
+
+        generated_weight_map = {}
+        total_size = 0
+        try:
+            for filename in shard_files:
+                shard_path = os.path.join(checkpoint_dir, filename)
+                total_size += os.path.getsize(shard_path)
+                with safe_open(shard_path, framework="pt", device="cpu") as shard:
+                    for key in shard.keys():
+                        generated_weight_map.setdefault(key, filename)
+        except (OSError, SafetensorError) as exc:
+            ad_logger.warning(
+                f"Could not generate fallback safetensors index for {checkpoint_dir}: {exc}"
+            )
+            return index_path
+
+        if not generated_weight_map:
+            return index_path
+
+        tmp_index_path = f"{generated_index_path}.{os.getpid()}.tmp"
+        with open(tmp_index_path, "w") as f:
+            json.dump(
+                {
+                    "metadata": {"total_size": total_size},
+                    "weight_map": dict(sorted(generated_weight_map.items())),
+                },
+                f,
+            )
+        os.replace(tmp_index_path, generated_index_path)
+        ad_logger.warning(
+            "Generated fallback safetensors index because the published index "
+            f"references {len(missing_files)} missing files. Using {generated_index_path}."
+        )
+        return generated_index_path
 
     def _prefetch_checkpoint(self, model_name_or_path: str, skip_prefetch_weights: bool) -> str:
         """Prefetch checkpoint from a HF repo if needed.
@@ -498,7 +602,9 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
                 ad_logger.info(
                     "disable_preload=True: Using accelerate's load_checkpoint_in_model (no CPU preload)"
                 )
-                with hf_load_state_dict_with_device(device):
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                with hf_load_state_dict_with_device(device, model=model):
                     load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
             else:
                 # Preload checkpoint files to CPU

@@ -15,6 +15,7 @@ _MODEL_MODULES = {
     "modeling_kimi_k2": ["KimiK2ForCausalLM", "KimiK25ForConditionalGeneration"],
     "modeling_minimax_m2": ["MiniMaxM2ForCausalLM"],
     "modeling_mistral3": ["Mistral3ForConditionalGenerationAD", "Mistral4ForCausalLM"],
+    "modeling_mimo_v2": ["MiMoV2ForCausalLM"],
     "modeling_nemotron_flash": ["NemotronFlashForCausalLM", "NemotronFlashPreTrainedTokenizerFast"],
     "modeling_nemotron_h": ["NemotronHForCausalLM"],
     "modeling_qwen3_5_moe": ["Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"],

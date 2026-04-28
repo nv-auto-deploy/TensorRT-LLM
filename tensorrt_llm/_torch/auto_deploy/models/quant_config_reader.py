@@ -207,9 +207,19 @@ class HFQuantConfigReader(QuantConfigReader):
         if not qconf:
             raise ValueError("HF quantization_config not found.")
 
-        # Inject default exclusion, add "model.embed_tokens" for "tie_word_embedding:true" case
-        excludes = qconf.get("exclude_modules", [])
-        qconf["exclude_modules"] = excludes + [n for n in self._ALWAYS_EXCLUDE if n not in excludes]
+        # HF repos use several equivalent names for "do not quantize" lists.
+        # Normalize them for AD transforms, which currently check either
+        # exclude_modules or modules_to_not_convert depending on the quantized op.
+        excludes = []
+        for key in ("exclude_modules", "modules_to_not_convert", "ignored_layers"):
+            value = qconf.get(key, [])
+            if value is None:
+                continue
+            excludes.extend(value)
+        excludes.extend(n for n in self._ALWAYS_EXCLUDE if n not in excludes)
+        excludes = list(dict.fromkeys(excludes))
+        qconf["exclude_modules"] = excludes
+        qconf["modules_to_not_convert"] = excludes
 
         self._quant_config = qconf
         from transformers.quantizers import AutoHfQuantizer

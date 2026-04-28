@@ -1,7 +1,9 @@
 import copy
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+import safetensors.torch
 import torch
 import torch.nn as nn
 from accelerate.utils import modeling
@@ -12,6 +14,7 @@ from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForCausalLMFactory,
     hf_load_state_dict_with_device,
 )
+from tensorrt_llm._torch.auto_deploy.models.quant_config_reader import HFQuantConfigReader
 
 
 class SimpleModel(nn.Module):
@@ -64,6 +67,64 @@ def test_hf_load_state_dict_with_device():
                 original_load_state_dict.assert_called_once_with(
                     "dummy_checkpoint", device_map={"": "cuda"}
                 )
+
+
+def test_hf_load_state_dict_with_device_streams_expected_safetensors_keys(tmp_path):
+    class RenamedStateDictModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2, 2))
+
+    def rename_weight_hook(module, state_dict, prefix, local_metadata):
+        state_dict[prefix + "checkpoint_weight"] = state_dict.pop(prefix + "weight")
+
+    model = RenamedStateDictModel()
+    model.register_state_dict_post_hook(rename_weight_hook)
+    checkpoint_path = tmp_path / "model.safetensors"
+    safetensors.torch.save_file(
+        {
+            "checkpoint_weight": torch.arange(4, dtype=torch.float32).reshape(2, 2),
+            "unused_expert_weight": torch.ones(2, 2),
+        },
+        checkpoint_path,
+    )
+
+    with hf_load_state_dict_with_device(device="cpu", model=model):
+        loaded = modeling.load_state_dict(str(checkpoint_path))
+
+    assert set(loaded) == {"checkpoint_weight"}
+    assert loaded["checkpoint_weight"].device.type == "cpu"
+    torch.testing.assert_close(
+        loaded["checkpoint_weight"],
+        torch.arange(4, dtype=torch.float32).reshape(2, 2),
+    )
+
+
+def test_hf_quant_config_reader_normalizes_ignore_aliases():
+    reader = HFQuantConfigReader()
+
+    reader.read_config(
+        {
+            "quantization_config": {
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+                "ignored_layers": ["model.layers.0.self_attn.o_proj"],
+                "modules_to_not_convert": ["model.layers.1.self_attn.o_proj"],
+                "exclude_modules": ["model.layers.2.self_attn.o_proj"],
+            }
+        }
+    )
+
+    qconfig = reader.get_config()
+    expected_excludes = [
+        "model.layers.2.self_attn.o_proj",
+        "model.layers.1.self_attn.o_proj",
+        "model.layers.0.self_attn.o_proj",
+        "lm_head",
+        "model.embed_tokens",
+    ]
+    assert qconfig["exclude_modules"] == expected_excludes
+    assert qconfig["modules_to_not_convert"] == expected_excludes
 
 
 @pytest.fixture
@@ -132,6 +193,53 @@ def test_recursive_update_config(mock_factory):
     # Check that complex nested updates were applied correctly
     assert config.text_config.rope_scaling["factor"] == 2.0
     assert config.text_config.rope_scaling["type"] == "linear"
+
+
+def test_get_checkpoint_file_repairs_stale_safetensors_index(mock_factory, tmp_path):
+    shard_path = tmp_path / "actual_shard.safetensors"
+    safetensors.torch.save_file({"linear.weight": torch.ones(2, 2)}, shard_path)
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 4},
+                "weight_map": {"linear.weight": "missing.safetensors"},
+            }
+        )
+    )
+
+    repaired_index_path = mock_factory._get_checkpoint_file(tmp_path)
+
+    assert repaired_index_path == str(tmp_path / "model.safetensors.auto_deploy.index.json")
+    with open(repaired_index_path) as f:
+        repaired_index = json.load(f)
+    assert repaired_index["weight_map"]["linear.weight"] == "actual_shard.safetensors"
+
+
+def test_get_checkpoint_file_reuses_valid_generated_safetensors_index(mock_factory, tmp_path):
+    shard_path = tmp_path / "actual_shard.safetensors"
+    safetensors.torch.save_file({"linear.weight": torch.ones(2, 2)}, shard_path)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 4},
+                "weight_map": {"linear.weight": "missing.safetensors"},
+            }
+        )
+    )
+    generated_index_path = tmp_path / "model.safetensors.auto_deploy.index.json"
+    generated_index_path.write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 4},
+                "weight_map": {"linear.weight": "actual_shard.safetensors"},
+            }
+        )
+    )
+
+    repaired_index_path = mock_factory._get_checkpoint_file(tmp_path)
+
+    assert repaired_index_path == str(generated_index_path)
 
 
 def test_register_custom_model_cls():

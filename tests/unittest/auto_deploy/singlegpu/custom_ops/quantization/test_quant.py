@@ -1,3 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -14,6 +19,24 @@ torch.manual_seed(0)
 
 SCALING_VECTOR_SIZE = 16  # NVFP4 block size along K
 INT4_BLOCK_SIZE = 128
+
+
+def _block_quantize_fp8_weight(weight: torch.Tensor, block_n: int = 128, block_k: int = 128):
+    scale = torch.empty(
+        (math.ceil(weight.shape[0] / block_n), math.ceil(weight.shape[1] / block_k)),
+        device=weight.device,
+        dtype=torch.float32,
+    )
+    weight_fp8 = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    for n_idx, n_start in enumerate(range(0, weight.shape[0], block_n)):
+        for k_idx, k_start in enumerate(range(0, weight.shape[1], block_k)):
+            block = weight[n_start : n_start + block_n, k_start : k_start + block_k].float()
+            block_scale = (block.abs().max() / 448.0).clamp_min(1e-12)
+            scale[n_idx, k_idx] = block_scale
+            weight_fp8[n_start : n_start + block_n, k_start : k_start + block_k] = (
+                block / block_scale
+            ).to(torch.float8_e4m3fn)
+    return weight_fp8, scale
 
 
 @pytest.mark.parametrize("M", [3, 12])  # NOTE: ensures both kernels are called
@@ -52,6 +75,25 @@ def test_fp8_linear(M, N, K, bias):
     assert output_fp8_trtllm.shape == output_fp8_torch.shape
 
     torch.testing.assert_close(output_fp8_trtllm, output_fp8_torch, rtol=0.01, atol=0.05)
+
+
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+def test_finegrained_fp8_linear_matches_hf_reference():
+    from transformers.integrations.finegrained_fp8 import act_quant, w8a8_block_fp8_matmul_triton
+
+    x = torch.randn(3, 5, 128, device="cuda", dtype=torch.bfloat16).contiguous()
+    weight = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16)
+    weight_fp8, weight_scale = _block_quantize_fp8_weight(weight)
+
+    qx, input_scale = act_quant(x, 128)
+    expected = w8a8_block_fp8_matmul_triton(
+        qx, weight_fp8, input_scale, weight_scale, [128, 128], output_dtype=x.dtype
+    )
+    actual = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+        x, weight_fp8, None, [], [weight_scale], [], []
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(
