@@ -13,7 +13,7 @@ from tensorrt_llm._torch.auto_deploy.distributed.common import cleanup, initiali
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
-from tensorrt_llm._utils import get_free_port
+from tensorrt_llm._utils import get_free_port, mpi_broadcast, mpi_rank
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
 # needed since MPI executor pool leaks a thread (_manager_spawn) on shutdown
@@ -69,6 +69,12 @@ class AllreduceResidualNorm2(torch.nn.Module):
 def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
     if not is_trtllm_op_available():
         pytest.skip("Require trtllm ops to run test_allreduce_fusion.")
+
+    # Pick the port inside the MPI workers so rank 0 chooses it immediately
+    # before distributed init, instead of probing it in the parent and
+    # leaving a race window before the workers use it for rendezvous.
+    if port is None:
+        port = mpi_broadcast(get_free_port() if mpi_rank() == 0 else None)
 
     _, _ = initialize_or_skip(port=port)
 
@@ -135,6 +141,11 @@ def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
         # check if we can still export the model as expected
         export(gm_transformed, args=args)
         torch_export_to_gm(gm_transformed, args=args)
+
+        # Keep teardown coordinated so one rank does not race ahead into the
+        # next test case while the other still owns the rendezvous resources.
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            torch.distributed.barrier()
     finally:
         cleanup()
 
@@ -158,19 +169,16 @@ def test_allreduce_fusion(device_count, ModuleCls, strategy):
         pytest.skip("Require multi GPUs to run test_allreduce_fusion.")
 
     n_workers = device_count
-    # Retry on EADDRINUSE: there is a Time-of-check-to-time-of-use (TOCTOU) race between get_free_port() in
-    # the parent and dist.init_process_group("nccl") in the workers. The
-    # spawn_multiprocess_job path handles this internally; the MpiPoolSession
-    # path used here does not, so retry with a fresh port and pool.
+    # Retry on EADDRINUSE with a fresh MPI pool to avoid transient
+    # rendezvous port conflicts in distributed initialization.
     max_retries = 5
     last_exc: Exception | None = None
-    for attempt in range(max_retries):
-        port = get_free_port()
+    for _ in range(max_retries):
         mpi_pool = MpiPoolSession(n_workers=n_workers)
         try:
             mpi_pool.submit_sync(
                 _test_allreduce_fusion,
-                port=port,
+                port=None,
                 ModuleCls=ModuleCls,
                 strategy=strategy,
             )
