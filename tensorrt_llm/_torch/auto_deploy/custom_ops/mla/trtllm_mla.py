@@ -89,18 +89,20 @@ from ..attention_interface import (
 # rope info on torch_mla nodes, consumed by prepare_node_for_cache_insertion
 # (at cache_init) to materialize the rotary_cos_sin buffer as a graph node.
 _TRTLLM_MLA_ROPE_INFO_KEY = "_trtllm_mla_rope_info"
-# Static reserve for ``thop.attention``'s C++ context-FMHA workspace.
-# The C++ side (``cpp/tensorrt_llm/thop/attentionOp.cpp``) auto-resizes the
-# tensor when the formula reports a larger requirement, but ``resize_()``
-# reallocates storage and **invalidates any captured CUDA graphs that
-# reference the workspace pointer**.  In dual-mode CG (decode-only
-# monolithic graphs are captured at engine init), that triggers a SIGSEGV
-# inside ``CUDAGraph::replay`` once the cache-reused-prefill path runs and
-# trips a resize.  Reserve enough up front so no resize ever fires:
-# at N (``chunked_prefill_buffer_batch_size``) = 16 and ``max_num_tokens
-# = 15360``, ``fp8_k_buf`` (16 * 15360 * 3072) + ``fp8_v_buf`` (16 * 15360 *
-# 2048) + small buffers + alignment ≈ 1.3 GiB.  Round up to 2 GiB.
-_TRTLLM_MLA_WORKSPACE_BYTES = 2 * 1024 * 1024 * 1024
+# ``thop.attention``'s C++ side (``cpp/tensorrt_llm/thop/attentionOp.cpp``)
+# auto-resizes the workspace tensor when its sizing formula exceeds the
+# tensor's capacity.  ``resize_()`` reallocates storage and rebinds the
+# ``data_ptr_`` — which **invalidates any captured CUDA graph that
+# recorded the old address**.  Mirroring the standard trtllm_attention
+# backend, we keep two workspaces and route per call:
+#
+# * ``workspace`` — used by eager paths (prefill).  Free to grow on demand
+#   via ``resize_()``; no captured graph references it.
+# * ``cuda_graph_workspace`` — used during CUDA-graph warmup and capture.
+#   Grows lazily during warmup so the captured graph records the final
+#   pointer; afterwards no resize fires for the captured workload.
+#
+# Both start size-0 and grow on first use.
 
 
 def get_trtllm_mla_rope_info(attn_node: Node) -> Optional[dict]:
@@ -129,7 +131,9 @@ class _TrtllmMLAPlanner:
     Mirrors ``_TrtllmPlanner`` from the standard trtllm backend.  Only stores data
     that cannot be derived from ``SequenceInfo`` or tensor shapes:
 
-    - ``workspace``: scratch for thop.attention
+    - ``workspace`` / ``cuda_graph_workspace``: scratch for thop.attention,
+      split between eager (prefill) and captured (decode) paths so the
+      C++ side's ``resize_()`` cannot invalidate captured graphs
     - Host metadata not in SequenceInfo: ``host_request_types``, ``host_total_kv_lens``,
       ``host_past_kv_lengths``, ``host_context_lengths``
     - ``block_offsets`` / ``block_ids_per_seq``: filled by the device-side
@@ -146,6 +150,7 @@ class _TrtllmMLAPlanner:
 
     def __init__(self):
         self.workspace: Optional[torch.Tensor] = None
+        self.cuda_graph_workspace: Optional[torch.Tensor] = None
         # Per-layer caches, keyed by the relevant tensor's data_ptr().
         self._pool_ptr_cache: dict = {}
         self._kv_b_proj_bmm_cache: dict = {}
@@ -208,10 +213,12 @@ class _TrtllmMLAPlanner:
         if self.workspace is not None:
             return
 
-        # Pre-allocate workspace large enough to avoid cudaMalloc during
-        # CUDA graph capture (matching the standard trtllm_attention backend).
-        # See ``_TRTLLM_MLA_WORKSPACE_BYTES`` for sizing rationale.
-        self.workspace = torch.empty(_TRTLLM_MLA_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        # Two size-0 workspaces; ``thop.attention``'s C++ side resizes on
+        # first use.  Splitting eager (prefill) from captured (decode)
+        # callers prevents a prefill-driven ``resize_()`` from invalidating
+        # captured-graph kernel pointers (see ``_select_workspace``).
+        self.workspace = torch.empty(0, dtype=torch.uint8, device=device)
+        self.cuda_graph_workspace = torch.empty(0, dtype=torch.uint8, device=device)
         # Shape: [_CONTEXT_LAYER_OFFSET + 1, 2] — one row per distinct mLayerIdx
         # we actually pass to thop.attention (decode=0, prefill=_CONTEXT_LAYER_OFFSET).
         # All zeros: each layer's pool pointer already points to that layer's
@@ -280,6 +287,18 @@ class _TrtllmMLAPlanner:
                 sm_count * 8, dtype=torch.int32, device=device
             )
             self.flash_mla_num_splits = torch.zeros(max_batch + 1, dtype=torch.int32, device=device)
+
+    def _select_workspace(self) -> torch.Tensor:
+        """Return the right workspace for the current execution context.
+
+        During CUDA-graph warmup or live capture, return ``cuda_graph_workspace``
+        so any C++-side ``resize_()`` happens before the graph records the
+        kernel's pointer.  Otherwise return ``workspace`` — captured graphs
+        do not reference it, so it is free to grow on demand.
+        """
+        if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
+            return self.cuda_graph_workspace
+        return self.workspace
 
     def ensure_decode_buffers(
         self,
@@ -757,7 +776,7 @@ def _handle_prefill_thop(
         v,  # v
         output,  # output
         None,  # output_sf
-        planner.workspace,  # workspace
+        planner._select_workspace(),  # workspace
         context_lengths[:pf],  # sequence_length (new tokens only)
         host_past_kv_lengths[:pf],  # host_past_key_value_lengths (all zero here)
         planner.ctx_total_kv_lens_host,  # host_total_kv_lens
@@ -1023,7 +1042,7 @@ def _handle_prefill_thop_cached_kv(
         full_v,  # v
         output,  # output
         None,  # output_sf
-        planner.workspace,  # workspace
+        planner._select_workspace(),  # workspace
         sequence_length[:pf],  # sequence_length (past + new tokens)
         host_past_kv_lengths[:pf],  # host_past_key_value_lengths (real)
         planner.ctx_total_kv_lens_host,  # host_total_kv_lens
@@ -1277,7 +1296,7 @@ def _handle_decode_impl(
         None,  # v
         output_latent,  # output
         None,  # output_sf
-        planner.workspace,  # workspace
+        planner._select_workspace(),  # workspace
         sequence_length,  # sequence_length
         host_past_kv_lengths,  # host_past_key_value_lengths
         host_total_kv_lens,  # host_total_kv_lens
