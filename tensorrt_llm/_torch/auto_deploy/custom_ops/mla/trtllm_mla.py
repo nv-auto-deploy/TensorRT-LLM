@@ -89,11 +89,18 @@ from ..attention_interface import (
 # rope info on torch_mla nodes, consumed by prepare_node_for_cache_insertion
 # (at cache_init) to materialize the rotary_cos_sin buffer as a graph node.
 _TRTLLM_MLA_ROPE_INFO_KEY = "_trtllm_mla_rope_info"
-# The cache-reused prefill path (``_handle_prefill_thop_cached_kv``) loads the
-# full ``[past + new]`` context from the paged KV cache; ``thop.attention``'s
-# context FMHA scratch grows with that total.  256 MiB suffices for fresh
-# prefill but is undersized once host_past_kv_lengths is non-zero.
-_TRTLLM_MLA_WORKSPACE_BYTES = 512 * 1024 * 1024
+# Static reserve for ``thop.attention``'s C++ context-FMHA workspace.
+# The C++ side (``cpp/tensorrt_llm/thop/attentionOp.cpp``) auto-resizes the
+# tensor when the formula reports a larger requirement, but ``resize_()``
+# reallocates storage and **invalidates any captured CUDA graphs that
+# reference the workspace pointer**.  In dual-mode CG (decode-only
+# monolithic graphs are captured at engine init), that triggers a SIGSEGV
+# inside ``CUDAGraph::replay`` once the cache-reused-prefill path runs and
+# trips a resize.  Reserve enough up front so no resize ever fires:
+# at N (``chunked_prefill_buffer_batch_size``) = 16 and ``max_num_tokens
+# = 15360``, ``fp8_k_buf`` (16 * 15360 * 3072) + ``fp8_v_buf`` (16 * 15360 *
+# 2048) + small buffers + alignment ≈ 1.3 GiB.  Round up to 2 GiB.
+_TRTLLM_MLA_WORKSPACE_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def get_trtllm_mla_rope_info(attn_node: Node) -> Optional[dict]:
@@ -1063,7 +1070,17 @@ def _handle_prefill_thop_cached_kv(
         True,  # use_paged_context_fmha
         int(AttentionInputType.context_only),  # attention_input_type
         True,  # is_mla_enable
-        1,  # chunked_prefill_buffer_batch_size
+        # FP8 context-MLA workspace (``fp8_k_buf`` / ``fp8_v_buf``) is sized
+        # to ``chunked_prefill_buffer_batch_size * max_num_tokens`` tokens.
+        # The cache-reused-prefill path passes the FULL ``[past + new]`` K/V
+        # in one call; ``num_full_tokens`` can exceed ``max_num_tokens`` at
+        # high prefill concurrency (e.g. 84 prefill seqs × 1003 tokens =
+        # 84252 vs ``max_num_tokens=15360`` at bs=256, isl=1000).  Hard-
+        # coding ``1`` caused IMA inside ``AttentionOp::enqueueContext``.
+        # Use ``16`` — covers up to ``16 * max_num_tokens`` tokens of FP8
+        # K/V scratch, ~1 GiB extra workspace at our config, while leaving
+        # KV-cache budget intact.
+        16,  # chunked_prefill_buffer_batch_size
         0,  # q_lora_rank
         kv_lora_rank,
         qk_nope_head_dim,
