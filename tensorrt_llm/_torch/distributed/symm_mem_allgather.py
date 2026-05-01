@@ -76,6 +76,28 @@ class SymmetricMemoryAllGather(nn.Module):
         },
     }
 
+    # Performance threshold (bytes) for the dim != 0 (transpose) path.
+    # Above this output size, the transpose+contiguous copies + the
+    # multimem all-at-once latency stop beating NCCL ring-LL's pipelined
+    # bandwidth — and on paths where multi-stream overlap is disabled
+    # (e.g. piecewise CG under disable_multi_stream), the multimem call
+    # ends up fully exposed on the critical path. Falling back to NCCL
+    # in that regime trades ~µs of latency for several ms of saved
+    # transpose + better pipelining on prefill-sized tensors.
+    # The dim == 0 path is unaffected (no transpose), and is gated only
+    # by the workspace overflow check (_MAX_SIZES).
+    _TRANSPOSE_PERF_THRESHOLD = {
+        "9.0": {
+            4: 1 * MiB,
+            6: 1 * MiB,
+            8: 1 * MiB,
+        },
+        "10.0": {
+            6: 1 * MiB,
+            8: 1 * MiB,
+        },
+    }
+
     def __init__(
         self,
         mapping: Mapping,
@@ -127,6 +149,9 @@ class SymmetricMemoryAllGather(nn.Module):
             return
 
         self.max_size = self._MAX_SIZES[self.device_capability][self.world_size]
+        self.transpose_perf_threshold = self._TRANSPOSE_PERF_THRESHOLD.get(
+            self.device_capability, {}
+        ).get(self.world_size, self.max_size)
 
         # Process group. NOTE: a group created here is left alive for the
         # module's lifetime — torch does not provide a cheap, safe way to
@@ -213,7 +238,12 @@ class SymmetricMemoryAllGather(nn.Module):
             logger.warning(f"SymmetricMemoryAllGather: workspace pre-allocation failed: {e}")
 
     def can_use_symm_mem(self, inp: torch.Tensor, dim: int = 0) -> bool:
-        """Check whether this tensor can be gathered with symm_mem."""
+        """Check whether this tensor can be gathered with symm_mem.
+
+        Non-zero gather dims are supported by transposing the gather dim to
+        position 0 in :py:meth:`forward`, performing the dim-0 multimem
+        allgather, and transposing back.
+        """
         if self.disabled:
             return False
         if inp.dtype != self.dtype:
@@ -224,9 +254,6 @@ class SymmetricMemoryAllGather(nn.Module):
             dim = ndim + dim
         if dim < 0 or dim >= ndim:
             return False
-        # Only dim-0 is served; other dims fall back to NCCL.
-        if dim != 0:
-            return False
         # multimem_all_gather_out requires 4B-aligned input.
         inp_bytes = inp.numel() * inp.element_size()
         if inp_bytes % 4 != 0:
@@ -235,6 +262,12 @@ class SymmetricMemoryAllGather(nn.Module):
         # Use >= to match SymmetricMemoryAllReduce's bound.
         out_bytes = inp_bytes * self.world_size
         if out_bytes >= self.max_size:
+            return False
+        # On the dim != 0 (transpose) path, gate by the perf threshold so
+        # that large tensors (typical of prefill) fall back to NCCL where
+        # ring-LL pipelining beats multimem-with-transpose. dim == 0 is
+        # unaffected.
+        if dim != 0 and out_bytes >= self.transpose_perf_threshold:
             return False
         return True
 
@@ -259,13 +292,25 @@ class SymmetricMemoryAllGather(nn.Module):
         dim: int = 0,
     ) -> Optional[torch.Tensor]:
         """
-        Perform allgather using multimem_all_gather_out along dim 0.
+        Perform allgather using multimem_all_gather_out.
 
-        Returns the gathered tensor, or ``None`` if this call cannot be
-        served by symm_mem (caller should fall back to NCCL). Non-zero
-        gather dims are deliberately rejected — see class docstring.
+        Supports any gather dimension by transposing the gather dim to
+        position 0, running the dim-0 multimem allgather, and transposing
+        back. Returns the gathered tensor, or ``None`` if this call cannot
+        be served by symm_mem (caller should fall back to NCCL).
         """
         if not self.can_use_symm_mem(inp, dim):
             return None
 
-        return self._allgather_dim0(inp)
+        # Normalize dim.
+        if dim < 0:
+            dim = inp.ndim + dim
+
+        if dim == 0:
+            return self._allgather_dim0(inp)
+
+        # For dim != 0: move the gather dim to position 0,
+        # allgather along dim-0, then move it back.
+        inp_t = inp.transpose(0, dim).contiguous()
+        gathered = self._allgather_dim0(inp_t)
+        return gathered.transpose(0, dim).contiguous()
