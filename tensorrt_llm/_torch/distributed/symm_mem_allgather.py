@@ -46,9 +46,10 @@ class SymmetricMemoryAllGather(nn.Module):
     - SM 9.0: 4, 6, 8 GPUs
     - SM 10.0: 6, 8 GPUs
 
-    Only dim-0 gather is served; other dims return ``None`` so the caller
-    falls back to NCCL (the transpose+contiguous copies that a generic-dim
-    path would need erode the MULTIMEM latency advantage).
+    Any gather dim is supported via transpose-to-dim-0 in :py:meth:`forward`.
+    Large outputs on the dim != 0 path fall back to NCCL via
+    ``_TRANSPOSE_PERF_THRESHOLD`` because the transpose+contiguous copies
+    erode the MULTIMEM latency advantage on prefill-sized tensors.
     """
 
     MiB = 1024 * 1024
@@ -149,9 +150,14 @@ class SymmetricMemoryAllGather(nn.Module):
             return
 
         self.max_size = self._MAX_SIZES[self.device_capability][self.world_size]
+        # Fail-safe: unknown (cap, ws) combinations get threshold=0, which
+        # forces dim != 0 calls onto NCCL fallback. This avoids silently
+        # admitting transpose-path multimem on configurations we have not
+        # actually measured. The dim == 0 path is unaffected (it does not
+        # consult this threshold).
         self.transpose_perf_threshold = self._TRANSPOSE_PERF_THRESHOLD.get(
             self.device_capability, {}
-        ).get(self.world_size, self.max_size)
+        ).get(self.world_size, 0)
 
         # Process group. NOTE: a group created here is left alive for the
         # module's lifetime — torch does not provide a cheap, safe way to
@@ -237,6 +243,15 @@ class SymmetricMemoryAllGather(nn.Module):
         except Exception as e:
             logger.warning(f"SymmetricMemoryAllGather: workspace pre-allocation failed: {e}")
 
+    @staticmethod
+    def _normalize_dim(dim: int, ndim: int) -> Optional[int]:
+        """Normalize a possibly-negative dim. Returns ``None`` if out of range."""
+        if dim < 0:
+            dim = ndim + dim
+        if dim < 0 or dim >= ndim:
+            return None
+        return dim
+
     def can_use_symm_mem(self, inp: torch.Tensor, dim: int = 0) -> bool:
         """Check whether this tensor can be gathered with symm_mem.
 
@@ -248,11 +263,8 @@ class SymmetricMemoryAllGather(nn.Module):
             return False
         if inp.dtype != self.dtype:
             return False
-        # Normalize negative dim.
-        ndim = inp.ndim
-        if dim < 0:
-            dim = ndim + dim
-        if dim < 0 or dim >= ndim:
+        dim = self._normalize_dim(dim, inp.ndim)
+        if dim is None:
             return False
         # multimem_all_gather_out requires 4B-aligned input.
         inp_bytes = inp.numel() * inp.element_size()
@@ -302,9 +314,9 @@ class SymmetricMemoryAllGather(nn.Module):
         if not self.can_use_symm_mem(inp, dim):
             return None
 
-        # Normalize dim.
-        if dim < 0:
-            dim = inp.ndim + dim
+        dim = self._normalize_dim(dim, inp.ndim)
+        # can_use_symm_mem already validated dim, so _normalize_dim cannot
+        # return None here.
 
         if dim == 0:
             return self._allgather_dim0(inp)
