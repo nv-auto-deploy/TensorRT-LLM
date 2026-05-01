@@ -25,6 +25,10 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor._util import get_decoding_mode
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+    AttentionTypeCpp,
+    create_kv_cache_transceiver,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
@@ -57,6 +61,11 @@ from ..transform.optimizer import InferenceOptimizer
 from ..utils.dist_config import DistConfig
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
+
+_ATTENTION_TYPE_TO_CPP = {
+    "mha": AttentionTypeCpp.DEFAULT,
+    "mla": AttentionTypeCpp.MLA,
+}
 
 # Non-tensor multimodal metadata consumed by _store_prefill_multimodal_metadata.
 # These keys must NOT leak into the generic extra_args dict — entries there
@@ -343,6 +352,7 @@ class ADEngine(ModelEngine):
             vocab_size_padded=factory.vocab_size_padded,
             spec_config=ad_config.speculative_config,
             requires_uniform_kv_caches=ad_config.requires_uniform_kv_caches,
+            reject_unmanaged_persistent_caches=ad_config.reject_unmanaged_persistent_caches,
         )
 
         reporting_info = ReportingInfo(
@@ -724,8 +734,16 @@ class ADEngine(ModelEngine):
         num_prefill_tokens = len(input_ids)
 
         for request in gen_requests:
-            # check if need overlap and draft length
-            is_overlap = not self._disable_overlap_scheduler and not request.is_dummy
+            # Overlap gathers tokens from the previous batch slot. Non-overlap
+            # forwards do not pass new_tokens at all; first-step generation-only
+            # disagg requests may have new_tokens from a previous batch but do
+            # not have a previous batch slot (py_batch_idx) to gather from yet.
+            is_overlap = (
+                has_new_tokens
+                and not self._disable_overlap_scheduler
+                and not request.is_dummy
+                and request.py_batch_idx is not None
+            )
 
             # check draft length
             draft_len = get_draft_token_length(request)
@@ -1119,6 +1137,42 @@ def create_autodeploy_executor(
         engine=engine,
     )
 
+    cache_transceiver_config = ad_config.cache_transceiver_config
+    kv_cache_transceiver = None
+    if cache_transceiver_config is not None and cache_transceiver_config.backend is not None:
+        if isinstance(kv_cache_manager, BaseMambaCacheManager):
+            raise RuntimeError(
+                "AutoDeploy disaggregated serving does not currently support Mamba/hybrid cache "
+                "managers. A prerequisite for disaggregated serving of hybrid models is to use "
+                "the C++ MambaCacheManager, which is currently not supported in AutoDeploy."
+            )
+        if cache_transceiver_config.max_tokens_in_buffer is None:
+            # The buffer must hold the prompt's KV state (full prefill length).
+            # We use max_seq_len as a safe upper bound on max ISL.
+            cache_transceiver_config.max_tokens_in_buffer = (
+                engine.cache_seq_interface.info.max_seq_len
+            )
+
+        cache_attention_type = engine.cache_seq_interface.attention_type
+        if cache_attention_type is None:
+            raise RuntimeError(
+                "Cache transceiver is enabled, but AutoDeploy did not find a managed paged KV "
+                "resource to provide attention_type."
+            )
+        try:
+            attention_type = _ATTENTION_TYPE_TO_CPP[cache_attention_type]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported attention_type: {cache_attention_type!r}") from exc
+
+        kv_cache_transceiver = create_kv_cache_transceiver(
+            dist_mapping,
+            dist,
+            kv_cache_manager,
+            attention_type,
+            cache_transceiver_config,
+            mamba_cache_manager=None,
+        )
+
     # Guided (structured) decoding.
     guided_decoder = None
     if (
@@ -1163,6 +1217,7 @@ def create_autodeploy_executor(
         max_batch_size=ad_config.max_batch_size,
         max_beam_width=ad_config.max_beam_width,
         guided_decoder=guided_decoder,
+        kv_cache_transceiver=kv_cache_transceiver,
         resource_governor_queue=resource_governor_queue,
         garbage_collection_gen0_threshold=ad_config.garbage_collection_gen0_threshold,
     )

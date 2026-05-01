@@ -600,6 +600,7 @@ class FlashInferAttention(AttentionDescriptor):
                 kv_factor=2,
                 kv_layout=_GlobalFlashInferPlanner.kv_layout,
                 sliding_window=sliding_window,
+                attention_type="mha",
             )
         }
 

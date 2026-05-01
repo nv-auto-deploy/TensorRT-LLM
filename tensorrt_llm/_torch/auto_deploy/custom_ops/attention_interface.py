@@ -39,6 +39,7 @@ from ..utils.logger import ad_logger
 from ..utils.node_utils import extract_op_args, get_op_schema
 
 Constant = Union[int, float, str, None]
+AttentionType = Literal["mha", "mla"]
 
 # Torch dtype → numpy dtype for fast list-to-tensor conversion.
 # numpy's list→array conversion is ~2-3x faster than torch.tensor(list) for large lists.
@@ -666,6 +667,8 @@ class SequenceInfo:
 
         # will store num_blocks later...
         self._num_blocks = None
+
+        self.attention_type: Optional[AttentionType] = None
 
         # TODO (lucaslie): can we remove this eventually from this i/f?
         self.vocab_size_padded = vocab_size_padded
@@ -1838,6 +1841,10 @@ class ResourceHandler(ABC):
         """Initialize the resource for the given sequence info."""
 
 
+class EphemeralResourceHandler(ResourceHandler):
+    """Base class for resources that do not persist across forward steps."""
+
+
 class KVPagedResourceHandler(ResourceHandler):
     """Handler for paged KV cache resources.
 
@@ -1857,6 +1864,7 @@ class KVPagedResourceHandler(ResourceHandler):
         kv_layout: Memory layout for the KV cache. Either "HND" (head-num-dim) or
             "NHD" (num-head-dim). Default is "HND" which is the standard layout
             for flashinfer.
+        attention_type: Attention layout semantics for this cache resource: ``"mha"`` or ``"mla"``.
         sliding_window: Sliding window size for this layer.  ``0`` means full
             attention; a positive value puts this layer in its own VSWA group.
     """
@@ -1871,6 +1879,7 @@ class KVPagedResourceHandler(ResourceHandler):
         num_kv_heads: int,
         head_dim: int,
         dtype: torch.dtype,
+        attention_type: AttentionType,
         kv_factor: int = 2,
         kv_layout: Literal["HND", "NHD"] = "HND",
         sliding_window: int = 0,
@@ -1883,6 +1892,7 @@ class KVPagedResourceHandler(ResourceHandler):
             dtype: The dtype of the KV cache.
             kv_factor: The factor of the KV cache. Default is 2.
             kv_layout: Memory layout - "HND" or "NHD". Default is "HND".
+            attention_type: Attention layout semantics for this cache resource: ``"mha"`` or ``"mla"``.
             sliding_window: Sliding window size for this layer. 0 means full attention.
         """
         self.num_kv_heads = num_kv_heads
@@ -1891,6 +1901,9 @@ class KVPagedResourceHandler(ResourceHandler):
         self.kv_factor = kv_factor
         assert kv_factor in [1, 2], f"Invalid kv_factor: {kv_factor}"
         self.kv_layout = kv_layout
+        if attention_type not in ("mha", "mla"):
+            raise ValueError(f"Unsupported attention_type: {attention_type!r}")
+        self.attention_type = attention_type
         self.sliding_window = (
             sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
         )
@@ -1910,6 +1923,7 @@ class KVPagedResourceHandler(ResourceHandler):
             and self.dtype == other.dtype
             and self.kv_factor == other.kv_factor
             and self.kv_layout == other.kv_layout
+            and self.attention_type == other.attention_type
             and self.sliding_window == other.sliding_window
         )
 

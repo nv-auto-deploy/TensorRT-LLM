@@ -1545,6 +1545,7 @@ class TritonPagedAttention(AttentionDescriptor):
                 kv_factor=2,
                 kv_layout=KV_LAYOUT,
                 sliding_window=sliding_window,
+                attention_type="mha",
             )
         }
 

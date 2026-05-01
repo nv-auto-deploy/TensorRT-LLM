@@ -288,6 +288,16 @@ Or using the provided client parsing the prompts from a file and sending request
 python3 ./clients/disagg_client.py -c disagg_config.yaml -p ./clients/prompts.json -e chat
 ```
 
+### AutoDeploy Backend
+
+To use the [AutoDeploy](../../docs/source/features/auto_deploy/auto-deploy.md) backend, follow the instructions above with these changes:
+
+- Start context and generation workers with `--backend _autodeploy`.
+- Set the disaggregated proxy config `backend` field to `_autodeploy`.
+- Use the AutoDeploy disaggregated config snippets as the worker configs:
+  - `examples/auto_deploy/model_registry/configs/disagg_ctx.yaml`
+  - `examples/auto_deploy/model_registry/configs/disagg_gen.yaml`
+
 ### Launching disaggregated servers on SLURM clusters
 
 To simplify usage, TensorRT-LLM internally relies on MPI spawning processes. However, some clusters do not offer such process flexibility. In these cases, we provide the `trtllm-llmapi-launch` tool to launch all processes at once. Therefore, when using TensorRT-LLM on a Slurm cluster, please refer to the following method.

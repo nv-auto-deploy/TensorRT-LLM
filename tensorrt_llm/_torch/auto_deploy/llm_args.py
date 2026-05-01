@@ -432,6 +432,14 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         """Whether CachedSequenceInterface must enforce a uniform KV cache mapping."""
         return self.attn_backend.lower() == "trtllm"
 
+    @property
+    def reject_unmanaged_persistent_caches(self) -> bool:
+        """Whether unmanaged persistent cache resources should be rejected."""
+        return (
+            self.cache_transceiver_config is not None
+            and self.cache_transceiver_config.backend is not None
+        )
+
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments.
 

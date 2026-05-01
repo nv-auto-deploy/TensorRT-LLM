@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+cache_transceiver_config:
+  backend: DEFAULT
+# Prefill workers must run without overlap scheduling because the current
+# context-only transfer path sends KV cache when a request completes its context
+# phase, after all prefill chunks have run.
+disable_overlap_scheduler: true

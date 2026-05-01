@@ -65,9 +65,14 @@ def two_window_interface():
         ),
     )
     interface.add_resource(
-        "kv_swa", KVPagedResourceHandler(4, 32, dtype=torch.float16, sliding_window=SWA_WINDOW)
+        "kv_swa",
+        KVPagedResourceHandler(
+            4, 32, dtype=torch.float16, attention_type="mha", sliding_window=SWA_WINDOW
+        ),
     )
-    interface.add_resource("kv_full", KVPagedResourceHandler(4, 32, dtype=torch.float16))
+    interface.add_resource(
+        "kv_full", KVPagedResourceHandler(4, 32, dtype=torch.float16, attention_type="mha")
+    )
     interface.initialize_resources()
     return interface
 

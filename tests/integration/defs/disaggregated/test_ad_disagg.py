@@ -1,0 +1,1067 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import multiprocessing as mp
+import os
+import time
+import traceback
+from contextlib import contextmanager
+from dataclasses import replace
+from queue import Empty
+
+import pytest
+import torch
+from defs.conftest import get_sm_version, skip_pre_hopper
+
+from tensorrt_llm import DisaggregatedParams, SamplingParams
+from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+WORKER_READY = "ready"
+REQUEST_MODE_AGGREGATE = "aggregate"
+WORKER_RESPONSE_TIMEOUT_S = 600
+WORKER_SHUTDOWN_TIMEOUT_S = 30
+WORKER_TERMINATE_TIMEOUT_S = 10
+AUTODEPLOY_DISAGG_SEED = 1234
+REDUCED_TINYLLAMA_LAYERS = 2
+REDUCED_DEEPSEEK_LAYERS = 2
+LLAMA_EAGLE3_EXPECTED_TEXT = " Berlin\nWhat is the capital of France? Paris\nWhat is the capital of"
+LLAMA_EAGLE3_EXPECTED_TOKEN_IDS = [
+    20437,
+    198,
+    3923,
+    374,
+    279,
+    6864,
+    315,
+    9822,
+    30,
+    12366,
+    198,
+    3923,
+    374,
+    279,
+    6864,
+    315,
+]
+
+
+MODEL_PATHS = {
+    "EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
+    "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct/",
+    "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+    "DeepSeek-V3-Lite-BF16": "DeepSeek-V3-Lite/bf16",
+}
+
+
+def model_path(model_name):
+    llm_models_root = os.environ["LLM_MODELS_ROOT"]
+    for name, path in MODEL_PATHS.items():
+        if name in model_name:
+            return os.path.join(llm_models_root, path)
+    raise ValueError(f"Unknown model: {model_name}")
+
+
+def response_summary(response):
+    """Summarize values returned by AutoDeploy test workers.
+
+    Inputs:
+        response: Queue payload from an AutoDeploy worker. It can be a formatted
+            exception string or a list of normal LLM output objects.
+
+    Outputs:
+        A string representing the input response.
+
+    This is useful because subprocess workers send results through
+    multiprocessing queues, so assertion failures otherwise lose the key fields
+    needed to debug the disaggregated handoff: generated text/tokens, request
+    type, context request id, draft-token count, and logits shape when present.
+    """
+    if isinstance(response, str):
+        return f"error={response}"
+    if isinstance(response, list) and response and hasattr(response[0], "token_ids"):
+        output = response[0]
+        disaggregated_params = output.disaggregated_params
+        if disaggregated_params is None:
+            request_type = REQUEST_MODE_AGGREGATE
+            ctx_request_id = None
+        else:
+            request_type = disaggregated_params.request_type
+            ctx_request_id = disaggregated_params.ctx_request_id
+        draft_tokens = (
+            len(disaggregated_params.draft_tokens)
+            if disaggregated_params is not None and disaggregated_params.draft_tokens is not None
+            else 0
+        )
+        logits = output.generation_logits
+        logits_shape = tuple(logits.shape) if logits is not None else None
+        return (
+            f"text={output.text!r}, token_ids={output.token_ids}, disagg_type={request_type}, "
+            f"ctx_request_id={ctx_request_id}, draft_tokens={draft_tokens}, logits_shape={logits_shape}"
+        )
+    return repr(response)
+
+
+def seed_autodeploy_disagg():
+    torch.manual_seed(AUTODEPLOY_DISAGG_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(AUTODEPLOY_DISAGG_SEED)
+
+
+def autodeploy_base_config(enable_cuda_graph, extra_config=None):
+    if enable_cuda_graph:
+        graph_config = dict(
+            compile_backend="torch-cudagraph",
+            cuda_graph_config={"batch_sizes": [1, 2, 4]},
+        )
+    else:
+        graph_config = dict(
+            compile_backend="torch-simple",
+            cuda_graph_config=None,
+        )
+
+    common_config = dict(
+        runtime="trtllm",
+        attn_backend="trtllm",
+        max_batch_size=4,
+        max_seq_len=2048,
+        max_num_tokens=512,
+        trust_remote_code=True,
+        kv_cache_config={"max_tokens": 2048},
+        **graph_config,
+    )
+    if extra_config:
+        common_config.update(extra_config)
+
+    return common_config
+
+
+def autodeploy_disagg_config(enable_cuda_graph, extra_config=None):
+    return dict(
+        autodeploy_base_config(enable_cuda_graph, extra_config),
+        cache_transceiver_config={"backend": "DEFAULT"},
+    )
+
+
+def autodeploy_context_config(enable_cuda_graph, extra_config=None):
+    # Context-only transfer happens after the request completes its context phase,
+    # so keep the context worker on the non-overlap scheduling path.
+    return dict(
+        autodeploy_disagg_config(enable_cuda_graph, extra_config),
+        disable_overlap_scheduler=True,
+    )
+
+
+def autodeploy_generation_config(generation_overlap, enable_cuda_graph, extra_config=None):
+    config = autodeploy_disagg_config(enable_cuda_graph, extra_config)
+    if not generation_overlap:
+        config["disable_overlap_scheduler"] = True
+
+    return config
+
+
+def single_output(response):
+    if isinstance(response, str):
+        raise RuntimeError(response)
+    if not isinstance(response, list) or not response:
+        raise RuntimeError(f"Expected a non-empty output list, got {response_summary(response)}")
+    return response[0]
+
+
+def first_output(responses):
+    if len(responses) != 1:
+        raise RuntimeError(f"Expected one response, got {response_summary(responses)}")
+    return single_output(responses[0])
+
+
+def generation_params_from_context(context_output):
+    context_params = context_output.disaggregated_params
+    if context_params is None:
+        raise RuntimeError(
+            f"Context output has no disaggregated params: {response_summary([context_output])}"
+        )
+    return replace(context_params, request_type="generation_only")
+
+
+def has_draft_tokens(output):
+    params = output.disaggregated_params
+    return params is not None and params.draft_tokens is not None and len(params.draft_tokens) > 0
+
+
+def has_handoff_transport_metadata(params):
+    # C++ transceiver carries handoff state in opaque_state; Python/native
+    # transceiver carries the context endpoint in ctx_info_endpoint.
+    return params.opaque_state is not None or params.ctx_info_endpoint is not None
+
+
+def run_autodeploy_aggregate_generation(
+    model,
+    world_size,
+    enable_cuda_graph,
+    prompt,
+    sampling_params_kwargs=None,
+    extra_autodeploy_config=None,
+):
+    """Run one non-disaggregated AutoDeploy generation request."""
+    if sampling_params_kwargs is None:
+        sampling_params_kwargs = {"max_tokens": 25, "ignore_eos": True}
+
+    seed_autodeploy_disagg()
+    with AutoDeployLLM(
+        model=model_path(model),
+        world_size=world_size,
+        **autodeploy_base_config(enable_cuda_graph, extra_autodeploy_config),
+    ) as llm:
+        seed_autodeploy_disagg()
+        result = llm.generate(
+            prompt,
+            sampling_params=SamplingParams(**sampling_params_kwargs),
+            use_tqdm=False,
+        )
+
+    output = result.outputs[0]
+    print(f"[AD DISAGG TEST] aggregate output: {response_summary([output])}")
+    return output
+
+
+# ---------------------------------------------------------------------------
+# Sequential live-pair tests.
+#
+# These tests run context-only and generation-only AutoDeploy instances in one
+# process, one after the other, while keeping the context instance alive for
+# the generation handoff. They usually run in the 1-GPU stage. Unlike the unit
+# smoke tests, these load real weights, so they can compare disaggregated
+# output, logits, and batched slot handoff against aggregate generation.
+# ---------------------------------------------------------------------------
+
+
+def reduced_tinyllama_real_weight_config(extra_config=None):
+    config = {
+        "model_kwargs": {"num_hidden_layers": REDUCED_TINYLLAMA_LAYERS},
+        "max_batch_size": 4,
+        "max_seq_len": 512,
+        "max_num_tokens": 256,
+        "kv_cache_config": {"max_tokens": 1024},
+    }
+    if extra_config:
+        config.update(extra_config)
+    return config
+
+
+def reduced_deepseek_v3_lite_mla_config():
+    # Keep DeepSeek MLA on torch-simple in this coverage. The TRTLLM MLA
+    # disaggregated path is not CUDA-graph clean yet, so CUDA graph coverage is
+    # intentionally deferred to a dedicated enablement pass.
+    config = {
+        "model_kwargs": {"num_hidden_layers": REDUCED_DEEPSEEK_LAYERS},
+        "compile_backend": "torch-simple",
+        "cuda_graph_config": None,
+        "max_batch_size": 4,
+        "max_seq_len": 512,
+        "max_num_tokens": 256,
+        "kv_cache_config": {"max_tokens": 1024},
+        "transforms": {
+            "insert_cached_mla_attention": {"backend": "trtllm_mla"},
+            "fuse_rope_into_trtllm_mla": {"enabled": True},
+            "multi_stream_mla_attn": {"stage": "compile", "enabled": False},
+        },
+    }
+    return config
+
+
+def long_context_prompt():
+    return (
+        "TensorRT-LLM disaggregated serving separates context prefill from token generation. "
+        "The context worker computes the prompt KV cache, sends the cache state to the "
+        "generation worker, and returns the first generated token metadata. "
+    )
+
+
+def batch_handoff_prompts():
+    return [
+        "What is the capital of Germany?",
+        "What is the capital of France?",
+        "What is the capital of Italy?",
+        "What is the capital of Spain?",
+    ]
+
+
+def assert_context_handoff_metadata(context_output, expect_logits=False):
+    context_params = context_output.disaggregated_params
+    assert context_params is not None
+    assert context_params.request_type == "context_only"
+    assert len(context_output.token_ids) == 1
+    assert context_params.ctx_request_id is not None
+    assert context_params.first_gen_tokens is not None
+    if expect_logits:
+        assert context_params.first_gen_logits is not None
+    assert has_handoff_transport_metadata(context_params)
+
+
+def run_autodeploy_aggregate_batch_generation(
+    model,
+    world_size,
+    enable_cuda_graph,
+    prompts,
+    sampling_params_kwargs=None,
+    extra_autodeploy_config=None,
+):
+    if sampling_params_kwargs is None:
+        sampling_params_kwargs = {"max_tokens": 25, "ignore_eos": True}
+
+    seed_autodeploy_disagg()
+    with AutoDeployLLM(
+        model=model_path(model),
+        world_size=world_size,
+        **autodeploy_base_config(enable_cuda_graph, extra_autodeploy_config),
+    ) as llm:
+        seed_autodeploy_disagg()
+        results = llm.generate(
+            prompts,
+            sampling_params=SamplingParams(**sampling_params_kwargs),
+            use_tqdm=False,
+        )
+
+    outputs = [result.outputs[0] for result in results]
+    print(f"[AD DISAGG TEST] aggregate batch output: {response_summary(outputs)}")
+    return outputs
+
+
+def run_sequential_handoff(
+    model,
+    generation_overlap,
+    enable_cuda_graph,
+    prompt,
+    sampling_params_kwargs=None,
+    extra_autodeploy_config=None,
+):
+    if sampling_params_kwargs is None:
+        sampling_params_kwargs = {"max_tokens": 25, "ignore_eos": True}
+
+    model_name = model_path(model)
+    with AutoDeployLLM(
+        model=model_name,
+        world_size=1,
+        **autodeploy_context_config(enable_cuda_graph, extra_autodeploy_config),
+    ) as context_llm:
+        seed_autodeploy_disagg()
+        context_output = context_llm.generate(
+            prompt,
+            sampling_params=SamplingParams(**sampling_params_kwargs),
+            disaggregated_params=DisaggregatedParams(request_type="context_only"),
+            use_tqdm=False,
+        ).outputs[0]
+        print(f"[AD DISAGG TEST] context output: {response_summary([context_output])}")
+        generation_params = generation_params_from_context(context_output)
+
+        # Keep the context-side sender alive while generation consumes the
+        # handoff params.
+        with AutoDeployLLM(
+            model=model_name,
+            world_size=1,
+            **autodeploy_generation_config(
+                generation_overlap, enable_cuda_graph, extra_autodeploy_config
+            ),
+        ) as generation_llm:
+            seed_autodeploy_disagg()
+            generation_output = generation_llm.generate(
+                prompt,
+                sampling_params=SamplingParams(**sampling_params_kwargs),
+                disaggregated_params=generation_params,
+                use_tqdm=False,
+            ).outputs[0]
+            print(f"[AD DISAGG TEST] generation output: {response_summary([generation_output])}")
+
+    return {
+        "context": context_output,
+        "generation": generation_output,
+    }
+
+
+async def run_async_requests(llm, prompts, sampling_params_kwargs, disaggregated_params):
+    futures = []
+    for prompt, params in zip(prompts, disaggregated_params):
+        seed_autodeploy_disagg()
+        futures.append(
+            llm.generate_async(
+                prompt,
+                sampling_params=SamplingParams(**sampling_params_kwargs),
+                disaggregated_params=params,
+            )
+        )
+
+    outputs = []
+    for future in futures:
+        result = await future
+        outputs.append(result.outputs[0])
+    return outputs
+
+
+def run_sequential_batch_handoff(
+    model,
+    generation_overlap,
+    enable_cuda_graph,
+    prompts,
+    sampling_params_kwargs=None,
+    extra_autodeploy_config=None,
+):
+    if sampling_params_kwargs is None:
+        sampling_params_kwargs = {"max_tokens": 25, "ignore_eos": True}
+
+    model_name = model_path(model)
+    context_params = [DisaggregatedParams(request_type="context_only") for _ in range(len(prompts))]
+    with AutoDeployLLM(
+        model=model_name,
+        world_size=1,
+        **autodeploy_context_config(enable_cuda_graph, extra_autodeploy_config),
+    ) as context_llm:
+        context_outputs = asyncio.run(
+            run_async_requests(context_llm, prompts, sampling_params_kwargs, context_params)
+        )
+        print(f"[AD DISAGG TEST] context batch output: {response_summary(context_outputs)}")
+        generation_params = [
+            generation_params_from_context(context_output) for context_output in context_outputs
+        ]
+
+        # Submit all generation-only requests before awaiting them so this
+        # remains a batch slot-transfer test while avoiding the async queue
+        # infrastructure used by the multi-GPU tests.
+        with AutoDeployLLM(
+            model=model_name,
+            world_size=1,
+            **autodeploy_generation_config(
+                generation_overlap, enable_cuda_graph, extra_autodeploy_config
+            ),
+        ) as generation_llm:
+            generation_outputs = asyncio.run(
+                run_async_requests(
+                    generation_llm,
+                    prompts,
+                    sampling_params_kwargs,
+                    generation_params,
+                )
+            )
+            print(
+                f"[AD DISAGG TEST] generation batch output: {response_summary(generation_outputs)}"
+            )
+
+    return {
+        "context": context_outputs,
+        "generation": generation_outputs,
+    }
+
+
+@pytest.mark.parametrize(
+    ("model", "extra_autodeploy_config"),
+    [
+        pytest.param(
+            "TinyLlama-1.1B-Chat-v1.0",
+            reduced_tinyllama_real_weight_config(),
+            id="tinyllama",
+        ),
+        pytest.param(
+            "DeepSeek-V3-Lite-BF16",
+            reduced_deepseek_v3_lite_mla_config(),
+            id="deepseek_mla",
+        ),
+    ],
+)
+@pytest.mark.skip_less_device_memory(30000)
+@pytest.mark.timeout(600)
+def test_reduced_layer_batch_handoff_matches_aggregate(model, extra_autodeploy_config):
+    """Check batched disaggregated handoff preserves per-request slot alignment.
+
+    The aggregate comparison catches cases where transferred KV cache or first
+    tokens are assigned to the wrong request in a batch.
+    """
+    prompts = batch_handoff_prompts()
+    sampling_params_kwargs = {
+        "max_tokens": 8,
+        "ignore_eos": True,
+        "top_k": 1,
+        "seed": AUTODEPLOY_DISAGG_SEED,
+    }
+    # Keep real weights loaded, but reduce the decoder stack. This targets
+    # per-request KV slot handoff, so batch mixups should still change outputs
+    # without paying the full-model cost.
+    aggregate_outputs = run_autodeploy_aggregate_batch_generation(
+        model,
+        world_size=1,
+        enable_cuda_graph=False,
+        prompts=prompts,
+        sampling_params_kwargs=sampling_params_kwargs,
+        extra_autodeploy_config=extra_autodeploy_config,
+    )
+    outputs = run_sequential_batch_handoff(
+        model,
+        generation_overlap=True,
+        enable_cuda_graph=False,
+        prompts=prompts,
+        sampling_params_kwargs=sampling_params_kwargs,
+        extra_autodeploy_config=extra_autodeploy_config,
+    )
+
+    for aggregate_output, context_output, generation_output in zip(
+        aggregate_outputs, outputs["context"], outputs["generation"]
+    ):
+        assert_context_handoff_metadata(context_output)
+        assert context_output.token_ids == aggregate_output.token_ids[:1]
+        assert generation_output.text == aggregate_output.text
+        assert generation_output.token_ids == aggregate_output.token_ids
+
+
+@pytest.mark.skip_less_device_memory(30000)
+@pytest.mark.timeout(600)
+def test_ad_disaggregated_logits():
+    sampling_params_kwargs = {
+        "max_tokens": 10,
+        "ignore_eos": True,
+        "return_generation_logits": True,
+    }
+    # Keep this weighted, but reduce the target layer count so the test focuses
+    # on logits transfer/equality instead of full-model compile and memory cost.
+    extra_autodeploy_config = reduced_tinyllama_real_weight_config(
+        {"gather_generation_logits": True}
+    )
+    model_name = "TinyLlama-1.1B-Chat-v1.0"
+    prompt = "What is the capital of Germany?"
+    aggregate_output = run_autodeploy_aggregate_generation(
+        model_name,
+        world_size=1,
+        enable_cuda_graph=False,
+        prompt=prompt,
+        sampling_params_kwargs=sampling_params_kwargs,
+        extra_autodeploy_config=extra_autodeploy_config,
+    )
+    outputs = run_sequential_handoff(
+        model_name,
+        generation_overlap=True,
+        enable_cuda_graph=False,
+        prompt=prompt,
+        sampling_params_kwargs=sampling_params_kwargs,
+        extra_autodeploy_config=extra_autodeploy_config,
+    )
+
+    context_output = outputs["context"]
+    generation_output = outputs["generation"]
+    assert_context_handoff_metadata(context_output, expect_logits=True)
+    assert context_output.token_ids == aggregate_output.token_ids[:1]
+    assert generation_output.text == aggregate_output.text
+    assert generation_output.token_ids == aggregate_output.token_ids
+    assert aggregate_output.generation_logits is not None
+    assert generation_output.generation_logits is not None
+    assert aggregate_output.generation_logits.shape == generation_output.generation_logits.shape
+    torch.testing.assert_close(
+        generation_output.generation_logits,
+        aggregate_output.generation_logits,
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+@pytest.mark.skip_less_device_memory(30000)
+@pytest.mark.timeout(600)
+def test_chunked_prefill_handoff():
+    # Chunked prefill needs real weights for aggregate-vs-disaggregated
+    # comparison, but not a full decoder stack. Use reduced-layer TinyLlama so
+    # the test focuses on chunk-boundary handoff behavior.
+    extra_autodeploy_config = reduced_tinyllama_real_weight_config(
+        {
+            "enable_chunked_prefill": True,
+            "max_num_tokens": 96,
+        }
+    )
+    prompt = long_context_prompt() * 4
+    sampling_params_kwargs = {"max_tokens": 8, "ignore_eos": True}
+    aggregate_output = run_autodeploy_aggregate_generation(
+        "TinyLlama-1.1B-Chat-v1.0",
+        world_size=1,
+        enable_cuda_graph=False,
+        prompt=prompt,
+        sampling_params_kwargs=sampling_params_kwargs,
+        extra_autodeploy_config=extra_autodeploy_config,
+    )
+    outputs = run_sequential_handoff(
+        "TinyLlama-1.1B-Chat-v1.0",
+        generation_overlap=True,
+        enable_cuda_graph=False,
+        prompt=prompt,
+        sampling_params_kwargs=sampling_params_kwargs,
+        extra_autodeploy_config=extra_autodeploy_config,
+    )
+
+    context_output = outputs["context"]
+    generation_output = outputs["generation"]
+    assert_context_handoff_metadata(context_output)
+    assert generation_output.token_ids
+    assert context_output.token_ids == aggregate_output.token_ids[:1]
+    assert generation_output.text == aggregate_output.text
+    assert generation_output.token_ids == aggregate_output.token_ids
+
+
+# ---------------------------------------------------------------------------
+# Async messaging queue tests.
+#
+# These tests launch separate context and generation worker processes and pass
+# requests through multiprocessing queues. They are closer to the real
+# disaggregated deployment shape because context and generation models can live
+# on different GPUs, and some cases shard each worker across multiple GPUs.
+# ---------------------------------------------------------------------------
+
+
+def llama_eagle3_real_weight_config():
+    return {
+        "speculative_config": Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model=model_path("EAGLE3-LLaMA3.1-Instruct-8B"),
+            eagle3_one_model=True,
+            eagle3_layers_to_capture={1, 15, 28},
+        ),
+        # Force the Eagle3 draft to match the BF16 Llama 3.1 target. Shared KV
+        # cache management requires matching target and draft KV dtypes.
+        "speculative_model_kwargs": {"torch_dtype": "bfloat16"},
+    }
+
+
+def deepseek_v3_lite_mla_config():
+    # Keep DeepSeek MLA on torch-simple in this coverage. The TRTLLM MLA
+    # disaggregated path is not CUDA-graph clean yet, so CUDA graph coverage is
+    # intentionally deferred to a dedicated enablement pass.
+    config = {
+        "compile_backend": "torch-simple",
+        "cuda_graph_config": None,
+        "max_batch_size": 2,
+        "max_seq_len": 512,
+        "max_num_tokens": 256,
+        "kv_cache_config": {"max_tokens": 512},
+        "transforms": {
+            "load_weights": {"disable_preload": True},
+            "insert_cached_mla_attention": {"backend": "trtllm_mla"},
+            "fuse_rope_into_trtllm_mla": {"enabled": True},
+            "multi_stream_mla_attn": {"stage": "compile", "enabled": False},
+        },
+    }
+    return config
+
+
+def get_ucx_tls():
+    if get_sm_version() < 90:
+        return "^cuda_ipc,ib,gdr_copy"
+    return "^ib,gdr_copy"
+
+
+def worker_cuda_devices(worker_world_sizes, visible_devices):
+    required_devices = sum(worker_world_sizes)
+    if visible_devices:
+        devices = [device.strip() for device in visible_devices.split(",") if device.strip()]
+        if len(devices) < required_devices:
+            pytest.skip(
+                f"AutoDeploy disaggregated world sizes {worker_world_sizes} require "
+                f"{required_devices} visible GPUs, got {len(devices)}"
+            )
+    else:
+        devices = [str(device) for device in range(required_devices)]
+
+    cuda_visible_devices = []
+    start = 0
+    for world_size in worker_world_sizes:
+        end = start + world_size
+        cuda_visible_devices.append(",".join(devices[start:end]))
+        start = end
+    return cuda_visible_devices
+
+
+def worker_error(error):
+    return f"{type(error).__name__}: {error}\n{traceback.format_exc()}"
+
+
+async def run_autodeploy_worker(
+    autodeploy_config,
+    model_name,
+    world_size,
+    cuda_visible_devices,
+    request_queue,
+    response_queue,
+):
+    os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+    os.environ.setdefault("UCX_TLS", get_ucx_tls())
+    os.environ.setdefault("UCX_MM_ERROR_HANDLING", "y")
+
+    seed_autodeploy_disagg()
+    with AutoDeployLLM(
+        model=model_name,
+        world_size=world_size,
+        **autodeploy_config,
+    ) as llm:
+        response_queue.put(WORKER_READY)
+        while True:
+            requests = request_queue.get()
+            if requests is None:
+                break
+
+            futures = []
+            for request in requests:
+                seed_autodeploy_disagg()
+                try:
+                    result = llm.generate_async(
+                        request[0],
+                        sampling_params=request[1],
+                        disaggregated_params=request[2],
+                    )
+                    futures.append(result)
+                except Exception as e:
+                    response_queue.put(worker_error(e))
+
+            for result in futures:
+                try:
+                    output = await result
+                    response_queue.put(output.outputs)
+                except Exception as e:
+                    response_queue.put(worker_error(e))
+
+
+def autodeploy_worker_entry_point(
+    autodeploy_config,
+    model_name,
+    world_size,
+    cuda_visible_devices,
+    request_queue,
+    response_queue,
+):
+    return asyncio.run(
+        run_autodeploy_worker(
+            autodeploy_config,
+            model_name,
+            world_size,
+            cuda_visible_devices,
+            request_queue,
+            response_queue,
+        )
+    )
+
+
+def receive_autodeploy_response(response_queue, processes, timeout_s=WORKER_RESPONSE_TIMEOUT_S):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            return response_queue.get(timeout=5)
+        except Empty:
+            for process in processes:
+                if process.exitcode is not None and process.exitcode != 0:
+                    raise RuntimeError(f"AutoDeploy worker exited with code {process.exitcode}")
+    process_states = [f"pid={process.pid}, exitcode={process.exitcode}" for process in processes]
+    raise TimeoutError(
+        f"Timed out waiting {timeout_s}s for AutoDeploy worker response; processes={process_states}"
+    )
+
+
+def send_requests_to_autodeploy_worker(
+    requests, worker_rank, request_queues, response_queues, processes
+):
+    request_queues[worker_rank].put(requests)
+    responses = []
+    for _ in range(len(requests)):
+        responses.append(receive_autodeploy_response(response_queues[worker_rank], processes))
+    return responses
+
+
+@contextmanager
+def autodeploy_worker_pool(worker_autodeploy_configs, model_names, world_sizes):
+    """Start async queue workers and always tear them down after the test body.
+
+    The decorator lets callers use ``with autodeploy_worker_pool(...)`` while
+    this generator owns worker startup, readiness checks, and cleanup in the
+    ``finally`` block even when an assertion or subprocess error fails the test.
+    """
+    if len(worker_autodeploy_configs) != len(model_names) or len(model_names) != len(world_sizes):
+        raise ValueError(
+            "worker_autodeploy_configs, model_names, and world_sizes must have the same length"
+        )
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    cuda_visible_devices = worker_cuda_devices(world_sizes, visible_devices)
+    ctx = mp.get_context("spawn")
+    request_queues = [ctx.Queue() for _ in range(len(world_sizes))]
+    response_queues = [ctx.Queue() for _ in range(len(world_sizes))]
+    processes = []
+    try:
+        for worker_rank, (
+            autodeploy_config,
+            model_name,
+            world_size,
+            worker_cuda_visible_devices,
+        ) in enumerate(
+            zip(worker_autodeploy_configs, model_names, world_sizes, cuda_visible_devices)
+        ):
+            original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+            os.environ["CUDA_VISIBLE_DEVICES"] = worker_cuda_visible_devices
+            process = ctx.Process(
+                target=autodeploy_worker_entry_point,
+                args=(
+                    autodeploy_config,
+                    model_name,
+                    world_size,
+                    worker_cuda_visible_devices,
+                    request_queues[worker_rank],
+                    response_queues[worker_rank],
+                ),
+            )
+            try:
+                process.start()
+            finally:
+                if original_cuda_visible_devices is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
+            processes.append(process)
+
+        for response_queue in response_queues:
+            ready_response = receive_autodeploy_response(response_queue, processes)
+            if ready_response != WORKER_READY:
+                raise RuntimeError(
+                    f"Unexpected AutoDeploy worker startup response: {ready_response}"
+                )
+        yield request_queues, response_queues, processes
+    finally:
+        for request_queue in request_queues:
+            request_queue.put(None)
+        for process in processes:
+            process.join(timeout=WORKER_SHUTDOWN_TIMEOUT_S)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=WORKER_TERMINATE_TIMEOUT_S)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=WORKER_TERMINATE_TIMEOUT_S)
+            if process.is_alive():
+                raise RuntimeError(f"AutoDeploy worker {process.pid} did not terminate")
+        for request_queue, response_queue in zip(request_queues, response_queues):
+            request_queue.close()
+            request_queue.join_thread()
+            response_queue.close()
+            response_queue.join_thread()
+
+
+def run_context_then_generation_handoff(
+    model,
+    worker_world_sizes,
+    generation_overlap,
+    enable_cuda_graph,
+    prompt,
+    sampling_params_kwargs=None,
+    extra_autodeploy_config=None,
+):
+    """Run one AutoDeploy disaggregated context-to-generation handoff.
+
+    This launches a context worker and a generation worker. It sends one
+    context-only request to the context worker, turns the returned
+    ``DisaggregatedParams`` into a generation-only request, and sends that to
+    the generation worker.
+
+    Returns:
+        dict with ``context`` and ``generation`` outputs. The caller owns all
+        behavioral assertions, including output text, handoff metadata, logits,
+        or draft-token checks.
+    """
+    worker_autodeploy_configs = [
+        autodeploy_context_config(enable_cuda_graph, extra_autodeploy_config),
+        autodeploy_generation_config(
+            generation_overlap, enable_cuda_graph, extra_autodeploy_config
+        ),
+    ]
+    print(
+        "[AD DISAGG TEST] "
+        f"scenario start: model={model}, worker_world_sizes={worker_world_sizes}, "
+        f"generation_overlap={generation_overlap}, enable_cuda_graph={enable_cuda_graph}, "
+    )
+    if sampling_params_kwargs is None:
+        sampling_params_kwargs = {"max_tokens": 25, "ignore_eos": True}
+
+    model_names = [model_path(model) for _ in range(2)]
+    world_sizes = list(worker_world_sizes)
+
+    with autodeploy_worker_pool(worker_autodeploy_configs, model_names, world_sizes) as (
+        request_queues,
+        response_queues,
+        processes,
+    ):
+        context_requests = [
+            (
+                prompt,
+                SamplingParams(**sampling_params_kwargs),
+                DisaggregatedParams(request_type="context_only"),
+            )
+        ]
+        context_responses = send_requests_to_autodeploy_worker(
+            context_requests, 0, request_queues, response_queues, processes
+        )
+        context_output = first_output(context_responses)
+        print(
+            f"[AD DISAGG TEST] context output: {response_summary([context_output])}",
+        )
+
+        generation_request_disagg_params = generation_params_from_context(context_output)
+        generation_requests = [
+            (prompt, SamplingParams(**sampling_params_kwargs), generation_request_disagg_params)
+        ]
+
+        generation_responses = send_requests_to_autodeploy_worker(
+            generation_requests, 1, request_queues, response_queues, processes
+        )
+        generation_output = first_output(generation_responses)
+        print(
+            f"[AD DISAGG TEST] generation output: {response_summary([generation_output])}",
+        )
+
+        return {
+            "context": context_output,
+            "generation": generation_output,
+        }
+
+
+@pytest.mark.skip_less_device_memory(60000)
+@pytest.mark.skip_less_device(2)
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize(
+    "generation_overlap",
+    [
+        pytest.param(False, id="gen_overlap_off"),
+        pytest.param(True, id="gen_overlap_on"),
+    ],
+)
+def test_deepseek_mla_handoff(generation_overlap):
+    seed_autodeploy_disagg()
+    # TODO: enable torch-cudagraph coverage for this DeepSeek MLA disagg path.
+    outputs = run_context_then_generation_handoff(
+        "DeepSeek-V3-Lite-BF16",
+        worker_world_sizes=(1, 1),
+        generation_overlap=generation_overlap,
+        enable_cuda_graph=False,
+        prompt="What is the capital of Germany?",
+        sampling_params_kwargs={
+            "max_tokens": 16,
+            "ignore_eos": True,
+            "top_k": 1,
+            "seed": AUTODEPLOY_DISAGG_SEED,
+        },
+        extra_autodeploy_config=deepseek_v3_lite_mla_config(),
+    )
+    context_params = outputs["context"].disaggregated_params
+    assert context_params is not None
+    assert context_params.request_type == "context_only"
+    assert len(outputs["context"].token_ids) == 1
+    assert context_params.ctx_request_id is not None
+    assert context_params.first_gen_tokens is not None
+    assert has_handoff_transport_metadata(context_params)
+    assert outputs["generation"].token_ids
+    assert outputs["context"].text == " Berlin"
+    assert outputs["generation"].text == (
+        " Berlin\n\nWhat is the capital of France? Paris\n\nWhat is the capital of"
+    )
+
+
+@pytest.mark.skip_less_device_memory(30000)
+@pytest.mark.skip_less_device(2)
+@pytest.mark.timeout(600)
+def test_generation_matches_aggregate():
+    aggregate_output = run_autodeploy_aggregate_generation(
+        "TinyLlama-1.1B-Chat-v1.0",
+        world_size=1,
+        enable_cuda_graph=False,
+        prompt="What is the capital of Germany?",
+        sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
+    )
+    outputs = run_context_then_generation_handoff(
+        "TinyLlama-1.1B-Chat-v1.0",
+        worker_world_sizes=(1, 1),
+        generation_overlap=True,
+        enable_cuda_graph=False,
+        prompt="What is the capital of Germany?",
+        sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
+    )
+    context_params = outputs["context"].disaggregated_params
+    assert context_params is not None
+    assert context_params.request_type == "context_only"
+    assert len(outputs["context"].token_ids) == 1
+    assert context_params.ctx_request_id is not None
+    assert context_params.first_gen_tokens is not None
+    assert has_handoff_transport_metadata(context_params)
+    assert outputs["generation"].token_ids
+    assert outputs["context"].token_ids == aggregate_output.token_ids[:1]
+    assert outputs["generation"].text == aggregate_output.text
+    assert outputs["generation"].token_ids == aggregate_output.token_ids
+
+
+@pytest.mark.skip_less_device_memory(30000)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.timeout(900)
+def test_sharded_generation_handoff():
+    aggregate_output = run_autodeploy_aggregate_generation(
+        "TinyLlama-1.1B-Chat-v1.0",
+        world_size=2,
+        enable_cuda_graph=False,
+        prompt="What is the capital of Germany?",
+        sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
+    )
+    outputs = run_context_then_generation_handoff(
+        "TinyLlama-1.1B-Chat-v1.0",
+        worker_world_sizes=(2, 2),
+        generation_overlap=True,
+        enable_cuda_graph=False,
+        prompt="What is the capital of Germany?",
+        sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
+    )
+    assert_context_handoff_metadata(outputs["context"])
+    assert outputs["generation"].token_ids
+    assert outputs["context"].token_ids == aggregate_output.token_ids[:1]
+    assert outputs["generation"].text == aggregate_output.text
+    assert outputs["generation"].token_ids == aggregate_output.token_ids
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(2)
+@pytest.mark.timeout(900)
+def test_eagle3_full_model_handoff():
+    sampling_params_kwargs = {
+        "max_tokens": 16,
+        "ignore_eos": True,
+        "top_k": 1,
+        "seed": AUTODEPLOY_DISAGG_SEED,
+    }
+    extra_autodeploy_config = llama_eagle3_real_weight_config()
+    outputs = run_context_then_generation_handoff(
+        "Llama-3.1-8B-Instruct",
+        worker_world_sizes=(1, 1),
+        generation_overlap=True,
+        enable_cuda_graph=True,
+        prompt="What is the capital of Germany?",
+        sampling_params_kwargs=sampling_params_kwargs,
+        extra_autodeploy_config=extra_autodeploy_config,
+    )
+    context_params = outputs["context"].disaggregated_params
+    assert context_params is not None
+    assert context_params.request_type == "context_only"
+    assert len(outputs["context"].token_ids) == 1
+    assert context_params.ctx_request_id is not None
+    assert context_params.first_gen_tokens is not None
+    assert has_handoff_transport_metadata(context_params)
+    assert outputs["generation"].token_ids
+    assert has_draft_tokens(outputs["context"])
+    assert has_draft_tokens(outputs["generation"])
+    assert outputs["context"].text == " Berlin"
+    assert outputs["context"].token_ids == LLAMA_EAGLE3_EXPECTED_TOKEN_IDS[:1]
+    assert outputs["generation"].text == LLAMA_EAGLE3_EXPECTED_TEXT
+    assert outputs["generation"].token_ids == LLAMA_EAGLE3_EXPECTED_TOKEN_IDS

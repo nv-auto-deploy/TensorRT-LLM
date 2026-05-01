@@ -26,8 +26,8 @@ from ...custom_ops.attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    EphemeralResourceHandler,
     MHACallable,
-    ResourceHandler,
     ResourceHandlerDict,
     SequenceInfo,
 )
@@ -215,7 +215,7 @@ class DetectHiddenStatesForCapture(BaseTransform):
         )
 
 
-class HiddenStatesResourceHandler(ResourceHandler):
+class HiddenStatesResourceHandler(EphemeralResourceHandler):
     """A resource handler for hidden states."""
 
     def __init__(self, hidden_size: int, dtype: torch.dtype) -> None:

@@ -376,6 +376,12 @@ l0_dgx_h100:
   - accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_bf16_small[4]
   - accuracy/test_llm_api_autodeploy.py::TestGemma4MoE::test_bf16
   - accuracy/test_llm_api_autodeploy.py::TestMiniMaxM2::test_finegrained_fp8
+  - disaggregated/test_ad_disagg.py::test_deepseek_mla_handoff[gen_overlap_off]
+  - disaggregated/test_ad_disagg.py::test_deepseek_mla_handoff[gen_overlap_on]
+  - disaggregated/test_ad_disagg.py::test_generation_matches_aggregate
+  - disaggregated/test_ad_disagg.py::test_sharded_generation_handoff
+  - disaggregated/test_ad_disagg.py::test_eagle3_full_model_handoff
+  - disaggregated/test_ad_disagg_trtllm_serve.py::test_openai_completion
 # ------------- AutoDeploy Backend Stages L1 / Nightly only ---------------
 - condition:
     ranges:
