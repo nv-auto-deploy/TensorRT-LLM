@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "ci_target_graph_lib",
+    srcs = [
+        "__init__.py",
+        "generate.py",
+        "selector_parser.py",
+    ],
+    deps = [
+        "@pip//pyyaml",
+    ],
+)
+
+py_binary(
+    name = "generate",
+    srcs = ["generate_main.py"],
+    main = "generate_main.py",
+    deps = [
+        ":ci_target_graph_lib",
+    ],
+)

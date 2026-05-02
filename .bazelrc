@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Keep Bazel's output tree and local caches off the repo filesystem.
+startup --output_user_root=/tmp/trtllm-bazel/output_user_root
+
+common --enable_bzlmod
+common --repository_cache=/tmp/trtllm-bazel/repository_cache
+
+build --disk_cache=/tmp/trtllm-bazel/disk_cache
+build --guard_against_concurrent_changes
+build --symlink_prefix=/
+build --verbose_failures
+
+test --test_output=errors
+test --test_summary=detailed
+test --cache_test_results=yes

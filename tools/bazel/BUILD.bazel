@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    ["pytest_selector_runner.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "pytest_selector_runner",
+    srcs = ["pytest_selector_runner.py"],
+    main = "pytest_selector_runner.py",
+    deps = [
+        "@pip//pytest",
+    ],
+)

@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    ["pytest_selector_test.sh"],
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "autodeploy_h100_seed",
+    tags = ["manual"],
+    tests = ["//ci/bazel/autodeploy:autodeploy_h100_seed"],
+)

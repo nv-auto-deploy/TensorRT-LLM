@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+package(default_visibility = ["//visibility:public"])
+
+constraint_setting(name = "gpu")
+
+constraint_value(
+    name = "h100",
+    constraint_setting = ":gpu",
+)
+
+constraint_value(
+    name = "b200",
+    constraint_setting = ":gpu",
+)
+
+constraint_value(
+    name = "none",
+    constraint_setting = ":gpu",
+)
