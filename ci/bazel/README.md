@@ -22,6 +22,8 @@ Repository-level Bazel setup:
 - [`.bazelversion`](../../.bazelversion): Bazel version used by Bazelisk.
 - [`.bazelrc`](../../.bazelrc): local output roots, cache paths, Bzlmod, and default test output settings.
 - [`MODULE.bazel`](../../MODULE.bazel): module dependencies and Python 3.12/pip setup.
+- [`MODULE.bazel.lock`](../../MODULE.bazel.lock): Bzlmod dependency lock file. Keep this committed with
+  `MODULE.bazel` so module resolution remains reproducible.
 - [`requirements_bazel_lock.txt`](../../requirements_bazel_lock.txt): lock file used by `rules_python`.
 
 CI target graph:
@@ -40,8 +42,12 @@ Pytest selector harness:
   normalizes selectors, and invokes pytest.
 - [`ci/bazel/BUILD.bazel`](BUILD.bazel):
   - `//ci/bazel:autodeploy_h100_seed`
+  - `//ci/bazel:autodeploy_h100_generated`
+- [`ci/bazel/autodeploy/generated/BUILD.bazel`](autodeploy/generated/BUILD.bazel):
+  generated pre-merge AutoDeploy H100 targets from the manifest.
 - [`ci/bazel/autodeploy/BUILD.bazel`](autodeploy/BUILD.bazel):
   - `//ci/bazel/autodeploy:autodeploy_h100_seed`
+  - `//ci/bazel/autodeploy:autodeploy_h100_generated`
   - `//ci/bazel/autodeploy:autodeploy_h100_4gpu`
   - AutoDeploy leaf seed tests such as `:llama31_trtllm_1gpu_h100`.
 
@@ -72,6 +78,7 @@ binary as `bazel`, the same commands work with `bazel` instead of `bazelisk`.
 These commands do not run GPU pytest workloads:
 
 ```bash
+python3 -m scripts.ci_target_graph.validate --repo-root . --output /tmp/trtllm-ci-target-graph.json
 bazel test //tests/unittest/tools:ci_target_graph_test
 bazel build //scripts/ci_target_graph:generate
 bazel query '//ci/bazel/...'
@@ -88,6 +95,21 @@ bazel run //scripts/ci_target_graph:generate -- \
 ```
 
 Omit `--output` to print the JSON manifest to stdout.
+
+## Generate AutoDeploy Bazel Targets
+
+Regenerate the checked-in AutoDeploy H100 BUILD package from the manifest:
+
+```bash
+python3 -m scripts.ci_target_graph.generate_bazel_autodeploy \
+    --repo-root . \
+    --output ci/bazel/autodeploy/generated/BUILD.bazel
+```
+
+The generated package is intentionally narrow: pre-merge AutoDeploy entries
+from `l0_h100.yml` and `l0_dgx_h100.yml` whose GPU constraint matches H100.
+Generated targets preserve manifest tags, pytest arguments, isolation and
+timeout metadata, and compatibility constraints.
 
 ## Query Examples
 

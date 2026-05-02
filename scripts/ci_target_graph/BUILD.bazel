@@ -8,7 +8,9 @@ py_library(
     srcs = [
         "__init__.py",
         "generate.py",
+        "generate_bazel_autodeploy.py",
         "selector_parser.py",
+        "validate.py",
     ],
     deps = [
         "@pip//pyyaml",
@@ -19,6 +21,15 @@ py_binary(
     name = "generate",
     srcs = ["generate_main.py"],
     main = "generate_main.py",
+    deps = [
+        ":ci_target_graph_lib",
+    ],
+)
+
+py_binary(
+    name = "generate_bazel_autodeploy",
+    srcs = ["generate_bazel_autodeploy_main.py"],
+    main = "generate_bazel_autodeploy_main.py",
     deps = [
         ":ci_target_graph_lib",
     ],

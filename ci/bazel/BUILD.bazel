@@ -13,3 +13,9 @@ test_suite(
     tags = ["manual"],
     tests = ["//ci/bazel/autodeploy:autodeploy_h100_seed"],
 )
+
+test_suite(
+    name = "autodeploy_h100_generated",
+    tags = ["manual"],
+    tests = ["//ci/bazel/autodeploy/generated:autodeploy_h100_generated"],
+)

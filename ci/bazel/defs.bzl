@@ -38,8 +38,12 @@ def trtllm_pytest_case(
         size = "large",
         timeout = "long",
         pytest_args = None,
+        deps = None,
         manual = True):
-    """Defines a Bazel test target for one TensorRT-LLM pytest selector."""
+    """Defines a Bazel test target for one TensorRT-LLM pytest selector.
+
+    The optional deps parameter models source ownership edges through sh_test data.
+    """
 
     if not selector:
         fail("trtllm_pytest_case requires a non-empty selector")
@@ -48,7 +52,7 @@ def trtllm_pytest_case(
         name = name,
         srcs = [_PYTEST_SELECTOR_TEST_WRAPPER],
         args = _runner_args(selector, pytest_args),
-        data = [_PYTEST_SELECTOR_RUNNER],
+        data = [_PYTEST_SELECTOR_RUNNER] + list(deps or []),
         env_inherit = _PYTEST_ENV_INHERIT,
         size = size,
         tags = _tags_with_manual(tags, manual),

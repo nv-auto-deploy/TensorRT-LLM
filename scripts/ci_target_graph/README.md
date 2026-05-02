@@ -6,10 +6,12 @@ SPDX-License-Identifier: Apache-2.0
 # CI Target Graph
 
 This package generates shadow-mode Bazel-style metadata for TensorRT-LLM CI.
-It does not add Bazel root files, BUILD files, toolchains, or CI enforcement.
-The first step is only to make the current Jenkins/test-db pytest selectors
-visible as explicit JSON targets so impact-selection ideas can be compared
-against the existing CI without changing what Jenkins runs.
+The repository now has a narrow Bazel spike with root Bazel files, platform
+constraints, BUILD packages, and generated pytest selector targets. This
+package remains the metadata source for that spike: it makes the current
+Jenkins/test-db pytest selectors visible as explicit JSON targets so
+impact-selection ideas can be compared against the existing CI without changing
+what Jenkins runs.
 
 ## Generate
 
@@ -29,6 +31,26 @@ python3 -m scripts.ci_target_graph.generate --repo-root .
 
 The manifest uses `schema_version: 1`; its practical JSON Schema lives in
 `manifest_schema_v1.json`.
+
+## Validate
+
+Regenerate the manifest and validate it against the checked-in schema:
+
+```bash
+python3 -m scripts.ci_target_graph.validate \
+  --repo-root . \
+  --output /tmp/trtllm-ci-target-graph.json
+```
+
+This command does not run GPU tests. It reports schema errors as failures and
+prints a conservative warning for manifest targets with no Jenkins stage
+candidate. A missing candidate means the YAML selector could not be matched to
+an active Jenkins L0 stage config before pytest shard assignment; impact
+selection should treat those entries as fallback inputs until the Jenkins
+mapping is modeled more completely.
+
+Use `--fail-on-missing-jenkins-stage` when a CI job wants to make those fallback
+entries blocking.
 
 ## Inputs
 
@@ -59,6 +81,7 @@ The parser also keeps unfamiliar pytest arguments rather than rejecting them.
 It detects the local `TIMEOUT (N)` convention as minutes, detects `ISOLATION`,
 and leaves unusual selectors in the manifest instead of failing generation.
 
-No Bazel files are added yet because the repo does not have a declared target
-model for Python, C++, CUDA, GPU platforms, model/data inputs, and generated
-artifacts. This shadow manifest is the low-risk first step toward that model.
+The Bazel spike consumes this manifest for a narrow generated AutoDeploy H100
+subpackage, but most Python, C++, CUDA, model/data inputs, and generated
+artifacts are still intentionally unmodeled. Unknown or unmodeled areas should
+fall back conservatively rather than being skipped.
