@@ -52,6 +52,53 @@ mapping is modeled more completely.
 Use `--fail-on-missing-jenkins-stage` when a CI job wants to make those fallback
 entries blocking.
 
+## Select Impacted Bazel Targets
+
+Select Bazel pytest targets affected by a source diff:
+
+```bash
+python3 scripts/ci_target_graph/select_impacted.py \
+  --base upstream/main \
+  --platform //platforms:h100_4gpu
+```
+
+The selector reads `git diff --name-status -z --find-renames` by default. It
+can also be driven without git, which is useful for shadow-mode CI plumbing and
+unit tests:
+
+```bash
+python3 scripts/ci_target_graph/select_impacted.py \
+  --base upstream/main \
+  --head HEAD \
+  --changed-file tensorrt_llm/_torch/auto_deploy/shim/ad_executor.py \
+  --platform //platforms:h100_4gpu \
+  --bazel-binary /tmp/codex-bazelisk \
+  --output both \
+  --json-output /tmp/trtllm-impacted-targets.json \
+  --targets-output /tmp/trtllm-impacted-targets.txt
+```
+
+Modeled source ownership is intentionally narrow:
+
+- `tensorrt_llm/_torch/auto_deploy/**/*.py` maps to
+  `//tensorrt_llm/_torch/auto_deploy:runtime`.
+- `tests/integration/defs/accuracy/*.py` maps to
+  `//tests/integration/defs/accuracy:accuracy_tests`.
+- `scripts/ci_target_graph/*.py` maps to
+  `//scripts/ci_target_graph:ci_target_graph_lib`.
+
+Unknown paths, invalid paths, Bazel query failures, and build or CI policy
+changes use a conservative broad fallback over `//ci/bazel/...`. Broad fallback
+is also used for Bazel metadata, dependency lock files, Jenkins policy, GitHub
+policy, platform definitions, and test-db or waive-list changes.
+
+The JSON output has `schema_version: 1` and records the diff refs, changed-file
+evidence, fallback reasons, owner labels, candidate targets, selected targets,
+smoke targets, and warnings. Manual targets are included by default so current
+manual GPU pytest selectors are not silently dropped; use
+`--manual-policy exclude` or `--manual-policy only` when a caller needs a
+different policy.
+
 ## Inputs
 
 The generator reads:

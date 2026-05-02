@@ -27,6 +27,15 @@ from scripts.ci_target_graph.generate_bazel_autodeploy import (  # noqa: E402
     bazel_cases_from_manifest,
     build_autodeploy_h100_build,
 )
+from scripts.ci_target_graph.select_impacted import (  # noqa: E402
+    BazelQueryError,
+    ChangedFile,
+    broad_fallback_reason_for_path,
+    normalize_changed_path,
+    owner_labels_for_path,
+    parse_name_status_z,
+    select_impacted,
+)
 from scripts.ci_target_graph.selector_parser import parse_pytest_selector  # noqa: E402
 from scripts.ci_target_graph.validate import (  # noqa: E402
     summarize_missing_jenkins_stage_targets,
@@ -69,6 +78,56 @@ EXPECTED_TARGET_IDS = [
         "testllama3_1_8b_test_auto_3a05522434"
     ),
 ]
+
+
+class _FakeQueryClient:
+    def __init__(
+        self,
+        *,
+        query_results: list[str] | None = None,
+        fallback_query_results: list[str] | None = None,
+        cquery_results: list[str] | None = None,
+        incompatible_query_results: list[str] | None = None,
+        fail_impacted_query: bool = False,
+        fail_fallback_query: bool = False,
+        fail_cquery: bool = False,
+    ) -> None:
+        self.query_results = query_results or []
+        self.fallback_query_results = fallback_query_results
+        self.cquery_results = cquery_results or []
+        self.incompatible_query_results = incompatible_query_results or []
+        self.fail_impacted_query = fail_impacted_query
+        self.fail_fallback_query = fail_fallback_query
+        self.fail_cquery = fail_cquery
+        self.queries: list[str] = []
+        self.cqueries: list[tuple[str, str]] = []
+
+    def query(self, expression: str) -> list[str]:
+        self.queries.append(expression)
+        if self.fail_impacted_query and "rdeps(" in expression:
+            raise BazelQueryError("fake impacted query failure")
+        if "target_compatible_with" in expression:
+            return self.incompatible_query_results
+        if self.fail_fallback_query and "tests(" in expression:
+            raise BazelQueryError("fake broad fallback query failure")
+        if "tests(" in expression and self.fallback_query_results is not None:
+            return self.fallback_query_results
+        return self.query_results
+
+    def cquery(self, expression: str, platform: str) -> list[str]:
+        self.cqueries.append((expression, platform))
+        if self.fail_cquery:
+            raise BazelQueryError("fake platform query failure")
+        return self.cquery_results
+
+
+def _changed_file(path: str) -> ChangedFile:
+    return ChangedFile(
+        status="M",
+        paths=(path,),
+        raw_paths=(path,),
+        source="test",
+    )
 
 
 def _assert_source(
@@ -402,3 +461,218 @@ def test_cli_writes_manifest_json(tmp_path: Path) -> None:
     target_ids = [target["target_id"] for target in manifest["targets"]]
     assert target_ids == sorted(target_ids)
     assert set(EXPECTED_TARGET_IDS).issubset(target_ids)
+
+
+def test_select_impacted_normalizes_repo_relative_paths() -> None:
+    assert normalize_changed_path(r"scripts\ci_target_graph/./select_impacted.py") == (
+        "scripts/ci_target_graph/select_impacted.py",
+        None,
+    )
+
+    normalized, reason = normalize_changed_path("/absolute/path.py")
+    assert normalized is None
+    assert reason == "absolute path"
+
+    normalized, reason = normalize_changed_path("scripts/../secret.py")
+    assert normalized is None
+    assert reason == "path escapes the repository"
+
+
+def test_select_impacted_parses_nul_name_status_with_rename_evidence() -> None:
+    parsed = parse_name_status_z(
+        b"R100\0old/path.py\0new/path.py\0A\0scripts/ci_target_graph/generate.py\0",
+        source="fixture",
+    )
+
+    assert parsed.fallback_reasons == ()
+    assert parsed.changed_files[0].status == "R100"
+    assert parsed.changed_files[0].raw_paths == ("old/path.py", "new/path.py")
+    assert parsed.changed_files[0].paths == ("old/path.py", "new/path.py")
+    assert parsed.changed_files[1].paths == ("scripts/ci_target_graph/generate.py",)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "ci/bazel/defs.bzl",
+        "platforms/BUILD.bazel",
+        ".bazelrc",
+        ".bazelversion",
+        "MODULE.bazel",
+        "MODULE.bazel.lock",
+        "requirements_bazel_lock.txt",
+        "requirements.txt",
+        "jenkins/L0_Test.groovy",
+        ".github/workflows/build.yml",
+        "tests/integration/test_lists/test-db/l0_h100.yml",
+        "tests/integration/test_lists/waives.txt",
+    ],
+)
+def test_select_impacted_broad_fallback_policy_paths(path: str) -> None:
+    assert broad_fallback_reason_for_path(path) is not None
+
+
+def test_select_impacted_modeled_owner_mapping() -> None:
+    assert owner_labels_for_path("tensorrt_llm/_torch/auto_deploy/shim/ad_executor.py") == (
+        "//tensorrt_llm/_torch/auto_deploy:runtime",
+    )
+    assert owner_labels_for_path("tests/integration/defs/accuracy/test_llm_api.py") == (
+        "//tests/integration/defs/accuracy:accuracy_tests",
+    )
+    assert owner_labels_for_path("scripts/ci_target_graph/select_impacted.py") == (
+        "//scripts/ci_target_graph:ci_target_graph_lib",
+    )
+    assert owner_labels_for_path("tests/integration/defs/accuracy/nested/test_llm_api.py") == ()
+    assert owner_labels_for_path("docs/source/index.rst") == ()
+
+
+def test_select_impacted_query_failure_uses_broad_fallback() -> None:
+    query_client = _FakeQueryClient(
+        query_results=["//ci/bazel:impacted_test"],
+        fallback_query_results=["//ci/bazel:fallback_test"],
+        cquery_results=["//ci/bazel:fallback_test"],
+        fail_impacted_query=True,
+    )
+
+    result = select_impacted(
+        repo_root=REPO_ROOT,
+        base="upstream/main",
+        platform="//platforms:h100_4gpu",
+        changed_files=[_changed_file("tensorrt_llm/_torch/auto_deploy/shim/ad_executor.py")],
+        smoke_targets=["//ci/bazel:smoke_test"],
+        query_client=query_client,
+    )
+
+    assert result.fallback_used
+    assert any("impacted Bazel query failed" in reason for reason in result.fallback_reasons)
+    assert result.candidate_targets == ("//ci/bazel:fallback_test",)
+    assert result.selected_targets == ("//ci/bazel:fallback_test", "//ci/bazel:smoke_test")
+    assert any("rdeps(" in expression for expression in query_client.queries)
+    assert any("tests(" in expression for expression in query_client.queries)
+
+
+def test_select_impacted_empty_impacted_query_uses_broad_fallback() -> None:
+    query_client = _FakeQueryClient(
+        query_results=[],
+        fallback_query_results=["//ci/bazel:fallback_test"],
+    )
+
+    result = select_impacted(
+        repo_root=REPO_ROOT,
+        base="upstream/main",
+        changed_files=[_changed_file("tensorrt_llm/_torch/auto_deploy/shim/ad_executor.py")],
+        smoke_targets=["//ci/bazel:smoke_test"],
+        query_client=query_client,
+    )
+
+    assert result.selection_available
+    assert result.fallback_reasons == (
+        "impacted Bazel query returned no targets for modeled owners; using broad fallback",
+    )
+    assert result.candidate_targets == ("//ci/bazel:fallback_test",)
+    assert result.selected_targets == ("//ci/bazel:fallback_test", "//ci/bazel:smoke_test")
+    assert any("rdeps(" in expression for expression in query_client.queries)
+    assert any("tests(" in expression for expression in query_client.queries)
+
+
+def test_select_impacted_broad_fallback_query_failure_marks_unavailable() -> None:
+    query_client = _FakeQueryClient(fail_fallback_query=True)
+
+    result = select_impacted(
+        repo_root=REPO_ROOT,
+        base="upstream/main",
+        changed_files=[_changed_file("requirements.txt")],
+        smoke_targets=["//ci/bazel:smoke_test"],
+        query_client=query_client,
+    )
+
+    assert not result.selection_available
+    assert result.candidate_targets == ()
+    assert result.selected_targets == ()
+    assert result.smoke_targets == ("//ci/bazel:smoke_test",)
+    assert any("broad fallback Bazel query failed" in warning for warning in result.warnings)
+    assert result.to_json_dict()["selection_available"] is False
+
+
+def test_select_impacted_platform_fallback_failure_marks_unavailable() -> None:
+    query_client = _FakeQueryClient(
+        query_results=["//ci/bazel:impacted_test"],
+        fail_cquery=True,
+        fail_fallback_query=True,
+    )
+
+    result = select_impacted(
+        repo_root=REPO_ROOT,
+        base="upstream/main",
+        platform="//platforms:h100_4gpu",
+        changed_files=[_changed_file("tensorrt_llm/_torch/auto_deploy/runtime.py")],
+        smoke_targets=["//ci/bazel:smoke_test"],
+        query_client=query_client,
+    )
+
+    assert not result.selection_available
+    assert result.candidate_targets == ("//ci/bazel:impacted_test",)
+    assert result.selected_targets == ()
+    assert any("platform cquery failed" in warning for warning in result.warnings)
+    assert any("broad fallback Bazel query failed" in warning for warning in result.warnings)
+
+
+def test_select_impacted_result_json_is_stable_and_sorted() -> None:
+    query_client = _FakeQueryClient(
+        query_results=["//ci/bazel:z_test", "//ci/bazel:a_test", "//ci/bazel:a_test"],
+    )
+
+    result = select_impacted(
+        repo_root=REPO_ROOT,
+        base="upstream/main",
+        head="feature",
+        changed_files=[_changed_file("scripts/ci_target_graph/generate.py")],
+        smoke_targets=["//ci/bazel:smoke_test"],
+        query_client=query_client,
+    )
+    payload = result.to_json_dict()
+
+    assert payload["schema_version"] == 1
+    assert payload["base"] == "upstream/main"
+    assert payload["head"] == "feature"
+    assert payload["fallback"] == {"reasons": [], "used": False}
+    assert payload["owner_labels"] == ["//scripts/ci_target_graph:ci_target_graph_lib"]
+    assert payload["candidate_targets"] == ["//ci/bazel:a_test", "//ci/bazel:z_test"]
+    assert payload["selection_available"] is True
+    assert payload["selected_targets"] == [
+        "//ci/bazel:a_test",
+        "//ci/bazel:smoke_test",
+        "//ci/bazel:z_test",
+    ]
+    assert json.loads(result.to_json()) == payload
+
+
+def test_select_impacted_platform_and_manual_filters_use_fake_query_client() -> None:
+    query_client = _FakeQueryClient(
+        query_results=["//ci/bazel:manual_gpu_test", "//ci/bazel:wrong_platform_test"],
+        cquery_results=["//ci/bazel:manual_gpu_test (abcdef)"],
+    )
+
+    result = select_impacted(
+        repo_root=REPO_ROOT,
+        base="upstream/main",
+        platform="//platforms:h100_4gpu",
+        changed_files=[_changed_file("tensorrt_llm/_torch/auto_deploy/runtime.py")],
+        manual_policy="only",
+        include_tags=["backend:autodeploy"],
+        exclude_tags=["slow"],
+        query_client=query_client,
+    )
+
+    assert result.selected_targets == ("//ci/bazel:manual_gpu_test",)
+    assert query_client.queries
+    query_expression = query_client.queries[0]
+    assert 'attr("tags", "manual"' in query_expression
+    assert 'attr("tags", "backend:autodeploy"' in query_expression
+    assert 'except attr("tags", "slow"' in query_expression
+    assert query_client.cqueries == [
+        (
+            "set(//ci/bazel:manual_gpu_test //ci/bazel:wrong_platform_test)",
+            "//platforms:h100_4gpu",
+        )
+    ]

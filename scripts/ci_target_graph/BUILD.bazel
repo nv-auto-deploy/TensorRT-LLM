@@ -9,6 +9,7 @@ py_library(
         "__init__.py",
         "generate.py",
         "generate_bazel_autodeploy.py",
+        "select_impacted.py",
         "selector_parser.py",
         "validate.py",
     ],
@@ -30,6 +31,15 @@ py_binary(
     name = "generate_bazel_autodeploy",
     srcs = ["generate_bazel_autodeploy_main.py"],
     main = "generate_bazel_autodeploy_main.py",
+    deps = [
+        ":ci_target_graph_lib",
+    ],
+)
+
+py_binary(
+    name = "select_impacted",
+    srcs = ["select_impacted_main.py"],
+    main = "select_impacted_main.py",
     deps = [
         ":ci_target_graph_lib",
     ],

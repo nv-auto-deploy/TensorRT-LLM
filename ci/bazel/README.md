@@ -111,6 +111,32 @@ from `l0_h100.yml` and `l0_dgx_h100.yml` whose GPU constraint matches H100.
 Generated targets preserve manifest tags, pytest arguments, isolation and
 timeout metadata, and compatibility constraints.
 
+## Select Impacted Targets
+
+Run the Phase 4 changed-file impact selector from the repository root:
+
+```bash
+python3 scripts/ci_target_graph/select_impacted.py \
+    --base upstream/main \
+    --platform //platforms:h100_4gpu
+```
+
+The selector maps changed files in currently modeled source areas to Bazel owner
+labels, queries reverse-dependent pytest targets under `//ci/bazel/...`, applies
+optional manual/tag filtering, then cquery-filters the candidates for the
+requested platform. Unknown inputs and CI/build/dependency policy changes use a
+conservative broad fallback rather than skipping tests.
+
+For CI sidecars, write both machine-readable outputs:
+
+```bash
+python3 scripts/ci_target_graph/select_impacted.py \
+    --base upstream/main \
+    --platform //platforms:h100_4gpu \
+    --json-output /tmp/trtllm-impacted-targets.json \
+    --targets-output /tmp/trtllm-impacted-targets.txt
+```
+
 ## Query Examples
 
 List Bazel targets under the spike packages:
