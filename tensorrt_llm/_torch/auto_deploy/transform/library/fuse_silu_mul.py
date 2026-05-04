@@ -16,16 +16,22 @@
 """Graph transform for fusing SiLU+Mul activation after GEMM fusion.
 
 After fuse_gemms_mixed_children or fuse_fp8_gemms fuses gate+up projections into a
-single GEMM, the graph contains one of two splitting patterns:
+single GEMM, the graph contains one of three splitting patterns:
 
-Variant 1 (non-quantized, torch.narrow):
+Variant 1 (non-quantized, torch.narrow, zero-copy view):
 
     fused_out = gemm(x, gate_up_weight)
     gate = narrow(fused_out, -1, 0, intermediate_size)
     up = narrow(fused_out, -1, intermediate_size, intermediate_size)
     hidden = silu(gate) * up
 
-Variant 2 (quantized, split+getitem):
+Variant 1b (non-quantized, torch.narrow + .contiguous()):
+
+    Same as Variant 1, but with an explicit .contiguous() call after each narrow,
+    inserted by _insert_fused_gemm(allow_not_contigous=False) — the form used by
+    fuse_gemms_mixed_children and the quantized fusion paths.
+
+Variant 2 (quantized, split+getitem, legacy closure path):
 
     fused_out = quant_gemm(x, fused_weight, ...)
     parts = split_output(fused_out)
@@ -33,7 +39,7 @@ Variant 2 (quantized, split+getitem):
     up = getitem(parts, 1)
     hidden = silu(gate) * up
 
-This transform replaces both patterns with a single fused op:
+This transform replaces all three patterns with a single fused op:
 
     hidden = silu_and_mul(fused_out)
 
@@ -111,6 +117,113 @@ def _check_narrow_constraints(match: Match) -> bool:
     up_offset, up_length = up_narrow.args[2], up_narrow.args[3]
 
     return gate_offset == 0 and up_offset == gate_length and gate_length == up_length
+
+
+# ---- Variant 1b: narrow+contiguous+silu+mul (graph walk) ----------------------------
+# fuse_gemms_mixed_children (and the quantized fusion paths) insert an explicit
+# .contiguous() call after each torch.narrow when allow_not_contigous=False. The
+# pattern matcher above does not match through call_method nodes, so we handle this
+# variant via direct graph walking. The replacement uses the pre-narrow tensor; the
+# narrow + contiguous nodes become dead code and get DCE'd.
+
+
+def _strip_contiguous(n: Node) -> Optional[Node]:
+    """If n is a `.contiguous()` call_method, return its source; else return n."""
+    if n.op == "call_method" and n.target == "contiguous":
+        inner = n.args[0] if n.args else None
+        return inner if isinstance(inner, Node) else None
+    return n
+
+
+def _match_narrow_silu_mul_with_contig(mul_node: Node) -> Optional[Node]:
+    """Match silu(narrow(x, -1, 0, h)[.contiguous()]) * narrow(x, -1, h, h)[.contiguous()].
+
+    Returns the pre-narrow tensor (fused linear output) if the pattern matches and
+    at least one side has an intervening .contiguous(); else None. The "no contiguous
+    on either side" case is handled by the pattern matcher (Variant 1).
+    """
+    left, right = mul_node.args[0], mul_node.args[1]
+    if not isinstance(left, Node) or not isinstance(right, Node):
+        return None
+
+    for silu_candidate, up_candidate in [(left, right), (right, left)]:
+        if not is_op(silu_candidate, torch.ops.aten.silu.default):
+            continue
+
+        silu_input = silu_candidate.args[0]
+        if not isinstance(silu_input, Node):
+            continue
+
+        had_contig = (silu_input.op == "call_method" and silu_input.target == "contiguous") or (
+            up_candidate.op == "call_method" and up_candidate.target == "contiguous"
+        )
+        if not had_contig:
+            # Pure narrow→silu/mul case — leave to the pattern matcher (Variant 1).
+            continue
+
+        gate_narrow = _strip_contiguous(silu_input)
+        up_narrow = _strip_contiguous(up_candidate)
+        if not isinstance(gate_narrow, Node) or not isinstance(up_narrow, Node):
+            continue
+
+        if gate_narrow.op != "call_function" or gate_narrow.target != torch.narrow:
+            continue
+        if up_narrow.op != "call_function" or up_narrow.target != torch.narrow:
+            continue
+        if len(gate_narrow.args) < 4 or len(up_narrow.args) < 4:
+            continue
+
+        # Same source tensor, same (last) dim, complementary offsets, equal lengths.
+        if gate_narrow.args[0] is not up_narrow.args[0]:
+            continue
+        if gate_narrow.args[1] != -1 or up_narrow.args[1] != -1:
+            continue
+
+        gate_offset, gate_length = gate_narrow.args[2], gate_narrow.args[3]
+        up_offset, up_length = up_narrow.args[2], up_narrow.args[3]
+        if gate_offset != 0 or up_offset != gate_length or gate_length != up_length:
+            continue
+
+        source = gate_narrow.args[0]
+        if not isinstance(source, Node):
+            continue
+        return source
+
+    return None
+
+
+def _fuse_narrow_contig_silu_mul(gm: GraphModule) -> int:
+    """Fuse narrow(+contiguous)+silu+mul produced by allow_not_contigous=False fusion."""
+    graph = gm.graph
+    cnt = 0
+
+    for node in list(graph.nodes):
+        if not is_op(node, torch.ops.aten.mul.Tensor):
+            continue
+
+        fused_linear_out = _match_narrow_silu_mul_with_contig(node)
+        if fused_linear_out is None:
+            continue
+
+        with graph.inserting_before(node):
+            fused_node = graph.call_function(
+                torch.ops.auto_deploy.silu_and_mul.default,
+                args=(fused_linear_out,),
+            )
+            ref_val = node.meta.get("val")
+            if ref_val is not None:
+                fused_node.meta["val"] = torch.empty(
+                    ref_val.shape, dtype=ref_val.dtype, device="meta"
+                )
+
+        node.replace_all_uses_with(fused_node)
+        cnt += 1
+
+    if cnt > 0:
+        graph.eliminate_dead_code()
+        gm.recompile()
+
+    return cnt
 
 
 # ---- Variant 2: getitem+silu+mul (graph walk) ---------------------------------------
@@ -259,6 +372,11 @@ class FuseSiluMul(BaseTransform):
             cnt += patterns.apply(gm.graph)
             if cnt > 0:
                 gm.recompile()
+
+        # Variant 1b: narrow+contiguous+silu+mul (direct graph walk; the pattern matcher
+        # cannot traverse call_method("contiguous") nodes inserted by
+        # _insert_fused_gemm(allow_not_contigous=False)).
+        cnt += _fuse_narrow_contig_silu_mul(gm)
 
         # Variant 2: getitem+silu+mul (direct graph walk for opaque split closures)
         cnt += _fuse_getitem_silu_mul(gm)
