@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import operator
 from unittest.mock import MagicMock
 
@@ -22,7 +36,11 @@ from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewise
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import submod_has_cuda_ops
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
+from tensorrt_llm._torch.auto_deploy.shim.ad_executor import (
+    _num_generation_output_tokens,
+    _round_up_to_closest,
+    _trim_cuda_graph_padding_outputs,
+)
 from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import (
     CompileModel,
     _generate_default_piecewise_num_tokens,
@@ -61,6 +79,26 @@ class ModelWithMultipleInputs(torch.nn.Module):
 )
 def test_round_up_to_closest(lst, value, expected):
     assert _round_up_to_closest(lst, value) == expected
+
+
+def test_trim_cuda_graph_padding_outputs_removes_dummy_logits():
+    outputs = {
+        "logits": torch.arange(40, dtype=torch.float32).reshape(10, 4),
+        "d2t": torch.arange(4, dtype=torch.int32),
+    }
+
+    _trim_cuda_graph_padding_outputs(outputs, num_real_output_tokens=6)
+
+    assert torch.equal(outputs["logits"], torch.arange(24, dtype=torch.float32).reshape(6, 4))
+    assert torch.equal(outputs["d2t"], torch.arange(4, dtype=torch.int32))
+
+
+def test_num_generation_output_tokens_counts_draft_tokens():
+    requests = [MagicMock(), MagicMock()]
+    requests[0].py_draft_tokens = []
+    requests[1].py_draft_tokens = [1, 2]
+
+    assert _num_generation_output_tokens(requests) == 4
 
 
 @pytest.mark.parametrize("num_inputs", [1, 2, 3])

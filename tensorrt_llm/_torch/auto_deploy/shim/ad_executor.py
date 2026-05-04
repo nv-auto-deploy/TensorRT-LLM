@@ -322,6 +322,24 @@ def _generate_dummy_request(
     return dummy_request
 
 
+def _num_generation_output_tokens(requests: RequestList) -> int:
+    """Return the number of output logits expected for generation requests."""
+    return sum(1 + get_draft_token_length(request) for request in requests)
+
+
+def _trim_cuda_graph_padding_outputs(
+    outputs: Dict[str, Optional[torch.Tensor]], num_real_output_tokens: int
+) -> None:
+    """Remove trailing CUDA graph padding logits from model outputs in-place."""
+    logits = outputs.get("logits")
+    if (
+        isinstance(logits, torch.Tensor)
+        and logits.ndim > 0
+        and logits.shape[0] > num_real_output_tokens
+    ):
+        outputs["logits"] = logits.narrow(0, 0, num_real_output_tokens)
+
+
 def maybe_pad_for_cuda_graph(func):
     def wrapper(
         self: "ADEngine",
@@ -394,15 +412,21 @@ def maybe_pad_for_cuda_graph(func):
         if num_padding == 0:
             return _call_func()
 
+        num_real_output_tokens = _num_generation_output_tokens(
+            scheduled_requests.generation_requests
+        )
+
         # pad the scheduled requests with the dummy request
         scheduled_requests.generation_requests.extend([self.padding_dummy_request] * num_padding)
 
-        ret = _call_func()
-
-        # truncate requests to remove the dummy requests we added
-        scheduled_requests.generation_requests = scheduled_requests.generation_requests[
-            :-num_padding
-        ]
+        try:
+            ret = _call_func()
+            _trim_cuda_graph_padding_outputs(ret, num_real_output_tokens)
+        finally:
+            # truncate requests to remove the dummy requests we added
+            scheduled_requests.generation_requests = scheduled_requests.generation_requests[
+                :-num_padding
+            ]
 
         return ret
 

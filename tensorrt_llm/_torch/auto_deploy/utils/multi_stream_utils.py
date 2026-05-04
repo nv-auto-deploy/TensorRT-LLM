@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Shared CUDA multi-stream utilities for multi-stream transforms.
 
 This module provides the core infrastructure for executing parts of an FX graph
@@ -168,10 +183,9 @@ def begin_aux_stream_passthrough(
     # record_stream is the idiomatic PyTorch solution for this cross-stream
     # liveness problem: it is a CPU-only allocator hint, never a GPU sync,
     # so it cannot deadlock with in-flight NCCL collectives.
-    # NOTE: skip during CUDA graph capture — passthrough partitions are
-    # reclassified as dynamic and won't be captured anyway.
-    if not torch.cuda.is_current_stream_capturing():
-        x.record_stream(aux_stream)
+    # This must also run during monolithic CUDA graph capture: unlike the
+    # piecewise path, monolithic graphs can capture these passthrough nodes.
+    x.record_stream(aux_stream)
     torch.cuda.set_stream(aux_stream)
     # Make aux wait for the main-stream event before executing any work.
     aux_stream.wait_event(main_event)
@@ -200,12 +214,13 @@ def end_aux_stream_passthrough(
     # This is critical during CUDA graph capture where the capture stream
     # differs from ``torch.cuda.default_stream()``.
     caller_stream = cuda_stream_manager._caller_streams.pop(device, None)
-    if caller_stream is not None:
-        torch.cuda.set_stream(caller_stream)
-    else:
-        torch.cuda.set_stream(
-            cuda_stream_manager.get_stream(device, cuda_stream_manager.MAIN_STREAM_NAME)
-        )
+    if caller_stream is None:
+        caller_stream = cuda_stream_manager.get_stream(device, cuda_stream_manager.MAIN_STREAM_NAME)
+
+    # ``x`` was produced on aux and is consumed after we restore the caller
+    # stream.  Preserve its lifetime across that reverse stream handoff too.
+    x.record_stream(caller_stream)
+    torch.cuda.set_stream(caller_stream)
     return x
 
 
