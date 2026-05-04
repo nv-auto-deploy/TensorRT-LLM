@@ -1,4 +1,5 @@
 import math
+import operator
 from collections import defaultdict
 from functools import partial
 from typing import Dict, List, Literal, Optional, Tuple, Type
@@ -34,6 +35,7 @@ from ...utils._graph import (
 )
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
+from ...utils.mapping_utils import deserialize_mapping
 from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import (
     bfs,
@@ -2291,13 +2293,129 @@ def _stack_nvfp4_cutlass_moe_weights(
     return fused_key_counter
 
 
+def _direct_noaux_getitem(node, expected_index: int) -> Optional[Node]:
+    if (
+        isinstance(node, Node)
+        and node.target is operator.getitem
+        and len(node.args) >= 2
+        and node.args[1] == expected_index
+        and is_op(node.args[0], torch.ops.trtllm.noaux_tc_op)
+    ):
+        return node.args[0]
+    return None
+
+
+def _find_selected_experts_noaux(node) -> Optional[Node]:
+    noaux = _direct_noaux_getitem(node, expected_index=1)
+    if noaux is not None:
+        return noaux
+
+    if (
+        isinstance(node, Node)
+        and node.target is operator.sub
+        and len(node.args) == 2
+        and isinstance(node.args[1], int)
+    ):
+        return _find_selected_experts_noaux(node.args[0])
+    return None
+
+
+def _find_ep_rank_mask_noaux(node) -> Optional[Node]:
+    if not (
+        isinstance(node, Node)
+        and node.target in (torch.eq, torch.ge)
+        and len(node.args) == 2
+        and isinstance(node.args[1], int)
+    ):
+        return None
+
+    floordiv_node = node.args[0]
+    if not (
+        isinstance(floordiv_node, Node)
+        and floordiv_node.target is operator.floordiv
+        and len(floordiv_node.args) == 2
+        and isinstance(floordiv_node.args[1], int)
+    ):
+        return None
+    return _direct_noaux_getitem(floordiv_node.args[0], expected_index=1)
+
+
+def _find_routing_weights_noaux(node) -> Optional[Node]:
+    noaux = _direct_noaux_getitem(node, expected_index=0)
+    if noaux is not None:
+        return noaux
+
+    if not (isinstance(node, Node) and node.target is operator.mul and len(node.args) == 2):
+        return None
+
+    lhs_noaux = _find_routing_weights_noaux(node.args[0])
+    rhs_mask_noaux = _find_ep_rank_mask_noaux(node.args[1])
+    if lhs_noaux is not None and lhs_noaux is rhs_mask_noaux:
+        return lhs_noaux
+
+    rhs_noaux = _find_routing_weights_noaux(node.args[1])
+    lhs_mask_noaux = _find_ep_rank_mask_noaux(node.args[0])
+    if rhs_noaux is not None and rhs_noaux is lhs_mask_noaux:
+        return rhs_noaux
+    return None
+
+
+def _extract_noaux_internal_routing(
+    selected_experts: Node, routing_weights: Node
+) -> Optional[Tuple[Node, Node, int, int, int, float]]:
+    selected_noaux = _find_selected_experts_noaux(selected_experts)
+    weights_noaux = _find_routing_weights_noaux(routing_weights)
+    if selected_noaux is None or selected_noaux is not weights_noaux:
+        return None
+
+    if len(selected_noaux.args) < 6:
+        return None
+
+    router_logits, routing_bias, n_group, topk_group, top_k, routed_scaling_factor = (
+        selected_noaux.args[:6]
+    )
+    if not isinstance(router_logits, Node) or not isinstance(routing_bias, Node):
+        return None
+    if not all(isinstance(v, int) for v in (n_group, topk_group, top_k)):
+        return None
+    if not isinstance(routed_scaling_factor, (float, int)):
+        return None
+
+    return (
+        router_logits,
+        routing_bias,
+        int(top_k),
+        int(n_group),
+        int(topk_group),
+        float(routed_scaling_factor),
+    )
+
+
+def _node_uses_moe_alltoall(node: Node) -> bool:
+    mapping_config = node.kwargs.get("mapping_config", "") if node.kwargs else ""
+    if not mapping_config:
+        return False
+    try:
+        mapping = deserialize_mapping(mapping_config)
+    except (TypeError, ValueError):
+        ad_logger.debug_once(
+            "Skip TRTLLM-Gen internal routing: unable to parse MoE mapping config.",
+            key="trtllm_gen_nvfp4_internal_routing_skip_mapping_parse",
+        )
+        return True
+    return mapping.enable_attention_dp and mapping.moe_ep_size > 1
+
+
 def _stack_nvfp4_trtllm_gen_moe_weights(
     gm: GraphModule,
     allow_different_input_scales: bool = False,
     reverse_interleaved_input_scales: bool = True,
+    use_internal_routing: bool = False,
 ) -> int:
     def _register_parameter(target, value):
         gm.register_parameter(target, torch.nn.Parameter(value, requires_grad=False))
+
+    bf16_routing_bias_keys: Dict[str, str] = {}
 
     def get_param_or_buffer(target):
         try:
@@ -2308,6 +2426,22 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
                 mod = gm.get_submodule(parts[0])
                 return getattr(mod, parts[1])
             return getattr(gm, target)
+
+    def _get_bf16_routing_bias_node(routing_bias: Node) -> Node:
+        if routing_bias.op != "get_attr":
+            return routing_bias
+
+        target = str(routing_bias.target)
+        value = get_param_or_buffer(target)
+        if not isinstance(value, torch.Tensor) or value.dtype == torch.bfloat16:
+            return routing_bias
+
+        new_key = bf16_routing_bias_keys.get(target)
+        if new_key is None:
+            new_key = f"trtllm_gen_nvfp4_moe_routing_bias_bf16_{len(bf16_routing_bias_keys)}"
+            bf16_routing_bias_keys[target] = new_key
+            _register_parameter(new_key, value.to(dtype=torch.bfloat16).contiguous())
+        return graph.get_attr(new_key)
 
     def _extract_op_args(node):
         return extract_op_args(
@@ -2405,6 +2539,9 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
     fused_key_counter = 0
     graph = gm.graph
     replacement_op = torch.ops.auto_deploy.trtllm_nvfp4_trtllm_gen_moe_fused
+    internal_routing_replacement_op = (
+        torch.ops.auto_deploy.trtllm_nvfp4_trtllm_gen_moe_fused_internal_routing
+    )
     replaced_op = torch.ops.auto_deploy.torch_quant_nvfp4_moe
 
     matched_nodes = [node for node in graph.nodes if is_op(node, replaced_op)]
@@ -2637,19 +2774,6 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
         _register_parameter(new_key_fc2_alpha, fc2_alpha)
 
         with graph.inserting_before(node):
-            args = (
-                hidden_states,
-                selected_experts,
-                routing_weights,
-                graph.get_attr(new_key_fc1),
-                graph.get_attr(new_key_fc2),
-                graph.get_attr(new_key_fc1_scale),
-                graph.get_attr(new_key_fc2_scale),
-                graph.get_attr(new_key_fc1_act_scale),
-                graph.get_attr(new_key_fc1_scale_c),
-                graph.get_attr(new_key_fc1_alpha),
-                graph.get_attr(new_key_fc2_alpha),
-            )
             kwargs = dict(node.kwargs) if node.kwargs else {}
             kwargs.update(
                 {
@@ -2657,8 +2781,57 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
                     "act_fn": act_fn,
                 }
             )
+            internal_routing = None
+            if use_internal_routing and not _node_uses_moe_alltoall(node):
+                internal_routing = _extract_noaux_internal_routing(
+                    selected_experts, routing_weights
+                )
+
+            if internal_routing is not None:
+                router_logits, routing_bias, top_k, n_group, topk_group, routed_scaling_factor = (
+                    internal_routing
+                )
+                routing_bias = _get_bf16_routing_bias_node(routing_bias)
+                args = (
+                    hidden_states,
+                    router_logits,
+                    routing_bias,
+                    graph.get_attr(new_key_fc1),
+                    graph.get_attr(new_key_fc2),
+                    graph.get_attr(new_key_fc1_scale),
+                    graph.get_attr(new_key_fc2_scale),
+                    graph.get_attr(new_key_fc1_act_scale),
+                    graph.get_attr(new_key_fc1_scale_c),
+                    graph.get_attr(new_key_fc1_alpha),
+                    graph.get_attr(new_key_fc2_alpha),
+                    top_k,
+                )
+                kwargs.update(
+                    {
+                        "n_group": n_group,
+                        "topk_group": topk_group,
+                        "routed_scaling_factor": routed_scaling_factor,
+                    }
+                )
+                replacement = internal_routing_replacement_op
+            else:
+                args = (
+                    hidden_states,
+                    selected_experts,
+                    routing_weights,
+                    graph.get_attr(new_key_fc1),
+                    graph.get_attr(new_key_fc2),
+                    graph.get_attr(new_key_fc1_scale),
+                    graph.get_attr(new_key_fc2_scale),
+                    graph.get_attr(new_key_fc1_act_scale),
+                    graph.get_attr(new_key_fc1_scale_c),
+                    graph.get_attr(new_key_fc1_alpha),
+                    graph.get_attr(new_key_fc2_alpha),
+                )
+                replacement = replacement_op
+
             new_node = graph.call_function(
-                replacement_op,
+                replacement,
                 args=args,
                 kwargs=kwargs,
             )
@@ -2697,6 +2870,13 @@ class FuseNVFP4MoeConfig(TransformConfig):
             "before TRTLLM-Gen shuffle+interleave. Only used when backend='trtllm_gen'."
         ),
     )
+    use_internal_routing: bool = Field(
+        default=False,
+        description=(
+            "If True and backend='trtllm_gen', pass DeepSeekV3 router logits and routing bias "
+            "directly to TRTLLM-Gen MoE when the routing tensors come from trtllm.noaux_tc_op."
+        ),
+    )
 
 
 @TransformRegistry.register("fuse_nvfp4_moe")
@@ -2717,7 +2897,10 @@ class FuseNVFP4Moe(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        ad_logger.info(f"FuseNVFP4Moe: backend={self.config.backend}")
+        ad_logger.info(
+            f"FuseNVFP4Moe: backend={self.config.backend}, "
+            f"use_internal_routing={self.config.use_internal_routing}"
+        )
         with cuda_memory_tracker():
             if self.config.backend == "cutlass":
                 fused_key_counter = _stack_nvfp4_cutlass_moe_weights(
@@ -2729,6 +2912,7 @@ class FuseNVFP4Moe(BaseTransform):
                     gm,
                     allow_different_input_scales=self.config.allow_different_input_scales,
                     reverse_interleaved_input_scales=self.config.reverse_interleaved_input_scales,
+                    use_internal_routing=self.config.use_internal_routing,
                 )
 
         info = TransformInfo(

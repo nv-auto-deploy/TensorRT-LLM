@@ -194,6 +194,7 @@ transforms:
     expect_mem_change: true
     allow_different_input_scales: false
     backend: cutlass
+    use_internal_routing: false
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
     requires_shape_prop: true

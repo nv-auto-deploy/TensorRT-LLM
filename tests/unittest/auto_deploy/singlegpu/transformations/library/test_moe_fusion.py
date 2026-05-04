@@ -1,4 +1,5 @@
 import json
+import operator
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,9 @@ from utils.util import skip_pre_blackwell, skip_pre_hopper
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy._compat import ActivationType
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import (
+    _extract_noaux_internal_routing,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
@@ -1622,6 +1626,31 @@ def test_nvfp4_trtllm_gen_non_gated_empty_w3_lists():
         output = gm(x)
 
     assert torch.isfinite(output).all(), "TRTLLM-Gen non-gated output contains non-finite values."
+
+
+@pytest.mark.skipif(not trtllm_ops_available(), reason="Requires TRTLLM ops")
+def test_nvfp4_trtllm_gen_internal_routing_matcher_ep_mask():
+    """The TRTLLM-Gen internal-routing matcher must see through EP localize/mask ops."""
+    graph = fx.Graph()
+    router_logits = graph.placeholder("router_logits")
+    routing_bias = graph.placeholder("routing_bias")
+    noaux = graph.call_function(
+        torch.ops.trtllm.noaux_tc_op.default,
+        args=(router_logits, routing_bias, 1, 1, 22, 5.0),
+    )
+    routing_weights = graph.call_function(operator.getitem, args=(noaux, 0))
+    selected_experts = graph.call_function(operator.getitem, args=(noaux, 1))
+    selected_experts_local = graph.call_function(operator.sub, args=(selected_experts, 128))
+    expert_rank = graph.call_function(operator.floordiv, args=(selected_experts, 128))
+    rank_mask = graph.call_function(torch.eq, args=(expert_rank, 1))
+    routing_weights_local = graph.call_function(operator.mul, args=(routing_weights, rank_mask))
+
+    result = _extract_noaux_internal_routing(selected_experts_local, routing_weights_local)
+
+    assert result is not None
+    assert result[0] is router_logits
+    assert result[1] is routing_bias
+    assert result[2:] == (22, 1, 1, 5.0)
 
 
 @pytest.mark.skipif(
