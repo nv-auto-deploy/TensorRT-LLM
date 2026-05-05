@@ -103,6 +103,7 @@ transforms:
     run_shape_prop: true
   quantize_mxfp4_moe:
     stage: pattern_matcher
+    mxfp4_backend: auto
   detect_hidden_states_for_capture:
     stage: pattern_matcher
     enabled: false

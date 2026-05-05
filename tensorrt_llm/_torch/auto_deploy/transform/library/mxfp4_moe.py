@@ -1,14 +1,15 @@
 from functools import partial
-from typing import Tuple
+from typing import Literal, Tuple
 
 import torch
 import torch.nn as nn
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
-from ..interface import BaseTransform, TransformInfo, TransformRegistry
+from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
 
 
 def _moe_dense_mlp_pattern(
@@ -145,6 +146,22 @@ def _get_packed_mxfp4_expert_layout(qcfg: dict):
     return getattr(checkpoint_layout, "packed_mxfp4_experts", None)
 
 
+class MXFP4MLPConfig(TransformConfig):
+    mxfp4_backend: Literal["auto", "torch", "triton"] = Field(
+        default="auto",
+        description=(
+            "Backend for packed MXFP4 MoE lowering. 'auto' selects the torch reference path "
+            "for checkpoint-layout packed experts and Triton for legacy quant_method=mxfp4."
+        ),
+    )
+
+
+def _get_mxfp4_moe_op(backend: Literal["torch", "triton"]):
+    if backend == "torch":
+        return torch.ops.auto_deploy.torch_mxfp4_moe
+    return torch.ops.auto_deploy.triton_mxfp4_moe
+
+
 def _layout_layer_from_names(checkpoint_layout: object, source_names: dict[str, str]):
     for source_name in source_names.values():
         layer = checkpoint_layout.layer_from_runtime_name(source_name)
@@ -251,11 +268,28 @@ def _register_mxfp4_expert_params(
 @TransformRegistry.register("quantize_mxfp4_moe")
 class InsertMXFP4MLP(BaseTransform):
     """
-    Replace (torch_moe_router -> torch_moe_dense_mlp) with a single auto_deploy::triton_mxfp4_moe op,
+    Replace (torch_moe_router -> torch_moe_dense_mlp) with a single MXFP4 MoE op,
     and register MXFP4 expert params (blocks + scales) on the experts module.
     """
 
     algo_name: str = "mxfp4"
+    config: MXFP4MLPConfig
+
+    @classmethod
+    def get_config_class(cls):
+        return MXFP4MLPConfig
+
+    def _resolve_backend(
+        self,
+        qcfg: dict,
+        checkpoint_layout: object | None,
+    ) -> Literal["torch", "triton"]:
+        backend = self.config.mxfp4_backend
+        if backend != "auto":
+            return backend
+        if checkpoint_layout is not None or qcfg.get("expert_quant_method") == self.algo_name:
+            return "torch"
+        return "triton"
 
     def _apply(
         self,
@@ -275,6 +309,8 @@ class InsertMXFP4MLP(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
         num_matches = 0
+        mxfp4_backend = self._resolve_backend(qcfg, checkpoint_layout)
+        mxfp4_op = _get_mxfp4_moe_op(mxfp4_backend)
 
         for n in list(gm.graph.nodes):
             if not is_op(n, torch.ops.auto_deploy.torch_moe_dense_mlp):
@@ -358,10 +394,10 @@ class InsertMXFP4MLP(BaseTransform):
                 dn_blocks_attr = gm.graph.create_node("get_attr", dn_blocks_name)
                 dn_scales_attr = gm.graph.create_node("get_attr", dn_scales_name)
 
-            n.target = torch.ops.auto_deploy.triton_mxfp4_moe.default
+            n.target = mxfp4_op.default
             n.kwargs = {}
 
-            # triton_mxfp4_moe(
+            # torch_mxfp4_moe/triton_mxfp4_moe(
             #   hidden_states,
             #   router_weight, router_bias, top_k,
             #   gate_up_blocks, gate_up_bias, gate_up_scales, alpha, limit,
