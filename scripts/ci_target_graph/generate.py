@@ -19,12 +19,58 @@ import yaml
 
 from .selector_parser import ParsedSelector, parse_pytest_selector
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TEST_DB_RELATIVE_DIR = Path("tests/integration/test_lists/test-db")
 JENKINS_L0_TEST_RELATIVE_PATH = Path("jenkins/L0_Test.groovy")
 
 _DIRECT_STAGE_RE = re.compile(r'"(?P<stage>(?:\\.|[^"\\])*)"\s*:\s*\[(?P<values>[^\]]*)\]')
 _SANITIZE_RE = re.compile(r"[^A-Za-z0-9_]+")
+_MODEL_FAMILY_KEYWORDS = {
+    "deepseek": ("deepseek",),
+    "gemma": ("gemma",),
+    "glm": ("glm",),
+    "llama": ("llama",),
+    "mistral": ("codestral", "ministral", "mistral", "mixtral", "pixtral"),
+    "nemotron": ("nemotron",),
+    "qwen": ("qwen", "qwq"),
+}
+_GPU_TYPE_KEYWORDS = {
+    "a10": ("a10",),
+    "a30": ("a30",),
+    "a40": ("a40",),
+    "a100": ("a100",),
+    "a100x": ("a100x",),
+    "b100": ("b100",),
+    "b200": ("b200",),
+    "b300": ("b300",),
+    "gb10": ("gb10",),
+    "gb200": ("gb200",),
+    "gb202": ("gb202",),
+    "gb203": ("gb203",),
+    "gb300": ("gb300",),
+    "h100": ("h100",),
+    "h200": ("h200",),
+    "l40": ("l40",),
+    "l40s": ("l40s",),
+    "rtx_pro_6000": ("6000", "rtxpro6000"),
+    "t4": ("t4",),
+    "v100": ("v100",),
+}
+_GPU_TYPE_MATCHERS = sorted(
+    _GPU_TYPE_KEYWORDS.items(),
+    key=lambda item: max(len(keyword) for keyword in item[1]),
+    reverse=True,
+)
+_TRITON_RUNTIME_RE = re.compile(r"(?<![a-z0-9])triton(?:[_-][a-z0-9]+)?(?![a-z0-9])")
+_MODEL_BACKED_PATH_PREFIXES = (
+    "accuracy/",
+    "cpp/test_e2e.py",
+    "cpp/test_multi_gpu.py",
+    "disaggregated/",
+    "examples/",
+    "test_e2e.py",
+    "triton_server/",
+)
 
 _BACKEND_STAGE_KEYWORDS = {
     "autodeploy": ["AUTODEPLOY"],
@@ -183,6 +229,7 @@ def _target_from_selector(
     constraints: dict[str, Any],
     jenkins_stages: list[str],
 ) -> dict[str, Any]:
+    runtime = _runtime_metadata(parsed_selector, constraints)
     return {
         "target_id": _target_id(
             yaml_stem=yaml_stem,
@@ -202,7 +249,8 @@ def _target_from_selector(
         },
         "selector": parsed_selector.to_dict(),
         "constraints": constraints,
-        "tags": _tags_for_target(parsed_selector, constraints),
+        "runtime": runtime,
+        "tags": _tags_for_target(parsed_selector, constraints, runtime),
         "component_hints": _component_hints(parsed_selector.paths),
     }
 
@@ -330,7 +378,11 @@ def _gpu_count_matches(stage_gpu_count: int, system_gpu_count: dict[str, Any]) -
     return True
 
 
-def _tags_for_target(parsed_selector: ParsedSelector, constraints: dict[str, Any]) -> list[str]:
+def _tags_for_target(
+    parsed_selector: ParsedSelector,
+    constraints: dict[str, Any],
+    runtime: dict[str, Any],
+) -> list[str]:
     tags: list[str] = []
     for key in ("stage", "backend", "orchestrator", "auto_trigger"):
         value = constraints.get(key)
@@ -353,7 +405,178 @@ def _tags_for_target(parsed_selector: ParsedSelector, constraints: dict[str, Any
     if parsed_selector.isolation:
         tags.append("isolation")
 
+    tags.extend(_runtime_tags(runtime))
+    return _dedupe_preserving_order(tags)
+
+
+def _runtime_metadata(
+    parsed_selector: ParsedSelector,
+    constraints: dict[str, Any],
+) -> dict[str, Any]:
+    backend = _normalize_runtime_value(constraints.get("backend"))
+    gpu_types = _runtime_gpu_types(constraints)
+    gpu_count = _exact_gpu_count(constraints.get("system_gpu_count"))
+    model_families = _runtime_model_families(parsed_selector)
+    requirements = _runtime_requirements(
+        parsed_selector=parsed_selector,
+        gpu_types=gpu_types,
+        gpu_count=gpu_count,
+        model_families=model_families,
+    )
+    missing = _runtime_missing(
+        backend=backend,
+        gpu_types=gpu_types,
+        gpu_count=gpu_count,
+        model_families=model_families,
+    )
+
+    return {
+        "model_families": model_families,
+        "backend": backend,
+        "gpu_types": gpu_types,
+        "gpu_count": gpu_count,
+        "requirements": requirements,
+        "metadata_complete": not missing,
+        "missing": missing,
+    }
+
+
+def _runtime_tags(runtime: dict[str, Any]) -> list[str]:
+    tags: list[str] = []
+    model_families = _string_list(runtime.get("model_families"))
+    if model_families:
+        tags.extend(f"model:{model_family}" for model_family in model_families)
+    else:
+        tags.append("model:unknown")
+
+    backend = _string_or_none(runtime.get("backend"))
+    if backend:
+        tags.append(f"backend:{backend}")
+
+    for gpu_type in _string_list(runtime.get("gpu_types")):
+        tags.append(f"gpu:{gpu_type}")
+
+    gpu_count = runtime.get("gpu_count")
+    if _is_int(gpu_count):
+        tags.append(f"gpu_count:{gpu_count}")
+
+    for requirement in _string_list(runtime.get("requirements")):
+        tags.append(f"requires:{requirement}")
+
+    if runtime.get("metadata_complete") is True:
+        tags.append("metadata:runtime_complete")
+    else:
+        tags.append("metadata:runtime_incomplete")
     return tags
+
+
+def _runtime_model_families(parsed_selector: ParsedSelector) -> list[str]:
+    compact_text = _compact_runtime_text(_selector_runtime_text(parsed_selector))
+    families = [
+        family
+        for family, keywords in _MODEL_FAMILY_KEYWORDS.items()
+        if any(keyword in compact_text for keyword in keywords)
+    ]
+    return sorted(families)
+
+
+def _runtime_gpu_types(constraints: dict[str, Any]) -> list[str]:
+    gpu_types: set[str] = set()
+    for wildcard in constraints.get("gpu_wildcards", []):
+        compact_wildcard = _compact_runtime_text(str(wildcard))
+        for gpu_type, keywords in _GPU_TYPE_MATCHERS:
+            if any(keyword in compact_wildcard for keyword in keywords):
+                gpu_types.add(gpu_type)
+                break
+    return sorted(gpu_types)
+
+
+def _runtime_requirements(
+    *,
+    parsed_selector: ParsedSelector,
+    gpu_types: list[str],
+    gpu_count: int | None,
+    model_families: list[str],
+) -> list[str]:
+    requirements: set[str] = set()
+    if (gpu_types or gpu_count is not None) and _is_model_backed_selector(
+        parsed_selector,
+        model_families,
+    ):
+        requirements.update({"cuda", "model_cache"})
+
+    if _has_triton_runtime_evidence(parsed_selector):
+        requirements.add("triton")
+
+    return sorted(requirements)
+
+
+def _runtime_missing(
+    *,
+    backend: str | None,
+    gpu_types: list[str],
+    gpu_count: int | None,
+    model_families: list[str],
+) -> list[str]:
+    missing: list[str] = []
+    if not model_families:
+        missing.append("model_families")
+    elif len(model_families) > 1:
+        missing.append("model_families_ambiguous")
+    if backend is None:
+        missing.append("backend")
+    if not gpu_types:
+        missing.append("gpu_types")
+    if gpu_count is None:
+        missing.append("gpu_count")
+    return missing
+
+
+def _is_model_backed_selector(
+    parsed_selector: ParsedSelector,
+    model_families: list[str],
+) -> bool:
+    if model_families:
+        return True
+    return any(
+        selector_path.startswith(_MODEL_BACKED_PATH_PREFIXES)
+        for selector_path in parsed_selector.paths
+    )
+
+
+def _has_triton_runtime_evidence(parsed_selector: ParsedSelector) -> bool:
+    selector_text = _selector_runtime_text(parsed_selector).lower()
+    return _TRITON_RUNTIME_RE.search(selector_text) is not None
+
+
+def _selector_runtime_text(parsed_selector: ParsedSelector) -> str:
+    return " ".join([parsed_selector.raw, *parsed_selector.paths, *parsed_selector.pytest_args])
+
+
+def _compact_runtime_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def _normalize_runtime_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = _SANITIZE_RE.sub("_", str(value).lower()).strip("_")
+    return normalized or None
+
+
+def _exact_gpu_count(system_gpu_count: Any) -> int | None:
+    if not isinstance(system_gpu_count, dict):
+        return None
+
+    eq_count = system_gpu_count.get("eq")
+    if _is_int(eq_count):
+        return eq_count
+
+    lower_count = system_gpu_count.get("gte")
+    upper_count = system_gpu_count.get("lte")
+    if _is_int(lower_count) and _is_int(upper_count) and lower_count == upper_count:
+        return lower_count
+    return None
 
 
 def _range_tag_value(value: dict[str, Any]) -> str:

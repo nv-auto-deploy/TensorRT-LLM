@@ -109,7 +109,9 @@ python3 -m scripts.ci_target_graph.generate_bazel_autodeploy \
 The generated package is intentionally narrow: pre-merge AutoDeploy entries
 from `l0_h100.yml` and `l0_dgx_h100.yml` whose GPU constraint matches H100.
 Generated targets preserve manifest tags, pytest arguments, isolation and
-timeout metadata, and compatibility constraints.
+timeout metadata, and hardware compatibility constraints. Runtime details such
+as model family, backend, CUDA/model-cache needs, and Triton runtime evidence
+remain query-visible tags instead of Bazel platform constraints.
 
 ## Select Impacted Targets
 
@@ -137,6 +139,23 @@ python3 scripts/ci_target_graph/select_impacted.py \
     --targets-output /tmp/trtllm-impacted-targets.txt
 ```
 
+Add structured runtime filters when a caller wants metadata-guarded tag
+selection:
+
+```bash
+python3 scripts/ci_target_graph/select_impacted.py \
+    --base upstream/main \
+    --platform //platforms:h100_4gpu \
+    --model-family llama \
+    --backend autodeploy \
+    --runtime-requirement triton
+```
+
+`--model-family`, `--backend`, and `--runtime-requirement` fall back
+conservatively if candidate targets have incomplete or missing runtime metadata.
+Use raw `--include-tag`, such as `--include-tag 'model:llama'`, as the escape
+hatch for direct tag regex filtering.
+
 ## Query Examples
 
 List Bazel targets under the spike packages:
@@ -149,6 +168,24 @@ List pytest selector test targets:
 
 ```bash
 bazel query 'kind("sh_test rule", //ci/bazel/...)'
+```
+
+List generated Llama AutoDeploy selectors:
+
+```bash
+bazel query 'attr("tags", "model:llama", attr("tags", "backend:autodeploy", //ci/bazel/...))'
+```
+
+List selectors with incomplete runtime metadata:
+
+```bash
+bazel query 'attr("tags", "metadata:runtime_incomplete", //ci/bazel/...)'
+```
+
+List selectors with clear Triton runtime evidence:
+
+```bash
+bazel query 'attr("tags", "requires:triton", //ci/bazel/...)'
 ```
 
 Inspect compatibility under an H100 one-GPU target platform:
@@ -224,8 +261,10 @@ trtllm_pytest_case(
         "backend:autodeploy",
         "gpu:h100",
         "gpu_count:1",
+        "model:llama",
         "requires:cuda",
         "requires:model_cache",
+        "metadata:runtime_complete",
     ],
     target_compatible_with = [
         "//platforms/gpu:h100",

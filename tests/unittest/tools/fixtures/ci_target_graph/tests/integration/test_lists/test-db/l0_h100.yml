@@ -49,3 +49,18 @@ l0_h100:
         orchestrator: mpi
     tests:
       - unittest/_torch/test_model_config.py unittest/llmapi/test_llm_args.py -k "config"
+  - condition:
+      ranges:
+        system_gpu_count:
+          gte: 1
+          lte: 1
+      wildcards:
+        gpu:
+          - '*h100*'
+        linux_distribution_name: ubuntu*
+      terms:
+        stage: pre_merge
+        backend: autodeploy
+        orchestrator: mpi
+    tests:
+      - accuracy/test_unknown_runtime_metadata.py::TestUnknownRuntime::test_auto_dtype[trtllm-False-1]

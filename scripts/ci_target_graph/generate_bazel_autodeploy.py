@@ -23,6 +23,14 @@ _AUTODEPLOY_H100_YAMLS = {
 }
 _RUNTIME_DEP = "//tensorrt_llm/_torch/auto_deploy:runtime"
 _ACCURACY_DEP = "//tests/integration/defs/accuracy:accuracy_tests"
+_GPU_CONSTRAINT_VALUES = {
+    "b200": "//platforms/gpu:b200",
+    "h100": "//platforms/gpu:h100",
+}
+_GPU_COUNT_CONSTRAINT_VALUES = {
+    1: "//platforms/gpu_count:one",
+    4: "//platforms/gpu_count:four",
+}
 
 
 @dataclass(frozen=True)
@@ -129,14 +137,17 @@ def _is_autodeploy_h100_target(target: Any) -> bool:
 
     source = target.get("source")
     constraints = target.get("constraints")
+    runtime = target.get("runtime")
     if not isinstance(source, dict) or not isinstance(constraints, dict):
+        return False
+    if not isinstance(runtime, dict):
         return False
 
     return (
         source.get("yaml") in _AUTODEPLOY_H100_YAMLS
         and constraints.get("stage") == "pre_merge"
-        and constraints.get("backend") == "autodeploy"
-        and _has_h100_constraint(constraints)
+        and runtime.get("backend") == "autodeploy"
+        and "h100" in _runtime_gpu_types(runtime)
     )
 
 
@@ -148,8 +159,7 @@ def _case_from_manifest_target(target: dict[str, Any]) -> BazelPytestCase:
     if not selector_paths:
         selector_paths = [selector["raw"]]
 
-    constraints = target["constraints"]
-    gpu_count = _exact_gpu_count(constraints)
+    runtime = target["runtime"]
     pytest_args = selector_paths[1:] + list(selector.get("pytest_args") or [])
     deps = [_RUNTIME_DEP]
     if _has_accuracy_path(selector_paths):
@@ -159,60 +169,77 @@ def _case_from_manifest_target(target: dict[str, Any]) -> BazelPytestCase:
         name=str(target["target_id"]).split(":", 1)[1],
         selector=selector_paths[0],
         pytest_args=pytest_args,
-        tags=_tags_for_target(target, gpu_count),
-        target_compatible_with=_target_compatible_with(gpu_count),
+        tags=_tags_for_target(target),
+        target_compatible_with=_target_compatible_with(runtime),
         timeout=_bazel_timeout(selector.get("timeout_minutes")),
         deps=deps,
     )
 
 
-def _tags_for_target(target: dict[str, Any], gpu_count: int | None) -> list[str]:
+def _tags_for_target(target: dict[str, Any]) -> list[str]:
     tags = list(target.get("tags") or [])
-    constraints = target.get("constraints") or {}
-    if _has_h100_constraint(constraints):
-        tags.append("gpu:h100")
-    if gpu_count is not None:
-        tags.append(f"gpu_count:{gpu_count}")
-    tags.extend(["requires:cuda", "requires:model_cache"])
+    runtime = target.get("runtime")
+    if isinstance(runtime, dict):
+        tags.extend(_runtime_tags(runtime))
     return _dedupe_preserving_order(tags)
 
 
-def _has_h100_constraint(constraints: dict[str, Any]) -> bool:
-    gpu_wildcards = constraints.get("gpu_wildcards")
-    if not isinstance(gpu_wildcards, list):
-        return False
-    return any("h100" in str(gpu_wildcard).lower() for gpu_wildcard in gpu_wildcards)
+def _target_compatible_with(runtime: dict[str, Any]) -> list[str]:
+    constraints = [
+        _GPU_CONSTRAINT_VALUES[gpu_type]
+        for gpu_type in _runtime_gpu_types(runtime)
+        if gpu_type in _GPU_CONSTRAINT_VALUES
+    ]
+    gpu_count = _runtime_gpu_count(runtime)
+    if gpu_count in _GPU_COUNT_CONSTRAINT_VALUES:
+        constraints.append(_GPU_COUNT_CONSTRAINT_VALUES[gpu_count])
+    return constraints
 
 
-def _exact_gpu_count(constraints: dict[str, Any]) -> int | None:
-    system_gpu_count = constraints.get("system_gpu_count")
-    if not isinstance(system_gpu_count, dict):
-        return None
+def _runtime_tags(runtime: dict[str, Any]) -> list[str]:
+    tags: list[str] = []
+    model_families = _runtime_string_list(runtime.get("model_families"))
+    if model_families:
+        tags.extend(f"model:{model_family}" for model_family in model_families)
+    else:
+        tags.append("model:unknown")
 
-    eq_count = system_gpu_count.get("eq")
-    if isinstance(eq_count, int) and not isinstance(eq_count, bool):
-        return eq_count
+    backend = runtime.get("backend")
+    if isinstance(backend, str) and backend:
+        tags.append(f"backend:{backend}")
 
-    lower_count = system_gpu_count.get("gte")
-    upper_count = system_gpu_count.get("lte")
-    if (
-        isinstance(lower_count, int)
-        and isinstance(upper_count, int)
-        and not isinstance(lower_count, bool)
-        and not isinstance(upper_count, bool)
-        and lower_count == upper_count
-    ):
-        return lower_count
+    for gpu_type in _runtime_gpu_types(runtime):
+        tags.append(f"gpu:{gpu_type}")
+
+    gpu_count = _runtime_gpu_count(runtime)
+    if gpu_count is not None:
+        tags.append(f"gpu_count:{gpu_count}")
+
+    for requirement in _runtime_string_list(runtime.get("requirements")):
+        tags.append(f"requires:{requirement}")
+
+    if runtime.get("metadata_complete") is True:
+        tags.append("metadata:runtime_complete")
+    else:
+        tags.append("metadata:runtime_incomplete")
+    return tags
+
+
+def _runtime_gpu_types(runtime: dict[str, Any]) -> list[str]:
+    return _runtime_string_list(runtime.get("gpu_types"))
+
+
+def _runtime_gpu_count(runtime: dict[str, Any]) -> int | None:
+    gpu_count = runtime.get("gpu_count")
+    if isinstance(gpu_count, int) and not isinstance(gpu_count, bool):
+        return gpu_count
     return None
 
 
-def _target_compatible_with(gpu_count: int | None) -> list[str]:
-    constraints = ["//platforms/gpu:h100"]
-    if gpu_count == 1:
-        constraints.append("//platforms/gpu_count:one")
-    elif gpu_count == 4:
-        constraints.append("//platforms/gpu_count:four")
-    return constraints
+def _runtime_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
 
 
 def _bazel_timeout(timeout_minutes: Any) -> str:

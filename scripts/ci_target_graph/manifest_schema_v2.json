@@ -1,0 +1,278 @@
+{
+  "$comment": "SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TensorRT-LLM shadow CI target graph manifest v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "targets"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "targets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/target"
+      }
+    }
+  },
+  "$defs": {
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_id",
+        "kind",
+        "source",
+        "selector",
+        "constraints",
+        "runtime",
+        "tags",
+        "component_hints"
+      ],
+      "properties": {
+        "target_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "const": "pytest_selector"
+        },
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "selector": {
+          "$ref": "#/$defs/selector"
+        },
+        "constraints": {
+          "$ref": "#/$defs/constraints"
+        },
+        "runtime": {
+          "$ref": "#/$defs/runtime"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "component_hints": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "yaml",
+        "context",
+        "entry_index",
+        "test_index",
+        "jenkins_stages",
+        "jenkins_stage_scope"
+      ],
+      "properties": {
+        "yaml": {
+          "type": "string",
+          "minLength": 1
+        },
+        "context": {
+          "type": "string",
+          "minLength": 1
+        },
+        "entry_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "test_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "jenkins_stages": {
+          "description": "Matching Jenkins stage configs before pytest shard assignment; not exact per-shard membership.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "jenkins_stage_scope": {
+          "description": "Scope of source.jenkins_stages.",
+          "const": "pre_shard_candidates"
+        }
+      }
+    },
+    "selector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw",
+        "path",
+        "paths",
+        "pytest_args",
+        "timeout_minutes",
+        "isolation"
+      ],
+      "properties": {
+        "raw": {
+          "type": "string"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paths": {
+          "description": "All non-option selector tokens treated conservatively as pytest paths, excluding TIMEOUT/ISOLATION markers and recognized option values.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "pytest_args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "timeout_minutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "isolation": {
+          "type": "boolean"
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "backend",
+        "orchestrator",
+        "auto_trigger",
+        "gpu_wildcards",
+        "system_gpu_count"
+      ],
+      "properties": {
+        "stage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "orchestrator": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "auto_trigger": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "gpu_wildcards": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "system_gpu_count": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "integer",
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_families",
+        "backend",
+        "gpu_types",
+        "gpu_count",
+        "requirements",
+        "metadata_complete",
+        "missing"
+      ],
+      "properties": {
+        "model_families": {
+          "description": "Normalized model families inferred from clear selector evidence.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "gpu_types": {
+          "description": "Concrete GPU type names inferred from test-db GPU wildcards.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "gpu_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "requirements": {
+          "description": "Runtime resources inferred from clear selector evidence.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "metadata_complete": {
+          "description": "True only when the generator inferred a single model family, backend, concrete GPU type, and exact GPU count.",
+          "type": "boolean"
+        },
+        "missing": {
+          "description": "Runtime metadata fields that are missing or ambiguous.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

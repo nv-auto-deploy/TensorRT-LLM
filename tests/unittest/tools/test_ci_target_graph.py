@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import types
@@ -50,6 +51,9 @@ H100_SELECTOR = (
 DGX_H100_SELECTOR = (
     "accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-4]"
 )
+UNKNOWN_MODEL_SELECTOR = (
+    "accuracy/test_unknown_runtime_metadata.py::TestUnknownRuntime::test_auto_dtype[trtllm-False-1]"
+)
 AUTO_TRIGGER_OTHERS_SELECTOR = (
     "accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_attention_dp[1]"
 )
@@ -88,6 +92,8 @@ class _FakeQueryClient:
         fallback_query_results: list[str] | None = None,
         cquery_results: list[str] | None = None,
         incompatible_query_results: list[str] | None = None,
+        query_results_by_substring: dict[str, list[str]] | None = None,
+        target_tags: dict[str, list[str]] | None = None,
         fail_impacted_query: bool = False,
         fail_fallback_query: bool = False,
         fail_cquery: bool = False,
@@ -96,11 +102,14 @@ class _FakeQueryClient:
         self.fallback_query_results = fallback_query_results
         self.cquery_results = cquery_results or []
         self.incompatible_query_results = incompatible_query_results or []
+        self.query_results_by_substring = query_results_by_substring or {}
+        self.target_tags = {target: tuple(tags) for target, tags in (target_tags or {}).items()}
         self.fail_impacted_query = fail_impacted_query
         self.fail_fallback_query = fail_fallback_query
         self.fail_cquery = fail_cquery
         self.queries: list[str] = []
         self.cqueries: list[tuple[str, str]] = []
+        self.tag_queries: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
 
     def query(self, expression: str) -> list[str]:
         self.queries.append(expression)
@@ -108,6 +117,12 @@ class _FakeQueryClient:
             raise BazelQueryError("fake impacted query failure")
         if "target_compatible_with" in expression:
             return self.incompatible_query_results
+        tag_query_results = self._tag_query_results(expression)
+        if tag_query_results is not None:
+            return tag_query_results
+        for substring, results in self.query_results_by_substring.items():
+            if substring in expression:
+                return results
         if self.fail_fallback_query and "tests(" in expression:
             raise BazelQueryError("fake broad fallback query failure")
         if "tests(" in expression and self.fallback_query_results is not None:
@@ -119,6 +134,52 @@ class _FakeQueryClient:
         if self.fail_cquery:
             raise BazelQueryError("fake platform query failure")
         return self.cquery_results
+
+    def _tag_query_results(self, expression: str) -> list[str] | None:
+        if not self.target_tags:
+            return None
+
+        match = re.fullmatch(
+            r'attr\("tags",\s*(?P<pattern>"(?:\\.|[^"\\])*"),\s*(?P<scope>.+)\)',
+            expression,
+        )
+        if match is None:
+            return None
+
+        candidate_targets = self._set_expression_targets(match.group("scope"))
+        if candidate_targets is None:
+            return None
+
+        pattern = json.loads(match.group("pattern"))
+        try:
+            tag_regex = re.compile(pattern)
+        except re.error as error:
+            raise BazelQueryError(f"fake tag query regex failed: {error}") from error
+
+        results = tuple(
+            target
+            for target in candidate_targets
+            if any(
+                self._tag_matches(pattern, tag_regex, tag)
+                for tag in self.target_tags.get(target, ())
+            )
+        )
+        self.tag_queries.append((pattern, candidate_targets, results))
+        return list(results)
+
+    @staticmethod
+    def _tag_matches(pattern: str, tag_regex: re.Pattern[str], tag: str) -> bool:
+        if re.fullmatch(r"[A-Za-z0-9_:-]+", pattern) and not pattern.endswith(":"):
+            return tag == pattern
+        return tag_regex.search(tag) is not None
+
+    @staticmethod
+    def _set_expression_targets(expression: str) -> tuple[str, ...] | None:
+        expression = expression.strip()
+        if not expression.startswith("set(") or not expression.endswith(")"):
+            return None
+        labels = expression.removeprefix("set(").removesuffix(")").split()
+        return tuple(label for label in labels if label)
 
 
 def _changed_file(path: str) -> ChangedFile:
@@ -165,6 +226,30 @@ def _manifest_targets(manifest: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _target_by_selector(targets: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {target["selector"]["raw"]: target for target in targets}
+
+
+def _runtime_metadata(target: dict[str, Any]) -> dict[str, Any]:
+    runtime = target.get("runtime")
+    assert isinstance(runtime, dict), "target must expose structured runtime metadata"
+    return runtime
+
+
+def _runtime_filter_kwargs() -> dict[str, list[str]]:
+    return {
+        "backends": ["autodeploy"],
+        "model_families": ["llama"],
+        "runtime_requirements": ["cuda", "model_cache"],
+    }
+
+
+def _target_ids_for_selectors(*selectors: str) -> tuple[str, ...]:
+    targets = _target_by_selector(_manifest_targets(_build_manifest()))
+    return tuple(sorted(targets[selector]["target_id"] for selector in selectors))
+
+
+def _target_tags_for_selectors(*selectors: str) -> dict[str, list[str]]:
+    targets = _target_by_selector(_manifest_targets(_build_manifest()))
+    return {targets[selector]["target_id"]: targets[selector]["tags"] for selector in selectors}
 
 
 def _assert_selector(parsed: dict[str, Any], raw: str, path: str) -> None:
@@ -223,6 +308,27 @@ def _assert_autodeploy_target(
         assert "multi_gpu" not in tags
 
     assert target["component_hints"] == ["tests/integration/defs/accuracy"]
+
+
+def _assert_complete_runtime_metadata(target: dict[str, Any], gpu_count: int) -> None:
+    runtime = _runtime_metadata(target)
+
+    assert runtime["model_families"] == ["llama"]
+    assert runtime["backend"] == "autodeploy"
+    assert runtime["gpu_types"] == ["h100"]
+    assert runtime["gpu_count"] == gpu_count
+    assert set(runtime["requirements"]) >= {"cuda", "model_cache"}
+    assert runtime["missing"] == []
+    assert runtime["metadata_complete"] is True
+
+    assert {
+        "metadata:runtime_complete",
+        "model:llama",
+        "gpu:h100",
+        f"gpu_count:{gpu_count}",
+        "requires:cuda",
+        "requires:model_cache",
+    }.issubset(set(target["tags"]))
 
 
 def test_parse_plain_pytest_selector() -> None:
@@ -291,7 +397,7 @@ def test_build_manifest_from_minimal_autodeploy_fixtures() -> None:
     first_manifest = _build_manifest()
     second_manifest = _build_manifest()
 
-    assert first_manifest["schema_version"] == 1
+    assert first_manifest["schema_version"] == 2
     first_target_ids = [target["target_id"] for target in _manifest_targets(first_manifest)]
     assert first_target_ids == sorted(first_target_ids)
     assert set(EXPECTED_TARGET_IDS).issubset(first_target_ids)
@@ -347,8 +453,47 @@ def test_manifest_component_hints_include_all_multi_path_prefixes() -> None:
 def test_build_manifest_accepts_string_repo_root() -> None:
     manifest = build_manifest(str(FIXTURE_REPO_ROOT))
 
-    assert manifest["schema_version"] == 1
-    assert len(manifest["targets"]) == 4
+    assert manifest["schema_version"] == 2
+    assert len(manifest["targets"]) == 5
+
+
+@pytest.mark.parametrize(
+    ("selector", "gpu_count"),
+    [
+        (H100_SELECTOR, 1),
+        (DGX_H100_SELECTOR, 4),
+    ],
+)
+def test_manifest_autodeploy_llama_h100_targets_have_runtime_metadata(
+    selector: str,
+    gpu_count: int,
+) -> None:
+    manifest = _build_manifest()
+    target = _target_by_selector(_manifest_targets(manifest))[selector]
+
+    _assert_complete_runtime_metadata(target, gpu_count)
+
+
+def test_manifest_unknown_model_runtime_metadata_is_incomplete() -> None:
+    manifest = _build_manifest()
+    target = _target_by_selector(_manifest_targets(manifest))[UNKNOWN_MODEL_SELECTOR]
+    runtime = _runtime_metadata(target)
+
+    assert runtime["model_families"] == []
+    assert runtime["backend"] == "autodeploy"
+    assert runtime["gpu_types"] == ["h100"]
+    assert runtime["gpu_count"] == 1
+    assert set(runtime["requirements"]) >= {"cuda", "model_cache"}
+    assert runtime["metadata_complete"] is False
+    assert set(runtime["missing"]) == {"model_families"}
+    assert {
+        "metadata:runtime_incomplete",
+        "model:unknown",
+        "gpu:h100",
+        "gpu_count:1",
+        "requires:cuda",
+        "requires:model_cache",
+    }.issubset(set(target["tags"]))
 
 
 def test_generate_autodeploy_h100_bazel_cases_from_manifest() -> None:
@@ -364,6 +509,8 @@ def test_generate_autodeploy_h100_bazel_cases_from_manifest() -> None:
         "gpu:*h100*",
         "gpu:h100",
         "gpu_count:1",
+        "metadata:runtime_complete",
+        "model:llama",
         "requires:cuda",
         "requires:model_cache",
     }.issubset(set(h100_case.tags))
@@ -457,7 +604,7 @@ def test_cli_writes_manifest_json(tmp_path: Path) -> None:
     )
 
     manifest = json.loads(output.read_text())
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == 2
     target_ids = [target["target_id"] for target in manifest["targets"]]
     assert target_ids == sorted(target_ids)
     assert set(EXPECTED_TARGET_IDS).issubset(target_ids)
@@ -676,3 +823,148 @@ def test_select_impacted_platform_and_manual_filters_use_fake_query_client() -> 
             "//platforms:h100_4gpu",
         )
     ]
+
+
+def test_select_impacted_runtime_filters_select_all_h100_autodeploy_llama_tests() -> None:
+    llama_targets = _target_ids_for_selectors(
+        DGX_H100_SELECTOR,
+        H100_SELECTOR,
+        AUTO_TRIGGER_OTHERS_SELECTOR,
+    )
+    query_client = _FakeQueryClient(
+        query_results=list(llama_targets),
+        target_tags=_target_tags_for_selectors(
+            DGX_H100_SELECTOR,
+            H100_SELECTOR,
+            AUTO_TRIGGER_OTHERS_SELECTOR,
+        ),
+    )
+
+    result = select_impacted(
+        repo_root=REPO_ROOT,
+        base="upstream/main",
+        changed_files=[_changed_file("tensorrt_llm/_torch/auto_deploy/runtime.py")],
+        **_runtime_filter_kwargs(),
+        query_client=query_client,
+    )
+
+    assert not result.fallback_used
+    assert result.candidate_targets == llama_targets
+    assert result.selected_targets == llama_targets
+
+    tag_query_patterns = [pattern for pattern, _, _ in query_client.tag_queries]
+    for tag in ("model:llama", "backend:autodeploy", "requires:cuda", "requires:model_cache"):
+        assert any(tag in pattern for pattern in tag_query_patterns)
+
+
+def test_select_impacted_runtime_filter_incomplete_metadata_uses_fallback() -> None:
+    unknown_runtime_target = "//ci/bazel:unknown_runtime_metadata"
+    query_client = _FakeQueryClient(
+        query_results=[unknown_runtime_target],
+        fallback_query_results=["//ci/bazel:runtime_metadata_fallback"],
+        target_tags={
+            unknown_runtime_target: [
+                "backend:autodeploy",
+                "gpu:h100",
+                "gpu_count:1",
+                "metadata:runtime_incomplete",
+                "model:unknown",
+                "requires:cuda",
+                "requires:model_cache",
+            ],
+        },
+    )
+
+    result = select_impacted(
+        repo_root=REPO_ROOT,
+        base="upstream/main",
+        changed_files=[_changed_file("tensorrt_llm/_torch/auto_deploy/runtime.py")],
+        **_runtime_filter_kwargs(),
+        smoke_targets=["//ci/bazel:smoke_test"],
+        query_client=query_client,
+    )
+
+    assert result.selection_available
+    assert result.fallback_used
+    assert result.candidate_targets == ("//ci/bazel:runtime_metadata_fallback",)
+    assert result.selected_targets == (
+        "//ci/bazel:runtime_metadata_fallback",
+        "//ci/bazel:smoke_test",
+    )
+    assert not any(
+        "impacted Bazel query returned no targets" in reason for reason in result.fallback_reasons
+    )
+    assert any(
+        "runtime filter metadata incomplete" in reason and unknown_runtime_target in reason
+        for reason in result.fallback_reasons
+    )
+
+
+def test_select_impacted_runtime_model_filter_matches_exact_structured_tag() -> None:
+    llama_target = "//ci/bazel:llama"
+    extended_target = "//ci/bazel:llama_extended"
+    query_client = _FakeQueryClient(
+        query_results=[llama_target, extended_target],
+        target_tags={
+            llama_target: [
+                "backend:autodeploy",
+                "metadata:runtime_complete",
+                "model:llama",
+                "requires:cuda",
+            ],
+            extended_target: [
+                "backend:autodeploy",
+                "metadata:runtime_complete",
+                "model:llama_extended",
+                "requires:cuda",
+            ],
+        },
+    )
+
+    result = select_impacted(
+        repo_root=REPO_ROOT,
+        base="upstream/main",
+        changed_files=[_changed_file("tensorrt_llm/_torch/auto_deploy/runtime.py")],
+        backends=["autodeploy"],
+        model_families=["llama"],
+        runtime_requirements=["cuda"],
+        query_client=query_client,
+    )
+
+    assert result.candidate_targets == (llama_target,)
+    assert result.selected_targets == (llama_target,)
+
+
+def test_select_impacted_platform_filter_rejects_runtime_incompatible_targets() -> None:
+    targets = _target_by_selector(_manifest_targets(_build_manifest()))
+    one_gpu_target = targets[H100_SELECTOR]["target_id"]
+    four_gpu_target = targets[DGX_H100_SELECTOR]["target_id"]
+    candidate_targets = tuple(sorted([one_gpu_target, four_gpu_target]))
+    query_client = _FakeQueryClient(
+        query_results=list(candidate_targets),
+        target_tags=_target_tags_for_selectors(H100_SELECTOR, DGX_H100_SELECTOR),
+        cquery_results=[
+            f"{one_gpu_target} (h100_1gpu)",
+            f"{four_gpu_target} (h100_4gpu)",
+        ],
+        incompatible_query_results=[one_gpu_target],
+    )
+
+    result = select_impacted(
+        repo_root=REPO_ROOT,
+        base="upstream/main",
+        platform="//platforms:h100_4gpu",
+        changed_files=[_changed_file("tensorrt_llm/_torch/auto_deploy/runtime.py")],
+        **_runtime_filter_kwargs(),
+        query_client=query_client,
+    )
+
+    assert result.candidate_targets == candidate_targets
+    assert result.selected_targets == (four_gpu_target,)
+    assert query_client.cqueries == [
+        (
+            f"set({' '.join(candidate_targets)})",
+            "//platforms:h100_4gpu",
+        )
+    ]
+    assert any("target_compatible_with" in expression for expression in query_client.queries)

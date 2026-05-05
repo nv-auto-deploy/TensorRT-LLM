@@ -78,6 +78,12 @@ _CONSTRAINT_GROUPS = (
 )
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:/")
 _CQUERY_CONFIGURATION_SUFFIX_RE = re.compile(r"\s+\([^)]*\)$")
+_RUNTIME_METADATA_INCOMPLETE_TAGS = (
+    "metadata:runtime_incomplete",
+    "model:unknown",
+    "backend:unknown",
+    "requires:unknown",
+)
 
 
 class BazelQueryError(RuntimeError):
@@ -205,6 +211,15 @@ class SelectionResult:
         lines.append("Warnings:")
         lines.extend(_format_bullets(self.warnings))
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RuntimeFilterGroup:
+    """One structured runtime filter group backed by Bazel tags."""
+
+    name: str
+    tag_prefix: str
+    tags: tuple[str, ...]
 
 
 class BazelQueryClient:
@@ -426,6 +441,9 @@ def select_impacted(
     manual_policy: str = "include",
     include_tags: Iterable[str] = (),
     exclude_tags: Iterable[str] = (),
+    model_families: Iterable[str] = (),
+    backends: Iterable[str] = (),
+    runtime_requirements: Iterable[str] = (),
     query_client: QueryClient | None = None,
 ) -> SelectionResult:
     """Select impacted targets from normalized changed-file records."""
@@ -449,6 +467,11 @@ def select_impacted(
     test_universes_tuple = tuple(test_universes) or DEFAULT_TEST_UNIVERSES
     include_tags_tuple = tuple(_dedupe_sorted(include_tags))
     exclude_tags_tuple = tuple(_dedupe_sorted(exclude_tags))
+    runtime_filter_groups = _runtime_filter_groups(
+        model_families=model_families,
+        backends=backends,
+        runtime_requirements=runtime_requirements,
+    )
     smoke_targets_tuple = tuple(_dedupe_sorted(smoke_targets))
 
     if manual_policy not in ("include", "exclude", "only"):
@@ -491,6 +514,25 @@ def select_impacted(
             fallback_reasons=fallback_reasons,
         )
         selected_base_targets = candidate_targets
+
+    if runtime_filter_groups and candidate_targets and selection_available:
+        (
+            selected_base_targets,
+            warnings,
+            fallback_reasons,
+            selection_available,
+        ) = _apply_runtime_filters_or_fallback(
+            query_client=query_client,
+            candidate_targets=candidate_targets,
+            test_universes=test_universes_tuple,
+            manual_policy=manual_policy,
+            include_tags=include_tags_tuple,
+            exclude_tags=exclude_tags_tuple,
+            runtime_filter_groups=runtime_filter_groups,
+            warnings=warnings,
+            fallback_reasons=fallback_reasons,
+        )
+        candidate_targets = selected_base_targets
 
     if platform and candidate_targets and selection_available:
         (
@@ -595,6 +637,33 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Exclude targets matching this Bazel tag regex. May be repeated.",
     )
+    parser.add_argument(
+        "--model-family",
+        action="append",
+        default=[],
+        help=(
+            "Only include targets tagged model:<value>. May be repeated; missing model "
+            "metadata triggers conservative fallback."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        action="append",
+        default=[],
+        help=(
+            "Only include targets tagged backend:<value>. May be repeated; missing backend "
+            "metadata triggers conservative fallback."
+        ),
+    )
+    parser.add_argument(
+        "--runtime-requirement",
+        action="append",
+        default=[],
+        help=(
+            "Only include targets tagged requires:<value>. May be repeated; missing runtime "
+            "requirement metadata triggers conservative fallback."
+        ),
+    )
     parser.add_argument("--json-output", type=Path, help="Write stable JSON result to this path.")
     parser.add_argument(
         "--targets-output",
@@ -636,6 +705,9 @@ def main(argv: list[str] | None = None) -> int:
         manual_policy=args.manual_policy,
         include_tags=args.include_tag,
         exclude_tags=args.exclude_tag,
+        model_families=args.model_family,
+        backends=args.backend,
+        runtime_requirements=args.runtime_requirement,
     )
 
     if args.targets_output:
@@ -784,6 +856,172 @@ def _owner_labels_and_fallback_reasons(
             fallback_reasons.append(f"unmodeled changed path: {path}")
 
     return owner_labels
+
+
+def _runtime_filter_groups(
+    *,
+    model_families: Iterable[str],
+    backends: Iterable[str],
+    runtime_requirements: Iterable[str],
+) -> tuple[RuntimeFilterGroup, ...]:
+    groups = [
+        RuntimeFilterGroup(
+            name="model family",
+            tag_prefix="model",
+            tags=_runtime_filter_tags("model", model_families),
+        ),
+        RuntimeFilterGroup(
+            name="backend",
+            tag_prefix="backend",
+            tags=_runtime_filter_tags("backend", backends),
+        ),
+        RuntimeFilterGroup(
+            name="runtime requirement",
+            tag_prefix="requires",
+            tags=_runtime_filter_tags("requires", runtime_requirements),
+        ),
+    ]
+    return tuple(group for group in groups if group.tags)
+
+
+def _runtime_filter_tags(prefix: str, values: Iterable[str]) -> tuple[str, ...]:
+    return tuple(_dedupe_sorted(_runtime_filter_tag(prefix, value) for value in values))
+
+
+def _runtime_filter_tag(prefix: str, value: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        return ""
+    if cleaned.startswith(f"{prefix}:"):
+        return cleaned
+    return f"{prefix}:{cleaned}"
+
+
+def _apply_runtime_filters_or_fallback(
+    *,
+    query_client: QueryClient,
+    candidate_targets: tuple[str, ...],
+    test_universes: tuple[str, ...],
+    manual_policy: str,
+    include_tags: tuple[str, ...],
+    exclude_tags: tuple[str, ...],
+    runtime_filter_groups: tuple[RuntimeFilterGroup, ...],
+    warnings: list[str],
+    fallback_reasons: list[str],
+) -> tuple[tuple[str, ...], list[str], list[str], bool]:
+    try:
+        fallback_reason = _runtime_metadata_fallback_reason(
+            query_client=query_client,
+            candidate_targets=candidate_targets,
+            runtime_filter_groups=runtime_filter_groups,
+        )
+        if fallback_reason is not None:
+            fallback_reasons.append(fallback_reason)
+            fallback_targets, warnings, selection_available = _query_broad_fallback_targets(
+                query_client=query_client,
+                test_universes=test_universes,
+                manual_policy=manual_policy,
+                include_tags=include_tags,
+                exclude_tags=exclude_tags,
+                warnings=warnings,
+            )
+            return fallback_targets, warnings, fallback_reasons, selection_available
+
+        filtered_targets = candidate_targets
+        for group in runtime_filter_groups:
+            matching_targets = _targets_matching_any_tag(
+                query_client=query_client,
+                candidate_targets=filtered_targets,
+                tags=group.tags,
+            )
+            matching_target_set = set(matching_targets)
+            filtered_targets = tuple(
+                target for target in filtered_targets if target in matching_target_set
+            )
+            if not filtered_targets:
+                break
+        return filtered_targets, warnings, fallback_reasons, True
+    except BazelQueryError as error:
+        reason = f"runtime metadata Bazel query failed; using broad fallback: {error}"
+        fallback_reasons.append(reason)
+        warnings.append(reason)
+        fallback_targets, warnings, selection_available = _query_broad_fallback_targets(
+            query_client=query_client,
+            test_universes=test_universes,
+            manual_policy=manual_policy,
+            include_tags=include_tags,
+            exclude_tags=exclude_tags,
+            warnings=warnings,
+        )
+        return fallback_targets, warnings, fallback_reasons, selection_available
+
+
+def _runtime_metadata_fallback_reason(
+    *,
+    query_client: QueryClient,
+    candidate_targets: tuple[str, ...],
+    runtime_filter_groups: tuple[RuntimeFilterGroup, ...],
+) -> str | None:
+    incomplete_targets = _targets_matching_any_tag(
+        query_client=query_client,
+        candidate_targets=candidate_targets,
+        tags=_RUNTIME_METADATA_INCOMPLETE_TAGS,
+    )
+    if incomplete_targets:
+        return (
+            "runtime filter metadata incomplete for candidate targets tagged "
+            f"{', '.join(_RUNTIME_METADATA_INCOMPLETE_TAGS)}: "
+            f"{_summarize_labels(incomplete_targets)}; using broad fallback"
+        )
+
+    for group in runtime_filter_groups:
+        tagged_targets = _targets_matching_tag_pattern(
+            query_client=query_client,
+            candidate_targets=candidate_targets,
+            tag_pattern=re.escape(f"{group.tag_prefix}:"),
+        )
+        tagged_target_set = set(tagged_targets)
+        missing_targets = tuple(
+            target for target in candidate_targets if target not in tagged_target_set
+        )
+        if missing_targets:
+            return (
+                f"runtime filter requires {group.name} metadata, but candidate targets "
+                f"lack {group.tag_prefix}:* tags: {_summarize_labels(missing_targets)}; "
+                "using broad fallback"
+            )
+
+    return None
+
+
+def _targets_matching_any_tag(
+    *,
+    query_client: QueryClient,
+    candidate_targets: tuple[str, ...],
+    tags: Iterable[str],
+) -> tuple[str, ...]:
+    matching_targets: set[str] = set()
+    for tag in _dedupe_sorted(tags):
+        expression = _exact_tag_attr_expression(
+            _set_expression(candidate_targets, always_set=True),
+            tag,
+        )
+        matching_targets.update(_normalize_bazel_labels(query_client.query(expression)))
+    return tuple(target for target in candidate_targets if target in matching_targets)
+
+
+def _targets_matching_tag_pattern(
+    *,
+    query_client: QueryClient,
+    candidate_targets: tuple[str, ...],
+    tag_pattern: str,
+) -> tuple[str, ...]:
+    expression = _tag_pattern_attr_expression(
+        _set_expression(candidate_targets, always_set=True),
+        tag_pattern,
+    )
+    matching_targets = set(_normalize_bazel_labels(query_client.query(expression)))
+    return tuple(target for target in candidate_targets if target in matching_targets)
 
 
 def _query_impacted_or_fallback_targets(
@@ -1013,7 +1251,19 @@ def _apply_query_filters(
 
 
 def _tag_attr_expression(expression: str, tag: str) -> str:
-    return f'attr("tags", {json.dumps(re.escape(tag))}, {expression})'
+    return _tag_pattern_attr_expression(expression, re.escape(tag))
+
+
+def _exact_tag_attr_expression(expression: str, tag: str) -> str:
+    return _tag_pattern_attr_expression(expression, _exact_tag_list_entry_pattern(tag))
+
+
+def _exact_tag_list_entry_pattern(tag: str) -> str:
+    return rf"(?:^|\[|,\s*){re.escape(tag)}(?:\]|,|$)"
+
+
+def _tag_pattern_attr_expression(expression: str, tag_pattern: str) -> str:
+    return f'attr("tags", {json.dumps(tag_pattern)}, {expression})'
 
 
 def _except_tag_expression(expression: str, tag: str) -> str:
@@ -1049,6 +1299,14 @@ def _format_bullets(values: Iterable[str]) -> list[str]:
     if not sorted_values:
         return ["  (none)"]
     return [f"  - {value}" for value in sorted_values]
+
+
+def _summarize_labels(labels: Iterable[str], limit: int = 5) -> str:
+    sorted_labels = _dedupe_sorted(labels)
+    if len(sorted_labels) <= limit:
+        return ", ".join(sorted_labels)
+    shown_labels = ", ".join(sorted_labels[:limit])
+    return f"{shown_labels}, ... ({len(sorted_labels)} total)"
 
 
 def _dedupe_sorted(values: Iterable[str]) -> tuple[str, ...]:

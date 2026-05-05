@@ -16,7 +16,7 @@ if __package__ in (None, ""):
 
 from scripts.ci_target_graph.generate import build_manifest
 
-DEFAULT_SCHEMA_PATH = Path(__file__).with_name("manifest_schema_v1.json")
+DEFAULT_SCHEMA_PATH = Path(__file__).with_name("manifest_schema_v2.json")
 
 
 def schema_errors(
@@ -77,6 +77,45 @@ def summarize_missing_jenkins_stage_targets(
     ]
 
 
+def targets_with_incomplete_runtime_metadata(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return manifest targets whose runtime metadata is explicitly incomplete."""
+    targets = manifest.get("targets", [])
+    if not isinstance(targets, list):
+        return []
+
+    incomplete_targets: list[dict[str, Any]] = []
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        runtime = target.get("runtime")
+        if not isinstance(runtime, dict) or runtime.get("metadata_complete") is not True:
+            incomplete_targets.append(target)
+    return incomplete_targets
+
+
+def summarize_incomplete_runtime_metadata_targets(
+    targets: list[dict[str, Any]],
+) -> list[tuple[int, str, str, str]]:
+    """Summarize incomplete runtime metadata by YAML, backend, and missing fields."""
+    counts: Counter[tuple[str, str, str]] = Counter()
+    for target in targets:
+        source = target.get("source", {})
+        runtime = target.get("runtime", {})
+        yaml_path = str(source.get("yaml") or "<unknown>")
+        backend = str(runtime.get("backend") or "<unset>")
+        missing = runtime.get("missing") if isinstance(runtime, dict) else None
+        if isinstance(missing, list) and missing:
+            missing_key = ",".join(str(item) for item in missing)
+        else:
+            missing_key = "<runtime object missing>"
+        counts[(yaml_path, backend, missing_key)] += 1
+
+    return [
+        (count, yaml_path, backend, missing_key)
+        for (yaml_path, backend, missing_key), count in sorted(counts.items())
+    ]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Regenerate and validate the shadow CI target graph manifest."
@@ -103,6 +142,11 @@ def main() -> int:
         action="store_true",
         help="Return a non-zero exit code when targets have no Jenkins stage candidate.",
     )
+    parser.add_argument(
+        "--fail-on-incomplete-runtime-metadata",
+        action="store_true",
+        help="Return a non-zero exit code when targets have incomplete runtime metadata.",
+    )
     args = parser.parse_args()
 
     manifest = build_manifest(args.repo_root)
@@ -119,11 +163,13 @@ def main() -> int:
         return 1
 
     missing_stage_targets = targets_without_jenkins_stage(manifest)
+    incomplete_runtime_targets = targets_with_incomplete_runtime_metadata(manifest)
     print(
         f"validated {len(manifest.get('targets', []))} manifest targets against {args.schema}",
         file=sys.stderr,
     )
     _report_missing_jenkins_stage_targets(missing_stage_targets)
+    _report_incomplete_runtime_metadata_targets(incomplete_runtime_targets)
 
     if args.output:
         output = json.dumps(manifest, indent=2, sort_keys=True)
@@ -132,6 +178,8 @@ def main() -> int:
 
     if args.fail_on_missing_jenkins_stage and missing_stage_targets:
         return 3
+    if args.fail_on_incomplete_runtime_metadata and incomplete_runtime_targets:
+        return 4
     return 0
 
 
@@ -159,6 +207,26 @@ def _report_missing_jenkins_stage_targets(targets: list[dict[str, Any]]) -> None
     for count, yaml_path, stage, backend in summarize_missing_jenkins_stage_targets(targets):
         print(
             f"  - {count}: {yaml_path} stage={stage} backend={backend}",
+            file=sys.stderr,
+        )
+
+
+def _report_incomplete_runtime_metadata_targets(targets: list[dict[str, Any]]) -> None:
+    if not targets:
+        print("all manifest targets have complete runtime metadata", file=sys.stderr)
+        return
+
+    print(
+        "warning: "
+        f"{len(targets)} manifest targets have incomplete runtime metadata; "
+        "use metadata:runtime_incomplete tags as conservative query inputs.",
+        file=sys.stderr,
+    )
+    for count, yaml_path, backend, missing_key in summarize_incomplete_runtime_metadata_targets(
+        targets
+    ):
+        print(
+            f"  - {count}: {yaml_path} backend={backend} missing={missing_key}",
             file=sys.stderr,
         )
 

@@ -29,8 +29,8 @@ If `--output` is omitted, the JSON manifest is written to stdout:
 python3 -m scripts.ci_target_graph.generate --repo-root .
 ```
 
-The manifest uses `schema_version: 1`; its practical JSON Schema lives in
-`manifest_schema_v1.json`.
+The manifest uses `schema_version: 2`; its practical JSON Schema lives in
+`manifest_schema_v2.json`.
 
 ## Validate
 
@@ -51,6 +51,9 @@ mapping is modeled more completely.
 
 Use `--fail-on-missing-jenkins-stage` when a CI job wants to make those fallback
 entries blocking.
+
+Use `--fail-on-incomplete-runtime-metadata` when a CI job wants unknown or
+ambiguous runtime metadata to become blocking instead of warning-only.
 
 ## Select Impacted Bazel Targets
 
@@ -99,6 +102,27 @@ manual GPU pytest selectors are not silently dropped; use
 `--manual-policy exclude` or `--manual-policy only` when a caller needs a
 different policy.
 
+Structured runtime filters narrow selected Bazel targets using manifest runtime
+metadata instead of raw tag regexes:
+
+```bash
+python3 scripts/ci_target_graph/select_impacted.py \
+  --base upstream/main \
+  --platform //platforms:h100_1gpu \
+  --model-family llama \
+  --backend autodeploy
+
+python3 scripts/ci_target_graph/select_impacted.py \
+  --base upstream/main \
+  --runtime-requirement triton
+```
+
+These flags map to `model:<value>`, `backend:<value>`, and
+`requires:<value>` tags. They first check candidate targets for incomplete or
+missing runtime metadata and use conservative broad fallback if the metadata is
+not complete. Use raw `--include-tag`, such as `--include-tag 'model:llama'`,
+as the escape hatch when direct tag regex filtering is wanted.
+
 ## Inputs
 
 The generator reads:
@@ -110,7 +134,8 @@ The generator reads:
 Each emitted target has `kind: "pytest_selector"` and records the raw selector,
 parsed pytest path, all parsed pytest paths, remaining pytest arguments,
 timeout minutes, isolation marker, test-db context, matching Jenkins stage
-candidates, test-db constraints, tags, and conservative component hints.
+candidates, test-db constraints, runtime metadata, tags, and conservative
+component hints.
 
 `source.jenkins_stages` is intentionally scoped as `pre_shard_candidates`.
 It records Jenkins stage configs that match the YAML entry before pytest shard
@@ -132,3 +157,42 @@ The Bazel spike consumes this manifest for a narrow generated AutoDeploy H100
 subpackage, but most Python, C++, CUDA, model/data inputs, and generated
 artifacts are still intentionally unmodeled. Unknown or unmodeled areas should
 fall back conservatively rather than being skipped.
+
+## Runtime Metadata
+
+Schema v2 adds an explicit per-target `runtime` object:
+
+```json
+{
+  "model_families": ["llama"],
+  "backend": "autodeploy",
+  "gpu_types": ["h100"],
+  "gpu_count": 1,
+  "requirements": ["cuda", "model_cache"],
+  "metadata_complete": true,
+  "missing": []
+}
+```
+
+Runtime tags are query-visible and derived from that object:
+
+- `model:<family>` or `model:unknown`
+- `backend:<name>`
+- `gpu:<type>` and `gpu_count:<n>`
+- `requires:<requirement>`
+- `metadata:runtime_complete` or `metadata:runtime_incomplete`
+
+Model-family inference is conservative. Clear selector evidence covers Llama,
+Nemotron, GLM, Gemma, Qwen, Mistral, and DeepSeek. Unknown selectors keep
+`model:unknown`; selectors with multiple family signals keep the discovered
+families but are marked `metadata:runtime_incomplete`.
+
+Examples:
+
+```bash
+jq '.targets[] | select(.runtime.metadata_complete) | .target_id' \
+  /tmp/trtllm-ci-target-graph.json
+
+jq '.targets[] | select(.tags[]? == "requires:triton") | .target_id' \
+  /tmp/trtllm-ci-target-graph.json
+```
