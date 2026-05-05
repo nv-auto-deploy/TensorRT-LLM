@@ -5,3 +5,14 @@ exports_files(
     ["requirements_bazel_lock.txt"],
     visibility = ["//visibility:public"],
 )
+
+# Metadata-only placeholder for query-time artifact modeling.
+filegroup(
+    name = "tensorrt_llm_wheel",
+    srcs = [
+        "pyproject.toml",
+        "setup.py",
+        "//cpp:wheel_native_artifacts",
+    ],
+    visibility = ["//visibility:public"],
+)

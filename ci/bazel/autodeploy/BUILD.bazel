@@ -15,6 +15,14 @@ _AUTODEPLOY_H100_TAGS = [
 _H100_COMPATIBILITY = ["//platforms/gpu:h100"]
 _ONE_GPU_COMPATIBILITY = ["//platforms/gpu_count:one"]
 _FOUR_GPU_COMPATIBILITY = ["//platforms/gpu_count:four"]
+_AUTODEPLOY_H100_ACCURACY_DEPS = [
+    "//:tensorrt_llm_wheel",
+    "//cpp:cuda_kernels",
+    "//cpp:nvinfer_plugin_tensorrt_llm",
+    "//cpp:tensorrt_llm_bindings",
+    "//tensorrt_llm/_torch/auto_deploy:runtime",
+    "//tests/integration/defs/accuracy:accuracy_tests",
+]
 
 # Hand-written seed examples are kept as a small macro and compatibility smoke set.
 # Manifest-derived coverage lives under //ci/bazel/autodeploy/generated.
@@ -24,6 +32,7 @@ trtllm_pytest_case(
     selector = "accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-1]",
     tags = _AUTODEPLOY_H100_TAGS + ["gpu_count:1"],
     target_compatible_with = _H100_COMPATIBILITY + _ONE_GPU_COMPATIBILITY,
+    deps = _AUTODEPLOY_H100_ACCURACY_DEPS,
 )
 
 trtllm_pytest_case(
@@ -31,6 +40,7 @@ trtllm_pytest_case(
     selector = "accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-4]",
     tags = _AUTODEPLOY_H100_TAGS + ["gpu_count:4"],
     target_compatible_with = _H100_COMPATIBILITY + _FOUR_GPU_COMPATIBILITY,
+    deps = _AUTODEPLOY_H100_ACCURACY_DEPS,
 )
 
 trtllm_pytest_case(
@@ -38,6 +48,7 @@ trtllm_pytest_case(
     selector = "accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_attention_dp[4]",
     tags = _AUTODEPLOY_H100_TAGS + ["gpu_count:4"],
     target_compatible_with = _H100_COMPATIBILITY + _FOUR_GPU_COMPATIBILITY,
+    deps = _AUTODEPLOY_H100_ACCURACY_DEPS,
 )
 
 test_suite(

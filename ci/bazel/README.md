@@ -113,6 +113,23 @@ timeout metadata, and hardware compatibility constraints. Runtime details such
 as model family, backend, CUDA/model-cache needs, and Triton runtime evidence
 remain query-visible tags instead of Bazel platform constraints.
 
+## Native Artifact Metadata Targets
+
+Phase 6 adds placeholder labels for package and native artifacts that generated
+AutoDeploy targets can depend on:
+
+- `//:tensorrt_llm_wheel`
+- `//cpp:tensorrt_llm_bindings`
+- `//cpp:cuda_kernels`
+- `//cpp:nvinfer_plugin_tensorrt_llm`
+- `//triton_backend:triton_tensorrt_llm_backend`
+
+These labels are metadata/query targets for CI impact selection. They let Bazel
+queries connect pytest selectors to owned native or packaging areas, but they do
+not build the TensorRT-LLM wheel, C++ bindings, CUDA kernels, TensorRT-LLM
+plugin library, or Triton backend. Native builds still use the existing
+TensorRT-LLM build flow outside this spike.
+
 ## Select Impacted Targets
 
 Run the Phase 4 changed-file impact selector from the repository root:
@@ -126,8 +143,9 @@ python3 scripts/ci_target_graph/select_impacted.py \
 The selector maps changed files in currently modeled source areas to Bazel owner
 labels, queries reverse-dependent pytest targets under `//ci/bazel/...`, applies
 optional manual/tag filtering, then cquery-filters the candidates for the
-requested platform. Unknown inputs and CI/build/dependency policy changes use a
-conservative broad fallback rather than skipping tests.
+requested platform. Unknown inputs, unmodeled native/build areas, and
+CI/build/dependency policy changes use a conservative broad fallback rather than
+skipping tests.
 
 For CI sidecars, write both machine-readable outputs:
 
@@ -186,6 +204,14 @@ List selectors with clear Triton runtime evidence:
 
 ```bash
 bazel query 'attr("tags", "requires:triton", //ci/bazel/...)'
+```
+
+List generated selectors depending on native artifact metadata:
+
+```bash
+bazel query 'rdeps(//ci/bazel/..., //cpp:tensorrt_llm_bindings)'
+bazel query 'rdeps(//ci/bazel/..., //cpp:cuda_kernels)'
+bazel query 'rdeps(//ci/bazel/..., //triton_backend:triton_tensorrt_llm_backend)'
 ```
 
 Inspect compatibility under an H100 one-GPU target platform:
@@ -284,6 +310,8 @@ a deliberate reason for wildcard Bazel test patterns to include them.
 
 - This is a CI/impact-selection spike, not a production Bazel build for TensorRT-LLM.
 - Bazel does not build TensorRT-LLM C++, CUDA, wheels, or Python packages in this spike.
+- Phase 6 native/package labels are metadata placeholders for query edges, not build rules for those
+  artifacts.
 - Bazel does not provision GPUs, model weights, CUDA libraries, or the Python runtime environment needed by
   real integration tests.
 - The manifest generator is shadow-mode metadata. Jenkins remains the CI executor.

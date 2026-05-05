@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+package(default_visibility = ["//visibility:public"])
+
+# Metadata-only placeholders for query-time artifact modeling.
+filegroup(
+    name = "libtensorrt_llm",
+    srcs = [
+        "CMakeLists.txt",
+        "tensorrt_llm/CMakeLists.txt",
+    ],
+)
+
+filegroup(
+    name = "nvinfer_plugin_tensorrt_llm",
+    srcs = [
+        "tensorrt_llm/plugins/CMakeLists.txt",
+    ],
+)
+
+filegroup(
+    name = "tensorrt_llm_bindings",
+    srcs = [
+        "tensorrt_llm/nanobind/CMakeLists.txt",
+    ],
+)
+
+filegroup(
+    name = "cuda_kernels",
+    srcs = [
+        "kernels/fmha_v2/setup.py",
+        "kernels/xqa/CMakeLists.txt",
+        "tensorrt_llm/kernels/CMakeLists.txt",
+    ],
+)
+
+filegroup(
+    name = "wheel_native_artifacts",
+    srcs = [
+        ":cuda_kernels",
+        ":libtensorrt_llm",
+        ":nvinfer_plugin_tensorrt_llm",
+        ":tensorrt_llm_bindings",
+    ],
+)

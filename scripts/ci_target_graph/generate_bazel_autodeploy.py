@@ -23,6 +23,13 @@ _AUTODEPLOY_H100_YAMLS = {
 }
 _RUNTIME_DEP = "//tensorrt_llm/_torch/auto_deploy:runtime"
 _ACCURACY_DEP = "//tests/integration/defs/accuracy:accuracy_tests"
+_PHASE6_METADATA_DEPS = [
+    "//:tensorrt_llm_wheel",
+    "//cpp:cuda_kernels",
+    "//cpp:nvinfer_plugin_tensorrt_llm",
+    "//cpp:tensorrt_llm_bindings",
+]
+_TRITON_DEP = "//triton_backend:triton_tensorrt_llm_backend"
 _GPU_CONSTRAINT_VALUES = {
     "b200": "//platforms/gpu:b200",
     "h100": "//platforms/gpu:h100",
@@ -161,18 +168,21 @@ def _case_from_manifest_target(target: dict[str, Any]) -> BazelPytestCase:
 
     runtime = target["runtime"]
     pytest_args = selector_paths[1:] + list(selector.get("pytest_args") or [])
-    deps = [_RUNTIME_DEP]
+    tags = _tags_for_target(target)
+    deps = _PHASE6_METADATA_DEPS + [_RUNTIME_DEP]
     if _has_accuracy_path(selector_paths):
         deps.append(_ACCURACY_DEP)
+    if "requires:triton" in tags:
+        deps.append(_TRITON_DEP)
 
     return BazelPytestCase(
         name=str(target["target_id"]).split(":", 1)[1],
         selector=selector_paths[0],
         pytest_args=pytest_args,
-        tags=_tags_for_target(target),
+        tags=tags,
         target_compatible_with=_target_compatible_with(runtime),
         timeout=_bazel_timeout(selector.get("timeout_minutes")),
-        deps=deps,
+        deps=_sorted_unique(deps),
     )
 
 
@@ -322,6 +332,10 @@ def _dedupe_preserving_order(values: list[str]) -> list[str]:
         seen.add(value)
         deduped.append(value)
     return deduped
+
+
+def _sorted_unique(values: list[str]) -> list[str]:
+    return sorted(set(values))
 
 
 if __name__ == "__main__":

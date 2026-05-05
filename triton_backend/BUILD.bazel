@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+package(default_visibility = ["//visibility:public"])
+
+# Metadata-only placeholders for query-time artifact modeling.
+filegroup(
+    name = "triton_tensorrt_llm_backend",
+    srcs = [
+        "inflight_batcher_llm/CMakeLists.txt",
+        "inflight_batcher_llm/scripts/build.sh",
+    ],
+)
+
+filegroup(
+    name = "triton_backend_artifacts",
+    srcs = [
+        ":triton_tensorrt_llm_backend",
+    ],
+)

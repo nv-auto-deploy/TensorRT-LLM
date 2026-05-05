@@ -21,6 +21,10 @@ GIT_DIFF_FILTER = "ACMRTUXBD"
 _AUTODEPLOY_RUNTIME_LABEL = "//tensorrt_llm/_torch/auto_deploy:runtime"
 _ACCURACY_TESTS_LABEL = "//tests/integration/defs/accuracy:accuracy_tests"
 _CI_TARGET_GRAPH_LABEL = "//scripts/ci_target_graph:ci_target_graph_lib"
+_CPP_TENSORRT_LLM_BINDINGS_LABEL = "//cpp:tensorrt_llm_bindings"
+_CPP_NVINFER_PLUGIN_TENSORRT_LLM_LABEL = "//cpp:nvinfer_plugin_tensorrt_llm"
+_CPP_CUDA_KERNELS_LABEL = "//cpp:cuda_kernels"
+_TRITON_TENSORRT_LLM_BACKEND_LABEL = "//triton_backend:triton_tensorrt_llm_backend"
 
 _BROAD_FALLBACK_EXACT_PATHS = {
     ".bazelrc",
@@ -47,6 +51,12 @@ _BROAD_FALLBACK_BASENAMES = {
     "WORKSPACE",
     "WORKSPACE.bazel",
 }
+_OWNER_PREFIX_LABELS = (
+    ("cpp/tensorrt_llm/nanobind/", _CPP_TENSORRT_LLM_BINDINGS_LABEL),
+    ("cpp/tensorrt_llm/plugins/", _CPP_NVINFER_PLUGIN_TENSORRT_LLM_LABEL),
+    ("cpp/tensorrt_llm/kernels/", _CPP_CUDA_KERNELS_LABEL),
+    ("triton_backend/inflight_batcher_llm/", _TRITON_TENSORRT_LLM_BACKEND_LABEL),
+)
 _PLATFORM_CONSTRAINTS = {
     "//platforms:b200_1gpu": (
         "//platforms/gpu:b200",
@@ -394,6 +404,10 @@ def collect_changed_files(
 def owner_labels_for_path(path: str) -> tuple[str, ...]:
     """Return modeled owner labels for a normalized repo-relative path."""
     labels: list[str] = []
+    for prefix, label in _OWNER_PREFIX_LABELS:
+        if path.startswith(prefix):
+            labels.append(label)
+
     if path.startswith("tensorrt_llm/_torch/auto_deploy/") and path.endswith(".py"):
         labels.append(_AUTODEPLOY_RUNTIME_LABEL)
 

@@ -89,11 +89,20 @@ Modeled source ownership is intentionally narrow:
   `//tests/integration/defs/accuracy:accuracy_tests`.
 - `scripts/ci_target_graph/*.py` maps to
   `//scripts/ci_target_graph:ci_target_graph_lib`.
+- `cpp/tensorrt_llm/nanobind/**` maps to
+  `//cpp:tensorrt_llm_bindings`.
+- `cpp/tensorrt_llm/kernels/**` maps to
+  `//cpp:cuda_kernels`.
+- `cpp/tensorrt_llm/plugins/**` maps to
+  `//cpp:nvinfer_plugin_tensorrt_llm`.
+- `triton_backend/inflight_batcher_llm/**` maps to
+  `//triton_backend:triton_tensorrt_llm_backend`.
 
-Unknown paths, invalid paths, Bazel query failures, and build or CI policy
-changes use a conservative broad fallback over `//ci/bazel/...`. Broad fallback
-is also used for Bazel metadata, dependency lock files, Jenkins policy, GitHub
-policy, platform definitions, and test-db or waive-list changes.
+Unknown paths, invalid paths, Bazel query failures, unmodeled native/build
+areas, and build or CI policy changes use a conservative broad fallback over
+`//ci/bazel/...`. Broad fallback is also used for Bazel metadata, dependency
+lock files, Jenkins policy, GitHub policy, platform definitions, and test-db or
+waive-list changes.
 
 The JSON output has `schema_version: 1` and records the diff refs, changed-file
 evidence, fallback reasons, owner labels, candidate targets, selected targets,
@@ -154,7 +163,11 @@ It detects the local `TIMEOUT (N)` convention as minutes, detects `ISOLATION`,
 and leaves unusual selectors in the manifest instead of failing generation.
 
 The Bazel spike consumes this manifest for a narrow generated AutoDeploy H100
-subpackage, but most Python, C++, CUDA, model/data inputs, and generated
+subpackage. Phase 6 native/package labels such as `//cpp:tensorrt_llm_bindings`,
+`//cpp:cuda_kernels`, and `//triton_backend:triton_tensorrt_llm_backend` are
+metadata/query placeholders for reverse-dependency selection; they do not build
+the C++ bindings, CUDA kernels, plugin library, Triton backend, wheel, or any
+other native artifact. Most Python, C++, CUDA, model/data inputs, and generated
 artifacts are still intentionally unmodeled. Unknown or unmodeled areas should
 fall back conservatively rather than being skipped.
 
@@ -195,4 +208,13 @@ jq '.targets[] | select(.runtime.metadata_complete) | .target_id' \
 
 jq '.targets[] | select(.tags[]? == "requires:triton") | .target_id' \
   /tmp/trtllm-ci-target-graph.json
+```
+
+Bazel reverse-dependency queries can inspect generated selectors that depend on
+the Phase 6 metadata placeholders:
+
+```bash
+bazel query 'rdeps(//ci/bazel/..., //cpp:tensorrt_llm_bindings)'
+bazel query 'rdeps(//ci/bazel/..., //cpp:cuda_kernels)'
+bazel query 'rdeps(//ci/bazel/..., //triton_backend:triton_tensorrt_llm_backend)'
 ```
