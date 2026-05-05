@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Tuple
 
 import torch
@@ -137,6 +138,69 @@ def _get_topk_from_router(node: Node) -> int:
     return int(node.args[3]) if len(node.args) >= 4 else 2
 
 
+def _get_packed_mxfp4_expert_layout(qcfg: dict):
+    checkpoint_layout = qcfg.get("checkpoint_layout")
+    if checkpoint_layout is None:
+        return None
+    return getattr(checkpoint_layout, "packed_mxfp4_experts", None)
+
+
+def _layout_layer_from_names(checkpoint_layout: object, source_names: dict[str, str]):
+    for source_name in source_names.values():
+        layer = checkpoint_layout.layer_from_runtime_name(source_name)
+        if layer is not None:
+            return layer
+    return None
+
+
+def _load_mxfp4_expert_layout_hook(
+    state_dict,
+    prefix,
+    *args,
+    checkpoint_layout: object,
+    target_names: dict[str, str],
+    layer: int,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> None:
+    prefix = prefix or ""
+    checkpoint_layout.load_runtime_buffers(
+        state_dict,
+        prefix,
+        layer=layer,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        target_gate_up_blocks=target_names["gate_up_blocks"],
+        target_gate_up_scales=target_names["gate_up_scales"],
+        target_down_blocks=target_names["down_blocks"],
+        target_down_scales=target_names["down_scales"],
+        num_experts=num_experts,
+    )
+
+
+def _get_mxfp4_expert_dims(
+    gm: GraphModule,
+    gate_up_w_name: str,
+    gate_up_b_name: str,
+    down_b_name: str,
+) -> Tuple[int, int, int]:
+    gu_b = gm.get_parameter(gate_up_b_name)  # [E, 2I]
+    gu_w = gm.get_parameter(gate_up_w_name)  # [E, H, 2I] or [E, 2I, H]
+    dn_b = gm.get_parameter(down_b_name)  # [E, H]
+
+    E = int(gu_b.shape[0])
+    I2 = int(gu_b.shape[1])
+    In = I2 // 2
+
+    assert gu_w.dim() == 3, "gate_up_w must be rank-3"
+    if gu_w.shape[1] == I2:
+        H = int(gu_w.shape[2])
+    else:
+        H = int(dn_b.shape[1])
+    return E, H, In
+
+
 def _register_mxfp4_expert_params(
     gm: GraphModule,
     gate_up_w_name: str,
@@ -149,22 +213,7 @@ def _register_mxfp4_expert_params(
     Returns:
       (gu_blocks_name, gu_scales_name, dn_blocks_name, dn_scales_name)
     """
-    # Shapes from existing params
-    gu_b = gm.get_parameter(gate_up_b_name)  # [E, 2I]
-    gu_w = gm.get_parameter(gate_up_w_name)  # [E, 2I, H]
-    dn_b = gm.get_parameter(down_b_name)  # [E, H]
-
-    E = int(gu_b.shape[0])
-    I2 = int(gu_b.shape[1])  # 2I
-    In = I2 // 2
-
-    # infer H from gu_w shape
-    assert gu_w.dim() == 3, "gate_up_w must be rank-3"
-    if gu_w.shape[1] == I2:
-        H = int(gu_w.shape[2])
-    else:
-        # Fallback: use down bias last dim
-        H = int(dn_b.shape[1])
+    E, H, In = _get_mxfp4_expert_dims(gm, gate_up_w_name, gate_up_b_name, down_b_name)
 
     # Compute block dims (assume divisible; zero-init anyway)
     H_blk = max(1, H // 32)
@@ -216,7 +265,12 @@ class InsertMXFP4MLP(BaseTransform):
         shared_config,
     ) -> Tuple[GraphModule, TransformInfo]:
         qcfg = factory.get_quant_config()
-        if not qcfg or qcfg.get("quant_method", "") != self.algo_name:
+        if not qcfg:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+        checkpoint_layout = _get_packed_mxfp4_expert_layout(qcfg)
+        if qcfg.get("quant_method", "") != self.algo_name and checkpoint_layout is None:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -257,11 +311,42 @@ class InsertMXFP4MLP(BaseTransform):
             gu_b_name = gate_up_b_node.target
             dn_w_name = down_w_node.target
             dn_b_name = down_b_node.target
+            source_names = {
+                "gate_up_weight": gu_w_name,
+                "gate_up_bias": gu_b_name,
+                "down_weight": dn_w_name,
+                "down_bias": dn_b_name,
+            }
+            layer = None
+            if checkpoint_layout is not None:
+                layer = _layout_layer_from_names(checkpoint_layout, source_names)
+                if layer is None:
+                    continue
+            num_experts, hidden_size, intermediate_size = _get_mxfp4_expert_dims(
+                gm, gu_w_name, gu_b_name, dn_b_name
+            )
 
             # Register MXFP4 params on experts
             gu_blocks_name, gu_scales_name, dn_blocks_name, dn_scales_name = (
                 _register_mxfp4_expert_params(gm, gu_w_name, gu_b_name, dn_w_name, dn_b_name)
             )
+            if checkpoint_layout is not None:
+                gm._register_load_state_dict_pre_hook(
+                    partial(
+                        _load_mxfp4_expert_layout_hook,
+                        checkpoint_layout=checkpoint_layout,
+                        target_names={
+                            "gate_up_blocks": gu_blocks_name,
+                            "gate_up_scales": gu_scales_name,
+                            "down_blocks": dn_blocks_name,
+                            "down_scales": dn_scales_name,
+                        },
+                        layer=layer,
+                        num_experts=num_experts,
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                    )
+                )
 
             # Alpha/limit (from dense call)
             alpha, limit = _get_alpha_limit_from_dense(n)
