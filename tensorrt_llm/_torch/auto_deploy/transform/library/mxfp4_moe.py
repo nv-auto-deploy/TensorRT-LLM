@@ -139,11 +139,24 @@ def _get_topk_from_router(node: Node) -> int:
     return int(node.args[3]) if len(node.args) >= 4 else 2
 
 
-def _get_packed_mxfp4_expert_layout(qcfg: dict):
+def _get_packed_mxfp4_expert_layout(
+    qcfg: dict,
+) -> object | None:
     checkpoint_layout = qcfg.get("checkpoint_layout")
     if checkpoint_layout is None:
         return None
-    return getattr(checkpoint_layout, "packed_mxfp4_experts", None)
+    for consumer in getattr(checkpoint_layout, "checkpoint_consumers", ()):
+        if _is_packed_mxfp4_expert_layout(consumer):
+            return consumer
+    return None
+
+
+def _is_packed_mxfp4_expert_layout(consumer: object) -> bool:
+    return (
+        getattr(consumer, "quant_method", None) == "mxfp4"
+        and callable(getattr(consumer, "layer_from_runtime_name", None))
+        and callable(getattr(consumer, "load_runtime_buffers", None))
+    )
 
 
 class MXFP4MLPConfig(TransformConfig):
@@ -162,9 +175,13 @@ def _get_mxfp4_moe_op(backend: Literal["torch", "triton"]):
     return torch.ops.auto_deploy.triton_mxfp4_moe
 
 
-def _layout_layer_from_names(checkpoint_layout: object, source_names: dict[str, str]):
+def _layout_layer_from_names(
+    checkpoint_layout: object,
+    source_names: dict[str, str],
+):
+    layer_from_runtime_name = getattr(checkpoint_layout, "layer_from_runtime_name")
     for source_name in source_names.values():
-        layer = checkpoint_layout.layer_from_runtime_name(source_name)
+        layer = layer_from_runtime_name(source_name)
         if layer is not None:
             return layer
     return None
@@ -182,7 +199,8 @@ def _load_mxfp4_expert_layout_hook(
     intermediate_size: int,
 ) -> None:
     prefix = prefix or ""
-    checkpoint_layout.load_runtime_buffers(
+    load_runtime_buffers = getattr(checkpoint_layout, "load_runtime_buffers")
+    load_runtime_buffers(
         state_dict,
         prefix,
         layer=layer,
