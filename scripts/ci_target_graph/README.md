@@ -167,9 +167,11 @@ subpackage. Phase 6 native/package labels such as `//cpp:tensorrt_llm_bindings`,
 `//cpp:cuda_kernels`, and `//triton_backend:triton_tensorrt_llm_backend` are
 metadata/query placeholders for reverse-dependency selection; they do not build
 the C++ bindings, CUDA kernels, plugin library, Triton backend, wheel, or any
-other native artifact. Most Python, C++, CUDA, model/data inputs, and generated
-artifacts are still intentionally unmodeled. Unknown or unmodeled areas should
-fall back conservatively rather than being skipped.
+other native artifact. The separate `//cpp:timestamp_utils_smoke_test` target is
+the first narrow host C++ Bazel build proof, not CUDA, TensorRT, native
+extension, or wheel build parity. Most Python, C++, CUDA, model/data inputs, and
+generated artifacts are still intentionally unmodeled. Unknown or unmodeled
+areas should fall back conservatively rather than being skipped.
 
 ## Runtime Metadata
 

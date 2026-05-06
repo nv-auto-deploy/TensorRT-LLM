@@ -14,6 +14,7 @@ The implemented scope is:
 - Generate a shadow-mode CI target graph manifest from Jenkins L0 stage metadata and test-db YAML files.
 - Run selected pytest selectors through Bazel test targets.
 - Seed manual AutoDeploy H100 one-GPU and four-GPU targets for validation.
+- Provide the first narrow host C++ Bazel build proof for timestamp utilities.
 
 ## Current Layout
 
@@ -79,10 +80,22 @@ These commands do not run GPU pytest workloads:
 
 ```bash
 python3 -m scripts.ci_target_graph.validate --repo-root . --output /tmp/trtllm-ci-target-graph.json
+bazel test //cpp:timestamp_utils_smoke_test --test_output=errors --cache_test_results=no
 bazel test //tests/unittest/tools:ci_target_graph_test
 bazel build //scripts/ci_target_graph:generate
 bazel query '//ci/bazel/...'
 ```
+
+## Host C++ Build Proof
+
+The first actual host C++ Bazel build proof is:
+
+```bash
+bazel test //cpp:timestamp_utils_smoke_test --test_output=errors --cache_test_results=no
+```
+
+This target exercises a small timestamp utility smoke test through Bazel. It proves that a narrow host C++
+`cc_test` can compile and run, but it is not CUDA, TensorRT, native extension, or wheel build parity.
 
 ## Generate The Manifest
 
@@ -127,8 +140,9 @@ AutoDeploy targets can depend on:
 These labels are metadata/query targets for CI impact selection. They let Bazel
 queries connect pytest selectors to owned native or packaging areas, but they do
 not build the TensorRT-LLM wheel, C++ bindings, CUDA kernels, TensorRT-LLM
-plugin library, or Triton backend. Native builds still use the existing
-TensorRT-LLM build flow outside this spike.
+plugin library, or Triton backend. The `//cpp:timestamp_utils_smoke_test` host
+C++ smoke target is separate from this metadata model. Native builds still use
+the existing TensorRT-LLM build flow outside this spike.
 
 ## Select Impacted Targets
 
@@ -309,7 +323,8 @@ a deliberate reason for wildcard Bazel test patterns to include them.
 ## Known Limitations And Non-Goals
 
 - This is a CI/impact-selection spike, not a production Bazel build for TensorRT-LLM.
-- Bazel does not build TensorRT-LLM C++, CUDA, wheels, or Python packages in this spike.
+- Bazel only builds the narrow host timestamp utility smoke target; it does not build TensorRT-LLM CUDA
+  kernels, TensorRT plugin libraries, native Python extensions, wheels, or Python packages in this spike.
 - Phase 6 native/package labels are metadata placeholders for query edges, not build rules for those
   artifacts.
 - Bazel does not provision GPUs, model weights, CUDA libraries, or the Python runtime environment needed by

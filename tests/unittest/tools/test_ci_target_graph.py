@@ -820,6 +820,31 @@ def test_select_impacted_unmodeled_native_path_uses_broad_fallback() -> None:
     assert any("tests(" in expression for expression in query_client.queries)
 
 
+def test_select_impacted_timestamp_utils_smoke_source_stays_unmodeled() -> None:
+    path = "cpp/bazel/timestampUtilsSmokeTest.cpp"
+    query_client = _FakeQueryClient(
+        fallback_query_results=["//ci/bazel:fallback_test"],
+    )
+
+    assert owner_labels_for_path(path) == ()
+    assert broad_fallback_reason_for_path(path) is None
+
+    result = select_impacted(
+        repo_root=REPO_ROOT,
+        base="upstream/main",
+        changed_files=[_changed_file(path)],
+        smoke_targets=["//ci/bazel:smoke_test"],
+        query_client=query_client,
+    )
+
+    assert result.fallback_used
+    assert result.owner_labels == ()
+    assert result.candidate_targets == ("//ci/bazel:fallback_test",)
+    assert result.selected_targets == ("//ci/bazel:fallback_test", "//ci/bazel:smoke_test")
+    assert f"unmodeled changed path: {path}" in result.fallback_reasons
+    assert any("tests(" in expression for expression in query_client.queries)
+
+
 def test_select_impacted_query_failure_uses_broad_fallback() -> None:
     query_client = _FakeQueryClient(
         query_results=["//ci/bazel:impacted_test"],

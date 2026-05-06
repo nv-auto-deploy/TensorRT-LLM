@@ -3,6 +3,25 @@
 
 package(default_visibility = ["//visibility:public"])
 
+cc_library(
+    name = "timestamp_utils",
+    srcs = ["tensorrt_llm/common/timestampUtils.cpp"],
+    hdrs = [
+        "include/tensorrt_llm/common/config.h",
+        "tensorrt_llm/common/timestampUtils.h",
+    ],
+    includes = [
+        ".",
+        "include",
+    ],
+)
+
+cc_test(
+    name = "timestamp_utils_smoke_test",
+    srcs = ["bazel/timestampUtilsSmokeTest.cpp"],
+    deps = [":timestamp_utils"],
+)
+
 # Metadata-only placeholders for query-time artifact modeling.
 filegroup(
     name = "libtensorrt_llm",
