@@ -9,7 +9,6 @@ module(
 bazel_dep(name = "platforms", version = "0.0.11")
 bazel_dep(name = "rules_cc", version = "0.2.14")
 bazel_dep(name = "rules_cuda", version = "0.3.0")
-bazel_dep(name = "rules_python", version = "1.5.0")
 
 cuda = use_extension("@rules_cuda//cuda:extensions.bzl", "toolchain")
 cuda.toolkit(
@@ -22,25 +21,4 @@ trtllm_system_deps = use_extension("//tools/bazel:system_deps.bzl", "system_deps
 use_repo(
     trtllm_system_deps,
     "trtllm_local_cuda",
-    "trtllm_local_tensorrt",
-    "trtllm_local_nccl",
-    "trtllm_local_mpi",
-    "trtllm_local_torch",
-    "trtllm_nanobind",
-    "trtllm_nlohmann_json",
-    "trtllm_cutlass",
 )
-
-python = use_extension("@rules_python//python/extensions:python.bzl", "python")
-python.toolchain(
-    python_version = "3.12",
-)
-use_repo(python, "python_3_12")
-
-pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
-pip.parse(
-    hub_name = "pip",
-    python_version = "3.12",
-    requirements_lock = "//:requirements_bazel_lock.txt",
-)
-use_repo(pip, "pip")

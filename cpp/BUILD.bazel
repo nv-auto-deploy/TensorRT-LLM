@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-load("//tools/bazel:cmake_artifacts.bzl", "trtllm_cmake_artifacts")
 load("@rules_cuda//cuda:defs.bzl", "cuda_library")
 
 package(default_visibility = ["//visibility:public"])
@@ -24,42 +23,6 @@ CUDA_KERNEL_DEFINES = COMMON_HOST_DEFINES + [
     "ENABLE_MULTI_DEVICE=0",
     "ENABLE_NVSHMEM=0",
 ]
-
-CMAKE_ARTIFACT_SRCS = glob(
-    ["**"],
-    exclude = [
-        "bazel-*/**",
-        "build/**",
-        "build_*/**",
-        "cmake-build-*/**",
-    ],
-)
-
-filegroup(
-    name = "cmake_artifact_sources",
-    srcs = CMAKE_ARTIFACT_SRCS,
-    visibility = ["//triton_backend:__pkg__"],
-)
-
-filegroup(
-    name = "wheel_package_sources",
-    srcs = CMAKE_ARTIFACT_SRCS,
-)
-
-trtllm_cmake_artifacts(
-    name = "cmake_native_artifacts",
-    srcs = CMAKE_ARTIFACT_SRCS,
-    tags = [
-        "manual",
-        "local",
-        "no-cache",
-        "no-remote",
-        "no-remote-cache",
-        "no-remote-exec",
-        "no-sandbox",
-    ],
-    visibility = ["//visibility:private"],
-)
 
 cc_library(
     name = "timestamp_utils",
@@ -96,7 +59,7 @@ cc_library(
         "@platforms//os:linux": ["-ldl"],
         "//conditions:default": [],
     }),
-    deps = ["@trtllm_local_cuda//:cuda_headers"],
+    deps = ["@trtllm_local_cuda//:headers"],
 )
 
 cc_test(
@@ -142,7 +105,7 @@ cc_library(
         "@trtllm_local_cuda//:cublas",
         "@trtllm_local_cuda//:cublasLt",
         "@trtllm_local_cuda//:cuda_driver",
-        "@trtllm_local_cuda//:cuda_runtime",
+        "@trtllm_local_cuda//:cudart",
         "@trtllm_local_cuda//:nvml",
     ],
 )
@@ -175,98 +138,8 @@ cuda_library(
     includes = COMMON_INCLUDES,
     deps = [
         ":common_cuda_host",
-        "@trtllm_local_cuda//:cuda_headers",
-        "@trtllm_local_cuda//:cuda_runtime",
-    ],
-)
-
-# Metadata-only placeholders for query-time artifact modeling.
-filegroup(
-    name = "libtensorrt_llm_metadata",
-    srcs = [
-        "CMakeLists.txt",
-        "tensorrt_llm/CMakeLists.txt",
-    ],
-)
-
-filegroup(
-    name = "libtensorrt_llm",
-    srcs = [":cmake_native_artifacts"],
-    output_group = "libtensorrt_llm",
-    tags = ["manual"],
-)
-
-filegroup(
-    name = "nvinfer_plugin_tensorrt_llm_metadata",
-    srcs = [
-        "tensorrt_llm/plugins/CMakeLists.txt",
-    ],
-)
-
-filegroup(
-    name = "nvinfer_plugin_tensorrt_llm",
-    srcs = [":cmake_native_artifacts"],
-    output_group = "nvinfer_plugin_tensorrt_llm",
-    tags = ["manual"],
-)
-
-filegroup(
-    name = "decoder_attention_0",
-    srcs = [":cmake_native_artifacts"],
-    output_group = "decoder_attention_0",
-    tags = ["manual"],
-)
-
-filegroup(
-    name = "decoder_attention_1",
-    srcs = [":cmake_native_artifacts"],
-    output_group = "decoder_attention_1",
-    tags = ["manual"],
-)
-
-filegroup(
-    name = "pg_utils",
-    srcs = [":cmake_native_artifacts"],
-    output_group = "pg_utils",
-    tags = ["manual"],
-)
-
-filegroup(
-    name = "trtllm_runtime_libs",
-    srcs = [":cmake_native_artifacts"],
-    output_group = "trtllm_runtime_libs",
-    tags = ["manual"],
-)
-
-filegroup(
-    name = "tensorrt_llm_bindings_metadata",
-    srcs = [
-        "tensorrt_llm/nanobind/CMakeLists.txt",
-    ],
-)
-
-filegroup(
-    name = "tensorrt_llm_bindings",
-    srcs = [":cmake_native_artifacts"],
-    output_group = "tensorrt_llm_bindings",
-    tags = ["manual"],
-)
-
-filegroup(
-    name = "executor_worker",
-    srcs = [":cmake_native_artifacts"],
-    output_group = "executor_worker",
-    tags = ["manual"],
-)
-
-filegroup(
-    name = "cuda_kernels_metadata",
-    srcs = [
-        "kernels/fmha_v2/setup.py",
-        "kernels/xqa/CMakeLists.txt",
-        "tensorrt_llm/kernels/CMakeLists.txt",
-        "tensorrt_llm/kernels/globalTimerKernel.cu",
-        "tensorrt_llm/kernels/globalTimerKernel.h",
+        "@trtllm_local_cuda//:headers",
+        "@trtllm_local_cuda//:cudart",
     ],
 )
 
@@ -355,8 +228,8 @@ cuda_library(
     includes = COMMON_INCLUDES,
     deps = [
         ":common_cuda_host",
-        "@trtllm_local_cuda//:cuda_headers",
-        "@trtllm_local_cuda//:cuda_runtime",
+        "@trtllm_local_cuda//:headers",
+        "@trtllm_local_cuda//:cudart",
     ],
 )
 
@@ -443,8 +316,8 @@ cuda_library(
     deps = [
         ":common_memory_utils_cuda",
         ":common_cuda_host",
-        "@trtllm_local_cuda//:cuda_headers",
-        "@trtllm_local_cuda//:cuda_runtime",
+        "@trtllm_local_cuda//:headers",
+        "@trtllm_local_cuda//:cudart",
     ],
 )
 
@@ -475,8 +348,8 @@ cuda_library(
     includes = COMMON_INCLUDES,
     deps = [
         ":common_cuda_host",
-        "@trtllm_local_cuda//:cuda_headers",
-        "@trtllm_local_cuda//:cuda_runtime",
+        "@trtllm_local_cuda//:headers",
+        "@trtllm_local_cuda//:cudart",
     ],
 )
 
@@ -511,8 +384,8 @@ cuda_library(
     includes = COMMON_INCLUDES,
     deps = [
         ":common_cuda_host",
-        "@trtllm_local_cuda//:cuda_headers",
-        "@trtllm_local_cuda//:cuda_runtime",
+        "@trtllm_local_cuda//:headers",
+        "@trtllm_local_cuda//:cudart",
     ],
 )
 
@@ -543,8 +416,8 @@ cuda_library(
     includes = COMMON_INCLUDES,
     deps = [
         ":common_cuda_host",
-        "@trtllm_local_cuda//:cuda_headers",
-        "@trtllm_local_cuda//:cuda_runtime",
+        "@trtllm_local_cuda//:headers",
+        "@trtllm_local_cuda//:cudart",
     ],
 )
 
@@ -558,38 +431,5 @@ cc_library(
         ":global_timer_kernel_cuda",
         ":mamba2_mtp_ssm_cache_cuda",
         ":root_cuda_kernels",
-    ],
-)
-
-filegroup(
-    name = "cuda_kernel_archives",
-    srcs = [
-        ":common_memory_utils_cuda",
-        ":extra_root_cuda_kernels",
-        ":fused_gated_rmsnorm_quant_cuda",
-        ":fused_layernorm_fp4_traits_cuda",
-        ":global_timer_kernel_cuda",
-        ":mamba2_mtp_ssm_cache_cuda",
-        ":root_cuda_kernels",
-    ],
-)
-
-filegroup(
-    name = "wheel_native_artifacts",
-    srcs = [
-        ":cuda_kernel_archives",
-        ":tensorrt_llm_bindings",
-        ":trtllm_runtime_libs",
-    ],
-    tags = ["manual"],
-)
-
-filegroup(
-    name = "wheel_native_artifacts_metadata",
-    srcs = [
-        ":cuda_kernels_metadata",
-        ":libtensorrt_llm_metadata",
-        ":nvinfer_plugin_tensorrt_llm_metadata",
-        ":tensorrt_llm_bindings_metadata",
     ],
 )
