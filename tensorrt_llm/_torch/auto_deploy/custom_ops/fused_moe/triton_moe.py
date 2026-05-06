@@ -388,24 +388,25 @@ def _get_kernel_config(
 
 
 def _default_kernel_config(M: int, E: int) -> dict:
+    # Only BLOCK_SIZE_M is consumed by the kernel launcher / packer; the other
+    # tile and compiler params are chosen by @triton.autotune. We pick
+    # BLOCK_SIZE_M from a small set of buckets based on the routed-token
+    # density (M * top_k vs E). The other fields are kept for backwards
+    # compatibility with on-disk JSON configs (see ``_get_kernel_config``).
     if M <= E:
-        return {
-            "BLOCK_SIZE_M": 16,
-            "BLOCK_SIZE_N": 32,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 1,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
+        block_m = 16
+    elif M < 256:
+        block_m = 64
     else:
-        return {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 32,
-            "GROUP_SIZE_M": 8,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
+        block_m = 128
+    return {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 3,
+    }
 
 
 def _pack_routed_tokens(
