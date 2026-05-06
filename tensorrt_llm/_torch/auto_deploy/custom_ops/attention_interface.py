@@ -239,9 +239,21 @@ class InputBuffer:
         if fill_value is not None:
             host_view.fill_(fill_value)
 
-        # convert to tensor via numpy (numpy is ~2-3x faster than torch.tensor for large lists)
+        # Fast path for Python lists: go straight numpy->numpy without the
+        # torch.from_numpy → .numpy() round-trip. The latter shows up as ~5-10 us
+        # of dispatcher overhead per stage() call; with ~12 _stage_arg calls per
+        # nest_sequences, that compounds to a measurable host-side cost.
         if not isinstance(data, torch.Tensor):
-            data = _list_to_tensor(data, dtype)
+            np_dtype = _TORCH_TO_NUMPY_DTYPE.get(dtype)
+            if np_dtype is not None:
+                src = np.asarray(data, dtype=np_dtype)
+                length = src.size
+                assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
+                dst = host_view[:length].numpy()
+                np.copyto(dst, src)
+                self._current_lengths[name] = length
+                return length
+            data = torch.tensor(data, dtype=dtype)
 
         length = data.numel()
         assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
