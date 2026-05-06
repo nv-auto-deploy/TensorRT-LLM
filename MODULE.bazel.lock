@@ -146,6 +146,50 @@
   },
   "selectedYankedVersions": {},
   "moduleExtensions": {
+    "//tools/bazel:system_deps.bzl%system_deps": {
+      "general": {
+        "bzlTransitiveDigest": "06nNG9u0hiCL694DlYE7RlNTygS7xDeZ/z7HHE1xpIs=",
+        "usagesDigest": "TjC1U59lhCoURS3nWK4n/RVvySp3a40KOHnLyCgovbg=",
+        "recordedFileInputs": {},
+        "recordedDirentsInputs": {},
+        "envVariables": {},
+        "generatedRepoSpecs": {
+          "trtllm_local_cuda": {
+            "repoRuleId": "@@//tools/bazel:system_deps.bzl%_cuda_repository",
+            "attributes": {}
+          },
+          "trtllm_local_tensorrt": {
+            "repoRuleId": "@@//tools/bazel:system_deps.bzl%_tensorrt_repository",
+            "attributes": {}
+          },
+          "trtllm_local_nccl": {
+            "repoRuleId": "@@//tools/bazel:system_deps.bzl%_nccl_repository",
+            "attributes": {}
+          },
+          "trtllm_local_mpi": {
+            "repoRuleId": "@@//tools/bazel:system_deps.bzl%_mpi_repository",
+            "attributes": {}
+          },
+          "trtllm_local_torch": {
+            "repoRuleId": "@@//tools/bazel:system_deps.bzl%_torch_repository",
+            "attributes": {}
+          },
+          "trtllm_nanobind": {
+            "repoRuleId": "@@//tools/bazel:system_deps.bzl%_nanobind_repository",
+            "attributes": {}
+          },
+          "trtllm_nlohmann_json": {
+            "repoRuleId": "@@//tools/bazel:system_deps.bzl%_nlohmann_json_repository",
+            "attributes": {}
+          },
+          "trtllm_cutlass": {
+            "repoRuleId": "@@//tools/bazel:system_deps.bzl%_cutlass_repository",
+            "attributes": {}
+          }
+        },
+        "recordedRepoMappingEntries": []
+      }
+    },
     "@@pybind11_bazel+//:python_configure.bzl%extension": {
       "general": {
         "bzlTransitiveDigest": "D2/qWHU6yQFwRG7Bb+caqrYMha5avsASao2vERrxK24=",

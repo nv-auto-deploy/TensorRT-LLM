@@ -5,6 +5,25 @@ load("@rules_cuda//cuda:defs.bzl", "cuda_library")
 
 package(default_visibility = ["//visibility:public"])
 
+COMMON_HOST_DEFINES = [
+    "ENABLE_BF16",
+    "ENABLE_FP8",
+    "ENABLE_FP4",
+    "NVTX_DISABLE",
+    "TLLM_ENABLE_CUDA",
+    "TLLM_GEN_EXPORT_INTERFACE",
+]
+
+COMMON_INCLUDES = [
+    ".",
+    "include",
+]
+
+CUDA_KERNEL_DEFINES = COMMON_HOST_DEFINES + [
+    "ENABLE_MULTI_DEVICE=0",
+    "ENABLE_NVSHMEM=0",
+]
+
 cc_library(
     name = "timestamp_utils",
     srcs = ["tensorrt_llm/common/timestampUtils.cpp"],
@@ -12,16 +31,116 @@ cc_library(
         "include/tensorrt_llm/common/config.h",
         "tensorrt_llm/common/timestampUtils.h",
     ],
-    includes = [
-        ".",
-        "include",
-    ],
+    includes = COMMON_INCLUDES,
 )
 
 cc_test(
     name = "timestamp_utils_smoke_test",
     srcs = ["bazel/timestampUtilsSmokeTest.cpp"],
     deps = [":timestamp_utils"],
+)
+
+cc_library(
+    name = "common_host_core",
+    srcs = [
+        "tensorrt_llm/common/assert.cpp",
+        "tensorrt_llm/common/stringUtils.cpp",
+        "tensorrt_llm/common/tllmException.cpp",
+    ],
+    hdrs = [
+        "include/tensorrt_llm/common/assert.h",
+        "include/tensorrt_llm/common/config.h",
+        "include/tensorrt_llm/common/stringUtils.h",
+        "include/tensorrt_llm/common/tllmException.h",
+    ],
+    defines = COMMON_HOST_DEFINES,
+    includes = COMMON_INCLUDES,
+    linkopts = select({
+        "@platforms//os:linux": ["-ldl"],
+        "//conditions:default": [],
+    }),
+    deps = ["@trtllm_local_cuda//:cuda_headers"],
+)
+
+cc_test(
+    name = "common_host_smoke_test",
+    srcs = ["bazel/commonHostSmokeTest.cpp"],
+    deps = [":common_host_core"],
+)
+
+cc_library(
+    name = "common_cuda_host",
+    srcs = [
+        "tensorrt_llm/common/cublasMMWrapper.cpp",
+        "tensorrt_llm/common/cublasVersionCheck.h",
+        "tensorrt_llm/common/cudaDriverWrapper.cpp",
+        "tensorrt_llm/common/cudaProfilerUtils.cpp",
+        "tensorrt_llm/common/envUtils.cpp",
+        "tensorrt_llm/common/ipUtils.cpp",
+        "tensorrt_llm/common/logger.cpp",
+        "tensorrt_llm/common/mcastDevMemUtils.cpp",
+        "tensorrt_llm/common/nvmlWrapper.cpp",
+    ],
+    hdrs = [
+        "include/tensorrt_llm/common/cudaBf16Wrapper.h",
+        "include/tensorrt_llm/common/cudaFp8Utils.h",
+        "include/tensorrt_llm/common/cudaProfilerUtils.h",
+        "include/tensorrt_llm/common/cudaUtils.h",
+        "include/tensorrt_llm/common/logger.h",
+        "tensorrt_llm/common/cublasMMWrapper.h",
+        "tensorrt_llm/common/cudaDriverWrapper.h",
+        "tensorrt_llm/common/envUtils.h",
+        "tensorrt_llm/common/ipUtils.h",
+        "tensorrt_llm/common/mcastDevMemUtils.h",
+        "tensorrt_llm/common/nvmlWrapper.h",
+    ],
+    defines = COMMON_HOST_DEFINES,
+    includes = COMMON_INCLUDES,
+    linkopts = select({
+        "@platforms//os:linux": ["-ldl"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":common_host_core",
+        "@trtllm_local_cuda//:cublas",
+        "@trtllm_local_cuda//:cublasLt",
+        "@trtllm_local_cuda//:cuda_driver",
+        "@trtllm_local_cuda//:cuda_runtime",
+        "@trtllm_local_cuda//:nvml",
+    ],
+)
+
+cc_library(
+    name = "common_host",
+    deps = [
+        ":common_cuda_host",
+        ":common_host_core",
+        ":timestamp_utils",
+    ],
+)
+
+cuda_library(
+    name = "common_memory_utils_cuda",
+    srcs = ["tensorrt_llm/common/memoryUtils.cu"],
+    hdrs = [
+        "include/tensorrt_llm/common/assert.h",
+        "include/tensorrt_llm/common/config.h",
+        "include/tensorrt_llm/common/cudaBf16Wrapper.h",
+        "include/tensorrt_llm/common/cudaFp8Utils.h",
+        "include/tensorrt_llm/common/cudaUtils.h",
+        "include/tensorrt_llm/common/logger.h",
+        "include/tensorrt_llm/common/tllmException.h",
+        "tensorrt_llm/common/cudaBf16Fallbacks.cuh",
+        "tensorrt_llm/common/cudaTypeUtils.cuh",
+        "tensorrt_llm/common/memoryUtils.h",
+    ],
+    defines = CUDA_KERNEL_DEFINES,
+    includes = COMMON_INCLUDES,
+    deps = [
+        ":common_cuda_host",
+        "@trtllm_local_cuda//:cuda_headers",
+        "@trtllm_local_cuda//:cuda_runtime",
+    ],
 )
 
 # Metadata-only placeholders for query-time artifact modeling.
@@ -88,21 +207,299 @@ cuda_library(
         "tensorrt_llm/common/cudaDriverWrapper.h",
         "tensorrt_llm/kernels/globalTimerKernel.h",
     ],
-    includes = [
-        ".",
-        "include",
+    includes = COMMON_INCLUDES,
+)
+
+cuda_library(
+    name = "root_cuda_kernels",
+    srcs = [
+        "tensorrt_llm/kernels/banBadWords.cu",
+        "tensorrt_llm/kernels/banRepeatNgram.cu",
+        "tensorrt_llm/kernels/beamSearchKernels.cu",
+        "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernels4.cu",
+        "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernels8.cu",
+        "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernels16.cu",
+        "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernels32.cu",
+        "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernels64.cu",
+        "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernels128.cu",
+        "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernels256.cu",
+        "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernels512.cu",
+        "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernels1024.cu",
+        "tensorrt_llm/kernels/buildRelativeAttentionBiasKernel.cu",
+        "tensorrt_llm/kernels/convertReqIndexToGlobal.cu",
+        "tensorrt_llm/kernels/cumsumLastDim.cu",
+        "tensorrt_llm/kernels/decodingCommon.cu",
+        "tensorrt_llm/kernels/delayStream.cu",
+        "tensorrt_llm/kernels/doraScaling.cu",
+        "tensorrt_llm/kernels/heuristicTopKDecode.cu",
+        "tensorrt_llm/kernels/indexerKCacheGather.cu",
+        "tensorrt_llm/kernels/indexerKCacheScatter.cu",
+        "tensorrt_llm/kernels/logitsBitmask.cu",
+        "tensorrt_llm/kernels/lookupKernels.cu",
+        "tensorrt_llm/kernels/lruKernel.cu",
+        "tensorrt_llm/kernels/penaltyKernels.cu",
+        "tensorrt_llm/kernels/preQuantScaleKernel.cu",
+        "tensorrt_llm/kernels/sparseAttentionKernels.cu",
+        "tensorrt_llm/kernels/stopCriteriaKernels.cu",
+    ],
+    hdrs = [
+        "include/tensorrt_llm/executor/types.h",
+        "include/tensorrt_llm/kernels/decodingCommon.h",
+        "include/tensorrt_llm/layers/defaultDecodingParams.h",
+        "include/tensorrt_llm/runtime/common.h",
+        "tensorrt_llm/common/cudaBf16Fallbacks.cuh",
+        "tensorrt_llm/common/cudaTypeUtils.cuh",
+        "tensorrt_llm/common/reduceKernelUtils.cuh",
+        "tensorrt_llm/kernels/IndexerKCacheGather.h",
+        "tensorrt_llm/kernels/IndexerKCacheScatter.h",
+        "tensorrt_llm/kernels/banBadWords.h",
+        "tensorrt_llm/kernels/banRepeatNgram.h",
+        "tensorrt_llm/kernels/beamSearchKernels.h",
+        "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernelsTemplate.h",
+        "tensorrt_llm/kernels/buildRelativeAttentionBiasKernel.h",
+        "tensorrt_llm/kernels/convertReqIndexToGlobal.h",
+        "tensorrt_llm/kernels/cumsumLastDim.h",
+        "tensorrt_llm/kernels/delayStream.h",
+        "tensorrt_llm/kernels/doraScaling.h",
+        "tensorrt_llm/kernels/heuristicTopKDecode.h",
+        "tensorrt_llm/kernels/heuristic_topk.cuh",
+        "tensorrt_llm/kernels/logitsBitmask.h",
+        "tensorrt_llm/kernels/lookupKernels.h",
+        "tensorrt_llm/kernels/lruKernel.h",
+        "tensorrt_llm/kernels/moe_utils.cuh",
+        "tensorrt_llm/kernels/penaltyKernels.h",
+        "tensorrt_llm/kernels/preQuantScaleKernel.h",
+        "tensorrt_llm/kernels/sparseAttentionKernels.h",
+        "tensorrt_llm/kernels/stopCriteriaKernels.h",
+        "tensorrt_llm/kernels/topkLastDim.h",
+    ],
+    defines = CUDA_KERNEL_DEFINES,
+    includes = COMMON_INCLUDES,
+    deps = [
+        ":common_cuda_host",
+        "@trtllm_local_cuda//:cuda_headers",
+        "@trtllm_local_cuda//:cuda_runtime",
     ],
 )
 
-alias(
+cuda_library(
+    name = "extra_root_cuda_kernels",
+    srcs = [
+        "tensorrt_llm/kernels/arcquantFP4.cu",
+        "tensorrt_llm/kernels/customMoeRoutingKernels.cu",
+        "tensorrt_llm/kernels/fusedActivationQuant.cu",
+        "tensorrt_llm/kernels/fusedCatFp8.cu",
+        "tensorrt_llm/kernels/fusedDiTQKNormRopeKernel.cu",
+        "tensorrt_llm/kernels/fusedMoeCommKernels.cu",
+        "tensorrt_llm/kernels/fusedQKNormRopeKernel.cu",
+        "tensorrt_llm/kernels/helixAllToAll.cu",
+        "tensorrt_llm/kernels/helixKernels.cu",
+        "tensorrt_llm/kernels/indexerTopK.cu",
+        "tensorrt_llm/kernels/layernormKernels.cu",
+        "tensorrt_llm/kernels/mambaConv1dKernels.cu",
+        "tensorrt_llm/kernels/moeAlignKernels.cu",
+        "tensorrt_llm/kernels/moePrepareKernels.cu",
+        "tensorrt_llm/kernels/noAuxTcKernels.cu",
+        "tensorrt_llm/kernels/qserveGemmPerChannel.cu",
+        "tensorrt_llm/kernels/qserveGemmPerGroup.cu",
+        "tensorrt_llm/kernels/quantization.cu",
+        "tensorrt_llm/kernels/recoverFromRingAtten.cu",
+        "tensorrt_llm/kernels/rmsnormKernels.cu",
+        "tensorrt_llm/kernels/sageAttentionKernels.cu",
+        "tensorrt_llm/kernels/samplingAirTopPKernels.cu",
+        "tensorrt_llm/kernels/samplingTopKKernels.cu",
+        "tensorrt_llm/kernels/samplingTopPKernels.cu",
+        "tensorrt_llm/kernels/topkLastDim.cu",
+    ],
+    hdrs = [
+        "include/tensorrt_llm/common/assert.h",
+        "include/tensorrt_llm/common/config.h",
+        "include/tensorrt_llm/common/cudaBf16Wrapper.h",
+        "include/tensorrt_llm/common/cudaFp8Utils.h",
+        "include/tensorrt_llm/common/cudaUtils.h",
+        "include/tensorrt_llm/common/logger.h",
+        "include/tensorrt_llm/common/quantization.h",
+        "include/tensorrt_llm/common/tllmException.h",
+        "include/tensorrt_llm/executor/types.h",
+        "include/tensorrt_llm/kernels/archCondition.h",
+        "include/tensorrt_llm/kernels/decodingCommon.h",
+        "include/tensorrt_llm/runtime/common.h",
+        "tensorrt_llm/common/cudaBf16Fallbacks.cuh",
+        "tensorrt_llm/common/cudaTypeUtils.cuh",
+        "tensorrt_llm/common/envUtils.h",
+        "tensorrt_llm/common/mathUtils.h",
+        "tensorrt_llm/common/memoryUtils.h",
+        "tensorrt_llm/common/quantTypeUtils.cuh",
+        "tensorrt_llm/common/reduceKernelUtils.cuh",
+        "tensorrt_llm/kernels/arcquantFP4.h",
+        "tensorrt_llm/kernels/cudaAsyncOps.cuh",
+        "tensorrt_llm/kernels/customMoeRoutingKernels.h",
+        "tensorrt_llm/kernels/fusedActivationQuant.h",
+        "tensorrt_llm/kernels/fusedCatFp8.h",
+        "tensorrt_llm/kernels/fusedDiTQKNormRopeKernel.h",
+        "tensorrt_llm/kernels/fusedMoeCommKernels.h",
+        "tensorrt_llm/kernels/fusedQKNormRopeKernel.h",
+        "tensorrt_llm/kernels/helixAllToAll.h",
+        "tensorrt_llm/kernels/helixKernels.h",
+        "tensorrt_llm/kernels/heuristicTopKDecode.h",
+        "tensorrt_llm/kernels/layernormKernels.h",
+        "tensorrt_llm/kernels/ll128Proto.cuh",
+        "tensorrt_llm/kernels/mambaConv1dKernels.h",
+        "tensorrt_llm/kernels/moeAlignKernels.h",
+        "tensorrt_llm/kernels/moeCommKernelsCommon.h",
+        "tensorrt_llm/kernels/moePrepareKernels.h",
+        "tensorrt_llm/kernels/moeTopKFuncs.cuh",
+        "tensorrt_llm/kernels/noAuxTcKernels.h",
+        "tensorrt_llm/kernels/qserveGemm.h",
+        "tensorrt_llm/kernels/quantization.cuh",
+        "tensorrt_llm/kernels/quantization.h",
+        "tensorrt_llm/kernels/recoverFromRingAtten.h",
+        "tensorrt_llm/kernels/rmsnormKernels.h",
+        "tensorrt_llm/kernels/sageAttentionKernels.h",
+        "tensorrt_llm/kernels/samplingTopKKernels.h",
+        "tensorrt_llm/kernels/samplingTopPKernels.h",
+        "tensorrt_llm/kernels/topkLastDim.h",
+    ],
+    defines = CUDA_KERNEL_DEFINES,
+    includes = COMMON_INCLUDES,
+    deps = [
+        ":common_memory_utils_cuda",
+        ":common_cuda_host",
+        "@trtllm_local_cuda//:cuda_headers",
+        "@trtllm_local_cuda//:cuda_runtime",
+    ],
+)
+
+cuda_library(
+    name = "fused_gated_rmsnorm_quant_cuda",
+    srcs = [
+        "tensorrt_llm/kernels/fusedGatedRMSNormQuant/fusedGatedRMSNormQuant.cu",
+    ],
+    hdrs = [
+        "include/tensorrt_llm/common/assert.h",
+        "include/tensorrt_llm/common/config.h",
+        "include/tensorrt_llm/common/cudaBf16Wrapper.h",
+        "include/tensorrt_llm/common/cudaFp8Utils.h",
+        "include/tensorrt_llm/common/cudaUtils.h",
+        "include/tensorrt_llm/common/logger.h",
+        "include/tensorrt_llm/common/quantization.h",
+        "include/tensorrt_llm/common/tllmException.h",
+        "tensorrt_llm/common/cudaBf16Fallbacks.cuh",
+        "tensorrt_llm/common/cudaBufferUtils.cuh",
+        "tensorrt_llm/common/cudaTypeUtils.cuh",
+        "tensorrt_llm/common/quantTypeUtils.cuh",
+        "tensorrt_llm/common/reduceKernelUtils.cuh",
+        "tensorrt_llm/kernels/fusedGatedRMSNormQuant/fusedGatedRMSNormQuant.cuh",
+        "tensorrt_llm/kernels/quantization.cuh",
+        "tensorrt_llm/kernels/quantization.h",
+    ],
+    defines = CUDA_KERNEL_DEFINES,
+    includes = COMMON_INCLUDES,
+    deps = [
+        ":common_cuda_host",
+        "@trtllm_local_cuda//:cuda_headers",
+        "@trtllm_local_cuda//:cuda_runtime",
+    ],
+)
+
+cuda_library(
+    name = "fused_layernorm_fp4_traits_cuda",
+    srcs = [
+        "tensorrt_llm/kernels/fusedLayernormKernels/ws_layernorm_fp4_traits.cu",
+    ],
+    hdrs = [
+        "include/tensorrt_llm/common/config.h",
+        "include/tensorrt_llm/common/cudaBf16Wrapper.h",
+        "include/tensorrt_llm/common/cudaFp8Utils.h",
+        "include/tensorrt_llm/common/cudaUtils.h",
+        "include/tensorrt_llm/common/logger.h",
+        "include/tensorrt_llm/common/quantization.h",
+        "include/tensorrt_llm/common/tllmException.h",
+        "include/tensorrt_llm/kernels/archCondition.h",
+        "tensorrt_llm/common/cudaBf16Fallbacks.cuh",
+        "tensorrt_llm/common/cudaBufferUtils.cuh",
+        "tensorrt_llm/common/cudaTypeUtils.cuh",
+        "tensorrt_llm/common/quantTypeUtils.cuh",
+        "tensorrt_llm/common/reduceKernelUtils.cuh",
+        "tensorrt_llm/kernels/fusedLayernormKernels/fp4_converter.cuh",
+        "tensorrt_llm/kernels/fusedLayernormKernels/layernorm_param.h",
+        "tensorrt_llm/kernels/fusedLayernormKernels/low_latency_layernorm.cuh",
+        "tensorrt_llm/kernels/fusedLayernormKernels/ws_layernorm.cuh",
+        "tensorrt_llm/kernels/fusedLayernormKernels/ws_layernorm.h",
+        "tensorrt_llm/kernels/quantization.cuh",
+        "tensorrt_llm/kernels/quantization.h",
+    ],
+    defines = CUDA_KERNEL_DEFINES,
+    includes = COMMON_INCLUDES,
+    deps = [
+        ":common_cuda_host",
+        "@trtllm_local_cuda//:cuda_headers",
+        "@trtllm_local_cuda//:cuda_runtime",
+    ],
+)
+
+cuda_library(
+    name = "mamba2_mtp_ssm_cache_cuda",
+    srcs = [
+        "tensorrt_llm/kernels/mamba2MTPSSMCache/mamba2MTPSSMCache.cu",
+        "tensorrt_llm/kernels/mamba2MTPSSMCache/mamba2MTPSSMCacheVec4.cu",
+        "tensorrt_llm/kernels/mamba2MTPSSMCache/mamba2MTPSSMCacheVec8.cu",
+        "tensorrt_llm/kernels/mamba2MTPSSMCache/mamba2MTPSSMCacheVec16.cu",
+    ],
+    hdrs = [
+        "include/tensorrt_llm/common/config.h",
+        "include/tensorrt_llm/common/cudaBf16Wrapper.h",
+        "include/tensorrt_llm/common/cudaFp8Utils.h",
+        "include/tensorrt_llm/common/cudaUtils.h",
+        "include/tensorrt_llm/common/logger.h",
+        "include/tensorrt_llm/common/tllmException.h",
+        "tensorrt_llm/common/cudaDriverWrapper.h",
+        "tensorrt_llm/kernels/mamba2MTPSSMCache/mamba2MTPSSMCache.h",
+        "tensorrt_llm/kernels/mamba2MTPSSMCache/mamba2MTPSSMCacheKernel.cuh",
+    ],
+    copts = [
+        "--use_fast_math",
+        "-std=c++17",
+    ],
+    defines = CUDA_KERNEL_DEFINES,
+    includes = COMMON_INCLUDES,
+    deps = [
+        ":common_cuda_host",
+        "@trtllm_local_cuda//:cuda_headers",
+        "@trtllm_local_cuda//:cuda_runtime",
+    ],
+)
+
+cc_library(
     name = "cuda_kernels",
-    actual = ":global_timer_kernel_cuda",
+    deps = [
+        ":common_memory_utils_cuda",
+        ":extra_root_cuda_kernels",
+        ":fused_gated_rmsnorm_quant_cuda",
+        ":fused_layernorm_fp4_traits_cuda",
+        ":global_timer_kernel_cuda",
+        ":mamba2_mtp_ssm_cache_cuda",
+        ":root_cuda_kernels",
+    ],
+)
+
+filegroup(
+    name = "cuda_kernel_archives",
+    srcs = [
+        ":common_memory_utils_cuda",
+        ":extra_root_cuda_kernels",
+        ":fused_gated_rmsnorm_quant_cuda",
+        ":fused_layernorm_fp4_traits_cuda",
+        ":global_timer_kernel_cuda",
+        ":mamba2_mtp_ssm_cache_cuda",
+        ":root_cuda_kernels",
+    ],
 )
 
 filegroup(
     name = "wheel_native_artifacts",
     srcs = [
-        ":cuda_kernels",
+        ":cuda_kernel_archives",
         ":libtensorrt_llm",
         ":nvinfer_plugin_tensorrt_llm",
         ":tensorrt_llm_bindings",
