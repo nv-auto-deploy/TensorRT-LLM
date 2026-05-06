@@ -19,3 +19,7 @@ cuda_graph_config:
 kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.8
+transforms:
+  multi_stream_qkv:
+    stage: compile
+    enabled: true
