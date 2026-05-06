@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+load("//tools/bazel:cmake_artifacts.bzl", "trtllm_cmake_artifacts")
 load("@rules_cuda//cuda:defs.bzl", "cuda_library")
 
 package(default_visibility = ["//visibility:public"])
@@ -23,6 +24,42 @@ CUDA_KERNEL_DEFINES = COMMON_HOST_DEFINES + [
     "ENABLE_MULTI_DEVICE=0",
     "ENABLE_NVSHMEM=0",
 ]
+
+CMAKE_ARTIFACT_SRCS = glob(
+    ["**"],
+    exclude = [
+        "bazel-*/**",
+        "build/**",
+        "build_*/**",
+        "cmake-build-*/**",
+    ],
+)
+
+filegroup(
+    name = "cmake_artifact_sources",
+    srcs = CMAKE_ARTIFACT_SRCS,
+    visibility = ["//triton_backend:__pkg__"],
+)
+
+filegroup(
+    name = "wheel_package_sources",
+    srcs = CMAKE_ARTIFACT_SRCS,
+)
+
+trtllm_cmake_artifacts(
+    name = "cmake_native_artifacts",
+    srcs = CMAKE_ARTIFACT_SRCS,
+    tags = [
+        "manual",
+        "local",
+        "no-cache",
+        "no-remote",
+        "no-remote-cache",
+        "no-remote-exec",
+        "no-sandbox",
+    ],
+    visibility = ["//visibility:private"],
+)
 
 cc_library(
     name = "timestamp_utils",
@@ -152,9 +189,11 @@ filegroup(
     ],
 )
 
-alias(
+filegroup(
     name = "libtensorrt_llm",
-    actual = ":libtensorrt_llm_metadata",
+    srcs = [":cmake_native_artifacts"],
+    output_group = "libtensorrt_llm",
+    tags = ["manual"],
 )
 
 filegroup(
@@ -164,9 +203,39 @@ filegroup(
     ],
 )
 
-alias(
+filegroup(
     name = "nvinfer_plugin_tensorrt_llm",
-    actual = ":nvinfer_plugin_tensorrt_llm_metadata",
+    srcs = [":cmake_native_artifacts"],
+    output_group = "nvinfer_plugin_tensorrt_llm",
+    tags = ["manual"],
+)
+
+filegroup(
+    name = "decoder_attention_0",
+    srcs = [":cmake_native_artifacts"],
+    output_group = "decoder_attention_0",
+    tags = ["manual"],
+)
+
+filegroup(
+    name = "decoder_attention_1",
+    srcs = [":cmake_native_artifacts"],
+    output_group = "decoder_attention_1",
+    tags = ["manual"],
+)
+
+filegroup(
+    name = "pg_utils",
+    srcs = [":cmake_native_artifacts"],
+    output_group = "pg_utils",
+    tags = ["manual"],
+)
+
+filegroup(
+    name = "trtllm_runtime_libs",
+    srcs = [":cmake_native_artifacts"],
+    output_group = "trtllm_runtime_libs",
+    tags = ["manual"],
 )
 
 filegroup(
@@ -176,9 +245,18 @@ filegroup(
     ],
 )
 
-alias(
+filegroup(
     name = "tensorrt_llm_bindings",
-    actual = ":tensorrt_llm_bindings_metadata",
+    srcs = [":cmake_native_artifacts"],
+    output_group = "tensorrt_llm_bindings",
+    tags = ["manual"],
+)
+
+filegroup(
+    name = "executor_worker",
+    srcs = [":cmake_native_artifacts"],
+    output_group = "executor_worker",
+    tags = ["manual"],
 )
 
 filegroup(
@@ -500,10 +578,10 @@ filegroup(
     name = "wheel_native_artifacts",
     srcs = [
         ":cuda_kernel_archives",
-        ":libtensorrt_llm",
-        ":nvinfer_plugin_tensorrt_llm",
         ":tensorrt_llm_bindings",
+        ":trtllm_runtime_libs",
     ],
+    tags = ["manual"],
 )
 
 filegroup(

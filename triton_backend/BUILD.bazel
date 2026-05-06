@@ -1,43 +1,44 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+load("//tools/bazel:triton_backend.bzl", "triton_tensorrt_llm_backend")
+
 package(default_visibility = ["//visibility:public"])
 
-# Source-coverage metadata for query-time artifact modeling. This label models
-# the Triton backend's checked-in inputs; it does not build the backend shared
-# library.
-filegroup(
-    name = "triton_tensorrt_llm_backend",
-    srcs = [
-        "inflight_batcher_llm/CMakeLists.txt",
-        "inflight_batcher_llm/client/README.md",
-        "inflight_batcher_llm/client/__init__.py",
-        "inflight_batcher_llm/client/e2e_grpc_speculative_decoding_client.py",
-        "inflight_batcher_llm/client/end_to_end_grpc_client.py",
-        "inflight_batcher_llm/client/inflight_batcher_llm_client.py",
-        "inflight_batcher_llm/cmake/TritonTensorRTLLMBackendConfig.cmake.in",
-        "inflight_batcher_llm/cmake/modules/set_ifndef.cmake",
-        "inflight_batcher_llm/scripts/build.sh",
-        "inflight_batcher_llm/src/custom_metrics_reporter/custom_metrics_reporter.cc",
-        "inflight_batcher_llm/src/custom_metrics_reporter/custom_metrics_reporter.h",
-        "inflight_batcher_llm/src/libtensorrtllm.cc",
-        "inflight_batcher_llm/src/libtriton_tensorrtllm.ldscript",
-        "inflight_batcher_llm/src/model_instance_state.cc",
-        "inflight_batcher_llm/src/model_instance_state.h",
-        "inflight_batcher_llm/src/model_state.cc",
-        "inflight_batcher_llm/src/model_state.h",
-        "inflight_batcher_llm/src/namedTensor.cpp",
-        "inflight_batcher_llm/src/namedTensor.h",
-        "inflight_batcher_llm/src/utils.cc",
-        "inflight_batcher_llm/src/utils.h",
-        "inflight_batcher_llm/tests/CMakeLists.txt",
-        "inflight_batcher_llm/tests/first.json",
-        "inflight_batcher_llm/tests/modelInstanceStateTest.cpp",
-        "inflight_batcher_llm/tests/modelState.cpp",
-        "inflight_batcher_llm/tests/second.json",
-        "inflight_batcher_llm/tests/third.json",
-        "inflight_batcher_llm/tests/utilsTest.cpp",
+TRITON_TENSORRT_LLM_BACKEND_SRCS = glob(
+    ["inflight_batcher_llm/**"],
+    exclude = [
+        "inflight_batcher_llm/bazel-*/**",
+        "inflight_batcher_llm/build/**",
+        "inflight_batcher_llm/build_*/**",
+        "inflight_batcher_llm/cmake-build-*/**",
     ],
+)
+
+filegroup(
+    name = "triton_tensorrt_llm_backend_sources",
+    srcs = TRITON_TENSORRT_LLM_BACKEND_SRCS,
+)
+
+triton_tensorrt_llm_backend(
+    name = "triton_tensorrt_llm_backend",
+    srcs = TRITON_TENSORRT_LLM_BACKEND_SRCS,
+    decoder_attention_0 = "//cpp:decoder_attention_0",
+    decoder_attention_1 = "//cpp:decoder_attention_1",
+    executor_worker = "//cpp:executor_worker",
+    libtensorrt_llm = "//cpp:libtensorrt_llm",
+    nvinfer_plugin_tensorrt_llm = "//cpp:nvinfer_plugin_tensorrt_llm",
+    pg_utils = "//cpp:pg_utils",
+    tags = [
+        "manual",
+        "local",
+        "no-cache",
+        "no-remote",
+        "no-remote-cache",
+        "no-remote-exec",
+        "no-sandbox",
+    ],
+    trtllm_srcs = ["//cpp:cmake_artifact_sources"],
 )
 
 filegroup(

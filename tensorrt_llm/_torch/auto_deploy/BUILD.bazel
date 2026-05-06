@@ -7,3 +7,20 @@ py_library(
     name = "runtime",
     srcs = glob(["**/*.py"]),
 )
+
+filegroup(
+    name = "wheel_package_sources",
+    srcs = glob(
+        [
+            "**/*.cu",
+            "**/*.json",
+            "**/*.py",
+            "**/*.yaml",
+            "**/*.yml",
+        ],
+        exclude = [
+            "**/__pycache__/**",
+        ],
+        allow_empty = True,
+    ),
+)

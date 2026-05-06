@@ -19,12 +19,62 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+_TENSORRT_LLM_WHEEL_ROOT_SRCS = glob(
+    [
+        "3rdparty/**",
+        "docker/common/install_tensorrt.sh",
+        "scripts/**",
+        "tensorrt_llm/**",
+        "triton_kernels/**",
+    ],
+    exclude = [
+        "**/*~",
+        "**/*.bak*",
+        "**/*.pyc",
+        "**/__pycache__/**",
+        "tensorrt_llm/*.so",
+        "tensorrt_llm/*_cpp_tllm*.so",
+        "tensorrt_llm/bin/**",
+        "tensorrt_llm/bindings/**",
+        "tensorrt_llm/bindings*.pyd",
+        "tensorrt_llm/bindings*.pyi",
+        "tensorrt_llm/bindings*.so",
+        "tensorrt_llm/deep_ep/**",
+        "tensorrt_llm/deep_gemm/**",
+        "tensorrt_llm/flash_mla/**",
+        "tensorrt_llm/include/**",
+        "tensorrt_llm/libs/**",
+        "tensorrt_llm/tensorrt_llm_transfer_agent_binding*",
+    ],
+)
+
+filegroup(
+    name = "tensorrt_llm_wheel_sources",
+    srcs = _TENSORRT_LLM_WHEEL_ROOT_SRCS + [
+        ".gitmodules",
+        "ATTRIBUTIONS-CPP-aarch64.md",
+        "ATTRIBUTIONS-CPP-x86_64.md",
+        "LICENSE",
+        "README.md",
+        "constraints.txt",
+        "pyproject.toml",
+        "requirements-dev.txt",
+        "requirements.txt",
+        "setup.py",
+        "//cpp:wheel_package_sources",
+        "//tensorrt_llm/_torch/auto_deploy:wheel_package_sources",
+    ],
+    visibility = ["//visibility:private"],
+)
+
 # Real wheel packaging target. It is intentionally manual/local/non-hermetic:
 # scripts/build_wheel.py uses the host Python/CUDA/TensorRT/CMake environment,
-# may create or reuse source-tree build state, and can be expensive.
+# and can be expensive. The action stages declared inputs into a writable temp
+# tree so wheel assembly does not read or mutate the checkout.
 trtllm_wheel(
     name = "tensorrt_llm_wheel",
     script = "scripts/build_wheel.py",
+    srcs = [":tensorrt_llm_wheel_sources"],
     tags = [
         "manual",
         "local",
