@@ -83,7 +83,11 @@ python3 -m scripts.ci_target_graph.validate --repo-root . --output /tmp/trtllm-c
 bazel test //cpp:timestamp_utils_smoke_test --test_output=errors --cache_test_results=no
 bazel test //tests/unittest/tools:ci_target_graph_test
 bazel build //scripts/ci_target_graph:generate
+bazel build //triton_backend:triton_tensorrt_llm_backend
 bazel query '//ci/bazel/...'
+bazel query 'rdeps(//ci/bazel/..., //:tensorrt_llm_wheel_metadata)'
+bazel query 'rdeps(//ci/bazel/..., //cpp:cuda_kernels_metadata)'
+bazel query 'rdeps(//ci/bazel/..., //triton_backend:triton_tensorrt_llm_backend)'
 ```
 
 ## Host C++ Build Proof
@@ -126,23 +130,62 @@ timeout metadata, and hardware compatibility constraints. Runtime details such
 as model family, backend, CUDA/model-cache needs, and Triton runtime evidence
 remain query-visible tags instead of Bazel platform constraints.
 
-## Native Artifact Metadata Targets
+## Native Artifact Labels
 
-Phase 6 adds placeholder labels for package and native artifacts that generated
-AutoDeploy targets can depend on:
+Phase 6 adds labels for package and native artifact ownership. AutoDeploy seed
+and generated targets use the metadata/query edges for CI impact selection, not
+expensive local packaging wrappers.
 
-- `//:tensorrt_llm_wheel`
-- `//cpp:tensorrt_llm_bindings`
-- `//cpp:cuda_kernels`
-- `//cpp:nvinfer_plugin_tensorrt_llm`
+CI/query edge labels:
+
+- `//:tensorrt_llm_wheel_metadata`
+- `//cpp:tensorrt_llm_bindings_metadata`
+- `//cpp:cuda_kernels_metadata`
+- `//cpp:nvinfer_plugin_tensorrt_llm_metadata`
 - `//triton_backend:triton_tensorrt_llm_backend`
 
-These labels are metadata/query targets for CI impact selection. They let Bazel
-queries connect pytest selectors to owned native or packaging areas, but they do
-not build the TensorRT-LLM wheel, C++ bindings, CUDA kernels, TensorRT-LLM
-plugin library, or Triton backend. The `//cpp:timestamp_utils_smoke_test` host
-C++ smoke target is separate from this metadata model. Native builds still use
-the existing TensorRT-LLM build flow outside this spike.
+Explicit build labels:
+
+- `//:tensorrt_llm_wheel`
+- `//cpp:cuda_kernels`
+
+Current status:
+
+- `//:tensorrt_llm_wheel_metadata` is the wheel-related query and CI
+  impact-selection edge. It is a metadata-only filegroup over wheel inputs and
+  `//cpp:wheel_native_artifacts_metadata`.
+- `//:tensorrt_llm_wheel` is the manual/local wrapper around the existing wheel
+  flow. It is intentionally tagged local, non-hermetic, and expensive, and
+  should not be used as an AutoDeploy CI impact-selection dependency.
+- `//cpp:timestamp_utils_smoke_test` is the first real host C++ compile/run
+  proof in this spike.
+- `//triton_backend:triton_tensorrt_llm_backend` builds as a source-coverage
+  `filegroup` over checked-in Triton backend CMake, script, client, C++ source,
+  linker script, test, and fixture inputs. It does not compile or link
+  `libtriton_tensorrtllm.so`.
+- `//cpp:cuda_kernels` is a narrow real CUDA seed through the
+  `global_timer_kernel_cuda` target. It should be read as one CUDA build proof,
+  not full TensorRT-LLM CUDA parity.
+- `//cpp:cuda_kernels_metadata`, `//cpp:libtensorrt_llm_metadata`,
+  `//cpp:nvinfer_plugin_tensorrt_llm_metadata`, and
+  `//cpp:tensorrt_llm_bindings_metadata` are metadata-only source-coverage
+  filegroups for CI deps and queries.
+- `//cpp:wheel_native_artifacts` includes the real CUDA seed and is reserved for
+  explicit native-artifact builds. `//cpp:wheel_native_artifacts_metadata` is
+  the cheap CI/query aggregate.
+
+Full `//cpp:tensorrt_llm_bindings` remains blocked until the native stack models
+the nanobind module dependencies visible in the existing CMake: nanobind,
+Python libraries, Torch and `torch_python`, CUDA driver libraries, the shared
+TensorRT-LLM library target, `th_common`, `pg_utils`, and optional NVSHMEM or
+transfer-agent pieces.
+
+The full Triton backend shared library remains blocked until the native stack
+models the dependencies visible in `triton_backend/inflight_batcher_llm`: Triton
+common/core/backend repositories, CUDA Toolkit and runtime libraries, cuDNN,
+cuBLAS/cuBLASLt, CUDA driver/NVML libraries, MPI, NCCL, TensorRT 10,
+TensorRT-LLM core and plugin shared libraries, `executorWorker`, nlohmann/json,
+and GoogleTest for backend tests.
 
 ## Select Impacted Targets
 
@@ -223,10 +266,16 @@ bazel query 'attr("tags", "requires:triton", //ci/bazel/...)'
 List generated selectors depending on native artifact metadata:
 
 ```bash
-bazel query 'rdeps(//ci/bazel/..., //cpp:tensorrt_llm_bindings)'
-bazel query 'rdeps(//ci/bazel/..., //cpp:cuda_kernels)'
+bazel query 'rdeps(//ci/bazel/..., //:tensorrt_llm_wheel_metadata)'
+bazel query 'rdeps(//ci/bazel/..., //cpp:tensorrt_llm_bindings_metadata)'
+bazel query 'rdeps(//ci/bazel/..., //cpp:cuda_kernels_metadata)'
 bazel query 'rdeps(//ci/bazel/..., //triton_backend:triton_tensorrt_llm_backend)'
 ```
+
+`//:tensorrt_llm_wheel` is a manual/local wrapper target for developers running
+the wheel flow directly; use `//:tensorrt_llm_wheel_metadata` for CI
+reverse-dependency queries. Use `//cpp:cuda_kernels` for explicit CUDA build
+proofs and `//cpp:cuda_kernels_metadata` for CI reverse-dependency queries.
 
 Inspect compatibility under an H100 one-GPU target platform:
 
@@ -323,10 +372,13 @@ a deliberate reason for wildcard Bazel test patterns to include them.
 ## Known Limitations And Non-Goals
 
 - This is a CI/impact-selection spike, not a production Bazel build for TensorRT-LLM.
-- Bazel only builds the narrow host timestamp utility smoke target; it does not build TensorRT-LLM CUDA
-  kernels, TensorRT plugin libraries, native Python extensions, wheels, or Python packages in this spike.
-- Phase 6 native/package labels are metadata placeholders for query edges, not build rules for those
-  artifacts.
+- Bazel now has a real host C++ timestamp smoke build.
+- `//cpp:cuda_kernels` is a real narrow CUDA seed build for `globalTimerKernel`, not full CUDA kernel
+  parity.
+- `//:tensorrt_llm_wheel` is a manual/local wrapper that analyzes, but full execution was not run here.
+- `//:tensorrt_llm_wheel_metadata` and `//cpp:*_metadata` remain cheap CI/query edges.
+- Full bindings, full TensorRT-LLM native libraries, the full Triton backend shared library, and full wheel
+  parity remain incomplete.
 - Bazel does not provision GPUs, model weights, CUDA libraries, or the Python runtime environment needed by
   real integration tests.
 - The manifest generator is shadow-mode metadata. Jenkins remains the CI executor.

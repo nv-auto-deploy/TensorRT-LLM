@@ -111,6 +111,40 @@ manual GPU pytest selectors are not silently dropped; use
 `--manual-policy exclude` or `--manual-policy only` when a caller needs a
 different policy.
 
+## Native Label Status
+
+The native/package labels modeled by AutoDeploy Bazel deps are intentionally
+uneven in build depth. AutoDeploy seed and generated targets use metadata/query
+edges for CI impact selection; expensive manual/local wrapper targets are kept
+out of those deps.
+
+- `//:tensorrt_llm_wheel_metadata` is the wheel-related query and CI
+  impact-selection edge. It is a metadata-only filegroup over wheel inputs and
+  `//cpp:wheel_native_artifacts_metadata`.
+- `//:tensorrt_llm_wheel` is the manual/local wrapper around the existing wheel
+  flow. It is intentionally tagged local, non-hermetic, and expensive, and
+  should not be used as an AutoDeploy CI impact-selection dependency.
+- `//triton_backend:triton_tensorrt_llm_backend` is a source-coverage
+  `filegroup` over the checked-in Triton backend CMake, script, client, C++
+  source, linker script, test, and fixture inputs. It can be built and queried
+  by Bazel as file metadata, but it does not produce `libtriton_tensorrtllm.so`.
+- `//cpp:cuda_kernels` is a narrow real CUDA seed through the
+  `global_timer_kernel_cuda` target. Treat it as one CUDA build proof, not
+  complete CUDA or TensorRT-LLM native parity.
+- `//cpp:cuda_kernels_metadata`, `//cpp:nvinfer_plugin_tensorrt_llm_metadata`,
+  and `//cpp:tensorrt_llm_bindings_metadata` are metadata-only filegroups used
+  by AutoDeploy seed and generated Bazel deps.
+- Full `//cpp:tensorrt_llm_bindings` remains blocked until Bazel models the
+  nanobind module stack: nanobind, Python libraries, Torch and `torch_python`,
+  CUDA driver libraries, the shared TensorRT-LLM library target, `th_common`,
+  `pg_utils`, and optional NVSHMEM or transfer-agent pieces.
+- The full Triton backend shared library remains blocked until Bazel models the
+  dependencies visible in `triton_backend/inflight_batcher_llm`: Triton
+  common/core/backend repositories, CUDA Toolkit and runtime libraries, cuDNN,
+  cuBLAS/cuBLASLt, CUDA driver/NVML libraries, MPI, NCCL, TensorRT 10,
+  TensorRT-LLM core and plugin shared libraries, `executorWorker`,
+  nlohmann/json, and GoogleTest for backend tests.
+
 Structured runtime filters narrow selected Bazel targets using manifest runtime
 metadata instead of raw tag regexes:
 
@@ -163,15 +197,17 @@ It detects the local `TIMEOUT (N)` convention as minutes, detects `ISOLATION`,
 and leaves unusual selectors in the manifest instead of failing generation.
 
 The Bazel spike consumes this manifest for a narrow generated AutoDeploy H100
-subpackage. Phase 6 native/package labels such as `//cpp:tensorrt_llm_bindings`,
-`//cpp:cuda_kernels`, and `//triton_backend:triton_tensorrt_llm_backend` are
-metadata/query placeholders for reverse-dependency selection; they do not build
-the C++ bindings, CUDA kernels, plugin library, Triton backend, wheel, or any
-other native artifact. The separate `//cpp:timestamp_utils_smoke_test` target is
-the first narrow host C++ Bazel build proof, not CUDA, TensorRT, native
-extension, or wheel build parity. Most Python, C++, CUDA, model/data inputs, and
-generated artifacts are still intentionally unmodeled. Unknown or unmodeled
-areas should fall back conservatively rather than being skipped.
+subpackage. Native/package labels provide reverse-dependency selection edges,
+with `//:tensorrt_llm_wheel_metadata` serving as the wheel-related CI edge and
+`//:tensorrt_llm_wheel` remaining a manual/local wrapper. C++ CI edges use
+metadata-only labels such as `//cpp:cuda_kernels_metadata`; explicit native
+build labels such as `//cpp:cuda_kernels` remain opt-in. Most labels are still
+metadata or narrow local seeds rather than production native builds. The
+separate `//cpp:timestamp_utils_smoke_test` target is the first narrow host C++
+Bazel build proof, not CUDA, TensorRT, native extension, or wheel build parity.
+Most Python, C++, CUDA, model/data inputs, and generated artifacts are still
+intentionally unmodeled. Unknown or unmodeled areas should fall back
+conservatively rather than being skipped.
 
 ## Runtime Metadata
 
@@ -213,10 +249,16 @@ jq '.targets[] | select(.tags[]? == "requires:triton") | .target_id' \
 ```
 
 Bazel reverse-dependency queries can inspect generated selectors that depend on
-the Phase 6 metadata placeholders:
+the Phase 6 metadata/query labels:
 
 ```bash
-bazel query 'rdeps(//ci/bazel/..., //cpp:tensorrt_llm_bindings)'
-bazel query 'rdeps(//ci/bazel/..., //cpp:cuda_kernels)'
+bazel query 'rdeps(//ci/bazel/..., //:tensorrt_llm_wheel_metadata)'
+bazel query 'rdeps(//ci/bazel/..., //cpp:tensorrt_llm_bindings_metadata)'
+bazel query 'rdeps(//ci/bazel/..., //cpp:cuda_kernels_metadata)'
 bazel query 'rdeps(//ci/bazel/..., //triton_backend:triton_tensorrt_llm_backend)'
 ```
+
+Use `//:tensorrt_llm_wheel_metadata` for CI reverse-dependency queries.
+Use `//cpp:cuda_kernels_metadata` for CI reverse-dependency queries and
+`//cpp:cuda_kernels` for explicit CUDA build proof runs. `//:tensorrt_llm_wheel`
+is for manual/local wheel runs.

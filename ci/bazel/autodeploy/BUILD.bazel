@@ -16,10 +16,10 @@ _H100_COMPATIBILITY = ["//platforms/gpu:h100"]
 _ONE_GPU_COMPATIBILITY = ["//platforms/gpu_count:one"]
 _FOUR_GPU_COMPATIBILITY = ["//platforms/gpu_count:four"]
 _AUTODEPLOY_H100_ACCURACY_DEPS = [
-    "//:tensorrt_llm_wheel",
-    "//cpp:cuda_kernels",
-    "//cpp:nvinfer_plugin_tensorrt_llm",
-    "//cpp:tensorrt_llm_bindings",
+    "//:tensorrt_llm_wheel_metadata",
+    "//cpp:cuda_kernels_metadata",
+    "//cpp:nvinfer_plugin_tensorrt_llm_metadata",
+    "//cpp:tensorrt_llm_bindings_metadata",
     "//tensorrt_llm/_torch/auto_deploy:runtime",
     "//tests/integration/defs/accuracy:accuracy_tests",
 ]

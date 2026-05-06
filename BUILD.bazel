@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+load("//tools/bazel:wheel.bzl", "trtllm_wheel")
+
 exports_files(
     ["requirements_bazel_lock.txt"],
     visibility = ["//visibility:public"],
@@ -8,11 +10,29 @@ exports_files(
 
 # Metadata-only placeholder for query-time artifact modeling.
 filegroup(
-    name = "tensorrt_llm_wheel",
+    name = "tensorrt_llm_wheel_metadata",
     srcs = [
         "pyproject.toml",
         "setup.py",
-        "//cpp:wheel_native_artifacts",
+        "//cpp:wheel_native_artifacts_metadata",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# Real wheel packaging target. It is intentionally manual/local/non-hermetic:
+# scripts/build_wheel.py uses the host Python/CUDA/TensorRT/CMake environment,
+# may create or reuse source-tree build state, and can be expensive.
+trtllm_wheel(
+    name = "tensorrt_llm_wheel",
+    script = "scripts/build_wheel.py",
+    tags = [
+        "manual",
+        "local",
+        "no-cache",
+        "no-remote",
+        "no-remote-cache",
+        "no-remote-exec",
+        "no-sandbox",
     ],
     visibility = ["//visibility:public"],
 )

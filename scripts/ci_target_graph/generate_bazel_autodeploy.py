@@ -24,10 +24,10 @@ _AUTODEPLOY_H100_YAMLS = {
 _RUNTIME_DEP = "//tensorrt_llm/_torch/auto_deploy:runtime"
 _ACCURACY_DEP = "//tests/integration/defs/accuracy:accuracy_tests"
 _PHASE6_METADATA_DEPS = [
-    "//:tensorrt_llm_wheel",
-    "//cpp:cuda_kernels",
-    "//cpp:nvinfer_plugin_tensorrt_llm",
-    "//cpp:tensorrt_llm_bindings",
+    "//:tensorrt_llm_wheel_metadata",
+    "//cpp:cuda_kernels_metadata",
+    "//cpp:nvinfer_plugin_tensorrt_llm_metadata",
+    "//cpp:tensorrt_llm_bindings_metadata",
 ]
 _TRITON_DEP = "//triton_backend:triton_tensorrt_llm_backend"
 _GPU_CONSTRAINT_VALUES = {

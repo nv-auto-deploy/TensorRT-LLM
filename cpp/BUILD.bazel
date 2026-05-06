@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
@@ -24,34 +26,77 @@ cc_test(
 
 # Metadata-only placeholders for query-time artifact modeling.
 filegroup(
-    name = "libtensorrt_llm",
+    name = "libtensorrt_llm_metadata",
     srcs = [
         "CMakeLists.txt",
         "tensorrt_llm/CMakeLists.txt",
     ],
 )
 
+alias(
+    name = "libtensorrt_llm",
+    actual = ":libtensorrt_llm_metadata",
+)
+
 filegroup(
-    name = "nvinfer_plugin_tensorrt_llm",
+    name = "nvinfer_plugin_tensorrt_llm_metadata",
     srcs = [
         "tensorrt_llm/plugins/CMakeLists.txt",
     ],
 )
 
+alias(
+    name = "nvinfer_plugin_tensorrt_llm",
+    actual = ":nvinfer_plugin_tensorrt_llm_metadata",
+)
+
 filegroup(
-    name = "tensorrt_llm_bindings",
+    name = "tensorrt_llm_bindings_metadata",
     srcs = [
         "tensorrt_llm/nanobind/CMakeLists.txt",
     ],
 )
 
+alias(
+    name = "tensorrt_llm_bindings",
+    actual = ":tensorrt_llm_bindings_metadata",
+)
+
 filegroup(
-    name = "cuda_kernels",
+    name = "cuda_kernels_metadata",
     srcs = [
         "kernels/fmha_v2/setup.py",
         "kernels/xqa/CMakeLists.txt",
         "tensorrt_llm/kernels/CMakeLists.txt",
+        "tensorrt_llm/kernels/globalTimerKernel.cu",
+        "tensorrt_llm/kernels/globalTimerKernel.h",
     ],
+)
+
+cuda_library(
+    name = "global_timer_kernel_cuda",
+    srcs = ["tensorrt_llm/kernels/globalTimerKernel.cu"],
+    hdrs = [
+        "include/tensorrt_llm/common/assert.h",
+        "include/tensorrt_llm/common/config.h",
+        "include/tensorrt_llm/common/cudaBf16Wrapper.h",
+        "include/tensorrt_llm/common/cudaFp8Utils.h",
+        "include/tensorrt_llm/common/cudaUtils.h",
+        "include/tensorrt_llm/common/logger.h",
+        "include/tensorrt_llm/common/stringUtils.h",
+        "include/tensorrt_llm/common/tllmException.h",
+        "tensorrt_llm/common/cudaDriverWrapper.h",
+        "tensorrt_llm/kernels/globalTimerKernel.h",
+    ],
+    includes = [
+        ".",
+        "include",
+    ],
+)
+
+alias(
+    name = "cuda_kernels",
+    actual = ":global_timer_kernel_cuda",
 )
 
 filegroup(
@@ -61,5 +106,15 @@ filegroup(
         ":libtensorrt_llm",
         ":nvinfer_plugin_tensorrt_llm",
         ":tensorrt_llm_bindings",
+    ],
+)
+
+filegroup(
+    name = "wheel_native_artifacts_metadata",
+    srcs = [
+        ":cuda_kernels_metadata",
+        ":libtensorrt_llm_metadata",
+        ":nvinfer_plugin_tensorrt_llm_metadata",
+        ":tensorrt_llm_bindings_metadata",
     ],
 )

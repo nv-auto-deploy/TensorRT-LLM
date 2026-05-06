@@ -84,11 +84,15 @@ EXPECTED_TARGET_IDS = [
 ]
 AUTODEPLOY_RUNTIME_DEP = "//tensorrt_llm/_torch/auto_deploy:runtime"
 ACCURACY_TESTS_DEP = "//tests/integration/defs/accuracy:accuracy_tests"
-NATIVE_ARTIFACT_DEPS = [
-    "//:tensorrt_llm_wheel",
-    "//cpp:cuda_kernels",
-    "//cpp:nvinfer_plugin_tensorrt_llm",
-    "//cpp:tensorrt_llm_bindings",
+WHEEL_METADATA_DEP = "//:tensorrt_llm_wheel_metadata"
+EXPENSIVE_WHEEL_DEP = "//:tensorrt_llm_wheel"
+CUDA_KERNELS_METADATA_DEP = "//cpp:cuda_kernels_metadata"
+REAL_CUDA_KERNELS_DEP = "//cpp:cuda_kernels"
+NATIVE_ARTIFACT_METADATA_DEPS = [
+    WHEEL_METADATA_DEP,
+    CUDA_KERNELS_METADATA_DEP,
+    "//cpp:nvinfer_plugin_tensorrt_llm_metadata",
+    "//cpp:tensorrt_llm_bindings_metadata",
 ]
 TRITON_BACKEND_DEP = "//triton_backend:triton_tensorrt_llm_backend"
 
@@ -274,7 +278,20 @@ def _assert_selector(parsed: dict[str, Any], raw: str, path: str) -> None:
 
 def _assert_native_artifact_deps(deps: list[str]) -> None:
     assert deps == sorted(set(deps))
-    assert [dep for dep in deps if dep in NATIVE_ARTIFACT_DEPS] == NATIVE_ARTIFACT_DEPS
+    assert WHEEL_METADATA_DEP in deps
+    assert EXPENSIVE_WHEEL_DEP not in deps
+    assert CUDA_KERNELS_METADATA_DEP in deps
+    assert REAL_CUDA_KERNELS_DEP not in deps
+    assert [dep for dep in deps if dep in NATIVE_ARTIFACT_METADATA_DEPS] == (
+        NATIVE_ARTIFACT_METADATA_DEPS
+    )
+
+
+def _assert_build_content_uses_native_metadata_deps(build_content: str) -> None:
+    for dep in NATIVE_ARTIFACT_METADATA_DEPS:
+        assert f'"{dep}",' in build_content
+    assert f'"{EXPENSIVE_WHEEL_DEP}",' not in build_content
+    assert f'"{REAL_CUDA_KERNELS_DEP}",' not in build_content
 
 
 def _synthetic_autodeploy_manifest(*, selector: str, requirements: list[str]) -> dict[str, Any]:
@@ -586,6 +603,20 @@ def test_generate_autodeploy_h100_bazel_cases_include_native_deps_in_stable_orde
         _assert_native_artifact_deps(case.deps)
 
 
+def test_seed_autodeploy_h100_build_deps_use_native_metadata() -> None:
+    seed_build = (REPO_ROOT / "ci/bazel/autodeploy/BUILD.bazel").read_text(encoding="utf-8")
+
+    _assert_build_content_uses_native_metadata_deps(seed_build)
+
+
+def test_checked_in_generated_autodeploy_h100_build_deps_use_native_metadata() -> None:
+    generated_build = (REPO_ROOT / "ci/bazel/autodeploy/generated/BUILD.bazel").read_text(
+        encoding="utf-8"
+    )
+
+    _assert_build_content_uses_native_metadata_deps(generated_build)
+
+
 def test_generate_autodeploy_h100_bazel_case_with_triton_runtime_depends_on_triton_backend() -> (
     None
 ):
@@ -610,8 +641,7 @@ def test_render_autodeploy_h100_build_file_marks_generated_content() -> None:
     assert "autodeploy_h100_generated" in rendered
     assert AUTODEPLOY_RUNTIME_DEP in rendered
     assert ACCURACY_TESTS_DEP in rendered
-    for dep in NATIVE_ARTIFACT_DEPS:
-        assert dep in rendered
+    _assert_build_content_uses_native_metadata_deps(rendered)
 
 
 def test_validate_reports_targets_without_jenkins_stage_candidates() -> None:
