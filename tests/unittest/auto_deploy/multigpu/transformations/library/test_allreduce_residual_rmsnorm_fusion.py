@@ -66,13 +66,15 @@ class AllreduceResidualNorm2(torch.nn.Module):
         return normed, y
 
 
-def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
+def _test_allreduce_fusion(port: int | None, ModuleCls, strategy: str):
     if not is_trtllm_op_available():
         pytest.skip("Require trtllm ops to run test_allreduce_fusion.")
 
     # Pick the port inside the MPI workers so rank 0 chooses it immediately
     # before distributed init, instead of probing it in the parent and
     # leaving a race window before the workers use it for rendezvous.
+    # mpi_broadcast is collective across all ranks in this worker invocation,
+    # so late-starting ranks block until they join and receive the same port.
     if port is None:
         port = mpi_broadcast(get_free_port() if mpi_rank() == 0 else None)
 
@@ -142,11 +144,11 @@ def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
         export(gm_transformed, args=args)
         torch_export_to_gm(gm_transformed, args=args)
 
-        # Keep teardown coordinated so one rank does not race ahead into the
-        # next test case while the other still owns the rendezvous resources.
+    finally:
+        # Keep teardown coordinated so one rank does not race ahead while
+        # peers still hold rendezvous/process-group resources.
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
             torch.distributed.barrier()
-    finally:
         cleanup()
 
 
