@@ -208,6 +208,11 @@ transforms:
     rmsnorm_backend: flashinfer
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
+  # Run after fuse_rmsnorm so the trailing rmsnorm has been mapped to its
+  # backend variant (flashinfer/triton/torch); the transform matches all three.
+  fuse_lm_head_with_final_norm:
+    stage: post_load_fusion
+    enabled: true
   fuse_gdn_gating:
     stage: post_load_fusion
   fuse_l2norm:
