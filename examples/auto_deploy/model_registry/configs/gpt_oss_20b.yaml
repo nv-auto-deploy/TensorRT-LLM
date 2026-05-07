@@ -26,3 +26,5 @@ transforms:
   multi_stream_router:
     stage: compile
     enabled: true
+  fuse_torch_attention_sinks_path:
+    enabled: true

@@ -247,6 +247,14 @@ transforms:
   fuse_rope_into_trtllm_mla:
     stage: post_load_fusion
     enabled: false
+  # fuse_torch_attention_sinks_path pre-casts the sinks tensor referenced by
+  # torch_attention(..., sinks=...) to float32, eliminating the per-layer
+  # `.to(float32)` runtime cast inside trtllm_attention_mha_with_cache.
+  # Disabled by default; enable in model configs that route sinks-aware
+  # torch_attention to the trtllm cached attention backend (GPT-OSS family).
+  fuse_torch_attention_sinks_path:
+    stage: post_load_fusion
+    enabled: false
   optimize_rope:
     stage: post_load_fusion
   ############################################################################################
