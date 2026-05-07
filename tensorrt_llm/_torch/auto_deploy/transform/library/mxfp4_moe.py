@@ -1,3 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import operator
 from functools import partial
 from typing import Literal, Tuple
 
@@ -11,6 +27,10 @@ from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
+
+_MXFP4_LEGACY_EXPERT_BLOCK_SIZE = 32
+_MXFP4_SUPPORTED_EXPERT_BLOCK_SIZE = 32
+_MXFP4_VALUES_PER_BYTE = 2
 
 
 def _moe_dense_mlp_pattern(
@@ -154,6 +174,57 @@ def _is_packed_mxfp4_expert_layout(consumer: object) -> bool:
     return (
         isinstance(consumer, PackedMXFP4ExpertCheckpointLayout) and consumer.quant_method == "mxfp4"
     )
+
+
+def _normalize_mxfp4_expert_block_size(source: str, value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"MXFP4 {source} should be an integer, got {value}.")
+    try:
+        block_size = operator.index(value)
+    except TypeError as error:
+        raise ValueError(
+            f"MXFP4 {source} should be an integer, got {type(value).__name__}."
+        ) from error
+    if block_size <= 0:
+        raise ValueError(f"MXFP4 {source} should be positive, got {block_size}.")
+    return block_size
+
+
+def _resolve_mxfp4_expert_block_size(
+    qcfg: dict,
+    checkpoint_layout: object | None,
+) -> int:
+    candidates = []
+    if qcfg.get("expert_block_size") is not None:
+        candidates.append(("quant config expert_block_size", qcfg["expert_block_size"]))
+
+    layout_block_size = (
+        getattr(checkpoint_layout, "expert_block_size", None)
+        if checkpoint_layout is not None
+        else None
+    )
+    if layout_block_size is not None:
+        candidates.append(("checkpoint layout expert_block_size", layout_block_size))
+
+    if not candidates:
+        block_size = _MXFP4_LEGACY_EXPERT_BLOCK_SIZE
+    else:
+        source, value = candidates[0]
+        block_size = _normalize_mxfp4_expert_block_size(source, value)
+        for other_source, other_value in candidates[1:]:
+            other_block_size = _normalize_mxfp4_expert_block_size(other_source, other_value)
+            if other_block_size != block_size:
+                raise ValueError(
+                    "MXFP4 expert_block_size mismatch: "
+                    f"{source} is {block_size}, but {other_source} is {other_block_size}."
+                )
+
+    if block_size != _MXFP4_SUPPORTED_EXPERT_BLOCK_SIZE:
+        raise ValueError(
+            "MXFP4 MoE supports expert_block_size=32 because torch_mxfp4_moe decodes "
+            f"32 values per scale block, got {block_size}."
+        )
+    return block_size
 
 
 class MXFP4MLPConfig(TransformConfig):
@@ -340,12 +411,24 @@ def _get_mxfp4_expert_dims(
     return E, H, In
 
 
+def _mxfp4_block_count(name: str, dim: int, expert_block_size: int) -> int:
+    if dim <= 0:
+        raise ValueError(f"MXFP4 expert {name} should be positive, got {dim}.")
+    if dim % expert_block_size != 0:
+        raise ValueError(
+            f"MXFP4 expert {name} should be divisible by expert_block_size="
+            f"{expert_block_size}, got {dim}."
+        )
+    return dim // expert_block_size
+
+
 def _register_mxfp4_expert_params(
     gm: GraphModule,
     gate_up_w_name: str,
     gate_up_b_name: str,
     down_w_name: str,
     down_b_name: str,
+    expert_block_size: int,
 ) -> Tuple[str, str, str, str]:
     """Create (if missing) the four MXFP4 params under the experts module and return their full names.
 
@@ -354,9 +437,9 @@ def _register_mxfp4_expert_params(
     """
     E, H, In = _get_mxfp4_expert_dims(gm, gate_up_w_name, gate_up_b_name, down_b_name)
 
-    # Compute block dims (assume divisible; zero-init anyway)
-    H_blk = max(1, H // 32)
-    I_blk = max(1, In // 32)
+    packed_block_width = expert_block_size // _MXFP4_VALUES_PER_BYTE
+    H_blk = _mxfp4_block_count("hidden_size", H, expert_block_size)
+    I_blk = _mxfp4_block_count("intermediate_size", In, expert_block_size)
 
     experts_mod, experts_path, _ = get_submodule_of_param(gm, gate_up_w_name)
 
@@ -367,9 +450,9 @@ def _register_mxfp4_expert_params(
     dn_scales_name = "down_proj_scales"
 
     # Zero-init tensors (uint8 for blocks/scales)
-    gu_blocks = torch.zeros((E, 2 * In, H_blk, 16), dtype=torch.uint8)
+    gu_blocks = torch.zeros((E, 2 * In, H_blk, packed_block_width), dtype=torch.uint8)
     gu_scales = torch.zeros((E, 2 * In, H_blk), dtype=torch.uint8)
-    dn_blocks = torch.zeros((E, H, I_blk, 16), dtype=torch.uint8)
+    dn_blocks = torch.zeros((E, H, I_blk, packed_block_width), dtype=torch.uint8)
     dn_scales = torch.zeros((E, H, I_blk), dtype=torch.uint8)
 
     experts_mod.register_parameter(gu_blocks_name, nn.Parameter(gu_blocks, requires_grad=False))
@@ -430,6 +513,7 @@ class InsertMXFP4MLP(BaseTransform):
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
+        expert_block_size = _resolve_mxfp4_expert_block_size(qcfg, checkpoint_layout)
         registered_targets: set[tuple[str, str, str, str]] = set()
         num_matches = 0
         if checkpoint_layout is not None:
@@ -493,7 +577,14 @@ class InsertMXFP4MLP(BaseTransform):
 
             # Register MXFP4 params on experts
             gu_blocks_name, gu_scales_name, dn_blocks_name, dn_scales_name = (
-                _register_mxfp4_expert_params(gm, gu_w_name, gu_b_name, dn_w_name, dn_b_name)
+                _register_mxfp4_expert_params(
+                    gm,
+                    gu_w_name,
+                    gu_b_name,
+                    dn_w_name,
+                    dn_b_name,
+                    expert_block_size,
+                )
             )
             if checkpoint_layout is not None:
                 _register_mxfp4_expert_layout_hook(
