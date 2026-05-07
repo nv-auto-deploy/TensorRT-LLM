@@ -269,6 +269,14 @@ transforms:
   insert_cached_attention:
     stage: cache_init
     backend: trtllm
+  # Folds the [B,S,N,D] -> reshape([B,S,-1]) -> o_proj tail of cached
+  # trtllm attention into a strict aten.view (the cached attention output
+  # is provably contiguous, so the reshape is always a no-copy view).
+  # Disabled by default; enable in model configs that route through the
+  # trtllm cached attention backend (GPT-OSS family).
+  fuse_attn_output_view_chain:
+    stage: cache_init
+    enabled: false
   insert_cached_mla_attention:
     stage: cache_init
     requires_shape_prop: true

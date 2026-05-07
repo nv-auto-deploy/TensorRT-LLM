@@ -14,6 +14,12 @@ per attention layer.
 Distinct from :class:`FuseGemms` (which only handles bias-less linear
 ops) — this transform supports the bias case that GPT-OSS-style
 attention uses (``attention_bias=True``).
+
+This module also hosts :class:`FuseAttnOutputViewChain`, which mirrors
+the QKV-side fusion on the attention OUTPUT side: it folds the
+``cached_attn[B,S,N,D] → reshape([B,S,-1]) → o_proj`` chain into
+``cached_attn → view([B,S,-1]) → o_proj`` so the metadata op is a strict
+view (no contiguity-check fallback path).
 """
 
 from collections import defaultdict
@@ -28,7 +34,7 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
-from ...utils.node_utils import is_linear_op
+from ...utils.node_utils import is_linear_op, is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -175,6 +181,80 @@ class FuseQKVProj(BaseTransform):
                         num_matches += 1
 
         torch.cuda.empty_cache()
+
+        return gm, TransformInfo(
+            skipped=False,
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
+        )
+
+
+# Cached-attention ops whose output flows directly into o_proj via a
+# tail reshape. The cached attention kernel returns a contiguous tensor
+# (``output.view(*q_shape_og)`` over a freshly-allocated ``torch.zeros``),
+# so the reshape is provably a view and can be expressed as ``aten.view``.
+_CACHED_ATTN_OUTPUT_OPS = (torch.ops.auto_deploy.trtllm_attention_mha_with_cache,)
+
+
+@TransformRegistry.register("fuse_attn_output_view_chain")
+class FuseAttnOutputViewChain(BaseTransform):
+    """Rewrite the tail reshape after cached attention into a strict view.
+
+    The GPT-OSS attention forward emits, per layer:
+
+        attn_out = trtllm_attention_mha_with_cache(q, k, v, ...)  # [B, S, N, D]
+        attn_out = aten.reshape(attn_out, [B, S, -1])             # [B, S, N*D]
+        out      = o_proj(attn_out)
+
+    The cached attention op returns a contiguous tensor (its underlying
+    buffer is a freshly-allocated ``torch.zeros(B*S, N*D, ...)`` viewed
+    back to ``q``'s shape). The tail ``aten.reshape`` therefore always
+    resolves to a view, never a copy. Replacing it with
+    ``aten.view.default`` removes the contiguity-check fallback path
+    from the dispatch and makes the no-copy property explicit in the
+    graph (analogous to how ``fuse_qkv_proj`` collapses the input-side
+    chain into a single fused linear + ``narrow`` view per slice).
+    """
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        num_matches = 0
+        for attn_node in list(gm.graph.nodes):
+            if not is_op(attn_node, _CACHED_ATTN_OUTPUT_OPS):
+                continue
+            for user in list(attn_node.users):
+                if not is_op(user, torch.ops.aten.reshape):
+                    continue
+                # Skip if reshape input isn't the attention output (defensive).
+                if user.args[0] is not attn_node:
+                    continue
+                with gm.graph.inserting_before(user):
+                    view_node = gm.graph.call_function(
+                        torch.ops.aten.view.default,
+                        args=user.args,
+                        kwargs=user.kwargs,
+                    )
+                ref_val = user.meta.get("val")
+                if ref_val is not None:
+                    view_node.meta["val"] = torch.empty(
+                        ref_val.shape, dtype=ref_val.dtype, device="meta"
+                    )
+                user.replace_all_uses_with(view_node)
+                gm.graph.erase_node(user)
+                num_matches += 1
+
+        if num_matches:
+            ad_logger.warning(
+                f"FuseAttnOutputViewChain: rewrote {num_matches} reshape→view "
+                f"after cached attention output."
+            )
+            eliminate_dead_code(gm)
 
         return gm, TransformInfo(
             skipped=False,

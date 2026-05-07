@@ -31,3 +31,10 @@ transforms:
   persist_moe_workspace_tensors:
     stage: compile
     enabled: true
+  # Rewrite the [B,S,N,D] -> reshape([B,S,-1]) -> o_proj tail of cached
+  # attention into a strict aten.view (no contiguity-check fallback path).
+  # Must run AFTER insert_cached_attention; the source op is the cached
+  # trtllm_attention_mha_with_cache, not the pre-cache torch_attention.
+  fuse_attn_output_view_chain:
+    stage: cache_init
+    enabled: true
