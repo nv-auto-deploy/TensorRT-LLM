@@ -24,13 +24,24 @@ from torch.fx import GraphModule, Node
 
 from ...models.quant_checkpoint_layout import PackedMXFP4ExpertCheckpointLayout
 from ...utils.module import get_submodule_of_param
-from ...utils.node_utils import is_op
+from ...utils.node_utils import extract_op_args, is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
 
-_MXFP4_LEGACY_EXPERT_BLOCK_SIZE = 32
+_MXFP4_DEFAULT_EXPERT_BLOCK_SIZE = 32
 _MXFP4_SUPPORTED_EXPERT_BLOCK_SIZE = 32
 _MXFP4_VALUES_PER_BYTE = 2
+_MXFP4_LAYOUT_ARG_NAMES = (
+    "gate_up_blocks",
+    "gate_up_scales",
+    "down_blocks",
+    "down_scales",
+)
+_MXFP4_RUNTIME_OPS = (
+    torch.ops.auto_deploy.torch_mxfp4_moe,
+    torch.ops.auto_deploy.triton_mxfp4_moe,
+    torch.ops.auto_deploy.torch_mxfp4_moe_from_routing,
+)
 
 
 def _moe_dense_mlp_pattern(
@@ -207,7 +218,7 @@ def _resolve_mxfp4_expert_block_size(
         candidates.append(("checkpoint layout expert_block_size", layout_block_size))
 
     if not candidates:
-        block_size = _MXFP4_LEGACY_EXPERT_BLOCK_SIZE
+        block_size = _MXFP4_DEFAULT_EXPERT_BLOCK_SIZE
     else:
         source, value = candidates[0]
         block_size = _normalize_mxfp4_expert_block_size(source, value)
@@ -232,7 +243,8 @@ class MXFP4MLPConfig(TransformConfig):
         default="auto",
         description=(
             "Backend for packed MXFP4 MoE lowering. 'auto' selects the torch reference path "
-            "for checkpoint-layout packed experts and Triton for legacy quant_method=mxfp4."
+            "for checkpoint-layout packed experts and Triton for quant_method=mxfp4 without "
+            "checkpoint layout metadata."
         ),
     )
 
@@ -263,35 +275,13 @@ def _get_attr_tensor(gm: GraphModule, target: str) -> torch.Tensor:
     return tensor
 
 
-def _mxfp4_expert_arg_positions(node: Node) -> dict[str, int] | None:
-    if is_op(node, torch.ops.auto_deploy.torch_mxfp4_moe) or is_op(
-        node, torch.ops.auto_deploy.triton_mxfp4_moe
-    ):
-        return {
-            "gate_up_blocks": 4,
-            "gate_up_scales": 6,
-            "down_blocks": 9,
-            "down_scales": 11,
-        }
-    if is_op(node, torch.ops.auto_deploy.torch_mxfp4_moe_from_routing):
-        return {
-            "gate_up_blocks": 3,
-            "gate_up_scales": 5,
-            "down_blocks": 8,
-            "down_scales": 10,
-        }
-    return None
-
-
 def _mxfp4_target_names_from_node(node: Node) -> dict[str, str] | None:
-    positions = _mxfp4_expert_arg_positions(node)
-    if positions is None:
+    if not is_op(node, _MXFP4_RUNTIME_OPS):
         return None
+
+    expert_args = extract_op_args(node, *_MXFP4_LAYOUT_ARG_NAMES)
     target_names: dict[str, str] = {}
-    for name, position in positions.items():
-        if position >= len(node.args):
-            return None
-        arg = node.args[position]
+    for name, arg in zip(_MXFP4_LAYOUT_ARG_NAMES, expert_args):
         if not isinstance(arg, Node) or arg.op != "get_attr":
             return None
         target_names[name] = str(arg.target)
