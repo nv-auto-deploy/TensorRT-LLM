@@ -54,9 +54,14 @@ TensorCacheKey = tuple[
 WeightCacheKey = tuple[object, ...]
 
 _MXFP4_WEIGHT_CACHE_MAX_ENTRIES = 256
+_MXFP4_BIAS_CACHE_MAX_ENTRIES = 256
+_MAX_MXFP4_IMPRECISE_ACC = 2**30
 # ``convert_layout`` swizzles the packed expert weights. Cache the result by
 # underlying storage/view metadata so decode steps do not repeat that work.
 _MXFP4_WEIGHT_CACHE: OrderedDict[WeightCacheKey, tuple[PreparedWeights, list[weakref.finalize]]] = (
+    OrderedDict()
+)
+_MXFP4_BIAS_CACHE: OrderedDict[TensorCacheKey, tuple[torch.Tensor, list[weakref.finalize]]] = (
     OrderedDict()
 )
 
@@ -126,9 +131,23 @@ def _evict_mxfp4_weight_cache_entry(key: WeightCacheKey) -> None:
     _detach_finalizers(finalizers)
 
 
+def _evict_mxfp4_bias_cache_entry(key: TensorCacheKey) -> None:
+    entry = _MXFP4_BIAS_CACHE.pop(key, None)
+    if entry is None:
+        return
+    _, finalizers = entry
+    _detach_finalizers(finalizers)
+
+
 def _trim_mxfp4_weight_cache() -> None:
     while len(_MXFP4_WEIGHT_CACHE) > _MXFP4_WEIGHT_CACHE_MAX_ENTRIES:
         _, (_, finalizers) = _MXFP4_WEIGHT_CACHE.popitem(last=False)
+        _detach_finalizers(finalizers)
+
+
+def _trim_mxfp4_bias_cache() -> None:
+    while len(_MXFP4_BIAS_CACHE) > _MXFP4_BIAS_CACHE_MAX_ENTRIES:
+        _, (_, finalizers) = _MXFP4_BIAS_CACHE.popitem(last=False)
         _detach_finalizers(finalizers)
 
 
@@ -151,6 +170,41 @@ def _register_cache_finalizers(
         seen_sources.add(source_id)
         finalizers.append(weakref.finalize(source, _evict_mxfp4_weight_cache_entry, key))
     return finalizers
+
+
+def _register_bias_cache_finalizers(
+    key: TensorCacheKey, tensors: tuple[torch.Tensor, ...]
+) -> list[weakref.finalize]:
+    finalizers: list[weakref.finalize] = []
+    seen_sources: set[int] = set()
+    for tensor in tensors:
+        source = _source_tensor(tensor)
+        source_id = id(source)
+        if source_id in seen_sources:
+            continue
+        seen_sources.add(source_id)
+        finalizers.append(weakref.finalize(source, _evict_mxfp4_bias_cache_entry, key))
+    return finalizers
+
+
+def _bias_as_fp32(bias: torch.Tensor) -> torch.Tensor:
+    if bias.dtype == torch.float32:
+        return bias
+
+    key = _tensor_cache_key(bias)
+    entry = _MXFP4_BIAS_CACHE.get(key)
+    if entry is not None:
+        _MXFP4_BIAS_CACHE.move_to_end(key)
+        cached_bias, _ = entry
+        return cached_bias
+
+    cached_bias = bias.to(torch.float32)
+    _MXFP4_BIAS_CACHE[key] = (
+        cached_bias,
+        _register_bias_cache_finalizers(key, (bias,)),
+    )
+    _trim_mxfp4_bias_cache()
+    return cached_bias
 
 
 def _prepare_weights_scales(
@@ -252,10 +306,14 @@ def _run_mxfp4_mlp_core(
     )
 
     gate_pc = PrecisionConfig(
-        weight_scale=gate_up_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
+        weight_scale=gate_up_w_scale_raw,
+        flex_ctx=FlexCtx(rhs_data=InFlexData()),
+        max_num_imprecise_acc=_MAX_MXFP4_IMPRECISE_ACC,
     )
     down_pc = PrecisionConfig(
-        weight_scale=down_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
+        weight_scale=down_w_scale_raw,
+        flex_ctx=FlexCtx(rhs_data=InFlexData()),
+        max_num_imprecise_acc=_MAX_MXFP4_IMPRECISE_ACC,
     )
 
     act = FusedActivation(
@@ -267,7 +325,7 @@ def _run_mxfp4_mlp_core(
     inter = matmul_ogs(
         x,
         triton_gate_up_w,
-        gate_up_bias.to(torch.float32),
+        _bias_as_fp32(gate_up_bias),
         routing_data,
         gather_indx=gather_idx,
         precision_config=gate_pc,
@@ -279,7 +337,7 @@ def _run_mxfp4_mlp_core(
     y = matmul_ogs(
         inter,
         triton_down_w,
-        down_bias.to(torch.float32),
+        _bias_as_fp32(down_bias),
         routing_data,
         scatter_indx=scatter_idx,
         precision_config=down_pc,
