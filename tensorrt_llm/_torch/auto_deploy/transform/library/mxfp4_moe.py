@@ -6,6 +6,7 @@ import torch.nn as nn
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
+from ...models.quant_checkpoint_layout import PackedMXFP4ExpertCheckpointLayout
 from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
@@ -139,9 +140,7 @@ def _get_topk_from_router(node: Node) -> int:
     return int(node.args[3]) if len(node.args) >= 4 else 2
 
 
-def _get_packed_mxfp4_expert_layout(
-    qcfg: dict,
-) -> object | None:
+def _get_packed_mxfp4_expert_layout(qcfg: dict) -> PackedMXFP4ExpertCheckpointLayout | None:
     checkpoint_layout = qcfg.get("checkpoint_layout")
     if checkpoint_layout is None:
         return None
@@ -153,9 +152,7 @@ def _get_packed_mxfp4_expert_layout(
 
 def _is_packed_mxfp4_expert_layout(consumer: object) -> bool:
     return (
-        getattr(consumer, "quant_method", None) == "mxfp4"
-        and callable(getattr(consumer, "layer_from_runtime_name", None))
-        and callable(getattr(consumer, "load_runtime_buffers", None))
+        isinstance(consumer, PackedMXFP4ExpertCheckpointLayout) and consumer.quant_method == "mxfp4"
     )
 
 
@@ -176,22 +173,65 @@ def _get_mxfp4_moe_op(backend: Literal["torch", "triton"]):
 
 
 def _layout_layer_from_names(
-    checkpoint_layout: object,
+    checkpoint_layout: PackedMXFP4ExpertCheckpointLayout,
     source_names: dict[str, str],
-):
-    layer_from_runtime_name = getattr(checkpoint_layout, "layer_from_runtime_name")
+) -> int | None:
     for source_name in source_names.values():
-        layer = layer_from_runtime_name(source_name)
+        layer = checkpoint_layout.layer_from_runtime_name(source_name)
         if layer is not None:
             return layer
     return None
+
+
+def _get_attr_tensor(gm: GraphModule, target: str) -> torch.Tensor:
+    mod_name, _, attr_name = target.rpartition(".")
+    submod = gm.get_submodule(mod_name)
+    tensor = getattr(submod, attr_name)
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"Expected get_attr target {target} to be a tensor, got {type(tensor)}.")
+    return tensor
+
+
+def _mxfp4_expert_arg_positions(node: Node) -> dict[str, int] | None:
+    if is_op(node, torch.ops.auto_deploy.torch_mxfp4_moe) or is_op(
+        node, torch.ops.auto_deploy.triton_mxfp4_moe
+    ):
+        return {
+            "gate_up_blocks": 4,
+            "gate_up_scales": 6,
+            "down_blocks": 9,
+            "down_scales": 11,
+        }
+    if is_op(node, torch.ops.auto_deploy.torch_mxfp4_moe_from_routing):
+        return {
+            "gate_up_blocks": 3,
+            "gate_up_scales": 5,
+            "down_blocks": 8,
+            "down_scales": 10,
+        }
+    return None
+
+
+def _mxfp4_target_names_from_node(node: Node) -> dict[str, str] | None:
+    positions = _mxfp4_expert_arg_positions(node)
+    if positions is None:
+        return None
+    target_names: dict[str, str] = {}
+    for name, position in positions.items():
+        if position >= len(node.args):
+            return None
+        arg = node.args[position]
+        if not isinstance(arg, Node) or arg.op != "get_attr":
+            return None
+        target_names[name] = str(arg.target)
+    return target_names
 
 
 def _load_mxfp4_expert_layout_hook(
     state_dict,
     prefix,
     *args,
-    checkpoint_layout: object,
+    checkpoint_layout: PackedMXFP4ExpertCheckpointLayout,
     target_names: dict[str, str],
     layer: int,
     num_experts: int,
@@ -199,8 +239,9 @@ def _load_mxfp4_expert_layout_hook(
     intermediate_size: int,
 ) -> None:
     prefix = prefix or ""
-    load_runtime_buffers = getattr(checkpoint_layout, "load_runtime_buffers")
-    load_runtime_buffers(
+    if prefix + target_names["gate_up_blocks"] in state_dict:
+        return
+    checkpoint_layout.load_runtime_buffers(
         state_dict,
         prefix,
         layer=layer,
@@ -212,6 +253,69 @@ def _load_mxfp4_expert_layout_hook(
         target_down_scales=target_names["down_scales"],
         num_experts=num_experts,
     )
+
+
+def _register_mxfp4_expert_layout_hook(
+    gm: GraphModule,
+    checkpoint_layout: PackedMXFP4ExpertCheckpointLayout,
+    target_names: dict[str, str],
+    *,
+    registered_targets: set[tuple[str, str, str, str]] | None = None,
+) -> bool:
+    target_key = (
+        target_names["gate_up_blocks"],
+        target_names["gate_up_scales"],
+        target_names["down_blocks"],
+        target_names["down_scales"],
+    )
+    if registered_targets is not None:
+        if target_key in registered_targets:
+            return False
+        registered_targets.add(target_key)
+
+    layer = _layout_layer_from_names(checkpoint_layout, target_names)
+    if layer is None:
+        return False
+    gate_up_blocks = _get_attr_tensor(gm, target_names["gate_up_blocks"])
+    down_blocks = _get_attr_tensor(gm, target_names["down_blocks"])
+    if gate_up_blocks.dim() < 4 or down_blocks.dim() < 4:
+        raise ValueError(
+            "MXFP4 expert runtime buffers should be at least rank 4, got "
+            f"{gate_up_blocks.shape} and {down_blocks.shape}."
+        )
+    gm._register_load_state_dict_pre_hook(
+        partial(
+            _load_mxfp4_expert_layout_hook,
+            checkpoint_layout=checkpoint_layout,
+            target_names=target_names,
+            layer=layer,
+            num_experts=int(gate_up_blocks.shape[0]),
+            hidden_size=int(down_blocks.shape[1]),
+            intermediate_size=int(gate_up_blocks.shape[1] // 2),
+        )
+    )
+    return True
+
+
+def _register_existing_mxfp4_expert_layout_hooks(
+    gm: GraphModule,
+    checkpoint_layout: PackedMXFP4ExpertCheckpointLayout,
+    *,
+    registered_targets: set[tuple[str, str, str, str]],
+) -> int:
+    num_hooks = 0
+    for node in gm.graph.nodes:
+        target_names = _mxfp4_target_names_from_node(node)
+        if target_names is None:
+            continue
+        if _register_mxfp4_expert_layout_hook(
+            gm,
+            checkpoint_layout,
+            target_names,
+            registered_targets=registered_targets,
+        ):
+            num_hooks += 1
+    return num_hooks
 
 
 def _get_mxfp4_expert_dims(
@@ -326,7 +430,14 @@ class InsertMXFP4MLP(BaseTransform):
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
+        registered_targets: set[tuple[str, str, str, str]] = set()
         num_matches = 0
+        if checkpoint_layout is not None:
+            num_matches += _register_existing_mxfp4_expert_layout_hooks(
+                gm,
+                checkpoint_layout,
+                registered_targets=registered_targets,
+            )
         mxfp4_backend = self._resolve_backend(qcfg, checkpoint_layout)
         mxfp4_op = _get_mxfp4_moe_op(mxfp4_backend)
 
@@ -385,21 +496,16 @@ class InsertMXFP4MLP(BaseTransform):
                 _register_mxfp4_expert_params(gm, gu_w_name, gu_b_name, dn_w_name, dn_b_name)
             )
             if checkpoint_layout is not None:
-                gm._register_load_state_dict_pre_hook(
-                    partial(
-                        _load_mxfp4_expert_layout_hook,
-                        checkpoint_layout=checkpoint_layout,
-                        target_names={
-                            "gate_up_blocks": gu_blocks_name,
-                            "gate_up_scales": gu_scales_name,
-                            "down_blocks": dn_blocks_name,
-                            "down_scales": dn_scales_name,
-                        },
-                        layer=layer,
-                        num_experts=num_experts,
-                        hidden_size=hidden_size,
-                        intermediate_size=intermediate_size,
-                    )
+                _register_mxfp4_expert_layout_hook(
+                    gm,
+                    checkpoint_layout,
+                    {
+                        "gate_up_blocks": gu_blocks_name,
+                        "gate_up_scales": gu_scales_name,
+                        "down_blocks": dn_blocks_name,
+                        "down_scales": dn_scales_name,
+                    },
+                    registered_targets=registered_targets,
                 )
 
             # Alpha/limit (from dense call)
