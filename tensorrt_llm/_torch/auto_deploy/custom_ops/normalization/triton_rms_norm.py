@@ -28,25 +28,46 @@ def rms_norm_kernel(
     eps: tl.constexpr,
     N_COLS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_TILE: tl.constexpr,
 ):
     """Rms norm kernel.
-    Forces weights to be in float32 for the kernel.
+
+    Iterates over BLOCK_N in chunks of BLOCK_TILE. With BLOCK_TILE == BLOCK_N
+    (default) this is a single-pass kernel; smaller BLOCK_TILE switches to a
+    2-pass chunked layout that reduces register pressure per stage.
     """
     prog_id = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK_N)
+    x_base = input + prog_id * input_row_stride
+    out_base = output + prog_id * input_row_stride
+    inv_n = float(1.0 / N_COLS)
 
-    w = tl.load(weight + offsets, mask=offsets < N_COLS)
-
-    x_ptr = input + prog_id * input_row_stride
-    x = tl.load(x_ptr + offsets, mask=offsets < N_COLS)
-    xf = x.to(tl.float32)
-
-    var = tl.sum(xf * xf, 0) * float(1.0 / N_COLS)
-    out = xf / tl.sqrt(var + eps)
-    out = (w.to(tl.float32) * out).to(x.dtype)
-
-    out_ptr = output + prog_id * input_row_stride
-    tl.store(out_ptr + offsets, out, mask=offsets < N_COLS)
+    if BLOCK_TILE >= BLOCK_N:
+        offsets = tl.arange(0, BLOCK_N)
+        mask = offsets < N_COLS
+        w = tl.load(weight + offsets, mask=mask).to(tl.float32)
+        x = tl.load(x_base + offsets, mask=mask)
+        xf = x.to(tl.float32)
+        var = tl.sum(xf * xf, 0) * inv_n
+        rrms = tl.rsqrt(var + eps)
+        out = (xf * rrms * w).to(x.dtype)
+        tl.store(out_base + offsets, out, mask=mask)
+    else:
+        sum_sq = 0.0
+        for k in tl.static_range(0, BLOCK_N, BLOCK_TILE):
+            offs = k + tl.arange(0, BLOCK_TILE)
+            mask = offs < N_COLS
+            x_chunk = tl.load(x_base + offs, mask=mask).to(tl.float32)
+            sum_sq += tl.sum(x_chunk * x_chunk, 0)
+        var = sum_sq * inv_n
+        rrms = 1.0 / tl.sqrt(var + eps)
+        for k in tl.static_range(0, BLOCK_N, BLOCK_TILE):
+            offs = k + tl.arange(0, BLOCK_TILE)
+            mask = offs < N_COLS
+            w_chunk = tl.load(weight + offs, mask=mask).to(tl.float32)
+            x_chunk = tl.load(x_base + offs, mask=mask)
+            xf = x_chunk.to(tl.float32)
+            out = (xf * rrms * w_chunk).to(x_chunk.dtype)
+            tl.store(out_base + offs, out, mask=mask)
 
 
 def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5):
@@ -62,6 +83,7 @@ def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5):
     input_stride = hidden_states.stride(-2)
 
     BLOCK_N = triton.next_power_of_2(feat_size)
+    BLOCK_TILE = BLOCK_N  # single-pass fast path; smaller value enables chunked path
     out = torch.empty_like(hidden_states)
 
     grid = (seq_len,)
@@ -73,6 +95,7 @@ def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5):
         eps=eps,
         N_COLS=feat_size,
         BLOCK_N=BLOCK_N,
+        BLOCK_TILE=BLOCK_TILE,
         num_warps=4,
         num_stages=3,
     )
