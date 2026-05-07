@@ -28,3 +28,6 @@ transforms:
     enabled: true
   fuse_torch_attention_sinks_path:
     enabled: true
+  persist_moe_workspace_tensors:
+    stage: compile
+    enabled: true
