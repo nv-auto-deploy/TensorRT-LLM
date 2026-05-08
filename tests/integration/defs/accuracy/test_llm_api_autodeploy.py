@@ -19,7 +19,7 @@ import pytest
 import torch
 import yaml
 from defs.conftest import (get_device_count, get_device_memory, get_llm_root,
-                           llm_models_root, skip_pre_ada, skip_pre_blackwell,
+                           llm_models_root, skip_pre_ada,
                            skip_pre_hopper)
 from test_common.llm_data import hf_id_to_local_model_dir
 
@@ -67,8 +67,9 @@ def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
 
 
 def _set_quant_config(llm, model_id: str) -> None:
-    """Set quant_config on *llm* based on *model_id* so the accuracy harness
-    can resolve the correct thresholds.
+    """Set quant_config on *llm* based on *model_id*.
+
+    This lets the accuracy harness resolve the correct thresholds.
     """
     QUANT_ALGO_BY_MODEL_ID = {
         "fp8": {
@@ -874,7 +875,7 @@ class TestNemotronUltraV3(LlmapiAccuracyTestHarness):
 
 
 class TestGLM4Flash(LlmapiAccuracyTestHarness):
-    """Accuracy regression tests for GLM-4.7-Flash variants"""
+    """Accuracy regression tests for GLM-4.7-Flash variants."""
 
     MODEL_NAME = "GLM-4.7-Flash"
     MODEL_PATH_BF16 = hf_id_to_local_model_dir("zai-org/GLM-4.7-Flash")
