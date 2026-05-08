@@ -288,6 +288,18 @@ def _mxfp4_target_names_from_node(node: Node) -> dict[str, str] | None:
     return target_names
 
 
+def _strip_prefix_from_state_dict(
+    state_dict: dict[str, torch.Tensor], prefix: str
+) -> dict[str, torch.Tensor]:
+    if not prefix:
+        return dict(state_dict)
+    return {
+        key.removeprefix(prefix): tensor
+        for key, tensor in state_dict.items()
+        if key.startswith(prefix)
+    }
+
+
 def _load_mxfp4_expert_layout_hook(
     state_dict,
     prefix,
@@ -302,18 +314,25 @@ def _load_mxfp4_expert_layout_hook(
     prefix = prefix or ""
     if prefix + target_names["gate_up_blocks"] in state_dict:
         return
-    checkpoint_layout.load_runtime_buffers(
-        state_dict,
-        prefix,
+    source_state = _strip_prefix_from_state_dict(state_dict, prefix)
+    if not checkpoint_layout.has_layer_expert_tensors(source_state, layer):
+        return
+
+    packed = checkpoint_layout.pack_experts(
+        source_state,
         layer=layer,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        target_gate_up_blocks=target_names["gate_up_blocks"],
-        target_gate_up_scales=target_names["gate_up_scales"],
-        target_down_blocks=target_names["down_blocks"],
-        target_down_scales=target_names["down_scales"],
         num_experts=num_experts,
     )
+    for source_key in checkpoint_layout.source_keys_for_packed_experts(
+        layer, packed.expert_indices
+    ):
+        state_dict.pop(prefix + source_key, None)
+    state_dict[prefix + target_names["gate_up_blocks"]] = packed.gate_up_blocks
+    state_dict[prefix + target_names["gate_up_scales"]] = packed.gate_up_scales
+    state_dict[prefix + target_names["down_blocks"]] = packed.down_blocks
+    state_dict[prefix + target_names["down_scales"]] = packed.down_scales
 
 
 def _register_mxfp4_expert_layout_hook(
