@@ -170,7 +170,6 @@ def test_non_registered_model_factory(model_factory: str):
         ("moe_cluster_parallel_size", 2),
         ("moe_tensor_parallel_size", 2),
         ("moe_expert_parallel_size", 2),
-        ("enable_attention_dp", True),
         ("cp_config", {"cp_type": "HELIX"}),
     ],
 )
@@ -185,6 +184,16 @@ def test_parallel_config_validation(parallel_field, invalid_value):
         ValueError, match="AutoDeploy only supports parallelization via the `world_size` argument."
     ):
         LlmArgs(**kwargs)
+
+
+def test_enable_attention_dp_shortcut_updates_detect_sharding():
+    args = LlmArgs(
+        model="test-model",
+        transforms={"detect_sharding": {"enable_attention_dp": False}},
+        enable_attention_dp=True,
+    )
+
+    assert args.transforms["detect_sharding"]["enable_attention_dp"] is True
 
 
 # ================================

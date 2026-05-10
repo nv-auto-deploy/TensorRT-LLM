@@ -48,6 +48,7 @@ def _check_for_default_value_only(
 _TRANSFORMS_SHORTCUT_LOOKUP = {
     "attn_backend": ("insert_cached_attention.backend", "transformers_replace_cached_attn.backend"),
     "compile_backend": ("compile_model.backend",),
+    "enable_attention_dp": ("detect_sharding.enable_attention_dp",),
 }
 
 
@@ -100,7 +101,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         "moe_cluster_parallel_size",
         "moe_tensor_parallel_size",
         "moe_expert_parallel_size",
-        "enable_attention_dp",
         "cp_config",
         mode="before",
     )

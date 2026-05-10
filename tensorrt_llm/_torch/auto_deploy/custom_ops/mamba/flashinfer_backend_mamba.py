@@ -126,6 +126,17 @@ def _flashinfer_cached_ssm(
 
         import flashinfer
 
+        # FlashInfer's selective_state_update requires these tensors to be
+        # 128-byte aligned. Slicing past prefill tokens can produce unaligned
+        # decode views, so clone only when the data pointer violates the
+        # kernel contract.
+        if x_decode.data_ptr() % 128 != 0:
+            x_decode = x_decode.clone()
+        if B_decode.data_ptr() % 128 != 0:
+            B_decode = B_decode.clone()
+        if C_decode.data_ptr() % 128 != 0:
+            C_decode = C_decode.clone()
+
         slot_idx_decode_i32 = slot_idx_decode.to(torch.int32)
         y_decode = flashinfer.mamba.selective_state_update(
             ssm_state_cache,

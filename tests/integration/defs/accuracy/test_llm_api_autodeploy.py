@@ -65,11 +65,14 @@ def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
 def _set_quant_config(llm, model_id: str) -> None:
     """Set quant_config on *llm* based on *model_id* so the accuracy harness
     can resolve the correct thresholds.
+
+    FP8 models inherit their KV-cache quantization from the HF config, so only
+    override the cache algorithm for schemes that require a harness-side value.
     """
     QUANT_ALGO_BY_MODEL_ID = {
         "fp8": {
             "weights": QuantAlgo.FP8,
-            "kv_cache": QuantAlgo.FP8
+            "kv_cache": None
         },
         "nvfp4": {
             "weights": QuantAlgo.NVFP4,
@@ -80,8 +83,9 @@ def _set_quant_config(llm, model_id: str) -> None:
     if model_id in QUANT_ALGO_BY_MODEL_ID:
         llm.args.quant_config.quant_algo = QUANT_ALGO_BY_MODEL_ID[model_id][
             "weights"]
-        llm.args.quant_config.kv_cache_quant_algo = QUANT_ALGO_BY_MODEL_ID[
-            model_id]["kv_cache"]
+        kv_cache_algo = QUANT_ALGO_BY_MODEL_ID[model_id]["kv_cache"]
+        if kv_cache_algo is not None:
+            llm.args.quant_config.kv_cache_quant_algo = kv_cache_algo
     else:
         print("Could not match quantization scheme, using default values")
 
@@ -636,8 +640,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         if model_id == "bf16":
             low_memory_overrides(kwargs)
         kwargs["attn_backend"] = attn_backend
-        kwargs.setdefault("transforms", {}).setdefault(
-            "detect_sharding", {})["enable_attention_dp"] = enable_attention_dp
+        kwargs["enable_attention_dp"] = enable_attention_dp
 
         print_memory_usage("test start")
         with AutoDeployLLM(model=model_path,
