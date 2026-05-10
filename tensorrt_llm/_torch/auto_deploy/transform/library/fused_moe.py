@@ -34,8 +34,8 @@ from ...utils._graph import (
     get_attr_by_name,
 )
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
+from ...utils.dist_config import DistConfig
 from ...utils.logger import ad_logger
-from ...utils.mapping_utils import deserialize_mapping
 from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import (
     bfs,
@@ -2396,7 +2396,7 @@ def _node_uses_moe_alltoall(node: Node) -> bool:
     if not mapping_config:
         return False
     try:
-        mapping = deserialize_mapping(mapping_config)
+        mapping = DistConfig.deserialize(mapping_config)
     except (TypeError, ValueError):
         ad_logger.debug_once(
             "Skip TRTLLM-Gen internal routing: unable to parse MoE mapping config.",
