@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import List, Optional, Type
 
 import pytest
@@ -190,9 +205,17 @@ class _DummyRequest:
         self.py_multimodal_data = None
         self.multimodal_positions = None
         self.multimodal_lengths = None
+        self.is_dummy = False
+        self.draft_tokens = []
+        self.py_draft_tokens = []
+        self.max_beam_num_tokens = len(tokens)
+        self.py_prompt_len = len(tokens)
 
     def get_tokens(self, _beam: int) -> List[int]:
         return self._tokens
+
+    def get_last_tokens(self, _beam: int) -> int:
+        return self._tokens[-1]
 
 
 @pytest.mark.parametrize("tokens_per_block", [256, 2])
@@ -251,6 +274,75 @@ def test_ad_engine_chunked_prefill_equivalence(tokens_per_block: int):
     logits_chunked_last = engine.forward(scheduled_requests_part2, resource_manager)["logits"][-1]
 
     torch.testing.assert_close(logits_full_last, logits_chunked_last)  # , atol=1e-5)
+
+    cache_seq_interface.shutdown()
+
+
+def test_ad_engine_middle_chunk_prefill_returns_empty_logits():
+    """A middle context chunk updates sequence/cache metadata but returns no logits."""
+    device = torch.device("cuda")
+    max_seq_len = 64
+    max_batch_size = 8
+
+    kv_cache_config = KvCacheConfig(tokens_per_block=8)
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, max_batch_size),
+        device=device,
+        kv_cache_config=kv_cache_config,
+    )
+    cache_seq_interface.to(device)
+
+    engine = ADEngine(get_inference_model, cache_seq_interface)
+    engine._disable_overlap_scheduler = True
+    kv_manager = _DummyKVCacheManager(tokens_per_block=8)
+    resource_manager = _DummyResourceManager(kv_manager)
+
+    req = _DummyRequest(tokens=[1, 2, 3, 4], begin=0, size=4, seq_slot=0)
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.context_requests_chunking.append(req)
+
+    output = engine.forward(scheduled_requests, resource_manager)
+
+    assert output["logits"].shape == (0, 128)
+    assert output["logits"].numel() == 0
+
+    cache_seq_interface.shutdown()
+
+
+def test_ad_engine_mixed_middle_chunk_and_decode_returns_decode_logits_only():
+    """A mixed middle-chunk/decode batch gathers only decode logits."""
+    device = torch.device("cuda")
+    max_seq_len = 64
+    max_batch_size = 8
+
+    kv_cache_config = KvCacheConfig(tokens_per_block=8)
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, max_batch_size),
+        device=device,
+        kv_cache_config=kv_cache_config,
+    )
+    cache_seq_interface.to(device)
+
+    engine = ADEngine(get_inference_model, cache_seq_interface)
+    engine._disable_overlap_scheduler = True
+    kv_manager = _DummyKVCacheManager(tokens_per_block=8)
+    resource_manager = _DummyResourceManager(kv_manager)
+
+    chunk_req = _DummyRequest(tokens=[1, 2, 3], begin=0, size=3, seq_slot=0)
+    decode_req = _DummyRequest(tokens=[4, 5], begin=0, size=1, seq_slot=1)
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.context_requests_chunking.append(chunk_req)
+    scheduled_requests.generation_requests.append(decode_req)
+
+    output = engine.forward(scheduled_requests, resource_manager)
+
+    assert output["logits"].shape == (1, 128)
+    token_gather_indices = cache_seq_interface.info.get_arg("token_gather_indices", truncate=True)
+    assert token_gather_indices.cpu().tolist() == [3]
 
     cache_seq_interface.shutdown()
 

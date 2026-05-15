@@ -156,6 +156,11 @@ class CachedSequenceInterface:
         """Return all the named arguments owned by this interface."""
         return {**self.info.named_args, **self._caches}
 
+    @property
+    def resource_handlers(self) -> ResourceHandlerDict:
+        """Return the registered resource handlers keyed by graph input name."""
+        return self._resource_lookup.copy()
+
     def get_arg(
         self, name: str, truncate: Optional[bool] = None, unflatten: Optional[bool] = None
     ) -> torch.Tensor:

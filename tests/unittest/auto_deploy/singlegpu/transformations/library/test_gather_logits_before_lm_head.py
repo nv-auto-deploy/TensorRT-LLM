@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,9 +22,17 @@ from torch.export import Dim
 from torch.fx import GraphModule
 
 # Import to register custom op
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
+    BatchInfo,
+    KVPagedResourceHandler,
+    StateResourceHandler,
+)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
+from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
+from tensorrt_llm._torch.auto_deploy.transform.library.gather_logits_before_lm_head import (
+    GatherLogitsBeforeLmHeadTransform,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 
@@ -84,6 +92,15 @@ class SoftcapLMHeadModel(torch.nn.Module):
         logits = torch.tanh(logits)
         logits = logits * self.softcap
         return logits
+
+
+class ManualLMHeadRoot(torch.nn.Module):
+    """Root module for hand-built FX graphs with an LM head."""
+
+    def __init__(self, hidden_size: int = 8):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.empty(hidden_size, hidden_size))
+        self.bias = torch.nn.Parameter(torch.empty(hidden_size))
 
 
 class TestGatherTokensOp:
@@ -159,6 +176,30 @@ class TestGatherTokensOp:
         assert output.shape == (1, 1, hidden_size)
         torch.testing.assert_close(output, hidden_states)
 
+    @pytest.mark.parametrize(
+        "hidden_shape, expected_shape",
+        [
+            ((1, 8, 128), (1, 0, 128)),
+            ((4, 1, 128), (0, 1, 128)),
+        ],
+    )
+    def test_zero_token_gather(self, hidden_shape, expected_shape):
+        """Test gather op with no selected tokens."""
+        hidden_states = torch.randn(*hidden_shape, device="cuda", dtype=torch.float16)
+        gather_indices = torch.empty(0, dtype=torch.long, device="cuda")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(0, True)
+        batch_info_host = batch_info.serialize()
+
+        output = torch.ops.auto_deploy.gather_tokens.default(
+            hidden_states, gather_indices, batch_info_host
+        )
+
+        assert output.shape == expected_shape
+        assert output.dtype == hidden_states.dtype
+        assert output.device == hidden_states.device
+        assert output.numel() == 0
+
     def test_fake_implementation_generate_format(self):
         """Test fake implementation for generate format."""
         batch_size = 4
@@ -230,6 +271,172 @@ class TestGatherLogitsBeforeLmHeadTransform:
     def _check_gather_op_in_graph(self, gm: GraphModule) -> bool:
         """Check if gather_tokens op is in the graph."""
         return any(is_op(n, torch.ops.auto_deploy.gather_tokens) for n in gm.graph.nodes)
+
+    def _get_gather_node(self, gm: GraphModule):
+        gather_nodes = [
+            node for node in gm.graph.nodes if is_op(node, torch.ops.auto_deploy.gather_tokens)
+        ]
+        assert len(gather_nodes) == 1
+        return gather_nodes[0]
+
+    def _apply_transform_direct(self, gm: GraphModule, cm: CachedSequenceInterface) -> GraphModule:
+        transform = GatherLogitsBeforeLmHeadTransform.from_kwargs(stage="post_load_fusion")
+        gm, info = transform._apply(gm, cm, None, SharedConfig())
+        assert not info.skipped
+        gm.graph.lint()
+        gm.recompile()
+        return gm
+
+    def _finish_manual_lm_head_graph(self, graph: torch.fx.Graph, lm_head_input) -> GraphModule:
+        first_non_placeholder = next(node for node in graph.nodes if node.op != "placeholder")
+        with graph.inserting_before(first_non_placeholder):
+            graph.placeholder("token_gather_indices")
+            graph.placeholder("batch_info_host")
+
+        root = ManualLMHeadRoot()
+        weight = graph.get_attr("weight")
+        bias = graph.get_attr("bias")
+        linear = graph.call_function(
+            torch.ops.aten.linear.default,
+            args=(lm_head_input, weight, bias),
+        )
+        graph.output(linear)
+        gm = GraphModule(root, graph)
+        gm.graph.lint()
+        return gm
+
+    def test_cache_consumer_gather_uses_resource_placeholder(self):
+        """The transform detects sequence-cache consumers from resource placeholders."""
+        cm = self._create_cached_sequence_interface(device="cpu")
+        cache_name = cm.add_resource("kv_cache", KVPagedResourceHandler(1, 8, dtype=torch.float16))
+        graph = torch.fx.Graph()
+        hidden_states = graph.placeholder("hidden_states")
+        kv_cache = graph.placeholder(cache_name)
+        cache_consumer = graph.call_function(
+            torch.ops.aten.add.Tensor, args=(hidden_states, kv_cache)
+        )
+        token_local = graph.call_function(torch.ops.aten.relu.default, args=(cache_consumer,))
+        gm = self._finish_manual_lm_head_graph(graph, token_local)
+
+        gm = self._apply_transform_direct(gm, cm)
+
+        gather_node = self._get_gather_node(gm)
+        assert gather_node.args[0] is cache_consumer
+
+    def test_cache_consumer_gather_uses_state_resource_placeholder(self):
+        """State cache resources are also treated as sequence-cache inputs."""
+        cm = self._create_cached_sequence_interface(device="cpu")
+        cache_name = cm.add_resource("delta_cache", StateResourceHandler(8, dtype=torch.float16))
+        graph = torch.fx.Graph()
+        hidden_states = graph.placeholder("hidden_states")
+        state_cache = graph.placeholder(cache_name)
+        cache_consumer = graph.call_function(
+            torch.ops.aten.add.Tensor, args=(hidden_states, state_cache)
+        )
+        token_local = graph.call_function(torch.ops.aten.relu.default, args=(cache_consumer,))
+        gm = self._finish_manual_lm_head_graph(graph, token_local)
+
+        gm = self._apply_transform_direct(gm, cm)
+
+        gather_node = self._get_gather_node(gm)
+        assert gather_node.args[0] is cache_consumer
+
+    def test_cache_consumer_gather_chooses_last_live_consumer(self):
+        """Multiple live cache consumers choose the last one on the logits path."""
+        cm = self._create_cached_sequence_interface(device="cpu")
+        cache_name_0 = cm.add_resource(
+            "kv_cache_0", KVPagedResourceHandler(1, 8, dtype=torch.float16)
+        )
+        cache_name_1 = cm.add_resource(
+            "kv_cache_1", KVPagedResourceHandler(1, 8, dtype=torch.float16)
+        )
+        graph = torch.fx.Graph()
+        hidden_states = graph.placeholder("hidden_states")
+        kv_cache_0 = graph.placeholder(cache_name_0)
+        kv_cache_1 = graph.placeholder(cache_name_1)
+        first_consumer = graph.call_function(
+            torch.ops.aten.add.Tensor, args=(hidden_states, kv_cache_0)
+        )
+        token_local = graph.call_function(torch.ops.aten.relu.default, args=(first_consumer,))
+        last_consumer = graph.call_function(
+            torch.ops.aten.add.Tensor, args=(token_local, kv_cache_1)
+        )
+        tail = graph.call_function(torch.ops.aten.relu.default, args=(last_consumer,))
+        gm = self._finish_manual_lm_head_graph(graph, tail)
+
+        gm = self._apply_transform_direct(gm, cm)
+
+        gather_node = self._get_gather_node(gm)
+        assert gather_node.args[0] is last_consumer
+
+    def test_cache_consumer_gather_ignores_dead_branch_consumer(self):
+        """Dead/non-output cache consumers are ignored."""
+        cm = self._create_cached_sequence_interface(device="cpu")
+        live_cache_name = cm.add_resource(
+            "live_kv_cache", KVPagedResourceHandler(1, 8, dtype=torch.float16)
+        )
+        dead_cache_name = cm.add_resource(
+            "dead_kv_cache", KVPagedResourceHandler(1, 8, dtype=torch.float16)
+        )
+        graph = torch.fx.Graph()
+        hidden_states = graph.placeholder("hidden_states")
+        live_kv_cache = graph.placeholder(live_cache_name)
+        dead_kv_cache = graph.placeholder(dead_cache_name)
+        live_consumer = graph.call_function(
+            torch.ops.aten.add.Tensor, args=(hidden_states, live_kv_cache)
+        )
+        dead_consumer = graph.call_function(
+            torch.ops.aten.add.Tensor, args=(hidden_states, dead_kv_cache)
+        )
+        tail = graph.call_function(torch.ops.aten.relu.default, args=(live_consumer,))
+        gm = self._finish_manual_lm_head_graph(graph, tail)
+
+        gm = self._apply_transform_direct(gm, cm)
+
+        gather_node = self._get_gather_node(gm)
+        assert gather_node.args[0] is live_consumer
+        assert gather_node.args[0] is not dead_consumer
+
+    def test_cache_consumer_gather_after_residual_merge_boundary(self):
+        """Gather after a cache-consuming block once the residual input has merged."""
+        cm = self._create_cached_sequence_interface(device="cpu")
+        cache_name = cm.add_resource("kv_cache", KVPagedResourceHandler(1, 8, dtype=torch.float16))
+        graph = torch.fx.Graph()
+        hidden_states = graph.placeholder("hidden_states")
+        kv_cache = graph.placeholder(cache_name)
+        cache_consumer = graph.call_function(
+            torch.ops.aten.add.Tensor, args=(hidden_states, kv_cache)
+        )
+        projection = graph.call_function(torch.ops.aten.relu.default, args=(cache_consumer,))
+        residual = graph.call_function(torch.ops.aten.add.Tensor, args=(projection, hidden_states))
+        tail = graph.call_function(torch.ops.aten.relu.default, args=(residual,))
+        gm = self._finish_manual_lm_head_graph(graph, tail)
+
+        gm = self._apply_transform_direct(gm, cm)
+
+        gather_node = self._get_gather_node(gm)
+        assert gather_node.args[0] is residual
+
+    def test_ambiguous_cache_consumer_path_falls_back_to_lm_head_input(self):
+        """Ambiguous downstream paths keep the conservative before-LM-head placement."""
+        cm = self._create_cached_sequence_interface(device="cpu")
+        cache_name = cm.add_resource("kv_cache", KVPagedResourceHandler(1, 8, dtype=torch.float16))
+        graph = torch.fx.Graph()
+        hidden_states = graph.placeholder("hidden_states")
+        kv_cache = graph.placeholder(cache_name)
+        cache_consumer = graph.call_function(
+            torch.ops.aten.add.Tensor, args=(hidden_states, kv_cache)
+        )
+        branch_0 = graph.call_function(torch.ops.aten.relu.default, args=(cache_consumer,))
+        branch_1 = graph.call_function(torch.ops.aten.neg.default, args=(cache_consumer,))
+        merged = graph.call_function(torch.ops.aten.add.Tensor, args=(branch_0, branch_1))
+        lm_head_input = graph.call_function(torch.ops.aten.relu.default, args=(merged,))
+        gm = self._finish_manual_lm_head_graph(graph, lm_head_input)
+
+        gm = self._apply_transform_direct(gm, cm)
+
+        gather_node = self._get_gather_node(gm)
+        assert gather_node.args[0] is lm_head_input
 
     @pytest.mark.parametrize("batch_size", [1, 4, 8])
     def test_transform_generate_format(self, batch_size):

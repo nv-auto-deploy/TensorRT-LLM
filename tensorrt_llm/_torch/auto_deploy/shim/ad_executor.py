@@ -902,6 +902,7 @@ class ADEngine(ModelEngine):
             slot_idx=state_slot_idx,
             prompt_lens=prompt_lens,
             gather_context_logits=gather_context_logits,
+            num_context_requests_chunking=len(scheduled_requests.context_requests_chunking),
             _gather_idx=flat_gather_indices,
             _mask_scatter_indices=mask_scatter_indices,
             _ungathered_input_ids=new_tokens_flat,

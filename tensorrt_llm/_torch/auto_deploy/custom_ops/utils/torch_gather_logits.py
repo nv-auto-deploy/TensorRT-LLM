@@ -42,7 +42,10 @@ def gather_tokens(
     gather_required = batch_info.is_gather_required()
 
     if gather_required:
-        out = hidden_states.index_select(0, token_gather_indices[:num_tokens_to_gather])
+        if num_tokens_to_gather == 0:
+            out = hidden_states.new_empty((0, *other_dims))
+        else:
+            out = hidden_states.index_select(0, token_gather_indices[:num_tokens_to_gather])
         num_tokens_final = num_tokens_to_gather
     else:
         out = hidden_states.clone(memory_format=torch.contiguous_format)

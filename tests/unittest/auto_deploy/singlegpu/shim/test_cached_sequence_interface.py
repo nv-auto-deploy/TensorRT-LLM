@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Unit tests for CachedSequenceInterface in interface.py.
 
 Tests the refactored CachedSequenceInterface which now:
@@ -1168,6 +1183,130 @@ def test_args_stored_to_input_buffer():
     token_gather_indices = seq_info.get_arg("token_gather_indices", truncate=True)
     assert token_gather_indices.tolist() == [0, 1, 2]
     assert seq_info.batch_info.get_num_tokens_to_gather() == 3
+    assert seq_info.batch_info.is_gather_required() is False
+
+
+def test_chunked_prefill_middle_chunk_gathers_zero_context_logits():
+    """Middle context chunks update caches but do not gather logits by default."""
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
+
+    seq_info.nest_sequences(
+        input_ids=[1, 2, 3],
+        cu_seqlen=[0, 3],
+        input_pos=[0],
+        batch_info=[1, 3, 0, 0, 0, 0],
+        cache_loc=[0],
+        cu_num_pages=[0, 1],
+        num_context_requests_chunking=1,
+    )
+
+    token_gather_indices = seq_info.get_arg("token_gather_indices", truncate=True)
+    assert token_gather_indices.tolist() == []
+    assert seq_info.batch_info.get_num_tokens_to_gather() == 0
+    assert seq_info.batch_info.is_gather_required() is True
+
+
+def test_chunked_prefill_last_chunk_gathers_final_context_token():
+    """Last context chunks still gather the final token for sampling."""
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
+
+    seq_info.nest_sequences(
+        input_ids=[1, 2, 3],
+        cu_seqlen=[0, 3],
+        input_pos=[3],
+        batch_info=[1, 3, 0, 0, 0, 0],
+        cache_loc=[0],
+        cu_num_pages=[0, 1],
+    )
+
+    token_gather_indices = seq_info.get_arg("token_gather_indices", truncate=True)
+    assert token_gather_indices.tolist() == [2]
+    assert seq_info.batch_info.get_num_tokens_to_gather() == 1
+    assert seq_info.batch_info.is_gather_required() is True
+
+
+def test_chunked_prefill_mixed_middle_chunk_and_decode_gathers_decode_only():
+    """Mixed batches gather generation logits while skipping middle chunk logits."""
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
+
+    seq_info.nest_sequences(
+        input_ids=[1, 2, 3, 4],
+        cu_seqlen=[0, 3, 4],
+        input_pos=[0, 8],
+        batch_info=[1, 3, 0, 0, 1, 1],
+        cache_loc=[0, 1],
+        cu_num_pages=[0, 1, 2],
+        num_context_requests_chunking=1,
+    )
+
+    token_gather_indices = seq_info.get_arg("token_gather_indices", truncate=True)
+    assert token_gather_indices.tolist() == [3]
+    assert seq_info.batch_info.get_num_tokens_to_gather() == 1
+    assert seq_info.batch_info.is_gather_required() is True
+
+
+def test_chunked_prefill_gather_context_logits_keeps_middle_chunk_tokens():
+    """Context-logits mode keeps all context chunk logits."""
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
+
+    seq_info.nest_sequences(
+        input_ids=[1, 2, 3],
+        cu_seqlen=[0, 3],
+        input_pos=[0],
+        batch_info=[1, 3, 0, 0, 0, 0],
+        cache_loc=[0],
+        cu_num_pages=[0, 1],
+        gather_context_logits=True,
+        num_context_requests_chunking=1,
+    )
+
+    token_gather_indices = seq_info.get_arg("token_gather_indices", truncate=True)
+    assert token_gather_indices.tolist() == [0, 1, 2]
+    assert seq_info.batch_info.get_num_tokens_to_gather() == 3
+    assert seq_info.batch_info.is_gather_required() is False
+
+
+def test_decode_only_gather_metadata_unchanged():
+    """Decode-only batches keep the existing no-gather metadata."""
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
+
+    seq_info.nest_sequences(
+        input_ids=[5, 6],
+        cu_seqlen=[0, 1, 2],
+        input_pos=[8, 9],
+        batch_info=[0, 0, 0, 0, 2, 2],
+        cache_loc=[0, 1],
+        cu_num_pages=[0, 1, 2],
+    )
+
+    token_gather_indices = seq_info.get_arg("token_gather_indices", truncate=True)
+    assert token_gather_indices.tolist() == [0, 1]
+    assert seq_info.batch_info.get_num_tokens_to_gather() == 2
     assert seq_info.batch_info.is_gather_required() is False
 
 
