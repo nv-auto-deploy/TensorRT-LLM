@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """DeepSeekV3 model with explicit sharding-hint custom ops for AutoDeploy IR sharding.
 
