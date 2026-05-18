@@ -1134,8 +1134,8 @@ class SequenceInfo:
                 If False (default), only the last token per context sequence is gathered while
                 all extend/decode tokens are kept.
             num_context_requests_chunking: Number of leading context requests that are middle
-                chunks. These requests update cache/state resources but do not gather logits when
-                gather_context_logits is False.
+                chunks. These requests update cache/state resources and still gather one final
+                token logit when gather_context_logits is False to match the PyExecutor layout.
             _gather_idx: Gather indices for the overlap scheduler to reorder input tokens.
             _mask_scatter_indices: Mask scatter indices for the overlap scheduler.
             _ungathered_input_ids: Optional tensor of ungathered input ids from the overlap
@@ -1255,9 +1255,7 @@ class SequenceInfo:
             )
             num_prefill_tokens = self.batch_info.get_num_tokens()[0]
             csl_np = csl_host.numpy()
-            ctx_last = (
-                csl_np[num_context_requests_chunking + 1 : num_prefill + 1].astype(np.int64) - 1
-            )
+            ctx_last = csl_np[1 : num_prefill + 1].astype(np.int64) - 1
             gen_all = np.arange(num_prefill_tokens, total, dtype=np.int64)
             token_gather_indices = torch.from_numpy(np.concatenate([ctx_last, gen_all]))
             self._stage_arg("token_gather_indices", token_gather_indices)

@@ -278,8 +278,8 @@ def test_ad_engine_chunked_prefill_equivalence(tokens_per_block: int):
     cache_seq_interface.shutdown()
 
 
-def test_ad_engine_middle_chunk_prefill_returns_empty_logits():
-    """A middle context chunk updates sequence/cache metadata but returns no logits."""
+def test_ad_engine_middle_chunk_prefill_returns_one_compatibility_logit():
+    """A middle context chunk updates metadata and returns one logit row for PyExecutor layout."""
     device = torch.device("cuda")
     max_seq_len = 64
     max_batch_size = 8
@@ -305,14 +305,15 @@ def test_ad_engine_middle_chunk_prefill_returns_empty_logits():
 
     output = engine.forward(scheduled_requests, resource_manager)
 
-    assert output["logits"].shape == (0, 128)
-    assert output["logits"].numel() == 0
+    assert output["logits"].shape == (1, 128)
+    token_gather_indices = cache_seq_interface.info.get_arg("token_gather_indices", truncate=True)
+    assert token_gather_indices.cpu().tolist() == [3]
 
     cache_seq_interface.shutdown()
 
 
-def test_ad_engine_mixed_middle_chunk_and_decode_returns_decode_logits_only():
-    """A mixed middle-chunk/decode batch gathers only decode logits."""
+def test_ad_engine_mixed_middle_chunk_and_decode_returns_context_and_decode_logits():
+    """A mixed middle-chunk/decode batch gathers one context row plus decode logits."""
     device = torch.device("cuda")
     max_seq_len = 64
     max_batch_size = 8
@@ -340,9 +341,9 @@ def test_ad_engine_mixed_middle_chunk_and_decode_returns_decode_logits_only():
 
     output = engine.forward(scheduled_requests, resource_manager)
 
-    assert output["logits"].shape == (1, 128)
+    assert output["logits"].shape == (2, 128)
     token_gather_indices = cache_seq_interface.info.get_arg("token_gather_indices", truncate=True)
-    assert token_gather_indices.cpu().tolist() == [3]
+    assert token_gather_indices.cpu().tolist() == [2, 3]
 
     cache_seq_interface.shutdown()
 

@@ -1186,8 +1186,8 @@ def test_args_stored_to_input_buffer():
     assert seq_info.batch_info.is_gather_required() is False
 
 
-def test_chunked_prefill_middle_chunk_gathers_zero_context_logits():
-    """Middle context chunks update caches but do not gather logits by default."""
+def test_chunked_prefill_middle_chunk_gathers_one_context_logit():
+    """Middle context chunks gather one compatibility logit by default."""
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,
@@ -1206,8 +1206,8 @@ def test_chunked_prefill_middle_chunk_gathers_zero_context_logits():
     )
 
     token_gather_indices = seq_info.get_arg("token_gather_indices", truncate=True)
-    assert token_gather_indices.tolist() == []
-    assert seq_info.batch_info.get_num_tokens_to_gather() == 0
+    assert token_gather_indices.tolist() == [2]
+    assert seq_info.batch_info.get_num_tokens_to_gather() == 1
     assert seq_info.batch_info.is_gather_required() is True
 
 
@@ -1235,8 +1235,8 @@ def test_chunked_prefill_last_chunk_gathers_final_context_token():
     assert seq_info.batch_info.is_gather_required() is True
 
 
-def test_chunked_prefill_mixed_middle_chunk_and_decode_gathers_decode_only():
-    """Mixed batches gather generation logits while skipping middle chunk logits."""
+def test_chunked_prefill_mixed_middle_chunk_and_decode_gathers_context_and_decode_logits():
+    """Mixed batches gather one middle-chunk context logit plus decode logits."""
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,
@@ -1255,8 +1255,8 @@ def test_chunked_prefill_mixed_middle_chunk_and_decode_gathers_decode_only():
     )
 
     token_gather_indices = seq_info.get_arg("token_gather_indices", truncate=True)
-    assert token_gather_indices.tolist() == [3]
-    assert seq_info.batch_info.get_num_tokens_to_gather() == 1
+    assert token_gather_indices.tolist() == [2, 3]
+    assert seq_info.batch_info.get_num_tokens_to_gather() == 2
     assert seq_info.batch_info.is_gather_required() is True
 
 
