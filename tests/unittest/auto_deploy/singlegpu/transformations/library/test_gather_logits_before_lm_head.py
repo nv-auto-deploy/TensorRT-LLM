@@ -26,6 +26,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     BatchInfo,
     KVPagedResourceHandler,
     StateResourceHandler,
+    UnpagedResourceHandler,
 )
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
@@ -332,6 +333,24 @@ class TestGatherLogitsBeforeLmHeadTransform:
         state_cache = graph.placeholder(cache_name)
         cache_consumer = graph.call_function(
             torch.ops.aten.add.Tensor, args=(hidden_states, state_cache)
+        )
+        token_local = graph.call_function(torch.ops.aten.relu.default, args=(cache_consumer,))
+        gm = self._finish_manual_lm_head_graph(graph, token_local)
+
+        gm = self._apply_transform_direct(gm, cm)
+
+        gather_node = self._get_gather_node(gm)
+        assert gather_node.args[0] is cache_consumer
+
+    def test_cache_consumer_gather_uses_unpaged_resource_placeholder(self):
+        """Unpaged KV-cache resources are also treated as sequence-cache inputs."""
+        cm = self._create_cached_sequence_interface(device="cpu")
+        cache_name = cm.add_resource("k_cache", UnpagedResourceHandler(8, dtype=torch.float16))
+        graph = torch.fx.Graph()
+        hidden_states = graph.placeholder("hidden_states")
+        k_cache = graph.placeholder(cache_name)
+        cache_consumer = graph.call_function(
+            torch.ops.aten.add.Tensor, args=(hidden_states, k_cache)
         )
         token_local = graph.call_function(torch.ops.aten.relu.default, args=(cache_consumer,))
         gm = self._finish_manual_lm_head_graph(graph, token_local)

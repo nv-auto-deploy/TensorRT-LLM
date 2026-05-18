@@ -159,7 +159,7 @@ class CachedSequenceInterface:
     @property
     def resource_handlers(self) -> ResourceHandlerDict:
         """Return the registered resource handlers keyed by graph input name."""
-        return self._resource_lookup.copy()
+        return self._resource_lookup
 
     def get_arg(
         self, name: str, truncate: Optional[bool] = None, unflatten: Optional[bool] = None

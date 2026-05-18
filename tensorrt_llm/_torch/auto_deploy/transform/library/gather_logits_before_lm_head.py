@@ -25,12 +25,20 @@ from typing import Optional, Set, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.attention_interface import KVPagedResourceHandler, StateResourceHandler
+from ...custom_ops.attention_interface import (
+    KVPagedResourceHandler,
+    StateResourceHandler,
+    UnpagedResourceHandler,
+)
 from ...utils._graph import get_lm_head_node
 from ...utils.node_utils import is_linear_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
-_SEQUENCE_CACHE_RESOURCE_TYPES = (KVPagedResourceHandler, StateResourceHandler)
+_SEQUENCE_CACHE_RESOURCE_TYPES = (
+    KVPagedResourceHandler,
+    StateResourceHandler,
+    UnpagedResourceHandler,
+)
 
 
 def _collect_ancestors(node: Node) -> Set[Node]:
