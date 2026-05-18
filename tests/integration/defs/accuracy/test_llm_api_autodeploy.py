@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from pathlib import Path
 
 import pytest
@@ -43,12 +44,16 @@ def _load_ad_config(config_name):
         return yaml.safe_load(f)
 
 
-def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
+def _get_registry_yaml_extra(model_name: str,
+                             config_id: str | None = None
+                             ) -> tuple[list[str], int]:
     """Return (yaml_extra paths, world_size) from the AutoDeploy model registry."""
     with open(_AD_MODEL_REGISTRY_DIR / "models.yaml") as f:
         registry = yaml.safe_load(f)
     for entry in registry["models"]:
         if entry["name"] != model_name:
+            continue
+        if config_id is not None and entry.get("config_id") != config_id:
             continue
         config_dir = _AD_MODEL_REGISTRY_DIR / "configs"
         paths = [str(config_dir / cfg) for cfg in entry["yaml_extra"]]
@@ -63,7 +68,9 @@ def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
             if "world_size" in config:
                 world_size = int(config["world_size"])
         return paths, world_size
-    raise ValueError(f"Model '{model_name}' not found in model registry")
+    suffix = f" with config_id '{config_id}'" if config_id is not None else ""
+    raise ValueError(
+        f"Model '{model_name}'{suffix} not found in model registry")
 
 
 def _set_quant_config(llm, model_id: str) -> None:
@@ -990,9 +997,12 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
+    MODEL_NAME_FP8 = "Qwen/Qwen3.5-397B-A17B-FP8"
     MODEL_NAME_NVFP4 = "nvidia/Qwen3.5-397B-A17B-NVFP4"
     MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
     MODEL_PATH_SMALL = hf_id_to_local_model_dir(MODEL_NAME_SMALL)
+    CONFIG_ID_FP8 = "qwen3_5_moe_400b_fp8"
+    CONFIG_ID_FP8_MTP = "qwen3_5_moe_400b_fp8_mtp"
     GSM8K_MAX_OUTPUT_LEN = 512
     EXTRA_EVALUATOR_KWARGS = dict(
         apply_chat_template=True,
@@ -1014,25 +1024,82 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
+    def get_fp8_model_path(self):
+        model_path = os.environ.get("QWEN35_FP8_MODEL_PATH")
+        if model_path is not None:
+            return model_path
+        return hf_id_to_local_model_dir(self.MODEL_NAME_FP8)
+
+    def get_fp8_gsm8k_runtime_overrides(self):
+        return {
+            "enable_chunked_prefill": False,
+            "max_num_tokens": 8192,
+            "max_batch_size": 32,
+            "cuda_graph_config": {
+                "max_batch_size": 32,
+                "batch_sizes": [1, 2, 3, 4, 5, 6, 7, 8, 16, 32],
+            },
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.7,
+                "tokens_per_block": 32,
+            },
+            "transforms": {
+                "insert_cached_causal_conv": {
+                    "backend": "triton_causal_conv"
+                },
+                "multi_stream_gemm": {
+                    "enabled": False
+                },
+                "multi_stream_moe": {
+                    "enabled": False
+                },
+            },
+        }
+
+    @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("world_size", [8])
-    def test_bf16(self, world_size, mocker):
+    def test_fp8_gsm8k(self, world_size, mocker, monkeypatch):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
-        sampling_params = self.get_default_sampling_params()
-        model_path = hf_id_to_local_model_dir(self.MODEL_NAME)
+        kwargs.update(self.get_fp8_gsm8k_runtime_overrides())
+        monkeypatch.setenv("TRTLLM_ACCURACY_NO_REFERENCE", "1")
+        model_path = self.get_fp8_model_path()
         yaml_paths, registry_world_size = _get_registry_yaml_extra(
-            self.MODEL_NAME)
+            self.MODEL_NAME_FP8, self.CONFIG_ID_FP8)
         assert registry_world_size == world_size
         with AutoDeployLLM(model=model_path,
                            tokenizer=model_path,
-                           dtype="bfloat16",
                            world_size=world_size,
                            yaml_extra=yaml_paths,
                            **kwargs) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
+            _set_quant_config(llm, "fp8")
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize("world_size", [8])
+    def test_fp8_mtp_gsm8k(self, world_size, mocker, monkeypatch):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = self.get_default_kwargs()
+        monkeypatch.setenv("TRTLLM_ACCURACY_NO_REFERENCE", "1")
+        model_path = self.get_fp8_model_path()
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(
+            self.MODEL_NAME_FP8, self.CONFIG_ID_FP8_MTP)
+        assert registry_world_size == world_size
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
+                           world_size=world_size,
+                           yaml_extra=yaml_paths,
+                           **kwargs) as llm:
+            _set_quant_config(llm, "fp8")
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)

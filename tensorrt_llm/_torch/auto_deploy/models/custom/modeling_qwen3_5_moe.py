@@ -818,6 +818,64 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         return hidden_states
 
 
+class Qwen3_5MoeEagleLayer(nn.Module):
+    """Qwen3.5 MTP layer for the AutoDeploy Eagle one-model path."""
+
+    def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int):
+        super().__init__()
+        self.pre_fc_norm_embedding = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.self_attn = Qwen3_5MoeAttention(config, layer_idx)
+        self.mlp = Qwen3_5MoeSparseMoeBlock(config)
+        self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3_5MoeRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.LongTensor,
+    ) -> torch.Tensor:
+        if position_ids.ndim == 1:
+            position_ids = position_ids.view(1, -1).expand(hidden_states.shape[0], -1)
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+        elif position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = self.fc(torch.cat([inputs_embeds, hidden_states], dim=-1))
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, position_embeddings=position_embeddings)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return self.norm(hidden_states)
+
+
+def build_qwen3_5_moe_eagle_layers(config: Qwen3_5MoeTextConfig) -> list[nn.Module]:
+    mtp_num_hidden_layers = getattr(
+        config, "mtp_num_hidden_layers", getattr(config, "num_nextn_predict_layers", 1)
+    )
+    if mtp_num_hidden_layers != 1:
+        raise ValueError(
+            "Qwen3.5 AutoDeploy MTP currently supports exactly one MTP layer, "
+            f"but config has {mtp_num_hidden_layers}."
+        )
+    return [Qwen3_5MoeEagleLayer(config, layer_idx=0)]
+
+
 # =============================================================================
 # Model
 # =============================================================================
@@ -936,6 +994,12 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
     def set_input_embeddings(self, new_embeddings):
         self.embed_tokens = new_embeddings
 
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def get_final_normalization(self):
+        return self.norm
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -994,6 +1058,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Qwen3_5MoeTextConfig, **kwargs):
+        if hasattr(config, "text_config"):
+            config = config.text_config
         super().__init__(config)
         self.model = Qwen3_5MoeTextModel(config)
         self.vocab_size = config.vocab_size
@@ -1015,6 +1081,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
         self.model.set_lm_head(new_embeddings)
+
+    def get_final_normalization(self):
+        return self.model.get_final_normalization()
 
     def forward(
         self,
@@ -1940,6 +2009,9 @@ class Qwen3_5MoeModel(nn.Module):
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
 
+    def get_final_normalization(self):
+        return self.language_model.get_final_normalization()
+
     def get_rope_index(
         self,
         input_ids: torch.LongTensor,
@@ -2771,9 +2843,15 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
     def get_input_embeddings(self):
         return self.model.language_model.get_input_embeddings()
 
+    def get_output_embeddings(self):
+        return self.lm_head
+
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
         self.model.language_model.set_lm_head(new_embeddings)
+
+    def get_final_normalization(self):
+        return self.model.language_model.get_final_normalization()
 
     def forward(
         self,
@@ -3066,7 +3144,5 @@ AutoConfig.register("qwen3_5_moe", Qwen3_5MoeConfig, exist_ok=True)
 AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeTextConfig, exist_ok=True)
 
 AutoModelForCausalLMFactory.register_custom_model_cls("Qwen3_5MoeTextConfig", Qwen3_5MoeForCausalLM)
-AutoModelForCausalLMFactory.register_custom_model_cls(
-    "Qwen3_5MoeConfig", Qwen3_5MoeForConditionalGeneration
-)
+AutoModelForCausalLMFactory.register_custom_model_cls("Qwen3_5MoeConfig", Qwen3_5MoeForCausalLM)
 Qwen3_5MoeFactory.register_custom_model_cls("Qwen3_5MoeConfig", Qwen3_5MoeForConditionalGeneration)

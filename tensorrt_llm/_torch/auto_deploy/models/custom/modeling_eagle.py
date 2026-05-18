@@ -44,6 +44,7 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils._config import deep_merge_dicts
 from ...utils.logger import ad_logger
 from .modeling_nemotron_h import build_nemotron_eagle_layers
+from .modeling_qwen3_5_moe import build_qwen3_5_moe_eagle_layers
 
 # =============================================================================
 # Layer Dispatch Functions
@@ -74,10 +75,12 @@ def get_eagle_layers(config, model_type: str) -> Union[nn.ModuleList, nn.Module]
             layers = build_llama_eagle_layers(config)
         case "nemotron_h":
             layers = build_nemotron_eagle_layers(config)
+        case "qwen3_5_moe" | "qwen3_5_moe_text":
+            layers = build_qwen3_5_moe_eagle_layers(config)
         case _:
             raise ValueError(
                 f"Model type '{model_type}' not supported for Eagle drafter. "
-                f"Supported types: llama, nemotron_h"
+                f"Supported types: llama, nemotron_h, qwen3_5_moe, qwen3_5_moe_text"
             )
 
     if len(layers) == 1:
@@ -136,6 +139,34 @@ class EagleConfig(PretrainedConfig):
             # NemotronH MTP checkpoint: mtp.* -> model.*
             "_checkpoint_conversion_mapping": {
                 r"^mtp\.": "model.",
+            },
+        },
+        "qwen3_5_moe_text": {
+            "load_embedding_from_target": True,
+            "load_lm_head_from_target": True,
+            "num_capture_layers": 1,
+            "normalize_target_hidden_state": True,
+            "layers_handle_final_norm": True,
+            "_checkpoint_conversion_mapping": {
+                r"^mtp\.layers\.0\.": "model.layers.",
+                r"^mtp\.fc\.": "model.layers.fc.",
+                r"^mtp\.pre_fc_norm_embedding\.": "model.layers.pre_fc_norm_embedding.",
+                r"^mtp\.pre_fc_norm_hidden\.": "model.layers.pre_fc_norm_hidden.",
+                r"^mtp\.norm\.": "model.layers.norm.",
+            },
+        },
+        "qwen3_5_moe": {
+            "load_embedding_from_target": True,
+            "load_lm_head_from_target": True,
+            "num_capture_layers": 1,
+            "normalize_target_hidden_state": True,
+            "layers_handle_final_norm": True,
+            "_checkpoint_conversion_mapping": {
+                r"^mtp\.layers\.0\.": "model.layers.",
+                r"^mtp\.fc\.": "model.layers.fc.",
+                r"^mtp\.pre_fc_norm_embedding\.": "model.layers.pre_fc_norm_embedding.",
+                r"^mtp\.pre_fc_norm_hidden\.": "model.layers.pre_fc_norm_hidden.",
+                r"^mtp\.norm\.": "model.layers.norm.",
             },
         },
     }
@@ -600,9 +631,14 @@ class EagleDrafterForCausalLM(PreTrainedModel):
 
     base_model_prefix = "model"
     supports_gradient_checkpointing = False
-    _no_split_modules = ["LlamaEagleLayer", "NemotronHEagleLayer"]
+    _no_split_modules = ["LlamaEagleLayer", "NemotronHEagleLayer", "Qwen3_5MoeEagleLayer"]
 
-    def __init__(self, config, layers: Optional[Union[nn.ModuleList, nn.Module]] = None):
+    def __init__(
+        self,
+        config,
+        layers: Optional[Union[nn.ModuleList, nn.Module]] = None,
+        **_unused_kwargs,
+    ):
         super().__init__(config)
 
         # Read checkpoint conversion mapping from config (set by EagleConfig based on model_type)

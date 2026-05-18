@@ -62,6 +62,9 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
 
         # Get model type for config
         model_type = model_config.model_type
+        if model_type == "qwen3_5_moe" and hasattr(model_config, "text_config"):
+            model_config = model_config.text_config
+            model_type = model_config.model_type
         ad_logger.info(f"EagleDrafterFactory: building drafter for model_type='{model_type}'")
 
         # Convert base config to EagleConfig, preserving existing values
