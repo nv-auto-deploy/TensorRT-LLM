@@ -1890,3 +1890,88 @@ run locally without MTP.
     not by the FP8 weights or core Qwen3.5 graph.
   - Next comparison point is the full MTP FP8 GSM8K run under the corresponding
     registry MTP config.
+
+### MTP FP8 Full GSM8K, Small MTP Serving Shape
+
+- Commit: `562a273de79bc9466ad885e3a13d08f5117018e2`
+- Command:
+  `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 LLM_MODELS_ROOT=/home/gramnarayan/dev/model-symlinks HF_HOME=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/autodeploy_data/hf_home QWEN35_FP8_MODEL_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/autodeploy_data/hf_home/hub/models--Qwen--Qwen3.5-397B-A17B-FP8/snapshots/ea5b4f81096f3901c91dea97f81324302495781d TRTLLM_DG_JIT_USE_NVCC=1 PYTHONUNBUFFERED=1 pytest -sv tests/integration/defs/accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_fp8_mtp_gsm8k[8] 2>&1 | tee ad_runs/full_gsm8k_fp8_mtp_pytest.log`
+- Log: `ad_runs/full_gsm8k_fp8_mtp_pytest.log`
+- Runtime shape:
+  - registry config: `qwen3_5_moe_400b_fp8_mtp`
+  - `max_batch_size=32`
+  - `max_num_tokens=8192`
+  - CUDA graph batch sizes: `[1, 2, 3, 4, 5, 6, 7, 8, 16, 32]`
+  - `enable_chunked_prefill=false`
+  - `kv_cache_config.free_gpu_memory_fraction=0.7`
+  - `multi_stream_gemm` and `multi_stream_moe` disabled
+- Build evidence:
+  - `EagleDrafterFactory` built a drafter for `model_type='qwen3_5_moe_text'`.
+  - `detect_hidden_states_for_capture` matched one hidden-state capture point
+    per rank.
+  - Sharding used `TP=420, EP=60` for the target graph and `TP=4, EP=1` for the
+    draft graph.
+  - Full FP8 weights loaded without missing or unexpected weight failures.
+  - CUDA graph capture completed for batch sizes `[32, 16, 8, 7, 6, 5, 4, 3, 2,
+    1]`.
+- Result:
+  - `PASSED`
+  - Full GSM8K `1319` samples completed.
+  - Flexible exact match: `88.0212`
+  - Strict exact match: `87.2631`
+  - Average accuracy: `87.64`
+  - TRTLLM execution time: `456.385` seconds
+  - Total pytest duration: `1304.98` seconds
+  - Acceptance-rate counters were not emitted by this pytest path.
+- Comparison to no-MTP small-shape baseline:
+  - No-MTP average accuracy: `87.23`
+  - MTP average accuracy: `87.64`
+  - Difference: `+0.41` points for MTP, within normal lm-eval noise for this
+    run.
+  - No-MTP TRTLLM execution time: `620.645` seconds
+  - MTP TRTLLM execution time: `456.385` seconds
+- Interpretation:
+  - Full-size Qwen3.5 FP8 MTP runs end-to-end on 8xH100 with TRTLLM attention,
+    CUDA graph capture, overlap scheduler, and the reduced MTP serving envelope.
+  - Accuracy is aligned with the full no-MTP FP8 baseline.
+  - The remaining missing evidence from this exact full pytest run is
+    acceptance rate; earlier 128-sample MTP probe runs recorded nontrivial
+    acceptance around `0.93`.
+
+### MTP FP8 B32 Acceptance Stats Probe
+
+- Commit: `562a273de79bc9466ad885e3a13d08f5117018e2`
+- Command:
+  `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 LLM_MODELS_ROOT=/home/gramnarayan/dev/model-symlinks HF_HOME=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/autodeploy_data/hf_home QWEN35_MTP_MODEL=Qwen/Qwen3.5-397B-A17B-FP8 QWEN35_MTP_REGISTRY_CONFIG_ID=qwen3_5_moe_400b_fp8_mtp QWEN35_MTP_COMPILE_BACKEND=torch-cudagraph QWEN35_MTP_ATTN_BACKEND=trtllm QWEN35_MTP_MAX_BATCH_SIZE=32 QWEN35_MTP_MAX_TOKENS=128 QWEN35_MTP_STATS_OUT=ad_runs/mtp_trtllm_torch_cudagraph_b32_stats.json TRTLLM_DG_JIT_USE_NVCC=1 PYTHONUNBUFFERED=1 python debug/qwen35-mtp/qwen35_mtp_stats_probe.py 2>&1 | tee ad_runs/mtp_trtllm_torch_cudagraph_b32_stats.log`
+- Logs:
+  - `ad_runs/mtp_trtllm_torch_cudagraph_b32_stats.log`
+  - `ad_runs/mtp_trtllm_torch_cudagraph_b32_stats.json`
+- Runtime shape:
+  - registry config: `qwen3_5_moe_400b_fp8_mtp`
+  - model: `Qwen/Qwen3.5-397B-A17B-FP8`
+  - `compile_backend=torch-cudagraph`
+  - `attn_backend=trtllm`
+  - `max_batch_size=32`
+  - `max_tokens=128`
+- Build evidence:
+  - `EagleDrafterFactory` built a drafter for `model_type='qwen3_5_moe_text'`.
+  - `detect_hidden_states_for_capture` matched one hidden-state capture point
+    per rank.
+  - Sharding used `TP=420, EP=60` for the target graph and `TP=4, EP=1` for the
+    draft graph.
+  - `insert_cached_gated_delta_rule` matched `45` GDN nodes per rank.
+  - `initialize_cache` reported `total=197/196`, `kv=16/16`, `ssm=90/90`,
+    `conv=90/90`, and `max_tokens=8192`.
+  - CUDA graph compile completed after cache initialization.
+- Result:
+  - Generation completed for 4 prompts.
+  - `spec_iters=71`
+  - `total_drafted=272`
+  - `total_accepted=241`
+  - `acceptance_rate=0.8860294117647058`
+  - `num_stats=72`
+- Interpretation:
+  - The full-size FP8 MTP serving envelope drafts and accepts nontrivially with
+    TRTLLM attention and CUDA graphs.
+  - The acceptance rate is lower than the earlier small-batch short probe
+    (`~0.94`) but still very healthy for these open-ended prompts.
