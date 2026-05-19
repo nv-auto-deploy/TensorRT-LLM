@@ -158,7 +158,13 @@ EXCLUDE_TEST_FILES = {
     "test_flashinfer_mamba_cached_op.py",
     # Require TRT-LLM custom ops (dsv3_router_gemm_op, noaux_tc_op, etc.)
     "test_deepseek_custom.py",
+    "test_glm4_moe_modeling.py",
     "test_glm4_moe_lite_modeling.py",
+    "test_glm_moe_dsa_modeling.py",
+    # Full-model tests hit standalone-incompatible HF cache behavior.
+    "test_granite_moe_hybrid_modeling.py",
+    # Imports triton_kernels, which is not a standalone dependency.
+    "test_mxfp4_moe_layout.py",
     # Require TRT-LLM distributed ops (trtllm_dist_all_gather)
     "test_gather_logits_before_lm_head.py",
     # Multimodal types are None in standalone (MultimodalInput guard)
