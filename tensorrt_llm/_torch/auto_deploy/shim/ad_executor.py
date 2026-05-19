@@ -734,13 +734,12 @@ class ADEngine(ModelEngine):
         num_prefill_tokens = len(input_ids)
 
         for request in gen_requests:
-            # Overlap gathers tokens from the previous batch slot. Non-overlap
-            # forwards do not pass new_tokens at all; first-step generation-only
-            # disagg requests may have new_tokens from a previous batch but do
-            # not have a previous batch slot (py_batch_idx) to gather from yet.
+            # Use overlap only for non-dummy requests with a previous batch slot.
+            # Dummy requests do not need sampled tokens from the previous iteration.
+            # First-step disagg decode requests have not appeared in a previous batch yet,
+            # so their py_batch_idx is None.
             is_overlap = (
-                has_new_tokens
-                and not self._disable_overlap_scheduler
+                not self._disable_overlap_scheduler
                 and not request.is_dummy
                 and request.py_batch_idx is not None
             )
@@ -1159,10 +1158,9 @@ def create_autodeploy_executor(
                 "Cache transceiver is enabled, but AutoDeploy did not find a managed paged KV "
                 "resource to provide attention_type."
             )
-        try:
-            attention_type = _ATTENTION_TYPE_TO_CPP[cache_attention_type]
-        except KeyError as exc:
-            raise ValueError(f"Unsupported attention_type: {cache_attention_type!r}") from exc
+        if cache_attention_type not in _ATTENTION_TYPE_TO_CPP:
+            raise ValueError(f"Unsupported attention_type: {cache_attention_type!r}")
+        attention_type = _ATTENTION_TYPE_TO_CPP[cache_attention_type]
 
         kv_cache_transceiver = create_kv_cache_transceiver(
             dist_mapping,
