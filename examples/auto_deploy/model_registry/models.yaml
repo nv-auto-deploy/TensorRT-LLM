@@ -340,9 +340,6 @@ models:
   config_id: qwen3_5_moe_400b
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b.yaml', 'enable_sharder_ir.yaml']
 - name: Qwen/Qwen3.5-397B-A17B-FP8
-  config_id: qwen3_5_moe_400b_fp8
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b.yaml', 'enable_sharder_ir.yaml']
-- name: Qwen/Qwen3.5-397B-A17B-FP8
   config_id: qwen3_5_moe_400b_fp8_mtp
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b.yaml', 'qwen3.5_moe_400b_mtp.yaml', 'enable_sharder_ir.yaml']
 # --- GLM-5 (Feb 2026) ---

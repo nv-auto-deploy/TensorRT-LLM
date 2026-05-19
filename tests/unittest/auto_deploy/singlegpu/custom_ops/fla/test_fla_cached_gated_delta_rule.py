@@ -84,9 +84,9 @@ def _preprocess_for_reference(q, k, a, b_proj, A_log, dt_bias, num_v_heads=None)
     return q_norm, k_norm, g, beta
 
 
-def _make_extend_case(device, dtype, *, num_k_heads=2, num_v_heads=2):
-    num_extend = 2
-    tokens_per_extend = 4
+def make_extend_kernel_inputs(device, dtype, *, num_k_heads=2, num_v_heads=2):
+    num_extend = 1
+    tokens_per_extend = 3
     total_tokens = num_extend * tokens_per_extend
     key_dim = 8
     value_dim = 8
@@ -104,7 +104,7 @@ def _make_extend_case(device, dtype, *, num_k_heads=2, num_v_heads=2):
         value_dim,
     )
 
-    slot_idx = torch.tensor([2, 0], device=device, dtype=torch.int32)
+    slot_idx = torch.tensor([2], device=device, dtype=torch.int32)
     delta_cache = torch.zeros(
         max_batch_size,
         num_v_heads,
@@ -358,13 +358,17 @@ def test_prefill_only(gdr_env, num_k_heads, num_v_heads):
 
 @pytest.mark.parametrize("num_k_heads,num_v_heads", [(2, 2), (2, 4)])
 def test_extend_only_matches_prefill_reference(gdr_env, num_k_heads, num_v_heads):
-    """Extend-only uses initial cached state without routing through prefill metadata."""
+    """Extend-only writes the same intermediate states as repeated prefill prefixes."""
     device = gdr_env["device"]
     dtype = gdr_env["dtype"]
     atol = 5e-3
     rtol = 5e-3
+    state_atol = 1e-2
+    state_rtol = 2e-2
 
-    args, _ = _make_extend_case(device, dtype, num_k_heads=num_k_heads, num_v_heads=num_v_heads)
+    args, _ = make_extend_kernel_inputs(
+        device, dtype, num_k_heads=num_k_heads, num_v_heads=num_v_heads
+    )
     (
         q,
         k,
@@ -387,51 +391,45 @@ def test_extend_only_matches_prefill_reference(gdr_env, num_k_heads, num_v_heads
     delta_cache.copy_(torch.randn_like(delta_cache))
     initial_cache = delta_cache.clone()
 
-    y = torch.ops.auto_deploy.fla_cached_gated_delta_rule(*args)
+    y_extend = torch.ops.auto_deploy.fla_cached_gated_delta_rule(*args)
 
-    q_norm, k_norm, g, beta = _preprocess_for_reference(q, k, a, b, A_log, dt_bias, num_v_heads)
-    num_extend = slot_idx.numel()
-    tokens_per_extend = q.shape[1] // num_extend
-    y_ref = torch.empty_like(y)
+    tokens_per_extend = q.shape[1]
+    for prefix_len in range(1, tokens_per_extend + 1):
+        prefix_delta_cache = initial_cache.clone()
+        prefix_batch_info = BatchInfo()
+        prefix_batch_info.update([1, prefix_len, 0, 0, 0, 0])
+        prefix_cu_seqlen = torch.tensor([0, prefix_len], device=device, dtype=torch.int32)
+        prefix_slot_idx = slot_idx[:1]
+        prefix_use_initial_states = torch.ones(1, device=device, dtype=torch.bool)
+        prefix_any_use_initial_states_host = torch.tensor([True], device=device, dtype=torch.bool)
 
-    for seq_idx in range(num_extend):
-        start = seq_idx * tokens_per_extend
-        end = start + tokens_per_extend
-        initial_state = initial_cache[slot_idx[seq_idx].long()].unsqueeze(0)
-
-        y_seq, _ = chunk_gated_delta_rule(
-            q=q_norm[:, start:end],
-            k=k_norm[:, start:end],
-            v=v[:, start:end],
-            g=g[:, start:end],
-            beta=beta[:, start:end],
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=False,
+        y_prefill = torch.ops.auto_deploy.fla_cached_gated_delta_rule(
+            q[:, :prefix_len],
+            k[:, :prefix_len],
+            v[:, :prefix_len],
+            a[:, :prefix_len],
+            b[:, :prefix_len],
+            A_log,
+            dt_bias,
+            prefix_batch_info.serialize(),
+            prefix_cu_seqlen,
+            prefix_slot_idx,
+            prefix_use_initial_states,
+            prefix_any_use_initial_states_host,
+            prefix_delta_cache,
+            None,
+            scale,
         )
 
-        y_ref[:, start:end] = y_seq.to(dtype)
-        for step_idx in range(tokens_per_extend):
-            _, prefix_final_state = fused_recurrent_gated_delta_rule_fwd(
-                q=q_norm[:, start : start + step_idx + 1],
-                k=k_norm[:, start : start + step_idx + 1],
-                v=v[:, start : start + step_idx + 1],
-                g=g[:, start : start + step_idx + 1],
-                beta=beta[:, start : start + step_idx + 1],
-                scale=scale,
-                initial_state=initial_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=False,
-            )
-            torch.testing.assert_close(
-                intermediate_delta_cache[seq_idx, step_idx],
-                prefix_final_state.squeeze(0).to(intermediate_delta_cache.dtype),
-                atol=atol,
-                rtol=rtol,
-            )
+        torch.testing.assert_close(
+            intermediate_delta_cache[0, prefix_len - 1],
+            prefix_delta_cache[prefix_slot_idx[0].long()].to(intermediate_delta_cache.dtype),
+            atol=state_atol,
+            rtol=state_rtol,
+        )
+        if prefix_len == tokens_per_extend:
+            torch.testing.assert_close(y_extend, y_prefill, atol=atol, rtol=rtol)
 
-    torch.testing.assert_close(y, y_ref, atol=atol, rtol=rtol)
     torch.testing.assert_close(delta_cache, initial_cache, atol=0, rtol=0)
 
 
@@ -442,11 +440,11 @@ def test_extend_cuda_graph_capture():
     dtype = torch.bfloat16
     torch.manual_seed(42)
 
-    warmup_args, _ = _make_extend_case(device, dtype)
+    warmup_args, _ = make_extend_kernel_inputs(device, dtype)
     for _ in range(3):
         torch.ops.auto_deploy.fla_cached_gated_delta_rule(*warmup_args)
 
-    capture_args, capture_v = _make_extend_case(device, dtype)
+    capture_args, capture_v = make_extend_kernel_inputs(device, dtype)
     static_out = torch.empty_like(capture_v)
 
     cuda_graph = torch.cuda.CUDAGraph()

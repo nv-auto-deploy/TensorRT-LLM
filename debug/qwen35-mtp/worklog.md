@@ -1975,3 +1975,188 @@ run locally without MTP.
     TRTLLM attention and CUDA graphs.
   - The acceptance rate is lower than the earlier small-batch short probe
     (`~0.94`) but still very healthy for these open-ended prompts.
+
+## PR 252 Review Comment Cleanup
+
+- Commit before task: `04cb31c2dacc79f52ed7ae603565ebb2223070d4`
+- Task:
+  - Address review comments on PR 252, especially around MTP registry shape,
+    FLA extend-state invariants, Qwen3.5 text/composite config handling,
+    strict MTP checkpoint loading, accuracy-test cleanup, and clearer modeling
+    test placement/names.
+- Plan:
+  - Keep model-specific Qwen3.5 MTP logic auditable in the Qwen3.5 modeling
+    file.
+  - Remove temporary no-MTP FP8 test scaffolding and add the full FP8 MTP GSM8K
+    reference measured from the completed run.
+  - Make the FLA extend path always require intermediate SSM state storage, then
+    test extend intermediate states against prefill-prefix states through the AD
+    custom op.
+  - Consolidate MTP modeling tests into the existing Qwen3.5 MoE test file and
+    rename them to describe contracts rather than repeat the model family name.
+- Changes:
+  - Updated `qwen3.5_moe_400b_mtp.yaml` to use `max_draft_len=6`,
+    `max_batch_size=8`, CUDA graph batches up to 8, and inherited multi-stream
+    settings.
+  - Removed the non-MTP FP8 registry entry from `models.yaml`.
+  - Moved Qwen3.5 composite-config resolution into the Qwen3.5 modeling code
+    and exposed it through a generic `resolve_eagle_config()` dispatch helper
+    so `models/eagle.py` stays model-family agnostic.
+  - Kept the production `Qwen3_5MoeConfig` CausalLM registration because the
+    text-only base registry still uses `AutoModelForCausalLM`; tests no longer
+    depend on this redirect.
+  - Left the internal `mlp` naming in the Qwen3.5 MTP block because it follows
+    the checkpoint/module convention for the block's channel mixer, even though
+    the implementation is MoE-backed.
+  - Reinstated the BF16 no-MTP accuracy test shape, removed the temporary FP8
+    no-MTP accuracy override, and added an FP8 MTP GSM8K reference of `87.64`.
+  - Renamed the FLA extend helper to `make_extend_kernel_inputs()` and rewrote
+    the extend test to compare custom-op extend intermediate states against
+    repeated custom-op prefill prefixes.
+  - Moved MTP modeling tests into
+    `tests/unittest/auto_deploy/singlegpu/models/test_qwen3_5_moe.py` and
+    renamed them around explicit contracts such as checkpoint mapping, layer
+    reference parity, factory construction, export I/O, hidden-state capture,
+    and strict HF checkpoint loading.
+- Verification:
+  - `CUDA_VISIBLE_DEVICES=0 pytest -sv tests/unittest/auto_deploy/singlegpu/models/test_qwen3_5_moe.py -k 'mtp' 2>&1 | tee debug/qwen35-mtp/logs/test_qwen3_5_moe_mtp_after_comments.log`
+    - Result after final resolver cleanup: `14 passed, 41 deselected, 3 warnings in 4.32s`.
+  - `CUDA_VISIBLE_DEVICES=0 pytest -sv tests/unittest/auto_deploy/singlegpu/custom_ops/fla/test_fla_cached_gated_delta_rule.py 2>&1 | tee debug/qwen35-mtp/logs/test_fla_cached_gated_delta_rule_after_comments.log`
+    - Result: `9 passed, 3 warnings in 24.94s`.
+  - The first FLA rerun failed because the state tolerance variables were scoped
+    to the wrong test; moving them into the extend test fixed it.
+- Current status:
+  - Review-comment cleanup is implemented and focused unit coverage passes.
+  - The new `max_draft_len=6` plus inherited multi-stream MTP registry shape has
+    not yet been rerun end-to-end after this cleanup.
+  - No commit has been created yet; current HEAD remains
+    `04cb31c2dacc79f52ed7ae603565ebb2223070d4`.
+
+## Full-Size FP8 MTP GSM8K Validation After Review Cleanup
+
+- Commit before task: `04cb31c2dacc79f52ed7ae603565ebb2223070d4`
+- Task:
+  - Validate the polished full-size FP8 MTP accuracy test path for
+    Qwen/Qwen3.5-397B-A17B-FP8 after the PR review cleanup.
+  - Stop treating short stats probes as the main evidence path; use them only
+    for quick sanity checks.
+- Plan:
+  - Run the real pytest accuracy test with the full FP8 snapshot, MTP enabled
+    through the model registry, TRTLLM attention, CUDA graphs, overlap
+    scheduler defaults, and the updated MTP config (`max_batch_size=8`,
+    `max_draft_len=6`).
+  - Check whether explicitly enabled multi-stream MoE/GEMM transforms apply.
+  - Record the exact GSM8K accuracy and compare it to the stored FP8 MTP
+    reference.
+- Commands:
+  - First attempt:
+    `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 LLM_MODELS_ROOT=/home/gramnarayan/dev/model-symlinks HF_HOME=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/autodeploy_data/hf_home TRTLLM_DG_JIT_USE_NVCC=1 PYTHONUNBUFFERED=1 pytest -sv tests/integration/defs/accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_fp8_mtp_gsm8k --tb=short 2>&1 | tee ad_runs/test_fp8_mtp_gsm8k_after_comments.log`
+  - Successful rerun:
+    `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 LLM_MODELS_ROOT=/home/gramnarayan/dev/model-symlinks HF_HOME=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/autodeploy_data/hf_home QWEN35_FP8_MODEL_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/autodeploy_data/hf_home/hub/models--Qwen--Qwen3.5-397B-A17B-FP8/snapshots/ea5b4f81096f3901c91dea97f81324302495781d TRTLLM_DG_JIT_USE_NVCC=1 PYTHONUNBUFFERED=1 pytest -sv tests/integration/defs/accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_fp8_mtp_gsm8k --tb=short 2>&1 | tee ad_runs/test_fp8_mtp_gsm8k_after_comments_with_model_path.log`
+- What happened:
+  - The first attempt failed before model build because
+    `Qwen/Qwen3.5-397B-A17B-FP8` was not present under `LLM_MODELS_ROOT`.
+  - The rerun used `QWEN35_FP8_MODEL_PATH` to point at the real local HF
+    snapshot and completed successfully.
+  - The full run built both target and drafter:
+    - target: `Qwen3_5MoeForCausalLM`
+    - drafter: `model_type='qwen3_5_moe_text'`
+  - Sharding used the expected full-size split:
+    - target graph: `TP=420`, `EP=60`
+    - draft graph: `TP=4`, `EP=1`
+  - Cache initialization covered the GDN/SSM resources:
+    - `total=197/196`, `kv=16/16`, `ssm=90/90`, `conv=90/90`,
+      `max_tokens=8192`
+  - Cache resize completed:
+    - rank 0: `max_tokens=492064`, `paged=7.51GB`,
+      `non_paged=1.69GB`, `total=9.20GB`
+    - other ranks: `max_tokens=492064`, `paged=7.92GB`,
+      `non_paged=1.69GB`, `total=9.61GB`
+  - Multi-stream transforms were actually enabled in this run:
+    - `multi_stream_moe`: `matches=61` per rank
+    - `multi_stream_gemm`: `matches=61` per rank
+    - `multi_stream_mla_attn`: disabled
+  - CUDA graph capture covered batch sizes `8, 7, 6, 5, 4, 3, 2, 1`.
+  - Total AutoDeploy transform time was about `731.35s`.
+  - GSM8K generation/evaluation completed in about `691.604s`.
+- Result:
+  - Pytest result: `1 passed, 3 warnings in 1463.99s (0:24:23)`.
+  - GSM8K flexible-extract exact match: `88.097`.
+  - GSM8K strict-match exact match: `86.884`.
+  - GSM8K average accuracy: `87.49`.
+  - Reference accuracy: `87.640`.
+  - Evaluated accuracy: `87.491`.
+  - Hypothesis threshold: `84.437`; the test passed.
+- Interpretation:
+  - This is the strongest validation so far for the intended landing shape:
+    full-size FP8 Qwen3.5 MTP, registry config, TRTLLM attention, CUDA graphs,
+    overlap scheduler path, managed SSM/conv cache resources, and multi-stream
+    MoE/GEMM enabled.
+  - The score is effectively aligned with the stored FP8 MTP reference and with
+    the prior full-size FP8 MTP run.
+  - The local test needs `QWEN35_FP8_MODEL_PATH` because this machine has the
+    FP8 snapshot in HF cache rather than under `LLM_MODELS_ROOT`; CI/model
+    staging still needs to provide the same model path through its normal model
+    root mechanism.
+- Current status:
+  - Full-size FP8 MTP GSM8K validation passed.
+  - No commit has been created yet; current HEAD remains
+    `04cb31c2dacc79f52ed7ae603565ebb2223070d4`.
+
+## Limit Text-Only Qwen3.5 MTP Config Coercion To Accuracy Test Setup
+
+- Commit before task: `04cb31c2dacc79f52ed7ae603565ebb2223070d4`
+- Task:
+  - Remove the production-path workaround that made the composite
+    `Qwen3_5MoeConfig` resolve to `Qwen3_5MoeForCausalLM`.
+  - Keep this PR scoped to LLM-only MTP support; future VLM+MTP support should
+    be implemented explicitly rather than hidden behind a global config
+    redirect.
+- Plan:
+  - Revert the global `AutoModelForCausalLMFactory` registration for
+    `Qwen3_5MoeConfig`.
+  - Remove composite-to-text conversion from the generic Eagle drafter config
+    path.
+  - In the FP8 MTP accuracy test only, create a temporary text-only view of the
+    local HF snapshot so the test exercises the LLM path without changing
+    production handling of composite Qwen3.5 configs.
+- Changes:
+  - Removed
+    `AutoModelForCausalLMFactory.register_custom_model_cls("Qwen3_5MoeConfig", Qwen3_5MoeForCausalLM)`.
+  - Removed `Qwen3_5MoeForCausalLM.__init__` accepting composite configs via
+    `config.text_config`.
+  - Removed `resolve_eagle_config()` and the Qwen3.5 composite-to-text drafter
+    resolver from the production Eagle path.
+  - Added `make_fp8_mtp_text_only_model_path()` in
+    `tests/integration/defs/accuracy/test_llm_api_autodeploy.py`.
+    - It creates a `tmp_path` snapshot view.
+    - It symlinks the real FP8 snapshot files.
+    - It writes a flattened `qwen3_5_moe_text` `config.json`.
+    - It preserves the top-level quantization config and still uses the real
+      snapshot path as the tokenizer path.
+- Verification:
+  - Sandboxed pytest initially failed during local MPI/socket initialization;
+    reran outside the sandbox.
+  - `CUDA_VISIBLE_DEVICES=0 pytest -sv tests/unittest/auto_deploy/singlegpu/models/test_qwen3_5_moe.py -k mtp 2>&1 | tee debug/qwen35-mtp/logs/test_qwen3_5_moe_mtp_text_only_test_setup.log`
+    - Result: `14 passed, 41 deselected, 3 warnings in 4.33s`.
+  - Temporary text-only snapshot sanity check:
+    - `AutoConfig.from_pretrained(temp_snapshot)` returned
+      `Qwen3_5MoeTextConfig`.
+    - `model_type == "qwen3_5_moe_text"`.
+    - `mtp_num_hidden_layers == 1`.
+    - Quantization config and sharded safetensors index were present.
+  - `git diff --check -- . ':!triton_backend/tools/gpt/input_data.json'`
+    passed.
+- Interpretation:
+  - This removes the production-path hack and makes the current limitation
+    explicit: the new full-size accuracy test is LLM-only by construction.
+  - The future VLM+MTP work should preserve and compose the original VLM target
+    factory instead of relying on text-only config coercion.
+- Current status:
+  - Test-local text-only setup is implemented and focused unit/sanity checks
+    pass.
+  - The full-size GSM8K accuracy pass should be rerun once more with this new
+    test-local setup if we want final end-to-end evidence for the exact landing
+    diff.
+  - No commit has been created yet; current HEAD remains
+    `04cb31c2dacc79f52ed7ae603565ebb2223070d4`.

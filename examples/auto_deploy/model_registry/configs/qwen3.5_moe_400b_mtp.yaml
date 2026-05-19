@@ -12,22 +12,24 @@
 # capture.
 enable_chunked_prefill: false
 max_num_tokens: 8192
-max_batch_size: 32
+max_batch_size: 8
 cuda_graph_config:
-  max_batch_size: 32
-  batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 16, 32]
+  max_batch_size: 8
+  batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
 kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.7
   tokens_per_block: 32
 speculative_config:
   decoding_type: MTP
-  max_draft_len: 1
+  max_draft_len: 6
   mtp_eagle_one_model: true
 transforms:
   insert_cached_causal_conv:
     backend: triton_causal_conv
-  multi_stream_gemm:
-    enabled: false
   multi_stream_moe:
-    enabled: false
+    stage: compile
+    enabled: true
+  multi_stream_gemm:
+    stage: compile
+    enabled: true

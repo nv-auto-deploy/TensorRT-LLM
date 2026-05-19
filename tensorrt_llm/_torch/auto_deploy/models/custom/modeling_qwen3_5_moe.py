@@ -1058,8 +1058,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Qwen3_5MoeTextConfig, **kwargs):
-        if hasattr(config, "text_config"):
-            config = config.text_config
         super().__init__(config)
         self.model = Qwen3_5MoeTextModel(config)
         self.vocab_size = config.vocab_size
@@ -3144,5 +3142,4 @@ AutoConfig.register("qwen3_5_moe", Qwen3_5MoeConfig, exist_ok=True)
 AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeTextConfig, exist_ok=True)
 
 AutoModelForCausalLMFactory.register_custom_model_cls("Qwen3_5MoeTextConfig", Qwen3_5MoeForCausalLM)
-AutoModelForCausalLMFactory.register_custom_model_cls("Qwen3_5MoeConfig", Qwen3_5MoeForCausalLM)
 Qwen3_5MoeFactory.register_custom_model_cls("Qwen3_5MoeConfig", Qwen3_5MoeForConditionalGeneration)

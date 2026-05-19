@@ -95,12 +95,6 @@ def main():
             "insert_cached_causal_conv": {
                 "backend": "triton_causal_conv",
             },
-            "multi_stream_gemm": {
-                "enabled": False,
-            },
-            "multi_stream_moe": {
-                "enabled": False,
-            },
         },
         "enable_iter_perf_stats": True,
         "enable_iter_req_stats": True,

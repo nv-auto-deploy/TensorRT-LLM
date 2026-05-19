@@ -160,45 +160,38 @@ def fla_cached_gated_delta_rule(
         a_ext = a_flat[extend_start:extend_end].view(num_extend, tokens_per_extend, HV)
         b_ext = b_flat[extend_start:extend_end].view(num_extend, tokens_per_extend, HV)
 
-        if batch_info.get_max_draft_len() > 0 and intermediate_delta_cache is not None:
-            recurrent_state_source = delta_cache[slot_idx_extend]
-            recurrent_state_indices = torch.arange(
-                num_extend, dtype=torch.int32, device=slot_idx_extend.device
+        if intermediate_delta_cache is None:
+            raise RuntimeError(
+                "fla_cached_gated_delta_rule requires an intermediate_delta_cache "
+                "for extend requests"
             )
-            g_ext = -A_log.float().exp() * F.softplus(a_ext.float() + dt_bias)
-            beta_ext = b_ext.float().sigmoid()
+        if intermediate_delta_cache.size(1) < tokens_per_extend:
+            raise RuntimeError(
+                "fla_cached_gated_delta_rule received an intermediate_delta_cache "
+                "that is too small for the extend branch"
+            )
 
-            y_extend = fused_recurrent_gated_delta_rule_update(
-                q=q_ext,
-                k=k_ext,
-                v=v_ext,
-                g=g_ext,
-                beta=beta_ext,
-                initial_state_source=recurrent_state_source,
-                initial_state_indices=recurrent_state_indices,
-                scale=scale,
-                use_qk_l2norm_in_kernel=True,
-                disable_state_update=True,
-                intermediate_states_buffer=intermediate_delta_cache,
-                cache_steps=tokens_per_extend,
-            )
-        else:
-            y_extend = fused_sigmoid_gating_delta_rule_update(
-                A_log=A_log,
-                a=a_ext,
-                dt_bias=dt_bias,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-                q=q_ext,
-                k=k_ext,
-                v=v_ext,
-                b=b_ext,
-                initial_state_source=delta_cache,
-                initial_state_indices=slot_idx_extend,
-                scale=scale,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=None,
-            )
+        recurrent_state_source = delta_cache[slot_idx_extend]
+        recurrent_state_indices = torch.arange(
+            num_extend, dtype=torch.int32, device=slot_idx_extend.device
+        )
+        g_ext = -A_log.float().exp() * F.softplus(a_ext.float() + dt_bias)
+        beta_ext = b_ext.float().sigmoid()
+
+        y_extend = fused_recurrent_gated_delta_rule_update(
+            q=q_ext,
+            k=k_ext,
+            v=v_ext,
+            g=g_ext,
+            beta=beta_ext,
+            initial_state_source=recurrent_state_source,
+            initial_state_indices=recurrent_state_indices,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+            disable_state_update=True,
+            intermediate_states_buffer=intermediate_delta_cache,
+            cache_steps=tokens_per_extend,
+        )
 
         y_flat[extend_start:extend_end] = y_extend.reshape(num_extend_tokens, HV, -1).to(
             y_flat.dtype
