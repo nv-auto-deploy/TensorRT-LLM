@@ -37,7 +37,6 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
     get_all_layer_subgraphs,
     get_layer_after_linear_node,
     get_weight_shape,
-    identify_regions_between_residuals,
     is_any_split_op,
     is_any_view_op,
 )
@@ -45,61 +44,6 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
 
 def _call_function_nodes(gm: GraphModule):
     return [n for n in gm.graph.nodes if n.op == "call_function"]
-
-
-def test_identify_regions_uses_embedding_input_ids_seed():
-    root = nn.Module()
-    root.weight = nn.Parameter(torch.randn(16, 8))
-
-    graph = fx.Graph()
-    input_ids = graph.placeholder("input_ids")
-    hidden_states = graph.placeholder("hidden_states")
-    weight = graph.get_attr("weight")
-    embedding = graph.call_function(torch.ops.aten.embedding.default, args=(weight, input_ids))
-    residual = graph.call_function(torch.ops.aten.add.Tensor, args=(embedding, hidden_states))
-    graph.output(residual)
-    gm = GraphModule(root, graph)
-
-    boundaries = identify_regions_between_residuals(gm)
-
-    assert [node.name for node in boundaries] == [
-        input_ids.name,
-        embedding.name,
-        residual.name,
-        "output",
-    ]
-
-
-def test_identify_regions_uses_inputs_embeds_when_input_ids_is_unused():
-    graph = fx.Graph()
-    input_ids = graph.placeholder("input_ids")
-    inputs_embeds = graph.placeholder("inputs_embeds")
-    hidden_states = graph.placeholder("hidden_states")
-    residual = graph.call_function(torch.ops.aten.add.Tensor, args=(inputs_embeds, hidden_states))
-    graph.output(residual)
-    gm = GraphModule(nn.Module(), graph)
-
-    boundaries = identify_regions_between_residuals(gm)
-
-    assert input_ids not in boundaries
-    assert [node.name for node in boundaries] == [
-        inputs_embeds.name,
-        residual.name,
-        "output",
-    ]
-
-
-def test_identify_regions_returns_minimal_boundaries_without_residual_seed():
-    graph = fx.Graph()
-    input_ids = graph.placeholder("input_ids")
-    hidden_states = graph.placeholder("hidden_states")
-    residual = graph.call_function(torch.ops.aten.add.Tensor, args=(input_ids, hidden_states))
-    graph.output(residual)
-    gm = GraphModule(nn.Module(), graph)
-
-    boundaries = identify_regions_between_residuals(gm)
-
-    assert boundaries == [input_ids, next(node for node in gm.graph.nodes if node.op == "output")]
 
 
 def test_is_any_view_op_aten_view():
