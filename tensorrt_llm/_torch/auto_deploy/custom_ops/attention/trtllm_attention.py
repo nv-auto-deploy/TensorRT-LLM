@@ -45,6 +45,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    AttentionType,
     BatchInfo,
     Constant,
     KVPagedResourceHandler,
@@ -869,7 +870,7 @@ class TrtllmAttention(AttentionDescriptor):
                 kv_factor=2,
                 kv_layout="HND",
                 sliding_window=sliding_window,
-                attention_type="mha",
+                attention_type=AttentionType.mha,
             )
         }
 

@@ -25,7 +25,10 @@ import torch
 from _model_test_utils import default_max_num_tokens
 
 from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import KVPagedResourceHandler
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
+    AttentionType,
+    KVPagedResourceHandler,
+)
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _compute_window_local_view
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 
@@ -67,11 +70,12 @@ def two_window_interface():
     interface.add_resource(
         "kv_swa",
         KVPagedResourceHandler(
-            4, 32, dtype=torch.float16, attention_type="mha", sliding_window=SWA_WINDOW
+            4, 32, dtype=torch.float16, attention_type=AttentionType.mha, sliding_window=SWA_WINDOW
         ),
     )
     interface.add_resource(
-        "kv_full", KVPagedResourceHandler(4, 32, dtype=torch.float16, attention_type="mha")
+        "kv_full",
+        KVPagedResourceHandler(4, 32, dtype=torch.float16, attention_type=AttentionType.mha),
     )
     interface.initialize_resources()
     return interface

@@ -76,6 +76,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    AttentionType,
     BatchInfo,
     Constant,
     KVPagedResourceHandler,
@@ -2200,7 +2201,7 @@ class TrtllmMLAAttention(AttentionDescriptor):
             dtype=cache_dtype,
             kv_factor=1,
             kv_layout="HND",
-            attention_type="mla",
+            attention_type=AttentionType.mla,
         )
         return {"kv_cache": kv_handler}
 

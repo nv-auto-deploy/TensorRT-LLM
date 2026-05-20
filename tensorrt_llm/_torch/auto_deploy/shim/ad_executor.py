@@ -55,6 +55,7 @@ from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, SamplerType
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from tensorrt_llm.mapping import Mapping
 
+from ..custom_ops.attention_interface import AttentionType
 from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
@@ -63,8 +64,8 @@ from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
 _ATTENTION_TYPE_TO_CPP = {
-    "mha": AttentionTypeCpp.DEFAULT,
-    "mla": AttentionTypeCpp.MLA,
+    AttentionType.mha: AttentionTypeCpp.DEFAULT,
+    AttentionType.mla: AttentionTypeCpp.MLA,
 }
 
 # Non-tensor multimodal metadata consumed by _store_prefill_multimodal_metadata.
@@ -420,12 +421,18 @@ class ADEngine(ModelEngine):
             self.max_beam_width = ad_config.max_beam_width
             self.spec_config = ad_config.speculative_config
             self._disable_overlap_scheduler = ad_config.disable_overlap_scheduler
+            cache_transceiver_config = ad_config.cache_transceiver_config
+            self._cache_transceiver_enabled = (
+                cache_transceiver_config is not None
+                and cache_transceiver_config.backend is not None
+            )
             self.llm_args.max_stats_len = ad_config.max_stats_len
             self._enable_chunked_prefill = getattr(ad_config, "enable_chunked_prefill", False)
         else:
             self.max_beam_width = 1
             self.spec_config = None
             self._disable_overlap_scheduler = False
+            self._cache_transceiver_enabled = False
             self.llm_args.max_stats_len = 1000
             self._enable_chunked_prefill = False
 
@@ -658,12 +665,23 @@ class ADEngine(ModelEngine):
         gather_context_logits: bool = False,
     ) -> None:
         """Prepare inputs for AD Model from scheduled requests."""
+        context_requests = scheduled_requests.context_requests
+        if (
+            context_requests
+            and self._cache_transceiver_enabled
+            and not self._disable_overlap_scheduler
+        ):
+            raise RuntimeError(
+                "AutoDeploy disaggregated context workers do not support overlap scheduling. "
+                "Set disable_overlap_scheduler=True, or use "
+                "examples/auto_deploy/model_registry/configs/disagg_ctx.yaml when starting "
+                "a context worker with cache_transceiver_config."
+            )
+
         # cache manager
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-        # requests in order of context, generate
-        context_requests = scheduled_requests.context_requests
         extend_requests = [
             r for r in scheduled_requests.generation_requests if get_draft_token_length(r) > 0
         ]
@@ -678,6 +696,7 @@ class ADEngine(ModelEngine):
         assert len(extend_requests) == 0 or len(generation_requests) == 0
 
         gen_requests = extend_requests + generation_requests
+        # Requests in order of context, extend, generation.
         ordered_requests = context_requests + gen_requests
 
         # sequence information
@@ -1140,6 +1159,7 @@ def create_autodeploy_executor(
     kv_cache_transceiver = None
     if cache_transceiver_config is not None and cache_transceiver_config.backend is not None:
         if isinstance(kv_cache_manager, BaseMambaCacheManager):
+            # See https://github.com/NVIDIA/TensorRT-LLM/issues/14320.
             raise RuntimeError(
                 "AutoDeploy disaggregated serving does not currently support Mamba/hybrid cache "
                 "managers. A prerequisite for disaggregated serving of hybrid models is to use "
@@ -1158,15 +1178,15 @@ def create_autodeploy_executor(
                 "Cache transceiver is enabled, but AutoDeploy did not find a managed paged KV "
                 "resource to provide attention_type."
             )
-        if cache_attention_type not in _ATTENTION_TYPE_TO_CPP:
-            raise ValueError(f"Unsupported attention_type: {cache_attention_type!r}")
-        attention_type = _ATTENTION_TYPE_TO_CPP[cache_attention_type]
+        if not isinstance(cache_attention_type, AttentionType):
+            raise TypeError(f"attention_type must be AttentionType, got {cache_attention_type!r}")
+        attention_type_cpp = _ATTENTION_TYPE_TO_CPP[cache_attention_type]
 
         kv_cache_transceiver = create_kv_cache_transceiver(
             dist_mapping,
             dist,
             kv_cache_manager,
-            attention_type,
+            attention_type_cpp,
             cache_transceiver_config,
             mamba_cache_manager=None,
         )

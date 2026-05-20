@@ -38,6 +38,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    AttentionType,
     Constant,
     KVPagedResourceHandler,
     MHACallable,
@@ -1545,7 +1546,7 @@ class TritonPagedAttention(AttentionDescriptor):
                 kv_factor=2,
                 kv_layout=KV_LAYOUT,
                 sliding_window=sliding_window,
-                attention_type="mha",
+                attention_type=AttentionType.mha,
             )
         }
 

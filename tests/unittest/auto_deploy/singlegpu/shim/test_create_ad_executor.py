@@ -20,6 +20,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionType
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import create_autodeploy_executor
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import AttentionTypeCpp
@@ -84,7 +85,7 @@ def make_mock_engine(
     max_seq_len: int = 128,
     max_num_tokens: int = 512,
     vocab_size_padded: int = 1000,
-    attention_type: str = "mha",
+    attention_type: Optional[AttentionType] = AttentionType.mha,
 ):
     kv_cache_manager = Mock()
     kv_cache_manager.impl = Mock()
@@ -178,8 +179,8 @@ def test_create_autodeploy_executor_with_guided_decoding(
 @pytest.mark.parametrize(
     "cache_attention_type, expected_attention_type",
     [
-        ("mha", AttentionTypeCpp.DEFAULT),
-        ("mla", AttentionTypeCpp.MLA),
+        (AttentionType.mha, AttentionTypeCpp.DEFAULT),
+        (AttentionType.mla, AttentionTypeCpp.MLA),
     ],
 )
 def test_create_executor_uses_cache_transceiver(cache_attention_type, expected_attention_type):
@@ -231,8 +232,8 @@ def test_create_executor_uses_cache_transceiver(cache_attention_type, expected_a
 @pytest.mark.parametrize(
     "cache_attention_type, expected_attention_type",
     [
-        ("mha", AttentionTypeCpp.DEFAULT),
-        ("mla", AttentionTypeCpp.MLA),
+        (AttentionType.mha, AttentionTypeCpp.DEFAULT),
+        (AttentionType.mla, AttentionTypeCpp.MLA),
     ],
 )
 def test_create_executor_preserves_explicit_transceiver_buffer_size(
@@ -281,8 +282,9 @@ def test_create_executor_preserves_explicit_transceiver_buffer_size(
     assert create_transceiver.call_args.kwargs["mamba_cache_manager"] is None
 
 
-def test_create_executor_rejects_unsupported_attention_type():
-    """Test create_autodeploy_executor rejects unmanaged KV cache attention semantics."""
+@pytest.mark.parametrize("cache_attention_type", ["mha", "unsupported"])
+def test_create_executor_rejects_non_enum_attention_type(cache_attention_type):
+    """Test create_autodeploy_executor requires enum KV cache attention semantics."""
     mock_tokenizer = MockTokenizer()
 
     ad_config = LlmArgs(
@@ -295,7 +297,8 @@ def test_create_executor_rejects_unsupported_attention_type():
         cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
     )
 
-    mock_engine, _ = make_mock_engine(attention_type="unsupported")
+    mock_engine, _ = make_mock_engine()
+    mock_engine.cache_seq_interface.attention_type = cache_attention_type
 
     with (
         patch(
@@ -308,7 +311,7 @@ def test_create_executor_rejects_unsupported_attention_type():
     ):
         mock_ad_engine.return_value = mock_engine
 
-        with pytest.raises(ValueError, match="Unsupported attention_type: 'unsupported'"):
+        with pytest.raises(TypeError, match="attention_type must be AttentionType"):
             create_autodeploy_executor(ad_config, mock_tokenizer)
 
 
@@ -362,8 +365,10 @@ def test_create_executor_rejects_mamba_cache_manager_for_transceiver():
         cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
     )
 
-    mock_engine, _ = make_mock_engine(attention_type="mha")
-    mock_engine.cache_seq_interface.kv_cache_manager = Mock(spec=BaseMambaCacheManager)
+    mock_engine, _ = make_mock_engine(attention_type=AttentionType.mha)
+    mamba_cache_manager = Mock(spec=BaseMambaCacheManager)
+    mamba_cache_manager.impl = Mock()
+    mock_engine.cache_seq_interface.kv_cache_manager = mamba_cache_manager
 
     with (
         patch(

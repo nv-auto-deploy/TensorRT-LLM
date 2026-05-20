@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# KV cache transfer config for disaggregated serving.
+# Valid backend values include DEFAULT (i.e., NIXL), UCX, and NIXL.
+# See examples/disaggregated/README.md for the full disaggregated serving setup.
 cache_transceiver_config:
   backend: DEFAULT
-# Prefill workers must run without overlap scheduling because the current
-# context-only transfer path sends KV cache when a request completes its context
-# phase, after all prefill chunks have run.
+# Overlap scheduling is currently unsupported for disaggregated context workers.
 disable_overlap_scheduler: true

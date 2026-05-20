@@ -40,6 +40,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    AttentionType,
     BatchInfo,
     Constant,
     KVPagedResourceHandler,
@@ -600,7 +601,7 @@ class FlashInferAttention(AttentionDescriptor):
                 kv_factor=2,
                 kv_layout=_GlobalFlashInferPlanner.kv_layout,
                 sliding_window=sliding_window,
-                attention_type="mha",
+                attention_type=AttentionType.mha,
             )
         }
 

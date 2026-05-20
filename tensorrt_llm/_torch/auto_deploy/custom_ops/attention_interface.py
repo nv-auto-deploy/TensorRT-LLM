@@ -26,6 +26,7 @@ and operates on a purely functional paradigm that is compatible with the torch c
 
 import math
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
 import numpy as np
@@ -39,7 +40,12 @@ from ..utils.logger import ad_logger
 from ..utils.node_utils import extract_op_args, get_op_schema
 
 Constant = Union[int, float, str, None]
-AttentionType = Literal["mha", "mla"]
+
+
+class AttentionType(Enum):
+    mha = "mha"
+    mla = "mla"
+
 
 # Torch dtype → numpy dtype for fast list-to-tensor conversion.
 # numpy's list→array conversion is ~2-3x faster than torch.tensor(list) for large lists.
@@ -1842,7 +1848,17 @@ class ResourceHandler(ABC):
 
 
 class EphemeralResourceHandler(ResourceHandler):
-    """Base class for resources that do not persist across forward steps."""
+    """Resources that are produced and consumed within one forward pass.
+
+    Examples include MTP/Eagle hidden-state resources, which are regenerated every
+    step and not needed across steps.
+
+    Used for judging whether resources can be safely dropped when transferring from one node
+    to another, e.g. for disagg. Ephemeral resources can be safely dropped if the transfer
+    happens between forward passes.
+
+    TODO: May need to revisit this notion for intra-forward resource transfers.
+    """
 
 
 class KVPagedResourceHandler(ResourceHandler):
@@ -1864,7 +1880,7 @@ class KVPagedResourceHandler(ResourceHandler):
         kv_layout: Memory layout for the KV cache. Either "HND" (head-num-dim) or
             "NHD" (num-head-dim). Default is "HND" which is the standard layout
             for flashinfer.
-        attention_type: Attention layout semantics for this cache resource: ``"mha"`` or ``"mla"``.
+        attention_type: Attention layout semantics for this cache resource, e.g. ``AttentionType.mha``.
         sliding_window: Sliding window size for this layer.  ``0`` means full
             attention; a positive value puts this layer in its own VSWA group.
     """
@@ -1892,7 +1908,7 @@ class KVPagedResourceHandler(ResourceHandler):
             dtype: The dtype of the KV cache.
             kv_factor: The factor of the KV cache. Default is 2.
             kv_layout: Memory layout - "HND" or "NHD". Default is "HND".
-            attention_type: Attention layout semantics for this cache resource: ``"mha"`` or ``"mla"``.
+            attention_type: Attention layout semantics for this cache resource, e.g. ``AttentionType.mha``.
             sliding_window: Sliding window size for this layer. 0 means full attention.
         """
         self.num_kv_heads = num_kv_heads
@@ -1901,8 +1917,8 @@ class KVPagedResourceHandler(ResourceHandler):
         self.kv_factor = kv_factor
         assert kv_factor in [1, 2], f"Invalid kv_factor: {kv_factor}"
         self.kv_layout = kv_layout
-        if attention_type not in ("mha", "mla"):
-            raise ValueError(f"Unsupported attention_type: {attention_type!r}")
+        if not isinstance(attention_type, AttentionType):
+            raise TypeError(f"attention_type must be AttentionType, got {attention_type!r}")
         self.attention_type = attention_type
         self.sliding_window = (
             sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
