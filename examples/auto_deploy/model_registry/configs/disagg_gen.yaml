@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# KV cache transfer config for disaggregated serving.
-# Valid backend values include DEFAULT (i.e., NIXL), UCX, and NIXL.
-# See examples/disaggregated/README.md for the full disaggregated serving setup.
+# Selects the KV-cache transport used to move cache blocks between disaggregated workers.
+# Valid backend values include DEFAULT, UCX, and NIXL; see examples/disaggregated/README.md.
 cache_transceiver_config:
   backend: DEFAULT
