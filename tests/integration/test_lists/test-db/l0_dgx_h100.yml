@@ -381,7 +381,6 @@ l0_dgx_h100:
   - disaggregated/test_ad_disagg.py::test_async_generation_matches_aggregate
   - disaggregated/test_ad_disagg.py::test_async_sharded_generation_handoff
   - disaggregated/test_ad_disagg.py::test_async_eagle3_full_model_handoff
-  - disaggregated/test_ad_disagg_trtllm_serve.py::test_openai_completion
 # ------------- AutoDeploy Backend Stages L1 / Nightly only ---------------
 - condition:
     ranges:
@@ -398,6 +397,7 @@ l0_dgx_h100:
       auto_trigger: others
       orchestrator: mpi
   tests:
+  - disaggregated/test_ad_disagg_trtllm_serve.py::test_openai_completion
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[google_gemma-3-1b-it-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[meta-llama_Llama-3.1-8B-Instruct-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[mistralai_Ministral-8B-Instruct-2410-False]

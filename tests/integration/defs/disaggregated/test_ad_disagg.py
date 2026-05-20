@@ -391,7 +391,7 @@ def run_sequential_handoff(
 
 async def run_async_requests(llm, prompts, sampling_params_kwargs, disaggregated_params):
     futures = []
-    for prompt, params in zip(prompts, disaggregated_params):
+    for prompt, params in zip(prompts, disaggregated_params, strict=True):
         seed_disagg()
         futures.append(
             llm.generate_async(
@@ -511,7 +511,7 @@ def test_reduced_layer_batch_handoff_matches_aggregate(model, extra_config):
     )
 
     for aggregate_output, context_output, generation_output in zip(
-        aggregate_outputs, outputs["context"], outputs["generation"]
+        aggregate_outputs, outputs["context"], outputs["generation"], strict=True
     ):
         assert_context_handoff_metadata(context_output)
         assert context_output.token_ids == aggregate_output.token_ids[:1]
@@ -792,7 +792,9 @@ def worker_pool(worker_configs, model_names, world_sizes):
             model_name,
             world_size,
             worker_cuda_visible_devices,
-        ) in enumerate(zip(worker_configs, model_names, world_sizes, cuda_visible_devices)):
+        ) in enumerate(
+            zip(worker_configs, model_names, world_sizes, cuda_visible_devices, strict=True)
+        ):
             original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
             os.environ["CUDA_VISIBLE_DEVICES"] = worker_cuda_visible_devices
             process = ctx.Process(
@@ -835,7 +837,7 @@ def worker_pool(worker_configs, model_names, world_sizes):
                 process.join(timeout=WORKER_TERMINATE_TIMEOUT_S)
             if process.is_alive():
                 raise RuntimeError(f"AutoDeploy worker {process.pid} did not terminate")
-        for request_queue, response_queue in zip(request_queues, response_queues):
+        for request_queue, response_queue in zip(request_queues, response_queues, strict=True):
             request_queue.close()
             request_queue.join_thread()
             response_queue.close()

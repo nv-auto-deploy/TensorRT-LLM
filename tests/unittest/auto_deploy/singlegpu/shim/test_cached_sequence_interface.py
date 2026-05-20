@@ -1234,7 +1234,7 @@ def test_initialize_resources_rejects_unmanaged_incompatible_kv(
 
     with pytest.raises(
         RuntimeError,
-        match="reject_unmanaged_persistent_caches.*KVPagedResourceHandler",
+        match=r"reject_unmanaged_persistent_caches.*KVPagedResourceHandler",
     ):
         interface.initialize_resources()
 
