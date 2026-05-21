@@ -588,11 +588,10 @@ class QuantizationShardingMixin(ABC):
         for k, v in sharded_scales.items():
             submod.register_buffer(k, v)
 
-        _, _, weight_param_name = weight_key.rpartition(".")
-        submod._register_load_state_dict_pre_hook(
+        gm._register_load_state_dict_pre_hook(
             partial(
                 self.shard_load_hook,
-                weight_name=weight_param_name,
+                weight_name=weight_key,
                 weight_original_shape=weight_original_shape,
                 dim=dim,
                 rank=rank,
@@ -3209,30 +3208,17 @@ def detect_sharding_from_config(
     for lin_node in linear_nodes:
         # use node's weight name to get the module name
         weight_name = extract_weight_name(lin_node)
-        if not isinstance(weight_name, str):
-            ad_logger.debug(
-                f"Skipping config-driven TP sharding for linear node {lin_node} "
-                "because no weight name could be extracted."
-            )
-            continue
         # get the parent layer_subgraph
-        layer_subgraph_matches = [
+        layer_subgraph = [
             layer
             for layer in layer_subgraphs
             if lin_node in layer.opening_nodes or lin_node == layer.terminating_node
         ]
-        layer_subgraph = None
-        if len(layer_subgraph_matches) == 1:
-            layer_subgraph = layer_subgraph_matches[0]
+        if len(layer_subgraph) == 1:
+            layer_subgraph = layer_subgraph[0]
             layer_type = layer_subgraph.layer_type
         else:
-            typed_matches = [
-                layer for layer in layer_subgraph_matches if layer.layer_type != LayerType.UNKNOWN
-            ]
-            if len(typed_matches) == 1:
-                layer_subgraph = typed_matches[0]
-                layer_type = layer_subgraph.layer_type
-            elif lin_node in unprocessed_linear_nodes:
+            if lin_node in unprocessed_linear_nodes:
                 layer_type = LayerType.UNKNOWN
             else:
                 ad_logger.warning(
@@ -3248,21 +3234,10 @@ def detect_sharding_from_config(
                 config = tp_plan[key]
 
                 if config == "colwise":
-                    if isinstance(layer_subgraph, LayerSubgraph):
-                        _process_column_sharding(
-                            layer_subgraph=layer_subgraph,
-                            transform_container=transform_container,
-                        )
-                    elif transform_container.add(
-                        WeightShardingInfo.from_node(
-                            lin_node,
-                            split_dim=SplitDimension.COLUMN,
-                            config=transform_container.config,
-                            dist_op=None,
-                            layer_type=layer_type,
-                        )
-                    ):
-                        num_simple_shards += 1
+                    _process_column_sharding(
+                        layer_subgraph=layer_subgraph,
+                        transform_container=transform_container,
+                    )
                 elif config == "rowwise":
                     if transform_container.add(
                         WeightShardingInfo.from_node(

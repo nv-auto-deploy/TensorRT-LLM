@@ -2160,3 +2160,50 @@ run locally without MTP.
     diff.
   - No commit has been created yet; current HEAD remains
     `04cb31c2dacc79f52ed7ae603565ebb2223070d4`.
+
+## Polish Qwen3.5 FP8 MTP Accuracy Test
+
+- Commit before task: `bd3dd4b7ce548e70d760cbc2f62eebea224779cd`
+- Task:
+  - Make the Qwen3.5 FP8 MTP GSM8K test a legitimate landing accuracy test for
+    the intended performant configuration.
+  - Ensure the test proves the registry path uses TRTLLM attention with the
+    torch CUDA graph backend and catches a low/nonfunctional MTP acceptance
+    rate.
+- Plan:
+  - Keep the existing GSM8K accuracy registration for
+    `Qwen/Qwen3.5-397B-A17B` with `quant_algo=FP8`, `kv_cache_quant_algo=FP8`,
+    and `spec_dec_algo=MTP`.
+  - Rename the test so the covered serving path is clear.
+  - Add explicit config assertions for TRTLLM attention and torch-cudagraph.
+  - Check speculative decoding stats after GSM8K and require acceptance rate
+    above 40%.
+  - Preserve the pre-Hopper skip guard.
+- Changes:
+  - Renamed the full-size test to
+    `test_fp8_mtp_gsm8k_trtllm_attention_cudagraph`.
+  - Added merged registry-config assertions that the selected FP8 MTP config is
+    `runtime=trtllm`, `attn_backend=trtllm`, `compile_backend=torch-cudagraph`,
+    and `speculative_config.decoding_type=MTP`.
+  - Added `MIN_MTP_ACCEPTANCE_RATE = 0.40` and check
+    `_check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate=0.40)`
+    after the GSM8K evaluation.
+  - Kept the pre-Hopper and 8x80GB+ guards; this test now uses the explicit
+    `@skip_pre_hopper()` decorator form.
+  - Confirmed the registry overlay uses `speculative_config.max_draft_len: 6`.
+- Verification:
+  - `python -m py_compile tests/integration/defs/accuracy/test_llm_api_autodeploy.py`
+    passed.
+  - `git diff --check -- tests/integration/defs/accuracy/test_llm_api_autodeploy.py debug/qwen35-mtp/worklog.md`
+    passed.
+  - Did not run the full 8-GPU GSM8K accuracy test because GPUs are expected to
+    be busy.
+- Interpretation:
+  - The accuracy reference already exists in
+    `tests/integration/defs/accuracy/references/gsm8k.yaml` for
+    `Qwen/Qwen3.5-397B-A17B` with FP8 weights, FP8 KV cache, and MTP. The test
+    now explicitly exercises that registered accuracy path through the FP8 model
+    registry entry and additionally validates MTP acceptance.
+- Current status:
+  - Changes are uncommitted.
+  - New commit hash: none.

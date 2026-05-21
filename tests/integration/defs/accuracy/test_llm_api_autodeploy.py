@@ -74,6 +74,24 @@ def _get_registry_yaml_extra(model_name: str,
         f"Model '{model_name}'{suffix} not found in model registry")
 
 
+def _merge_config_dicts(base: dict, overrides: dict) -> dict:
+    result = dict(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _merge_config_dicts(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _load_merged_ad_config(yaml_paths: list[str]) -> dict:
+    config = {}
+    for yaml_path in yaml_paths:
+        with open(yaml_path) as f:
+            config = _merge_config_dicts(config, yaml.safe_load(f) or {})
+    return config
+
+
 def _set_quant_config(llm, model_id: str) -> None:
     """Set quant_config on *llm* based on *model_id* so the accuracy harness
     can resolve the correct thresholds.
@@ -1004,6 +1022,7 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     MODEL_PATH_SMALL = hf_id_to_local_model_dir(MODEL_NAME_SMALL)
     CONFIG_ID_FP8_MTP = "qwen3_5_moe_400b_fp8_mtp"
     GSM8K_MAX_OUTPUT_LEN = 512
+    MIN_MTP_ACCEPTANCE_RATE = 0.40
     EXTRA_EVALUATOR_KWARGS = dict(
         apply_chat_template=True,
         fewshot_as_multiturn=True,
@@ -1083,10 +1102,11 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    @skip_pre_hopper
+    @skip_pre_hopper()
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("world_size", [8])
-    def test_fp8_mtp_gsm8k(self, world_size, mocker, tmp_path):
+    def test_fp8_mtp_gsm8k_trtllm_attention_cudagraph(self, world_size, mocker,
+                                                      tmp_path):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
@@ -1096,6 +1116,11 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
         yaml_paths, registry_world_size = _get_registry_yaml_extra(
             self.MODEL_NAME_FP8, self.CONFIG_ID_FP8_MTP)
         assert registry_world_size == world_size
+        config = _load_merged_ad_config(yaml_paths)
+        assert config["runtime"] == "trtllm"
+        assert config["attn_backend"] == "trtllm"
+        assert config["compile_backend"] == "torch-cudagraph"
+        assert config["speculative_config"]["decoding_type"] == "MTP"
         with AutoDeployLLM(model=text_model_path,
                            tokenizer=model_path,
                            world_size=world_size,
@@ -1107,6 +1132,9 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            _check_acceptance_rate_stats(
+                llm.get_stats(),
+                min_acceptance_rate=self.MIN_MTP_ACCEPTANCE_RATE)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(180000)
