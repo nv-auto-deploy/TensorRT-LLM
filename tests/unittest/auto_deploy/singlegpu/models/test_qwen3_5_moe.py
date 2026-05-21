@@ -100,6 +100,7 @@ from tensorrt_llm._torch.auto_deploy.transform.interface import TransformConfig
 from tensorrt_llm._torch.auto_deploy.transform.library.hidden_states import (
     DetectHiddenStatesForCapture,
 )
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import identify_regions_between_residuals
 from tensorrt_llm.llmapi import MTPDecodingConfig
 
 
@@ -2849,6 +2850,46 @@ def _export_mtp_target_for_capture(num_hidden_layers: int = 3):
     return gm, config
 
 
+def _export_mtp_target_with_position_ids_first(
+    num_hidden_layers: int = 3,
+    include_dynamic_weight_linear: bool = False,
+):
+    class PositionIdsFirstTarget(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+
+        def forward(self, position_ids, inputs_embeds):
+            output = self.model(inputs_embeds=inputs_embeds, position_ids=position_ids)
+            if not include_dynamic_weight_linear:
+                return output
+
+            dynamic_weight = inputs_embeds[0]
+            helper = torch.ops.aten.linear.default(inputs_embeds, dynamic_weight)
+            return output, helper
+
+    config = _make_small_config(
+        num_hidden_layers=num_hidden_layers,
+        layer_types=["full_attention"] * num_hidden_layers,
+        mtp_num_hidden_layers=1,
+    )
+    model = PositionIdsFirstTarget(Qwen3_5MoeForCausalLM(config).eval())
+
+    inputs_embeds = torch.randn(2, 4, config.hidden_size)
+    position_ids = torch.arange(4).view(1, 4).expand(2, -1)
+    gm = torch_export_to_gm(
+        model,
+        args=(position_ids, inputs_embeds),
+        dynamic_shapes={
+            "position_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+            "inputs_embeds": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        },
+        strict=False,
+        num_moe_experts_for_export=2,
+    )
+    return gm, config
+
+
 def _init_mtp_module_weights(module: torch.nn.Module):
     for submodule in module.modules():
         if isinstance(submodule, torch.nn.Linear):
@@ -3263,6 +3304,30 @@ def test_mtp_target_export_uses_inputs_embeds_as_live_seed():
     assert not any(
         node.op == "call_module" and "embed_tokens" in str(node.target) for node in gm.graph.nodes
     )
+
+
+def test_mtp_target_hidden_state_capture_uses_inputs_embeds_when_no_embedding():
+    gm, config = _export_mtp_target_with_position_ids_first(
+        num_hidden_layers=3,
+        include_dynamic_weight_linear=True,
+    )
+    placeholders = [node.name for node in gm.graph.nodes if node.op == "placeholder"]
+    assert placeholders.index("position_ids") < placeholders.index("inputs_embeds")
+    assert not gm.graph.find_nodes(op="call_function", target=torch.ops.aten.embedding.default)
+    boundary_nodes = identify_regions_between_residuals(gm)
+    assert boundary_nodes[0].name == "inputs_embeds"
+
+    transform = DetectHiddenStatesForCapture(
+        config=TransformConfig(
+            stage="pattern_matcher",
+            eagle3_layers_to_capture={-1},
+        )
+    )
+
+    residual_nodes = transform.collect_residual_add_nodes(gm)
+
+    assert sorted(residual_nodes) == list(range(config.num_hidden_layers))
+    assert residual_nodes[max(residual_nodes)].meta["val"].shape[-1] == config.hidden_size
 
 
 def test_mtp_hf_checkpoint_keys_load_strictly():

@@ -851,32 +851,39 @@ def _precompute_weight_node_mapping(gm: GraphModule) -> None:
 
         category = _classify_weight_node(node)
 
-        # Forward-traverse through unary ops, tagging every node along the
-        # way (intermediates like exp, neg, to.dtype AND the terminal consumer).
-        # Stops at multi-input nodes (the actual consumer) or dead ends.
-        current = node
-        while True:
+        def tag_node(current: Node):
             if category not in current.meta:
                 current.meta[category] = []
             current.meta[category].append(node)
-            if len(current.all_input_nodes) > 1:
-                break
-            if len(current.users) == 0:
-                ad_logger.debug(
-                    f"Weight node {node.name} has no downstream consumer "
-                    f"(chain ended at {current.name})"
-                )
-                break
-            current = next(iter(current.users))
 
-        # If the chain could not advance past the get_attr node itself
-        # (e.g. get_attr has 0 users, or get_attr directly feeds a
-        # multi-input consumer), tag each direct user as a fallback.
-        if current == node:
-            for user in node.users:
-                if category not in user.meta:
-                    user.meta[category] = []
-                user.meta[category].append(node)
+        tag_node(node)
+
+        # Forward-traverse through unary ops, tagging every node along the
+        # way (intermediates like exp, neg, to.dtype AND the terminal consumer).
+        # Stops at multi-input nodes (the actual consumer) or dead ends.
+        #
+        # Some graph preservation helpers attach auxiliary users to parameters
+        # (for example torch._assert nodes that keep lm_head alive). Traverse
+        # each direct user independently so an auxiliary unary chain does not
+        # hide the real compute consumer from extract_weight_nodes().
+        for user in node.users:
+            current = user
+            while True:
+                tag_node(current)
+                if len(current.all_input_nodes) > 1:
+                    break
+                if len(current.users) == 0:
+                    ad_logger.debug(
+                        f"Weight node {node.name} has no downstream consumer "
+                        f"(chain ended at {current.name})"
+                    )
+                    break
+                if len(current.users) > 1:
+                    for direct_user in current.users:
+                        if direct_user is not current:
+                            tag_node(direct_user)
+                    break
+                current = next(iter(current.users))
 
 
 def get_user_if_pattern_match(node, ops, numusers, user_idx: int = 0):
@@ -923,18 +930,33 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     # in the graph, and this input_id_node op is "placeholder". Nevertheless, it serves as a proper
     # hook for residual identification.
     if input_id_node.name == "inputs_embeds":
+        assert not any(is_op(n_user, torch.ops.aten.embedding) for n_user in input_id_node.users), (
+            "inputs_embeds should not feed an embedding node"
+        )
         boundary_nodes.append(input_id_node)
     else:
+        embedding_node = None
         for n_user in input_id_node.users:
             if is_op(n_user, torch.ops.aten.embedding):
+                embedding_node = n_user
                 break
+        if embedding_node is not None:
+            # add embedding node to boundary nodes
+            boundary_nodes.append(embedding_node)
         else:
-            # we could not identify any boundary regions via embedding nodes
-            boundary_nodes.append(output_node)
-            return boundary_nodes
-
-        # add embedding node to boundary nodes
-        boundary_nodes.append(n_user)
+            inputs_embeds_node = next(
+                (
+                    node
+                    for node in gm.graph.nodes
+                    if node.op == "placeholder" and node.name == "inputs_embeds"
+                ),
+                None,
+            )
+            if inputs_embeds_node is None:
+                # we could not identify any boundary regions via embedding nodes
+                boundary_nodes.append(output_node)
+                return boundary_nodes
+            boundary_nodes = [inputs_embeds_node, inputs_embeds_node]
 
     # find residual nodes from here on
     while True:
@@ -1001,12 +1023,19 @@ def get_all_layer_subgraphs(
     # Pre-compute weight-to-consumer mapping for O(1) weight node lookup
     _precompute_weight_node_mapping(gm)
 
-    # Cache weight shapes for all linear nodes
+    # Cache weight shapes for all linear nodes. Some quantized/fused helper
+    # linears may not have a directly recoverable weight node after graph
+    # rewrites; keep them out of layer-boundary detection.
+    shapeable_linear_nodes = []
     for lin_node in linear_nodes:
         if "lin_node_shape" not in lin_node.meta:
             shape = get_weight_shape(lin_node)
             if shape is not None:
                 lin_node.meta["lin_node_shape"] = shape
+        if lin_node.meta.get("lin_node_shape") is not None:
+            shapeable_linear_nodes.append(lin_node)
+    linear_nodes = shapeable_linear_nodes
+    assert len(linear_nodes) > 0, "Could not find any shapeable linear nodes in the graph"
 
     embd = None
 
@@ -1029,12 +1058,28 @@ def get_all_layer_subgraphs(
 
     # Find the embedding size from the first linear node.
     if embd is None:
-        embd = get_weight_shape(linear_nodes[0], dim=-1)
+        first_linear_shape = get_weight_shape(linear_nodes[0])
+        if _is_fused_hidden_prologue_shape(first_linear_shape):
+            embd = first_linear_shape[0]
+        else:
+            embd = get_weight_shape(linear_nodes[0], dim=-1)
     if embd is None:
         raise ValueError("Failed to extract embedding size from first linear node")
 
     unprocessed_linear_nodes = set(linear_nodes)
-    assert len(linear_nodes) > 0, "Could not find any linear nodes in the graph"
+
+    if not in_eagle_drafter:
+        num_prologue_nodes = 0
+        while linear_nodes and _is_draft_prologue_linear(linear_nodes[0], embd):
+            num_prologue_nodes += 1
+            linear_nodes = linear_nodes[1:]
+        if num_prologue_nodes > 0:
+            ad_logger.debug(
+                "Skipped %s draft prologue linear nodes during layer-boundary detection",
+                num_prologue_nodes,
+            )
+        if len(linear_nodes) == 0:
+            return layer_subgraphs, unprocessed_linear_nodes
 
     terminating_indices = [-1]
     last_lin_index = terminating_indices[-1] + 1
@@ -1062,15 +1107,41 @@ def get_all_layer_subgraphs(
     return layer_subgraphs, unprocessed_linear_nodes
 
 
+def _is_fused_hidden_prologue_shape(shape: Optional[torch.Size]) -> bool:
+    if shape is None or len(shape) < 2:
+        return False
+
+    out_dim, in_dim = shape[0], shape[-1]
+    return out_dim is not None and in_dim == 2 * out_dim
+
+
+def _is_draft_prologue_linear(node: Node, embd: int) -> bool:
+    if not is_any_lin_op(node):
+        return False
+
+    lin_shape = node.meta.get("lin_node_shape")
+    if lin_shape is None:
+        lin_shape = get_weight_shape(node)
+    if lin_shape is None or len(lin_shape) < 2:
+        return False
+
+    out_dim, in_dim = lin_shape[0], lin_shape[-1]
+    if out_dim != embd or in_dim == embd:
+        return False
+
+    return not any(is_any_attention_op(user) for user in node.users)
+
+
 def infer_draft_embedding_size(
     gm: GraphModule, linear_nodes: List[Node]
 ) -> Optional[Tuple[int, bool]]:
     """Infer the hidden width for exported draft graphs.
 
     Exported draft graphs are expected to represent the inner draft body, not an
-    lm_head. In both Eagle and Nemotron MTP drafters, the final executed linear
-    projects back to the model hidden size, so we use that output width as the
-    draft embedding size.
+    lm_head. MTP drafters can start with a fused 2h -> h projection, while some
+    MoE drafters end with scalar shared-expert gates. Prefer that explicit MTP
+    prologue when present, then fall back to the final executed hidden projection
+    used by existing Eagle/Nemotron paths.
 
     Eagle still needs special handling during layer-boundary detection because
     its q/k/v projections open on a 2h-wide fused input. We infer that topology
@@ -1081,6 +1152,12 @@ def infer_draft_embedding_size(
 
     if len(linear_nodes) == 0:
         return None
+
+    first_shape = linear_nodes[0].meta.get("lin_node_shape")
+    if first_shape is None:
+        first_shape = get_weight_shape(linear_nodes[0])
+    if _is_fused_hidden_prologue_shape(first_shape):
+        return first_shape[0], False
 
     shape = linear_nodes[-1].meta.get("lin_node_shape")
     if shape is None:
@@ -1433,7 +1510,10 @@ def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[in
     found, s = WeightBiasInfoCache.get_weight_shape(node)
     if not found:
         # Not in cache or caching not enabled - compute the shape
-        s = list(shape(extract_weight_nodes(node).weights[0].node))
+        weight_nodes = extract_weight_nodes(node).weights
+        if not weight_nodes:
+            return None
+        s = list(shape(weight_nodes[0].node))
         if len(s) == 0:
             s = None
         elif is_fp4_op(node):
@@ -1500,6 +1580,9 @@ def get_layer_after_linear_node(
     def boundary_condition(node: Node, dim: int) -> bool:
         if match_on_shapes:
             if is_any_lin_op(node):
+                lin_shape = node.meta.get("lin_node_shape")
+                if lin_shape is None:
+                    return True
                 # MLA latent projections like q_b_proj can map back to the embedding width while
                 # still feeding the downstream MLA op. Those are internal attention projections,
                 # not true layer boundaries.
@@ -1509,7 +1592,7 @@ def get_layer_after_linear_node(
                     attr_next="users",
                     include_root=False,
                 )
-                return node.meta["lin_node_shape"][dim] == embd and feeds_mla is None
+                return lin_shape[dim] == embd and feeds_mla is None
             return (
                 is_any_moe_op(node)
                 or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
@@ -1526,15 +1609,18 @@ def get_layer_after_linear_node(
     def filter_condition(node: Node, dim: int) -> bool:
         if match_on_shapes:
             if is_any_lin_op(node):
+                lin_shape = node.meta.get("lin_node_shape")
+                if lin_shape is None:
+                    return False
                 if dim == -1:
-                    in_dim = node.meta["lin_node_shape"][dim]
+                    in_dim = lin_shape[dim]
                     if in_dim == embd:
                         return True
                     if in_eagle_drafter and in_dim == 2 * embd:
                         # Eagle drafts feed attention with 2h-wide q/k/v inputs.
                         return any(is_any_attention_op(u) for u in node.users)
                     return False
-                return node.meta["lin_node_shape"][dim] == embd
+                return lin_shape[dim] == embd
             return False
         else:
             return is_any_lin_op(node)
@@ -1703,12 +1789,14 @@ def get_layer_after_linear_node(
         layer_type=layer_type,
         min_local_shape=head_size,
     )
-    assert linear_nodes[start_lin_index] in opening_linear_nodes, (
-        f"Start linear node (index {start_lin_index}) not found in opening linear nodes - "
-        f"start_linear node: {linear_nodes[start_lin_index].name}, "
-        f"opening_linear_nodes: {[n.name for n in opening_linear_nodes]}"
-        f"terminating_linear_node:{terminating_linear_node.name}, "
-    )
+    if linear_nodes[start_lin_index] not in opening_linear_nodes:
+        terminating_indices.append(start_lin_index)
+        return LayerSubgraph(
+            opening_nodes=[],
+            subgraph_nodes=[],
+            terminating_node=None,
+            layer_type=LayerType.UNKNOWN,
+        )
 
     # return the index of the terminating linear node
     if terminating_linear_node == linear_nodes[-1]:

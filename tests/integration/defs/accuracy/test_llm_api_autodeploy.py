@@ -1110,6 +1110,7 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
+        kwargs["enable_iter_perf_stats"] = True
         model_path = self.get_fp8_model_path()
         text_model_path = self.make_fp8_mtp_text_only_model_path(
             model_path, tmp_path)
