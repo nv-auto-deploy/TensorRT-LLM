@@ -22,6 +22,8 @@
     without distributed execution.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -33,6 +35,7 @@ import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 import tensorrt_llm._torch.auto_deploy.transform.library  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import _shard_scale_and_hook
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
@@ -141,3 +144,29 @@ def test_apply_hints(world_size, expect_skipped, expect_up_shape, expect_down_sh
         is_op(n, torch.ops.auto_deploy.torch_dist_all_reduce.default) for n in gm_out.graph.nodes
     )
     assert has_dist_ar == (not expect_skipped)
+
+
+def test_sharded_scale_load_hook_runs_after_parent_checkpoint_conversion():
+    gm = nn.Module()
+    gm.proj = nn.Module()
+    gm.proj.register_buffer("weight_scale_inv", torch.empty(1, 4))
+
+    def convert_checkpoint_scale(state_dict, prefix, *args):
+        packed_key = prefix + "packed.weight_scale_inv"
+        unpacked_key = prefix + "proj.weight_scale_inv"
+        if packed_key in state_dict:
+            state_dict[unpacked_key] = state_dict.pop(packed_key)
+
+    gm._register_load_state_dict_pre_hook(convert_checkpoint_scale)
+
+    full_scale = torch.arange(8, dtype=torch.float32).view(2, 4)
+    sharded_scale = full_scale[:1].clone()
+    scale_weight_node = SimpleNamespace(
+        node_key="proj.weight_scale_inv",
+        submod=gm.proj,
+    )
+    _shard_scale_and_hook(gm, scale_weight_node, sharded_scale, lambda t: t[:1])
+
+    gm.load_state_dict({"packed.weight_scale_inv": full_scale}, strict=False)
+
+    torch.testing.assert_close(gm.proj.weight_scale_inv, sharded_scale)

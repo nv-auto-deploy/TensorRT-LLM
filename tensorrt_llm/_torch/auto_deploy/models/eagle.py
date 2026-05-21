@@ -60,7 +60,6 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
     def _build_model(self, device: DeviceLikeType) -> nn.Module:
         model_config, unused_kwargs = self._get_model_config()
 
-        # Get model type for config
         model_type = model_config.model_type
         ad_logger.info(f"EagleDrafterFactory: building drafter for model_type='{model_type}'")
 

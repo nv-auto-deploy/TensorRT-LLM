@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -43,12 +45,16 @@ def _load_ad_config(config_name):
         return yaml.safe_load(f)
 
 
-def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
+def _get_registry_yaml_extra(model_name: str,
+                             config_id: str | None = None
+                             ) -> tuple[list[str], int]:
     """Return (yaml_extra paths, world_size) from the AutoDeploy model registry."""
     with open(_AD_MODEL_REGISTRY_DIR / "models.yaml") as f:
         registry = yaml.safe_load(f)
     for entry in registry["models"]:
         if entry["name"] != model_name:
+            continue
+        if config_id is not None and entry.get("config_id") != config_id:
             continue
         config_dir = _AD_MODEL_REGISTRY_DIR / "configs"
         paths = [str(config_dir / cfg) for cfg in entry["yaml_extra"]]
@@ -63,7 +69,27 @@ def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
             if "world_size" in config:
                 world_size = int(config["world_size"])
         return paths, world_size
-    raise ValueError(f"Model '{model_name}' not found in model registry")
+    suffix = f" with config_id '{config_id}'" if config_id is not None else ""
+    raise ValueError(
+        f"Model '{model_name}'{suffix} not found in model registry")
+
+
+def _merge_config_dicts(base: dict, overrides: dict) -> dict:
+    result = dict(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _merge_config_dicts(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _load_merged_ad_config(yaml_paths: list[str]) -> dict:
+    config = {}
+    for yaml_path in yaml_paths:
+        with open(yaml_path) as f:
+            config = _merge_config_dicts(config, yaml.safe_load(f) or {})
+    return config
 
 
 def _set_quant_config(llm, model_id: str) -> None:
@@ -990,10 +1016,13 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
+    MODEL_NAME_FP8 = "Qwen/Qwen3.5-397B-A17B-FP8"
     MODEL_NAME_NVFP4 = "nvidia/Qwen3.5-397B-A17B-NVFP4"
     MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
     MODEL_PATH_SMALL = hf_id_to_local_model_dir(MODEL_NAME_SMALL)
+    CONFIG_ID_FP8_MTP = "qwen3_5_moe_400b_fp8_mtp"
     GSM8K_MAX_OUTPUT_LEN = 512
+    MIN_MTP_ACCEPTANCE_RATE = 0.40
     EXTRA_EVALUATOR_KWARGS = dict(
         apply_chat_template=True,
         fewshot_as_multiturn=True,
@@ -1013,6 +1042,40 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
                               pad_id=eos_id,
                               n=beam_width,
                               use_beam_search=beam_width > 1)
+
+    def get_fp8_model_path(self):
+        model_path = os.environ.get("QWEN35_FP8_MODEL_PATH")
+        if model_path is not None:
+            return model_path
+        return hf_id_to_local_model_dir(self.MODEL_NAME_FP8)
+
+    def make_fp8_mtp_text_only_model_path(self, model_path, tmp_path):
+        source_path = Path(model_path)
+        text_model_path = tmp_path / "qwen3_5_moe_fp8_mtp_text_only"
+        text_model_path.mkdir()
+
+        for child in source_path.iterdir():
+            if child.name == "config.json":
+                continue
+            os.symlink(child,
+                       text_model_path / child.name,
+                       target_is_directory=child.is_dir())
+
+        with (source_path / "config.json").open(encoding="utf-8") as f:
+            source_config = json.load(f)
+
+        text_config = dict(source_config["text_config"])
+        text_config["architectures"] = ["Qwen3_5MoeForCausalLM"]
+        text_config["model_type"] = "qwen3_5_moe_text"
+        for key in ("quantization_config", "tie_word_embeddings",
+                    "transformers_version"):
+            if key in source_config and key not in text_config:
+                text_config[key] = source_config[key]
+
+        with (text_model_path / "config.json").open("w", encoding="utf-8") as f:
+            json.dump(text_config, f, indent=2)
+
+        return text_model_path
 
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("world_size", [8])
@@ -1038,6 +1101,41 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper()
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize("world_size", [8])
+    def test_fp8_mtp_gsm8k_trtllm_attention_cudagraph(self, world_size, mocker,
+                                                      tmp_path):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = self.get_default_kwargs()
+        kwargs["enable_iter_perf_stats"] = True
+        model_path = self.get_fp8_model_path()
+        text_model_path = self.make_fp8_mtp_text_only_model_path(
+            model_path, tmp_path)
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(
+            self.MODEL_NAME_FP8, self.CONFIG_ID_FP8_MTP)
+        assert registry_world_size == world_size
+        config = _load_merged_ad_config(yaml_paths)
+        assert config["runtime"] == "trtllm"
+        assert config["attn_backend"] == "trtllm"
+        assert config["compile_backend"] == "torch-cudagraph"
+        assert config["speculative_config"]["decoding_type"] == "MTP"
+        with AutoDeployLLM(model=text_model_path,
+                           tokenizer=model_path,
+                           world_size=world_size,
+                           yaml_extra=yaml_paths,
+                           **kwargs) as llm:
+            _set_quant_config(llm, "fp8")
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            _check_acceptance_rate_stats(
+                llm.get_stats(),
+                min_acceptance_rate=self.MIN_MTP_ACCEPTANCE_RATE)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(180000)

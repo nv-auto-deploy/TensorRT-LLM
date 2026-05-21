@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen3.5 MoE one-model MTP speculative decoding.
+#
+# Keep this as an overlay on top of qwen3.5_moe_400b.yaml so the base target
+# model remains the source of truth for sharding and quantization settings.
+#
+# MTP adds draft-layer KV plus managed recurrent GDN state and intermediate
+# speculative state. Use a smaller serving shape than the non-MTP baseline so
+# cache initialization leaves room for distributed workspaces and CUDA graph
+# capture.
+enable_chunked_prefill: false
+max_num_tokens: 8192
+max_batch_size: 8
+cuda_graph_config:
+  max_batch_size: 8
+  batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.7
+  tokens_per_block: 32
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 6
+  mtp_eagle_one_model: true
+transforms:
+  insert_cached_causal_conv:
+    backend: triton_causal_conv
+  multi_stream_moe:
+    stage: compile
+    enabled: true
+  multi_stream_gemm:
+    stage: compile
+    enabled: true
