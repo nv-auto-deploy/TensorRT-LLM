@@ -158,8 +158,8 @@ models:
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: openai/gpt-oss-20b
-  config_id: gpt_oss_20b
-  yaml_extra: ['gpt_oss_20b.yaml']
+  config_id: gpt_oss
+  yaml_extra: ['gpt_oss.yaml', 'world_size_1.yaml']
 - name: ibm-granite/granite-3.0-8b-instruct
   config_id: default_ws_1
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
@@ -302,8 +302,8 @@ models:
   config_id: multimodal
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
 - name: openai/gpt-oss-120b
-  config_id: gpt_oss_120b
-  yaml_extra: ['gpt_oss_120b.yaml']
+  config_id: gpt_oss
+  yaml_extra: ['gpt_oss.yaml', 'world_size_1.yaml']
 - name: meta-llama/Llama-4-Scout-17B-16E-Instruct
   config_id: multimodal__llama4_scout
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_scout.yaml']
