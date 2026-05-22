@@ -813,8 +813,6 @@ accuracy/test_llm_api_pytorch_multimodal.py::TestKimiK25::test_nvfp4[dep8]
 accuracy/test_llm_api_pytorch_multimodal.py::TestVILA1_5_3B::test_auto_dtype
 accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
 unittest/disaggregated/test_openai_disagg_server.py
-disaggregated/test_ad_disagg.py::test_async_deepseek_mla_handoff[gen_overlap_off]
-disaggregated/test_ad_disagg.py::test_async_deepseek_mla_handoff[gen_overlap_on]
 disaggregated/test_ad_disagg.py::test_async_eagle3_full_model_handoff
 disaggregated/test_ad_disagg.py::test_async_generation_matches_aggregate
 disaggregated/test_ad_disagg.py::test_async_sharded_generation_handoff

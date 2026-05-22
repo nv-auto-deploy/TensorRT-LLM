@@ -63,7 +63,7 @@ MODEL_PATHS = {
     "EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
     "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct/",
     "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-    "DeepSeek-V3-Lite-BF16": "DeepSeek-V3-Lite/bf16",
+    "DeepSeek-V3": "DeepSeek-V3",
 }
 
 
@@ -93,25 +93,29 @@ def response_summary(response):
     if isinstance(response, str):
         return f"error={response}"
     if isinstance(response, list) and response and hasattr(response[0], "token_ids"):
-        output = response[0]
-        disaggregated_params = output.disaggregated_params
-        if disaggregated_params is None:
-            request_type = REQUEST_MODE_AGGREGATE
-            ctx_request_id = None
-        else:
-            request_type = disaggregated_params.request_type
-            ctx_request_id = disaggregated_params.ctx_request_id
-        draft_tokens = (
-            len(disaggregated_params.draft_tokens)
-            if disaggregated_params is not None and disaggregated_params.draft_tokens is not None
-            else 0
-        )
-        logits = output.generation_logits
-        logits_shape = tuple(logits.shape) if logits is not None else None
-        return (
-            f"text={output.text!r}, token_ids={output.token_ids}, disagg_type={request_type}, "
-            f"ctx_request_id={ctx_request_id}, draft_tokens={draft_tokens}, logits_shape={logits_shape}"
-        )
+        summaries = []
+        for idx, output in enumerate(response):
+            disaggregated_params = output.disaggregated_params
+            if disaggregated_params is None:
+                request_type = REQUEST_MODE_AGGREGATE
+                ctx_request_id = None
+            else:
+                request_type = disaggregated_params.request_type
+                ctx_request_id = disaggregated_params.ctx_request_id
+            draft_tokens = (
+                len(disaggregated_params.draft_tokens)
+                if disaggregated_params is not None
+                and disaggregated_params.draft_tokens is not None
+                else 0
+            )
+            logits = output.generation_logits
+            logits_shape = tuple(logits.shape) if logits is not None else None
+            summaries.append(
+                f"{idx}: text={output.text!r}, token_ids={output.token_ids}, "
+                f"disagg_type={request_type}, ctx_request_id={ctx_request_id}, "
+                f"draft_tokens={draft_tokens}, logits_shape={logits_shape}"
+            )
+        return "[" + "; ".join(summaries) + "]"
     return repr(response)
 
 
@@ -243,8 +247,10 @@ def run_aggregate_generation(
 # These tests run context-only and generation-only AutoDeploy instances in one
 # process, one after the other, while keeping the context instance alive for
 # the generation handoff. They usually run in the 1-GPU stage. Unlike the unit
-# smoke tests, these load real weights, so they can compare disaggregated
-# output, logits, and batched slot handoff against aggregate generation.
+# smoke tests, these load real weights. Keep exact output comparisons to
+# single-request cases; batched handoff uses semantic slot checks because IFB can
+# make multi-request generation differ from aggregate output even when handoff is
+# correct.
 # ---------------------------------------------------------------------------
 
 
@@ -261,25 +267,30 @@ def reduced_tinyllama_config(extra_config=None):
     return config
 
 
-def reduced_deepseek_v3_lite_mla_config():
-    # Keep DeepSeek MLA on torch-simple in this coverage. The TRTLLM MLA
-    # disaggregated path is not CUDA-graph clean yet, so CUDA graph coverage is
-    # intentionally deferred to a dedicated enablement pass.
-    config = {
+def reduced_deepseek_v3_mla_config(enable_cuda_graph):
+    if enable_cuda_graph:
+        graph_config = {
+            "compile_backend": "torch-cudagraph",
+            "cuda_graph_config": {"batch_sizes": [1, 2, 4]},
+        }
+    else:
+        graph_config = {
+            "compile_backend": "torch-simple",
+            "cuda_graph_config": None,
+        }
+    return {
         "model_kwargs": {"num_hidden_layers": REDUCED_DEEPSEEK_LAYERS},
-        "compile_backend": "torch-simple",
-        "cuda_graph_config": None,
+        **graph_config,
         "max_batch_size": 4,
         "max_seq_len": 512,
         "max_num_tokens": 256,
-        "kv_cache_config": {"max_tokens": 1024},
+        "kv_cache_config": {"max_tokens": 1024, "free_gpu_memory_fraction": 0.05},
         "transforms": {
             "insert_cached_mla_attention": {"backend": "trtllm_mla"},
             "fuse_rope_into_trtllm_mla": {"enabled": True},
             "multi_stream_mla_attn": {"stage": "compile", "enabled": False},
         },
     }
-    return config
 
 
 def long_context_prompt():
@@ -290,12 +301,12 @@ def long_context_prompt():
     )
 
 
-def batch_handoff_prompts():
+def capital_completion_prompts():
     return [
-        "What is the capital of Germany?",
-        "What is the capital of France?",
-        "What is the capital of Italy?",
-        "What is the capital of Spain?",
+        "The capital of Germany is",
+        "The capital of France is",
+        "The capital of Italy is",
+        "The capital of Spain is",
     ]
 
 
@@ -309,35 +320,6 @@ def assert_context_handoff_metadata(context_output, expect_logits=False):
     if expect_logits:
         assert context_params.first_gen_logits is not None
     assert has_handoff_transport_metadata(context_params)
-
-
-def run_aggregate_batch_generation(
-    model,
-    world_size,
-    enable_cuda_graph,
-    prompts,
-    sampling_params_kwargs=None,
-    extra_config=None,
-):
-    if sampling_params_kwargs is None:
-        sampling_params_kwargs = {"max_tokens": 25, "ignore_eos": True}
-
-    seed_disagg()
-    with AutoDeployLLM(
-        model=model_path(model),
-        world_size=world_size,
-        **base_config(enable_cuda_graph, extra_config),
-    ) as llm:
-        seed_disagg()
-        results = llm.generate(
-            prompts,
-            sampling_params=SamplingParams(**sampling_params_kwargs),
-            use_tqdm=False,
-        )
-
-    outputs = [result.outputs[0] for result in results]
-    print(f"[AD DISAGG TEST] aggregate batch output: {response_summary(outputs)}")
-    return outputs
 
 
 def run_sequential_handoff(
@@ -460,63 +442,77 @@ def run_sequential_batch_handoff(
     }
 
 
-@pytest.mark.parametrize(
-    ("model", "extra_config"),
-    [
+def reduced_layer_handoff_cases():
+    return [
         pytest.param(
             "TinyLlama-1.1B-Chat-v1.0",
             reduced_tinyllama_config(),
+            False,
             id="tinyllama",
         ),
         pytest.param(
-            "DeepSeek-V3-Lite-BF16",
-            reduced_deepseek_v3_lite_mla_config(),
-            id="deepseek_mla",
+            "TinyLlama-1.1B-Chat-v1.0",
+            reduced_tinyllama_config(),
+            True,
+            id="tinyllama_cudagraph",
         ),
-    ],
+        pytest.param(
+            "DeepSeek-V3",
+            reduced_deepseek_v3_mla_config(enable_cuda_graph=False),
+            False,
+            id="deepseek_v3_mla",
+            marks=skip_pre_hopper,
+        ),
+        pytest.param(
+            "DeepSeek-V3",
+            reduced_deepseek_v3_mla_config(enable_cuda_graph=True),
+            True,
+            id="deepseek_v3_mla_cudagraph",
+            marks=skip_pre_hopper,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model", "extra_config", "enable_cuda_graph"),
+    reduced_layer_handoff_cases(),
 )
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.timeout(600)
-def test_reduced_layer_batch_handoff_matches_aggregate(model, extra_config):
-    """Check batched disaggregated handoff preserves per-request slot alignment.
-
-    The aggregate comparison catches cases where transferred KV cache or first
-    tokens are assigned to the wrong request in a batch.
-    """
-    prompts = batch_handoff_prompts()
+def test_reduced_layer_handoff_matches_aggregate(model, extra_config, enable_cuda_graph):
+    """Check single-request disaggregated handoff matches aggregate generation."""
+    prompt = "What is the capital of Germany?"
     sampling_params_kwargs = {
         "max_tokens": 8,
         "ignore_eos": True,
         "top_k": 1,
         "seed": AUTODEPLOY_DISAGG_SEED,
     }
-    # Keep real weights loaded, but reduce the decoder stack. This targets
-    # per-request KV slot handoff, so batch mixups should still change outputs
-    # without paying the full-model cost.
-    aggregate_outputs = run_aggregate_batch_generation(
+    # Keep real weights loaded, but reduce the decoder stack so this still
+    # exercises the model-specific attention/cache path without full-model cost.
+    aggregate_output = run_aggregate_generation(
         model,
         world_size=1,
-        enable_cuda_graph=False,
-        prompts=prompts,
+        enable_cuda_graph=enable_cuda_graph,
+        prompt=prompt,
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
     )
-    outputs = run_sequential_batch_handoff(
+    outputs = run_sequential_handoff(
         model,
         generation_overlap=True,
-        enable_cuda_graph=False,
-        prompts=prompts,
+        enable_cuda_graph=enable_cuda_graph,
+        prompt=prompt,
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
     )
 
-    for aggregate_output, context_output, generation_output in zip(
-        aggregate_outputs, outputs["context"], outputs["generation"], strict=True
-    ):
-        assert_context_handoff_metadata(context_output)
-        assert context_output.token_ids == aggregate_output.token_ids[:1]
-        assert generation_output.text == aggregate_output.text
-        assert generation_output.token_ids == aggregate_output.token_ids
+    context_output = outputs["context"]
+    generation_output = outputs["generation"]
+    assert_context_handoff_metadata(context_output)
+    assert context_output.token_ids == aggregate_output.token_ids[:1]
+    assert generation_output.text == aggregate_output.text
+    assert generation_output.token_ids == aggregate_output.token_ids
 
 
 @pytest.mark.skip_less_device_memory(30000)
@@ -564,6 +560,34 @@ def test_disaggregated_logits():
         rtol=1e-2,
         atol=1e-2,
     )
+
+
+@pytest.mark.skip_less_device_memory(30000)
+@pytest.mark.timeout(600)
+def test_tinyllama_batch_handoff_semantic_slots():
+    prompts = capital_completion_prompts()
+    expected_capitals = ["Berlin", "Paris", "Rome", "Madrid"]
+    sampling_params_kwargs = {
+        "max_tokens": 12,
+        "ignore_eos": True,
+        "top_k": 1,
+        "seed": AUTODEPLOY_DISAGG_SEED,
+    }
+    outputs = run_sequential_batch_handoff(
+        "TinyLlama-1.1B-Chat-v1.0",
+        generation_overlap=True,
+        enable_cuda_graph=False,
+        prompts=prompts,
+        sampling_params_kwargs=sampling_params_kwargs,
+    )
+
+    for expected_capital, context_output, generation_output in zip(
+        expected_capitals, outputs["context"], outputs["generation"], strict=True
+    ):
+        assert_context_handoff_metadata(context_output)
+        assert expected_capital.lower() in generation_output.text.lower(), response_summary(
+            outputs["generation"]
+        )
 
 
 @pytest.mark.skip_less_device_memory(30000)
@@ -628,27 +652,6 @@ def llama_eagle3_config():
         # cache management requires matching target and draft KV dtypes.
         "speculative_model_kwargs": {"torch_dtype": "bfloat16"},
     }
-
-
-def deepseek_v3_lite_mla_config():
-    # Keep DeepSeek MLA on torch-simple in this coverage. The TRTLLM MLA
-    # disaggregated path is not CUDA-graph clean yet, so CUDA graph coverage is
-    # intentionally deferred to a dedicated enablement pass.
-    config = {
-        "compile_backend": "torch-simple",
-        "cuda_graph_config": None,
-        "max_batch_size": 2,
-        "max_seq_len": 512,
-        "max_num_tokens": 256,
-        "kv_cache_config": {"max_tokens": 512},
-        "transforms": {
-            "load_weights": {"disable_preload": True},
-            "insert_cached_mla_attention": {"backend": "trtllm_mla"},
-            "fuse_rope_into_trtllm_mla": {"enabled": True},
-            "multi_stream_mla_attn": {"stage": "compile", "enabled": False},
-        },
-    }
-    return config
 
 
 def get_ucx_tls():
@@ -917,47 +920,6 @@ def run_context_then_generation_handoff(
             "context": context_output,
             "generation": generation_output,
         }
-
-
-@pytest.mark.skip_less_device_memory(60000)
-@pytest.mark.skip_less_device(2)
-@pytest.mark.timeout(600)
-@pytest.mark.parametrize(
-    "generation_overlap",
-    [
-        pytest.param(False, id="gen_overlap_off"),
-        pytest.param(True, id="gen_overlap_on"),
-    ],
-)
-def test_async_deepseek_mla_handoff(generation_overlap):
-    seed_disagg()
-    # TODO: enable torch-cudagraph coverage for this DeepSeek MLA disagg path.
-    outputs = run_context_then_generation_handoff(
-        "DeepSeek-V3-Lite-BF16",
-        worker_world_sizes=(1, 1),
-        generation_overlap=generation_overlap,
-        enable_cuda_graph=False,
-        prompt="What is the capital of Germany?",
-        sampling_params_kwargs={
-            "max_tokens": 16,
-            "ignore_eos": True,
-            "top_k": 1,
-            "seed": AUTODEPLOY_DISAGG_SEED,
-        },
-        extra_config=deepseek_v3_lite_mla_config(),
-    )
-    context_params = outputs["context"].disaggregated_params
-    assert context_params is not None
-    assert context_params.request_type == "context_only"
-    assert len(outputs["context"].token_ids) == 1
-    assert context_params.ctx_request_id is not None
-    assert context_params.first_gen_tokens is not None
-    assert has_handoff_transport_metadata(context_params)
-    assert outputs["generation"].token_ids
-    assert outputs["context"].text == " Berlin"
-    assert outputs["generation"].text == (
-        " Berlin\n\nWhat is the capital of France? Paris\n\nWhat is the capital of"
-    )
 
 
 @pytest.mark.skip_less_device_memory(30000)

@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from dataclasses import replace
 
 import pytest
 from _model_test_utils import get_small_model_config
+from utils.util import skip_pre_hopper
 
 from tensorrt_llm import DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
@@ -154,6 +156,61 @@ def run_live_disagg_smoke(
             return context_output, generation_output
 
 
+async def run_async_requests(llm, prompts, sampling_params, disaggregated_params):
+    futures = []
+    for prompt, params in zip(prompts, disaggregated_params, strict=True):
+        futures.append(
+            llm.generate_async(
+                prompt,
+                sampling_params=sampling_params,
+                disaggregated_params=params,
+            )
+        )
+    return [(await future).outputs[0] for future in futures]
+
+
+def run_live_batch_disagg_smoke(model_id, attn_backend, compile_backend, config_overrides):
+    prompts = [[1, 2, 3, 4], [5, 6, 7, 8]]
+    context_params = [DisaggregatedParams(request_type="context_only") for _ in prompts]
+
+    with AutoDeployLLM(
+        **small_model_config_disagg(
+            model_id,
+            attn_backend,
+            compile_backend,
+            **config_overrides,
+            disable_overlap_scheduler=True,
+        )
+    ) as context_llm:
+        context_outputs = asyncio.run(
+            run_async_requests(context_llm, prompts, _sampling_params(), context_params)
+        )
+        generation_params = [
+            create_generation_params(context_output) for context_output in context_outputs
+        ]
+
+        with AutoDeployLLM(
+            **small_model_config_disagg(
+                model_id,
+                attn_backend,
+                compile_backend,
+                **config_overrides,
+            )
+        ) as generation_llm:
+            generation_outputs = asyncio.run(
+                run_async_requests(
+                    generation_llm,
+                    prompts,
+                    _sampling_params(),
+                    generation_params,
+                )
+            )
+
+    for context_output, generation_output in zip(context_outputs, generation_outputs, strict=True):
+        assert context_output_valid(context_output)
+        assert generation_output.token_ids
+
+
 GENERIC_DISAGG_SMOKE_CASES = [
     pytest.param(LLAMA_MODEL_ID, "trtllm", "torch-simple", {}, id="llama-trtllm-simple"),
     pytest.param(LLAMA_MODEL_ID, "trtllm", "torch-cudagraph", {}, id="llama-trtllm-cudagraph"),
@@ -170,6 +227,7 @@ GENERIC_DISAGG_SMOKE_CASES = [
         "trtllm",
         "torch-simple",
         {"transforms": DEEPSEEK_DISAGG_TRANSFORMS},
+        marks=skip_pre_hopper,
         id="deepseek-trtllm-simple",
     ),
 ]
@@ -187,6 +245,22 @@ def test_autodeploy_disaggregated_smoke(model_id, attn_backend, compile_backend,
         )
 
     run_live_disagg_smoke(model_id, attn_backend, compile_backend, config_overrides)
+
+
+@pytest.mark.parametrize(
+    ("model_id", "attn_backend", "compile_backend", "config_overrides"),
+    GENERIC_DISAGG_SMOKE_CASES,
+)
+def test_autodeploy_disaggregated_batch_smoke(
+    model_id, attn_backend, compile_backend, config_overrides
+):
+    if model_id == DEEPSEEK_MODEL_ID:
+        pytest.importorskip(
+            "transformers.models.deepseek_v3.configuration_deepseek_v3",
+            reason="DeepseekV3Config requires a newer transformers version",
+        )
+
+    run_live_batch_disagg_smoke(model_id, attn_backend, compile_backend, config_overrides)
 
 
 def test_autodeploy_disaggregated_eagle3_smoke():

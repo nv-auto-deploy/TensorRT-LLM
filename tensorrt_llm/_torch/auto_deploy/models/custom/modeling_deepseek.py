@@ -461,8 +461,8 @@ class DeepSeekV3Attention(nn.Module):
         self.softmax_scale = self.q_head_dim ** (-0.5)
         if config.rope_scaling is not None:
             mscale_all_dim = config.rope_scaling.get("mscale_all_dim", 0)
-            scaling_factor = config.rope_scaling.get("factor")
-            if mscale_all_dim and scaling_factor is not None:
+            scaling_factor = config.rope_scaling["factor"]
+            if mscale_all_dim:
                 mscale = DeepSeekV3YarnRotaryEmbedding._yarn_get_mscale(
                     scaling_factor, mscale_all_dim
                 )
