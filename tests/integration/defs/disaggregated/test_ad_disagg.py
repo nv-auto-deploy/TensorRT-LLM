@@ -457,6 +457,12 @@ def reduced_layer_handoff_cases():
             id="tinyllama_cudagraph",
         ),
         pytest.param(
+            "TinyLlama-1.1B-Chat-v1.0",
+            reduced_tinyllama_config({"attn_backend": "flashinfer"}),
+            True,
+            id="tinyllama_flashinfer",
+        ),
+        pytest.param(
             "DeepSeek-V3",
             reduced_deepseek_v3_mla_config(enable_cuda_graph=False),
             False,
@@ -515,31 +521,48 @@ def test_reduced_layer_handoff_matches_aggregate(model, extra_config, enable_cud
     assert generation_output.token_ids == aggregate_output.token_ids
 
 
+@pytest.mark.parametrize(
+    ("model", "extra_config"),
+    [
+        pytest.param(
+            "TinyLlama-1.1B-Chat-v1.0",
+            reduced_tinyllama_config({"gather_generation_logits": True}),
+            id="tinyllama",
+        ),
+        pytest.param(
+            "DeepSeek-V3",
+            {
+                **reduced_deepseek_v3_mla_config(enable_cuda_graph=True),
+                "gather_generation_logits": True,
+            },
+            id="deepseek_v3_mla",
+            marks=skip_pre_hopper,
+        ),
+    ],
+)
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.timeout(600)
-def test_disaggregated_logits():
+def test_disaggregated_logits(model, extra_config):
+    # Keep weighted but reduced layers so the test focuses on logits
+    # transfer/equality rather than full-model compile and memory cost.
     sampling_params_kwargs = {
         "max_tokens": 10,
         "ignore_eos": True,
         "return_generation_logits": True,
     }
-    # Keep this weighted, but reduce the target layer count so the test focuses
-    # on logits transfer/equality instead of full-model compile and memory cost.
-    extra_config = reduced_tinyllama_config({"gather_generation_logits": True})
-    model_name = "TinyLlama-1.1B-Chat-v1.0"
     prompt = "What is the capital of Germany?"
     aggregate_output = run_aggregate_generation(
-        model_name,
+        model,
         world_size=1,
-        enable_cuda_graph=False,
+        enable_cuda_graph=True,
         prompt=prompt,
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
     )
     outputs = run_sequential_handoff(
-        model_name,
+        model,
         generation_overlap=True,
-        enable_cuda_graph=False,
+        enable_cuda_graph=True,
         prompt=prompt,
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
@@ -576,7 +599,7 @@ def test_tinyllama_batch_handoff_semantic_slots():
     outputs = run_sequential_batch_handoff(
         "TinyLlama-1.1B-Chat-v1.0",
         generation_overlap=True,
-        enable_cuda_graph=False,
+        enable_cuda_graph=True,
         prompts=prompts,
         sampling_params_kwargs=sampling_params_kwargs,
     )
@@ -590,32 +613,51 @@ def test_tinyllama_batch_handoff_semantic_slots():
         )
 
 
+@pytest.mark.parametrize(
+    ("model", "extra_config"),
+    [
+        pytest.param(
+            "TinyLlama-1.1B-Chat-v1.0",
+            reduced_tinyllama_config(
+                {
+                    "enable_chunked_prefill": True,
+                    "max_num_tokens": 96,
+                }
+            ),
+            id="tinyllama",
+        ),
+        pytest.param(
+            "DeepSeek-V3",
+            {
+                **reduced_deepseek_v3_mla_config(enable_cuda_graph=True),
+                "enable_chunked_prefill": True,
+                "max_num_tokens": 96,
+            },
+            id="deepseek_v3_mla",
+            marks=skip_pre_hopper,
+        ),
+    ],
+)
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.timeout(600)
-def test_chunked_prefill_handoff():
+def test_chunked_prefill_handoff(model, extra_config):
     # Chunked prefill needs real weights for aggregate-vs-disaggregated
-    # comparison, but not a full decoder stack. Use reduced-layer TinyLlama so
-    # the test focuses on chunk-boundary handoff behavior.
-    extra_config = reduced_tinyllama_config(
-        {
-            "enable_chunked_prefill": True,
-            "max_num_tokens": 96,
-        }
-    )
+    # comparison, but not a full decoder stack. Use reduced layers so the test
+    # focuses on chunk-boundary handoff behavior with cuda graph enabled.
     prompt = long_context_prompt() * 4
     sampling_params_kwargs = {"max_tokens": 8, "ignore_eos": True}
     aggregate_output = run_aggregate_generation(
-        "TinyLlama-1.1B-Chat-v1.0",
+        model,
         world_size=1,
-        enable_cuda_graph=False,
+        enable_cuda_graph=True,
         prompt=prompt,
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
     )
     outputs = run_sequential_handoff(
-        "TinyLlama-1.1B-Chat-v1.0",
+        model,
         generation_overlap=True,
-        enable_cuda_graph=False,
+        enable_cuda_graph=True,
         prompt=prompt,
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
@@ -929,7 +971,7 @@ def test_async_generation_matches_aggregate():
     aggregate_output = run_aggregate_generation(
         "TinyLlama-1.1B-Chat-v1.0",
         world_size=1,
-        enable_cuda_graph=False,
+        enable_cuda_graph=True,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
     )
@@ -937,7 +979,7 @@ def test_async_generation_matches_aggregate():
         "TinyLlama-1.1B-Chat-v1.0",
         worker_world_sizes=(1, 1),
         generation_overlap=True,
-        enable_cuda_graph=False,
+        enable_cuda_graph=True,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
     )
@@ -955,13 +997,46 @@ def test_async_generation_matches_aggregate():
 
 
 @pytest.mark.skip_less_device_memory(30000)
+@pytest.mark.skip_less_device(2)
+@pytest.mark.timeout(600)
+def test_async_generation_no_overlap_matches_aggregate():
+    """Match aggregate generation with the generation worker on overlap=off.
+
+    Same shape as test_async_generation_matches_aggregate but with the
+    generation worker on the non-overlap scheduling path. Covers MHA disagg
+    with overlap=off against the aggregate baseline.
+    """
+    sampling_params_kwargs = {"max_tokens": 10, "ignore_eos": True}
+    aggregate_output = run_aggregate_generation(
+        "TinyLlama-1.1B-Chat-v1.0",
+        world_size=1,
+        enable_cuda_graph=True,
+        prompt="What is the capital of Germany?",
+        sampling_params_kwargs=sampling_params_kwargs,
+    )
+    outputs = run_context_then_generation_handoff(
+        "TinyLlama-1.1B-Chat-v1.0",
+        worker_world_sizes=(1, 1),
+        generation_overlap=False,
+        enable_cuda_graph=True,
+        prompt="What is the capital of Germany?",
+        sampling_params_kwargs=sampling_params_kwargs,
+    )
+    assert_context_handoff_metadata(outputs["context"])
+    assert outputs["generation"].token_ids
+    assert outputs["context"].token_ids == aggregate_output.token_ids[:1]
+    assert outputs["generation"].text == aggregate_output.text
+    assert outputs["generation"].token_ids == aggregate_output.token_ids
+
+
+@pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.timeout(900)
 def test_async_sharded_generation_handoff():
     aggregate_output = run_aggregate_generation(
         "TinyLlama-1.1B-Chat-v1.0",
         world_size=2,
-        enable_cuda_graph=False,
+        enable_cuda_graph=True,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
     )
@@ -969,9 +1044,51 @@ def test_async_sharded_generation_handoff():
         "TinyLlama-1.1B-Chat-v1.0",
         worker_world_sizes=(2, 2),
         generation_overlap=True,
-        enable_cuda_graph=False,
+        enable_cuda_graph=True,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
+    )
+    assert_context_handoff_metadata(outputs["context"])
+    assert outputs["generation"].token_ids
+    assert outputs["context"].token_ids == aggregate_output.token_ids[:1]
+    assert outputs["generation"].text == aggregate_output.text
+    assert outputs["generation"].token_ids == aggregate_output.token_ids
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(30000)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.timeout(900)
+def test_async_mla_sharded_generation_handoff():
+    """Match aggregate generation through a TP=2 / TP=2 MLA disagg handoff.
+
+    MLA's compressed KV layout interacts differently with sharding than MHA,
+    and the cpp transceiver dispatches on AttentionTypeCpp.MLA, so this asserts
+    the MLA branch is correct under sharding.
+    """
+    extra_config = reduced_deepseek_v3_mla_config(enable_cuda_graph=True)
+    sampling_params_kwargs = {
+        "max_tokens": 10,
+        "ignore_eos": True,
+        "top_k": 1,
+        "seed": AUTODEPLOY_DISAGG_SEED,
+    }
+    aggregate_output = run_aggregate_generation(
+        "DeepSeek-V3",
+        world_size=2,
+        enable_cuda_graph=True,
+        prompt="What is the capital of Germany?",
+        sampling_params_kwargs=sampling_params_kwargs,
+        extra_config=extra_config,
+    )
+    outputs = run_context_then_generation_handoff(
+        "DeepSeek-V3",
+        worker_world_sizes=(2, 2),
+        generation_overlap=True,
+        enable_cuda_graph=True,
+        prompt="What is the capital of Germany?",
+        sampling_params_kwargs=sampling_params_kwargs,
+        extra_config=extra_config,
     )
     assert_context_handoff_metadata(outputs["context"])
     assert outputs["generation"].token_ids
