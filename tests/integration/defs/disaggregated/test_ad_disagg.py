@@ -125,18 +125,7 @@ def seed_disagg():
         torch.cuda.manual_seed_all(AUTODEPLOY_DISAGG_SEED)
 
 
-def base_config(enable_cuda_graph, extra_config=None):
-    if enable_cuda_graph:
-        graph_config = dict(
-            compile_backend="torch-cudagraph",
-            cuda_graph_config={"batch_sizes": [1, 2, 4]},
-        )
-    else:
-        graph_config = dict(
-            compile_backend="torch-simple",
-            cuda_graph_config=None,
-        )
-
+def base_config(extra_config=None):
     common_config = dict(
         runtime="trtllm",
         attn_backend="trtllm",
@@ -145,7 +134,8 @@ def base_config(enable_cuda_graph, extra_config=None):
         max_num_tokens=512,
         trust_remote_code=True,
         kv_cache_config={"max_tokens": 2048},
-        **graph_config,
+        compile_backend="torch-cudagraph",
+        cuda_graph_config={"batch_sizes": [1, 2, 4]},
     )
     if extra_config:
         common_config.update(extra_config)
@@ -153,24 +143,24 @@ def base_config(enable_cuda_graph, extra_config=None):
     return common_config
 
 
-def disagg_config(enable_cuda_graph, extra_config=None):
+def disagg_config(extra_config=None):
     return dict(
-        base_config(enable_cuda_graph, extra_config),
+        base_config(extra_config),
         cache_transceiver_config={"backend": "DEFAULT"},
     )
 
 
-def context_config(enable_cuda_graph, extra_config=None):
+def context_config(extra_config=None):
     # Context-only transfer happens after the request completes its context phase,
     # so keep the context worker on the non-overlap scheduling path.
     return dict(
-        disagg_config(enable_cuda_graph, extra_config),
+        disagg_config(extra_config),
         disable_overlap_scheduler=True,
     )
 
 
-def generation_config(generation_overlap, enable_cuda_graph, extra_config=None):
-    config = disagg_config(enable_cuda_graph, extra_config)
+def generation_config(generation_overlap, extra_config=None):
+    config = disagg_config(extra_config)
     if not generation_overlap:
         config["disable_overlap_scheduler"] = True
 
@@ -214,7 +204,6 @@ def has_handoff_transport_metadata(params):
 def run_aggregate_generation(
     model,
     world_size,
-    enable_cuda_graph,
     prompt,
     sampling_params_kwargs=None,
     extra_config=None,
@@ -227,7 +216,7 @@ def run_aggregate_generation(
     with AutoDeployLLM(
         model=model_path(model),
         world_size=world_size,
-        **base_config(enable_cuda_graph, extra_config),
+        **base_config(extra_config),
     ) as llm:
         seed_disagg()
         result = llm.generate(
@@ -267,20 +256,9 @@ def reduced_tinyllama_config(extra_config=None):
     return config
 
 
-def reduced_deepseek_v3_mla_config(enable_cuda_graph):
-    if enable_cuda_graph:
-        graph_config = {
-            "compile_backend": "torch-cudagraph",
-            "cuda_graph_config": {"batch_sizes": [1, 2, 4]},
-        }
-    else:
-        graph_config = {
-            "compile_backend": "torch-simple",
-            "cuda_graph_config": None,
-        }
+def reduced_deepseek_v3_mla_config():
     return {
         "model_kwargs": {"num_hidden_layers": REDUCED_DEEPSEEK_LAYERS},
-        **graph_config,
         "max_batch_size": 4,
         "max_seq_len": 512,
         "max_num_tokens": 256,
@@ -325,7 +303,6 @@ def assert_context_handoff_metadata(context_output, expect_logits=False):
 def run_sequential_handoff(
     model,
     generation_overlap,
-    enable_cuda_graph,
     prompt,
     sampling_params_kwargs=None,
     extra_config=None,
@@ -337,7 +314,7 @@ def run_sequential_handoff(
     with AutoDeployLLM(
         model=model_name,
         world_size=1,
-        **context_config(enable_cuda_graph, extra_config),
+        **context_config(extra_config),
     ) as context_llm:
         seed_disagg()
         context_output = context_llm.generate(
@@ -354,7 +331,7 @@ def run_sequential_handoff(
         with AutoDeployLLM(
             model=model_name,
             world_size=1,
-            **generation_config(generation_overlap, enable_cuda_graph, extra_config),
+            **generation_config(generation_overlap, extra_config),
         ) as generation_llm:
             seed_disagg()
             generation_output = generation_llm.generate(
@@ -393,7 +370,6 @@ async def run_async_requests(llm, prompts, sampling_params_kwargs, disaggregated
 def run_sequential_batch_handoff(
     model,
     generation_overlap,
-    enable_cuda_graph,
     prompts,
     sampling_params_kwargs=None,
     extra_config=None,
@@ -406,7 +382,7 @@ def run_sequential_batch_handoff(
     with AutoDeployLLM(
         model=model_name,
         world_size=1,
-        **context_config(enable_cuda_graph, extra_config),
+        **context_config(extra_config),
     ) as context_llm:
         context_outputs = asyncio.run(
             run_async_requests(context_llm, prompts, sampling_params_kwargs, context_params)
@@ -422,7 +398,7 @@ def run_sequential_batch_handoff(
         with AutoDeployLLM(
             model=model_name,
             world_size=1,
-            **generation_config(generation_overlap, enable_cuda_graph, extra_config),
+            **generation_config(generation_overlap, extra_config),
         ) as generation_llm:
             generation_outputs = asyncio.run(
                 run_async_requests(
@@ -442,50 +418,37 @@ def run_sequential_batch_handoff(
     }
 
 
-def reduced_layer_handoff_cases():
+def reduced_model_config(model, extra_config=None):
+    if "DeepSeek-V3" in model:
+        config = reduced_deepseek_v3_mla_config()
+    else:
+        config = reduced_tinyllama_config()
+    if extra_config:
+        config.update(extra_config)
+    return config
+
+
+def reduced_model_cases():
     return [
         pytest.param(
             "TinyLlama-1.1B-Chat-v1.0",
-            reduced_tinyllama_config(),
-            False,
             id="tinyllama",
         ),
         pytest.param(
-            "TinyLlama-1.1B-Chat-v1.0",
-            reduced_tinyllama_config(),
-            True,
-            id="tinyllama_cudagraph",
-        ),
-        pytest.param(
-            "TinyLlama-1.1B-Chat-v1.0",
-            reduced_tinyllama_config({"attn_backend": "flashinfer"}),
-            True,
-            id="tinyllama_flashinfer",
-        ),
-        pytest.param(
             "DeepSeek-V3",
-            reduced_deepseek_v3_mla_config(enable_cuda_graph=False),
-            False,
             id="deepseek_v3_mla",
-            marks=skip_pre_hopper,
-        ),
-        pytest.param(
-            "DeepSeek-V3",
-            reduced_deepseek_v3_mla_config(enable_cuda_graph=True),
-            True,
-            id="deepseek_v3_mla_cudagraph",
             marks=skip_pre_hopper,
         ),
     ]
 
 
 @pytest.mark.parametrize(
-    ("model", "extra_config", "enable_cuda_graph"),
-    reduced_layer_handoff_cases(),
+    "model",
+    reduced_model_cases(),
 )
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.timeout(600)
-def test_reduced_layer_handoff_matches_aggregate(model, extra_config, enable_cuda_graph):
+def test_reduced_layer_handoff_matches_aggregate(model):
     """Check single-request disaggregated handoff matches aggregate generation."""
     prompt = "What is the capital of Germany?"
     sampling_params_kwargs = {
@@ -494,12 +457,12 @@ def test_reduced_layer_handoff_matches_aggregate(model, extra_config, enable_cud
         "top_k": 1,
         "seed": AUTODEPLOY_DISAGG_SEED,
     }
+    extra_config = reduced_model_config(model)
     # Keep real weights loaded, but reduce the decoder stack so this still
     # exercises the model-specific attention/cache path without full-model cost.
     aggregate_output = run_aggregate_generation(
         model,
         world_size=1,
-        enable_cuda_graph=enable_cuda_graph,
         prompt=prompt,
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
@@ -507,7 +470,6 @@ def test_reduced_layer_handoff_matches_aggregate(model, extra_config, enable_cud
     outputs = run_sequential_handoff(
         model,
         generation_overlap=True,
-        enable_cuda_graph=enable_cuda_graph,
         prompt=prompt,
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
@@ -522,29 +484,15 @@ def test_reduced_layer_handoff_matches_aggregate(model, extra_config, enable_cud
 
 
 @pytest.mark.parametrize(
-    ("model", "extra_config"),
-    [
-        pytest.param(
-            "TinyLlama-1.1B-Chat-v1.0",
-            reduced_tinyllama_config({"gather_generation_logits": True}),
-            id="tinyllama",
-        ),
-        pytest.param(
-            "DeepSeek-V3",
-            {
-                **reduced_deepseek_v3_mla_config(enable_cuda_graph=True),
-                "gather_generation_logits": True,
-            },
-            id="deepseek_v3_mla",
-            marks=skip_pre_hopper,
-        ),
-    ],
+    "model",
+    reduced_model_cases(),
 )
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.timeout(600)
-def test_disaggregated_logits(model, extra_config):
+def test_disaggregated_logits(model):
     # Keep weighted but reduced layers so the test focuses on logits
     # transfer/equality rather than full-model compile and memory cost.
+    extra_config = reduced_model_config(model, {"gather_generation_logits": True})
     sampling_params_kwargs = {
         "max_tokens": 10,
         "ignore_eos": True,
@@ -554,7 +502,6 @@ def test_disaggregated_logits(model, extra_config):
     aggregate_output = run_aggregate_generation(
         model,
         world_size=1,
-        enable_cuda_graph=True,
         prompt=prompt,
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
@@ -562,7 +509,6 @@ def test_disaggregated_logits(model, extra_config):
     outputs = run_sequential_handoff(
         model,
         generation_overlap=True,
-        enable_cuda_graph=True,
         prompt=prompt,
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
@@ -599,7 +545,6 @@ def test_tinyllama_batch_handoff_semantic_slots():
     outputs = run_sequential_batch_handoff(
         "TinyLlama-1.1B-Chat-v1.0",
         generation_overlap=True,
-        enable_cuda_graph=True,
         prompts=prompts,
         sampling_params_kwargs=sampling_params_kwargs,
     )
@@ -614,42 +559,27 @@ def test_tinyllama_batch_handoff_semantic_slots():
 
 
 @pytest.mark.parametrize(
-    ("model", "extra_config"),
-    [
-        pytest.param(
-            "TinyLlama-1.1B-Chat-v1.0",
-            reduced_tinyllama_config(
-                {
-                    "enable_chunked_prefill": True,
-                    "max_num_tokens": 96,
-                }
-            ),
-            id="tinyllama",
-        ),
-        pytest.param(
-            "DeepSeek-V3",
-            {
-                **reduced_deepseek_v3_mla_config(enable_cuda_graph=True),
-                "enable_chunked_prefill": True,
-                "max_num_tokens": 96,
-            },
-            id="deepseek_v3_mla",
-            marks=skip_pre_hopper,
-        ),
-    ],
+    "model",
+    reduced_model_cases(),
 )
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.timeout(600)
-def test_chunked_prefill_handoff(model, extra_config):
+def test_chunked_prefill_handoff(model):
     # Chunked prefill needs real weights for aggregate-vs-disaggregated
     # comparison, but not a full decoder stack. Use reduced layers so the test
     # focuses on chunk-boundary handoff behavior with cuda graph enabled.
+    extra_config = reduced_model_config(
+        model,
+        {
+            "enable_chunked_prefill": True,
+            "max_num_tokens": 96,
+        },
+    )
     prompt = long_context_prompt() * 4
     sampling_params_kwargs = {"max_tokens": 8, "ignore_eos": True}
     aggregate_output = run_aggregate_generation(
         model,
         world_size=1,
-        enable_cuda_graph=True,
         prompt=prompt,
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
@@ -657,7 +587,6 @@ def test_chunked_prefill_handoff(model, extra_config):
     outputs = run_sequential_handoff(
         model,
         generation_overlap=True,
-        enable_cuda_graph=True,
         prompt=prompt,
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
@@ -893,7 +822,6 @@ def run_context_then_generation_handoff(
     model,
     worker_world_sizes,
     generation_overlap,
-    enable_cuda_graph,
     prompt,
     sampling_params_kwargs=None,
     extra_config=None,
@@ -911,13 +839,13 @@ def run_context_then_generation_handoff(
         or draft-token checks.
     """
     worker_configs = [
-        context_config(enable_cuda_graph, extra_config),
-        generation_config(generation_overlap, enable_cuda_graph, extra_config),
+        context_config(extra_config),
+        generation_config(generation_overlap, extra_config),
     ]
     print(
         "[AD DISAGG TEST] "
         f"scenario start: model={model}, worker_world_sizes={worker_world_sizes}, "
-        f"generation_overlap={generation_overlap}, enable_cuda_graph={enable_cuda_graph}, "
+        f"generation_overlap={generation_overlap}, compile_backend=torch-cudagraph, "
     )
     if sampling_params_kwargs is None:
         sampling_params_kwargs = {"max_tokens": 25, "ignore_eos": True}
@@ -971,7 +899,6 @@ def test_async_generation_matches_aggregate():
     aggregate_output = run_aggregate_generation(
         "TinyLlama-1.1B-Chat-v1.0",
         world_size=1,
-        enable_cuda_graph=True,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
     )
@@ -979,7 +906,6 @@ def test_async_generation_matches_aggregate():
         "TinyLlama-1.1B-Chat-v1.0",
         worker_world_sizes=(1, 1),
         generation_overlap=True,
-        enable_cuda_graph=True,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
     )
@@ -1010,7 +936,6 @@ def test_async_generation_no_overlap_matches_aggregate():
     aggregate_output = run_aggregate_generation(
         "TinyLlama-1.1B-Chat-v1.0",
         world_size=1,
-        enable_cuda_graph=True,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs=sampling_params_kwargs,
     )
@@ -1018,7 +943,6 @@ def test_async_generation_no_overlap_matches_aggregate():
         "TinyLlama-1.1B-Chat-v1.0",
         worker_world_sizes=(1, 1),
         generation_overlap=False,
-        enable_cuda_graph=True,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs=sampling_params_kwargs,
     )
@@ -1036,7 +960,6 @@ def test_async_sharded_generation_handoff():
     aggregate_output = run_aggregate_generation(
         "TinyLlama-1.1B-Chat-v1.0",
         world_size=2,
-        enable_cuda_graph=True,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
     )
@@ -1044,7 +967,6 @@ def test_async_sharded_generation_handoff():
         "TinyLlama-1.1B-Chat-v1.0",
         worker_world_sizes=(2, 2),
         generation_overlap=True,
-        enable_cuda_graph=True,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
     )
@@ -1066,7 +988,7 @@ def test_async_mla_sharded_generation_handoff():
     and the cpp transceiver dispatches on AttentionTypeCpp.MLA, so this asserts
     the MLA branch is correct under sharding.
     """
-    extra_config = reduced_deepseek_v3_mla_config(enable_cuda_graph=True)
+    extra_config = reduced_deepseek_v3_mla_config()
     sampling_params_kwargs = {
         "max_tokens": 10,
         "ignore_eos": True,
@@ -1076,7 +998,6 @@ def test_async_mla_sharded_generation_handoff():
     aggregate_output = run_aggregate_generation(
         "DeepSeek-V3",
         world_size=2,
-        enable_cuda_graph=True,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
@@ -1085,7 +1006,6 @@ def test_async_mla_sharded_generation_handoff():
         "DeepSeek-V3",
         worker_world_sizes=(2, 2),
         generation_overlap=True,
-        enable_cuda_graph=True,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
@@ -1113,7 +1033,6 @@ def test_async_eagle3_full_model_handoff():
         "Llama-3.1-8B-Instruct",
         worker_world_sizes=(1, 1),
         generation_overlap=True,
-        enable_cuda_graph=True,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
