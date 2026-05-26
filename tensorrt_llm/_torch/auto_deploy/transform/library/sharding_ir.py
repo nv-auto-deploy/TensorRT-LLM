@@ -1097,7 +1097,7 @@ class ApplyShardingHints(BaseTransform):
         # Add the placeholder before the node loop so MoEShardableNode.apply()
         # can find and wire it into each MoE node.
         if dc.enable_attention_dp and dc.moe_ep_size > 1 and cm is not None:
-            self._add_or_retrieve_input(gm, cm, "batch_info_host")
+            self._add_or_retrieve_input(gm, cm, "batch_info_host", init_val=True)
 
         num_updates = 0
         if self.config.simple_shard_only:

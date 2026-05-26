@@ -1343,7 +1343,7 @@ class ShardingTransformExecutor(BaseTransform):
         # When cm is None (e.g., unit tests that drive the sharding transform
         # standalone), skip — the MoE op falls back to max_num_tokens.
         if transforms.ep_transforms and cm is not None:
-            self._add_or_retrieve_input(gm, cm, "batch_info_host")
+            self._add_or_retrieve_input(gm, cm, "batch_info_host", init_val=True)
 
         with WeightBiasInfoCache():
             for tp_transform in transforms.weight_sharding_transforms:
