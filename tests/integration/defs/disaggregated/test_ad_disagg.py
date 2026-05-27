@@ -15,13 +15,17 @@
 
 import asyncio
 import multiprocessing as mp
+import multiprocessing.reduction as mp_reduction
 import os
+import pickle
+import sys
 import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import replace
 from queue import Empty
 
+import cloudpickle
 import pytest
 import torch
 from defs.conftest import get_sm_version, skip_pre_hopper
@@ -29,6 +33,18 @@ from defs.conftest import get_sm_version, skip_pre_hopper
 from tensorrt_llm import DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+cloudpickle.register_pickle_by_value(sys.modules[__name__])
+
+
+def multiprocessing_dumps(obj, protocol=None):
+    if protocol is None:
+        protocol = pickle.HIGHEST_PROTOCOL
+    return cloudpickle.dumps(obj, protocol=protocol)
+
+
+mp_reduction.ForkingPickler.dumps = multiprocessing_dumps
+mp_reduction.ForkingPickler.loads = cloudpickle.loads
 
 WORKER_READY = "ready"
 REQUEST_MODE_AGGREGATE = "aggregate"
