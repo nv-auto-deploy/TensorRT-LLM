@@ -31,6 +31,8 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     EagleConfig,
     EagleDrafterForCausalLM,
     EagleRMSNorm,
+    EagleWrapper,
+    EagleWrapperConfig,
 )
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
@@ -178,6 +180,54 @@ def test_eagle_rmsnorm_keeps_fp32_weights():
     norm = EagleRMSNorm(hidden_size=16)
 
     assert norm.weight.dtype == torch.float32
+
+
+def test_eagle_wrapper_instantiates_sa_enhancer():
+    from tensorrt_llm.llmapi import SAEnhancerConfig
+
+    wrapper = EagleWrapper(
+        EagleWrapperConfig(
+            max_draft_len=3,
+            load_embedding_from_target=True,
+            load_lm_head_from_target=True,
+            sa_config=SAEnhancerConfig(threshold=2),
+        ),
+        target_model=torch.nn.Module(),
+        draft_model=torch.nn.Module(),
+    )
+
+    assert wrapper.sa_enhancer is not None
+    assert wrapper.sa_enhancer.threshold == 2
+
+
+def test_eagle_wrapper_sa_override_updates_next_new_tokens():
+    class FakeSAEnhancer:
+        def maybe_override_all_draft_tokens(self, draft_tokens):
+            return draft_tokens + 100
+
+    wrapper = EagleWrapper(
+        EagleWrapperConfig(
+            max_draft_len=2,
+            load_embedding_from_target=True,
+            load_lm_head_from_target=True,
+        ),
+        target_model=torch.nn.Module(),
+        draft_model=torch.nn.Module(),
+    )
+    wrapper.sa_enhancer = FakeSAEnhancer()
+    next_new_tokens = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+
+    wrapper._maybe_apply_sa_draft_override(
+        next_new_tokens,
+        num_prefill=1,
+        num_extend=1,
+        sa_manager=object(),
+    )
+
+    torch.testing.assert_close(
+        next_new_tokens,
+        torch.tensor([[1, 2, 3], [4, 105, 106]], dtype=torch.int32),
+    )
 
 
 @pytest.fixture
