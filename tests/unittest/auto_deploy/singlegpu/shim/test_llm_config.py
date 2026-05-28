@@ -224,10 +224,10 @@ class TestSpeculativeConfigValidation:
         args = LlmArgs(model="test-model", speculative_config=spec_config)
         assert args.model_factory == "eagle_one_model"
 
-    def test_accepts_eagle_one_model_with_sa_enhancer(self):
-        from tensorrt_llm.llmapi import EagleDecodingConfig, SAEnhancerConfig
+    def test_accepts_eagle3_one_model_with_sa_enhancer(self):
+        from tensorrt_llm.llmapi import Eagle3DecodingConfig, SAEnhancerConfig
 
-        spec_config = EagleDecodingConfig(
+        spec_config = Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model="some/model",
             eagle3_one_model=True,

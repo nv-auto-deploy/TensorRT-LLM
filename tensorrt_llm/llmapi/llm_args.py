@@ -1139,29 +1139,6 @@ class MedusaDecodingConfig(DecodingBaseConfig):
         return backend not in ("pytorch", "_autodeploy")
 
 
-class SAEnhancerConfig(StrictBaseModel):
-    """Configuration for the Suffix Automaton (SA) draft enhancer.
-
-    Use this to combine SA pattern-matching drafting with another speculative
-    decoding method (Eagle3, MTP, PARD).  When provided as ``sa_config`` on a
-    decoding config, SA drafting is enabled and may override neural draft
-    tokens when the suffix match length meets the *threshold*.
-
-    For standalone SA speculative decoding (no neural drafter), use
-    :class:`SADecodingConfig` instead.
-    """
-
-    threshold: PositiveInt = Field(
-        default=4,
-        description="Minimum suffix match length required for the SA output "
-        "to override neural draft tokens.")
-    enable_global_pool: bool = Field(
-        default=False,
-        description="When True, each request searches all active SA states "
-        "for the longest match, not just its own. Improves acceptance rates "
-        "when requests share common patterns.")
-
-
 class EagleDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Eagle"] = "Eagle"
     eagle_choices: Optional[List[List[int]]] = Field(
@@ -1208,11 +1185,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_model_arch: Literal["llama3", "mistral_large3"] = Field(
         default="llama3",
         description="The model architecture of the eagle3 model.")
-    sa_config: Optional[SAEnhancerConfig] = Field(
-        default=None,
-        status="beta",
-        description="Optional Suffix Automaton configuration. When set, "
-        "combines SA drafting with Eagle speculative decoding.")
 
     @field_validator('eagle_choices', mode='before')
     @classmethod
@@ -1357,6 +1329,29 @@ class EagleDecodingConfig(DecodingBaseConfig):
         return False
 
 
+class SAEnhancerConfig(StrictBaseModel):
+    """Configuration for the Suffix Automaton (SA) draft enhancer.
+
+    Use this to combine SA pattern-matching drafting with another speculative
+    decoding method (Eagle3, MTP, PARD).  When provided as ``sa_config`` on a
+    decoding config, SA drafting is enabled and may override neural draft
+    tokens when the suffix match length meets the *threshold*.
+
+    For standalone SA speculative decoding (no neural drafter), use
+    :class:`SADecodingConfig` instead.
+    """
+
+    threshold: PositiveInt = Field(
+        default=4,
+        description="Minimum suffix match length required for the SA output "
+        "to override neural draft tokens.")
+    enable_global_pool: bool = Field(
+        default=False,
+        description="When True, each request searches all active SA states "
+        "for the longest match, not just its own. Improves acceptance rates "
+        "when requests share common patterns.")
+
+
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
 
@@ -1370,6 +1365,12 @@ class Eagle3DecodingConfig(EagleDecodingConfig):
     # exposed as a PrivateAttr -- not a user-tunable knob -- and is
     # auto-populated by py_executor_creator from the global max_batch_size.
     _max_batch_size: Optional[int] = PrivateAttr(default=None)
+
+    sa_config: Optional[SAEnhancerConfig] = Field(
+        default=None,
+        status="beta",
+        description="Optional Suffix Automaton configuration. When set, "
+        "combines SA drafting with Eagle3 speculative decoding.")
 
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
