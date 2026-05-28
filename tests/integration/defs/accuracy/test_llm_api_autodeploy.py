@@ -341,7 +341,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
 
     def get_default_kwargs(self, attn_backend="flashinfer", enable_sa=False):
         yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
-        sa_config = SAEnhancerConfig() if enable_sa else None
+        sa_config = SAEnhancerConfig(threshold=1) if enable_sa else None
         speculative_config = Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model=self.EAGLE_MODEL_PATH,

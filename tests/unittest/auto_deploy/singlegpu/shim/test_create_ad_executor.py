@@ -182,8 +182,6 @@ def test_create_autodeploy_executor_registers_sa_resource_manager():
     mock_engine.cache_seq_interface.kv_cache_manager = Mock()
     mock_engine.cache_seq_interface.kv_cache_manager.impl = Mock()
     mock_engine.cache_seq_interface.kv_cache_config_tuned = SimpleNamespace(tokens_per_block=64)
-    mock_dist = Mock()
-    mock_dist.broadcast.side_effect = lambda port: port
     mock_sa_manager = Mock()
 
     with (
@@ -192,10 +190,6 @@ def test_create_autodeploy_executor_registers_sa_resource_manager():
         patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.get_free_port", return_value=12345),
         patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.initialize_or_skip"),
         patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.torch.cuda.set_device"),
-        patch(
-            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.Distributed.get",
-            return_value=mock_dist,
-        ),
         patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config",
             return_value=mock_engine,

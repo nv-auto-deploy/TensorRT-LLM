@@ -257,7 +257,6 @@ def test_eagle_wrapper_sa_override_updates_next_new_tokens():
     wrapper._maybe_apply_sa_draft_override(
         next_new_tokens,
         num_prefill=1,
-        num_extend=1,
         sa_manager=object(),
     )
 

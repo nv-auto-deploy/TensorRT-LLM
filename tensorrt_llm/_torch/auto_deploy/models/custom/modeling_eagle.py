@@ -952,10 +952,9 @@ class EagleWrapper(nn.Module):
         self,
         next_new_tokens: torch.Tensor,
         num_prefill: int,
-        num_extend: int,
         sa_manager,
     ) -> None:
-        if self.sa_enhancer is None or sa_manager is None or num_extend == 0:
+        if self.sa_enhancer is None or sa_manager is None:
             return
 
         next_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
@@ -1162,7 +1161,7 @@ class EagleWrapper(nn.Module):
                 csi.info.copy_("input_ids", draft_tokens)
                 csi.info.offset_pos_and_cache_(c_offset)
 
-        self._maybe_apply_sa_draft_override(next_new_tokens, num_prefill, num_extend, sa_manager)
+        self._maybe_apply_sa_draft_override(next_new_tokens, num_prefill, sa_manager)
 
         # ---- Phase 6: Package output ----
         return EagleWrapperOutput(
