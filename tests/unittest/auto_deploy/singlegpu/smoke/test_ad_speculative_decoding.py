@@ -30,7 +30,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.hidden_states import (
 )
 from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
 from tensorrt_llm._torch.speculative.sa_enhancer import SADraftEnhancer
-from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig, SAEnhancerConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
 
 
 def get_extra_seq_len_for_kv_cache(llm_args) -> int:
@@ -96,13 +96,19 @@ def test_super_mtp_smoke():
     assert len(prompts_and_outputs) == 1
 
 
-def test_super_mtp_with_sa_enhancer_smoke(monkeypatch):
-    """Test one-model MTP/Eagle runtime with SA enhancer enabled."""
+def test_llama_eagle_with_sa_enhancer_smoke(monkeypatch):
+    """Test Llama/Eagle runtime with SA enhancer enabled."""
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
     test_prompt = "repeat repeat repeat repeat"
-    model_hub_id = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+    model_hub_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+    eagle_model_hub_id = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
     model_path = hf_id_to_local_model_dir(model_hub_id)
+    eagle_model_path = hf_id_to_local_model_dir(eagle_model_hub_id)
     if model_path is None or not Path(model_path).is_dir():
         pytest.skip(f"Model {model_hub_id} not found")
+    if eagle_model_path is None or not Path(eagle_model_path).is_dir():
+        pytest.skip(f"Draft model {eagle_model_hub_id} not found")
 
     sa_calls = {
         "extend_and_prepare": [],
@@ -139,25 +145,25 @@ def test_super_mtp_with_sa_enhancer_smoke(monkeypatch):
         recording_maybe_override_all_draft_tokens,
     )
 
-    experiment_config = get_small_model_config(
-        model_hub_id,
-        transforms={
-            "insert_cached_causal_conv": {"backend": "triton_causal_conv"},
-            "insert_cached_ssm_attention": {"backend": "triton_ssm"},
-        },
-    )
+    experiment_config = get_small_model_config(model_hub_id)
+    experiment_config["args"]["model_kwargs"]["num_hidden_layers"] = 3
     experiment_config["args"]["model"] = model_path
     experiment_config["args"]["runtime"] = "trtllm"
     experiment_config["args"]["world_size"] = 1
-    experiment_config["args"]["speculative_config"] = MTPDecodingConfig(
-        num_nextn_predict_layers=3,
-        mtp_eagle_one_model=True,
-        speculative_model=model_path,
-        sa_config=SAEnhancerConfig(threshold=1),
-    )
-    experiment_config["args"]["speculative_model_kwargs"] = experiment_config["args"][
-        "model_kwargs"
-    ]
+    experiment_config["args"]["speculative_config"] = {
+        "decoding_type": "Eagle3",
+        "max_draft_len": 3,
+        "eagle3_one_model": True,
+        "speculative_model": eagle_model_path,
+        "eagle3_layers_to_capture": [0, 1, 2],
+        "sa_config": {
+            "threshold": 1,
+        },
+    }
+    experiment_config["args"]["speculative_model_kwargs"] = {
+        "hidden_size": 64,
+        "torch_dtype": "bfloat16",
+    }
     experiment_config["args"]["attn_backend"] = "flashinfer"
     experiment_config["args"]["disable_overlap_scheduler"] = True
     experiment_config["args"]["compile_backend"] = "torch-simple"
