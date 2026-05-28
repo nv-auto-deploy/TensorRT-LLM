@@ -1067,19 +1067,17 @@ class EagleWrapper(nn.Module):
             if num_extend > 0:
                 new_tokens_lens[num_prefill:] = new_tokens_lens_extend
 
-        if self.sa_enhancer is not None and sa_manager is not None and num_extend > 0:
+        if self.sa_enhancer is not None and sa_manager is not None:
             self.sa_enhancer.extend_and_prepare(
                 sa_manager=sa_manager,
-                # ADEngine has already prepared the manager's batch indices
-                # for the current extend requests, and SuffixAutomatonManager
-                # uses those indices during extend(). The ID values are not
-                # read on this path, so avoid threading request IDs through
-                # the model forward signature.
-                request_ids=list(range(num_extend)),
-                accepted_tokens=new_tokens_2d[num_prefill:],
-                num_accepted_tokens=new_tokens_lens[num_prefill:],
+                # Match the PyTorch backend's full-batch call shape. ADEngine has
+                # already prepared real manager slots for the extend requests, and
+                # the ID values are not read during the enhancer's extend path.
+                request_ids=list(range(num_sequences)),
+                accepted_tokens=new_tokens_2d,
+                num_accepted_tokens=new_tokens_lens,
                 num_gens=num_extend,
-                num_contexts=0,
+                num_contexts=num_prefill,
                 max_draft_len=self.max_draft_len,
             )
 

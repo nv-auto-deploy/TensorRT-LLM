@@ -122,6 +122,7 @@ def test_llama_eagle_with_sa_enhancer_smoke(monkeypatch):
         sa_calls["extend_and_prepare"].append(
             {
                 "num_gens": kwargs["num_gens"],
+                "num_contexts": kwargs["num_contexts"],
                 "max_draft_len": kwargs["max_draft_len"],
                 "draft_shape": tuple(self.sa_draft_tokens.shape),
             }
@@ -185,7 +186,11 @@ def test_llama_eagle_with_sa_enhancer_smoke(monkeypatch):
     assert len(prompts_and_outputs) == 1
     assert sa_calls["extend_and_prepare"]
     assert sa_calls["maybe_override_all_draft_tokens"]
-    assert all(call["num_gens"] > 0 for call in sa_calls["extend_and_prepare"])
+    assert any(
+        call["num_gens"] == 0 and call["num_contexts"] > 0
+        for call in sa_calls["extend_and_prepare"]
+    )
+    assert any(call["num_gens"] > 0 for call in sa_calls["extend_and_prepare"])
     assert all(call["max_draft_len"] == 3 for call in sa_calls["extend_and_prepare"])
     assert all(call["draft_shape"][1] >= 3 for call in sa_calls["extend_and_prepare"])
     assert all(
