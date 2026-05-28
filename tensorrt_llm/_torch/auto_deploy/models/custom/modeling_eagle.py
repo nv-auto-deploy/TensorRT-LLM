@@ -852,11 +852,8 @@ class EagleWrapper(nn.Module):
         - Otherwise: prefill-only mode (export time, before caches are inserted).
         """
         sa_manager = kwargs.pop("sa_manager", None)
-        sa_request_ids = kwargs.pop("sa_request_ids", None)
         if cache_seq_interface is not None:
-            return self._forward_with_kv_cache(
-                cache_seq_interface, sa_manager=sa_manager, sa_request_ids=sa_request_ids
-            )
+            return self._forward_with_kv_cache(cache_seq_interface, sa_manager=sa_manager)
         else:
             return self._forward_prefill_only(**kwargs)
 
@@ -966,9 +963,7 @@ class EagleWrapper(nn.Module):
         )
         next_new_tokens[num_prefill:, 1:] = next_draft_tokens
 
-    def _forward_with_kv_cache(
-        self, csi: CachedSequenceInterface, sa_manager=None, sa_request_ids=None
-    ):
+    def _forward_with_kv_cache(self, csi: CachedSequenceInterface, sa_manager=None):
         """Forward pass with KV cache (inference after graph transforms).
 
         Phases: target forward -> collect hidden states -> gather + sample + verify ->
@@ -1073,10 +1068,14 @@ class EagleWrapper(nn.Module):
                 new_tokens_lens[num_prefill:] = new_tokens_lens_extend
 
         if self.sa_enhancer is not None and sa_manager is not None and num_extend > 0:
-            assert sa_request_ids is not None, "SA request ids must be provided when SA is enabled."
             self.sa_enhancer.extend_and_prepare(
                 sa_manager=sa_manager,
-                request_ids=sa_request_ids,
+                # ADEngine has already prepared the manager's batch indices
+                # for the current extend requests, and SuffixAutomatonManager
+                # uses those indices during extend(). The ID values are not
+                # read on this path, so avoid threading request IDs through
+                # the model forward signature.
+                request_ids=list(range(num_extend)),
                 accepted_tokens=new_tokens_2d[num_prefill:],
                 num_accepted_tokens=new_tokens_lens[num_prefill:],
                 num_gens=num_extend,

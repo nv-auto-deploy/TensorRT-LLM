@@ -304,6 +304,7 @@ class ADEngine(ModelEngine):
         self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
         self.iter_counter = 0
         self.iter_states = {}
+        self.sa_manager = None
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
         self.enable_attention_dp = dist_config.enable_attention_dp if dist_config else False
@@ -732,20 +733,15 @@ class ADEngine(ModelEngine):
             **extra_args,
         )
 
-        self.iter_states.pop("sa_manager", None)
-        self.iter_states.pop("sa_request_ids", None)
-        sa_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER
-        )
-        if (
-            sa_manager is not None
-            and getattr(self.spec_config, "sa_config", None) is not None
-            and num_extend > 0
-        ):
+        if getattr(self.spec_config, "sa_config", None) is not None:
+            if self.sa_manager is None:
+                self.sa_manager = resource_manager.get_resource_manager(
+                    ResourceManagerType.SPEC_RESOURCE_MANAGER
+                )
+
+        if self.sa_manager is not None and num_extend > 0:
             gen_request_ids = [request.py_request_id for request in extend_requests]
-            sa_manager.prepare(gen_request_ids, self.spec_config.max_draft_len)
-            self.iter_states["sa_manager"] = sa_manager
-            self.iter_states["sa_request_ids"] = gen_request_ids
+            self.sa_manager.prepare(gen_request_ids, self.spec_config.max_draft_len)
 
         self.iter_states["num_ctx_requests"] = num_prefill
         self.iter_states["num_ctx_tokens"] = num_prefill_tokens
@@ -760,13 +756,10 @@ class ADEngine(ModelEngine):
         csi = self.cache_seq_interface
 
         if self.spec_config is not None:
-            sa_manager = self.iter_states.get("sa_manager")
-            sa_request_ids = self.iter_states.get("sa_request_ids")
             model_output = self.model(
                 **csi.named_args,
                 cache_seq_interface=csi,
-                sa_manager=sa_manager,
-                sa_request_ids=sa_request_ids,
+                sa_manager=self.sa_manager,
             )
         else:
             model_output = self.model(**csi.named_args)
