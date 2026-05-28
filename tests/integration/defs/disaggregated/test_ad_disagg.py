@@ -14,43 +14,45 @@
 # limitations under the License.
 
 import asyncio
-import multiprocessing as mp
-import multiprocessing.reduction as mp_reduction
 import os
 import pickle
 import sys
-import time
 import traceback
-from contextlib import contextmanager
+import uuid
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
-from queue import Empty
 
 import cloudpickle
 import pytest
 import torch
 from defs.conftest import get_sm_version, skip_pre_hopper
+from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+from tensorrt_llm._utils import set_mpi_comm
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
-
-
-def multiprocessing_dumps(obj, protocol=None):
-    if protocol is None:
-        protocol = pickle.HIGHEST_PROTOCOL
-    return cloudpickle.dumps(obj, protocol=protocol)
-
-
-mp_reduction.ForkingPickler.dumps = multiprocessing_dumps
-mp_reduction.ForkingPickler.loads = cloudpickle.loads
+MPI.pickle.__init__(
+    cloudpickle.dumps,
+    cloudpickle.loads,
+    pickle.HIGHEST_PROTOCOL,
+)
 
 WORKER_READY = "ready"
 REQUEST_MODE_AGGREGATE = "aggregate"
-WORKER_RESPONSE_TIMEOUT_S = 600
-WORKER_SHUTDOWN_TIMEOUT_S = 30
-WORKER_TERMINATE_TIMEOUT_S = 10
+MPI_REQUEST = 9999
+MPI_RESULT = MPI_REQUEST + 1
+OMPI_COMM_WORLD_ENV_KEYS = (
+    "OMPI_COMM_WORLD_SIZE",
+    "OMPI_COMM_WORLD_RANK",
+    "OMPI_COMM_WORLD_LOCAL_SIZE",
+    "OMPI_COMM_WORLD_LOCAL_RANK",
+    "OMPI_COMM_WORLD_NODE_RANK",
+    "OMPI_UNIVERSE_SIZE",
+)
 AUTODEPLOY_DISAGG_SEED = 1234
 REDUCED_TINYLLAMA_LAYERS = 2
 REDUCED_DEEPSEEK_LAYERS = 2
@@ -95,14 +97,14 @@ def response_summary(response):
     """Summarize values returned by AutoDeploy test workers.
 
     Inputs:
-        response: Queue payload from an AutoDeploy worker. It can be a formatted
-            exception string or a list of normal LLM output objects.
+        response: Payload from an AutoDeploy worker. It can be a formatted exception
+            string or a list of normal LLM output objects.
 
     Outputs:
         A string representing the input response.
 
-    This is useful because subprocess workers send results through
-    multiprocessing queues, so assertion failures otherwise lose the key fields
+    This is useful because subprocess workers send results through MPI, so
+    assertion failures otherwise lose the key fields
     needed to debug the disaggregated handoff: generated text/tokens, request
     type, context request id, draft-token count, and logits shape when present.
     """
@@ -618,12 +620,12 @@ def test_chunked_prefill_handoff(model):
 
 
 # ---------------------------------------------------------------------------
-# Async messaging queue tests.
+# Async MPI worker tests.
 #
 # These tests launch separate context and generation worker processes and pass
-# requests through multiprocessing queues. They are closer to the real
-# disaggregated deployment shape because context and generation models can live
-# on different GPUs, and some cases shard each worker across multiple GPUs.
+# requests through an MPI intercommunicator. They are closer to the real
+# disaggregated deployment shape because context and generation models can live on
+# different GPUs, and some cases shard each worker across multiple GPUs.
 # ---------------------------------------------------------------------------
 
 
@@ -672,49 +674,67 @@ def worker_error(error):
     return f"{type(error).__name__}: {error}\n{traceback.format_exc()}"
 
 
+def isolate_ad_worker_from_outer_mpi():
+    """Hide pytest's MPI transport from AutoDeploy's distributed init."""
+    rank = MPI.COMM_WORLD.Get_rank()
+    ad_comm = MPI.COMM_WORLD.Split(color=rank, key=0)
+    set_mpi_comm(ad_comm)
+    for key in OMPI_COMM_WORLD_ENV_KEYS:
+        os.environ.pop(key, None)
+    return ad_comm
+
+
 async def run_worker(
     config,
     model_name,
     world_size,
     cuda_visible_devices,
-    request_queue,
-    response_queue,
+    service_name,
 ):
     os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     os.environ.setdefault("UCX_TLS", get_ucx_tls())
     os.environ.setdefault("UCX_MM_ERROR_HANDLING", "y")
 
-    seed_disagg()
-    with AutoDeployLLM(
-        model=model_name,
-        world_size=world_size,
-        **config,
-    ) as llm:
-        response_queue.put(WORKER_READY)
-        while True:
-            requests = request_queue.get()
-            if requests is None:
-                break
+    intercomm = MPI.COMM_WORLD.Connect(MPI.Lookup_name(service_name))
+    ad_comm = isolate_ad_worker_from_outer_mpi()
+    try:
+        seed_disagg()
+        with AutoDeployLLM(
+            model=model_name,
+            world_size=world_size,
+            **config,
+        ) as llm:
+            intercomm.send(WORKER_READY, dest=0, tag=MPI_RESULT)
+            while True:
+                requests = intercomm.recv(source=0, tag=MPI_REQUEST)
+                if requests is None:
+                    break
 
-            futures = []
-            for request in requests:
-                seed_disagg()
-                try:
-                    result = llm.generate_async(
-                        request[0],
-                        sampling_params=request[1],
-                        disaggregated_params=request[2],
-                    )
-                    futures.append(result)
-                except Exception as e:
-                    response_queue.put(worker_error(e))
+                futures = []
+                for request in requests:
+                    seed_disagg()
+                    try:
+                        result = llm.generate_async(
+                            request[0],
+                            sampling_params=request[1],
+                            disaggregated_params=request[2],
+                        )
+                        futures.append(result)
+                    except Exception as e:
+                        intercomm.send(worker_error(e), dest=0, tag=MPI_RESULT)
 
-            for result in futures:
-                try:
-                    output = await result
-                    response_queue.put(output.outputs)
-                except Exception as e:
-                    response_queue.put(worker_error(e))
+                for result in futures:
+                    try:
+                        output = await result
+                        intercomm.send(output.outputs, dest=0, tag=MPI_RESULT)
+                    except Exception as e:
+                        intercomm.send(worker_error(e), dest=0, tag=MPI_RESULT)
+    except Exception as e:
+        intercomm.send(worker_error(e), dest=0, tag=MPI_RESULT)
+        raise
+    finally:
+        intercomm.Disconnect()
+        ad_comm.Free()
 
 
 def worker_entry_point(
@@ -722,8 +742,7 @@ def worker_entry_point(
     model_name,
     world_size,
     cuda_visible_devices,
-    request_queue,
-    response_queue,
+    service_name,
 ):
     return asyncio.run(
         run_worker(
@@ -731,107 +750,97 @@ def worker_entry_point(
             model_name,
             world_size,
             cuda_visible_devices,
-            request_queue,
-            response_queue,
+            service_name,
         )
     )
 
 
-def receive_worker_response(response_queue, processes, timeout_s=WORKER_RESPONSE_TIMEOUT_S):
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        try:
-            return response_queue.get(timeout=5)
-        except Empty:
-            for process in processes:
-                if process.exitcode is not None and process.exitcode != 0:
-                    raise RuntimeError(f"AutoDeploy worker exited with code {process.exitcode}")
-    process_states = [f"pid={process.pid}, exitcode={process.exitcode}" for process in processes]
-    raise TimeoutError(
-        f"Timed out waiting {timeout_s}s for AutoDeploy worker response; processes={process_states}"
-    )
+def mpi_publish_name():
+    service_name = f"ad_disagg_{uuid.uuid4()}"
+    port_name = MPI.Open_port()
+    MPI.Publish_name(service_name, port_name)
+    return service_name, port_name
 
 
-def send_requests_to_worker(requests, worker_rank, request_queues, response_queues, processes):
-    request_queues[worker_rank].put(requests)
+def send_requests_to_worker(requests, worker_rank, intercomms):
+    intercomm = intercomms[worker_rank]
+    intercomm.send(requests, dest=0, tag=MPI_REQUEST)
     responses = []
     for _ in range(len(requests)):
-        responses.append(receive_worker_response(response_queues[worker_rank], processes))
+        responses.append(intercomm.recv(source=0, tag=MPI_RESULT))
     return responses
 
 
 @contextmanager
 def worker_pool(worker_configs, model_names, world_sizes):
-    """Start async queue workers and always tear them down after the test body.
+    """Start async MPI workers and always tear them down after the test body.
 
-    The decorator lets callers use ``with worker_pool(...)`` while
-    this generator owns worker startup, readiness checks, and cleanup in the
-    ``finally`` block even when an assertion or subprocess error fails the test.
+    MPI cloudpickle serialization keeps worker callables by value, so CI workers
+    do not re-import this pytest module from the source checkout before the
+    installed TensorRT-LLM wheel is on the import path.
     """
     if len(worker_configs) != len(model_names) or len(model_names) != len(world_sizes):
         raise ValueError("worker_configs, model_names, and world_sizes must have the same length")
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     cuda_visible_devices = worker_cuda_devices(world_sizes, visible_devices)
-    ctx = mp.get_context("spawn")
-    request_queues = [ctx.Queue() for _ in range(len(world_sizes))]
-    response_queues = [ctx.Queue() for _ in range(len(world_sizes))]
-    processes = []
-    try:
-        for worker_rank, (
-            config,
-            model_name,
-            world_size,
-            worker_cuda_visible_devices,
-        ) in enumerate(
-            zip(worker_configs, model_names, world_sizes, cuda_visible_devices, strict=True)
-        ):
-            original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-            os.environ["CUDA_VISIBLE_DEVICES"] = worker_cuda_visible_devices
-            process = ctx.Process(
-                target=worker_entry_point,
-                args=(
-                    config,
-                    model_name,
-                    world_size,
-                    worker_cuda_visible_devices,
-                    request_queues[worker_rank],
-                    response_queues[worker_rank],
-                ),
-            )
-            try:
-                process.start()
-            finally:
-                if original_cuda_visible_devices is None:
-                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-                else:
-                    os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
-            processes.append(process)
-
-        for response_queue in response_queues:
-            ready_response = receive_worker_response(response_queue, processes)
-            if ready_response != WORKER_READY:
-                raise RuntimeError(
-                    f"Unexpected AutoDeploy worker startup response: {ready_response}"
+    services = [mpi_publish_name() for _ in world_sizes]
+    futures = []
+    intercomms = []
+    with ExitStack() as stack:
+        try:
+            for (
+                config,
+                model_name,
+                world_size,
+                worker_cuda_visible_devices,
+                (service_name, _),
+            ) in zip(
+                worker_configs,
+                model_names,
+                world_sizes,
+                cuda_visible_devices,
+                services,
+                strict=True,
+            ):
+                executor = stack.enter_context(
+                    MPIPoolExecutor(
+                        max_workers=1,
+                        path=sys.path,
+                        env={
+                            "UCX_TLS": get_ucx_tls(),
+                            "UCX_MM_ERROR_HANDLING": "y",
+                        },
+                    )
                 )
-        yield request_queues, response_queues, processes
-    finally:
-        for request_queue in request_queues:
-            request_queue.put(None)
-        for process in processes:
-            process.join(timeout=WORKER_SHUTDOWN_TIMEOUT_S)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=WORKER_TERMINATE_TIMEOUT_S)
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=WORKER_TERMINATE_TIMEOUT_S)
-            if process.is_alive():
-                raise RuntimeError(f"AutoDeploy worker {process.pid} did not terminate")
-        for request_queue, response_queue in zip(request_queues, response_queues, strict=True):
-            request_queue.close()
-            request_queue.join_thread()
-            response_queue.close()
-            response_queue.join_thread()
+                futures.append(
+                    executor.submit(
+                        worker_entry_point,
+                        config,
+                        model_name,
+                        world_size,
+                        worker_cuda_visible_devices,
+                        service_name,
+                    )
+                )
+
+            for _, port_name in services:
+                intercomms.append(MPI.COMM_SELF.Accept(port_name))
+            for intercomm in intercomms:
+                ready_response = intercomm.recv(source=0, tag=MPI_RESULT)
+                if ready_response != WORKER_READY:
+                    raise RuntimeError(
+                        f"Unexpected AutoDeploy worker startup response: {ready_response}"
+                    )
+            yield intercomms
+        finally:
+            for intercomm in intercomms:
+                intercomm.send(None, dest=0, tag=MPI_REQUEST)
+                intercomm.Disconnect()
+            for service_name, port_name in services:
+                MPI.Unpublish_name(service_name, port_name)
+                MPI.Close_port(port_name)
+            for future in futures:
+                future.result()
 
 
 def run_context_then_generation_handoff(
@@ -869,11 +878,7 @@ def run_context_then_generation_handoff(
     model_names = [model_path(model) for _ in range(2)]
     world_sizes = list(worker_world_sizes)
 
-    with worker_pool(worker_configs, model_names, world_sizes) as (
-        request_queues,
-        response_queues,
-        processes,
-    ):
+    with worker_pool(worker_configs, model_names, world_sizes) as intercomms:
         context_requests = [
             (
                 prompt,
@@ -881,9 +886,7 @@ def run_context_then_generation_handoff(
                 DisaggregatedParams(request_type="context_only"),
             )
         ]
-        context_responses = send_requests_to_worker(
-            context_requests, 0, request_queues, response_queues, processes
-        )
+        context_responses = send_requests_to_worker(context_requests, 0, intercomms)
         context_output = first_output(context_responses)
         print(
             f"[AD DISAGG TEST] context output: {response_summary([context_output])}",
@@ -894,9 +897,7 @@ def run_context_then_generation_handoff(
             (prompt, SamplingParams(**sampling_params_kwargs), generation_request_disagg_params)
         ]
 
-        generation_responses = send_requests_to_worker(
-            generation_requests, 1, request_queues, response_queues, processes
-        )
+        generation_responses = send_requests_to_worker(generation_requests, 1, intercomms)
         generation_output = first_output(generation_responses)
         print(
             f"[AD DISAGG TEST] generation output: {response_summary([generation_output])}",
@@ -908,6 +909,7 @@ def run_context_then_generation_handoff(
         }
 
 
+@pytest.mark.threadleak(enabled=False)
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.skip_less_device(2)
 @pytest.mark.timeout(600)
@@ -938,6 +940,7 @@ def test_async_generation_matches_aggregate():
     assert outputs["generation"].token_ids == aggregate_output.token_ids
 
 
+@pytest.mark.threadleak(enabled=False)
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.skip_less_device(2)
 @pytest.mark.timeout(600)
@@ -969,6 +972,7 @@ def test_async_generation_no_overlap_matches_aggregate():
     assert outputs["generation"].token_ids == aggregate_output.token_ids
 
 
+@pytest.mark.threadleak(enabled=False)
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.timeout(900)
@@ -994,6 +998,7 @@ def test_async_sharded_generation_handoff():
 
 
 @skip_pre_hopper
+@pytest.mark.threadleak(enabled=False)
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.timeout(900)
@@ -1034,6 +1039,7 @@ def test_async_mla_sharded_generation_handoff():
 
 
 @skip_pre_hopper
+@pytest.mark.threadleak(enabled=False)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(2)
 @pytest.mark.timeout(900)
