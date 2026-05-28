@@ -16,7 +16,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Adapted from NVIDIA's Nemotron-Flash-3B-Instruct model (Apache-2.0, NVIDIA CORPORATION & AFFILIATES.):
+# Adapted from NVIDIA CORPORATION & AFFILIATES' Nemotron-Flash-3B-Instruct model (Apache-2.0):
 # https://huggingface.co/nvidia/Nemotron-Flash-3B-Instruct/tree/main
 import copy
 import math
