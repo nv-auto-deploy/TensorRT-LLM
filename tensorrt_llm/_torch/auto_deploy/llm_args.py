@@ -150,7 +150,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                 "EagleDecodingConfig(eagle3_one_model=True)."
             )
 
-        self.model_factory = "eagle_one_model"
         return self
 
     @model_validator(mode="after")
@@ -210,6 +209,14 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     model_factory: str = Field(
         default="AutoModelForCausalLM",
         description="The model factory to use for loading the model.",
+    )
+
+    target_model_factory: Optional[str] = Field(
+        default=None,
+        description=(
+            "The target model factory to wrap when model_factory='eagle_one_model'. "
+            "Leave unset for non-wrapper model factories."
+        ),
     )
 
     model_kwargs: Dict[str, Any] = Field(
@@ -309,6 +316,32 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             )
 
         return value
+
+    @model_validator(mode="after")
+    def validate_speculative_model_factory(self):
+        if self.speculative_config is None:
+            if self.model_factory == "eagle_one_model":
+                raise ValueError("model_factory='eagle_one_model' requires speculative_config.")
+            return self
+
+        if not self._requires_eagle_one_model():
+            raise ValueError(
+                "AutoDeploy only supports speculative decoding via "
+                "MTPDecodingConfig(mtp_eagle_one_model=True) or "
+                "EagleDecodingConfig(eagle3_one_model=True)."
+            )
+
+        if self.model_factory != "eagle_one_model":
+            self.target_model_factory = self.model_factory
+            self.model_factory = "eagle_one_model"
+
+        else:
+            if self.target_model_factory is None:
+                raise ValueError(
+                    "target_model_factory must be set when model_factory='eagle_one_model'."
+                )
+
+        return self
 
     @model_validator(mode="after")
     def update_transforms_with_shortcuts(self) -> Dict[str, Any]:
@@ -432,6 +465,17 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         """Whether CachedSequenceInterface must enforce a uniform KV cache mapping."""
         return self.attn_backend.lower() == "trtllm"
 
+    def _requires_eagle_one_model(self) -> bool:
+        """Whether speculative decoding should use the Eagle one-model factory path."""
+        spec_config = self.speculative_config
+        if spec_config is None:
+            return False
+        if isinstance(spec_config, MTPDecodingConfig):
+            return spec_config.mtp_eagle_one_model and not spec_config.use_mtp_vanilla
+        if isinstance(spec_config, EagleDecodingConfig):
+            return spec_config.eagle3_one_model
+        return False
+
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments.
 
@@ -453,6 +497,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             sync_before_hidden_state_capture=self.attn_backend == "flashinfer",
             speculative_config=self.speculative_config,
             speculative_model_kwargs=self.speculative_model_kwargs or None,
+            target_model_factory=self.target_model_factory,
         )
 
         # The factory handles the logic internally for getting the `max_seq_len` if not provided

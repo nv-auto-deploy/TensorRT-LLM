@@ -37,6 +37,7 @@ from typing import Any, ClassVar, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
+from torch.fx import GraphModule
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
@@ -48,6 +49,7 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils._config import deep_merge_dicts
 from ...utils.logger import ad_logger
 from .modeling_nemotron_h import build_nemotron_eagle_layers
+from .modeling_qwen3_5_moe import build_qwen3_5_moe_eagle_layers
 
 # =============================================================================
 # Layer Dispatch Functions
@@ -78,10 +80,12 @@ def get_eagle_layers(config, model_type: str) -> Union[nn.ModuleList, nn.Module]
             layers = build_llama_eagle_layers(config)
         case "nemotron_h":
             layers = build_nemotron_eagle_layers(config)
+        case "qwen3_5_moe_text":
+            layers = build_qwen3_5_moe_eagle_layers(config)
         case _:
             raise ValueError(
                 f"Model type '{model_type}' not supported for Eagle drafter. "
-                f"Supported types: llama, nemotron_h"
+                f"Supported types: llama, nemotron_h, qwen3_5_moe_text"
             )
 
     if len(layers) == 1:
@@ -140,6 +144,20 @@ class EagleConfig(PretrainedConfig):
             # NemotronH MTP checkpoint: mtp.* -> model.*
             "_checkpoint_conversion_mapping": {
                 r"^mtp\.": "model.",
+            },
+        },
+        "qwen3_5_moe_text": {
+            "load_embedding_from_target": True,
+            "load_lm_head_from_target": True,
+            "num_capture_layers": 1,
+            "normalize_target_hidden_state": True,
+            "layers_handle_final_norm": True,
+            "_checkpoint_conversion_mapping": {
+                r"^mtp\.layers\.0\.": "model.layers.",
+                r"^mtp\.fc\.": "model.layers.fc.",
+                r"^mtp\.pre_fc_norm_embedding\.": "model.layers.pre_fc_norm_embedding.",
+                r"^mtp\.pre_fc_norm_hidden\.": "model.layers.pre_fc_norm_hidden.",
+                r"^mtp\.norm\.": "model.layers.norm.",
             },
         },
     }
@@ -604,9 +622,15 @@ class EagleDrafterForCausalLM(PreTrainedModel):
 
     base_model_prefix = "model"
     supports_gradient_checkpointing = False
-    _no_split_modules = ["LlamaEagleLayer", "NemotronHEagleLayer"]
+    _no_split_modules = ["LlamaEagleLayer", "NemotronHEagleLayer", "Qwen3_5MoeEagleLayer"]
 
-    def __init__(self, config, layers: Optional[Union[nn.ModuleList, nn.Module]] = None):
+    def __init__(
+        self,
+        config,
+        layers: Optional[Union[nn.ModuleList, nn.Module]] = None,
+        **_unused_kwargs,
+    ):
+        # Accept unused HF-style kwargs such as use_cache; _from_config() forwards them.
         super().__init__(config)
 
         # Read checkpoint conversion mapping from config (set by EagleConfig based on model_type)
@@ -914,8 +938,29 @@ class EagleWrapper(nn.Module):
 
     @staticmethod
     def _filter_kwargs_for_submodule(kwargs: dict, submodule: nn.Module) -> dict:
-        """Filter kwargs to only include those accepted by submodule's forward (GraphModule)."""
-        expected_names = {node.name for node in submodule.graph.nodes if node.op == "placeholder"}
+        """Filter kwargs to names accepted by the exported target GraphModule.
+
+        Text targets are exported directly as a GraphModule. VLM targets keep
+        the exported language-model GraphModule as a child (for Qwen3.5 MoE,
+        ``model.language_model``), so unwrap that single child before checking
+        placeholders. Reject multiple child GraphModules because the unwrapping
+        is ambiguous.
+        """
+        if isinstance(submodule, GraphModule):
+            gm = submodule
+        else:
+            graph_modules = [
+                child
+                for child in submodule.modules()
+                if child is not submodule and isinstance(child, GraphModule)
+            ]
+            if len(graph_modules) != 1:
+                raise ValueError(
+                    f"Cannot infer exported GraphModule inside {type(submodule).__name__}: "
+                    f"found {len(graph_modules)} child GraphModules; unwrapping is ambiguous."
+                )
+            gm = graph_modules[0]
+        expected_names = {node.name for node in gm.graph.nodes if node.op == "placeholder"}
         return {k: v for k, v in kwargs.items() if k in expected_names}
 
     @staticmethod
