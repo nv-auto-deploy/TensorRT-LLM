@@ -91,7 +91,7 @@ def make_extend_kernel_inputs(device, dtype, num_k_heads=2, num_v_heads=2):
     updating ``delta_cache`` directly, matching how extend requests are used during
     speculative decoding.
     """
-    num_extend = 1
+    num_extend = 2
     tokens_per_extend = 3
     total_tokens = num_extend * tokens_per_extend
     key_dim = 8
@@ -110,7 +110,7 @@ def make_extend_kernel_inputs(device, dtype, num_k_heads=2, num_v_heads=2):
         value_dim,
     )
 
-    slot_idx = torch.tensor([2], device=device, dtype=torch.int32)
+    slot_idx = torch.tensor([1, 3], device=device, dtype=torch.int32)
     delta_cache = torch.zeros(
         max_batch_size,
         num_v_heads,
@@ -403,42 +403,51 @@ def test_intermediate_delta_cache(gdr_env, num_k_heads, num_v_heads):
 
     y_extend = torch.ops.auto_deploy.fla_cached_gated_delta_rule(*args)
 
-    tokens_per_extend = q.shape[1]
-    for prefix_len in range(1, tokens_per_extend + 1):
-        prefix_delta_cache = initial_cache.clone()
-        prefix_batch_info = BatchInfo()
-        prefix_batch_info.update([1, prefix_len, 0, 0, 0, 0])
-        prefix_cu_seqlen = torch.tensor([0, prefix_len], device=device, dtype=torch.int32)
-        prefix_slot_idx = slot_idx[:1]
-        prefix_use_initial_states = torch.ones(1, device=device, dtype=torch.bool)
-        prefix_any_use_initial_states_host = torch.tensor([True], device=device, dtype=torch.bool)
+    num_extend = slot_idx.numel()
+    tokens_per_extend = q.shape[1] // num_extend
+    for request_idx, slot in enumerate(slot_idx):
+        request_start = request_idx * tokens_per_extend
+        request_end = request_start + tokens_per_extend
+        for prefix_len in range(1, tokens_per_extend + 1):
+            prefix_delta_cache = initial_cache.clone()
+            prefix_batch_info = BatchInfo()
+            prefix_batch_info.update([1, prefix_len, 0, 0, 0, 0])
+            prefix_cu_seqlen = torch.tensor([0, prefix_len], device=device, dtype=torch.int32)
+            prefix_slot_idx = slot_idx[request_idx : request_idx + 1]
+            prefix_use_initial_states = torch.ones(1, device=device, dtype=torch.bool)
+            prefix_any_use_initial_states_host = torch.tensor(
+                [True], device=device, dtype=torch.bool
+            )
 
-        y_prefill = torch.ops.auto_deploy.fla_cached_gated_delta_rule(
-            q[:, :prefix_len],
-            k[:, :prefix_len],
-            v[:, :prefix_len],
-            a[:, :prefix_len],
-            b[:, :prefix_len],
-            A_log,
-            dt_bias,
-            prefix_batch_info.serialize(),
-            prefix_cu_seqlen,
-            prefix_slot_idx,
-            prefix_use_initial_states,
-            prefix_any_use_initial_states_host,
-            prefix_delta_cache,
-            None,
-            scale,
-        )
+            prefix_slice = slice(request_start, request_start + prefix_len)
+            y_prefill = torch.ops.auto_deploy.fla_cached_gated_delta_rule(
+                q[:, prefix_slice],
+                k[:, prefix_slice],
+                v[:, prefix_slice],
+                a[:, prefix_slice],
+                b[:, prefix_slice],
+                A_log,
+                dt_bias,
+                prefix_batch_info.serialize(),
+                prefix_cu_seqlen,
+                prefix_slot_idx,
+                prefix_use_initial_states,
+                prefix_any_use_initial_states_host,
+                prefix_delta_cache,
+                None,
+                scale,
+            )
 
-        torch.testing.assert_close(
-            intermediate_delta_cache[0, prefix_len - 1],
-            prefix_delta_cache[prefix_slot_idx[0].long()].to(intermediate_delta_cache.dtype),
-            atol=state_atol,
-            rtol=state_rtol,
-        )
-        if prefix_len == tokens_per_extend:
-            torch.testing.assert_close(y_extend, y_prefill, atol=atol, rtol=rtol)
+            torch.testing.assert_close(
+                intermediate_delta_cache[request_idx, prefix_len - 1],
+                prefix_delta_cache[slot.long()].to(intermediate_delta_cache.dtype),
+                atol=state_atol,
+                rtol=state_rtol,
+            )
+            if prefix_len == tokens_per_extend:
+                torch.testing.assert_close(
+                    y_extend[:, request_start:request_end], y_prefill, atol=atol, rtol=rtol
+                )
 
     torch.testing.assert_close(delta_cache, initial_cache, atol=0, rtol=0)
 

@@ -3299,10 +3299,13 @@ def test_mtp_vlm_wrapper_accepts_text_only_inputs_embeds():
     position_ids = torch.arange(4).view(1, 4).expand(2, -1)
 
     wrapper_logits = model(inputs_embeds=inputs_embeds, position_ids=position_ids).logits
-    expected_logits = model.model.language_model(
+    text_out = model.model.language_model(
         inputs_embeds=inputs_embeds,
         position_ids=position_ids[None, ...].expand(3, position_ids.shape[0], -1),
-    ).logits
+    )
+    expected_logits = model.lm_head(
+        text_out.last_hidden_state.to(model.lm_head.weight.dtype)
+    ).float()
 
     torch.testing.assert_close(wrapper_logits, expected_logits)
 
