@@ -379,7 +379,6 @@ l0_dgx_h100:
   - disaggregated/test_ad_disagg.py::test_async_generation_matches_aggregate
   - disaggregated/test_ad_disagg.py::test_async_generation_no_overlap_matches_aggregate
   - disaggregated/test_ad_disagg.py::test_async_sharded_generation_handoff
-  - disaggregated/test_ad_disagg.py::test_async_mla_sharded_generation_handoff
   - disaggregated/test_ad_disagg.py::test_async_eagle3_full_model_handoff
 # ------------- AutoDeploy Backend Stages L1 / Nightly only ---------------
 - condition:
