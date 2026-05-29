@@ -15,6 +15,7 @@
 
 """Tests for SequenceInfo.switch_to_generate_inplace."""
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
@@ -375,6 +376,57 @@ class TestSwitchToGenerateHostArgHandling:
         assert device_cu[:3].tolist() == [0, 1, 2]
         assert host_cu[:3].tolist() == [0, 1, 2]
 
+    def test_out_of_scope_active_host_mirror_not_synced_by_switch_to_generate(self):
+        """Host mirrors outside the next consumer's placeholders should keep staging values."""
+        si = _make_seq_info(extra_activate=("cu_seqlen_host",))
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            pages_per_seq=[1, 1],
+            cache_loc=[10, 20],
+        )
+
+        si.switch_to_generate_(active_args_override={"input_ids"})
+
+        device_cu = si._input_buffer.get_view("cu_seqlen")
+        host_cu = si._input_buffer.get_host_view("cu_seqlen")
+        assert device_cu[:3].tolist() == [0, 1, 2]
+        assert host_cu[:3].tolist() == [0, 3, 7]
+
+    def test_in_scope_active_host_mirror_synced_by_switch_to_generate(self):
+        """Host mirrors inside the next consumer's placeholders should be refreshed."""
+        si = _make_seq_info(extra_activate=("cu_seqlen_host",))
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            pages_per_seq=[1, 1],
+            cache_loc=[10, 20],
+        )
+
+        si.switch_to_generate_(active_args_override={"cu_seqlen_host"})
+
+        device_cu = si._input_buffer.get_view("cu_seqlen")
+        host_cu = si._input_buffer.get_host_view("cu_seqlen")
+        assert device_cu[:3].tolist() == [0, 1, 2]
+        assert host_cu[:3].tolist() == [0, 1, 2]
+
+    def test_active_args_override_must_be_active(self):
+        """Override placeholders must be active graph args."""
+        si = _make_seq_info(extra_activate=("cu_seqlen_host",))
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3]],
+            pages_per_seq=[1],
+            cache_loc=[10],
+        )
+
+        with pytest.raises(ValueError):
+            si.switch_to_generate_(active_args_override={"not_an_active_arg"})
+
+        increment = torch.tensor([1], dtype=torch.int32, device=si.device)
+        with pytest.raises(ValueError):
+            si.offset_pos_and_cache_(increment, active_args_override={"not_an_active_arg"})
+
     def test_non_native_host_arg_syncs_device_to_host(self):
         """Activating a non-native host arg should sync device -> host instead of raising."""
         si = _make_seq_info()
@@ -422,6 +474,44 @@ class TestSwitchToGenerateHostArgHandling:
         host_swc = si._input_buffer.get_host_view("seq_len_with_cache")
         assert host_swc[0].item() == 4
         assert host_swc[1].item() == 5
+
+    def test_out_of_scope_active_host_mirror_not_synced_by_offset_pos_and_cache(self):
+        """Scoped updates should not refresh target-only host mirrors during draft metadata edits."""
+        si = _make_seq_info(extra_activate=("seq_len_with_cache_host",))
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            pages_per_seq=[1, 1],
+            cache_loc=[10, 20],
+        )
+
+        increment = torch.tensor([1, 1], dtype=torch.int32, device=si.device)
+        si.switch_to_generate_(active_args_override={"input_ids"})
+        si.offset_pos_and_cache_(increment, active_args_override={"input_ids"})
+
+        device_swc = si._input_buffer.get_view("seq_len_with_cache")
+        host_swc = si._input_buffer.get_host_view("seq_len_with_cache")
+        assert device_swc[:2].tolist() == [4, 5]
+        assert host_swc[:2].tolist() == [3, 4]
+
+    def test_in_scope_active_host_mirror_synced_by_offset_pos_and_cache(self):
+        """Scoped offset updates should refresh host mirrors required by the next consumer."""
+        si = _make_seq_info(extra_activate=("seq_len_with_cache_host",))
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            pages_per_seq=[1, 1],
+            cache_loc=[10, 20],
+        )
+
+        increment = torch.tensor([1, 1], dtype=torch.int32, device=si.device)
+        si.switch_to_generate_(active_args_override={"input_ids"})
+        si.offset_pos_and_cache_(increment, active_args_override={"seq_len_with_cache_host"})
+
+        device_swc = si._input_buffer.get_view("seq_len_with_cache")
+        host_swc = si._input_buffer.get_host_view("seq_len_with_cache")
+        assert device_swc[:2].tolist() == [4, 5]
+        assert host_swc[:2].tolist() == [4, 5]
 
     def test_native_host_args_do_not_raise(self):
         """batch_info_host, cu_seqlen_host, seq_len_host are native (tokens_gather in batch_info)."""
