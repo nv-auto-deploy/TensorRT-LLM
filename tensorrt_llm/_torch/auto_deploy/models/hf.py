@@ -709,49 +709,67 @@ class _StateDictParamNameConverter:
                     state_dict[new_key] = state_dict.pop(key)
 
 
+def expose_graph_module_accessor(
+    sub_mod: nn.Module,
+    sub_gm: GraphModule,
+    accessor_name: str,
+    error_message: str,
+) -> None:
+    """Expose a module accessor from an original module on its exported GraphModule.
+
+    ``sub_mod`` is the original module and ``sub_gm`` is the exported graph for that
+    module. ``accessor_name`` must name a zero-argument accessor, such as
+    ``get_input_embeddings`` or ``get_output_embeddings``, that returns a real
+    submodule from ``sub_mod``. The helper binds the same accessor on ``sub_gm``,
+    recreates the submodule hierarchy needed by that accessor, and inserts a
+    sentinel graph node so cleanup does not delete the referenced submodule.
+    """
+    module = getattr(sub_mod, accessor_name)()
+    setattr(
+        sub_gm,
+        accessor_name,
+        types.MethodType(getattr(sub_mod, accessor_name).__func__, sub_gm),
+    )
+
+    # Retrieve and replicate the expected submodule hierarchy for where the
+    # accessed module is located.
+    for module_name, subsubmod in sub_mod.named_modules():
+        if subsubmod is module:
+            break
+    else:
+        raise RuntimeError(error_message)
+    sub_gm.set_submodule(module_name, module)
+
+    # Add a dummy node to make the module impure. Impure nodes are preserved
+    # during graph cleanup, which keeps the accessor's submodule on the
+    # GraphModule as well.
+    # TODO (lucaslie): is there a better way to make this module "sticky"?
+    output_node = next(node for node in sub_gm.graph.nodes if node.op == "output")
+    with sub_gm.graph.inserting_before(output_node):
+        weight = sub_gm.graph.get_attr(f"{module_name}.weight")
+        # Assert on a scalar shape-derived condition instead of the weight
+        # tensor itself so the sentinel remains valid under fake-tensor shape
+        # propagation.
+        rows = sub_gm.graph.call_function(torch.ops.aten.sym_size.int, args=(weight, 0))
+        has_nonnegative_rows = sub_gm.graph.call_function(operator.ge, args=(rows, 0))
+        sub_gm.graph.call_function(
+            torch._assert,
+            args=(has_nonnegative_rows, f"Avoid {module_name} getting deleted from graph."),
+        )
+
+
 class TextModelExportInfo(SubModuleExportInfo):
     """An export configuration for the text model portion of a VLM."""
 
     def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
         """Post-process the subgraph module and make sure the embedding remains available."""
-        # make sure get_input_embeddings function is available in the graph module
-        embed_tokens = sub_mod.get_input_embeddings()
-        sub_gm.get_input_embeddings = types.MethodType(
-            sub_mod.get_input_embeddings.__func__, sub_gm
+        expose_graph_module_accessor(
+            sub_mod,
+            sub_gm,
+            "get_input_embeddings",
+            "Could not find embedding module in model. Expected embedding module to be a "
+            "submodule of the text submodule.",
         )
-
-        # retrieve+replicate expected submodule hierarchy for where the embedding module is located
-        for embed_name, subsubmod in sub_mod.named_modules():
-            if subsubmod is embed_tokens:
-                break
-        else:
-            raise RuntimeError(
-                "Could not find embedding module in model. Expected embedding module to be a "
-                "submodule of the text submodule."
-            )
-        sub_gm.set_submodule(embed_name, embed_tokens)
-
-        # add a dummy node to the graph for making the embedding module impure --> impure nodes
-        # won't be deleted from the graph during cleanup and this way we ensure that the embedding
-        # module is not deleted from the GraphModule either.
-        # TODO (lucaslie): is there a better way to make the embedding module "sticky"?
-        output_node = next(node for node in sub_gm.graph.nodes if node.op == "output")
-        with sub_gm.graph.inserting_before(output_node):
-            n_embed_tokens = sub_gm.graph.get_attr(f"{embed_name}.weight")
-            # Assert on a scalar shape-derived condition instead of the weight tensor itself so the
-            # sentinel remains valid under fake-tensor shape propagation.
-            n_embed_rows = sub_gm.graph.call_function(
-                torch.ops.aten.sym_size.int,
-                args=(n_embed_tokens, 0),
-            )
-            has_nonnegative_rows = sub_gm.graph.call_function(
-                operator.ge,
-                args=(n_embed_rows, 0),
-            )
-            sub_gm.graph.call_function(
-                torch._assert,
-                args=(has_nonnegative_rows, "Avoid embedding getting deleted from graph."),
-            )
 
     def _init_dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
         batch_size_dynamic = Dim.DYNAMIC
