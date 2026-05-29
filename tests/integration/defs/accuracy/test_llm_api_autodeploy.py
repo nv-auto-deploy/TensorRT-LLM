@@ -1689,7 +1689,7 @@ class TestQwen3_5_MoE_IR(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(80000)
-    def test_ir_mtp_gsm8k(self, monkeypatch):
+    def test_ir_mtp_gsm8k(self, monkeypatch) -> None:
         world_size = 2
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
