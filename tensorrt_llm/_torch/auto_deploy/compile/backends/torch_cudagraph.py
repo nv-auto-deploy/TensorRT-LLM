@@ -575,7 +575,15 @@ class PiecewiseCapturedGraph(nn.Module):
 
                 if not needs_out_buffer(submod):
                     if is_metadata_prep(submod):
-                        wrapper = MetadataWrapper(submod, max_batch_size=self.max_batch_size)
+                        wrapper = MetadataWrapper(
+                            submod,
+                            max_batch_size=self.max_batch_size,
+                            max_num_tokens=(
+                                max(self.piecewise_num_tokens)
+                                if self.piecewise_num_tokens
+                                else None
+                            ),
+                        )
                         setattr(self.split_gm, submod_name, wrapper)
                         num_metadata_wrapped += 1
                         ad_logger.info(
@@ -1017,36 +1025,46 @@ class DualModeCapturedGraph(nn.Module):
         return self.piecewise.original_model(*args, **kwargs)
 
 
-def _setup_piecewise_mixed_batch(seq_info: Any, num_tokens: int) -> None:
+def _setup_piecewise_mixed_batch(seq_info: Any, num_tokens: int, max_draft_len: int = 0) -> None:
     """Set up SequenceInfo for a mixed-batch with the given total num_tokens.
 
-    Creates a mixed batch with at least 1 prefill + 1 decode to exercise both
-    code paths in dynamic ops (attention, SSM). Each prefill sequence is capped
-    to max_seq_len so page indices stay within block_offsets capacity.
+    Creates a mixed batch with at least 1 prefill + 1 trailing generation sequence to exercise
+    both code paths in dynamic ops (attention, SSM). Each prefill sequence is capped to
+    max_seq_len so page indices stay within block_offsets capacity.
+
+    Under speculative decoding (``max_draft_len > 0``) the trailing sequence is an MTP *extend*
+    sequence of ``1 + max_draft_len`` tokens and ``batch_info`` is set with ``num_decode == 0``.
+    This matches the eagle wrapper's invariant (it rejects pure-decode sequences); the default
+    seq-len heuristic would otherwise classify the trailing len-1 token as a decode sequence and
+    trip ``assert num_decode == 0`` during capture.
 
     Args:
         seq_info: SequenceInfo object (duck-typed: needs max_seq_len, max_batch_size,
             tokens_per_block, and nest_sequences method).
         num_tokens: Total number of tokens for this piecewise bucket.
+        max_draft_len: MTP draft length (0 when not speculative decoding).
     """
-    assert num_tokens >= 3, (
-        f"Piecewise bucket {num_tokens} too small for mixed batch. "
-        f"Minimum is 3 (1 prefill seq with len>=2 + 1 decode seq)."
+    gen_len = 1 + max_draft_len  # trailing extend seq (spec dec) or single decode token
+    assert num_tokens >= gen_len + 1, (
+        f"Piecewise bucket {num_tokens} too small for mixed batch "
+        f"(need >= 1 prefill token + {gen_len} generation tokens)."
     )
     max_seq = seq_info.max_seq_len
     max_batch = seq_info.max_batch_size
 
     seq_lens: List[int] = []
-    remaining = num_tokens - 1
+    remaining = num_tokens - gen_len
     while remaining > 0 and len(seq_lens) < max_batch - 1:
         sl = min(remaining, max_seq)
         seq_lens.append(sl)
         remaining -= sl
-    seq_lens.append(1)  # decode token
+    num_prefill = len(seq_lens)
+    num_prefill_tokens = num_tokens - gen_len
+    seq_lens.append(gen_len)  # trailing generation sequence
 
     assert remaining == 0, (
         f"Piecewise bucket {num_tokens} exceeds batch capacity "
-        f"({max_batch - 1} seqs * {max_seq} tokens + 1 decode). "
+        f"({max_batch - 1} seqs * {max_seq} tokens + {gen_len} generation). "
         f"Increase max_seq_len or max_batch_size."
     )
 
@@ -1064,6 +1082,13 @@ def _setup_piecewise_mixed_batch(seq_info: Any, num_tokens: int) -> None:
     cache_loc = torch.arange(cu_num_pages[-1].item())
     slot_idx = torch.arange(bs)
 
+    # Under spec dec, mark the trailing sequence as an MTP extend (not decode) so the eagle
+    # wrapper's ``num_decode == 0`` invariant holds. batch_info =
+    # [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
+    batch_info = None
+    if max_draft_len > 0:
+        batch_info = [num_prefill, num_prefill_tokens, 1, gen_len, 0, 0]
+
     seq_info.nest_sequences(
         input_ids=input_ids_flat,
         cu_seqlen=cu_seqlen,
@@ -1071,6 +1096,7 @@ def _setup_piecewise_mixed_batch(seq_info: Any, num_tokens: int) -> None:
         cache_loc=cache_loc,
         cu_num_pages=cu_num_pages,
         slot_idx=slot_idx,
+        batch_info=batch_info,
     )
 
 
@@ -1082,16 +1108,39 @@ def _capture_inner_kwargs(
 ) -> Dict[str, Any]:
     """Run full model once and intercept kwargs passed to the inner module."""
     captured: Dict[str, Any] = {}
+    # The MTP/eagle wrapper invokes the inner module multiple times per forward: the target
+    # pass (large, num_tokens tokens) and several draft-loop steps (small). A plain
+    # "keep the last call" would size the static input buffers (e.g. inputs_embeds /
+    # hidden_states) to the tiny draft shape, which then overflows at runtime on the target
+    # pass ("[2,1,4096] vs [2,1301,4096]"). Keep the invocation with the most tensor elements
+    # so buffers are sized for the largest (target) pass.
+    captured_numel = [-1]
 
     def hook(module, args, kwargs):
-        captured.update(kwargs)
+        cur = sum(v.numel() for v in kwargs.values() if isinstance(v, torch.Tensor))
+        if cur > captured_numel[0]:
+            captured_numel[0] = cur
+            captured.clear()
+            captured.update(kwargs)
         return args, kwargs
 
     handle = inner_module.register_forward_pre_hook(hook, with_kwargs=True)
+    # This run only intercepts the inner module's kwargs (and shapes) -- it is NOT a graph
+    # capture/replay. Force any ADPiecewiseRunner segments into eager "warmup" mode so they
+    # bypass their stable-output buffers. Otherwise the stale class-level globals
+    # (_current_phase defaults to "replay", _current_num_tokens may hold a prior bucket such as
+    # the MTP draft loop's small bucket) make a metadata runner copy a full-size result into a
+    # mismatched saved buffer (e.g. "64 vs 8185" under MTP-eagle's target+draft multi-pass).
+    prev_phase = ADPiecewiseRunner._current_phase
+    prev_nt = ADPiecewiseRunner._current_num_tokens
+    ADPiecewiseRunner.set_current_phase("warmup")
+    ADPiecewiseRunner.set_current_num_tokens(None)
     try:
         full_model(**top_level_kwargs)
     finally:
         handle.remove()
+        ADPiecewiseRunner.set_current_phase(prev_phase)
+        ADPiecewiseRunner.set_current_num_tokens(prev_nt)
     return _order_kwargs_runtime_then_resources(captured, resource_input_names)
 
 
@@ -1118,6 +1167,7 @@ class TorchCudagraphCompiler(CompilerBackend):
         piecewise_num_tokens: Optional[List[int]] = None,
         piecewise_seq_info: Any = None,
         piecewise_named_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
+        piecewise_max_draft_len: int = 0,
         resource_input_names: Optional[Set[str]] = None,
         full_model: Optional[nn.Module] = None,
         **kwargs_for_init,
@@ -1130,6 +1180,7 @@ class TorchCudagraphCompiler(CompilerBackend):
         self.piecewise_num_tokens = piecewise_num_tokens or []
         self.piecewise_seq_info = piecewise_seq_info
         self.piecewise_named_args_fn = piecewise_named_args_fn
+        self.piecewise_max_draft_len = piecewise_max_draft_len
         self.resource_input_names = (
             set(resource_input_names) if resource_input_names is not None else None
         )
@@ -1204,7 +1255,9 @@ class TorchCudagraphCompiler(CompilerBackend):
             ):
 
                 def get_piecewise_args(num_tokens: int):
-                    _setup_piecewise_mixed_batch(self.piecewise_seq_info, num_tokens)
+                    _setup_piecewise_mixed_batch(
+                        self.piecewise_seq_info, num_tokens, self.piecewise_max_draft_len
+                    )
                     top_level_kwargs = self.piecewise_named_args_fn()
                     if self.full_model is not None:
                         return (), _capture_inner_kwargs(

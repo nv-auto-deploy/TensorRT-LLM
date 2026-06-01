@@ -10,6 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
@@ -187,6 +188,14 @@ def maybe_pad_for_cuda_graph(func):
         can_run_cuda_graph_all = all(r_info[0] for r_info in all_rank_info)
 
         if not can_run_cuda_graph_all:
+            # Experimental (AD_PIECEWISE_MIXED): instead of forcing ALL ranks to full eager on a
+            # mixed prefill/decode step, run the model directly so the DualModeCapturedGraph
+            # dispatches mixed batches to piecewise CUDA graphs (static segments graphed, only
+            # attention/SSM/conv eager). Requires piecewise_enabled=true AND a cross-rank-consistent
+            # all-to-all budget (AD_MOE_CONSISTENT_BUDGET) so a piecewise rank and a monolithic
+            # rank do not diverge the collective. Without those, keep the force-eager fallback.
+            if os.environ.get("AD_PIECEWISE_MIXED", "0") != "0":
+                return _call_func()
             return _call_func_eager()
 
         # get closest cudagraph batch size based on max_batch_size across ALL ranks
@@ -331,10 +340,11 @@ class ADEngine(ModelEngine):
         # how long a prefill is deferred waiting for other ranks (kept small to not starve the
         # decode batch at low/mid concurrency).
         self.llm_args.attention_dp_config = AttentionDpConfig(
-            enable_balance=True,
-            batching_wait_iters=10,
-            timeout_iters=16,
+            enable_balance=os.environ.get("AD_ADP_ENABLE_BALANCE", "1") != "0",
+            batching_wait_iters=int(os.environ.get("AD_ADP_BATCHING_WAIT_ITERS", "10")),
+            timeout_iters=int(os.environ.get("AD_ADP_TIMEOUT_ITERS", "16")),
         )
+        ad_logger.info(f"[ADP balancer] {self.llm_args.attention_dp_config}")
         self.llm_args.batch_wait_timeout_ms = 0
         self.llm_args.batch_wait_timeout_iters = 0
         self.llm_args.batch_wait_max_tokens_ratio = 0.0

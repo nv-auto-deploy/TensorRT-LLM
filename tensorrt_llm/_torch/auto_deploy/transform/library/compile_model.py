@@ -137,7 +137,21 @@ class CompileModel(BaseTransform):
         config_overrides = {}
         if self.config.piecewise_enabled:
             extra_kwargs["piecewise_seq_info"] = cm.info
-            extra_kwargs["piecewise_named_args_fn"] = lambda: cm.named_args
+            extra_kwargs["piecewise_max_draft_len"] = (
+                spec_config.max_draft_len if spec_config is not None else 0
+            )
+            # Match the monolithic capture's top-level kwargs: under speculative decoding the
+            # model is invoked with an extra ``cache_seq_interface`` object (the resource/cache
+            # kwargs flow through it), so the piecewise capture must pass it too -- otherwise
+            # ``_capture_inner_kwargs`` runs the full model without resources and the inner GM
+            # sees only {inputs_embeds, position_ids} (kwarg mismatch on every cache input).
+            if spec_config is not None:
+                extra_kwargs["piecewise_named_args_fn"] = lambda: {
+                    **cm.named_args,
+                    "cache_seq_interface": cm,
+                }
+            else:
+                extra_kwargs["piecewise_named_args_fn"] = lambda: cm.named_args
 
             max_seq = cm.info.max_seq_len
             max_batch = cm.info.max_batch_size

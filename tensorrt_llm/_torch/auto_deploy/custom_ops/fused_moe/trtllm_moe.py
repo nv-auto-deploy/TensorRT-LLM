@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -59,6 +60,12 @@ def _hybrid_runtime_max_tokens_per_rank(
       It is a constant every rank computes identically (layout agrees across ranks) and
       involves no host sync. Prefill is compute-bound, so the fat recv view is amortized.
     """
+    # Experimental: force the static max_num_tokens budget on every path. Makes the all-to-all
+    # stride identical across ranks AND execution modes (monolithic graph / piecewise / eager),
+    # which is required to run mixed prefill/decode on graphs (piecewise) without force-eager.
+    # Costs the tight-decode budget; see AD_PIECEWISE_MIXED in ad_executor.py.
+    if os.environ.get("AD_MOE_CONSISTENT_BUDGET", "0") != "0":
+        return max_num_tokens
     if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
         budget = local_num_tokens
         if budget > 0 and budget * ep_size * 4 <= max_num_tokens:

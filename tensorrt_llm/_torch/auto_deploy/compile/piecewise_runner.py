@@ -108,6 +108,7 @@ def _alloc_stable_metadata_tensor(
     num_tokens: int,
     max_batch_size: int,
     pad_for_mamba_metadata: bool,
+    max_num_tokens: Optional[int] = None,
 ) -> torch.Tensor:
     """Allocate one stable metadata tensor with optional Mamba headroom."""
     if tensor.ndim == 0:
@@ -117,18 +118,29 @@ def _alloc_stable_metadata_tensor(
     # due to misaligned sequence boundaries.
     extra = max(0, max_batch_size - 1) if pad_for_mamba_metadata else 0
 
+    # Mamba metadata length is a function of the cached sequence composition, not of this
+    # piecewise bucket's token count. Under MTP-eagle a *draft* sub-forward is assigned a small
+    # bucket (e.g. 64) yet its Mamba metadata reflects the full target context (e.g. 1301), so a
+    # bucket-sized buffer overflows on replay ("64 vs 1301"). Size Mamba-metadata buffers to the
+    # global max bucket so any real metadata fits; the eager SSM consumer reads the true length.
+    token_bound = max(num_tokens, max_num_tokens or 0) if pad_for_mamba_metadata else num_tokens
+
     if tensor.ndim == 1:
-        padded_len = _align_up(tensor.shape[0] + extra, _METADATA_PAD_ALIGN)
+        base = max(tensor.shape[0], token_bound) if pad_for_mamba_metadata else tensor.shape[0]
+        padded_len = _align_up(base + extra, _METADATA_PAD_ALIGN)
         buf = torch.zeros((padded_len,), dtype=tensor.dtype, device=tensor.device)
         buf[: tensor.shape[0]].copy_(tensor)
         return buf
 
     # Common metadata shape: [1, N] (e.g., seq_idx_prefill). Grow only token dim.
     if tensor.ndim == 2 and tensor.shape[0] == 1:
-        padded_len = min(
-            _align_up(tensor.shape[1] + extra, _METADATA_PAD_ALIGN),
-            _align_up(max(num_tokens, tensor.shape[1]), _METADATA_PAD_ALIGN),
-        )
+        if pad_for_mamba_metadata:
+            padded_len = _align_up(max(token_bound, tensor.shape[1]) + extra, _METADATA_PAD_ALIGN)
+        else:
+            padded_len = min(
+                _align_up(tensor.shape[1] + extra, _METADATA_PAD_ALIGN),
+                _align_up(max(num_tokens, tensor.shape[1]), _METADATA_PAD_ALIGN),
+            )
         buf = torch.zeros((1, padded_len), dtype=tensor.dtype, device=tensor.device)
         buf[:, : tensor.shape[1]].copy_(tensor)
         return buf
@@ -147,16 +159,19 @@ def _alloc_stable_metadata_result(
     num_tokens: int,
     max_batch_size: int,
     pad_for_mamba_metadata: bool,
+    max_num_tokens: Optional[int] = None,
 ) -> Tuple[torch.Tensor, ...]:
     if isinstance(result, torch.Tensor):
         return (
             _alloc_stable_metadata_tensor(
-                result, num_tokens, max_batch_size, pad_for_mamba_metadata
+                result, num_tokens, max_batch_size, pad_for_mamba_metadata, max_num_tokens
             ),
         )
     if isinstance(result, (tuple, list)):
         return tuple(
-            _alloc_stable_metadata_tensor(t, num_tokens, max_batch_size, pad_for_mamba_metadata)
+            _alloc_stable_metadata_tensor(
+                t, num_tokens, max_batch_size, pad_for_mamba_metadata, max_num_tokens
+            )
             if isinstance(t, torch.Tensor)
             else t
             for t in result
@@ -182,12 +197,20 @@ class MetadataWrapper(nn.Module):
     still see the true metadata length instead of padded tail elements.
     """
 
-    def __init__(self, submodule: nn.Module, max_batch_size: Optional[int] = None):
+    def __init__(
+        self,
+        submodule: nn.Module,
+        max_batch_size: Optional[int] = None,
+        max_num_tokens: Optional[int] = None,
+    ):
         super().__init__()
         self.submodule = submodule
         self.max_batch_size = (
             max_batch_size if max_batch_size is not None and max_batch_size > 0 else 1
         )
+        # Global max bucket; Mamba-metadata buffers are sized to this so a draft sub-forward's
+        # context-sized metadata fits regardless of its (smaller) assigned bucket.
+        self.max_num_tokens = max_num_tokens
         self._pad_for_mamba_metadata = _contains_mamba_metadata_prep(submodule)
         # {num_tokens: tuple of stable output tensors (sized to bucket upper bound)}
         self._stable_outputs: Dict[int, Tuple[torch.Tensor, ...]] = {}
@@ -219,6 +242,7 @@ class MetadataWrapper(nn.Module):
             num_tokens=num_tokens,
             max_batch_size=self.max_batch_size,
             pad_for_mamba_metadata=self._pad_for_mamba_metadata,
+            max_num_tokens=self.max_num_tokens,
         )
 
     @staticmethod
