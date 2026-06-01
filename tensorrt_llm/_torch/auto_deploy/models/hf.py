@@ -709,6 +709,27 @@ class _StateDictParamNameConverter:
                     state_dict[new_key] = state_dict.pop(key)
 
 
+def insert_keepalive_sentinel(sub_gm: GraphModule, weight_attr: str) -> None:
+    """Insert an impure graph node that keeps ``weight_attr`` alive through cleanup.
+
+    ``weight_attr`` is the dotted attribute path to a tensor on ``sub_gm`` (e.g.
+    ``"backbone.embeddings.weight"`` or ``"model.d2t"``). Impure nodes are preserved
+    during graph cleanup, which keeps the referenced submodule/parameter on the
+    GraphModule. We assert on a scalar shape-derived condition instead of the tensor
+    itself so the sentinel remains valid under fake-tensor shape propagation.
+    """
+    # TODO (lucaslie): is there a better way to make this module "sticky"?
+    output_node = next(node for node in sub_gm.graph.nodes if node.op == "output")
+    with sub_gm.graph.inserting_before(output_node):
+        tensor = sub_gm.graph.get_attr(weight_attr)
+        rows = sub_gm.graph.call_function(torch.ops.aten.sym_size.int, args=(tensor, 0))
+        has_nonnegative_rows = sub_gm.graph.call_function(operator.ge, args=(rows, 0))
+        sub_gm.graph.call_function(
+            torch._assert,
+            args=(has_nonnegative_rows, f"Avoid {weight_attr} getting deleted from graph."),
+        )
+
+
 def expose_graph_module_accessor(
     sub_mod: nn.Module,
     sub_gm: GraphModule,
@@ -720,16 +741,24 @@ def expose_graph_module_accessor(
     ``sub_mod`` is the original module and ``sub_gm`` is the exported graph for that
     module. ``accessor_name`` must name a zero-argument accessor, such as
     ``get_input_embeddings`` or ``get_output_embeddings``, that returns a real
-    submodule from ``sub_mod``. The helper binds the same accessor on ``sub_gm``,
-    recreates the submodule hierarchy needed by that accessor, and inserts a
-    sentinel graph node so cleanup does not delete the referenced submodule.
+    submodule from ``sub_mod``. The helper binds an accessor on ``sub_gm`` that
+    returns that submodule directly, recreates the submodule hierarchy needed by
+    that accessor, and inserts a sentinel graph node so cleanup does not delete
+    the referenced submodule.
+
+    Idempotent: if ``accessor_name`` was already exposed on ``sub_gm`` (e.g. the
+    target factory's own ``post_process`` already exposed ``get_input_embeddings``
+    for a VLM target), this is a no-op so we do not insert a duplicate sentinel.
     """
+    exposed = getattr(sub_gm, "_ad_exposed_accessors", None)
+    if exposed is None:
+        exposed = set()
+        sub_gm._ad_exposed_accessors = exposed
+    if accessor_name in exposed:
+        return
+    exposed.add(accessor_name)
+
     module = getattr(sub_mod, accessor_name)()
-    setattr(
-        sub_gm,
-        accessor_name,
-        types.MethodType(getattr(sub_mod, accessor_name).__func__, sub_gm),
-    )
 
     # Retrieve and replicate the expected submodule hierarchy for where the
     # accessed module is located.
@@ -740,22 +769,20 @@ def expose_graph_module_accessor(
         raise RuntimeError(error_message)
     sub_gm.set_submodule(module_name, module)
 
-    # Add a dummy node to make the module impure. Impure nodes are preserved
-    # during graph cleanup, which keeps the accessor's submodule on the
-    # GraphModule as well.
-    # TODO (lucaslie): is there a better way to make this module "sticky"?
-    output_node = next(node for node in sub_gm.graph.nodes if node.op == "output")
-    with sub_gm.graph.inserting_before(output_node):
-        weight = sub_gm.graph.get_attr(f"{module_name}.weight")
-        # Assert on a scalar shape-derived condition instead of the weight
-        # tensor itself so the sentinel remains valid under fake-tensor shape
-        # propagation.
-        rows = sub_gm.graph.call_function(torch.ops.aten.sym_size.int, args=(weight, 0))
-        has_nonnegative_rows = sub_gm.graph.call_function(operator.ge, args=(rows, 0))
-        sub_gm.graph.call_function(
-            torch._assert,
-            args=(has_nonnegative_rows, f"Avoid {module_name} getting deleted from graph."),
-        )
+    # Bind an accessor that fetches the submodule directly by its replicated path.
+    # We intentionally do not rebind ``sub_mod``'s original accessor method: some
+    # models implement it via nested delegation (e.g. NemotronH's
+    # ``get_input_embeddings`` returns ``self.backbone.get_input_embeddings()``),
+    # which would fail on ``sub_gm`` because intermediate containers recreated by
+    # ``set_submodule`` are plain ``nn.Module`` instances without that method.
+    setattr(
+        sub_gm,
+        accessor_name,
+        types.MethodType(lambda self, _name=module_name: self.get_submodule(_name), sub_gm),
+    )
+
+    # Keep the accessed submodule alive through graph cleanup.
+    insert_keepalive_sentinel(sub_gm, f"{module_name}.weight")
 
 
 class TextModelExportInfo(SubModuleExportInfo):

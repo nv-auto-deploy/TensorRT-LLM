@@ -306,15 +306,18 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return kwargs
 
     ### VALIDATION #################################################################################
-    @field_validator("model_factory", mode="after")
-    @classmethod
-    def model_factory_exists(cls, value: str) -> str:
+    @staticmethod
+    def _ensure_model_factory_registered(value: str) -> None:
         if not ModelFactoryRegistry.has(value):
             raise ValueError(
                 f"'{value}' does not exist in the model factory registry. Available values: "
                 f"{ModelFactoryRegistry.entries()}."
             )
 
+    @field_validator("model_factory", mode="after")
+    @classmethod
+    def model_factory_exists(cls, value: str) -> str:
+        cls._ensure_model_factory_registered(value)
         return value
 
     @model_validator(mode="after")
@@ -340,6 +343,11 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                 raise ValueError(
                     "target_model_factory must be set when model_factory='eagle_one_model'."
                 )
+
+        # target_model_factory is the factory that will be wrapped. On the common
+        # path it is derived from the already-validated model_factory; validating
+        # it here also guards the advanced path where it is set explicitly.
+        self._ensure_model_factory_registered(self.target_model_factory)
 
         return self
 

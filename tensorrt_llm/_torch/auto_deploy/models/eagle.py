@@ -25,7 +25,6 @@ import types
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 
-import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
 from torch._prims_common import DeviceLikeType
@@ -46,6 +45,7 @@ from .hf import (
     AutoModelForCausalLMFactory,
     AutoModelForImageTextToTextFactory,
     expose_graph_module_accessor,
+    insert_keepalive_sentinel,
 )
 
 
@@ -221,10 +221,7 @@ class DraftModelExportInfo(SubModuleExportInfo):
             sub_gm.get_input_embeddings = types.MethodType(
                 lambda self, _n=embed_name: self.get_submodule(_n), sub_gm
             )
-            n_embed = sub_gm.graph.get_attr(f"{embed_name}.weight")
-            sub_gm.graph.call_function(
-                torch._assert, args=(n_embed, "Avoid draft embedding getting deleted.")
-            )
+            insert_keepalive_sentinel(sub_gm, f"{embed_name}.weight")
 
         # --- lm_head (only if draft model has its own) ---
         if not self.load_lm_head_from_target:
@@ -238,24 +235,19 @@ class DraftModelExportInfo(SubModuleExportInfo):
             sub_gm.get_output_embeddings = types.MethodType(
                 lambda self, _n=lm_head_name: self.get_submodule(_n), sub_gm
             )
-            n_lm_head = sub_gm.graph.get_attr(f"{lm_head_name}.weight")
-            sub_gm.graph.call_function(
-                torch._assert, args=(n_lm_head, "Avoid draft lm_head getting deleted.")
-            )
+            insert_keepalive_sentinel(sub_gm, f"{lm_head_name}.weight")
 
         # --- fc module (fuses hidden states from multiple layers) ---
         fc_module = getattr(inner_model, "fc", None)
         if fc_module is not None:
             sub_gm.set_submodule("model.fc", fc_module)
-            n_fc = sub_gm.graph.get_attr("model.fc.weight")
-            sub_gm.graph.call_function(torch._assert, args=(n_fc, "Avoid fc getting deleted."))
+            insert_keepalive_sentinel(sub_gm, "model.fc.weight")
 
         # --- d2t parameter (draft-to-target vocab mapping) ---
         d2t = getattr(inner_model, "d2t", None)
         if d2t is not None:
             inner_gm.register_parameter("d2t", d2t)
-            n_d2t = sub_gm.graph.get_attr("model.d2t")
-            sub_gm.graph.call_function(torch._assert, args=(n_d2t, "Avoid d2t getting deleted."))
+            insert_keepalive_sentinel(sub_gm, "model.d2t")
 
         # --- model dtype (used by apply_eagle3_fc) ---
         model_dtype = getattr(inner_model, "dtype", None)
