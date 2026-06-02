@@ -59,11 +59,28 @@ fresh Claude instance. Read this first, then the two governing docs.
 - **Checkpoints** downloaded + symlinked (see Environment).
 - **PyTorch smoke** run: `debug/spikes/pt_dflash_qwen3_8b_smoke.py` → **the open blocker (§4).**
 
-## 4. OPEN BLOCKER — resolve FIRST on the CI cluster
-The PyTorch DFlash *oracle* on the **public** `z-lab/Qwen3-8B-DFlash-b16` gives **~0 acceptance**
+## 4. ✅ RESOLVED (2026-06-02, CI cluster `/home/scratch.gramnarayan_coreai`) — oracle works
+The PyTorch DFlash oracle **works on the internal CI checkpoint**. Run on a free H100 with
+`LLM_MODELS_ROOT=/home/scratch.trt_llm_data_ci/llm-models`:
+- `pytest …/test_dflash.py::test_dflash_qwen3_8b[True]` → **PASSED** (127s).
+- Real acceptance (script `debug/spikes/pt_dflash_qwen3_8b_internal.py`, overlap off, internal ckpt):
+  per-request accepted/iter = **1.909 / 0.984 / 1.081**, **mean = 1.325** (max 4.0 at `max_draft_len=4`).
+  Coherent text. Drafter is functional.
+- **Root cause of the old ~0 acceptance:** NOT structural. The internal `Qwen3-8B-DFlash-b16` is
+  shape-identical to the public z-lab one (58 tensors, separate `q/k/v_proj`, no embed/lm_head — the
+  loader's separate→fused qkv packing is fine). The divergence was **public HF-id download vs internal
+  `llm_models_root()` path** — i.e. the public `z-lab/Qwen3-8B-DFlash-b16` *weights* the old cluster had
+  were stale/different (no public copy on this cluster to diff). Moot now: use the internal checkpoint,
+  which is the CI oracle the AD port must match. (A public→TRT-LLM conversion/validation, if ever needed,
+  is a separate task.)
+- Repro: `CUDA_VISIBLE_DEVICES=<free> TRITON_CACHE_DIR=/home/scratch.gramnarayan_coreai/.triton/cache
+  LLM_MODELS_ROOT=/home/scratch.trt_llm_data_ci/llm-models python debug/spikes/pt_dflash_qwen3_8b_internal.py`
+
+### (historical) original blocker description
+The PyTorch DFlash *oracle* on the **public** `z-lab/Qwen3-8B-DFlash-b16` gave **~0 acceptance**
 (0.017 accepted/iter; avg_decoded≈1.0) — vs the **unwaived** unit test `TestQwen3_8B::test_dflash`'s
-threshold `mean_accepted ≥ 1.0`. Target text is coherent; spec decoding *runs* but proposals are
-~always rejected → the **drafter is non-functional as loaded**.
+threshold `mean_accepted ≥ 1.0`. Target text was coherent; spec decoding *ran* but proposals were
+~always rejected → the **drafter was non-functional as loaded** (with the public download).
 - The smoke replicates `tests/unittest/_torch/speculative/hw_agnostic/test_dflash.py::_make_llm_config`
   exactly; the ONLY difference is it uses **public HF ids** vs the CI's `{llm_models_root()}/…` paths.
 - Both public z-lab drafts (Qwen3-8B & Llama) are identical in shape: **58 tensors, separate
@@ -104,6 +121,14 @@ threshold `mean_accepted ≥ 1.0`. Target text is coherent; spec decoding *runs*
   separate→fused; eager fused-KV buffers (built at load, never lazily in forward).
 - **Runtime:** target `attn_backend=trtllm`, `sync_before_hidden_state_capture=False` (no host sync).
   Phased bring-up: `torch-simple`(overlap off→on) → `torch-cudagraph`. v1 `world_size==1`.
+  **CUDA-graph target = single monolithic graph** (AD `CapturedGraph`, the `torch-cudagraph` default,
+  `piecewise_enabled=False`). In monolithic capture the draft attention runs *inside* the one captured
+  graph with `out=None` (normal return path); intermediate addresses are frozen by the capture itself,
+  so the cached op's `out=` param is **inert/unused** here. We do NOT need piecewise. The `out=` param
+  is kept anyway (fixed to the AD-canonical `return out.new_empty(0)`, see [[reference_ad_cached_op_out_convention]])
+  so piecewise works for free if ever wanted — zero cost in single-graph mode. Eagle precedent: Eagle
+  captures its draft loop monolithically; `CapturedGraph.refresh_args_static` handles the
+  extend→generate batch-mode switch inside the loop.
 - **Export:** generic `submodules_to_preserve()` (modules-only) + thin Eagle tail; target reuses
   `TargetModelExportInfo` (embeddings enough). Build on the `qwen3-vlm-mtp` helpers.
 - **Sampler:** reuse `Eagle3OneModelSampler` (add `is_dflash()` to selection) — only after rung-8
@@ -111,12 +136,66 @@ threshold `mean_accepted ≥ 1.0`. Target text is coherent; spec decoding *runs*
 - **Reference pair:** `Qwen/Qwen3-8B` + `z-lab/Qwen3-8B-DFlash-b16` (unwaived test, ref acc ≈ 87.11).
   Full shared spec-dec base = follow-up PR.
 
+## 5b. OPEN QUESTIONS — revisit at FINAL CODE REVIEW (do not lose these)
+- **DFlash verify vs draft width — RESOLVED (2026-06-02, user-confirmed).** Two *distinct* widths:
+  - **Target-verify width = `tokens_per_gen_step = max_draft_len + 1`** (the number of tokens the
+    target re-verifies per gen step). Confirmed by `_torch/pyexecutor/model_engine.py:4041`
+    ("tokens_per_gen_step (PARD: 2K, DFlash: K+1)") and the summary §5.
+  - **Draft-forward (query-block) width = `block_size`** — whatever the DFlash *head was trained
+    with* (b16=16, Llama=10); the query block is `[last_accepted, MASK, ..., MASK]` and may be
+    **mask-padded** out to block_size. `model_engine.py:436-439` / `mamba_cache_manager.py:1860`
+    note DFlash sizes per-request draft scratch by query tokens per gen ("K drafts + K mask fillers").
+  - Net for the **single monolithic CUDA graph**: capture the *draft* forward at the fixed
+    `block_size` query width and the *target-verify* forward at fixed `max_draft_len+1`. The summary's
+    `max_draft_len+1 ≤ block_size` validation stands. Still worth a final-review glance at the exact
+    PyTorch ref widths, but the design framing is correct as written — no rework expected.
+- **Compare against the other AD attention ops** (`trtllm`/`flashinfer`/`triton`/`torch_backend`
+  cached ops + descriptors) at review time: signature/arg-ordering conventions, `get_constants`,
+  metadata wiring, and especially how each handles its fixed-shape capture width — to make sure the
+  DFlash op + descriptor follow the same patterns and the verify-width choice is consistent.
+- **REMINDER:** surface both bullets above (and re-read [[reference_ad_cached_op_out_convention]])
+  when doing the final code review.
+
 ## 6. Task list (statuses at handoff)
 1. ✅ Spike A: flash_attn contract probe.
-2. ⏳ Step 0: checkpoints downloaded ✅; **PyTorch reference acceptance = BLOCKED (§4).**
-3. ⏳ Step 1: ops written; **cached-op unit test** (model on `test_torch_attention_op.py`) + source-op
-   == `torch_attention` test still TODO.
-4. ☐ Step 2 + Spike B: dedicated `insert_cached_dflash_attention` transform + ctx_len-threading export probe.
+2. ✅ Step 0: checkpoints present (internal) ✅; **PyTorch reference acceptance = mean 1.325 accepted/iter, test PASSES (§4 resolved 2026-06-02).**
+3. ✅ Step 1: ops written + **unit tests done** (2026-06-02):
+   `tests/unittest/auto_deploy/singlegpu/custom_ops/attention/test_dflash_attention_op.py` — 15 tests
+   PASS. Source-op == `torch_attention(is_causal=False)` parity (MHA+GQA, scale variants), `ctx_len`
+   inert, non-causal sanity, fake shapes; cached-op SDPA parity over `[ctx‖block]` (GQA ratios),
+   in-place query-block append at `ctx_len`, persistent-context preservation, default-scale, `out=`
+   CUDA-graph buffer path, fake shape. **Fixed during testing:** cached op's `out=` path returned
+   `out` (an input) → `torch._library` aliasing violation; changed to the AD-canonical convention
+   (write into `out`, `return out.new_empty(0)`; fake likewise) matching trtllm/flashinfer cached ops.
+   `out=` is the runtime's pre-allocated graph-stable output buffer (needed for the `torch-cudagraph`
+   phase), injected as a trailing kwarg — NOT droppable.
+   **Step-1 review done (2026-06-02):** 4-subagent fan-out (architect/thorough/coverage/cleanliness);
+   Codex 5th-opinion timed out mid-survey (no unique findings; it did corroborate verify=K+1, §5b).
+   Addressed: (a) cached-op `scale` made positional-required (canonical convention vs trtllm/flashinfer);
+   (b) tests expanded 15→**25**, added independent hand-rolled SDPA reference (breaks shared-ref
+   dependency), batch=1, ctx_len=0, max-slack append, uniform ctx_len, bf16, production block_size=16,
+   slack-tail-untouched guard, append-still-happens-on-out= assertion; autouse seed+empty_cache fixture;
+   deduped shape constants. pre-commit clean. Parked for Step 2 (architect flags): the descriptor must
+   match the **distinct** `auto_deploy::dflash_attention` packet via `get_source_attention_op`, and
+   source `slot_idx`/`ctx_len` as standard-or-extra metadata.
+4. ⏳ Step 2 + Spike B: **Spike B ✅ (2026-06-02)** — `debug/spikes/spike_b_ctx_len_export.py` PASSES:
+   toy 1-layer draft `forward(q,k,v,ctx_len)` → `dflash_attention`, `torch.export` keeps `ctx_len` as a
+   placeholder named "ctx_len" carried as the op's arg[3], survives DCE; replicated
+   `_add_or_retrieve_input` (interface.py:797) → RETRIEVE for ctx_len / ADD for slot_idx; control
+   (no-carry) confirms the carry is load-bearing.
+   **Step 2 + 5 DONE (2026-06-02):** `DFlashCtxKVResourceHandler` (unpaged dense
+   `[max_slots, max_seq_len+block_size, n_kv, hd]`) + `@AttentionRegistry.register("dflash")
+   DFlashAttention` descriptor (`get_source_attention_op==auto_deploy::dflash_attention`,
+   `get_cached==dflash_attention_with_kvcache`, `get_standard_metadata_args=[slot_idx, ctx_len]`,
+   bsnd, `get_constants=[scale]`) in `custom_ops/attention/dflash_attention.py`;
+   `InsertCachedDFlashAttention(_InsertCachedOperator)` in `transform/library/kvcache.py`; default.yaml
+   `insert_cached_dflash_attention {stage: cache_init, backend: dflash}`. Verified the descriptor's
+   produced arg order EXACTLY matches the cached-op signature. **Structural gate test**
+   `tests/.../transformations/library/test_dflash_cache.py` PASSES (rewrite: src→cached, slot_idx
+   ADDED, ctx_len RETRIEVED, 2 slack-sized caches, scale const). **TEST-UPGRADE (user-requested):** the
+   toy-module structural test is a placeholder; once Step 3 `modeling_dflash.py` exists, replace it with
+   a small test that exports the **real** prefill-version DFlash draft model and runs the transform over
+   its actual `dflash_attention` sites (keep the toy test as a fast regression guard).
 5. ☐ Step 5: slack-sized ctx K/V resource handler + `ctx_len` metadata wiring.
 6. ☐ Step 4: eager `precompute_context_kv` + fused-KV buffers + `submodules_to_preserve()` refactor.
 7. ☐ Step 3: `DFlashWrapper` + draft module (`modeling_dflash.py`).

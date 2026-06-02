@@ -638,6 +638,16 @@ class InsertCachedAttention(_InsertCachedOperator):
     """A transform to insert cached attention into the graph module."""
 
 
+@TransformRegistry.register("insert_cached_dflash_attention")
+class InsertCachedDFlashAttention(_InsertCachedOperator):
+    """Insert cached DFlash draft attention into the graph module.
+
+    Matches only the distinct ``auto_deploy::dflash_attention`` source op (backend ``"dflash"``), so it
+    coexists with ``insert_cached_attention`` (which matches ``torch_attention``) -- each is a no-op on
+    the other's nodes. The generic base handles the unpaged dense ctx K/V resources (num_groups == 0).
+    """
+
+
 @TransformRegistry.register("insert_cached_mla_attention")
 class InsertCachedMLAAttention(_InsertCachedOperator):
     """A transform to insert cached MLA attention into the graph module."""

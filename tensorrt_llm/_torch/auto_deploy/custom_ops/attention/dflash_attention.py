@@ -24,11 +24,32 @@ query-block K/V to append) are ``[B, block, n_kv, head_dim]``; the ctx caches ar
 ``[max_slots, max_ctx + block, n_kv, head_dim]``.
 """
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
+from torch._ops import OpOverloadPacket
+from torch._subclasses import FakeTensor
+from torch.fx import Node
 
-__all__ = ["dflash_attention", "dflash_attention_with_kvcache"]
+from ..._compat import KvCacheConfig
+from ...utils.node_utils import extract_op_args
+from ..attention_interface import (
+    AttentionDescriptor,
+    AttentionLayout,
+    AttentionRegistry,
+    Constant,
+    MHACallable,
+    ResourceHandler,
+    ResourceHandlerDict,
+    SequenceInfo,
+)
+
+__all__ = [
+    "dflash_attention",
+    "dflash_attention_with_kvcache",
+    "DFlashCtxKVResourceHandler",
+    "DFlashAttention",
+]
 
 
 # ============================================================================ #
@@ -84,8 +105,9 @@ def dflash_attention_with_kvcache(
     # CACHES (mutated: flash appends the query block into the slack at ctx_len)
     ctx_k_cache: torch.Tensor,  # [max_slots, max_ctx + block, n_kv, head_dim]
     ctx_v_cache: torch.Tensor,
-    # CONSTANTS
-    scale: Optional[float] = None,
+    # CONSTANTS (scale is positional-required, matching trtllm/flashinfer cached ops: the first
+    # CONSTANT is always supplied positionally by the descriptor's get_constants).
+    scale: Optional[float],
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Read persistent ctx K/V + append current query-block K/V, non-causal block attention.
@@ -109,8 +131,13 @@ def dflash_attention_with_kvcache(
         causal=False,
     )
     if out is not None:
+        # AD CUDA-graph convention (mirrors trtllm/flashinfer cached ops): when the runtime injects a
+        # pre-allocated, fixed-address output buffer, write the result into it and return an *empty*
+        # fresh tensor. We must NOT return ``out`` itself -- a returned tensor may not alias an input
+        # (``torch._library`` aliasing check). ``flash_attn_with_kvcache`` has no ``out=`` param, so a
+        # copy into the stable buffer is unavoidable; the copy keeps the output at a graph-stable addr.
         out.copy_(result)
-        return out
+        return out.new_empty(0)
     return result
 
 
@@ -123,9 +150,110 @@ def dflash_attention_with_kvcache_fake(
     ctx_len: torch.Tensor,
     ctx_k_cache: torch.Tensor,
     ctx_v_cache: torch.Tensor,
-    scale: Optional[float] = None,
+    scale: Optional[float],
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if out is not None:
-        return out
+        return out.new_empty(0)
     return q.new_empty(*q.shape[:-1], ctx_v_cache.shape[-1]).contiguous()
+
+
+# ============================================================================ #
+#  Resource handler: dense slack-sized per-slot context K/V (bypasses KVCache) #
+# ============================================================================ #
+class DFlashCtxKVResourceHandler(ResourceHandler):
+    """Unpaged dense per-slot context K/V for DFlash draft attention.
+
+    Shape ``[max_num_state_slots, max_seq_len + block_size, n_kv, head_dim]`` -- one such resource
+    per draft attention node (a ``ctx_k_cache`` and a ``ctx_v_cache``). The persistent context lives
+    in ``[:ctx_len]`` (written by the wrapper from accepted target-derived K/V); the ``+block_size``
+    slack is where ``flash_attn_with_kvcache`` transiently appends the current query block at row
+    ``ctx_len`` (see ``dflash_attention_with_kvcache``). Unpaged + slot-indexed (``slot_idx`` ==
+    ``cache_batch_idx``), so it bypasses the paged ``KVCacheManager`` -- the Eagle ``hidden_states``
+    precedent. ``max_ctx = max_seq_len`` so ``ctx_len`` can never exceed the buffer (no clamp).
+    """
+
+    def __init__(
+        self, num_kv_heads: int, head_dim: int, block_size: int, dtype: torch.dtype
+    ) -> None:
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.block_size = block_size
+        self.dtype = dtype
+
+    def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        return torch.empty(
+            sequence_info.max_num_state_slots,
+            sequence_info.max_seq_len
+            + self.block_size,  # +slack for the transient query-block append
+            self.num_kv_heads,
+            self.head_dim,
+            device=sequence_info.device,
+            dtype=self.dtype,
+        )
+
+
+# ============================================================================ #
+#  Attention descriptor: routes dflash_attention -> dflash_attention_with_kvcache
+# ============================================================================ #
+@AttentionRegistry.register("dflash")
+class DFlashAttention(AttentionDescriptor):
+    """Descriptor for the DFlash draft attention path.
+
+    Matches the **distinct** source op ``auto_deploy::dflash_attention`` (NOT ``torch_attention``), so
+    the dedicated ``insert_cached_dflash_attention`` transform and the default ``insert_cached_attention``
+    (which matches ``torch_attention``) never collide -- routing is purely by op-type. Lowers to the
+    cached ``auto_deploy::dflash_attention_with_kvcache`` over per-slot dense ctx K/V resources.
+
+    Metadata: ``slot_idx`` is *added* from ``SequenceInfo`` (no placeholder in the draft graph ->
+    activate_arg), ``ctx_len`` is *retrieved* from the existing draft-graph placeholder (carried by the
+    source op). The cached op's positional arg order
+    ``(q, k, v, slot_idx, ctx_len, ctx_k_cache, ctx_v_cache, scale)`` is exactly
+    ``(*qkv, *standard_metadata, *caches, *constants)`` produced by the generic insertion transform.
+    """
+
+    @classmethod
+    def get_attention_layout(cls) -> AttentionLayout:
+        return "bsnd"
+
+    @classmethod
+    def get_num_qkv_args(cls) -> int:
+        return 3
+
+    @classmethod
+    def get_source_attention_op(cls) -> OpOverloadPacket:
+        return torch.ops.auto_deploy.dflash_attention
+
+    @classmethod
+    def get_cached_attention_op(cls) -> MHACallable:
+        return torch.ops.auto_deploy.dflash_attention_with_kvcache.default
+
+    @classmethod
+    def get_standard_metadata_args(cls) -> List[str]:
+        # Order MUST match the cached op signature: slot_idx then ctx_len.
+        # slot_idx -> added from SequenceInfo; ctx_len -> retrieved from the draft-graph placeholder.
+        return ["slot_idx", "ctx_len"]
+
+    @classmethod
+    def get_cache_initializers(
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
+    ) -> ResourceHandlerDict:
+        # Source op is dflash_attention(q, k, v, ctx_len, scale), bsnd layout.
+        q_fake: FakeTensor = source_attn_node.args[0].meta["val"]
+        k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
+        block_size = q_fake.shape[1]  # query-block width (drafter block_size)
+        num_kv_heads = k_fake.shape[2]
+        head_dim = k_fake.shape[3]
+        dtype = cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype)
+        # One resource per draft attention node; two per node (k and v).
+        return {
+            "ctx_k_cache": DFlashCtxKVResourceHandler(num_kv_heads, head_dim, block_size, dtype),
+            "ctx_v_cache": DFlashCtxKVResourceHandler(num_kv_heads, head_dim, block_size, dtype),
+        }
+
+    @classmethod
+    def get_constants(cls, source_attn_node: Node) -> List[Constant]:
+        (scale,) = extract_op_args(source_attn_node, "scale")
+        if not (isinstance(scale, float) or scale is None):
+            scale = None
+        return [scale]
