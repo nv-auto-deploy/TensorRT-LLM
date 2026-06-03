@@ -302,6 +302,23 @@ threshold `mean_accepted ≥ 1.0`. Target text was coherent; spec decoding *ran*
    our overridden `position_ids`/`ctx_len`, and do slot_idx/ctx caches arrive via named_args?
    (iii) `input_pos` semantics; (iv) per-seq `.item()` scatter is torch-simple-only (CUDA-graph-safe
    fixed-shape scatter is a follow-up). Iterate the smoke → acceptance vs the **1.325 oracle**.
+   **E2E smoke status (2026-06-02):** `debug/spikes/ad_dflash_qwen3_8b_smoke.py` (committed) now passes
+   config validation. **Current blocker: executor-init `Cannot copy out of meta tensor; use
+   to_empty()`** — the AD executor builds the model on `meta` then materializes; my draft build
+   (`DFlashOneModelFactory._build_model` does `draft_model.to(device=device, dtype=...)`) or the load
+   flow leaves a meta tensor moved via `.to()`. This is BEFORE the forward (build/load path). Likely fix:
+   ensure the draft is materialized with `to_empty()` + then load weights, or align with how
+   EagleOneModelFactory/AutoModelForCausalLMFactory handle the meta→device transition (they build on
+   meta for export then load real weights). Debug from `/tmp/ad_dflash_smoke2.log`.
+   **Context-KV PARITY TEST (user-requested, HIGH VALUE, independent of the E2E bug):** add a unit test
+   comparing AD `DFlashModel.precompute_context_kv(raw_captured, positions)` vs the PyTorch backend
+   `modeling_speculative.py::DFlashForCausalLM.precompute_context_kv(projected_hidden, positions)`
+   (signature `[N, hidden] -> ([N,L,nkv,hd], [N,L,nkv,hd])`, fused-KV GEMM + k_norm + RoPE). Plan: load
+   the SAME z-lab checkpoint into both; AD takes raw captured (does fc+hidden_norm internally), PyTorch
+   takes `pt.hidden_norm(pt.fc(raw))`; assert K and V close. Validates the per-layer (AD) vs fused (PT)
+   precompute produce identical K/V — the context-KV fidelity core. Caveat: constructing the PyTorch
+   `DFlashForCausalLM` standalone needs its init/load_weights path wired (it's a PyTorch-backend model);
+   sort that out (or hook the z-lab HF reference model's attention to expose k_ctx/v_ctx as an alt ref).
    **Test inventory (all PASS, 40 DFlash unit tests across 6 files):** op (25), transform toy (1),
    model (4: eager/export/transform/precompute), factory (5: register/build/export-infos/block_size/
    strict-weight-load), wrapper (2: prefill/kv-stub), config-resolution (3).
