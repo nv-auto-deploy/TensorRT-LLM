@@ -57,6 +57,7 @@ from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
 
 from ... import custom_ops  # noqa: F401  -- register all auto_deploy ops
+from ...shim.interface import CachedSequenceInterface
 from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 
@@ -365,3 +366,100 @@ class DFlashDrafterForCausalLM(nn.Module):
     ) -> DFlashDraftOutput:
         norm_hidden_state = self.model(inputs_embeds, position_ids, ctx_len)
         return DFlashDraftOutput(norm_hidden_state=norm_hidden_state)
+
+
+@dataclass
+class DFlashWrapperConfig:
+    """Config for DFlashWrapper (mirrors EagleWrapperConfig)."""
+
+    max_draft_len: int
+    block_size: int
+    mask_token_id: int
+    # DFlash shares embed_tokens + lm_head from the target (the draft owns neither).
+    load_embedding_from_target: bool = True
+    load_lm_head_from_target: bool = True
+    sync_before_hidden_state_capture: bool = False
+
+
+class DFlashWrapper(nn.Module):
+    """Combined target + DFlash draft for one-model speculative decoding (mirrors EagleWrapper).
+
+    Holds the target model and the DFlash draft model as submodules. ``forward`` is dual-mode: at
+    export time (no ``cache_seq_interface``) it runs the prefill-only path; at inference it runs the
+    kv-cache path driven by the ``CachedSequenceInterface``. Embedding + lm_head are taken from the
+    target (DFlash shares both).
+
+    NOTE: ``__init__`` + accessors + ``get_export_infos`` wiring are complete and tested via the
+    factory-build test. The two forward bodies are the E2E-coupled runtime glue (Step 7 continuation):
+    they need the draft loop + hidden-state capture + sampler + cache scatter, and are validated at E2E
+    (build_and_run_ad). They are documented stubs below.
+    """
+
+    def __init__(
+        self, config: DFlashWrapperConfig, target_model: nn.Module, draft_model: nn.Module
+    ):
+        super().__init__()
+        self.target_model = target_model
+        self.draft_model = draft_model
+        self.max_draft_len = config.max_draft_len
+        self.block_size = config.block_size
+        self.mask_token_id = config.mask_token_id
+        self.load_embedding_from_target = config.load_embedding_from_target
+        self.load_lm_head_from_target = config.load_lm_head_from_target
+        self.sync_before_hidden_state_capture = config.sync_before_hidden_state_capture
+
+    @property
+    def _draft_inner_model(self) -> "DFlashModel":
+        return self.draft_model.model
+
+    @property
+    def _draft_dtype(self) -> torch.dtype:
+        return getattr(self._draft_inner_model, "dtype", None) or torch.bfloat16
+
+    def apply_draft_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed query-block token ids (incl. the mask token), from the target's embedding."""
+        embeds = self.target_model.get_input_embeddings()(input_ids)
+        return embeds.to(self._draft_dtype)
+
+    def apply_lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project draft hidden states to logits via the target's lm_head."""
+        logits = self.target_model.get_output_embeddings()(hidden_states)
+        return logits.to(self._draft_dtype)
+
+    def forward(self, cache_seq_interface: Optional[CachedSequenceInterface] = None, **kwargs):
+        if cache_seq_interface is not None:
+            return self._forward_with_kv_cache(cache_seq_interface)
+        return self._forward_prefill_only(**kwargs)
+
+    def _forward_prefill_only(self, input_ids: torch.Tensor, position_ids: torch.Tensor, **kwargs):
+        """Export-time prefill path (TODO Step 7 continuation).
+
+        Algorithm (mirrors the cached path's single-iteration shape so export sees the right kwargs):
+          1. target forward over (embed(input_ids), position_ids) -> logits -> bonus token.
+          2. build the query block [bonus, MASK x (block_size-1)] -> embed via target.
+          3. precompute_context_kv(captured_hidden, ctx_positions) -> (eager; scatter handled in the
+             cached path). At export the context is empty (ctx_len=0), so the draft attends the block.
+          4. draft_model(inputs_embeds=block_embeds, position_ids=query_positions, ctx_len=zeros) ->
+             emits dflash_attention per layer.
+          5. apply_lm_head -> draft tokens; package speculative output.
+        """
+        raise NotImplementedError(
+            "DFlashWrapper._forward_prefill_only is the Step-7 export-path continuation; "
+            "the model builds + exports its draft today via DFlashModel (see test_dflash_model.py)."
+        )
+
+    def _forward_with_kv_cache(self, cache_seq_interface: CachedSequenceInterface):
+        """Inference path (TODO Step 7 continuation; validated at E2E).
+
+        Loop (mirrors modeling_speculative.py::dflash_forward + the worker):
+          1. target verification over the K+1 verify window (tokens_per_gen_step = max_draft_len+1).
+          2. compute accepted token counts; gather accepted target hidden states (target_layer_ids order).
+          3. precompute_context_kv -> scatter accepted K/V rows into each layer's ctx K/V cache at
+             input_pos.
+          4. build query block [last_accepted/bonus, MASK, ...] + query_positions = ctx_len + arange.
+          5. run the (cached) draft GM -> dflash_attention_with_kvcache per layer.
+          6. apply_lm_head -> next_draft_tokens; return speculative bookkeeping.
+        """
+        raise NotImplementedError(
+            "DFlashWrapper._forward_with_kv_cache is the Step-7 runtime continuation, validated at E2E."
+        )

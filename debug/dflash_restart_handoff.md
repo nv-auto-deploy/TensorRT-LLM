@@ -247,7 +247,23 @@ threshold `mean_accepted ≥ 1.0`. Target text was coherent; spec decoding *ran*
    + `insert_keepalive_sentinel`/`expose_graph_module_accessor`; custom drafts are built by a
    `@ModelFactoryRegistry.register("dflash_one_model")` factory, NOT the `_MODEL_MODULES` architecture map.
 8. ☐ Step 6: hidden-state capture wiring (`target_layer_ids` order).
-9. ☐ Step 7: `DFlashOneModelFactory` + config + sampler wiring (incl. qkv packing + block_size validation).
+9. ⏳ Step 7: **factory + wrapper + export infos DONE (2026-06-02)** —
+   `models/dflash.py`: `DFlashOneModelFactory` (registered `"dflash_one_model"`, mirrors
+   `EagleOneModelFactory`: target via `target_model_factory`, draft via `AutoConfig` +
+   `DFlashDrafterForCausalLM`, wrapped in `DFlashWrapper`; validates `max_draft_len+1 ≤ block_size`,
+   resolves block_size/mask_token_id from the draft config) + `DFlashDraftModelExportInfo`
+   (keepalive sentinels for `fc`/`hidden_norm`; `ctx_len` declared dynamic input) + reuses the generic
+   `TargetModelExportInfo`. `DFlashWrapper`/`DFlashWrapperConfig` in `modeling_dflash.py`
+   (__init__ + target-embed/lm_head accessors + dual-mode dispatch). Registered via `models/__init__.py`.
+   Test `tests/.../models/test_dflash_factory.py` (4) PASS: factory registered, **builds the wrapper
+   through the factory** (block_size=16, mask_token_id=151669 resolved), export-infos properties,
+   block_size guard raises. (Mirrors the Eagle factory tests, per user guidance — build-through-factory
+   + check properties.) **Still TODO (E2E-coupled, validated at build_and_run_ad):** the wrapper's
+   `_forward_prefill_only` (export path) + `_forward_with_kv_cache` (inference draft loop + capture +
+   scatter + sampler) bodies (currently documented NotImplementedError stubs); draft weight loading
+   (separate→fused qkv packing in `_load_checkpoint`); AD `llm_args` wiring (DFlash branch in
+   `validate_supported_speculative_config`/`setup_hidden_state_capture`/`validate_speculative_model_factory`
+   + `DFlashDecodingConfig.supports_backend("autodeploy")`); sampler `is_dflash()` on Eagle3OneModelSampler.
 10. ☐ E2E: phased bring-up + GSM8K acceptance on Qwen3-8B (ref ≈ 87.11).
 
 ## 7. Key reference code
