@@ -24,6 +24,7 @@ summary §8); the draft export info is DFlash-specific (preserves ``fc`` + ``hid
 via keepalive sentinels — they are used by the eager ``precompute_context_kv``, not the traced graph).
 """
 
+import types
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 
@@ -34,7 +35,12 @@ from torch.export import Dim
 from torch.fx import GraphModule
 from transformers import AutoConfig
 
-from .custom.modeling_dflash import DFlashDrafterForCausalLM, DFlashWrapper, DFlashWrapperConfig
+from .custom.modeling_dflash import (
+    DFlashDrafterForCausalLM,
+    DFlashModel,
+    DFlashWrapper,
+    DFlashWrapperConfig,
+)
 from .eagle import TargetModelExportInfo  # reuse generic target export-info plumbing (summary §8)
 from .factory import DynamicShape, ModelFactory, ModelFactoryRegistry, SubModuleExportInfo
 from .hf import insert_keepalive_sentinel
@@ -55,27 +61,43 @@ class DFlashDraftModelExportInfo(SubModuleExportInfo):
 
     def _init_dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
         batch_size_dyn = Dim.DYNAMIC
-        seq_len_dyn = Dim.DYNAMIC
+        # NOTE (DFlash-specific, differs from Eagle's draft): the DFlash draft ALWAYS runs at the
+        # fixed trained ``block_size`` query width (non-causal fixed-width block -- never variable),
+        # so the seq dim is STATIC, not dynamic. This is load-bearing: the ctx-K/V resource handler
+        # reads ``block_size`` from ``q.shape[1]`` in ``get_cache_initializers`` to size the cache
+        # slack; a dynamic seq dim makes that a SymInt and breaks ``torch.empty`` at allocation.
         return {
-            "inputs_embeds": {0: batch_size_dyn, 1: seq_len_dyn},
-            "position_ids": {0: batch_size_dyn, 1: seq_len_dyn},
+            "inputs_embeds": {0: batch_size_dyn},  # [B, block_size, H]; seq (dim 1) static
+            "position_ids": {0: batch_size_dyn},  # [B, block_size]; seq (dim 1) static
             "ctx_len": {0: batch_size_dyn},  # [B] int32, one entry per request
         }
 
     def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
-        inner_model = sub_mod.model
+        inner_model = sub_mod.model  # eager DFlashModel (full module structure + the method)
         sub_gm.is_draft = True
+        inner_gm = sub_gm.get_submodule("model")  # the exported inner query-block GraphModule
 
-        # fc + hidden_norm: owned by the draft, used by eager precompute_context_kv (not traced).
-        fc_module = getattr(inner_model, "fc", None)
-        if fc_module is not None:
-            sub_gm.set_submodule("model.fc", fc_module)
-            insert_keepalive_sentinel(sub_gm, "model.fc.weight")
+        # The eager ``precompute_context_kv`` (Step 4/6) runs OUTSIDE the traced query-block graph, so
+        # export drops BOTH the method and the nn.Modules it calls. Re-attach everything precompute
+        # needs onto the inner GM (the proven Eagle ``set_submodule`` + keepalive pattern) and rebind
+        # the method, so ``self.draft_model.model.precompute_context_kv(...)`` keeps working unchanged
+        # post-export. ``fc``/``hidden_norm`` are precompute-ONLY (not in the traced graph) and so also
+        # need keepalive sentinels to survive graph cleanup; ``rotary_emb`` (no persistent weight) and
+        # the per-layer projections (already kept alive by the query-block attention's graph usage) do
+        # not. Re-attached modules share their parameters with the graph (export clone=False), so this
+        # is not a second weight copy.
+        for name in ("fc", "hidden_norm", "rotary_emb", "layers"):
+            mod = getattr(inner_model, name, None)
+            if mod is not None:
+                sub_gm.set_submodule(f"model.{name}", mod)
+        for weight_attr in ("model.fc.weight", "model.hidden_norm.weight"):
+            insert_keepalive_sentinel(sub_gm, weight_attr)
 
-        hidden_norm = getattr(inner_model, "hidden_norm", None)
-        if hidden_norm is not None:
-            sub_gm.set_submodule("model.hidden_norm", hidden_norm)
-            insert_keepalive_sentinel(sub_gm, "model.hidden_norm.weight")
+        # Rebind the eager precompute method onto the inner GM (``self`` -> ``inner_gm``); it now finds
+        # fc/hidden_norm/rotary_emb/layers as attributes.
+        inner_gm.precompute_context_kv = types.MethodType(
+            DFlashModel.precompute_context_kv, inner_gm
+        )
 
 
 @ModelFactoryRegistry.register("dflash_one_model")
@@ -158,6 +180,11 @@ class DFlashOneModelFactory(ModelFactory):
         if device == "meta":
             if hasattr(draft_model, "post_init"):
                 draft_model.post_init()
+            # HF's _from_config builds meta params already in config.dtype; our standalone module
+            # builds in float32. Apply a dtype-only conversion (safe on meta -- no data copy) so the
+            # draft's compute dtype matches both the non-meta path below and the bf16 checkpoint.
+            if draft_dtype is not None:
+                draft_model.to(dtype=draft_dtype)
         elif draft_dtype is not None:
             draft_model.to(device=device, dtype=draft_dtype)
         else:
@@ -229,7 +256,17 @@ class DFlashOneModelFactory(ModelFactory):
         self, model: nn.Module, device: DeviceLikeType, disable_preload: bool = False
     ):
         assert isinstance(model, DFlashWrapper), f"Expected DFlashWrapper, got {type(model)}"
+        # Mirror EagleOneModelFactory.load_or_random_init: initialize BOTH submodels. The target has
+        # its own factory; the DFlash draft has none (it is built inline in ``_build_model``), so we
+        # run the base ``load_or_random_init`` logic for it here -- materialize any (meta) params on
+        # ``device`` via ``_to_maybe_random``, then load the real draft checkpoint over them. Without
+        # this, the draft stayed on ``meta`` and the subsequent ``move_to_device`` in the load_weights
+        # transform raised "Cannot copy out of meta tensor; use to_empty()".
         self.target_factory.load_or_random_init(model.target_model, device, disable_preload)
+        self._to_maybe_random(model.draft_model, device)
+        if not self.skip_loading_weights:
+            self.prefetch_checkpoint(force=True)
+            self._load_draft_weights(model.draft_model, device)
 
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         target_export_info = next(
