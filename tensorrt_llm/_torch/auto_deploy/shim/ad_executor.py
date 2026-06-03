@@ -1058,10 +1058,13 @@ def instantiate_sampler(
     max_draft_len = 0 if spec_config is None else spec_config.max_draft_len
     max_total_draft_tokens = 0 if spec_config is None else spec_config.tokens_per_gen_step - 1
 
-    # One-model spec dec: model performs sampling internally, returns pre-computed tokens
+    # One-model spec dec: model performs sampling internally, returns pre-computed tokens.
+    # DFlash is a one-model parallel-draft method whose wrapper output matches the
+    # Eagle3OneModelSampler contract (new_tokens/new_tokens_lens/next_draft_tokens/next_new_tokens).
     if spec_config is not None and (
         spec_config.spec_dec_mode.is_eagle3_one_model()
         or spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+        or spec_config.spec_dec_mode.is_dflash()
     ):
         sampler_args = TorchSampler.Args(
             max_seq_len=ad_config.max_seq_len,

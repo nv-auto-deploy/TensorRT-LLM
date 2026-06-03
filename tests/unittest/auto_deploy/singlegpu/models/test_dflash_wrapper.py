@@ -87,15 +87,26 @@ def test_prefill_only_forward_shapes():
 
 
 @torch.inference_mode()
-def test_kv_cache_forward_is_stub():
-    """The inference (kv-cache) path is the E2E continuation -- currently a documented stub."""
+def test_kv_cache_forward_helpers():
+    """The kv-cache forward's pure helpers behave correctly (the full path is validated at E2E).
+
+    Exercises _collect_ctx_cache_pairs (name-sorted per-layer pairing) and _collect_hidden_states
+    (target_layer_ids-order concat) without a full CachedSequenceInterface.
+    """
     wrapper = _build_tiny_wrapper()
-
-    class _DummyCSI:
-        pass
-
-    with pytest.raises(NotImplementedError):
-        wrapper(cache_seq_interface=_DummyCSI())
+    hidden = 8
+    named = {
+        "layers.9_hidden_states_cache": torch.randn(4, hidden),
+        "layers.1_hidden_states_cache": torch.randn(4, hidden),
+        "ctx_v_cache_1": torch.zeros(2, 3),
+        "ctx_k_cache_0": torch.zeros(2, 3),
+        "ctx_k_cache_1": torch.zeros(2, 3),
+        "ctx_v_cache_0": torch.zeros(2, 3),
+    }
+    collected = wrapper._collect_hidden_states(named, num_tokens=4)
+    assert collected.shape == (4, 2 * hidden)  # two capture buffers concatenated
+    k_caches, v_caches = wrapper._collect_ctx_cache_pairs(named)
+    assert len(k_caches) == len(v_caches) == 2  # sorted: ctx_{k,v}_cache_0, _1
 
 
 if __name__ == "__main__":

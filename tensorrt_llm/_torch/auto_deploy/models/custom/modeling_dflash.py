@@ -49,10 +49,11 @@ NOTE (Step 3 scope): draft *nn.Module* classes + the exportable query-block forw
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
+from torch.fx import GraphModule
 from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
 
@@ -374,10 +375,19 @@ class DFlashDrafterForCausalLM(nn.Module):
 
 @dataclass
 class DFlashWrapperOutput(ModelOutput):
-    """Speculative output of DFlashWrapper (mirrors EagleWrapperOutput)."""
+    """Speculative output of DFlashWrapper (mirrors EagleWrapperOutput).
 
-    new_tokens: Optional[torch.Tensor] = None  # [B, max_draft_len + 1] (bonus + draft tokens)
+    The AD spec sampler (Eagle3OneModelSampler -> SpecSamplerBase) consumes all four tensors
+    (spec_sampler_base.py): ``new_tokens``/``new_tokens_lens`` = accepted tokens + counts this step;
+    ``next_new_tokens`` = ``[last_accepted, draft_0, ..., draft_{K-1}]``; ``next_draft_tokens`` =
+    ``next_new_tokens[:, 1:]`` (the drafts to verify next step).
+    """
+
+    logits: Optional[torch.Tensor] = None  # [B, K+1, vocab] (debug)
+    new_tokens: Optional[torch.Tensor] = None  # [B, max_draft_len + 1]
     new_tokens_lens: Optional[torch.Tensor] = None  # [B]
+    next_draft_tokens: Optional[torch.Tensor] = None  # [B, max_draft_len]
+    next_new_tokens: Optional[torch.Tensor] = None  # [B, max_draft_len + 1]
 
 
 @dataclass
@@ -401,10 +411,10 @@ class DFlashWrapper(nn.Module):
     kv-cache path driven by the ``CachedSequenceInterface``. Embedding + lm_head are taken from the
     target (DFlash shares both).
 
-    NOTE: ``__init__`` + accessors + ``get_export_infos`` wiring are complete and tested via the
-    factory-build test. The two forward bodies are the E2E-coupled runtime glue (Step 7 continuation):
-    they need the draft loop + hidden-state capture + sampler + cache scatter, and are validated at E2E
-    (build_and_run_ad). They are documented stubs below.
+    The prefill forward is the export path; the kv-cache forward is the inference path (target verify
+    -> commit accepted ctx K/V -> single non-autoregressive draft pass). The kv-cache path is being
+    validated/tuned against build_and_run_ad (the per-seq scatter is torch-simple bring-up; a
+    CUDA-graph-safe fixed-shape scatter is a follow-up).
     """
 
     def __init__(
@@ -448,6 +458,62 @@ class DFlashWrapper(nn.Module):
     @staticmethod
     def _sample_greedy(logits: torch.Tensor) -> torch.Tensor:
         return torch.argmax(logits, dim=-1)
+
+    @staticmethod
+    def _filter_kwargs_for_submodule(kwargs: dict, submodule: nn.Module) -> dict:
+        """Filter kwargs to the placeholder names accepted by the exported submodule GraphModule.
+
+        Copied from EagleWrapper. This is how KV-cache tensors + metadata in ``csi.named_args`` get
+        passed to the (already cache-inserted) target/draft GraphModules.
+        """
+        if isinstance(submodule, GraphModule):
+            gm = submodule
+        else:
+            graph_modules = [
+                child
+                for child in submodule.modules()
+                if child is not submodule and isinstance(child, GraphModule)
+            ]
+            if len(graph_modules) != 1:
+                raise ValueError(
+                    f"Cannot infer exported GraphModule inside {type(submodule).__name__}: "
+                    f"found {len(graph_modules)} child GraphModules; unwrapping is ambiguous."
+                )
+            gm = graph_modules[0]
+        expected_names = {node.name for node in gm.graph.nodes if node.op == "placeholder"}
+        return {k: v for k, v in kwargs.items() if k in expected_names}
+
+    @staticmethod
+    def _collect_hidden_states(kwargs: dict, num_tokens: int) -> torch.Tensor:
+        """Read the layer-prefixed ``*_hidden_states_cache`` buffers (target_layer_ids order) and concat.
+
+        Returns ``[num_tokens, hidden_size * num_capture_layers]`` (the input to precompute_context_kv).
+        Buffers are sorted by name; capture (detect_hidden_states_for_capture) writes them in
+        target_layer_ids order, so lexical sort of the layer-indexed names preserves that order.
+        """
+        buffers = sorted(
+            [(name, t) for name, t in kwargs.items() if name.endswith("hidden_states_cache")],
+            key=lambda x: x[0],
+        )
+        if not buffers:
+            raise ValueError("No *_hidden_states_cache buffers found for DFlash context capture.")
+        layer_hs = [buf[:num_tokens] for _, buf in buffers]
+        return layer_hs[0] if len(layer_hs) == 1 else torch.cat(layer_hs, dim=1)
+
+    @staticmethod
+    def _collect_ctx_cache_pairs(kwargs: dict) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Return the per-layer (ctx_k_cache, ctx_v_cache) tensors from named_args, sorted by name.
+
+        The cache-insertion transform registers one ``ctx_k_cache``/``ctx_v_cache`` resource per draft
+        attention node, patched with the node index for uniqueness (e.g. ``ctx_k_cache_3``). Sorting by
+        name groups them by layer; index i is draft layer i.
+        """
+        k_caches = [kwargs[n] for n in sorted(kwargs) if "ctx_k_cache" in n]
+        v_caches = [kwargs[n] for n in sorted(kwargs) if "ctx_v_cache" in n]
+        assert len(k_caches) == len(v_caches), (
+            f"Mismatched ctx K/V cache counts: {len(k_caches)} vs {len(v_caches)}"
+        )
+        return k_caches, v_caches
 
     def _forward_prefill_only(self, input_ids: torch.Tensor, position_ids: torch.Tensor, **kwargs):
         """Export-time prefill path: run target + draft once so export captures the right kwargs.
@@ -494,18 +560,166 @@ class DFlashWrapper(nn.Module):
             new_tokens_lens=torch.ones(batch_size, dtype=torch.long, device=device),
         )
 
-    def _forward_with_kv_cache(self, cache_seq_interface: CachedSequenceInterface):
-        """Inference path (TODO Step 7 continuation; validated at E2E).
+    def _scatter_context_kv(
+        self,
+        captured: torch.Tensor,  # [num_total_tokens, num_capture * hidden]
+        k_caches: List[torch.Tensor],
+        v_caches: List[torch.Tensor],
+        slot_idx: torch.Tensor,  # [num_seq]
+        input_pos: torch.Tensor,  # [num_seq] committed context length before this step
+        cu_seqlen: torch.Tensor,  # [num_seq + 1]
+        new_tokens_lens: torch.Tensor,  # [num_seq]
+        num_prefill: int,
+    ) -> torch.Tensor:
+        """Commit accepted target-derived K/V into the per-layer ctx caches; return per-seq ctx_len.
 
-        Loop (mirrors modeling_speculative.py::dflash_forward + the worker):
-          1. target verification over the K+1 verify window (tokens_per_gen_step = max_draft_len+1).
-          2. compute accepted token counts; gather accepted target hidden states (target_layer_ids order).
-          3. precompute_context_kv -> scatter accepted K/V rows into each layer's ctx K/V cache at
-             input_pos.
-          4. build query block [last_accepted/bonus, MASK, ...] + query_positions = ctx_len + arange.
-          5. run the (cached) draft GM -> dflash_attention_with_kvcache per layer.
-          6. apply_lm_head -> next_draft_tokens; return speculative bookkeeping.
+        Prefill commits the WHOLE prompt as context; extend commits the accepted prefix
+        (``new_tokens_lens``). Writes draft layer ``i``'s K/V at ``ctx_k_cache_i[slot, pos]`` for
+        ``pos in [input_pos, input_pos + n_commit)``. Returns ``ctx_len = input_pos + n_commit``.
+
+        NOTE: per-sequence Python loop (D2H syncs via .item()) -- correct for the torch-simple
+        bring-up phase. A fixed-shape, CUDA-graph-safe scatter is a follow-up (torch-cudagraph phase).
         """
-        raise NotImplementedError(
-            "DFlashWrapper._forward_with_kv_cache is the Step-7 runtime continuation, validated at E2E."
+        precompute = self.draft_model.model.precompute_context_kv
+        ctx_len = torch.empty(slot_idx.shape[0], dtype=torch.int32, device=captured.device)
+        for i in range(slot_idx.shape[0]):
+            start, end = int(cu_seqlen[i].item()), int(cu_seqlen[i + 1].item())
+            n_commit = (end - start) if i < num_prefill else int(new_tokens_lens[i].item())
+            base = int(input_pos[i].item())
+            ctx_len[i] = base + n_commit
+            if n_commit <= 0:
+                continue
+            hs = captured[start : start + n_commit]
+            positions = torch.arange(base, base + n_commit, device=captured.device)
+            k, v = precompute(hs, positions)  # [n_commit, L, n_kv, head_dim]
+            s = int(slot_idx[i].item())
+            for li in range(len(k_caches)):
+                k_caches[li][s, base : base + n_commit] = k[:, li]
+                v_caches[li][s, base : base + n_commit] = v[:, li]
+        return ctx_len
+
+    def _forward_with_kv_cache(self, csi: CachedSequenceInterface):
+        """Inference path: target verify -> commit accepted ctx K/V -> single DFlash draft pass.
+
+        Verify mechanics mirror EagleWrapper; the context handling is DFlash-specific (precompute +
+        scatter into the per-layer ctx K/V caches), and the draft is a SINGLE non-autoregressive pass
+        over the ``[last_accepted, MASK...]`` query block (NOT Eagle's autoregressive loop).
+
+        WIP: first-cut for torch-simple bring-up; the exact runtime contract (input_pos/positions,
+        draft-GM arg flow, CUDA-graph-safe scatter) is being validated against build_and_run_ad.
+        """
+        info = csi.info
+        batch_info = info.batch_info
+        num_prefill, num_extend, num_decode = batch_info.get_num_sequences()
+        num_prefill_tokens, num_extend_tokens, _ = batch_info.get_num_tokens()
+        num_sequences = num_prefill + num_extend + num_decode
+        num_total_tokens = num_prefill_tokens + num_extend_tokens
+        assert num_decode == 0, "DFlash: pure-decode (no drafting) is not supported in the wrapper."
+        if num_extend > 0:
+            assert num_extend_tokens // num_extend == 1 + self.max_draft_len, (
+                "Unexpected DFlash verify width (expected max_draft_len + 1 tokens per extend seq)."
+            )
+
+        device = info.device
+        ids_dtype = csi.get_arg("input_ids").dtype
+
+        # ---- Phase 1: target forward ----
+        out = self.target_model(
+            inputs_embeds=self.target_model.get_input_embeddings()(csi.get_arg("input_ids")),
+            **self._filter_kwargs_for_submodule(csi.named_args, self.target_model),
+        )
+        target_logits = info.maybe_gather_and_squeeze(out.logits)
+        sampled_tokens = self._sample_greedy(target_logits).to(ids_dtype)
+
+        # ---- Phase 3: build the [num_seq, K+1] sampled grid (idx 0 = bonus token) ----
+        new_tokens_2d_extend = (
+            sampled_tokens[num_prefill:].view(num_extend, 1 + self.max_draft_len)
+            if num_extend > 0
+            else None
+        )
+        if num_prefill > 0:
+            new_tokens_2d = torch.zeros(
+                num_sequences, self.max_draft_len + 1, dtype=ids_dtype, device=device
+            )
+            new_tokens_2d[:num_prefill, 0] = sampled_tokens[:num_prefill]
+            if num_extend > 0:
+                new_tokens_2d[num_prefill:] = new_tokens_2d_extend
+        else:
+            new_tokens_2d = new_tokens_2d_extend
+
+        # ---- Phase 4: verify (cumprod acceptance, draft tokens were the extend input ids) ----
+        input_ids_flat = csi.get_arg("input_ids", unflatten=False, truncate=True)
+        if num_prefill == 0:
+            input_ids_extend = input_ids_flat[num_prefill_tokens:].view(num_extend, -1)
+            mask_same = new_tokens_2d_extend[:, :-1] == input_ids_extend[:, 1:]
+            new_tokens_lens = mask_same.cumprod(dim=1).sum(dim=1, dtype=torch.int32) + 1
+        else:
+            new_tokens_lens = torch.ones(num_sequences, dtype=torch.int32, device=device)
+            if num_extend > 0:
+                input_ids_extend = input_ids_flat[num_prefill_tokens:].view(num_extend, -1)
+                mask_same = new_tokens_2d_extend[:, :-1] == input_ids_extend[:, 1:]
+                new_tokens_lens[num_prefill:] = (
+                    mask_same.cumprod(dim=1).sum(dim=1, dtype=torch.int32) + 1
+                )
+
+        # ---- Phase 2 (DFlash): commit accepted target-derived K/V into the ctx caches ----
+        if self.sync_before_hidden_state_capture:
+            torch.cuda.synchronize()
+        captured = self._collect_hidden_states(csi.named_args, num_total_tokens)
+        k_caches, v_caches = self._collect_ctx_cache_pairs(csi.named_args)
+        slot_idx = csi.get_arg("slot_idx", truncate=True)
+        input_pos = csi.get_arg("input_pos", truncate=True)
+        cu_seqlen = csi.get_arg("cu_seqlen", truncate=True)
+        ctx_len = self._scatter_context_kv(
+            captured,
+            k_caches,
+            v_caches,
+            slot_idx,
+            input_pos,
+            cu_seqlen,
+            new_tokens_lens,
+            num_prefill,
+        )
+
+        # ---- Phase 5: single DFlash draft pass over the query block ----
+        # last accepted token per seq = new_tokens_2d[i, new_tokens_lens[i]-1]
+        last_accepted = new_tokens_2d.gather(
+            1, (new_tokens_lens - 1).clamp_min(0).long().unsqueeze(1)
+        ).squeeze(1)
+        query_ids = torch.full(
+            (num_sequences, self.block_size), self.mask_token_id, dtype=ids_dtype, device=device
+        )
+        query_ids[:, 0] = last_accepted
+        block_embeds = self.apply_draft_embedding(query_ids)  # [num_seq, block_size, H]
+        query_positions = ctx_len.long().unsqueeze(1) + torch.arange(self.block_size, device=device)
+
+        draft_kwargs = self._filter_kwargs_for_submodule(csi.named_args, self.draft_model)
+        # We override position_ids/ctx_len with the DFlash query-block values.
+        draft_kwargs.pop("position_ids", None)
+        draft_kwargs.pop("ctx_len", None)
+        draft_output = self.draft_model(
+            inputs_embeds=block_embeds,
+            position_ids=query_positions,
+            ctx_len=ctx_len,
+            **draft_kwargs,
+        )
+        draft_logits = self.apply_lm_head(
+            draft_output.norm_hidden_state
+        )  # [num_seq, block_size, vocab]
+        draft_tokens = self._sample_greedy(draft_logits[:, 1 : self.max_draft_len + 1, :]).to(
+            ids_dtype
+        )
+
+        # ---- Phase 6: package output ----
+        next_new_tokens = torch.empty(
+            num_sequences, self.max_draft_len + 1, dtype=ids_dtype, device=device
+        )
+        next_new_tokens[:, 0] = last_accepted
+        next_new_tokens[:, 1:] = draft_tokens
+        return DFlashWrapperOutput(
+            logits=target_logits,
+            new_tokens=new_tokens_2d,
+            new_tokens_lens=new_tokens_lens,
+            next_draft_tokens=next_new_tokens[:, 1:],
+            next_new_tokens=next_new_tokens,
         )
