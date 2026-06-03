@@ -155,6 +155,40 @@ def test_transform_over_real_model():
     assert len(cache_inputs) == 2 * N_LAYERS
 
 
+@torch.inference_mode()
+def test_precompute_context_kv():
+    """precompute_context_kv: shape + the asymmetric context path (V raw, K normed+RoPE'd).
+
+    Validates the oracle contract: context K/V = fc -> hidden_norm -> per-layer k/v_proj, with k_norm
+    + RoPE on K only (V is the raw v_proj output, no norm/RoPE). NOT routed through input_layernorm.
+    """
+    cfg = _tiny_config()
+    model = _make_model()
+    n_ctx = 6
+    num_capture = len(cfg.dflash_config["target_layer_ids"])
+    captured = torch.randn(n_ctx, num_capture * cfg.hidden_size, device=DEVICE, dtype=DTYPE)
+    positions = torch.arange(n_ctx, device=DEVICE, dtype=torch.long)
+
+    k, v = model.precompute_context_kv(captured, positions)
+    assert k.shape == (n_ctx, N_LAYERS, cfg.num_key_value_heads, cfg.head_dim)
+    assert v.shape == (n_ctx, N_LAYERS, cfg.num_key_value_heads, cfg.head_dim)
+    assert torch.isfinite(k).all() and torch.isfinite(v).all()
+
+    # Independent check of the context projection (raw F-ops, no module reuse for the norm/proj path).
+    ctx = model.hidden_norm(model.fc(captured))  # [N, hidden]
+    for i, layer in enumerate(model.layers):
+        attn = layer.self_attn
+        # V is the raw v_proj output (NO k_norm, NO RoPE).
+        ref_v = attn.v_proj(ctx).view(n_ctx, cfg.num_key_value_heads, cfg.head_dim)
+        torch.testing.assert_close(v[:, i], ref_v, atol=0.0, rtol=0.0)
+        # K has k_norm + RoPE applied => it must differ from the raw projection.
+        raw_k = attn.k_proj(ctx).view(n_ctx, cfg.num_key_value_heads, cfg.head_dim)
+        assert not torch.allclose(k[:, i], raw_k, atol=1e-2, rtol=1e-2)
+        # K with k_norm but position 0 (RoPE identity at pos 0) should match k_norm(raw_k) on row 0.
+        k_normed_row0 = attn.k_norm(raw_k)[0]
+        torch.testing.assert_close(k[0, i], k_normed_row0, atol=2e-2, rtol=2e-2)
+
+
 if __name__ == "__main__":
     import sys
 

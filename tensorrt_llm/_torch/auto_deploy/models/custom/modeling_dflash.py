@@ -299,6 +299,42 @@ class DFlashModel(nn.Module):
             hidden_states = layer(hidden_states, position_embeddings, ctx_len)
         return self.norm(hidden_states)
 
+    @torch.no_grad()
+    def precompute_context_kv(
+        self,
+        captured_hidden: torch.Tensor,  # [N, num_capture_layers * hidden] (target_layer_ids order)
+        position_ids: torch.Tensor,  # [N] absolute positions of the accepted context tokens
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project accepted target hidden states into per-layer drafter context K/V (eager).
+
+        Ports the oracle ``modeling_speculative.py::precompute_context_kv``: the context path is
+        ``fc -> hidden_norm -> per-layer k_proj/v_proj -> k_norm (K only) -> RoPE (K only)``. It does
+        NOT go through each layer's ``input_layernorm`` (that is only on the query stream); ``k_norm``
+        is per-token RMSNorm so applying it to the context K alone matches the oracle's post-cat norm.
+        Returns per-layer ``k``/``v`` ``[N, num_layers, n_kv, head_dim]`` (no batch dim); the wrapper
+        (Step 7) scatters ``k[:, i]``/``v[:, i]`` into draft layer ``i``'s ctx K/V cache at ``positions``.
+
+        Eager (not traced/exported). Runs the projections via ``nn.Linear`` directly (not the sharding
+        ops). Per-layer separate ``k_proj``/``v_proj`` are used (our standalone model keeps q/k/v
+        separate, AD fuses downstream); the oracle's single fused-KV GEMM is a deferred perf
+        optimization (identical math). TP-sharding of this path is a follow-up (v1 world_size==1).
+        """
+        n = captured_hidden.shape[0]
+        ctx = self.hidden_norm(self.fc(captured_hidden)).unsqueeze(0)  # [1, N, hidden]
+        cos, sin = self.rotary_emb(ctx, position_ids.unsqueeze(0))  # [1, N, head_dim]
+
+        k_layers, v_layers = [], []
+        for layer in self.layers:
+            attn = layer.self_attn
+            k = attn.k_proj(ctx).view(1, n, attn.num_kv_heads, attn.head_dim)
+            k = attn.k_norm(k)
+            # RoPE on K only (bsnd, unsqueeze_dim=2); the op rotates both args identically.
+            k, _ = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(k, k, cos, sin, 2)
+            v = attn.v_proj(ctx).view(1, n, attn.num_kv_heads, attn.head_dim)
+            k_layers.append(k.squeeze(0))  # [N, n_kv, head_dim]
+            v_layers.append(v.squeeze(0))
+        return torch.stack(k_layers, dim=1), torch.stack(v_layers, dim=1)  # [N, L, n_kv, head_dim]
+
 
 @dataclass
 class DFlashDraftOutput(ModelOutput):

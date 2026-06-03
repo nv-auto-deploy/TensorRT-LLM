@@ -209,7 +209,21 @@ threshold `mean_accepted ≥ 1.0`. Target text was coherent; spec decoding *ran*
    a small test that exports the **real** prefill-version DFlash draft model and runs the transform over
    its actual `dflash_attention` sites (keep the toy test as a fast regression guard).
 5. ☐ Step 5: slack-sized ctx K/V resource handler + `ctx_len` metadata wiring.
-6. ☐ Step 4: eager `precompute_context_kv` + fused-KV buffers + `submodules_to_preserve()` refactor.
+6. ⏳ Step 4: **`precompute_context_kv` DONE (2026-06-02)** — `DFlashModel.precompute_context_kv`
+   (eager, `@torch.no_grad`): captured target hidden (in target_layer_ids order) → `fc` →
+   `hidden_norm` → per-layer `k_proj`/`v_proj` → `k_norm` (K only) → RoPE (K only) → returns per-layer
+   `k`/`v` `[N, L, n_kv, hd]`. **Critical fidelity detail (verified vs z-lab `dflash.py`):** the context
+   path is asymmetric to the query path — context does NOT go through each layer's `input_layernorm`
+   (only the query stream does); `k_norm` is per-token RMSNorm so applying it to context-K alone
+   matches the oracle's post-`cat` norm. Test `test_precompute_context_kv` PASSES (shape; V is raw
+   `v_proj`; K has k_norm+RoPE; pos-0 RoPE-identity row matches `k_norm(raw_k)`). **Re fused-KV (clarified):** the *traced* query-block forward keeps separate q/k/v_proj in source and
+   the AD pipeline FUSES them via `fuse_gemms`/`fuse_gemms_mixed_children` (default.yaml) — canonical
+   AD path, no deviation. The fused-KV gap exists ONLY in `precompute_context_kv`, which is *eager*
+   (plain method, not exported) so it bypasses `fuse_gemms` and runs per-layer GEMMs. Correct fix is
+   NOT manual fused-KV buffers (the oracle did that because its precompute is eager in PyExecutor) but
+   to export precompute as a **3rd GraphModule** so AD fuses it automatically — the summary's
+   "3rd-GraphModule = profiling follow-up". v1 eager per-layer is fine (identical math, simple). **Still TODO in Step 4:** the export-preservation
+   `DraftModelExportInfo.post_process` (keepalive for fc/hidden_norm; this lives with the factory, Step 7).
 7. ⏳ Step 3: **draft module `models/custom/modeling_dflash.py` DONE (2026-06-02)** — exportable draft
    model (`DFlashModel`/`DFlashDrafterForCausalLM` + attention/layer/MLP/RMSNorm/RoPE), module names
    match the 58-tensor checkpoint, query-block forward `(inputs_embeds, position_ids, ctx_len)` emits
