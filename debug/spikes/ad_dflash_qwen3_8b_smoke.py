@@ -16,7 +16,12 @@ sys.path.append("tests/unittest/utils")
 from llm_data import llm_models_root  # noqa: E402
 
 from tensorrt_llm._torch.auto_deploy import LLM  # noqa: E402
-from tensorrt_llm.llmapi import DFlashDecodingConfig, KvCacheConfig, SamplingParams  # noqa: E402
+from tensorrt_llm.llmapi import (  # noqa: E402
+    CudaGraphConfig,
+    DFlashDecodingConfig,
+    KvCacheConfig,
+    SamplingParams,
+)
 
 PROMPTS = ["The capital of France is"]
 
@@ -38,6 +43,7 @@ def main():
         max_batch_size=4,
         world_size=1,
         compile_backend="torch-simple",  # bring-up phase (no cudagraph yet)
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4], enable_padding=True),
         kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_tokens=2048),
     )
     outputs = llm.generate(PROMPTS, SamplingParams(max_tokens=64, temperature=0))
