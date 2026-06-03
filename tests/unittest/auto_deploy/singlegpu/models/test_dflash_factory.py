@@ -22,6 +22,7 @@ Builds on the ``meta`` device (no weight allocation) and skips if the checkpoint
 from pathlib import Path
 
 import pytest
+import torch
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401  (registers factories + ops)
@@ -96,6 +97,21 @@ def test_factory_validates_block_size():
     factory = _make_factory(max_draft_len=20)  # 21 > 16
     with pytest.raises(ValueError, match="block_size"):
         factory.build_model("meta")
+
+
+@torch.inference_mode()
+def test_draft_weights_load_strict():
+    """Draft loads the real z-lab checkpoint with strict=True (fidelity: 58 tensors match exactly)."""
+    factory = _make_factory()
+    draft_config = factory._build_draft_config()
+    draft_dtype = getattr(draft_config, "torch_dtype", None)
+    draft_model = DFlashDrafterForCausalLM(draft_config).to(device="cuda", dtype=draft_dtype).eval()
+    # Must not raise (strict=True validates exact key match across all 58 tensors).
+    factory._load_draft_weights(draft_model, "cuda")
+    assert torch.isfinite(draft_model.model.fc.weight).all()
+    assert draft_model.model.hidden_norm.weight.shape[0] == draft_config.hidden_size
+    if draft_dtype is not None:
+        assert draft_model.model.fc.weight.dtype == draft_dtype
 
 
 if __name__ == "__main__":

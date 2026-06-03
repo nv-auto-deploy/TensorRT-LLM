@@ -276,14 +276,25 @@ threshold `mean_accepted ≥ 1.0`. Target text was coherent; spec decoding *ran*
    `ctx_len=0`) emits dflash_attention per layer → target lm_head → `DFlashWrapperOutput`. Fixed
    `_draft_dtype` to read the draft param dtype (was defaulting to bf16 → fp16 mismatch). Tests
    `models/test_dflash_wrapper.py` (2) PASS on a tiny target+draft (no 8B build).
-   **REMAINING for E2E (the final iterative run loop, best via ad-run-agent/build_and_run_ad):**
+   **Draft dtype (resolved):** driven by `config.torch_dtype` (overridable via
+   `speculative_model_kwargs={"torch_dtype": ...}`, Llama+Eagle convention). `DFlashModel.dtype =
+   config.torch_dtype`; `_build_model` builds the draft in that dtype; `_draft_dtype` reads it. (Earlier
+   runtime param-reading band-aid removed.)
+   **Draft weight loading DONE (2026-06-02, commit 32b5721d7e):**
+   `DFlashOneModelFactory._load_draft_weights` — DIRECT state_dict load (checkpoint keys → `model.`
+   prefix), `strict=True`. NO separate→fused qkv packing (our standalone model keeps separate q/k/v,
+   AD fuses the GEMMs in the exported graph via `fuse_gemms`). `test_draft_weights_load_strict` loads
+   the REAL z-lab checkpoint strict — a fidelity check that the standalone modeling matches the
+   58-tensor checkpoint EXACTLY (PASSES). `_load_checkpoint` loads both target + draft.
+   **ONLY REMAINING for E2E (the final iterative run loop — best via ad-run-agent/build_and_run_ad):**
    (a) `_forward_with_kv_cache` — the inference draft loop (target verify → capture accepted hidden →
    `precompute_context_kv` → scatter into ctx caches → query block + `query_positions=ctx_len+arange`
-   → cached draft GM → lm_head → next draft tokens + spec bookkeeping); (b) draft weight loading
-   (separate→fused qkv packing) in `DFlashOneModelFactory._load_checkpoint`; (c) sampler `is_dflash()`
-   on `Eagle3OneModelSampler`; then **E2E acceptance vs the 1.325 oracle**.
-   **Test inventory (all PASS):** op (25), transform toy (1), model (4: eager/export/transform/precompute),
-   factory (4), wrapper (2), config-resolution (3) = 39 DFlash unit tests across 6 files.
+   → cached draft GM → lm_head → next draft tokens + spec bookkeeping); template = EagleWrapper.
+   `_forward_with_kv_cache`. (b) sampler `is_dflash()` on `Eagle3OneModelSampler`. Then
+   **E2E acceptance vs the 1.325 oracle**.
+   **Test inventory (all PASS, 40 DFlash unit tests across 6 files):** op (25), transform toy (1),
+   model (4: eager/export/transform/precompute), factory (5: register/build/export-infos/block_size/
+   strict-weight-load), wrapper (2: prefill/kv-stub), config-resolution (3).
 10. ☐ E2E: phased bring-up + GSM8K acceptance on Qwen3-8B (ref ≈ 87.11).
 
 ## 7. Key reference code

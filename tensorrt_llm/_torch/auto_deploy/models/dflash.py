@@ -148,11 +148,18 @@ class DFlashOneModelFactory(ModelFactory):
         target_model = self.target_factory.build_model(device)
 
         draft_config = self._build_draft_config()
+        # Build the draft in its config dtype (torch_dtype, overridable via speculative_model_kwargs)
+        # so it matches the target; mirrors the Llama+Eagle dtype convention.
+        draft_dtype = getattr(draft_config, "torch_dtype", None) or getattr(
+            draft_config, "dtype", None
+        )
         with (init_empty_weights if device == "meta" else nullcontext)():
             draft_model = DFlashDrafterForCausalLM(draft_config)
         if device == "meta":
             if hasattr(draft_model, "post_init"):
                 draft_model.post_init()
+        elif draft_dtype is not None:
+            draft_model.to(device=device, dtype=draft_dtype)
         else:
             draft_model.to(device)
         draft_model.eval()
@@ -184,14 +191,39 @@ class DFlashOneModelFactory(ModelFactory):
             config=wrapper_config, target_model=target_model, draft_model=draft_model
         )
 
+    def _load_draft_weights(self, draft_model: nn.Module, device: DeviceLikeType) -> None:
+        """Load the DFlash draft checkpoint directly into ``draft_model``.
+
+        Our standalone draft keeps SEPARATE q/k/v_proj (matching the z-lab checkpoint), so this is a
+        direct state_dict load — no separate->fused qkv packing (AD fuses the q/k/v GEMMs downstream in
+        the exported graph). Checkpoint keys (``fc.weight``, ``hidden_norm.weight``, ``layers.N...``,
+        ``norm.weight``) map under the ``model.`` prefix. ``strict=True`` doubles as a fidelity check
+        that the standalone modeling matches the checkpoint exactly (all 58 tensors).
+        """
+        import glob
+        import os
+
+        from safetensors.torch import load_file
+
+        files = sorted(glob.glob(os.path.join(self.draft_model_path, "*.safetensors")))
+        if not files:
+            raise FileNotFoundError(
+                f"No *.safetensors found for the DFlash draft at {self.draft_model_path}."
+            )
+        state: Dict[str, Any] = {}
+        for f in files:
+            state.update(load_file(f, device=str(device)))
+        # The draft wraps DFlashModel under ``model.``; checkpoint keys are unprefixed.
+        remapped = {f"model.{k}": v for k, v in state.items()}
+        draft_model.load_state_dict(remapped, strict=True)
+
     def _load_checkpoint(
         self, model: nn.Module, device: DeviceLikeType, disable_preload: bool = False
     ):
-        """Load the target checkpoint; draft weight loading (separate->fused qkv packing) is the
-        Step-7 continuation (validated at E2E). For now only the target is loaded."""
+        """Load both the target checkpoint (via the target factory) and the DFlash draft checkpoint."""
         assert isinstance(model, DFlashWrapper), f"Expected DFlashWrapper, got {type(model)}"
         self.target_factory._load_checkpoint(model.target_model, device, disable_preload)
-        # TODO(Step 7): load the DFlash draft checkpoint (fc/hidden_norm + per-layer q/k/v packing).
+        self._load_draft_weights(model.draft_model, device)
 
     def load_or_random_init(
         self, model: nn.Module, device: DeviceLikeType, disable_preload: bool = False
