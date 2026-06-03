@@ -932,9 +932,15 @@ class TrtllmAttention(AttentionDescriptor):
             num_kv_heads = k_fake.shape[2]
             head_dim = k_fake.shape[3]
             kv_dtype = k_fake.dtype
-        # Keep every layer in one uniform pool (sliding_window=0): the trtllm
-        # backend requires uniform KV caches. SWA masking still comes from the op's
-        # own sliding_window arg, so per-window pool splitting only over-allocates KV.
+        # ``sliding_window`` is propagated into the handler so layers with
+        # different windows land in separate KV pools. The trtllm backend now
+        # supports multiple pools (per-group block_offsets + cyclic-window
+        # staging), so non-uniform-window models (e.g. gpt-oss) get a dedicated
+        # window-sized pool per window instead of over-allocating a single
+        # full-seq pool for every layer.
+        (sw,) = extract_op_args(source_attn_node, "sliding_window")
+        sliding_window = sw if isinstance(sw, int) and sw > 0 else 0
+
         return {
             "kv_cache": KVPagedResourceHandler(
                 num_kv_heads,
@@ -942,6 +948,7 @@ class TrtllmAttention(AttentionDescriptor):
                 dtype=cls.resolve_cache_dtype(cache_config.dtype, kv_dtype),
                 kv_factor=2,
                 kv_layout="HND",
+                sliding_window=sliding_window,
             )
         }
 
