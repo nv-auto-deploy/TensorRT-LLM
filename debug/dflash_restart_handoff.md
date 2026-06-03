@@ -30,6 +30,18 @@ fresh Claude instance. Read this first, then the two governing docs.
   check `nvidia-smi` and set `CUDA_VISIBLE_DEVICES` to free GPUs before GPU runs. Debug logging = plain
   `print`s (no env gating), removed before commit. Throwaway probes live in `debug/spikes/`.
 
+## 1b. Git state (2026-06-02)
+- **Committed:** Step 1 tests + Step 2/5 descriptor/transform/resource as `2288b896e6` (post-rebase
+  hash); Step 1 ops + docs + spikes as `bfa71ec09e`.
+- **REBASED** `gramnarayan/dflash` onto `origin/gramnarayan/qwen3-vlm-mtp` (base now `c23ae34068`)
+  — zero conflicts. The export helpers (`insert_keepalive_sentinel`, `expose_graph_module_accessor`
+  in `models/hf.py`) are now available for the modeling/export-preservation phase. All 26 DFlash tests
+  pass on the new base.
+- **Future cleanup:** when `qwen3-vlm-mtp` merges into `main`, `git rebase --onto main
+  <old-vlm-mtp-base> gramnarayan/dflash` will auto-drop the vlm-mtp commits (patch-id equivalence);
+  if vlm-mtp is *squash*-merged the auto-drop won't match by patch-id but content-identical changes
+  resolve trivially. Safety backup ref: `gramnarayan/dflash-prerebase-backup`.
+
 ## 2. Environment
 - **Worktree:** `/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/gramnarayan/dev/dflash`
   (also bind-mounted at `~/dev/dflash`). Branch `gramnarayan/dflash`. **Rebase target:**
@@ -198,7 +210,28 @@ threshold `mean_accepted ≥ 1.0`. Target text was coherent; spec decoding *ran*
    its actual `dflash_attention` sites (keep the toy test as a fast regression guard).
 5. ☐ Step 5: slack-sized ctx K/V resource handler + `ctx_len` metadata wiring.
 6. ☐ Step 4: eager `precompute_context_kv` + fused-KV buffers + `submodules_to_preserve()` refactor.
-7. ☐ Step 3: `DFlashWrapper` + draft module (`modeling_dflash.py`).
+7. ⏳ Step 3: **draft module `models/custom/modeling_dflash.py` DONE (2026-06-02)** — exportable draft
+   model (`DFlashModel`/`DFlashDrafterForCausalLM` + attention/layer/MLP/RMSNorm/RoPE), module names
+   match the 58-tensor checkpoint, query-block forward `(inputs_embeds, position_ids, ctx_len)` emits
+   `auto_deploy::dflash_attention` **per layer** with `ctx_len` threaded. Key design: the traced
+   forward processes the **query block only**; context K/V comes from the eager `precompute_context_kv`
+   (Step 4) via the cache — NOT in this forward.
+   **STANDALONE + sharding-IR (user-directed):** the Qwen3 building blocks are *copied* from
+   `modeling_qwen3.py` (NOT imported — no cross-model coupling; copy-paste even if identical is the AD
+   convention, except MTP/Eagle which intentionally reuse the *target's* layers). Uses the sharding IR
+   ops (`torch_linear_simple` colwise/rowwise + `tp_min_local_shape`, `view` `tp_scaled_dim=2`,
+   `torch_rope_with_explicit_cos_sin`, `all_reduce`) so the exported graph carries TP hints. Mirrors the
+   PyTorch oracle, which reuses Qwen3's qkv/q-k-norm/RoPE/MLP and swaps only the attention call — here
+   the swap is to `dflash_attention`. v1 = Qwen3 family; non-Qwen DFlash bases get their own standalone
+   modeling later. TODO: TP-sharding of the dense ctx K/V resource (v1 world_size==1, so deferred). Tests `tests/.../models/test_dflash_model.py` (3) PASS,
+   incl. **model-based Step-2 gate** `test_transform_over_real_model` (the user-requested upgrade: run
+   `insert_cached_dflash_attention` over the REAL exported model — all N layers lower, slot_idx shared,
+   ctx_len retrieved, 2 caches/layer). **Still TODO:** `DFlashWrapper` dual-mode forward
+   (prefill-only / kv-cache), `precompute_context_kv` + fused-KV buffers (Step 4), `DFlashOneModelFactory`
+   + `DraftModelExportInfo.post_process` (keepalive for fc/hidden_norm + shared embed/lm_head) + config
+   wiring (Step 7). NOTE: `submodules_to_preserve()` does NOT exist — use `SubModuleExportInfo.post_process`
+   + `insert_keepalive_sentinel`/`expose_graph_module_accessor`; custom drafts are built by a
+   `@ModelFactoryRegistry.register("dflash_one_model")` factory, NOT the `_MODEL_MODULES` architecture map.
 8. ☐ Step 6: hidden-state capture wiring (`target_layer_ids` order).
 9. ☐ Step 7: `DFlashOneModelFactory` + config + sampler wiring (incl. qkv packing + block_size validation).
 10. ☐ E2E: phased bring-up + GSM8K acceptance on Qwen3-8B (ref ≈ 87.11).
