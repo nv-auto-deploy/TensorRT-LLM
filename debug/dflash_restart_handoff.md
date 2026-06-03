@@ -286,12 +286,22 @@ threshold `mean_accepted ≥ 1.0`. Target text was coherent; spec decoding *ran*
    AD fuses the GEMMs in the exported graph via `fuse_gemms`). `test_draft_weights_load_strict` loads
    the REAL z-lab checkpoint strict — a fidelity check that the standalone modeling matches the
    58-tensor checkpoint EXACTLY (PASSES). `_load_checkpoint` loads both target + draft.
-   **ONLY REMAINING for E2E (the final iterative run loop — best via ad-run-agent/build_and_run_ad):**
-   (a) `_forward_with_kv_cache` — the inference draft loop (target verify → capture accepted hidden →
-   `precompute_context_kv` → scatter into ctx caches → query block + `query_positions=ctx_len+arange`
-   → cached draft GM → lm_head → next draft tokens + spec bookkeeping); template = EagleWrapper.
-   `_forward_with_kv_cache`. (b) sampler `is_dflash()` on `Eagle3OneModelSampler`. Then
-   **E2E acceptance vs the 1.325 oracle**.
+   **kv-cache inference forward + sampler wiring DONE — first cut (2026-06-02, commit 59db527579):**
+   `DFlashWrapper._forward_with_kv_cache` implemented: target verify (cumprod, Eagle-mirrored) →
+   `_scatter_context_kv` (precompute_context_kv → per-seq scatter of accepted ctx K/V into the per-layer
+   `ctx_k/v_cache` resources at input_pos) → single non-autoregressive draft pass over `[last_accepted,
+   MASK...]` (`ctx_len=input_pos+num_accepted`, `query_positions=ctx_len+arange`) → lm_head → next draft
+   tokens. Helpers `_filter_kwargs_for_submodule`/`_collect_hidden_states` (copied from Eagle) +
+   `_collect_ctx_cache_pairs`. `DFlashWrapperOutput` gained `next_draft_tokens`/`next_new_tokens` (sampler
+   needs all 4). `ad_executor.py` selects `Eagle3OneModelSampler` for `is_dflash()`. Unit tests still pass
+   (helpers tested; full path is E2E).
+   **E2E DEBUG IN PROGRESS (the remaining work):** smoke `debug/spikes/ad_dflash_qwen3_8b_smoke.py`
+   (AD LLM, torch-simple, Qwen3-8B + b16). The runtime contract has UNVALIDATED parts to debug from the
+   smoke log: (i) per-seq scatter positions (prefill = whole prompt; extend = accepted prefix) vs how AD
+   lays out tokens; (ii) draft-GM arg flow — does it accept `inputs_embeds [num_seq, block_size, H]` +
+   our overridden `position_ids`/`ctx_len`, and do slot_idx/ctx caches arrive via named_args?
+   (iii) `input_pos` semantics; (iv) per-seq `.item()` scatter is torch-simple-only (CUDA-graph-safe
+   fixed-shape scatter is a follow-up). Iterate the smoke → acceptance vs the **1.325 oracle**.
    **Test inventory (all PASS, 40 DFlash unit tests across 6 files):** op (25), transform toy (1),
    model (4: eager/export/transform/precompute), factory (5: register/build/export-infos/block_size/
    strict-weight-load), wrapper (2: prefill/kv-stub), config-resolution (3).
