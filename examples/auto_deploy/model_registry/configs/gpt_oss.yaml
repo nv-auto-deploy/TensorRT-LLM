@@ -30,7 +30,12 @@ transforms:
   apply_sharding_hints:
     enabled: true
     requires_shape_prop: true
-    shard_layers: ["mha", "moe"]
+    # lm_head: vocab-parallel (colwise + all_gather) — pairs with the modeling
+    # emit; per-rank vocab = vocab/world_size. No-op at world_size=1.
+    shard_layers: ["mha", "moe", "lm_head"]
+    # Fused one-shot-lamport AllReduce (= PT). Default NCCL has no fused
+    # AR+residual+rmsnorm kernel. Autotuned; no-op at world_size=1.
+    allreduce_strategy: AUTO
   quantize_mxfp4_moe:
     backend: trtllm
     trtllm_quant_act: mxfp8
