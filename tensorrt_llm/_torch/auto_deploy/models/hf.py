@@ -746,18 +746,12 @@ def expose_graph_module_accessor(
     that accessor, and inserts a sentinel graph node so cleanup does not delete
     the referenced submodule.
 
-    Idempotent: if ``accessor_name`` was already exposed on ``sub_gm`` (e.g. the
-    target factory's own ``post_process`` already exposed ``get_input_embeddings``
-    for a VLM target), this is a no-op so we do not insert a duplicate sentinel.
+    Safe to call more than once for the same accessor (e.g. a VLM target exposes
+    ``get_input_embeddings`` via both the inner text export-info and the Eagle
+    target path). Re-exposing just re-sets the same submodule and rebinds the same
+    accessor; the only repeated effect is an extra keepalive sentinel, which is a
+    harmless no-op assert on the weight's row count (no GPU work, no extra memory).
     """
-    exposed = getattr(sub_gm, "_ad_exposed_accessors", None)
-    if exposed is None:
-        exposed = set()
-        sub_gm._ad_exposed_accessors = exposed
-    if accessor_name in exposed:
-        return
-    exposed.add(accessor_name)
-
     module = getattr(sub_mod, accessor_name)()
 
     # Retrieve and replicate the expected submodule hierarchy for where the

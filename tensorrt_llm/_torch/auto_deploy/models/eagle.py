@@ -157,6 +157,9 @@ class TargetModelExportInfo(SubModuleExportInfo):
             # Mirror the target factory's own export post-processing first. For
             # VLMs, this is the same hook used by TextModelExportInfo to keep
             # language-model accessors available on the exported text GraphModule.
+            # That hook already exposes get_input_embeddings, so the call below
+            # re-exposes it for VLM targets. This is intentional and harmless: the
+            # only repeated effect is a redundant, no-op keepalive sentinel.
             self.target_export_info.post_process(sub_mod, sub_gm)
         expose_graph_module_accessor(
             sub_mod,
