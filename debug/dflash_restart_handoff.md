@@ -269,8 +269,21 @@ threshold `mean_accepted ≥ 1.0`. Target text was coherent; spec decoding *ran*
    (capture = `target_layer_ids`, required for v1), and factory resolution via new
    `_required_one_model_factory()` (DFlash → `dflash_one_model`). `DFlashDecodingConfig.supports_backend`
    now allows `"_autodeploy"` (note the leading underscore — the internal backend string). Tests in
-   `shim/test_llm_config.py::TestSpeculativeConfigValidation` (3 DFlash) PASS. **Remaining for E2E:**
-   wrapper forward bodies + draft weight loading + sampler `is_dflash()` + Step 6 capture → E2E run.
+   `shim/test_llm_config.py::TestSpeculativeConfigValidation` (3 DFlash) PASS.
+   **Wrapper prefill-only forward DONE (2026-06-02, commit c54b8797eb):**
+   `DFlashWrapper._forward_prefill_only` (export path, mirrors EagleWrapper): target → bonus →
+   query block `[bonus, MASK…]` (embed via target) → draft (`inputs_embeds`, `position_ids`,
+   `ctx_len=0`) emits dflash_attention per layer → target lm_head → `DFlashWrapperOutput`. Fixed
+   `_draft_dtype` to read the draft param dtype (was defaulting to bf16 → fp16 mismatch). Tests
+   `models/test_dflash_wrapper.py` (2) PASS on a tiny target+draft (no 8B build).
+   **REMAINING for E2E (the final iterative run loop, best via ad-run-agent/build_and_run_ad):**
+   (a) `_forward_with_kv_cache` — the inference draft loop (target verify → capture accepted hidden →
+   `precompute_context_kv` → scatter into ctx caches → query block + `query_positions=ctx_len+arange`
+   → cached draft GM → lm_head → next draft tokens + spec bookkeeping); (b) draft weight loading
+   (separate→fused qkv packing) in `DFlashOneModelFactory._load_checkpoint`; (c) sampler `is_dflash()`
+   on `Eagle3OneModelSampler`; then **E2E acceptance vs the 1.325 oracle**.
+   **Test inventory (all PASS):** op (25), transform toy (1), model (4: eager/export/transform/precompute),
+   factory (4), wrapper (2), config-resolution (3) = 39 DFlash unit tests across 6 files.
 10. ☐ E2E: phased bring-up + GSM8K acceptance on Qwen3-8B (ref ≈ 87.11).
 
 ## 7. Key reference code

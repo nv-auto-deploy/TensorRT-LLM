@@ -265,6 +265,10 @@ class DFlashModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        # Draft compute dtype, driven by config.torch_dtype (overridable via
+        # speculative_model_kwargs={"torch_dtype": ...}, mirroring Llama+Eagle). The wrapper reads
+        # this via ``_draft_dtype`` to cast the target-shared embeddings/lm_head to the draft dtype.
+        self.dtype = getattr(config, "torch_dtype", None) or getattr(config, "dtype", None)
         target_layer_ids = getattr(config, "dflash_config", {}).get("target_layer_ids", []) or []
         self.num_capture_layers = len(target_layer_ids)
 
@@ -369,6 +373,14 @@ class DFlashDrafterForCausalLM(nn.Module):
 
 
 @dataclass
+class DFlashWrapperOutput(ModelOutput):
+    """Speculative output of DFlashWrapper (mirrors EagleWrapperOutput)."""
+
+    new_tokens: Optional[torch.Tensor] = None  # [B, max_draft_len + 1] (bonus + draft tokens)
+    new_tokens_lens: Optional[torch.Tensor] = None  # [B]
+
+
+@dataclass
 class DFlashWrapperConfig:
     """Config for DFlashWrapper (mirrors EagleWrapperConfig)."""
 
@@ -414,6 +426,8 @@ class DFlashWrapper(nn.Module):
 
     @property
     def _draft_dtype(self) -> torch.dtype:
+        # DFlashModel.dtype is set from config.torch_dtype (driven by speculative_model_kwargs,
+        # mirroring Eagle). Fall back to bf16 only if unset.
         return getattr(self._draft_inner_model, "dtype", None) or torch.bfloat16
 
     def apply_draft_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -431,21 +445,53 @@ class DFlashWrapper(nn.Module):
             return self._forward_with_kv_cache(cache_seq_interface)
         return self._forward_prefill_only(**kwargs)
 
-    def _forward_prefill_only(self, input_ids: torch.Tensor, position_ids: torch.Tensor, **kwargs):
-        """Export-time prefill path (TODO Step 7 continuation).
+    @staticmethod
+    def _sample_greedy(logits: torch.Tensor) -> torch.Tensor:
+        return torch.argmax(logits, dim=-1)
 
-        Algorithm (mirrors the cached path's single-iteration shape so export sees the right kwargs):
-          1. target forward over (embed(input_ids), position_ids) -> logits -> bonus token.
-          2. build the query block [bonus, MASK x (block_size-1)] -> embed via target.
-          3. precompute_context_kv(captured_hidden, ctx_positions) -> (eager; scatter handled in the
-             cached path). At export the context is empty (ctx_len=0), so the draft attends the block.
-          4. draft_model(inputs_embeds=block_embeds, position_ids=query_positions, ctx_len=zeros) ->
-             emits dflash_attention per layer.
-          5. apply_lm_head -> draft tokens; package speculative output.
+    def _forward_prefill_only(self, input_ids: torch.Tensor, position_ids: torch.Tensor, **kwargs):
+        """Export-time prefill path: run target + draft once so export captures the right kwargs.
+
+        Mirrors EagleWrapper._forward_prefill_only, adapted for DFlash's query block + ctx_len. At
+        export the persistent context is empty (ctx_len=0), so the draft attends only the query block;
+        the cached lowering wires the real ctx K/V at runtime. The exact token values are irrelevant
+        to export (it traces the computation graph); the shapes/kwargs flowing into the draft are what
+        matter (inputs_embeds [B, block_size, H], position_ids [B, block_size], ctx_len [B]).
         """
-        raise NotImplementedError(
-            "DFlashWrapper._forward_prefill_only is the Step-7 export-path continuation; "
-            "the model builds + exports its draft today via DFlashModel (see test_dflash_model.py)."
+        batch_size, _ = input_ids.shape
+        device = input_ids.device
+
+        # --- Target forward -> bonus token ---
+        input_embeds = self.target_model.get_input_embeddings()(input_ids)
+        target_logits = self.target_model(
+            inputs_embeds=input_embeds, position_ids=position_ids
+        ).logits
+        bonus_token = self._sample_greedy(target_logits[:, -1, :])  # [B]
+
+        # --- Build the DFlash query block [bonus, MASK, ..., MASK] (width block_size) ---
+        query_ids = torch.full(
+            (batch_size, self.block_size), self.mask_token_id, dtype=torch.long, device=device
+        )
+        query_ids[:, 0] = bonus_token
+        block_embeds = self.apply_draft_embedding(query_ids)  # [B, block_size, H]
+
+        # Query positions start right after the prompt; ctx is empty at export.
+        next_pos = position_ids[:, -1:].long() + 1  # [B, 1]
+        query_positions = next_pos + torch.arange(self.block_size, device=device)  # [B, block_size]
+        ctx_len = torch.zeros(batch_size, dtype=torch.int32, device=device)
+
+        # --- Draft forward (emits dflash_attention per layer) ---
+        draft_output = self.draft_model(
+            inputs_embeds=block_embeds, position_ids=query_positions, ctx_len=ctx_len
+        )
+        draft_logits = self.apply_lm_head(draft_output.norm_hidden_state)  # [B, block_size, vocab]
+        # Draft predicts the masked positions 1..max_draft_len.
+        draft_tokens = self._sample_greedy(draft_logits[:, 1 : self.max_draft_len + 1, :])  # [B, K]
+
+        new_tokens = torch.cat([bonus_token.unsqueeze(1), draft_tokens], dim=1)  # [B, K+1]
+        return DFlashWrapperOutput(
+            new_tokens=new_tokens,
+            new_tokens_lens=torch.ones(batch_size, dtype=torch.long, device=device),
         )
 
     def _forward_with_kv_cache(self, cache_seq_interface: CachedSequenceInterface):
