@@ -264,6 +264,13 @@ threshold `mean_accepted ≥ 1.0`. Target text was coherent; spec decoding *ran*
    (separate→fused qkv packing in `_load_checkpoint`); AD `llm_args` wiring (DFlash branch in
    `validate_supported_speculative_config`/`setup_hidden_state_capture`/`validate_speculative_model_factory`
    + `DFlashDecodingConfig.supports_backend("autodeploy")`); sampler `is_dflash()` on Eagle3OneModelSampler.
+   **Config wiring DONE (2026-06-02, commit dcd6a88c63):** AD `llm_args` DFlash branches in
+   `validate_supported_speculative_config` (allow + `world_size<=1`), `setup_hidden_state_capture`
+   (capture = `target_layer_ids`, required for v1), and factory resolution via new
+   `_required_one_model_factory()` (DFlash → `dflash_one_model`). `DFlashDecodingConfig.supports_backend`
+   now allows `"_autodeploy"` (note the leading underscore — the internal backend string). Tests in
+   `shim/test_llm_config.py::TestSpeculativeConfigValidation` (3 DFlash) PASS. **Remaining for E2E:**
+   wrapper forward bodies + draft weight loading + sampler `is_dflash()` + Step 6 capture → E2E run.
 10. ☐ E2E: phased bring-up + GSM8K acceptance on Qwen3-8B (ref ≈ 87.11).
 
 ## 7. Key reference code

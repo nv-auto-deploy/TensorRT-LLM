@@ -328,6 +328,46 @@ class TestSpeculativeConfigValidation:
             compile_backend="torch-simple",
         )
 
+    def test_accepts_dflash(self):
+        from tensorrt_llm.llmapi import DFlashDecodingConfig
+
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=4,
+            speculative_model="some/dflash-draft",
+            target_layer_ids=[1, 9, 17, 25, 33],
+        )
+        args = LlmArgs(model="test-model", speculative_config=spec_config)
+        # DFlash resolves to its own one-model factory; the original factory becomes the target.
+        assert args.model_factory == "dflash_one_model"
+        assert args.target_model_factory == "AutoModelForCausalLM"
+        # Hidden-state capture is configured for the DFlash target_layer_ids.
+        capture = args.transforms["detect_hidden_states_for_capture"]
+        assert capture["enabled"] is True
+        assert capture["eagle3_layers_to_capture"] == {1, 9, 17, 25, 33}
+
+    def test_dflash_moves_declared_target_factory(self):
+        from tensorrt_llm.llmapi import DFlashDecodingConfig
+
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=4,
+            speculative_model="some/dflash-draft",
+            target_layer_ids=[1, 9, 17, 25, 33],
+        )
+        args = LlmArgs(
+            model="test-model",
+            model_factory="AutoModelForImageTextToText",
+            speculative_config=spec_config,
+        )
+        assert args.model_factory == "dflash_one_model"
+        assert args.target_model_factory == "AutoModelForImageTextToText"
+
+    def test_dflash_requires_target_layer_ids(self):
+        from tensorrt_llm.llmapi import DFlashDecodingConfig
+
+        spec_config = DFlashDecodingConfig(max_draft_len=4, speculative_model="some/dflash-draft")
+        with pytest.raises(ValueError, match="target_layer_ids"):
+            LlmArgs(model="test-model", speculative_config=spec_config)
+
 
 # ================================
 # CUDA Graph Batch Sizes Tests

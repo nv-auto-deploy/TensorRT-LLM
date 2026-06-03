@@ -22,6 +22,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.llmapi.llm_args import (
     BuildConfig,
+    DFlashDecodingConfig,
     EagleDecodingConfig,
     MTPDecodingConfig,
     TorchLlmArgs,
@@ -143,11 +144,18 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                     "AutoDeploy only supports Eagle speculative decoding with "
                     f"eagle3_one_model=True (got eagle3_one_model={spec_config.eagle3_one_model})."
                 )
+        elif isinstance(spec_config, DFlashDecodingConfig):
+            # v1 supports single-GPU only (world_size 0 = demollm single GPU, 1 = single GPU).
+            if self.world_size not in (0, 1):
+                raise ValueError(
+                    "AutoDeploy DFlash speculative decoding currently supports world_size <= 1 "
+                    f"(got world_size={self.world_size})."
+                )
         else:
             raise ValueError(
                 "AutoDeploy only supports speculative decoding via "
-                "MTPDecodingConfig(mtp_eagle_one_model=True) or "
-                "EagleDecodingConfig(eagle3_one_model=True)."
+                "MTPDecodingConfig(mtp_eagle_one_model=True), "
+                "EagleDecodingConfig(eagle3_one_model=True), or DFlashDecodingConfig."
             )
 
         return self
@@ -165,6 +173,18 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                     "enabled. Ensure num_nextn_predict_layers is set in the model config."
                 )
             capture_layers = {-1}
+        elif isinstance(spec_config, DFlashDecodingConfig):
+            if spec_config.max_draft_len is None:
+                raise ValueError("DFlashDecodingConfig.max_draft_len must not be None.")
+            # DFlash captures the target layers whose hidden states feed the drafter's fc.
+            # v1 requires target_layer_ids to be set explicitly (PyTorch reads them from the draft
+            # config; auto-resolution from the draft config is an AutoDeploy follow-up).
+            if not spec_config.target_layer_ids:
+                raise ValueError(
+                    "AutoDeploy DFlash requires DFlashDecodingConfig.target_layer_ids to be set "
+                    "(the target layers captured for the drafter's cross-attention context)."
+                )
+            capture_layers = set(spec_config.target_layer_ids)
         else:
             assert isinstance(spec_config, EagleDecodingConfig)
             if spec_config.max_draft_len is None:
@@ -320,28 +340,33 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         cls._ensure_model_factory_registered(value)
         return value
 
+    _ONE_MODEL_FACTORIES = ("eagle_one_model", "dflash_one_model")
+
     @model_validator(mode="after")
     def validate_speculative_model_factory(self):
+        required_factory = self._required_one_model_factory()
         if self.speculative_config is None:
-            if self.model_factory == "eagle_one_model":
-                raise ValueError("model_factory='eagle_one_model' requires speculative_config.")
+            if self.model_factory in self._ONE_MODEL_FACTORIES:
+                raise ValueError(
+                    f"model_factory='{self.model_factory}' requires speculative_config."
+                )
             return self
 
-        if not self._requires_eagle_one_model():
+        if required_factory is None:
             raise ValueError(
                 "AutoDeploy only supports speculative decoding via "
-                "MTPDecodingConfig(mtp_eagle_one_model=True) or "
-                "EagleDecodingConfig(eagle3_one_model=True)."
+                "MTPDecodingConfig(mtp_eagle_one_model=True), "
+                "EagleDecodingConfig(eagle3_one_model=True), or DFlashDecodingConfig."
             )
 
-        if self.model_factory != "eagle_one_model":
+        if self.model_factory != required_factory:
+            # The original model_factory becomes the wrapped target factory.
             self.target_model_factory = self.model_factory
-            self.model_factory = "eagle_one_model"
-
+            self.model_factory = required_factory
         else:
             if self.target_model_factory is None:
                 raise ValueError(
-                    "target_model_factory must be set when model_factory='eagle_one_model'."
+                    f"target_model_factory must be set when model_factory='{required_factory}'."
                 )
 
         # target_model_factory is the factory that will be wrapped. On the common
@@ -483,14 +508,29 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     def _requires_eagle_one_model(self) -> bool:
         """Whether speculative decoding should use the Eagle one-model factory path."""
+        return self._required_one_model_factory() == "eagle_one_model"
+
+    def _required_one_model_factory(self) -> Optional[str]:
+        """The one-model factory required by the speculative config, or None if unsupported.
+
+        Maps the (AutoDeploy-supported) speculative configs to their composing factory:
+        MTP(mtp_eagle_one_model)/Eagle(eagle3_one_model) -> 'eagle_one_model'; DFlash ->
+        'dflash_one_model'. The original ``model_factory`` becomes the wrapped target factory.
+        """
         spec_config = self.speculative_config
         if spec_config is None:
-            return False
+            return None
         if isinstance(spec_config, MTPDecodingConfig):
-            return spec_config.mtp_eagle_one_model and not spec_config.use_mtp_vanilla
+            return (
+                "eagle_one_model"
+                if spec_config.mtp_eagle_one_model and not spec_config.use_mtp_vanilla
+                else None
+            )
         if isinstance(spec_config, EagleDecodingConfig):
-            return spec_config.eagle3_one_model
-        return False
+            return "eagle_one_model" if spec_config.eagle3_one_model else None
+        if isinstance(spec_config, DFlashDecodingConfig):
+            return "dflash_one_model"
+        return None
 
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments.

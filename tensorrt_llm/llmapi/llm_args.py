@@ -1976,7 +1976,7 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         return self.max_draft_len + 1
 
     def supports_backend(self, backend: str) -> bool:
-        return backend == "pytorch"
+        return backend in ("pytorch", "_autodeploy")
 
     @functools.cached_property
     def spec_dec_mode(self):
