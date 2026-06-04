@@ -24,7 +24,6 @@ This is the replacement for the legacy heuristic-based sharding pipeline in
 for background.
 """
 
-import operator
 from abc import ABC, abstractmethod
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Type
@@ -651,7 +650,7 @@ class FP4SwiGLUShardableNode(SwiGLUShardableNode):
     torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe,
 )
 class MoEShardableNode(ShardableNode):
-    """List-based MoE ops: EP weight partitioning, expert ID localization, mapping injection.
+    """List-based MoE ops: EP weight partitioning and mapping injection.
 
     Handles ops where args[3:6] are ``List[torch.Tensor]`` (per-expert weight
     lists).  Stacked-tensor MoE variants (``torch_moe_fused``,
@@ -670,14 +669,13 @@ class MoEShardableNode(ShardableNode):
         if ep_size <= 1 and tp_size <= 1:
             return 0
 
-        [selected_experts, routing_weights, w1_weight, w2_weight, w3_weight] = extract_op_args(
-            self.node, "selected_experts", "routing_weights", "w1_weight", "w2_weight", "w3_weight"
+        [w1_weight, w2_weight, w3_weight] = extract_op_args(
+            self.node, "w1_weight", "w2_weight", "w3_weight"
         )
         num_experts = len(w1_weight)
         assert num_experts % ep_size == 0, (
             f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})"
         )
-        experts_per_rank = num_experts // ep_size
 
         def get_partition(lst, world_size, rank):
             n = len(lst)
@@ -727,15 +725,11 @@ class MoEShardableNode(ShardableNode):
                 nodes_to_remove.extend(removed)
         self.node.args = tuple(args)
 
-        if enable_alltoall:
-            # mapping and max_num_tokens are needed downstream for MoE all-to-all dispatcher
-            mapping_config = dc.serialize()
-            set_op_args(self.node, mapping_config=mapping_config, max_num_tokens=max_num_tokens)
-        else:
-            # with pure EP/TP parallelism, global expert indices must be localized
-            self._localize_expert_indices(
-                gm, selected_experts, routing_weights, experts_per_rank, ep_rank, ep_size
-            )
+        # Keep expert IDs in global coordinates for both all-to-all and all-reduce EP.
+        # Runtime MoE kernels use the serialized mapping to localize to this rank's
+        # expert range. This avoids pre-localized ids being interpreted as ep_size=1.
+        mapping_config = dc.serialize()
+        set_op_args(self.node, mapping_config=mapping_config, max_num_tokens=max_num_tokens)
 
         ad_logger.debug(
             f"  sharded MoE: {num_experts} experts, ep={ep_size}, ep_rank={ep_rank}, "
@@ -745,45 +739,6 @@ class MoEShardableNode(ShardableNode):
         )
         self._pending_dead_nodes = nodes_to_remove
         return 1
-
-    def _localize_expert_indices(
-        self,
-        gm: GraphModule,
-        selected_experts: Node,
-        routing_weights: Node,
-        experts_per_rank: int,
-        ep_rank: int,
-        ep_size: int,
-    ) -> None:
-        """Remap global expert indices to EP-local indices and mask routing weights.
-
-        Inserts graph nodes that (1) subtract the rank offset from
-        selected_experts to get local indices, and (2) zero out routing
-        weights for experts not assigned to this rank.
-        """
-        with gm.graph.inserting_before(self.node):
-            lower = experts_per_rank * ep_rank
-            selected_experts_local = gm.graph.create_node(
-                "call_function", operator.sub, args=(selected_experts, lower), kwargs={}
-            )
-            div_node = gm.graph.create_node(
-                "call_function",
-                operator.floordiv,
-                args=(selected_experts, experts_per_rank),
-                kwargs={},
-            )
-            comp_op = torch.ge if ep_rank == ep_size - 1 else torch.eq
-            rank_mask = gm.graph.create_node(
-                "call_function", comp_op, args=(div_node, ep_rank), kwargs={}
-            )
-            routing_weights_local = gm.graph.create_node(
-                "call_function", operator.mul, args=(routing_weights, rank_mask), kwargs={}
-            )
-        set_op_args(
-            self.node,
-            selected_experts=selected_experts_local,
-            routing_weights=routing_weights_local,
-        )
 
 
 class StackedMoEShardableNode(ShardableNode):

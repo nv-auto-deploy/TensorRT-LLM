@@ -13,7 +13,7 @@
 runtime: trtllm
 compile_backend: torch-cudagraph
 model_factory: AutoModelForCausalLM
-attn_backend: flashinfer
+attn_backend: triton  # was: flashinfer  (debug: FI isolation test)
 max_seq_len: 4096
 max_num_tokens: 4096
 max_batch_size: 64

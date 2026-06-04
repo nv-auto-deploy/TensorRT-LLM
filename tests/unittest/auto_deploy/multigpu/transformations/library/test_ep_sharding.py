@@ -74,25 +74,32 @@ def _run_ep_shard_job(
             },
         },
     )(None, gm)
+
+    def check_moe_mapping(gm):
+        # get MoE node
+        moe_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_moe)]
+        assert len(moe_nodes) == 1, f"Expected 1 MoE node, got {len(moe_nodes)}"
+        moe_node = moe_nodes[0]
+        print(f"\nMoE node {moe_node.name}, kwargs: {moe_node.kwargs}\n\n")
+        assert "mapping_config" in moe_node.kwargs, (
+            f"Mapping config not found in MoE node {moe_node.name}"
+        )
+        # deserialize the mapping config string to DistConfig
+        dc = DistConfig.deserialize(moe_node.kwargs["mapping_config"])
+        assert dc.enable_attention_dp == enable_attention_dp
+        assert dc.moe_ep_size == world_size
+        return True
+
     if enable_attention_dp:
         # attention-dp + MoE EP-only all-to-all does not insert explicit
         # communication nodes. Instead, trtllm_moe uses MoEAlltoAll internally.
-        # Instead, check if input argument to MoE node, `enable_alltoall` is true
+        # Check that mapping metadata is attached to the MoE node.
         def transform_check(gm):
-            # get MoE node
-            moe_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_moe)]
-            assert len(moe_nodes) == 1, f"Expected 1 MoE node, got {len(moe_nodes)}"
-            moe_node = moe_nodes[0]
-            print(f"\nMoE node {moe_node.name}, kwargs: {moe_node.kwargs}\n\n")
-            assert "mapping_config" in moe_node.kwargs, (
-                f"Mapping config not found in MoE node {moe_node.name}"
-            )
-            # deserialize the mapping config string to DistConfig
-            dc = DistConfig.deserialize(moe_node.kwargs["mapping_config"])
-            return dc.enable_attention_dp
+            return check_moe_mapping(gm)
     else:
 
         def transform_check(gm):
+            check_moe_mapping(gm)
             return any(
                 is_op(n, torch.ops.auto_deploy.torch_dist_all_reduce) for n in gm.graph.nodes
             ) == (world_size > 1)
@@ -175,7 +182,7 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
 
 
 @pytest.mark.parametrize("device_count", get_device_counts([2, 8]))
-@pytest.mark.parametrize("num_experts", [3, 8])
+@pytest.mark.parametrize("num_experts", [4, 8])
 @pytest.mark.parametrize("enable_attention_dp", [True, False])
 def test_ep_shard(device_count: int, num_experts: int, enable_attention_dp: bool):
     if device_count > num_experts:
@@ -189,7 +196,7 @@ def test_ep_shard(device_count: int, num_experts: int, enable_attention_dp: bool
 # Note: EP pattern detection is invariant to enable_attention_dp:
 # it is only relevant inside the executor while inserting the right ops.
 @pytest.mark.parametrize("world_size", [1, 8])
-@pytest.mark.parametrize("num_experts", [3, 8])
+@pytest.mark.parametrize("num_experts", [4, 8])
 def test_sharding_pattern_detection(world_size: int, num_experts: int):
     """Test pattern detection logic without distributed execution.
 

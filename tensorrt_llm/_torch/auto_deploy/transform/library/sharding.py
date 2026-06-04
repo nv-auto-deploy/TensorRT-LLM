@@ -36,7 +36,6 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
-import operator
 import re
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum
@@ -1974,7 +1973,7 @@ def _insert_sharded_moe(
     """Apply expert parallelism (EP) sharding to a MoE node.
 
     Supports two paradigms:
-    - EP with All-Reduce: Localize expert IDs, mask routing weights, add all_reduce after MoE
+    - EP with All-Reduce: Keep global expert IDs, add all_reduce after MoE
     - EP with All-to-All: Keep global expert IDs, dispatch/combine handled in trtllm_moe_fused
 
     NOTE: allreduce_strategy is MANDATORY.
@@ -1997,12 +1996,10 @@ def _insert_sharded_moe(
         raise ValueError(f"allreduce_strategy must be set for MoE sharding on node {node.name}")
     scale_names = list(scale_names)
 
-    # -- Handle selected_experts and final_scales sharding --
-    selected_experts = args[1]
-    final_scales = args[2]
     num_experts = len(args[3])
-
-    experts_per_rank = num_experts // ep_size
+    assert num_experts % ep_size == 0, (
+        f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})"
+    )
 
     # =====================================================================================
     # Shard expert weights
@@ -2011,11 +2008,7 @@ def _insert_sharded_moe(
         num_experts = len(lst)
         expert_size_per_partition = num_experts // world_size
         expert_start = rank * expert_size_per_partition
-        # For num_experts % world_size != 0 case,
-        # assign the last (num_experts % world_size) experts to the last rank
-        expert_end = (
-            num_experts if (rank == world_size - 1) else expert_start + expert_size_per_partition
-        )
+        expert_end = expert_start + expert_size_per_partition
 
         return lst[expert_start:expert_end], lst[:expert_start] + lst[expert_end:]
 
@@ -2087,55 +2080,12 @@ def _insert_sharded_moe(
                         gm, scale_node, s_name, dim, tp_rank, tp_size, orig_shapes[j]
                     )
 
-    if enable_alltoall:
-        # ---------------------------------------------------------------------------
-        # ALL-TO-ALL PARADIGM
-        # ---------------------------------------------------------------------------
-        # - Keep expert IDs in GLOBAL coordinates (0 to num_experts-1)
-        # - Keep original routing weights (no masking)
-        # - trtllm_moe_fused handles dispatch/combine using global IDs
-        # - No all_reduce needed (all-to-all handles communication)
-        # ---------------------------------------------------------------------------
-        # args[1] and args[2] unchanged - keep global expert IDs and routing weights
-        pass
-    else:
-        # ---------------------------------------------------------------------------
-        # ALL-REDUCE PARADIGM
-        # ---------------------------------------------------------------------------
-        # - Convert expert IDs to LOCAL coordinates
-        # - Mask routing weights (zero out tokens routed to other ranks)
-        # - Each GPU computes partial results for local experts only
-        # - all_reduce sums partial results across GPUs
-        # ---------------------------------------------------------------------------
-        with gm.graph.inserting_before(node):
-            # Localize expert IDs: selected_experts_local = selected_experts - (ep_rank * experts_per_rank)
-            lower = experts_per_rank * ep_rank
-            selected_experts_local = gm.graph.create_node(
-                "call_function", operator.sub, args=(selected_experts, lower), kwargs={}
-            )
+    # Keep expert IDs in GLOBAL coordinates for both all-to-all and all-reduce EP.
+    # Runtime MoE kernels use mapping_config to localize to this rank's expert range.
+    # The all-reduce path sums each rank's local expert contribution after the node.
 
-            # Create rank mask: True only for tokens routed to this rank's experts
-            div_node = gm.graph.create_node(
-                "call_function",
-                operator.floordiv,
-                args=(selected_experts, experts_per_rank),
-                kwargs={},
-            )
-            comp_op = torch.ge if ep_rank == ep_size - 1 else torch.eq
-            rank_mask = gm.graph.create_node(
-                "call_function", comp_op, args=(div_node, ep_rank), kwargs={}
-            )
-
-            # Zero out routing weights for remote experts
-            final_scales_local = gm.graph.create_node(
-                "call_function", operator.mul, args=(final_scales, rank_mask), kwargs={}
-            )
-
-        args[1] = selected_experts_local
-        args[2] = final_scales_local
-
-    # Serialize Mapping for all-to-all dispatch/combine
-    # (Will be used inside the op to determine enable_alltoall and workspace size)
+    # Serialize Mapping for all MoE kernels. All-to-all uses it for dispatch/combine;
+    # all-reduce EP uses it to pass TP/EP metadata into the local kernel.
     mapping_config = config.dist_config.serialize()
 
     # Write back weight/scale list updates (applied above) and inject mapping args.
@@ -2146,7 +2096,7 @@ def _insert_sharded_moe(
 
     if not enable_alltoall:
         # =====================================================================================
-        # Non-all-to-all paradigm: add collective ops for TP reduction
+        # Non-all-to-all paradigm: add collective op for EP/TP partial-result reduction
         # =====================================================================================
         if config.enable_attention_dp:
             # TODO: The Attention-DP + MoE TP-only sharding is not supported yet.

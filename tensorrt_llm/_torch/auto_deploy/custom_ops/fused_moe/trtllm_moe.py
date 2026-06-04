@@ -57,6 +57,32 @@ def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mappi
     return mapping, enable_alltoall
 
 
+def _moe_parallelism_kwargs(mapping: Mapping | None) -> dict[str, int | bool]:
+    """Return TRTLLM fused-MoE parallelism kwargs for a serialized AD mapping."""
+    if mapping is None:
+        return {}
+    return {
+        "tp_size": mapping.moe_tp_size,
+        "tp_rank": mapping.moe_tp_rank,
+        "ep_size": mapping.moe_ep_size,
+        "ep_rank": mapping.moe_ep_rank,
+        "cluster_size": mapping.moe_cluster_size,
+        "cluster_rank": mapping.moe_cluster_rank,
+        "enable_alltoall": False,
+    }
+
+
+def _expert_layout(mapping: Mapping | None, local_num_experts: int) -> Tuple[int, int, int]:
+    """Return ``(global_num_experts, local_expert_offset, local_num_experts)``."""
+    if mapping is None:
+        return local_num_experts, 0, local_num_experts
+    return (
+        local_num_experts * mapping.moe_ep_size,
+        mapping.moe_ep_rank * local_num_experts,
+        local_num_experts,
+    )
+
+
 def _run_moe_with_alltoall(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -447,8 +473,8 @@ def trtllm_moe_fused(
             max_num_tokens=max_num_tokens,
         ).view(x_shape)
 
-    # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
-    # routing weights for remote experts are zeroed, all_reduce is added after this op
+    # EP WITH ALL-REDUCE PATH: Expert IDs stay in GLOBAL coordinates. The TRTLLM kernel
+    # localizes them from EP metadata, and all_reduce is added after this op by sharding.
     return torch.ops.trtllm.fused_moe(
         x,
         selected_experts,
@@ -460,6 +486,7 @@ def trtllm_moe_fused(
         output_dtype=x.dtype,
         quant_scales=quant_scales,
         activation_type=activation_type,
+        **_moe_parallelism_kwargs(mapping),
     )[0].view(x_shape)
 
 
@@ -593,7 +620,7 @@ def trtllm_quant_fp8_moe_fused(
             max_num_tokens=max_num_tokens,
         ).view(x_shape)
 
-    # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
+    # EP WITH ALL-REDUCE PATH: Expert IDs stay in GLOBAL coordinates.
     # Note! Outputting Float8_e4m3fn directly is not currently supported
     output = torch.ops.trtllm.fused_moe(
         x_q_fp8,
@@ -606,6 +633,7 @@ def trtllm_quant_fp8_moe_fused(
         output_dtype=x.dtype,
         quant_scales=quant_scales,
         activation_type=act_fn,
+        **_moe_parallelism_kwargs(mapping),
     )
 
     # Restore original shape
@@ -722,7 +750,7 @@ def trtllm_quant_nvfp4_moe_fused(
             nvfp4_act_global_scale=fc1_act_global_scale,
         ).view(x.shape)
 
-    # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
+    # EP WITH ALL-REDUCE PATH: Expert IDs stay in GLOBAL coordinates.
     # FP4 quantisation happens here (before the kernel) for the non-alltoall path.
     if x.dtype in (torch.float16, torch.bfloat16):
         x_q_fp4, input_blockscale = torch.ops.trtllm.fp4_quantize(
@@ -745,6 +773,7 @@ def trtllm_quant_nvfp4_moe_fused(
         quant_scales=quant_scales,
         input_sf=input_blockscale,
         activation_type=act_fn,
+        **_moe_parallelism_kwargs(mapping),
     )[0].view(x.shape)
 
 
@@ -848,8 +877,8 @@ def trtllm_quant_finegrained_fp8_moe_fused(
             is_gated_mlp=is_gated_mlp,
         ).view(x_shape)
 
-    # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
-    # routing weights for remote experts are zeroed, all_reduce is added after this op
+    # EP WITH ALL-REDUCE PATH: Expert IDs stay in GLOBAL coordinates. The runner
+    # localizes them from the global expert layout, and sharding adds all_reduce.
     if is_sm_100f():
         # --- Blackwell (SM100+) Path ---
         # TODO: pass act_type once FP8BlockScaleMoERunner C++ supports it.
@@ -861,7 +890,10 @@ def trtllm_quant_finegrained_fp8_moe_fused(
 
         x_fp8, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x2d)
 
-        num_experts = fc1_expert_weights.shape[0]
+        local_num_experts = fc1_expert_weights.shape[0]
+        num_experts, local_expert_offset, local_num_experts = _expert_layout(
+            mapping, local_num_experts
+        )
         top_k = selected_experts.shape[-1]
         intermediate_size = (
             fc1_expert_weights.shape[1] // 2 if is_gated_mlp else fc1_expert_weights.shape[1]
@@ -885,8 +917,8 @@ def trtllm_quant_finegrained_fp8_moe_fused(
             None,  # n_group
             None,  # topk_group
             intermediate_size,
-            0,  # local_expert_offset
-            num_experts,  # local_num_experts
+            local_expert_offset,
+            local_num_experts,
             None,  # routed_scaling_factor
             RoutingMethodType.Renormalize,
             topk_weights=routing_weights_bf16,
@@ -913,6 +945,7 @@ def trtllm_quant_finegrained_fp8_moe_fused(
             quant_scales=quant_scales,
             activation_type=act_fn,
             use_deepseek_fp8_block_scale=True,
+            **_moe_parallelism_kwargs(mapping),
         )
 
         return output[0].view(x_shape)
@@ -1011,12 +1044,7 @@ def _trtllm_nvfp4_trtllm_gen_moe_impl(
     routing_method_type = int(RoutingMethodType.DeepSeekV3)
     mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
 
-    if mapping is not None and use_internal_routing:
-        num_experts = local_num_experts * mapping.moe_ep_size
-        local_expert_offset = mapping.moe_ep_rank * local_num_experts
-    else:
-        num_experts = local_num_experts
-        local_expert_offset = 0
+    num_experts, local_expert_offset, local_num_experts = _expert_layout(mapping, local_num_experts)
 
     if enable_alltoall:
         if use_internal_routing:

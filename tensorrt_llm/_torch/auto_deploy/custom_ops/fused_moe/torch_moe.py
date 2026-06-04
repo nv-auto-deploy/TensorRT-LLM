@@ -202,14 +202,14 @@ def _template_moe(
 
     Args:
         x: Input tensor
-        selected_experts: Expert indices for each token (GLOBAL coordinates when all-to-all enabled)
+        selected_experts: Expert indices for each token (GLOBAL coordinates when mapping_config is set)
         routing_weights: Routing weights for each expert
-        mlps: List of MLP functions (LOCAL experts only when all-to-all enabled)
+        mlps: List of MLP functions (LOCAL experts only when mapping_config is set)
         apply_routing_on_input: If True, multiply routing weights with INPUT before MLP (BMM-based pattern).
                                 This means: silu(input * routing_weight)
                                 If False, multiply routing weights with OUTPUT after MLP (standard pattern).
                                 This means: silu(input) * routing_weight
-        mapping_config: Serialized Mapping config for distributed all-to-all
+        mapping_config: Serialized Mapping config for distributed MoE
         max_num_tokens: Maximum tokens for workspace allocation (all-to-all mode)
     """
 
@@ -236,6 +236,9 @@ def _template_moe(
     hidden_dim = x_shape[-1]
     x = x.view(-1, hidden_dim)
     num_experts = len(mlps)
+    if mapping is not None and mapping.moe_ep_size > 1:
+        local_expert_start = mapping.moe_ep_rank * num_experts
+        selected_experts = selected_experts - local_expert_start
 
     final_hidden_states = torch.zeros_like(x)
     valid_mask = (selected_experts >= 0) & (selected_experts < num_experts)
