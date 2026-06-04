@@ -1263,7 +1263,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "openai/gpt-oss-20b",
             None,
             None,
-            marks=pytest.mark.skip_less_device(2),
             id="20b",
         ),
         pytest.param(
@@ -1278,7 +1277,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "openai/gpt-oss-120b",
             2,
             "tp",
-            marks=pytest.mark.skip_less_device(2),
             id="120b-tp2",
         ),
         pytest.param(
@@ -1286,12 +1284,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "openai/gpt-oss-120b",
             2,
             "ep",
-            marks=pytest.mark.skip_less_device(2),
             id="120b-ep2",
         ),
     ]
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize(
         "model_id,model_name,world_size_override,moe_topology", MODEL_PARAMS)
     def test_mxfp4_gsm8k(self, model_id, model_name, world_size_override,
