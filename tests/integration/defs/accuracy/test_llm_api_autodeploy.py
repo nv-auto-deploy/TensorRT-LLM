@@ -1186,6 +1186,93 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestStep3_7Flash(LlmapiAccuracyTestHarness):
+    """Accuracy coverage for Step-3.7-Flash via AutoDeploy."""
+
+    MODEL_NAME = "stepfun-ai/Step-3.7-Flash"
+    HF_HOME = ("/scratch/fsw/portfolios/coreai/projects/"
+               "coreai_comparch_trtllm/hf_home")
+    MODEL_PATHS = {
+        "bf16": (f"{HF_HOME}/hub/models--stepfun-ai--Step-3.7-Flash/"
+                 "snapshots/5f6244077ac62e04eec3f320501ff8c2b293373a"),
+        "fp8": (f"{HF_HOME}/hub/models--stepfun-ai--Step-3.7-Flash-FP8/"
+                "snapshots/b3d7916fccac844cca050d7520f2aaa513f9a84f"),
+    }
+
+    # Step-3.7-Flash's chat template hard-codes `<|im_start|>assistant\n<think>\n`
+    # when add_generation_prompt=True, so GSM8K answers are preceded by an
+    # unconditional reasoning block. 1024 tokens leaves enough room for a
+    # `reasoning_effort=low` trace plus the `#### N` final answer; if accuracy
+    # is bottlenecked by truncated reasoning, bump this back to 2048.
+    GSM8K_MAX_OUTPUT_LEN = 1024
+    # Iteration-speed knob: 128 samples runs in ~5 min, full dataset (1319) in ~3h.
+    # Set to None to use the full GSM8K test split.
+    GSM8K_NUM_SAMPLES = 128
+    GSM8K_EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(reasoning_effort="low"),
+    )
+
+    def get_default_sampling_params(self):
+        # Use end_id=None so task setup can tokenize evaluator stop sequences.
+        return SamplingParams(end_id=None,
+                              pad_id=None,
+                              n=1,
+                              use_beam_search=False)
+
+    def get_gsm8k_sampling_params(self):
+        sampling_params = self.get_default_sampling_params()
+        config = _load_ad_config("step-3.7-flash.yaml")
+        max_seq_len = int(config.get("max_seq_len", GSM8K.MAX_INPUT_LEN))
+        sampling_params.max_tokens = self.GSM8K_MAX_OUTPUT_LEN
+        sampling_params.truncate_prompt_tokens = (max_seq_len -
+                                                  self.GSM8K_MAX_OUTPUT_LEN)
+        return sampling_params
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "bf16",
+            pytest.param("fp8", marks=skip_pre_hopper),
+        ],
+    )
+    def test_accuracy(self, model_id, mocker):
+        yaml_paths, world_size = _get_registry_yaml_extra(self.MODEL_NAME)
+        if get_device_count() < world_size:
+            pytest.skip(f"Not enough devices for world_size={world_size}")
+
+        kwargs = {}
+        if model_id == "bf16":
+            kwargs["dtype"] = "bfloat16"
+
+        model_path = self.MODEL_PATHS[model_id]
+        with AutoDeployLLM(
+                model=model_path,
+                tokenizer=model_path,
+                world_size=world_size,
+                yaml_extra=yaml_paths,
+                trust_remote_code=True,
+                **kwargs,
+        ) as llm:
+            if model_id == "fp8":
+                _set_quant_config(llm, model_id)
+
+            # task = MMLU(self.MODEL_NAME)
+            # task.evaluate(llm,
+            #               sampling_params=self.get_default_sampling_params())
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            # if self.GSM8K_NUM_SAMPLES is not None:
+            #     task.NUM_SAMPLES = self.GSM8K_NUM_SAMPLES
+            task.evaluate(
+                llm,
+                sampling_params=self.get_gsm8k_sampling_params(),
+                extra_evaluator_kwargs=self.GSM8K_EXTRA_EVALUATOR_KWARGS)
+
+
 class TestKimiK2_5(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for Kimi-K2.5 (moonshotai/Kimi-K2.5) via AutoDeploy.
 

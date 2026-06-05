@@ -417,6 +417,12 @@ GLM-4.7-Flash:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 81.046
+stepfun-ai/Step-3.7-Flash:
+  - dtype: bfloat16
+    accuracy: 84.003
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 82.866
 bigcode/starcoder2-3b:
   - accuracy: 20.2
 bigcode/starcoder2-7b:

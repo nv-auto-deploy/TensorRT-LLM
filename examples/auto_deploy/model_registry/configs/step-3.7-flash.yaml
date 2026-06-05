@@ -13,14 +13,14 @@
 runtime: trtllm
 compile_backend: torch-cudagraph
 model_factory: AutoModelForCausalLM
-attn_backend: triton  # was: flashinfer  (debug: FI isolation test)
-max_seq_len: 4096
-max_num_tokens: 4096
-max_batch_size: 64
-world_size: 8
+attn_backend: flashinfer  # was: flashinfer  (debug: FI isolation test)
+max_seq_len: 8192
+max_num_tokens: 8192
+max_batch_size: 128
+world_size: 4
 enable_chunked_prefill: true
 cuda_graph_config:
-  batch_sizes: [1, 2, 4, 8, 16, 32, 64]
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128]
 kv_cache_config:
   dtype: bfloat16
   enable_block_reuse: false
