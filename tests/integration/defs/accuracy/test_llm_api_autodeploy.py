@@ -1190,8 +1190,8 @@ class TestStep3_7Flash(LlmapiAccuracyTestHarness):
     """Accuracy coverage for Step-3.7-Flash via AutoDeploy."""
 
     MODEL_NAME = "stepfun-ai/Step-3.7-Flash"
-    HF_HOME = ("/scratch/fsw/portfolios/coreai/projects/"
-               "coreai_comparch_trtllm/hf_home")
+    HF_HOME = ("/lustre/fs1/portfolios/coreai/projects/"
+               "coreai_comparch_autodeploy/autodeploy_data/hf_home")
     MODEL_PATHS = {
         "bf16": (f"{HF_HOME}/hub/models--stepfun-ai--Step-3.7-Flash/"
                  "snapshots/5f6244077ac62e04eec3f320501ff8c2b293373a"),
