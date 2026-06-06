@@ -1265,8 +1265,8 @@ class TestStep3_7Flash(LlmapiAccuracyTestHarness):
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
-            # if self.GSM8K_NUM_SAMPLES is not None:
-            #     task.NUM_SAMPLES = self.GSM8K_NUM_SAMPLES
+            if self.GSM8K_NUM_SAMPLES is not None:
+                task.NUM_SAMPLES = self.GSM8K_NUM_SAMPLES
             task.evaluate(
                 llm,
                 sampling_params=self.get_gsm8k_sampling_params(),
