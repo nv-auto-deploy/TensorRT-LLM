@@ -40,3 +40,11 @@ transforms:
     enabled: true
   gather_logits_before_lm_head:
     enabled: true
+  # Consolidate projections that share hidden_states into one GEMM at
+  # post_load_fusion (after per-rank sharding): attention q/k/v(/g) and the
+  # bf16 SwiGLU gate/up (dense MLP + MoE shared expert). Reference-safe
+  # concatenated matmul + narrow split. No conflict with multi_stream_gemm
+  # (FP8-only; attention/dense linears here are bf16, so multi_stream_gemm
+  # matches 0 in this model).
+  fuse_gemms_mixed_children:
+    enabled: true
