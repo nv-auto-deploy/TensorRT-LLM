@@ -55,3 +55,16 @@ transforms:
   # matches 0 in this model).
   fuse_gemms_mixed_children:
     enabled: true
+  # Overlap the bf16 shared-expert MLP with the FP8 routed grouped-GEMM on an
+  # auxiliary CUDA stream. Step has a shared expert on all 42 MoE layers; the merge
+  # node `self.moe(h) + self.share_expert(h)` (modeling_step3p7.py:650, one per MoE
+  # layer) is exactly the routed+shared add that MultiStreamMOE rewrites — it traces
+  # the shared-expert subgraph (fused gate/up GEMM -> silu_mul -> down GEMM) and runs
+  # it via begin/end/wait_aux_stream so it overlaps the routed
+  # trtllm_quant_finegrained_fp8_moe_fused op. At TP8/batch=1 decode both kernels
+  # under-occupy the SMs (same launch/occupancy-bound regime as idea_0013), so
+  # concurrent execution recovers idle SM cycles. Pure stream scheduling with a
+  # main-stream wait before the merge -> numerics-safe. Off-by-default
+  # (default.yaml:312-314); not overridden elsewhere for this model.
+  multi_stream_moe:
+    enabled: true
