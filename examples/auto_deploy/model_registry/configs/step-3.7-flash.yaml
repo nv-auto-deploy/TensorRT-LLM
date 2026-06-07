@@ -38,6 +38,13 @@ transforms:
     enabled: false
   apply_sharding_hints:
     enabled: true
+    # TP8 batch=1 decode: ~2 all_reduces/layer x45 layers on the critical path,
+    # each ~1 token (~14KB). Default NCCL ring latency is fixed-overhead bound for
+    # tiny msgs; AUTO routes through trtllm::tunable_allreduce which autotunes and
+    # picks the fastest NVLink one-shot/min-latency kernel per message size.
+    # Numerics-safe (bit-faithful sum; NOT LOWPRECISION). Consumed by
+    # init_dist_config -> DistConfig -> all_reduce op args (sharding_ir.py).
+    allreduce_strategy: AUTO
   gather_logits_before_lm_head:
     enabled: true
   # Consolidate projections that share hidden_states into one GEMM at
