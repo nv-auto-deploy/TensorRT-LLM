@@ -1,0 +1,22 @@
+# PyTorch-backend serve config for SuperV3 MTP + attention-DP (TP4 / EP4).
+# CRITICAL: PT reads parallelism from `tensor_parallel_size` / `moe_expert_parallel_size`
+# in this yaml (NOT world_size, NOT mpirun). Batching is matched to the AD config above
+# (max_batch_size 256, max_num_tokens 4096) so the AD-vs-PT comparison is apples-to-apples.
+max_batch_size: 256
+max_seq_len: 4096
+max_num_tokens: 4096
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+trust_remote_code: true
+enable_attention_dp: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 256
+kv_cache_config:
+  free_gpu_memory_fraction: 0.8
+  enable_block_reuse: false
+  mamba_ssm_cache_dtype: auto
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 6
+  mtp_eagle_one_model: true

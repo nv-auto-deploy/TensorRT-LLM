@@ -1,0 +1,59 @@
+# AutoDeploy serve config for SuperV3 MTP + attention-DP (TP4 / EP4).
+# CRITICAL: `world_size` MUST be set here — AutoDeploy reads it from this yaml and
+# spawns its own workers. Do NOT launch under `mpirun -n N` and do NOT pass --tp_size
+# (AD rejects --tp_size: "AutoDeploy only supports parallelization via the world_size
+# argument"). With world_size set, all ranks report moe_ep_size=4 and the base executor
+# parallel_config gets world_size=4. Without it, serve workers default to world_size=1
+# and die with "Rank should be an integer between 0 and 0".
+world_size: 4
+runtime: trtllm
+compile_backend: torch-cudagraph
+max_batch_size: 256          # cover the full concurrency sweep (c up to 256)
+max_seq_len: 4096            # ~1k-1.3k input + variable output for SPEED-Bench
+max_num_tokens: 4096
+enable_chunked_prefill: false  # not supported with spec dec
+attn_backend: trtllm
+model_factory: AutoModelForCausalLM
+skip_loading_weights: false
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+kv_cache_config:
+  mamba_ssm_cache_dtype: auto
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 6
+  mtp_eagle_one_model: true
+transforms:
+  detect_sharding:
+    allreduce_strategy: NCCL
+    enable_attention_dp: true   # the attention-DP MoE all-to-all path under test
+    sharding_dims: ['ep', 'bmm']
+    sharding_source: ['manual']
+    manual_config:
+      head_dim: 128
+      tp_plan:
+        "in_proj": "mamba"
+        "out_proj": "rowwise"
+        "q_proj": "colwise"
+        "k_proj": "colwise"
+        "v_proj": "colwise"
+        "o_proj": "rowwise"
+        "up_proj": "colwise"
+        "down_proj": "rowwise"
+        "fc1_latent_proj": "gather"
+        "fc2_latent_proj": "gather"
+  multi_stream_moe:
+    stage: compile
+    enabled: false              # creates NaNs in target sampled logits (known issue)
+  fuse_mamba_a_log:
+    stage: post_load_fusion
+    enabled: true
+  insert_cached_ssm_attention:
+    backend: flashinfer_ssm
+    ssm_replay: true            # SSM replay kernel (high-c win)
+  insert_cached_causal_conv:
+    backend: triton_causal_conv
+  fuse_nvfp4_moe:
+    backend: trtllm_gen
+  fuse_fp8_moe:
+    allow_different_input_scales: true
