@@ -577,12 +577,37 @@ class DFlashWrapper(nn.Module):
         (``new_tokens_lens``). Writes draft layer ``i``'s K/V at ``ctx_k_cache_i[slot, pos]`` for
         ``pos in [input_pos, input_pos + n_commit)``. Returns ``ctx_len = input_pos + n_commit``.
 
-        NOTE: per-sequence Python loop (D2H syncs via .item()) -- correct for the torch-simple
-        bring-up phase. A fixed-shape, CUDA-graph-safe scatter is a follow-up (torch-cudagraph phase).
+        Two paths:
+        - Generation (pure extend, ``num_prefill == 0``): a fixed-shape, CUDA-graph-safe vectorized
+          scatter. Every sequence has exactly ``block = max_draft_len + 1`` captured tokens, so the
+          layout is regular and we scatter with integer-tensor indexing -- no ``.item()``, no
+          data-dependent Python loop. We commit ALL ``block`` positions unconditionally; positions
+          beyond ``ctx_len`` (= input_pos + accepted) are never read this step and are overwritten
+          next step before they could come in-range, so the extra writes are harmless.
+        - Prefill/context (``num_prefill > 0``): the per-sequence Python loop below (uses .item()
+          D2H syncs and variable-length slices). This phase runs eager and is never CUDA-graph
+          captured, so the syncs are acceptable here.
         """
         precompute = self.draft_model.model.precompute_context_kv
-        ctx_len = torch.empty(slot_idx.shape[0], dtype=torch.int32, device=captured.device)
-        for i in range(slot_idx.shape[0]):
+        num_seq = slot_idx.shape[0]
+
+        if num_prefill == 0 and num_seq > 0:
+            block = self.max_draft_len + 1
+            # [num_seq, block] absolute ctx positions for each captured token (input_pos + 0..K).
+            positions = input_pos.to(torch.long).unsqueeze(1) + torch.arange(
+                block, device=captured.device
+            )
+            k, v = precompute(captured, positions.reshape(-1))  # [num_seq*block, L, n_kv, head_dim]
+            k = k.view(num_seq, block, *k.shape[1:])
+            v = v.view(num_seq, block, *v.shape[1:])
+            slot_grid = slot_idx.to(torch.long).unsqueeze(1).expand(num_seq, block)
+            for li in range(len(k_caches)):
+                k_caches[li][slot_grid, positions] = k[:, :, li]
+                v_caches[li][slot_grid, positions] = v[:, :, li]
+            return input_pos.to(torch.int32) + new_tokens_lens.to(torch.int32)
+
+        ctx_len = torch.empty(num_seq, dtype=torch.int32, device=captured.device)
+        for i in range(num_seq):
             start, end = int(cu_seqlen[i].item()), int(cu_seqlen[i + 1].item())
             n_commit = (end - start) if i < num_prefill else int(new_tokens_lens[i].item())
             base = int(input_pos[i].item())
@@ -677,7 +702,9 @@ class DFlashWrapper(nn.Module):
             draft_tokens = torch.zeros(
                 num_sequences, self.max_draft_len, dtype=ids_dtype, device=device
             )
-            ctx_len = torch.zeros(num_sequences, dtype=torch.int32, device=device)  # debug placeholder
+            ctx_len = torch.zeros(
+                num_sequences, dtype=torch.int32, device=device
+            )  # debug placeholder
         else:
             # ---- Phase 2 (DFlash): commit accepted target-derived K/V into the ctx caches ----
             if self.sync_before_hidden_state_capture:
