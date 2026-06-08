@@ -69,6 +69,8 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
@@ -397,6 +399,153 @@ class Step3p7MLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Fused MoE routing op (sigmoid + per-expert bias + top-k + renormalize)
+# ---------------------------------------------------------------------------
+#
+# Step's router does the following per token (see ``Step3p7MoE.forward``):
+#     probs   = sigmoid(router_logits)               # un-biased gate probs
+#     scores  = probs + router_bias                  # selection-only bias
+#     idx     = topk(scores, k)                       # pick experts by score
+#     weights = gather(probs, idx)                    # weights use UN-biased probs
+#     weights = weights / (weights.sum(-1) + 1e-20)   # renormalize
+#     weights = weights * routed_scaling_factor       # scale
+#     weights = weights.to(hidden.dtype)              # cast
+#
+# At TP8/batch=1 decode the router gate is replicated, so this runs on a tiny
+# ``[1, num_experts]`` fp32 tensor for each of the 42 MoE layers. As separate
+# torch ops that is ~7 launch-bound kernels per layer on the routed critical
+# path (the shared expert is overlapped on an aux stream by ``multi_stream_moe``).
+# This custom op fuses all of them into a single Triton launch that produces
+# ``(routing_weights, selected_experts)`` directly, trading 7 serial kernels for
+# 1 under cudagraph replay. The math is unchanged (same fp32 sigmoid / bias /
+# top-k / renormalize, same bf16 output rounding), so it is numerics-faithful to
+# the reference path.
+
+
+@triton.jit
+def _step3p7_router_topk_kernel(
+    logits_ptr,  # [T, E] router logits (fp32)
+    bias_ptr,  # [E]    per-expert selection bias (fp32)
+    weights_ptr,  # [T, K] out routing weights (out_dtype)
+    indices_ptr,  # [T, K] out selected expert ids (int64)
+    num_tokens,
+    num_experts,
+    scaling_factor,  # fp32 scalar (routed_scaling_factor)
+    stride_lt,
+    stride_le,
+    stride_wt,
+    stride_wk,
+    stride_it,
+    stride_ik,
+    BLOCK_E: tl.constexpr,  # >= num_experts, power of 2
+    TOP_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,  # >= TOP_K, power of 2
+):
+    """One Triton program per token: sigmoid+bias top-k selection + renormalize."""
+    token_id = tl.program_id(0)
+    if token_id >= num_tokens:
+        return
+
+    offs_e = tl.arange(0, BLOCK_E)
+    mask_e = offs_e < num_experts
+    logits = tl.load(
+        logits_ptr + token_id * stride_lt + offs_e * stride_le,
+        mask=mask_e,
+        other=0.0,
+    ).to(tl.float32)
+    bias = tl.load(bias_ptr + offs_e, mask=mask_e, other=0.0).to(tl.float32)
+
+    # Un-biased gate probabilities (used for weights) and biased selection scores.
+    probs = tl.sigmoid(logits)
+    scores = tl.where(mask_e, probs + bias, float("-inf"))
+
+    # Iterative top-k by SCORE; record the UN-biased prob at each argmax.
+    topk_probs = tl.zeros([BLOCK_K], dtype=tl.float32)
+    topk_idxs = tl.zeros([BLOCK_K], dtype=tl.int32)
+    offs_k = tl.arange(0, BLOCK_K)
+    for k_i in tl.static_range(TOP_K):
+        max_val = tl.max(scores, axis=0)
+        is_max = scores == max_val
+        candidate = tl.where(is_max, offs_e, BLOCK_E)  # smallest index on ties
+        max_idx = tl.min(candidate, axis=0)
+        prob_at_max = tl.sum(tl.where(offs_e == max_idx, probs, 0.0), axis=0)
+        ki_mask = offs_k == k_i
+        topk_probs = tl.where(ki_mask, prob_at_max, topk_probs)
+        topk_idxs = tl.where(ki_mask, max_idx.to(tl.int32), topk_idxs)
+        scores = tl.where(offs_e == max_idx, float("-inf"), scores)
+
+    # Renormalize over the K selected probs (matches the ``+ 1e-20`` guard), scale.
+    mask_k = offs_k < TOP_K
+    sum_probs = tl.sum(tl.where(mask_k, topk_probs, 0.0), axis=0)
+    weights = topk_probs / (sum_probs + 1e-20) * scaling_factor
+
+    tl.store(weights_ptr + token_id * stride_wt + offs_k * stride_wk, weights, mask=mask_k)
+    tl.store(indices_ptr + token_id * stride_it + offs_k * stride_ik, topk_idxs, mask=mask_k)
+
+
+def _next_pow2(n: int) -> int:
+    return 1 << math.ceil(math.log2(max(n, 1)))
+
+
+@torch.library.custom_op("auto_deploy::step3p7_fused_router_topk", mutates_args=())
+def step3p7_fused_router_topk(
+    router_logits: torch.Tensor,
+    router_bias: torch.Tensor,
+    top_k: int,
+    routed_scaling_factor: float,
+    out_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused sigmoid + per-expert-bias top-k MoE routing in a single Triton launch.
+
+    Mathematically equivalent to the separate-op reference in ``Step3p7MoE.forward``.
+
+    Returns:
+        routing_weights: ``(T, top_k)`` tensor in ``out_dtype``.
+        selected_experts: ``(T, top_k)`` ``int64`` tensor of expert ids.
+    """
+    assert router_logits.ndim == 2, "router_logits must be 2-D (T, E)"
+    num_tokens, num_experts = router_logits.shape
+    routing_weights = torch.empty((num_tokens, top_k), dtype=out_dtype, device=router_logits.device)
+    selected_experts = torch.empty(
+        (num_tokens, top_k), dtype=torch.int64, device=router_logits.device
+    )
+    grid = (num_tokens,)
+    _step3p7_router_topk_kernel[grid](
+        router_logits,
+        router_bias,
+        routing_weights,
+        selected_experts,
+        num_tokens,
+        num_experts,
+        float(routed_scaling_factor),
+        router_logits.stride(0),
+        router_logits.stride(1),
+        routing_weights.stride(0),
+        routing_weights.stride(1),
+        selected_experts.stride(0),
+        selected_experts.stride(1),
+        BLOCK_E=_next_pow2(num_experts),
+        TOP_K=top_k,
+        BLOCK_K=_next_pow2(top_k),
+    )
+    return routing_weights, selected_experts
+
+
+@step3p7_fused_router_topk.register_fake
+def _step3p7_fused_router_topk_fake(
+    router_logits: torch.Tensor,
+    router_bias: torch.Tensor,
+    top_k: int,
+    routed_scaling_factor: float,
+    out_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = router_logits.shape[0]
+    routing_weights = router_logits.new_empty((num_tokens, top_k), dtype=out_dtype)
+    selected_experts = router_logits.new_empty((num_tokens, top_k), dtype=torch.int64)
+    return routing_weights, selected_experts
+
+
+# ---------------------------------------------------------------------------
 # Sparse MoE block (routed experts + shared expert)
 # ---------------------------------------------------------------------------
 
@@ -445,14 +594,16 @@ class Step3p7MoE(nn.Module):
 
         # fp32 router GEMM (config.need_fp32_gate)
         router_logits = F.linear(hidden_flat.float(), self.gate.weight.float())
-        probs = torch.sigmoid(router_logits)
 
-        scores = probs + self.router_bias.unsqueeze(0)
-        _, selected_experts = torch.topk(scores, self.top_k, dim=-1)
-        routing_weights = torch.gather(probs, 1, selected_experts)
-        routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        routing_weights = routing_weights * self.routed_scaling_factor
-        routing_weights = routing_weights.to(hidden_flat.dtype)
+        # Fused sigmoid + per-expert-bias top-k routing in a single Triton launch
+        # (replaces the 7 separate torch ops; numerics-faithful, see custom op above).
+        routing_weights, selected_experts = torch.ops.auto_deploy.step3p7_fused_router_topk(
+            router_logits,
+            self.router_bias,
+            self.top_k,
+            self.routed_scaling_factor,
+            hidden_flat.dtype,
+        )
 
         routed = torch.ops.auto_deploy.torch_moe(
             hidden_flat,
