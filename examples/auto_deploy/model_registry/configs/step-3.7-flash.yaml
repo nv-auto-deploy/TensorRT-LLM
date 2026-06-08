@@ -68,3 +68,21 @@ transforms:
   # (default.yaml:312-314); not overridden elsewhere for this model.
   multi_stream_moe:
     enabled: true
+  # Vocab-parallel (column) shard the otherwise-REPLICATED lm_head weight across the
+  # TP=8 group + all_gather the vocab-dim logit shards. lm_head (modeling_step3p7.py:946,
+  # used :984) is the only linear with no torch_linear_simple sharding hint, so
+  # apply_sharding_hints leaves its ~[hidden x 128896] bf16 weight fully replicated -> every
+  # rank reads the whole thing on every decode step (a non-trivial slice of per-step HBM at
+  # TP8/B=1). Column shard (dim-0 / vocab) + all_gather (dim -1) makes each rank read only
+  # vocab/8 = 16112 rows, cutting the lm_head weight read ~8x. The win is HBM-bytes (survives
+  # cudagraph, not just a launch-count change) and bit-exact (concatenation, no reduction).
+  # Reuses the heuristic simple-shard machinery (WeightShardingInfo COLUMN + all_gather ->
+  # _shard_parameter_node); get_lm_head_node already understands the resulting
+  # `lm_head -> all_gather -> output` pattern so gather_logits_before_lm_head composes cleanly.
+  # This is the GRAPH-TRANSFORM mechanism (shard post-export so the all_gather register_fake
+  # re-propagates [..., vocab], avoiding the export-time `vocab*world_size` constant that
+  # blocks the modeling-edit approach).
+  shard_lm_head_vocab_parallel:
+    stage: post_load_fusion
+    enabled: true
+    run_shape_prop: true
