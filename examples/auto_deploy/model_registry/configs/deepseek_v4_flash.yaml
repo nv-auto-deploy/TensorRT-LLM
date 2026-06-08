@@ -14,7 +14,6 @@
 # limitations under the License.
 
 # DeepSeek V4 Flash full-layer config for generation quality validation with monolithic decode CUDA graph.
-attn_backend: deepseek_v4_sparse
 compile_backend: torch-cudagraph
 model_factory: DeepseekV4AutoModelForCausalLM
 max_batch_size: 2
@@ -26,6 +25,10 @@ cuda_graph_config:
 transforms:
   load_weights:
     disable_preload: true
+  insert_cached_deepseek_v4_sparse_attention:
+    stage: cache_init
+    backend: flashmla_deepseek_v4_sparse
+    enabled: true
   fuse_rmsnorm:
     rmsnorm_backend: torch
   detect_sharding:

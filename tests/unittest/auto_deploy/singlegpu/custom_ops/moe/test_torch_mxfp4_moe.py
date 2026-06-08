@@ -711,6 +711,145 @@ def test_torch_mxfp4_moe_from_routing_ep_partitions_deepseek_layout_experts() ->
     torch.testing.assert_close(partial_sum, full, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
+    reason="Triton MXFP4 routed MoE Hopper path requires an SM90 GPU",
+)
+def test_triton_mxfp4_moe_from_routing_topk6_matches_torch_reference_on_hopper() -> None:
+    num_experts = 8
+    ep_size = 4
+    hidden_size = 32
+    intermediate_size = 32
+    alpha = 1.0
+    limit = 1.0
+    top_k = 6
+    x = torch.linspace(
+        -0.15,
+        0.2,
+        steps=6 * hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).reshape(6, hidden_size)
+    selected_experts = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5],
+            [2, 3, 4, 5, 6, 7],
+            [1, 2, 3, 4, 5, 6],
+            [3, 4, 5, 6, 7, 0],
+            [0, 2, 4, 6, 1, 3],
+            [1, 3, 5, 7, 0, 2],
+        ],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    assert selected_experts.shape[1] == top_k
+    routing_weights = torch.linspace(
+        0.1,
+        0.9,
+        steps=selected_experts.numel(),
+        dtype=torch.float32,
+        device="cuda",
+    ).reshape_as(selected_experts)
+    packed, _, _, _ = _deepseek_packed_params_from_layout(num_experts)
+    gate_up_bias = torch.zeros(
+        (num_experts, 2 * intermediate_size),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    down_bias = torch.zeros((num_experts, hidden_size), dtype=torch.bfloat16, device="cuda")
+
+    reference = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
+        x,
+        selected_experts,
+        routing_weights,
+        packed.gate_up_blocks.cuda(),
+        gate_up_bias,
+        packed.gate_up_scales.cuda(),
+        alpha,
+        limit,
+        packed.down_blocks.cuda(),
+        down_bias,
+        packed.down_scales.cuda(),
+        "up_gate",
+        "deepseek",
+    )
+    full = torch.ops.auto_deploy.triton_mxfp4_moe_from_routing(
+        x,
+        selected_experts,
+        routing_weights,
+        packed.gate_up_blocks.cuda(),
+        gate_up_bias,
+        packed.gate_up_scales.cuda(),
+        alpha,
+        limit,
+        packed.down_blocks.cuda(),
+        down_bias,
+        packed.down_scales.cuda(),
+        "up_gate",
+        "deepseek",
+    )
+
+    partial_sum = torch.zeros_like(full)
+    for ep_rank in range(ep_size):
+        lo, hi = _expert_slice(num_experts, ep_size, ep_rank)
+        partial_sum += torch.ops.auto_deploy.triton_mxfp4_moe_from_routing_ep(
+            x,
+            selected_experts,
+            routing_weights,
+            packed.gate_up_blocks[lo:hi].cuda(),
+            gate_up_bias[lo:hi],
+            packed.gate_up_scales[lo:hi].cuda(),
+            alpha,
+            limit,
+            packed.down_blocks[lo:hi].cuda(),
+            down_bias[lo:hi],
+            packed.down_scales[lo:hi].cuda(),
+            "up_gate",
+            "deepseek",
+            expert_start=lo,
+            num_experts_total=num_experts,
+        )
+
+    assert full.dtype == torch.bfloat16
+    assert partial_sum.dtype == torch.bfloat16
+    torch.testing.assert_close(full, reference, rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(partial_sum, full, rtol=5e-2, atol=5e-2)
+
+    lo, hi = _expert_slice(num_experts, ep_size, 1)
+    ep_args = (
+        x,
+        selected_experts,
+        routing_weights,
+        packed.gate_up_blocks[lo:hi].cuda(),
+        gate_up_bias[lo:hi],
+        packed.gate_up_scales[lo:hi].cuda(),
+        alpha,
+        limit,
+        packed.down_blocks[lo:hi].cuda(),
+        down_bias[lo:hi],
+        packed.down_scales[lo:hi].cuda(),
+        "up_gate",
+        "deepseek",
+    )
+    expected_ep = torch.ops.auto_deploy.triton_mxfp4_moe_from_routing_ep(
+        *ep_args,
+        expert_start=lo,
+        num_experts_total=num_experts,
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_ep = torch.ops.auto_deploy.triton_mxfp4_moe_from_routing_ep(
+            *ep_args,
+            expert_start=lo,
+            num_experts_total=num_experts,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(captured_ep, expected_ep, rtol=5e-2, atol=5e-2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for CUDA graph capture")
 def test_torch_mxfp4_moe_from_routing_ep_allows_cuda_graph_capture() -> None:
     num_experts = 2

@@ -17,9 +17,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 from _model_test_utils import assert_rmse_close
+from omegaconf import OmegaConf
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.export import Dim
 from torch.fx import Graph
@@ -31,6 +34,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention import (  # noqa: E402
 )
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_sparse_attention import (  # noqa: E402
     DeepSeekV4SparseAttention,
+    FlashMLADeepSeekV4SparseAttention,
 )
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (  # noqa: E402
     BatchInfo,
@@ -49,6 +53,13 @@ from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (  # noqa:
     InsertCachedDeepSeekV4SparseAttention,
     _InsertCachedOperator,
 )
+
+
+def _repo_root() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "tensorrt_llm/_torch/auto_deploy/config/default.yaml").is_file():
+            return parent
+    raise AssertionError("Could not locate TensorRT-LLM repository root")
 
 
 def _page_meta(
@@ -266,6 +277,46 @@ def _run_cached_sparse_attention(
     indexer_compressor_kv_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
     indexer_compressor_gate_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
     return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        *_empty_sparse_attention_tensors(q, kv),
+        *metadata,
+        swa_cache,
+        mhc_cache,
+        compressor_kv_cache,
+        compressor_gate_cache,
+        indexer_compressor_kv_cache,
+        indexer_compressor_gate_cache,
+        softmax_scale,
+        window_size,
+        compress_ratio,
+        None,
+        1e-6,
+        None,
+        out=out,
+    )
+
+
+def _run_flashmla_cached_sparse_attention(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    metadata: tuple[torch.Tensor, ...],
+    swa_cache: torch.Tensor,
+    softmax_scale: float = 1.0,
+    window_size: int | None = None,
+    compress_ratio: int = 0,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    mhc_cache = swa_cache.new_empty(swa_cache.shape)
+    compressor_kv_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
+    compressor_gate_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
+    indexer_compressor_kv_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
+    indexer_compressor_gate_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
+    return torch.ops.auto_deploy.flashmla_deepseek_v4_sparse_attention_with_cache(
         q,
         kv,
         attn_sink,
@@ -576,6 +627,442 @@ def _paged_cache_row(
 
 def _has_resource_with_suffix(resource_names: list[str], suffix: str) -> bool:
     return any(name.endswith(suffix) for name in resource_names)
+
+
+def test_flash_mla_sparse_prefill_contract_requires_dsv4_kwargs() -> None:
+    def sparse_prefill_without_dsv4_kwargs(q, kv, indices, sm_scale, d_v=512):
+        return q, kv, indices, sm_scale, d_v
+
+    def dsv4_flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d_v=512,
+        attn_sink=None,
+        topk_length=None,
+        out=None,
+    ):
+        return q, kv, indices, sm_scale, d_v, attn_sink, topk_length, out
+
+    with pytest.raises(RuntimeError, match="DeepSeek V4 contract"):
+        dsv4_sparse._validate_flash_mla_sparse_prefill_contract(sparse_prefill_without_dsv4_kwargs)
+
+    dsv4_sparse._validate_flash_mla_sparse_prefill_contract(dsv4_flash_mla_sparse_fwd)
+
+
+def test_flash_mla_sparse_prefill_input_preparation_offsets_batches() -> None:
+    q = torch.empty(2, 2, 3, 4)
+    kv = torch.empty(2, 5, 4)
+    topk_idxs = torch.tensor(
+        [
+            [[0, 4, -1, 5], [2, 99, 1, -2]],
+            [[0, 3, 4, -1], [1, 5, 2, 0]],
+        ],
+        dtype=torch.int64,
+    )
+
+    q_flat, kv_flat, indices, topk_length = dsv4_sparse._prepare_flash_mla_sparse_prefill_inputs(
+        q, kv, topk_idxs
+    )
+
+    assert q_flat.shape == (4, 3, 4)
+    assert kv_flat.shape == (10, 1, 4)
+    assert indices.shape == (4, 1, dsv4_sparse._FLASH_MLA_PREFILL_TOPK_MULTIPLE)
+    assert topk_length.tolist() == [4, 4, 4, 4]
+    expected_prefix = torch.tensor(
+        [[[0, 4, -1, -1]], [[2, -1, 1, -1]], [[5, 8, 9, -1]], [[6, -1, 7, 5]]],
+        dtype=torch.int32,
+    )
+    torch.testing.assert_close(indices[:, :, :4], expected_prefix)
+    assert torch.all(indices[:, :, 4:] == -1)
+
+
+def test_flash_mla_model1_cache_pack_writes_block_layout() -> None:
+    block_size = 4
+    cache = torch.zeros(
+        1,
+        block_size,
+        dsv4_sparse._FLASH_MLA_MODEL1_BYTES_PER_TOKEN,
+        dtype=torch.uint8,
+    )
+    values = torch.zeros(2, dsv4_sparse._FLASH_MLA_MODEL1_HEAD_DIM, dtype=torch.bfloat16)
+    values[0, 0] = 1.0
+    values[0, dsv4_sparse._FLASH_MLA_MODEL1_NOPE_DIM] = 3.0
+    values[1, 0] = 2.0
+    values[1, dsv4_sparse._FLASH_MLA_MODEL1_NOPE_DIM] = 4.0
+    cu_num_pages, cache_loc, _ = _page_meta([2], [0], [0], tokens_per_block=block_size)
+
+    dsv4_sparse._write_paged_cache_rows(
+        values,
+        cache,
+        seq_idx=0,
+        input_pos=0,
+        cu_num_pages_host=cu_num_pages,
+        cache_loc_host=cache_loc,
+    )
+
+    flat = cache.view(torch.uint8).view(1, -1)[0]
+    token_data_bytes = dsv4_sparse._FLASH_MLA_MODEL1_TOKEN_DATA_BYTES
+    scale_base = block_size * token_data_bytes
+    first_rope_start = dsv4_sparse._FLASH_MLA_MODEL1_NOPE_DIM
+    second_rope_start = token_data_bytes + dsv4_sparse._FLASH_MLA_MODEL1_NOPE_DIM
+
+    assert flat[0].item() != 0
+    assert flat[token_data_bytes].item() != 0
+    first_rope = flat[first_rope_start : first_rope_start + 2].view(torch.bfloat16)
+    second_rope = flat[second_rope_start : second_rope_start + 2].view(torch.bfloat16)
+    torch.testing.assert_close(first_rope, torch.tensor([3.0], dtype=torch.bfloat16))
+    torch.testing.assert_close(second_rope, torch.tensor([4.0], dtype=torch.bfloat16))
+    assert flat[scale_base : scale_base + dsv4_sparse._FLASH_MLA_MODEL1_NUM_TILES].any()
+    second_scale = scale_base + dsv4_sparse._FLASH_MLA_MODEL1_SCALE_BYTES
+    assert flat[second_scale : second_scale + dsv4_sparse._FLASH_MLA_MODEL1_NUM_TILES].any()
+
+
+def test_flash_mla_model1_cache_write_uses_vectorized_page_translation(monkeypatch) -> None:
+    block_size = 2
+    cache = torch.zeros(
+        3,
+        block_size,
+        dsv4_sparse._FLASH_MLA_MODEL1_BYTES_PER_TOKEN,
+        dtype=torch.uint8,
+    )
+    values = torch.zeros(3, dsv4_sparse._FLASH_MLA_MODEL1_HEAD_DIM, dtype=torch.bfloat16)
+    values[:, dsv4_sparse._FLASH_MLA_MODEL1_NOPE_DIM] = torch.tensor(
+        [11.0, 12.0, 13.0],
+        dtype=torch.bfloat16,
+    )
+    cu_num_pages = torch.tensor([0, 3], dtype=torch.int32)
+    cache_loc = torch.tensor([2, 0, 1], dtype=torch.int32)
+
+    def scalar_page_lookup_should_not_run(*args, **kwargs):
+        raise AssertionError("scalar page lookup should not run")
+
+    monkeypatch.setattr(
+        dsv4_sparse,
+        "_host_page_id_and_offset",
+        scalar_page_lookup_should_not_run,
+    )
+
+    dsv4_sparse._write_paged_cache_rows(
+        values,
+        cache,
+        seq_idx=0,
+        input_pos=1,
+        cu_num_pages_host=cu_num_pages,
+        cache_loc_host=cache_loc,
+    )
+
+    token_data_bytes = dsv4_sparse._FLASH_MLA_MODEL1_TOKEN_DATA_BYTES
+    rope_offset = dsv4_sparse._FLASH_MLA_MODEL1_NOPE_DIM
+
+    def rope_value(page_id: int, page_offset: int) -> torch.Tensor:
+        flat_page = cache[page_id].view(-1)
+        start = page_offset * token_data_bytes + rope_offset
+        return flat_page[start : start + 2].view(torch.bfloat16)
+
+    torch.testing.assert_close(rope_value(2, 1), torch.tensor([11.0], dtype=torch.bfloat16))
+    torch.testing.assert_close(rope_value(0, 0), torch.tensor([12.0], dtype=torch.bfloat16))
+    torch.testing.assert_close(rope_value(0, 1), torch.tensor([13.0], dtype=torch.bfloat16))
+    assert not cache[1].any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_flash_mla_model1_cache_pack_is_cuda_graph_capturable() -> None:
+    block_size = 4
+    cache = torch.zeros(
+        1,
+        block_size,
+        dsv4_sparse._FLASH_MLA_MODEL1_BYTES_PER_TOKEN,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    values = torch.randn(
+        2,
+        dsv4_sparse._FLASH_MLA_MODEL1_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    page_ids = torch.zeros(2, dtype=torch.int64, device="cuda")
+    page_offsets = torch.tensor([0, 1], dtype=torch.int64, device="cuda")
+    valid = torch.ones(2, dtype=torch.bool, device="cuda")
+
+    dsv4_sparse._write_flash_mla_model1_rows_to_cache(
+        cache,
+        values,
+        page_ids,
+        page_offsets,
+        valid,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dsv4_sparse._write_flash_mla_model1_rows_to_cache(
+            cache,
+            values,
+            page_ids,
+            page_offsets,
+            valid,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    flat = cache.view(torch.uint8).view(1, -1)[0]
+    token_data_bytes = dsv4_sparse._FLASH_MLA_MODEL1_TOKEN_DATA_BYTES
+    scale_base = block_size * token_data_bytes
+    assert flat[: token_data_bytes * 2].any()
+    assert flat[scale_base : scale_base + 2 * dsv4_sparse._FLASH_MLA_MODEL1_SCALE_BYTES].any()
+
+
+def test_flash_mla_sparse_decode_backend_builds_swa_indices(monkeypatch) -> None:
+    num_decode = 2
+    num_heads = 64
+    head_dim = dsv4_sparse._FLASH_MLA_MODEL1_HEAD_DIM
+    tokens_per_block = 2
+    metadata = _multi_decode_meta([2, 4], tokens_per_block=tokens_per_block)
+    q = torch.randn(num_decode, 1, num_heads, head_dim, dtype=torch.bfloat16)
+    kv = torch.randn(num_decode, 1, head_dim, dtype=torch.bfloat16)
+    attn_sink = torch.zeros(num_heads, dtype=torch.float32)
+    topk_idxs = torch.full((num_decode, 1, 1), -1, dtype=torch.int32)
+    swa_cache = torch.zeros(
+        5,
+        tokens_per_block,
+        dsv4_sparse._FLASH_MLA_MODEL1_BYTES_PER_TOKEN,
+        dtype=torch.uint8,
+    )
+    calls = []
+
+    def fake_flash_mla_sparse_decode(
+        q_decode,
+        swa_cache_arg,
+        attn_sink_arg,
+        indices,
+        topk_length,
+        softmax_scale,
+        extra_k_cache=None,
+        extra_indices=None,
+        extra_topk_length=None,
+    ):
+        calls.append(
+            {
+                "q_shape": tuple(q_decode.shape),
+                "cache_shape": tuple(swa_cache_arg.shape),
+                "attn_sink_shape": tuple(attn_sink_arg.shape),
+                "indices": indices.clone(),
+                "topk_length": topk_length.clone(),
+                "softmax_scale": softmax_scale,
+                "extra_k_cache": extra_k_cache,
+                "extra_indices": extra_indices,
+                "extra_topk_length": extra_topk_length,
+            }
+        )
+        return q_decode
+
+    monkeypatch.setattr(dsv4_sparse, "_flash_mla_sparse_decode", fake_flash_mla_sparse_decode)
+
+    output = _run_flashmla_cached_sparse_attention(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        metadata,
+        swa_cache,
+        softmax_scale=0.25,
+        window_size=3,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["q_shape"] == (num_decode, num_heads, head_dim)
+    assert calls[0]["cache_shape"] == tuple(swa_cache.shape)
+    assert calls[0]["attn_sink_shape"] == (num_heads,)
+    assert calls[0]["softmax_scale"] == 0.25
+    expected_prefix = torch.tensor([[[0, 1, 2]], [[6, 7, 8]]], dtype=torch.int32)
+    assert calls[0]["indices"].shape == (
+        num_decode,
+        1,
+        dsv4_sparse._FLASH_MLA_DECODE_TOPK_MULTIPLE,
+    )
+    torch.testing.assert_close(calls[0]["indices"][:, :, :3], expected_prefix)
+    assert torch.all(calls[0]["indices"][:, :, 3:] == -1)
+    torch.testing.assert_close(calls[0]["topk_length"], torch.tensor([3, 3], dtype=torch.int32))
+    assert calls[0]["extra_k_cache"] is None
+    torch.testing.assert_close(
+        output.reshape(num_decode, num_heads, head_dim), q.reshape(num_decode, num_heads, head_dim)
+    )
+
+
+def test_flashmla_sparse_backend_handles_mixed_prefill_decode(monkeypatch) -> None:
+    num_heads = 2
+    head_dim = dsv4_sparse._FLASH_MLA_MODEL1_HEAD_DIM
+    tokens_per_block = 2
+    batch_info_host = BatchInfo()
+    batch_info_host.update([1, 2, 0, 0, 1, 1])
+    cu_num_pages, cache_loc, last_page_len = _page_meta(
+        [2, 1],
+        [0, 3],
+        [0, 1],
+        tokens_per_block=tokens_per_block,
+    )
+    metadata = (
+        batch_info_host.serialize(),
+        torch.tensor([2, 1], dtype=torch.int32),
+        torch.tensor([0, 3], dtype=torch.int32),
+        torch.tensor([0, 1], dtype=torch.int64),
+        torch.tensor([0, 2, 3], dtype=torch.int32),
+        cu_num_pages,
+        cache_loc,
+        last_page_len,
+    )
+    q = torch.randn(1, 3, num_heads, head_dim, dtype=torch.bfloat16)
+    kv = torch.randn(1, 3, head_dim, dtype=torch.bfloat16)
+    attn_sink = torch.zeros(num_heads, dtype=torch.float32)
+    topk_idxs = torch.full((1, 3, 1), -1, dtype=torch.int32)
+    swa_cache = torch.zeros(
+        3,
+        tokens_per_block,
+        dsv4_sparse._FLASH_MLA_MODEL1_BYTES_PER_TOKEN,
+        dtype=torch.uint8,
+    )
+    calls = {"prefill": 0, "decode": []}
+
+    def fake_flash_mla_sparse_prefill(
+        q_prefill,
+        kv_source,
+        attn_sink_arg,
+        topk_idxs_arg,
+        softmax_scale,
+    ):
+        del kv_source, attn_sink_arg, topk_idxs_arg, softmax_scale
+        calls["prefill"] += 1
+        return q_prefill + 10
+
+    def fake_flash_mla_sparse_decode(
+        q_decode,
+        swa_cache_arg,
+        attn_sink_arg,
+        indices,
+        topk_length,
+        softmax_scale,
+        extra_k_cache=None,
+        extra_indices=None,
+        extra_topk_length=None,
+    ):
+        del swa_cache_arg, attn_sink_arg, softmax_scale, extra_k_cache, extra_indices
+        del extra_topk_length
+        calls["decode"].append(
+            {
+                "q": q_decode.clone(),
+                "indices": indices.clone(),
+                "topk_length": topk_length.clone(),
+            }
+        )
+        return q_decode + 20
+
+    monkeypatch.setattr(dsv4_sparse, "_flash_mla_sparse_prefill", fake_flash_mla_sparse_prefill)
+    monkeypatch.setattr(dsv4_sparse, "_flash_mla_sparse_decode", fake_flash_mla_sparse_decode)
+
+    output = _run_flashmla_cached_sparse_attention(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        metadata,
+        swa_cache,
+        softmax_scale=0.25,
+        window_size=2,
+    )
+
+    assert calls["prefill"] == 1
+    assert len(calls["decode"]) == 1
+    assert calls["decode"][0]["q"].shape == (1, num_heads, head_dim)
+    assert calls["decode"][0]["topk_length"].tolist() == [2]
+    assert calls["decode"][0]["indices"].shape == (1, 1, 128)
+    torch.testing.assert_close(output[:, :2], q[:, :2] + 10)
+    torch.testing.assert_close(output[:, 2:3], q[:, 2:3] + 20)
+
+
+def test_sparse_source_op_does_not_call_flashmla(monkeypatch) -> None:
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("semantic sparse attention must not call FlashMLA")
+
+    monkeypatch.setattr(dsv4_sparse, "_flash_mla_sparse_prefill", fail_if_called)
+
+    q = torch.randn(1, 2, 2, 4)
+    kv = torch.randn(1, 4, 4)
+    attn_sink = torch.randn(2)
+    topk_idxs = torch.tensor([[[0, 1], [2, 3]]], dtype=torch.int64)
+
+    output = _run_sparse_attention(q, kv, attn_sink, topk_idxs, softmax_scale=0.5)
+    expected = dsv4_sparse._deepseek_v4_sparse_attention(q, kv, attn_sink, topk_idxs, 0.5)
+    torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flashmla_sparse_backend_op_invokes_flashmla_kernel(monkeypatch) -> None:
+    capability = torch.cuda.get_device_capability()
+    if capability[0] < 9:
+        pytest.skip("FlashMLA sparse prefill requires Hopper or newer")
+
+    flash_mla_sparse_fwd = dsv4_sparse._get_flash_mla_sparse_prefill()
+    if flash_mla_sparse_fwd is None:
+        pytest.skip("FlashMLA sparse prefill interface is not available")
+
+    torch.manual_seed(123)
+    batch_size = 1
+    seq_len = 2
+    num_heads = 64
+    head_dim = 512
+    kv_rows = 256
+    topk = 128
+    softmax_scale = head_dim**-0.5
+    device = torch.device("cuda")
+
+    q = (torch.randn(batch_size, seq_len, num_heads, head_dim, device=device) / 8).to(
+        torch.bfloat16
+    )
+    kv = (torch.randn(batch_size, kv_rows, head_dim, device=device) / 8).to(torch.bfloat16)
+    attn_sink = torch.linspace(-0.2, 0.2, num_heads, device=device, dtype=torch.float32)
+    topk_idxs = torch.arange(topk, device=device, dtype=torch.int32).view(1, 1, topk)
+    topk_idxs = topk_idxs.expand(batch_size, seq_len, topk).contiguous()
+    metadata = _context_meta(seq_len)
+    swa_cache = torch.empty(
+        1,
+        seq_len,
+        dsv4_sparse._FLASH_MLA_MODEL1_BYTES_PER_TOKEN,
+        device=device,
+        dtype=torch.uint8,
+    )
+
+    calls = []
+
+    def counted_flash_mla_sparse_fwd(*args, **kwargs):
+        q_flat, kv_flat, indices = args[:3]
+        calls.append((tuple(q_flat.shape), tuple(kv_flat.shape), tuple(indices.shape)))
+        return flash_mla_sparse_fwd(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dsv4_sparse,
+        "_get_flash_mla_sparse_prefill",
+        lambda: counted_flash_mla_sparse_fwd,
+    )
+
+    output = _run_flashmla_cached_sparse_attention(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        metadata,
+        swa_cache,
+        softmax_scale,
+    )
+    reference = dsv4_sparse._deepseek_v4_sparse_attention(
+        q, kv, attn_sink, topk_idxs, softmax_scale
+    )
+
+    assert calls == [((2, 64, 512), (256, 1, 512), (2, 1, 128))]
+    assert torch.allclose(output.float(), reference.float(), atol=5e-2, rtol=5e-2)
 
 
 def test_sink_only_all_negative_topk_yields_finite_zero_output() -> None:
@@ -2496,6 +2983,41 @@ def test_deepseek_sparse_cache_initializers_use_schema_names_for_source_args() -
     assert handlers["indexer_compressor_kv_cache"].token_shape == (3,)
 
 
+def test_flashmla_deepseek_sparse_cache_initializers_use_packed_cache_layout() -> None:
+    graph = Graph()
+    q_node = graph.placeholder("q")
+    kv_node = graph.placeholder("kv")
+    compressor_kv_node = graph.placeholder("compressor_kv")
+    indexer_compressor_kv_node = graph.placeholder("indexer_compressor_kv")
+
+    kv_node.meta["val"] = torch.empty(1, 2, 512, dtype=torch.bfloat16)
+    compressor_kv_node.meta["val"] = torch.empty(1, 2, 1024, dtype=torch.float32)
+    indexer_compressor_kv_node.meta["val"] = torch.empty(1, 2, 256, dtype=torch.float32)
+
+    source_node = graph.call_function(
+        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention.default,
+        args=(q_node,),
+        kwargs={
+            "kv": kv_node,
+            "compressor_kv": compressor_kv_node,
+            "indexer_compressor_kv": indexer_compressor_kv_node,
+        },
+    )
+
+    handlers = FlashMLADeepSeekV4SparseAttention.get_cache_initializers(
+        source_node,
+        KvCacheConfig(),
+    )
+
+    assert isinstance(handlers["swa_cache"], PagedResourceHandler)
+    assert handlers["swa_cache"].token_shape == (dsv4_sparse._FLASH_MLA_MODEL1_BYTES_PER_TOKEN,)
+    assert handlers["swa_cache"].dtype == torch.uint8
+    assert handlers["mhc_cache"].token_shape == (dsv4_sparse._FLASH_MLA_MODEL1_BYTES_PER_TOKEN,)
+    assert handlers["mhc_cache"].dtype == torch.uint8
+    assert handlers["compressor_kv_cache"].token_shape == (1024,)
+    assert handlers["indexer_compressor_kv_cache"].token_shape == (256,)
+
+
 @pytest.mark.parametrize("compress_ratio", [0, 4, 128])
 def test_deepseek_sparse_cache_transform_rewrites_source_op_and_adds_resource(
     compress_ratio: int,
@@ -2535,6 +3057,64 @@ def test_deepseek_sparse_cache_transform_rewrites_source_op_and_adds_resource(
     ):
         assert _has_resource_with_suffix(placeholder_names, suffix)
         assert _has_resource_with_suffix(resource_names, suffix)
+
+
+def test_deepseek_sparse_cache_transform_can_select_flashmla_backend() -> None:
+    q = torch.randn(1, 2, 1, dsv4_sparse._FLASH_MLA_MODEL1_HEAD_DIM)
+    kv = torch.randn(1, 2, dsv4_sparse._FLASH_MLA_MODEL1_HEAD_DIM)
+    attn_sink = torch.randn(1)
+    topk_idxs = torch.tensor([[[0], [1]]], dtype=torch.int64)
+    gm = torch_export_to_gm(
+        _TinyDeepSeekSparseModule(compress_ratio=0),
+        (q, kv, attn_sink, topk_idxs),
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=8,
+        max_batch_size=2,
+        max_num_tokens=8,
+        device="cpu",
+    )
+
+    transform = InsertCachedDeepSeekV4SparseAttention(
+        InsertCachedAttentionConfig(
+            stage=Stages.CACHE_INIT,
+            backend="flashmla_deepseek_v4_sparse",
+        )
+    )
+    gm, info = transform._apply(gm, cm, factory=None, shared_config=SharedConfig())
+
+    assert info.num_matches == 1
+    targets = [node.target for node in gm.graph.nodes if node.op == "call_function"]
+    assert torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention.default not in targets
+    assert (
+        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache.default not in targets
+    )
+    assert torch.ops.auto_deploy.flashmla_deepseek_v4_sparse_attention_with_cache.default in targets
+    for name, handler in cm._resource_lookup.items():
+        if name.endswith("_swa_cache") or name.endswith("_mhc_cache"):
+            assert handler.token_shape == (dsv4_sparse._FLASH_MLA_MODEL1_BYTES_PER_TOKEN,)
+            assert handler.dtype == torch.uint8
+
+
+def test_deepseek_v4_flash_registry_orders_sparse_cache_before_initialization() -> None:
+    root = _repo_root()
+    config_files = [
+        root / "tensorrt_llm/_torch/auto_deploy/config/default.yaml",
+        root / "examples/auto_deploy/model_registry/configs/dashboard_default.yaml",
+        root / "examples/auto_deploy/model_registry/configs/world_size_8.yaml",
+        root / "examples/auto_deploy/model_registry/configs/deepseek_v4_flash.yaml",
+    ]
+    cfg = OmegaConf.merge(*(OmegaConf.load(path) for path in config_files))
+    transform_names = list(cfg.transforms.keys())
+
+    assert cfg.transforms.insert_cached_deepseek_v4_sparse_attention.enabled is True
+    assert (
+        cfg.transforms.insert_cached_deepseek_v4_sparse_attention.backend
+        == "flashmla_deepseek_v4_sparse"
+    )
+    assert transform_names.index("insert_cached_deepseek_v4_sparse_attention") < (
+        transform_names.index("initialize_cache")
+    )
 
 
 def test_deepseek_sparse_cache_transform_rejects_unsupported_compress_ratio() -> None:

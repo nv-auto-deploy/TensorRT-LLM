@@ -18,6 +18,7 @@
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +26,57 @@ import torch.nn.functional as F
 # NOTE: ``triton_kernels`` is an optional dependency. The torch-reference MXFP4 ops
 # (``torch_mxfp4_moe`` etc.) must remain importable and usable without it, so all
 # ``triton_kernels`` symbols are imported lazily inside the functions that need them.
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
+
+if triton is not None:
+
+    @triton.jit
+    def _fill_int_kernel(tensor, n_elements, value, BLOCK: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        tl.store(tensor + offsets, value, mask=offsets < n_elements)
+
+    @triton.jit
+    def _routing_col_sum_kernel(expert_indices, col_sum, n_indices, BLOCK: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        cols = tl.load(expert_indices + offsets, mask=offsets < n_indices, other=-1)
+        valid = (offsets < n_indices) & (cols >= 0)
+        tl.atomic_add(col_sum + cols, 1, sem="relaxed", mask=valid)
+
+    @triton.jit
+    def _routing_prefix_sum_kernel(
+        col_sum,
+        col_offsets,
+        col_counters,
+        n_cols,
+        BLOCK: tl.constexpr,
+    ):
+        offsets = tl.arange(0, BLOCK)
+        values = tl.load(col_sum + offsets, mask=offsets < n_cols, other=0)
+        offsets_exclusive = tl.cumsum(values, 0) - values
+        tl.store(col_offsets + offsets, offsets_exclusive, mask=offsets < n_cols)
+        tl.store(col_counters + offsets, offsets_exclusive, mask=offsets < n_cols)
+
+    @triton.jit
+    def _routing_sorted_indices_kernel(
+        expert_indices,
+        col_counters,
+        col_sorted_indx,
+        row_sorted_indx,
+        n_indices,
+        BLOCK: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        cols = tl.load(expert_indices + offsets, mask=offsets < n_indices, other=-1)
+        valid = (offsets < n_indices) & (cols >= 0)
+        sorted_offsets = tl.atomic_add(col_counters + cols, 1, sem="relaxed", mask=valid)
+        tl.store(col_sorted_indx + sorted_offsets, offsets, mask=valid)
+        tl.store(row_sorted_indx + offsets, sorted_offsets, mask=valid)
+
 
 _E2M1_VALUES = (
     0.0,
@@ -65,6 +117,123 @@ TensorCacheKey = tuple[
     int | None,
 ]
 WeightCacheKey = tuple[object, ...]
+
+
+@dataclass
+class _RoutingSparseMatrix:
+    vals: torch.Tensor
+    indx: torch.Tensor
+    mask: object
+    mask_metadata: object
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _next_power_of_two(value: int) -> int:
+    return 1 << (value - 1).bit_length()
+
+
+def _make_routing_metadata_from_indices(expert_indices: torch.Tensor, num_experts: int) -> object:
+    if triton is None:
+        raise ImportError("triton is required for Triton MXFP4 routed MoE metadata.")
+
+    from triton_kernels.tensor_details.bitmatrix import BitmatrixMetadata
+
+    expert_indices = expert_indices.to(torch.int32).contiguous()
+    n_indices = expert_indices.numel()
+    device = expert_indices.device
+    col_sum = torch.empty((num_experts,), dtype=torch.int32, device=device)
+    col_offsets = torch.empty((num_experts,), dtype=torch.int32, device=device)
+    col_counters = torch.empty((num_experts,), dtype=torch.int32, device=device)
+    col_sorted_indx = torch.empty((n_indices,), dtype=torch.int32, device=device)
+    row_sorted_indx = torch.empty((n_indices,), dtype=torch.int32, device=device)
+
+    block_indices = 256
+    block_cols = _next_power_of_two(num_experts)
+    _fill_int_kernel[(triton.cdiv(num_experts, block_indices),)](
+        col_sum,
+        num_experts,
+        0,
+        BLOCK=block_indices,
+    )
+    _fill_int_kernel[(triton.cdiv(n_indices, block_indices),)](
+        col_sorted_indx,
+        n_indices,
+        -1,
+        BLOCK=block_indices,
+    )
+    _fill_int_kernel[(triton.cdiv(n_indices, block_indices),)](
+        row_sorted_indx,
+        n_indices,
+        -1,
+        BLOCK=block_indices,
+    )
+    _routing_col_sum_kernel[(triton.cdiv(n_indices, block_indices),)](
+        expert_indices,
+        col_sum,
+        n_indices,
+        BLOCK=block_indices,
+    )
+    _routing_prefix_sum_kernel[(1,)](
+        col_sum,
+        col_offsets,
+        col_counters,
+        num_experts,
+        BLOCK=block_cols,
+    )
+    _routing_sorted_indices_kernel[(triton.cdiv(n_indices, block_indices),)](
+        expert_indices,
+        col_counters,
+        col_sorted_indx,
+        row_sorted_indx,
+        n_indices,
+        BLOCK=block_indices,
+    )
+    return BitmatrixMetadata(
+        col_sum=col_sum,
+        col_sorted_indx=col_sorted_indx,
+        row_sorted_indx=row_sorted_indx,
+    )
+
+
+def _make_routing_bitmatrix(
+    selected: torch.Tensor,
+    num_experts: int,
+    valid_mask: torch.Tensor | None = None,
+) -> object:
+    from triton_kernels.tensor import BIT, Bitmatrix
+
+    num_tokens, top_k = selected.shape
+
+    def cdiv(x, y):
+        return (x + y - 1) // y
+
+    bitmatrix_data = torch.zeros(
+        (cdiv(num_experts, 32), cdiv(num_tokens, 32) * 32),
+        dtype=torch.int32,
+        device=selected.device,
+    )
+    bitmatrix_data = bitmatrix_data.t()[:num_tokens]
+    rows = (
+        torch.arange(num_tokens, device=selected.device).unsqueeze(1).expand(-1, top_k).reshape(-1)
+    )
+    cols = selected.reshape(-1)
+    if valid_mask is not None:
+        flat_valid_mask = valid_mask.reshape(-1)
+        rows = rows[flat_valid_mask]
+        cols = cols[flat_valid_mask]
+    word_idx = torch.div(cols, 32, rounding_mode="floor")
+    bit_idx = cols % 32
+    masks = torch.ones_like(bit_idx, dtype=torch.int32) << bit_idx
+    bitmatrix_data.index_put_((rows, word_idx), masks, accumulate=True)
+    return Bitmatrix(
+        bitmatrix_data.view(torch.uint32),
+        dtype=BIT,
+        shape=[num_tokens, num_experts],
+    )
+
 
 # ``convert_layout`` swizzles the packed expert weights. Cache the result by
 # underlying storage/view metadata so decode steps do not repeat that work.
@@ -581,6 +750,164 @@ def _run_mxfp4_mlp_core(
     return y
 
 
+def _triton_route_from_selected_experts(
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    num_experts_total: int,
+    expert_start: int,
+    num_local_experts: int,
+):
+    """Build Triton OGS routing metadata from externally computed top-k routing."""
+    from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
+    from triton_kernels.tensor import make_bitmatrix_metadata, make_ragged_tensor_metadata
+
+    from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import TritonEPRouter
+
+    selected = selected_experts.to(torch.int32).contiguous()
+    weights = routing_weights.to(torch.float32).contiguous()
+    num_tokens, top_k = selected.shape
+
+    expert_stop = expert_start + num_local_experts
+    is_ep = expert_start != 0 or num_local_experts != num_experts_total
+    if _is_power_of_two(top_k):
+        mask = _make_routing_bitmatrix(selected, num_experts_total)
+        sparse_matrix = _RoutingSparseMatrix(
+            vals=weights,
+            indx=selected,
+            mask=mask,
+            mask_metadata=make_bitmatrix_metadata(selected, mask),
+        )
+        expt_scal = sparse_matrix.vals
+        expt_indx = sparse_matrix.indx
+        if is_ep:
+            triton_ep_router = TritonEPRouter()
+            expt_scal, expt_indx, sparse_matrix = triton_ep_router.prune_routing_ep(
+                expt_scal,
+                expt_indx,
+                sparse_matrix,
+                num_experts_total,
+                expert_start,
+                expert_stop,
+            )
+            metadata = make_bitmatrix_metadata(expt_indx, sparse_matrix.mask)
+        else:
+            metadata = sparse_matrix.mask_metadata
+    else:
+        if is_ep:
+            keep = (selected >= expert_start) & (selected < expert_stop)
+            expt_indx = torch.where(keep, selected - expert_start, -1)
+            expt_scal = torch.where(keep, weights, -1.0)
+            metadata = _make_routing_metadata_from_indices(expt_indx, num_local_experts)
+        else:
+            expt_scal = weights
+            expt_indx = selected
+            metadata = _make_routing_metadata_from_indices(expt_indx, num_experts_total)
+
+    expt_data = make_ragged_tensor_metadata(metadata.col_sum, num_tokens * top_k)
+    gate_scal_sorted = expt_scal.reshape(-1)[metadata.col_sorted_indx]
+
+    rdata = RoutingData(
+        gate_scal=gate_scal_sorted,
+        expt_hist=metadata.col_sum,
+        n_expts_tot=num_local_experts,
+        n_expts_act=top_k,
+        expt_data=expt_data,
+    )
+    gather_idx = GatherIndx(
+        src_indx=metadata.col_sorted_indx,
+        dst_indx=metadata.row_sorted_indx,
+    )
+    scatter_idx = ScatterIndx(
+        src_indx=metadata.row_sorted_indx,
+        dst_indx=metadata.col_sorted_indx,
+    )
+    return rdata, gather_idx, scatter_idx
+
+
+def _run_triton_mxfp4_from_routing_core(
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    gate_up_blocks: torch.Tensor,
+    gate_up_bias: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    alpha: float,
+    limit: float,
+    down_blocks: torch.Tensor,
+    down_bias: torch.Tensor,
+    down_scales: torch.Tensor,
+    gate_up_order: str,
+    swiglu_mode: str,
+    expert_start: int = 0,
+    num_experts_total: int = -1,
+) -> torch.Tensor:
+    from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig, matmul_ogs
+    from triton_kernels.numerics import InFlexData
+
+    leading_shape = hidden_states.shape[:-1]
+    hidden_size = hidden_states.shape[-1]
+    x = hidden_states.reshape(-1, hidden_size)
+    selected = selected_experts.reshape(x.shape[0], -1)
+    weights = routing_weights.reshape_as(selected)
+
+    num_local_experts = int(gate_up_blocks.shape[0])
+    if num_experts_total < 0:
+        num_experts_total = expert_start + num_local_experts
+    if num_experts_total < expert_start + num_local_experts:
+        raise ValueError(
+            "num_experts_total should cover the local expert range, got "
+            f"num_experts_total={num_experts_total}, expert_start={expert_start}, "
+            f"num_local_experts={num_local_experts}."
+        )
+
+    with torch.cuda.device(x.device):
+        routing_data, gather_idx, scatter_idx = _triton_route_from_selected_experts(
+            selected,
+            weights,
+            int(num_experts_total),
+            int(expert_start),
+            num_local_experts,
+        )
+
+    (
+        triton_gate_up_w,
+        gate_up_w_scale_raw,
+        triton_down_w,
+        down_w_scale_raw,
+    ) = _prepare_weights_scales_cached(
+        hidden_size, gate_up_blocks, gate_up_scales, down_blocks, down_scales
+    )
+
+    gate_pc = PrecisionConfig(
+        weight_scale=gate_up_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
+    )
+    down_pc = PrecisionConfig(
+        weight_scale=down_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
+    )
+
+    gate_up = matmul_ogs(
+        x,
+        triton_gate_up_w,
+        gate_up_bias.to(torch.float32),
+        routing_data,
+        gather_indx=gather_idx,
+        precision_config=gate_pc,
+        gammas=None,
+    )
+    inter = _apply_swiglu(gate_up, alpha, limit, gate_up_order, swiglu_mode)
+    y = matmul_ogs(
+        inter,
+        triton_down_w,
+        down_bias.to(torch.float32),
+        routing_data,
+        scatter_indx=scatter_idx,
+        precision_config=down_pc,
+        gammas=routing_data.gate_scal,
+    )
+
+    return y.reshape(*leading_shape, hidden_size)
+
+
 @torch.library.custom_op("auto_deploy::triton_mxfp4_moe", mutates_args=())
 def triton_mxfp4_moe(
     hidden_states: torch.Tensor,  # [B, S, H] or [B*S, H]
@@ -621,6 +948,64 @@ def triton_mxfp4_moe(
         down_scales,
         route_fn=_global_route_fn,
     )
+
+
+@torch.library.custom_op("auto_deploy::triton_mxfp4_moe_from_routing", mutates_args=())
+def triton_mxfp4_moe_from_routing(
+    hidden_states: torch.Tensor,  # [B, S, H] or [B*S, H]
+    selected_experts: torch.Tensor,  # [B*S, top_k]
+    routing_weights: torch.Tensor,  # [B*S, top_k]
+    gate_up_blocks: torch.Tensor,  # [E, 2I, H//32, 16] in uint8
+    gate_up_bias: torch.Tensor,  # [E, 2I]
+    gate_up_scales: torch.Tensor,  # [E, 2I, H//32] in uint8
+    alpha: float,
+    limit: float,
+    down_blocks: torch.Tensor,  # [E, H, I//32, 16] in uint8
+    down_bias: torch.Tensor,  # [E, H]
+    down_scales: torch.Tensor,  # [E, H, I//32] in uint8
+    gate_up_order: str = "up_gate",
+    swiglu_mode: str = "deepseek",
+    layer_type: str = "moe",
+    num_experts_total: int = -1,
+) -> torch.Tensor:
+    return _run_triton_mxfp4_from_routing_core(
+        hidden_states,
+        selected_experts,
+        routing_weights,
+        gate_up_blocks,
+        gate_up_bias,
+        gate_up_scales,
+        alpha,
+        limit,
+        down_blocks,
+        down_bias,
+        down_scales,
+        gate_up_order,
+        swiglu_mode,
+        num_experts_total=num_experts_total,
+    )
+
+
+@triton_mxfp4_moe_from_routing.register_fake
+def _triton_mxfp4_mlp_from_routing_fake(
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    gate_up_blocks: torch.Tensor,
+    gate_up_bias: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    alpha: float,
+    limit: float,
+    down_blocks: torch.Tensor,
+    down_bias: torch.Tensor,
+    down_scales: torch.Tensor,
+    gate_up_order: str = "up_gate",
+    swiglu_mode: str = "deepseek",
+    layer_type: str = "moe",
+    num_experts_total: int = -1,
+):
+    del num_experts_total
+    return torch.empty_like(hidden_states)
 
 
 @triton_mxfp4_moe.register_fake
@@ -714,7 +1099,9 @@ def torch_mxfp4_moe_from_routing(
     gate_up_order: str = "up_gate",
     swiglu_mode: str = "deepseek",
     layer_type: str = "moe",
+    num_experts_total: int = -1,
 ) -> torch.Tensor:
+    del num_experts_total
     return _run_torch_mxfp4_from_routing_core(
         hidden_states,
         selected_experts,
@@ -748,7 +1135,9 @@ def _torch_mxfp4_mlp_from_routing_fake(
     gate_up_order: str = "up_gate",
     swiglu_mode: str = "deepseek",
     layer_type: str = "moe",
+    num_experts_total: int = -1,
 ):
+    del num_experts_total
     return torch.empty_like(hidden_states)
 
 
@@ -817,6 +1206,66 @@ def _mxfp4_mlp_ep_fake(
     return torch.empty_like(hidden_states)
 
 
+@torch.library.custom_op("auto_deploy::triton_mxfp4_moe_from_routing_ep", mutates_args=())
+def triton_mxfp4_moe_from_routing_ep(
+    hidden_states: torch.Tensor,  # [B, S, H] or [B*S, H]
+    selected_experts: torch.Tensor,  # [B*S, top_k]
+    routing_weights: torch.Tensor,  # [B*S, top_k]
+    gate_up_blocks: torch.Tensor,  # [E_local, 2I, H//32, 16] in uint8
+    gate_up_bias: torch.Tensor,  # [E_local, 2I]
+    gate_up_scales: torch.Tensor,  # [E_local, 2I, H//32] in uint8
+    alpha: float,
+    limit: float,
+    down_blocks: torch.Tensor,  # [E_local, H, I//32, 16] in uint8
+    down_bias: torch.Tensor,  # [E_local, H]
+    down_scales: torch.Tensor,  # [E_local, H, I//32] in uint8
+    gate_up_order: str = "up_gate",
+    swiglu_mode: str = "deepseek",
+    layer_type: str = "moe",
+    expert_start: int = 0,
+    num_experts_total: int = -1,
+) -> torch.Tensor:
+    return _run_triton_mxfp4_from_routing_core(
+        hidden_states,
+        selected_experts,
+        routing_weights,
+        gate_up_blocks,
+        gate_up_bias,
+        gate_up_scales,
+        alpha,
+        limit,
+        down_blocks,
+        down_bias,
+        down_scales,
+        gate_up_order,
+        swiglu_mode,
+        expert_start=expert_start,
+        num_experts_total=num_experts_total,
+    )
+
+
+@triton_mxfp4_moe_from_routing_ep.register_fake
+def _triton_mxfp4_mlp_from_routing_ep_fake(
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    gate_up_blocks: torch.Tensor,
+    gate_up_bias: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    alpha: float,
+    limit: float,
+    down_blocks: torch.Tensor,
+    down_bias: torch.Tensor,
+    down_scales: torch.Tensor,
+    gate_up_order: str = "up_gate",
+    swiglu_mode: str = "deepseek",
+    layer_type: str = "moe",
+    expert_start: int = 0,
+    num_experts_total: int = -1,
+):
+    return torch.empty_like(hidden_states)
+
+
 @torch.library.custom_op("auto_deploy::torch_mxfp4_moe_from_routing_ep", mutates_args=())
 def torch_mxfp4_moe_from_routing_ep(
     hidden_states: torch.Tensor,  # [B, S, H] or [B*S, H]
@@ -835,7 +1284,9 @@ def torch_mxfp4_moe_from_routing_ep(
     swiglu_mode: str = "deepseek",
     layer_type: str = "moe",
     expert_start: int = 0,
+    num_experts_total: int = -1,
 ) -> torch.Tensor:
+    del num_experts_total
     return _run_torch_mxfp4_from_routing_core(
         hidden_states,
         selected_experts,
@@ -871,7 +1322,9 @@ def _torch_mxfp4_mlp_from_routing_ep_fake(
     swiglu_mode: str = "deepseek",
     layer_type: str = "moe",
     expert_start: int = 0,
+    num_experts_total: int = -1,
 ):
+    del num_experts_total
     return torch.empty_like(hidden_states)
 
 
