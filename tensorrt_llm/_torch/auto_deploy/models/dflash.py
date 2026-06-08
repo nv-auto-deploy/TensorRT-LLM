@@ -293,7 +293,17 @@ class DFlashOneModelFactory(ModelFactory):
         return self.target_factory.get_quant_config()
 
     def get_cache_config_updates(self) -> Dict[str, Any]:
-        return self.target_factory.get_cache_config_updates()
+        updates = dict(self.target_factory.get_cache_config_updates())
+        # TEMPORARY (TODO): disable the resize_kv_cache pass for DFlash by forcing
+        # free_gpu_memory_fraction=0.0 (-> CachedSequenceInterface.needs_resize() == False). The
+        # resize pass runs a large `set_max_num_tokens_sample` forward that corrupts a target model
+        # weight in place (Qwen3 target -> lm_head; verified: with resize skipped, output is coherent
+        # WITHOUT any lm_head workaround). Root cause (likely the DFlash unmanaged ctx caches shrinking
+        # the estimation paged-pool budget so the sample forward overruns into model-weight memory)
+        # must be fixed properly so the KV cache can be sized for capacity again. See
+        # debug/dflash_worklog_accuracy.md.
+        updates["free_gpu_memory_fraction"] = 0.0
+        return updates
 
     def init_tokenizer(self) -> Optional[Any]:
         return self.target_factory.init_tokenizer()

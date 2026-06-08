@@ -347,9 +347,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
             eagle3_one_model=True,
             eagle3_layers_to_capture={1, 15, 28},
         )
-        # Note: Test crashes with trtllm attn_backend + torch-simple
-        # See: https://github.com/NVIDIA/TensorRT-LLM/issues/13135
-        compile_backend = "torch-cudagraph" if attn_backend == "trtllm" else "torch-simple"
+        compile_backend = "torch-simple"
 
         kwargs = {
             "yaml_extra": yaml_paths,
