@@ -159,6 +159,15 @@ class EagleConfig(PretrainedConfig):
                 r"^mtp\.pre_fc_norm_hidden\.": "model.layers.pre_fc_norm_hidden.",
                 r"^mtp\.norm\.": "model.layers.norm.",
             },
+            # Quant exclude_modules are fnmatch globs (e.g. "mtp.layers.0*"). The
+            # draft MTP layer is unwrapped (no layer index), so its modules live
+            # under "model.layers.*" (mirrors _checkpoint_conversion_mapping
+            # dropping the ".0" index). Remap excludes so the unquantized MTP head
+            # is skipped in the draft sub-graph. Target modules are
+            # "model.language_model.layers.*", so "model.layers*" cannot collide.
+            "_quant_exclude_conversion_mapping": {
+                r"^mtp\.layers\.0(?=\.|\*)": "model.layers",
+            },
         },
     }
     # Some custom HF config classes expose backward-compatibility fields as properties instead of
@@ -633,9 +642,12 @@ class EagleDrafterForCausalLM(PreTrainedModel):
         # Accept unused HF-style kwargs such as use_cache; _from_config() forwards them.
         super().__init__(config)
 
-        # Read checkpoint conversion mapping from config (set by EagleConfig based on model_type)
+        # Read conversion mappings from config (set by EagleConfig based on model_type)
         self._checkpoint_conversion_mapping = getattr(
             config, "_checkpoint_conversion_mapping", None
+        )
+        self._quant_exclude_conversion_mapping = getattr(
+            config, "_quant_exclude_conversion_mapping", None
         )
 
         self.load_embedding_from_target = getattr(config, "load_embedding_from_target", False)

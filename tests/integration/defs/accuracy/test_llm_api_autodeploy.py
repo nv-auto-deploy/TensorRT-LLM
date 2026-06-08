@@ -1050,6 +1050,8 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
     MODEL_PATH_SMALL = hf_id_to_local_model_dir(MODEL_NAME_SMALL)
     GSM8K_MAX_OUTPUT_LEN = 512
+    MTP_EXTRA_ACC_SPEC = "qwen3_5_moe_400b_mtp"
+    MIN_MTP_ACCEPTANCE_RATE = 0.20
     EXTRA_EVALUATOR_KWARGS = dict(
         apply_chat_template=True,
         fewshot_as_multiturn=True,
@@ -1120,6 +1122,39 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(180000)
+    @pytest.mark.parametrize("world_size", [4])
+    def test_nvfp4_mtp(self, world_size, mocker):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = self.get_default_kwargs()
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME_NVFP4)
+        yaml_paths = [
+            str(_AD_CONFIGS_DIR / cfg) for cfg in (
+                "dashboard_default.yaml",
+                "world_size_4.yaml",
+                "qwen3.5_moe_400b_mtp.yaml",
+                "enable_sharder_ir.yaml",
+            )
+        ]
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
+                           world_size=world_size,
+                           yaml_extra=yaml_paths,
+                           enable_iter_perf_stats=True,
+                           **kwargs) as llm:
+            _set_quant_config(llm, "nvfp4")
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_acc_spec=self.MTP_EXTRA_ACC_SPEC,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            _check_acceptance_rate_stats(
+                llm.get_stats(),
+                min_acceptance_rate=self.MIN_MTP_ACCEPTANCE_RATE)
 
     @staticmethod
     def _load_small_config():
@@ -1653,8 +1688,6 @@ class TestQwen3_5_MoE_IR(LlmapiAccuracyTestHarness):
 
     MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
     CONFIG_YAML = str(_AD_CONFIGS_DIR / "qwen3.5_moe_35b.yaml")
-    MTP_EXTRA_ACC_SPEC = "qwen3_5_moe_35b_mtp"
-    MIN_MTP_ACCEPTANCE_RATE = 0.20
     EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
         enable_thinking=False))
 
@@ -1698,48 +1731,3 @@ class TestQwen3_5_MoE_IR(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-
-    @skip_pre_hopper
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_ir_mtp_gsm8k(self, monkeypatch) -> None:
-        world_size = 2
-        if get_device_count() < world_size:
-            pytest.skip(f"Not enough devices for world_size={world_size}")
-
-        monkeypatch.setenv("AD_USE_IR_MODELS", "1")
-
-        kwargs = {
-            "enable_iter_perf_stats": True,
-            "skip_tokenizer_init": False,
-            "trust_remote_code": True,
-        }
-        model_path = hf_id_to_local_model_dir(self.MODEL_NAME)
-        yaml_paths = [
-            str(_AD_CONFIGS_DIR / config_name) for config_name in (
-                "dashboard_default.yaml",
-                "world_size_2.yaml",
-                "qwen3.5_moe_35b_mtp.yaml",
-                "enable_sharder_ir.yaml",
-            )
-        ]
-        assert any(
-            Path(path).name == "enable_sharder_ir.yaml" for path in yaml_paths)
-        assert any(
-            Path(path).name == "qwen3.5_moe_35b_mtp.yaml"
-            for path in yaml_paths)
-        mtp_config = _load_ad_config("qwen3.5_moe_35b_mtp.yaml")
-        assert mtp_config["speculative_config"]["decoding_type"] == "MTP"
-        assert mtp_config["speculative_config"]["mtp_eagle_one_model"] is True
-        assert mtp_config["transforms"]["insert_cached_gated_delta_rule"][
-            "backend"] == "fla_gated_delta"
-
-        with AutoDeployLLM(model=model_path,
-                           tokenizer=model_path,
-                           world_size=world_size,
-                           yaml_extra=yaml_paths,
-                           **kwargs) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, extra_acc_spec=self.MTP_EXTRA_ACC_SPEC)
-            _check_acceptance_rate_stats(
-                llm.get_stats(),
-                min_acceptance_rate=self.MIN_MTP_ACCEPTANCE_RATE)
