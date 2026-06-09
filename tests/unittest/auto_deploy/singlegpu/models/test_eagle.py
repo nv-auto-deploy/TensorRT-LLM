@@ -321,3 +321,63 @@ def test_infer_draft_hidden_size_from_exported_draft_graph(
     embd, in_eagle_drafter = infer_draft_embedding_size(gm, linear_nodes)
     assert embd == hidden_size
     assert in_eagle_drafter is expected_is_eagle
+
+
+def test_eagle_get_quant_config_aliases_target_excludes():
+    """Target excludes are aliased into the exported (relative) graph namespace.
+
+    EagleOneModelFactory.get_quant_config must translate checkpoint-namespace target
+    exclude_modules into the exported (relative) graph namespace.
+
+    The target text model is exported rooted at its own submodule, so its graph node names are
+    relative (e.g. ``layers.0.linear_attn*``) while the checkpoint exclude patterns are full paths
+    (e.g. ``model.language_model.layers.0.linear_attn*``). The factory must add relative aliases so
+    the excluded bf16 modules are skipped, while leaving the draft-namespace mapping
+    (``mtp.layers.0* -> model.layers*``) intact and not over-matching the target graph.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
+    from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import should_skip_quantization
+
+    # Glob forms as they appear in the NVFP4 hf_quant_config.json exclude_modules.
+    target_excludes = [
+        "lm_head",
+        "model.language_model.layers.0.linear_attn*",
+        "model.language_model.layers.11.self_attn*",
+        "model.language_model.layers.0.mlp.shared_expert_gate",
+        "model.visual*",  # irrelevant to the text export; must survive untouched
+        "mtp.layers.0*",  # the unquantized MTP head; mapped to draft namespace
+    ]
+    # Stand-in factory exposing only what get_quant_config reads (no model build).
+    # The draft mapping mirrors modeling_eagle.py's qwen3_5_moe_text entry exactly.
+    stub = SimpleNamespace(
+        target_factory=SimpleNamespace(
+            get_quant_config=lambda: {"exclude_modules": target_excludes}
+        ),
+        draft_factory=SimpleNamespace(
+            _quant_exclude_conversion_mapping={r"^mtp\.layers\.0(?=\.|\*)": "model.layers"}
+        ),
+        _target_export_submodule_name="model.language_model",
+    )
+
+    result = EagleOneModelFactory.get_quant_config(stub)["exclude_modules"]
+
+    # Relative aliases are added for the text-model excludes (so the relative graph matches)...
+    assert "layers.0.linear_attn*" in result
+    assert "layers.11.self_attn*" in result
+    assert "layers.0.mlp.shared_expert_gate" in result
+    # ...while originals are kept and the draft-namespace mapping is applied.
+    assert "model.language_model.layers.0.linear_attn*" in result
+    assert "model.layers*" in result  # mtp.layers.0* -> model.layers*
+    # Unrelated entries are preserved.
+    assert "lm_head" in result
+    assert "model.visual*" in result
+
+    # Behavioral checks against the FULL resulting list: the alias skips the relative target
+    # self_attn module that the checkpoint excludes...
+    assert should_skip_quantization("layers.11.self_attn.q_proj", result)
+    # ...while a relative target module that is NOT excluded stays quantized. This guards against
+    # the draft pattern "model.layers*" (or any over-broad alias) accidentally skipping the whole
+    # target graph -- the reason we add namespaced aliases instead of globally stripping prefixes.
+    assert not should_skip_quantization("layers.5.self_attn.q_proj", result)

@@ -339,6 +339,11 @@ class EagleOneModelFactory(ModelFactory):
             max_seq_len=max_seq_len,
         )
 
+        # Export submodule path of the target text model (e.g. "model.language_model"),
+        # populated in _build_model. Used by get_quant_config to translate checkpoint-namespace
+        # exclude_modules into the exported (relative) graph namespace.
+        self._target_export_submodule_name = ""
+
         # Create draft factory (EagleDrafter).
         self.draft_factory = EagleDrafterFactory(
             model=str(draft_model_path),
@@ -359,6 +364,13 @@ class EagleOneModelFactory(ModelFactory):
 
     def _build_model(self, device: str) -> nn.Module:
         target_model = self.target_factory.build_model(device)
+        # Record the target's export submodule path using the same get_export_infos call that
+        # export_to_gm relies on, so the recorded prefix can never drift from the actual export
+        # root. For a VLM target this is "model.language_model"; for a full-model export it is "".
+        target_export_info = next(iter(self.target_factory.get_export_infos(target_model)), None)
+        self._target_export_submodule_name = (
+            target_export_info.submodule_name if target_export_info else ""
+        )
         draft_model = self.draft_factory.build_model(device)
 
         draft_config = draft_model.config
@@ -418,11 +430,28 @@ class EagleOneModelFactory(ModelFactory):
         return self.target_factory.get_sharding_config()
 
     def get_quant_config(self) -> Dict[str, Any]:
+        # Start from the target model's quant config (checkpoint-namespace exclude_modules).
         qcfg = dict(self.target_factory.get_quant_config())
         excluded = qcfg.get("exclude_modules")
         if excluded:
+            # Copy so we never mutate the target factory's cached config.
+            excluded = list(excluded)
+            # The target text model is exported rooted at its own submodule, so its FX graph node
+            # names are relative (e.g. "layers.0.linear_attn*"), while the checkpoint exclude
+            # patterns are full paths (e.g. "model.language_model.layers.0.linear_attn*").
+            prefix = self._target_export_submodule_name
+            # Only alias when the target was exported as a submodule; a full-model export ("") keeps
+            # full-path graph names that already match the checkpoint-namespace patterns.
+            if prefix:
+                # Strip the export submodule prefix to produce graph-relative aliases that match.
+                prefix_dot = prefix + "."
+                aliases = [p[len(prefix_dot) :] for p in excluded if p.startswith(prefix_dot)]
+                # Keep originals (inert on the relative graph) and add the matching relative aliases.
+                excluded = excluded + aliases
+            # Map any draft-namespace excludes (e.g. "mtp.layers.0*" -> "model.layers*") so the
+            # draft sub-graph's unquantized MTP head is skipped too.
             qcfg["exclude_modules"] = mapped_module_names(
-                list(excluded),
+                excluded,
                 getattr(self.draft_factory, "_quant_exclude_conversion_mapping", None),
             )
         return qcfg
