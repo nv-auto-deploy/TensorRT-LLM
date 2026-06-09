@@ -323,20 +323,37 @@ def test_infer_draft_hidden_size_from_exported_draft_graph(
     assert in_eagle_drafter is expected_is_eagle
 
 
-def test_eagle_get_quant_config_aliases_target_excludes():
-    """Target excludes are aliased into the exported (relative) graph namespace.
+# The actual draft-namespace exclude remap we ship for qwen3.5 MoE MTP, read straight from the
+# production config so these tests can never drift from what's deployed: the one-model MTP head
+# ("mtp.layers.0*") is unwrapped into the draft graph as "model.layers*".
+_QWEN3_5_MTP_DRAFT_EXCLUDE_MAP = EagleConfig._drafter_defaults["qwen3_5_moe_text"][
+    "_quant_exclude_conversion_mapping"
+]
 
-    EagleOneModelFactory.get_quant_config must translate checkpoint-namespace target
-    exclude_modules into the exported (relative) graph namespace.
+
+def _eagle_quant_stub(target_excludes, draft_map, export_submodule_name):
+    """A stand-in EagleOneModelFactory exposing only what get_quant_config reads (no model build)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        target_factory=SimpleNamespace(
+            get_quant_config=lambda: {"exclude_modules": list(target_excludes)}
+        ),
+        draft_factory=SimpleNamespace(_quant_exclude_conversion_mapping=draft_map),
+        _target_export_submodule_name=export_submodule_name,
+    )
+
+
+def test_eagle_get_quant_config_aliases_target_excludes():
+    """VLM target (non-trivial submodule name): target excludes are re-rooted, draft remap maps MTP.
 
     The target text model is exported rooted at its own submodule, so its graph node names are
     relative (e.g. ``layers.0.linear_attn*``) while the checkpoint exclude patterns are full paths
-    (e.g. ``model.language_model.layers.0.linear_attn*``). The factory must add relative aliases so
-    the excluded bf16 modules are skipped, while leaving the draft-namespace mapping
-    (``mtp.layers.0* -> model.layers*``) intact and not over-matching the target graph.
+    (e.g. ``model.language_model.layers.0.linear_attn*``). The factory must rewrite the target
+    patterns into the relative namespace so the excluded bf16 modules are skipped, while applying
+    the draft-namespace remap (``mtp.layers.0* -> model.layers*``) only to the draft head and not
+    over-matching the target graph.
     """
-    from types import SimpleNamespace
-
     from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
     from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import should_skip_quantization
 
@@ -349,26 +366,19 @@ def test_eagle_get_quant_config_aliases_target_excludes():
         "model.visual*",  # irrelevant to the text export; must survive untouched
         "mtp.layers.0*",  # the unquantized MTP head; mapped to draft namespace
     ]
-    # Stand-in factory exposing only what get_quant_config reads (no model build).
-    # The draft mapping mirrors modeling_eagle.py's qwen3_5_moe_text entry exactly.
-    stub = SimpleNamespace(
-        target_factory=SimpleNamespace(
-            get_quant_config=lambda: {"exclude_modules": target_excludes}
-        ),
-        draft_factory=SimpleNamespace(
-            _quant_exclude_conversion_mapping={r"^mtp\.layers\.0(?=\.|\*)": "model.layers"}
-        ),
-        _target_export_submodule_name="model.language_model",
+    stub = _eagle_quant_stub(
+        target_excludes, _QWEN3_5_MTP_DRAFT_EXCLUDE_MAP, "model.language_model"
     )
 
     result = EagleOneModelFactory.get_quant_config(stub)["exclude_modules"]
 
-    # Relative aliases are added for the text-model excludes (so the relative graph matches)...
+    # Text-model excludes are rewritten in place into the relative graph namespace...
     assert "layers.0.linear_attn*" in result
     assert "layers.11.self_attn*" in result
     assert "layers.0.mlp.shared_expert_gate" in result
-    # ...while originals are kept and the draft-namespace mapping is applied.
-    assert "model.language_model.layers.0.linear_attn*" in result
+    # ...with the checkpoint-namespace originals dropped (not kept), and the draft-namespace
+    # mapping applied.
+    assert "model.language_model.layers.0.linear_attn*" not in result
     assert "model.layers*" in result  # mtp.layers.0* -> model.layers*
     # Unrelated entries are preserved.
     assert "lm_head" in result
@@ -381,3 +391,96 @@ def test_eagle_get_quant_config_aliases_target_excludes():
     # the draft pattern "model.layers*" (or any over-broad alias) accidentally skipping the whole
     # target graph -- the reason we add namespaced aliases instead of globally stripping prefixes.
     assert not should_skip_quantization("layers.5.self_attn.q_proj", result)
+
+
+def test_eagle_get_quant_config_full_model_export_keeps_full_paths():
+    """Non-VLM target (trivial submodule name ""): full paths are kept, draft remap still maps MTP.
+
+    With ``_target_export_submodule_name == ""`` there is no prefix to strip, so the target's
+    checkpoint-namespace patterns already match the (full-model) graph and must be left untouched --
+    in particular the draft remap must not mangle them.
+    """
+    from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
+    from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import should_skip_quantization
+
+    target_excludes = [
+        "lm_head",
+        "model.embed_tokens*",  # full-path target module; the draft remap must not touch it
+        "model.norm*",
+        "mtp.layers.0*",  # the unquantized MTP head; still mapped to the draft namespace
+    ]
+    stub = _eagle_quant_stub(target_excludes, _QWEN3_5_MTP_DRAFT_EXCLUDE_MAP, "")
+
+    result = EagleOneModelFactory.get_quant_config(stub)["exclude_modules"]
+
+    # No prefix to strip -> target full-path patterns survive verbatim (they match the full-model
+    # graph), and the draft remap leaves them alone.
+    assert "model.embed_tokens*" in result
+    assert "model.norm*" in result
+    assert "lm_head" in result
+    # The draft head exclude is still mapped into the draft namespace.
+    assert "model.layers*" in result
+    assert "mtp.layers.0*" not in result
+
+    # Behavioral check: the surviving full-path target pattern actually skips its module on the
+    # full-model graph. (We only assert the positive direction here: with prefix "", the draft
+    # head maps to "model.layers*", which by construction is only ever paired with a VLM target
+    # whose layers live under "model.language_model.*"; pairing it with a full-model "model.layers.*"
+    # target would over-match -- the documented invariant in modeling_eagle.py.)
+    assert should_skip_quantization("model.embed_tokens.weight", result)
+
+
+def test_eagle_get_quant_config_rejects_draft_remap_into_target():
+    """A draft remap that would rewrite a (stripped) target pattern must fail loudly.
+
+    The draft exclude remap is draft-owned and must never touch a target exclude. Because the remap
+    is applied to relative names, a regex anchored on the stripped target namespace (matching
+    "layers.31..." after the prefix is stripped) would silently corrupt a target exclude; the
+    factory asserts against this so a future draft map reaching into the target namespace is a clear
+    error, not a mis-quantization.
+    """
+    from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
+
+    # Anchored on the stripped target name "layers.31..." -- does not match the full path
+    # "model.language_model.layers.31..." but would match after the prefix is stripped.
+    overreaching_map = {r"^layers\.31": "CORRUPTED"}
+    stub = _eagle_quant_stub(
+        ["model.language_model.layers.31.self_attn*"], overreaching_map, "model.language_model"
+    )
+
+    with pytest.raises(AssertionError):
+        EagleOneModelFactory.get_quant_config(stub)
+
+
+def test_eagle_single_target_export_info_rejects_multiple_submodules():
+    """The one-model path assumes a single target export root; >1 must fail loudly.
+
+    Otherwise the code would silently use the first export info, mis-namespacing the prefix strip
+    in get_quant_config.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
+
+    def stub_with(infos):
+        return SimpleNamespace(
+            target_factory=SimpleNamespace(get_export_infos=lambda _model: infos)
+        )
+
+    # Real target factories always return exactly one export info: full-model export is
+    # [FullModelExportInfo()] (submodule_name ""), a VLM is one TextModelExportInfo
+    # (submodule_name "model.language_model"). Both are returned as-is.
+    full_model = SimpleNamespace(submodule_name="")
+    got = EagleOneModelFactory._single_target_export_info(stub_with([full_model]), object())
+    assert got is full_model
+    vlm = SimpleNamespace(submodule_name="model.language_model")
+    got = EagleOneModelFactory._single_target_export_info(stub_with([vlm]), object())
+    assert got is vlm
+
+    # >1 export infos -> assert (the prefix-strip logic only threads a single export root).
+    two = [
+        SimpleNamespace(submodule_name="model.language_model"),
+        SimpleNamespace(submodule_name="model.vision_model"),
+    ]
+    with pytest.raises(AssertionError):
+        EagleOneModelFactory._single_target_export_info(stub_with(two), object())

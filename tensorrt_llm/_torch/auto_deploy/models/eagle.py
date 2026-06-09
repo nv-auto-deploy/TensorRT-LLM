@@ -362,12 +362,28 @@ class EagleOneModelFactory(ModelFactory):
     def vocab_size_padded(self) -> Optional[int]:
         return self.target_factory.vocab_size_padded
 
+    def _single_target_export_info(self, target_model: nn.Module) -> Optional[SubModuleExportInfo]:
+        """Return the target factory's single export info (or None for a full-model export).
+
+        The Eagle one-model path assumes the target exports at most one submodule -- a VLM text
+        model rooted at e.g. "model.language_model", or "" for a full-model export. Supporting
+        multiple exported submodules would require threading several export roots through
+        get_quant_config / get_export_infos; we deliberately don't (the goal is VLM targets, not
+        arbitrary nesting) and assert loudly rather than silently using only the first.
+        """
+        infos = self.target_factory.get_export_infos(target_model)
+        assert len(infos) <= 1, (
+            "EagleOneModelFactory expects the target factory to export at most one submodule, got "
+            f"{len(infos)}: {[i.submodule_name for i in infos]}"
+        )
+        return infos[0] if infos else None
+
     def _build_model(self, device: str) -> nn.Module:
         target_model = self.target_factory.build_model(device)
         # Record the target's export submodule path using the same get_export_infos call that
         # export_to_gm relies on, so the recorded prefix can never drift from the actual export
         # root. For a VLM target this is "model.language_model"; for a full-model export it is "".
-        target_export_info = next(iter(self.target_factory.get_export_infos(target_model)), None)
+        target_export_info = self._single_target_export_info(target_model)
         self._target_export_submodule_name = (
             target_export_info.submodule_name if target_export_info else ""
         )
@@ -408,9 +424,7 @@ class EagleOneModelFactory(ModelFactory):
         draft_config = model.draft_model.config
         load_embedding_from_target = getattr(draft_config, "load_embedding_from_target", True)
         load_lm_head_from_target = getattr(draft_config, "load_lm_head_from_target", True)
-        target_export_info = next(
-            iter(self.target_factory.get_export_infos(model.target_model)), None
-        )
+        target_export_info = self._single_target_export_info(model.target_model)
         target_submodule_name = "target_model"
         if target_export_info is not None and target_export_info.submodule_name:
             # export_to_gm uses this path to select and replace the exported
@@ -434,26 +448,44 @@ class EagleOneModelFactory(ModelFactory):
         qcfg = dict(self.target_factory.get_quant_config())
         excluded = qcfg.get("exclude_modules")
         if excluded:
-            # Copy so we never mutate the target factory's cached config.
-            excluded = list(excluded)
-            # The target text model is exported rooted at its own submodule, so its FX graph node
-            # names are relative (e.g. "layers.0.linear_attn*"), while the checkpoint exclude
-            # patterns are full paths (e.g. "model.language_model.layers.0.linear_attn*").
+            # exclude_modules come from the *combined* one-model checkpoint, which bundles the
+            # target text model, vision tower, and MTP head under one quant config (so the "mtp.*"
+            # entries arrive here too -- there is no separate draft quant config). We split that
+            # checkpoint into two exported sub-graphs, and each pattern belongs to one of them:
+            #   - Target sub-graph: exported rooted at its own submodule, so its node names are
+            #     relative. Keep the pattern but strip the export-submodule prefix
+            #     ("model.language_model.layers.0.linear_attn*" -> "layers.0.linear_attn*"). A
+            #     full-model export has prefix "" -> nothing to strip.
+            #   - Draft (MTP) sub-graph: we load its weights canonically (restructured,
+            #     "mtp.* -> model.*"), so its excludes need the draft factory's regex remap
+            #     ("mtp.layers.0*" -> "model.layers*").
+            # The draft remap is draft-owned and is never applied to target patterns, so it cannot
+            # corrupt a target exclude (before or after stripping).
             prefix = self._target_export_submodule_name
-            # Only alias when the target was exported as a submodule; a full-model export ("") keeps
-            # full-path graph names that already match the checkpoint-namespace patterns.
-            if prefix:
-                # Strip the export submodule prefix to produce graph-relative aliases that match.
-                prefix_dot = prefix + "."
-                aliases = [p[len(prefix_dot) :] for p in excluded if p.startswith(prefix_dot)]
-                # Keep originals (inert on the relative graph) and add the matching relative aliases.
-                excluded = excluded + aliases
-            # Map any draft-namespace excludes (e.g. "mtp.layers.0*" -> "model.layers*") so the
-            # draft sub-graph's unquantized MTP head is skipped too.
-            qcfg["exclude_modules"] = mapped_module_names(
-                excluded,
-                getattr(self.draft_factory, "_quant_exclude_conversion_mapping", None),
-            )
+            prefix_dot = prefix + "." if prefix else None
+            draft_map = getattr(self.draft_factory, "_quant_exclude_conversion_mapping", None)
+
+            new_excluded = []
+            for p in excluded:
+                if prefix_dot and p.startswith(prefix_dot):
+                    stripped = p[len(prefix_dot) :]
+                    # This partition assumes the target and draft exclude namespaces are disjoint, so
+                    # the draft remap never needs to touch a target pattern. We don't apply it here;
+                    # we only assert it WOULD be a no-op on the stripped pattern. Tripping this does
+                    # not mean the model is wrong -- it means that assumption no longer holds and
+                    # THIS exclude-splitting logic must be revisited (it can no longer just partition
+                    # by prefix), rather than silently mis-quantizing the target.
+                    assert not draft_map or mapped_module_names([stripped], draft_map) == [
+                        stripped
+                    ], (
+                        f"draft exclude remap would rewrite target pattern {stripped!r} (from "
+                        f"{p!r}): target and draft exclude namespaces overlap, so this partition is "
+                        "no longer valid -- revisit EagleOneModelFactory.get_quant_config"
+                    )
+                    new_excluded.append(stripped)
+                else:
+                    new_excluded.extend(mapped_module_names([p], draft_map))
+            qcfg["exclude_modules"] = new_excluded
         return qcfg
 
     def get_cache_config_updates(self) -> Dict[str, Any]:
