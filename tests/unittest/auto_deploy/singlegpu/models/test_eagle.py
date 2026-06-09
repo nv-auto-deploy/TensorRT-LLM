@@ -102,7 +102,7 @@ class MockEagle3ModelForCausalLM(EagleDrafterForCausalLM):
         self._dtype = config.dtype
 
     def forward(self, input_ids, position_ids, input_embeds=None, **kwargs):
-        assert self.model.embed_tokens is not None, (
+        assert self.eagle_drafter.embed_tokens is not None, (
             "embed_tokens must be set before running standalone Eagle model."
         )
         assert self.lm_head is not None, (
@@ -110,7 +110,7 @@ class MockEagle3ModelForCausalLM(EagleDrafterForCausalLM):
         )
 
         if input_embeds is None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
+            inputs_embeds = self.eagle_drafter.embed_tokens(input_ids)
 
         # Inject mock hidden states if not provided
         if "hidden_states" not in kwargs:
@@ -295,7 +295,7 @@ def test_infer_draft_hidden_size_from_exported_draft_graph(
 ):
     factory = _build_small_draft_factory(model_hub_id, model_kwargs=model_kwargs)
     model = factory.build_model("cuda")
-    inner_model = model.model.eval()
+    inner_model = model.eagle_drafter.eval()
     hidden_size = model.config.hidden_size
     dtype = model.config.torch_dtype
 
@@ -377,9 +377,9 @@ def test_eagle_get_quant_config_aliases_target_excludes():
     assert "layers.11.self_attn*" in result
     assert "layers.0.mlp.shared_expert_gate" in result
     # ...with the checkpoint-namespace originals dropped (not kept), and the draft-namespace
-    # mapping applied.
+    # mapping applied into the dedicated eagle_drafter namespace.
     assert "model.language_model.layers.0.linear_attn*" not in result
-    assert "model.layers*" in result  # mtp.layers.0* -> model.layers*
+    assert "eagle_drafter.layers*" in result  # mtp.layers.0* -> eagle_drafter.layers*
     # Unrelated entries are preserved.
     assert "lm_head" in result
     assert "model.visual*" in result
@@ -388,45 +388,48 @@ def test_eagle_get_quant_config_aliases_target_excludes():
     # self_attn module that the checkpoint excludes...
     assert should_skip_quantization("layers.11.self_attn.q_proj", result)
     # ...while a relative target module that is NOT excluded stays quantized. This guards against
-    # the draft pattern "model.layers*" (or any over-broad alias) accidentally skipping the whole
-    # target graph -- the reason we add namespaced aliases instead of globally stripping prefixes.
+    # the draft pattern (or any over-broad alias) accidentally skipping the whole target graph --
+    # the reason we add namespaced aliases instead of globally stripping prefixes.
     assert not should_skip_quantization("layers.5.self_attn.q_proj", result)
 
 
-def test_eagle_get_quant_config_full_model_export_keeps_full_paths():
-    """Non-VLM target (trivial submodule name ""): full paths are kept, draft remap still maps MTP.
+def test_eagle_get_quant_config_full_model_export_no_target_collision():
+    """Non-VLM target (trivial submodule ""): the draft's eagle_drafter excludes don't collide.
 
-    With ``_target_export_submodule_name == ""`` there is no prefix to strip, so the target's
-    checkpoint-namespace patterns already match the (full-model) graph and must be left untouched --
-    in particular the draft remap must not mangle them.
+    This is the non-VLM NVFP4 MTP case (e.g. Ultra): the target is exported at the root, so its
+    node names are full ``model.layers.N.*``. Because the draft is rooted at the dedicated
+    ``eagle_drafter.*`` namespace, its remapped excludes can never over-match the target -- even a
+    broad ``mtp.layers.0*`` exclude maps to ``eagle_drafter.layers*`` and stays disjoint from
+    ``model.layers.*``. (Before the eagle_drafter rename, ``mtp.layers.0* -> model.layers*`` and
+    this collided, wrongly skipping the whole target.)
     """
     from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
     from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import should_skip_quantization
 
     target_excludes = [
         "lm_head",
-        "model.embed_tokens*",  # full-path target module; the draft remap must not touch it
-        "model.norm*",
-        "mtp.layers.0*",  # the unquantized MTP head; still mapped to the draft namespace
+        "model.embed_tokens*",  # full-path target module; kept verbatim (no prefix to strip)
+        "model.layers.0.linear_attn*",  # a specific target-layer exclude
+        "mtp.layers.0*",  # broad MTP head exclude -> eagle_drafter.layers*
     ]
     stub = _eagle_quant_stub(target_excludes, _QWEN3_5_MTP_DRAFT_EXCLUDE_MAP, "")
 
     result = EagleOneModelFactory.get_quant_config(stub)["exclude_modules"]
 
     # No prefix to strip -> target full-path patterns survive verbatim (they match the full-model
-    # graph), and the draft remap leaves them alone.
+    # graph), and the draft remap maps the MTP head into the *distinct* eagle_drafter namespace.
     assert "model.embed_tokens*" in result
-    assert "model.norm*" in result
+    assert "model.layers.0.linear_attn*" in result
     assert "lm_head" in result
-    # The draft head exclude is still mapped into the draft namespace.
-    assert "model.layers*" in result
+    assert "eagle_drafter.layers*" in result
+    assert "model.layers*" not in result  # crucially NOT the generic target namespace
     assert "mtp.layers.0*" not in result
 
-    # Behavioral check: the surviving full-path target pattern actually skips its module on the
-    # full-model graph. (We only assert the positive direction here: with prefix "", the draft
-    # head maps to "model.layers*", which by construction is only ever paired with a VLM target
-    # whose layers live under "model.language_model.*"; pairing it with a full-model "model.layers.*"
-    # target would over-match -- the documented invariant in modeling_eagle.py.)
+    # Behavioral: the target's own layers stay quantizable -- the draft's broad "eagle_drafter.layers*"
+    # does NOT over-match a full-model target node "model.layers.5...".
+    assert not should_skip_quantization("model.layers.5.self_attn.q_proj.weight", result)
+    # ...while the specific target exclude and the full-path target module still apply.
+    assert should_skip_quantization("model.layers.0.linear_attn.q_proj.weight", result)
     assert should_skip_quantization("model.embed_tokens.weight", result)
 
 
@@ -448,6 +451,23 @@ def test_eagle_get_quant_config_rejects_draft_remap_into_target():
         ["model.language_model.layers.31.self_attn*"], overreaching_map, "model.language_model"
     )
 
+    with pytest.raises(AssertionError):
+        EagleOneModelFactory.get_quant_config(stub)
+
+
+def test_eagle_get_quant_config_rejects_target_in_draft_namespace():
+    """A target exclude in the draft's reserved "eagle_drafter.*" namespace must fail loudly.
+
+    That is the core no-collision assumption: targets live under "model.*"/etc., never
+    "eagle_drafter.*". A target exclude there means the two namespaces overlap and the partition is
+    unsafe.
+    """
+    from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
+
+    # Full-model target whose checkpoint (hypothetically) names a module in the draft's reserved
+    # namespace. The draft remap does not touch it (not an "mtp.*" pattern), so it would slip into
+    # the draft sub-graph's namespace and collide.
+    stub = _eagle_quant_stub(["eagle_drafter.layers.0.foo*"], _QWEN3_5_MTP_DRAFT_EXCLUDE_MAP, "")
     with pytest.raises(AssertionError):
         EagleOneModelFactory.get_quant_config(stub)
 

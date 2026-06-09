@@ -226,8 +226,8 @@ class DraftModelExportInfo(SubModuleExportInfo):
 
     def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
         """Preserve modules needed by EagleWrapper utility methods (fc, d2t, embed, lm_head)."""
-        inner_model = sub_mod.model
-        inner_gm = sub_gm.get_submodule("model")
+        inner_model = sub_mod.eagle_drafter
+        inner_gm = sub_gm.get_submodule("eagle_drafter")
 
         # mark this gm as the draft model gm
         sub_gm.is_draft = True
@@ -263,14 +263,14 @@ class DraftModelExportInfo(SubModuleExportInfo):
         # --- fc module (fuses hidden states from multiple layers) ---
         fc_module = getattr(inner_model, "fc", None)
         if fc_module is not None:
-            sub_gm.set_submodule("model.fc", fc_module)
-            insert_keepalive_sentinel(sub_gm, "model.fc.weight")
+            sub_gm.set_submodule("eagle_drafter.fc", fc_module)
+            insert_keepalive_sentinel(sub_gm, "eagle_drafter.fc.weight")
 
         # --- d2t parameter (draft-to-target vocab mapping) ---
         d2t = getattr(inner_model, "d2t", None)
         if d2t is not None:
             inner_gm.register_parameter("d2t", d2t)
-            insert_keepalive_sentinel(sub_gm, "model.d2t")
+            insert_keepalive_sentinel(sub_gm, "eagle_drafter.d2t")
 
         # --- model dtype (used by apply_eagle3_fc) ---
         model_dtype = getattr(inner_model, "dtype", None)
@@ -456,25 +456,37 @@ class EagleOneModelFactory(ModelFactory):
             #     relative. Keep the pattern but strip the export-submodule prefix
             #     ("model.language_model.layers.0.linear_attn*" -> "layers.0.linear_attn*"). A
             #     full-model export has prefix "" -> nothing to strip.
-            #   - Draft (MTP) sub-graph: we load its weights canonically (restructured,
-            #     "mtp.* -> model.*"), so its excludes need the draft factory's regex remap
-            #     ("mtp.layers.0*" -> "model.layers*").
+            #   - Draft (MTP) sub-graph: we load its weights canonically into the draft's dedicated
+            #     "eagle_drafter.*" namespace (restructured, "mtp.* -> eagle_drafter.*"), so its
+            #     excludes need the draft factory's regex remap ("mtp.layers.0*" ->
+            #     "eagle_drafter.layers*"). That namespace is deliberately distinct from the
+            #     target's "model.*", so a draft exclude can never collide with a target module --
+            #     whether the target is a VLM submodule export or a full-model export.
             # The draft remap is draft-owned and is never applied to target patterns, so it cannot
             # corrupt a target exclude (before or after stripping).
             prefix = self._target_export_submodule_name
             prefix_dot = prefix + "." if prefix else None
             draft_map = getattr(self.draft_factory, "_quant_exclude_conversion_mapping", None)
 
+            # *Core no-collision assumption.* The draft remap rewrites the MTP head into the draft
+            # model's own dedicated namespace -- the RHS of draft_map, "eagle_drafter.*". No TARGET
+            # model names a module "eagle_drafter" (targets live under "model.*"/"backbone.*"/...),
+            # and that distinct namespace is the entire reason the draft's remapped excludes can
+            # never collide with target graph nodes -- for a VLM submodule export (target nodes
+            # "layers.*") or a full-model export (target nodes "model.layers.*") alike. We can't see
+            # the target graph here, but we guard the assumption against the patterns we do see: a
+            # non-draft (target / agnostic) exclude must not already live in that reserved namespace.
+            draft_namespaces = tuple(f"{v.split('.', 1)[0]}." for v in (draft_map or {}).values())
+
             new_excluded = []
             for p in excluded:
                 if prefix_dot and p.startswith(prefix_dot):
                     stripped = p[len(prefix_dot) :]
-                    # This partition assumes the target and draft exclude namespaces are disjoint, so
-                    # the draft remap never needs to touch a target pattern. We don't apply it here;
-                    # we only assert it WOULD be a no-op on the stripped pattern. Tripping this does
-                    # not mean the model is wrong -- it means that assumption no longer holds and
-                    # THIS exclude-splitting logic must be revisited (it can no longer just partition
-                    # by prefix), rather than silently mis-quantizing the target.
+                    # The draft remap is draft-owned and must never touch a target pattern. We don't
+                    # apply it here; we only assert it WOULD be a no-op on the stripped pattern.
+                    # Tripping this does not mean the model is wrong -- it means the disjoint-
+                    # namespace assumption no longer holds and THIS exclude-splitting logic must be
+                    # revisited (it can no longer just partition by prefix).
                     assert not draft_map or mapped_module_names([stripped], draft_map) == [
                         stripped
                     ], (
@@ -484,7 +496,15 @@ class EagleOneModelFactory(ModelFactory):
                     )
                     new_excluded.append(stripped)
                 else:
-                    new_excluded.extend(mapped_module_names([p], draft_map))
+                    remapped = mapped_module_names([p], draft_map)
+                    # A non-draft pattern (lm_head / vision / etc.) intruding into the draft's
+                    # reserved "eagle_drafter.*" namespace breaks the core assumption above.
+                    assert remapped != [p] or not p.startswith(draft_namespaces), (
+                        f"target exclude {p!r} lives in the draft's reserved namespace "
+                        f"{draft_namespaces}: target and draft exclude namespaces must stay "
+                        "disjoint -- revisit EagleOneModelFactory.get_quant_config"
+                    )
+                    new_excluded.extend(remapped)
             qcfg["exclude_modules"] = new_excluded
         return qcfg
 

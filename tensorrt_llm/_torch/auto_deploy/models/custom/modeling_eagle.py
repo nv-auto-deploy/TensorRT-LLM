@@ -126,9 +126,9 @@ class EagleConfig(PretrainedConfig):
             # If False, the wrapper applies self.norm after the layers.
             # If True, layers have their own final_layernorm and wrapper skips self.norm.
             "layers_handle_final_norm": False,
-            # Llama Eagle checkpoint: fc.*, midlayer.* -> model.fc.*, model.layers.*
+            # Llama Eagle checkpoint: fc.*, midlayer.* -> eagle_drafter.fc.*, eagle_drafter.layers.*
             "_checkpoint_conversion_mapping": {
-                "^(?!lm_head|norm)": "model.",
+                "^(?!lm_head|norm)": "eagle_drafter.",
                 "midlayer": "layers",
             },
         },
@@ -141,9 +141,9 @@ class EagleConfig(PretrainedConfig):
             # NemotronH MTP layers have final_layernorm on the last layer,
             # so the wrapper should NOT apply an additional norm.
             "layers_handle_final_norm": True,
-            # NemotronH MTP checkpoint: mtp.* -> model.*
+            # NemotronH MTP checkpoint: mtp.* -> eagle_drafter.*
             "_checkpoint_conversion_mapping": {
-                r"^mtp\.": "model.",
+                r"^mtp\.": "eagle_drafter.",
             },
         },
         "qwen3_5_moe_text": {
@@ -153,20 +153,21 @@ class EagleConfig(PretrainedConfig):
             "normalize_target_hidden_state": True,
             "layers_handle_final_norm": True,
             "_checkpoint_conversion_mapping": {
-                r"^mtp\.layers\.0\.": "model.layers.",
-                r"^mtp\.fc\.": "model.layers.fc.",
-                r"^mtp\.pre_fc_norm_embedding\.": "model.layers.pre_fc_norm_embedding.",
-                r"^mtp\.pre_fc_norm_hidden\.": "model.layers.pre_fc_norm_hidden.",
-                r"^mtp\.norm\.": "model.layers.norm.",
+                r"^mtp\.layers\.0\.": "eagle_drafter.layers.",
+                r"^mtp\.fc\.": "eagle_drafter.layers.fc.",
+                r"^mtp\.pre_fc_norm_embedding\.": "eagle_drafter.layers.pre_fc_norm_embedding.",
+                r"^mtp\.pre_fc_norm_hidden\.": "eagle_drafter.layers.pre_fc_norm_hidden.",
+                r"^mtp\.norm\.": "eagle_drafter.layers.norm.",
             },
-            # Quant exclude_modules are fnmatch globs (e.g. "mtp.layers.0*"). The
-            # draft MTP layer is unwrapped (no layer index), so its modules live
-            # under "model.layers.*" (mirrors _checkpoint_conversion_mapping
-            # dropping the ".0" index). Remap excludes so the unquantized MTP head
-            # is skipped in the draft sub-graph. Target modules are
-            # "model.language_model.layers.*", so "model.layers*" cannot collide.
+            # Quant exclude_modules are fnmatch globs (e.g. "mtp.layers.0*"). The draft MTP layer is
+            # unwrapped (no layer index), so its modules live under "eagle_drafter.layers.*" (mirrors
+            # _checkpoint_conversion_mapping dropping the ".0" index). Remap excludes so the
+            # unquantized MTP head is skipped in the draft sub-graph. The draft is rooted at the
+            # dedicated "eagle_drafter.*" namespace (never "model.*"), so it cannot collide with target
+            # modules regardless of whether the target is a VLM submodule export or a full-model
+            # export.
             "_quant_exclude_conversion_mapping": {
-                r"^mtp\.layers\.0(?=\.|\*)": "model.layers",
+                r"^mtp\.layers\.0(?=\.|\*)": "eagle_drafter.layers",
             },
         },
     }
@@ -661,7 +662,10 @@ class EagleDrafterForCausalLM(PreTrainedModel):
         if layers is None:
             layers = get_eagle_layers(config, config.model_type)
 
-        self.model = EagleModel(config, layers)
+        # Rooted at a dedicated "eagle_drafter" namespace (not the generic "model") so the draft's
+        # exported node names ("eagle_drafter.layers.*") can never collide with a target model's
+        # "model.*" names -- see _quant_exclude_conversion_mapping above.
+        self.eagle_drafter = EagleModel(config, layers)
 
         # Only create norm if layers don't handle final normalization internally.
         if not self._layers_handle_final_norm:
@@ -708,7 +712,7 @@ class EagleDrafterForCausalLM(PreTrainedModel):
         if hidden_states is None:
             raise ValueError("hidden_states must be provided.")
 
-        hidden_states = self.model(
+        hidden_states = self.eagle_drafter(
             inputs_embeds=inputs_embeds, position_ids=position_ids, hidden_states=hidden_states
         )
 
@@ -728,8 +732,8 @@ class EagleDrafterForCausalLM(PreTrainedModel):
         )
 
     def get_input_embeddings(self):
-        if self.model.embed_tokens is not None:
-            return self.model.embed_tokens
+        if self.eagle_drafter.embed_tokens is not None:
+            return self.eagle_drafter.embed_tokens
         else:
             raise NotImplementedError(
                 "EagleDrafterForCausalLM does not have an input embedding layer."
@@ -808,10 +812,10 @@ class EagleWrapper(nn.Module):
     def _draft_inner_model(self):
         """Get the inner model submodule of the draft model.
 
-        Before export: self.draft_model.model (EagleModel inside EagleDrafterForCausalLM).
-        After export: self.draft_model.model (preserved by DraftModelExportInfo.post_process).
+        Before export: self.draft_model.eagle_drafter (EagleModel inside EagleDrafterForCausalLM).
+        After export: self.draft_model.eagle_drafter (preserved by DraftModelExportInfo.post_process).
         """
-        return self.draft_model.model
+        return self.draft_model.eagle_drafter
 
     @property
     def _draft_dtype(self):

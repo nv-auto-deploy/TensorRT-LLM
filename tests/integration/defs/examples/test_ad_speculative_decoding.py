@@ -290,8 +290,9 @@ def test_eagle_model_with_weights():
     # Verify expected missing and unexpected keys
     # These are the keys we expect based on Eagle3 architecture:
     # - embed_tokens: shared from target model (not in Eagle checkpoint)
-    # - t2d: target-to-draft mapping, not used in Eagle3 (uses d2t instead)
-    expected_unexpected_keys = {"model.t2d"}
+    # - t2d: target-to-draft mapping, not used in Eagle3 (uses d2t instead). The draft is rooted at
+    #   the "eagle_drafter" namespace, so the checkpoint's "t2d" maps to "eagle_drafter.t2d".
+    expected_unexpected_keys = {"eagle_drafter.t2d"}
 
     assert len(missing_keys) == 0, (
         f"Expect all keys to be loaded.\nKeys that are missing: {missing_keys}\n"
