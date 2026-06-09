@@ -261,7 +261,7 @@ Llama-3.1-8B target + Qwen3-arch Llama DFlash draft, same NO_RESTORE+SKIP_CTX:
 [RESIZEPROBE] before/after resize forward + after manager: lm_head std=0.01427 (UNCHANGED, same dptr)
 ```
 **Llama target lm_head is INTACT through resize — BUT Llama output is ALSO GARBAGE**
-(`": OOiterm,ist and it,oreOO..."`). So:
+(garbage tokens like `": OOiterm, <gibberish>, it, oreOO..."`). So:
 - NOT cleanly Qwen3-specific. Both Qwen3 and Llama DFlash produce garbage; Qwen3's victim is lm_head,
   Llama's victim is some OTHER weight (lm_head survives) — or the body.
 - REFRAMED ROOT CAUSE: a **memory-orphaning bug in the DFlash path** — the large-batch resize forward
@@ -489,3 +489,26 @@ disable_overlap_scheduler; OVERLAP=1 in the harness) works. GSM8K 200-sample, DF
 | Qwen3 accept_rate| 58.36% | 57.45% |
 => accuracy + acceptance effectively unchanged (all within sampling noise). Overlap scheduler OK.
 Next: task #12 monolithic cudagraph (compile_backend torch-simple -> torch-cudagraph).
+
+### TASK #12 (monolithic cudagraph) — progress + BLOCKER = stale C++ build (2026-06-08)
+DFlash-specific blocker FIXED: `_scatter_context_kv` had a per-seq Python loop with `.item()` D2H
+syncs (illegal during cudagraph capture). Vectorized the generation (pure-extend) path: fixed-shape
+tensor-indexed scatter, no `.item()`, commits all K+1 positions unconditionally (tail beyond ctx_len
+is never read this step + overwritten next step). Eager prefill keeps the loop (never captured).
+This cleared the scatter capture error.
+
+REMAINING BLOCKER (NOT DFlash, NOT spec-dec): capture warmup fails in the target trtllm attention op
+with `thop.attention(): incompatible function arguments`. Reproduces with PLAIN Llama (DFLASH=0) +
+torch-cudagraph too -> it's a general AD infra issue on this checkout.
+ROOT CAUSE = stale compiled binding: `cpp/build/.../libth_common.so` (built 2026-06-08 11:49) is from
+a NEWER revision that added `max_context_q_len_override` as attention() binding param #12. The current
+checked-out source (qwen3-vlm-mtp base) has NEITHER the Python call NOR the C++ binding param (it's
+only an internal local var at attentionOp.cpp:578). So current Python <-> current C++ source are
+consistent; the .so is the mismatch (param #12 = max_context_q_len_override in .so vs
+kv_cache_block_offsets in source -> all later args shift by one).
+FIX: rebuild C++ from the current worktree source (so the .so matches the Python). qwen3-vlm-mtp is
+NOT new enough to match the updated (.so) bindings; rebase onto a main with the max_context_q_len_
+override commit ONLY if that newer binding is wanted. Invariant: .so must be built from the same
+revision as the Python that's run. (User is recreating the worktree + rebasing + rebuilding.)
+After rebuild, re-run: CUDAGRAPH=1 OVERLAP=1 smoke, then full 200-sample CUDAGRAPH+OVERLAP GSM8K to
+confirm accuracy+acceptance match the torch-simple baseline (Llama 75.75/46.4%, Qwen3 87.25/58.4%).
