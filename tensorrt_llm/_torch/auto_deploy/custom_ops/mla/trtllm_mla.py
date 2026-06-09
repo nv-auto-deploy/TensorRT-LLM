@@ -53,6 +53,7 @@ Cache layout:
 """
 
 import math
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -85,6 +86,31 @@ from ..attention_interface import (
     ResourceHandlerDict,
 )
 from .rope_metadata import _TRTLLM_MLA_ROPE_INFO_KEY
+
+
+# =============================================================================
+# [TPLA INVESTIGATION HACK -- see mla_sharding_investigation.md] NOT FOR MERGE
+# =============================================================================
+def _tpla_latent_div() -> int:
+    """Latent-cache division factor ``G`` for the TPLA upper-bound experiment.
+
+    When ``TPLA_LATENT_DIV=G`` (G>1) is set in the environment, each rank caches
+    and reads only ``kv_lora_rank // G`` of the MLA latent (plus the full RoPE
+    dims), emulating the per-rank KV-cache footprint and read bandwidth of
+    Tensor-Parallel Latent Attention (TPLA) with ``G`` latent groups.
+
+    THIS PRODUCES NUMERICALLY GARBAGE OUTPUT: the latent is simply truncated,
+    with no orthogonal (Hadamard/PCA) reparameterization and no cross-group
+    all-reduce. It exists ONLY to measure the decode bandwidth ceiling before
+    committing to a real TPLA implementation. ``G=1`` (default) is a no-op.
+
+    NOTE: the specialized MLA decode kernel (flash-MLA / trtllm-gen MLA) may be
+    hard-specialized to head_dim=576; if it rejects a reduced latent, run the
+    experiment on a flexible backend (triton_mla / torch_backend_mla) -- see
+    mla_sharding_investigation.md.
+    """
+    return max(1, int(os.environ.get("TPLA_LATENT_DIV", "1")))
+
 
 # =============================================================================
 # Helpers
@@ -1837,6 +1863,15 @@ def _mla_with_cache_impl(
     kv_head_dim = out_features // num_heads
     v_head_dim = kv_head_dim - qk_nope_head_dim
 
+    # [TPLA investigation hack] kv_lora_rank arrives already divided by G (see
+    # get_constants). The graph still feeds the full (replicated) compressed_kv
+    # and kv_b_proj_weight from kv_a_proj/kv_b_proj, so truncate both to the
+    # per-rank latent slice. GARBAGE numerics (no reparam / no cross-group
+    # reduce) -- this only reproduces TPLA's per-rank KV bandwidth for perf.
+    if compressed_kv.shape[-1] != kv_lora_rank:
+        compressed_kv = compressed_kv[..., :kv_lora_rank].contiguous()
+        kv_b_proj_weight = kv_b_proj_weight[:, :kv_lora_rank].contiguous()
+
     batch_info = BatchInfo(batch_info_host)
     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
@@ -2206,6 +2241,11 @@ class TrtllmMLAAttention(AttentionDescriptor):
 
         cache_dtype = cls.resolve_cache_dtype(cache_config.dtype, compressed_kv_fake.dtype)
 
+        # [TPLA investigation hack] shrink the cached latent per rank by G so the
+        # paged pool is allocated for kv_lora_rank//G (+ RoPE) instead of the full
+        # latent. Must stay consistent with get_constants / _mla_with_cache_impl.
+        kv_lora_rank = kv_lora_rank // _tpla_latent_div()
+
         return {
             "kv_cache": KVPagedResourceHandler(
                 num_kv_heads=1,
@@ -2259,7 +2299,9 @@ class TrtllmMLAAttention(AttentionDescriptor):
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         compressed_kv_fake = source_attn_node.args[2].meta["val"]
-        kv_lora_rank = compressed_kv_fake.shape[-1]
+        # [TPLA investigation hack] pass the per-rank reduced latent rank (G>1)
+        # so the op slices compressed_kv / kv_b_proj_weight to match the cache.
+        kv_lora_rank = compressed_kv_fake.shape[-1] // _tpla_latent_div()
         (scale,) = extract_op_args(source_attn_node, "scale")
 
         rope_info = get_trtllm_mla_rope_info(source_attn_node)
