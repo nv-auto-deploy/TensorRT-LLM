@@ -98,14 +98,19 @@ def main():
         # Eagle3 one-model AD already runs with overlap ON, so the infra supports it.
         if os.environ.get("OVERLAP", "0") != "1":
             kwargs["disable_overlap_scheduler"] = True
-        # TEMP-FIX SIDE EFFECT: the DFlash factory forces free_gpu_memory_fraction=0.0, which DISABLES
-        # the memory-aware resize_kv_cache pass. Without it the KV pool is sized at the full estimate
-        # (max_batch_size x max_seq_len) and OOMs at batch=128/seq=8192. So bound memory explicitly:
-        # smaller batch + an explicit max_tokens. Greedy accuracy is batch/pool-invariant, so the
-        # on-vs-off comparison still holds. (Proper fix = make resize safe; see worklog task #9.)
+        # TODO: Enable cache resize. DFlash cannot currently run the resize_kv_cache pass (its large
+        # sample forward corrupts a target weight in place), so we disable it with
+        # free_gpu_memory_fraction=0.0. That also turns OFF memory-aware KV sizing, so the pool would
+        # otherwise default to the full estimate (max_batch_size x max_seq_len) and OOM -- hence the
+        # explicit smaller batch + max_tokens bound here. Greedy accuracy is batch/pool-invariant, so
+        # the DFlash on-vs-off comparison still holds. See debug/dflash_worklog_accuracy.md.
         kwargs["max_batch_size"] = 16
         kwargs["cuda_graph_config"] = {"batch_sizes": [1, 2, 4, 8, 16], "enable_padding": True}
-        kwargs["kv_cache_config"] = {"enable_block_reuse": False, "max_tokens": 32768}
+        kwargs["kv_cache_config"] = {
+            "enable_block_reuse": False,
+            "max_tokens": 32768,
+            "free_gpu_memory_fraction": 0.0,
+        }
 
     tag = f"MODEL={key} DFLASH={int(use_dflash)} N={num_samples} ATTN={attn}"
     print(

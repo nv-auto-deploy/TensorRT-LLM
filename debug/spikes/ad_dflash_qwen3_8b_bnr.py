@@ -57,15 +57,15 @@ def run():
             "cuda_graph_config": {"batch_sizes": [1, 2, 4], "enable_padding": True},
             "kv_cache_config": {"enable_block_reuse": False, "max_tokens": 2048},
         }
-    if os.environ.get("NORESIZE") == "1":
-        # free_gpu_memory_fraction=0.0 -> needs_resize()==False -> the resize_kv_cache pass (whose
-        # large sample forward corrupts the target lm_head) is skipped entirely; the estimation-mode
-        # pool is kept. TEMPORARY: trades away KV capacity tuning. See debug/dflash_worklog_accuracy.md.
-        args.setdefault("kv_cache_config", {})["free_gpu_memory_fraction"] = 0.0
     if use_spec:
         args["speculative_config"] = DFlashDecodingConfig(
             max_draft_len=4, speculative_model=draft, target_layer_ids=layer_ids
         )
+        # TODO: Enable cache resize. DFlash can't run the resize_kv_cache pass yet (its large sample
+        # forward corrupts a target weight in place); disable it via free_gpu_memory_fraction=0.0
+        # (-> needs_resize()==False). This also turns off memory-aware KV sizing, so keep the explicit
+        # max_tokens bound above. See debug/dflash_worklog_accuracy.md.
+        args.setdefault("kv_cache_config", {})["free_gpu_memory_fraction"] = 0.0
         # Spec decoding bring-up requires the overlap scheduler OFF (the AD spec-dec smoke does this
         # for every spec case). Overlap pipelines next-step scheduling against in-flight tokens, which
         # is incompatible with the one-model verify wrapper -> garbage if left on.
