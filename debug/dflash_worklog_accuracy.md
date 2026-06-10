@@ -23,10 +23,15 @@ Per-issue worklog. Issue: the AD DFlash E2E smoke RUNS (no crash) but produces g
   forward corrupts a target weight in place (Qwen3→lm_head, Llama→a body weight). It is resize-driven
   and target-AGNOSTIC, NOT Qwen3-specific. "Acceptance 0" was purely a symptom of the corrupted verify
   logits — once the target is coherent the draft accepts normally.
-- FIX (TEMPORARY, in code): `DFlashOneModelFactory.get_cache_config_updates()` forces
-  `free_gpu_memory_fraction=0.0` → `needs_resize()`==False → resize pass deterministically SKIPPED.
-  The lm_head re-home/restore workaround was REMOVED. Debug probes in kvcache.py removed.
-- The detailed evidence is in the dated sections below (CONFIRMED FIX → ACCEPTANCE → LLAMA VERIFIED).
+- FIX (TEMPORARY): set `kv_cache_config.free_gpu_memory_fraction=0.0` → `needs_resize()`==False →
+  resize pass SKIPPED. Applied EXPLICITLY at the DFlash run/test configs (gsm8k_ad_compare.py,
+  ad_dflash_qwen3_8b_bnr.py) with a "TODO: Enable cache resize" marker — NOT forced in the factory
+  (moved out per review; easy to miss there). The lm_head re-home/restore workaround was REMOVED.
+- ROADMAP ALL VERIFIED (GSM8K 200-sample, DFlash on==off lossless): (1) accuracy parity + acceptance,
+  (2) overlap scheduler, (3) monolithic cudagraph capture (after C++ rebuild fixed a stale-binding
+  skew). Acceptance unchanged across all three; accuracy within sampling noise. See dated sections.
+- The detailed evidence is in the dated sections below (CONFIRMED FIX → ACCEPTANCE → LLAMA VERIFIED →
+  GSM8K TABLE → OVERLAP → CUDAGRAPH).
 
 **REMAINING TODOs (priority order):**
 1. PROPER fix (task #9): make `resize_kv_cache`'s sample forward not corrupt model weights, so KV can
@@ -512,3 +517,72 @@ override commit ONLY if that newer binding is wanted. Invariant: .so must be bui
 revision as the Python that's run. (User is recreating the worktree + rebasing + rebuilding.)
 After rebuild, re-run: CUDAGRAPH=1 OVERLAP=1 smoke, then full 200-sample CUDAGRAPH+OVERLAP GSM8K to
 confirm accuracy+acceptance match the torch-simple baseline (Llama 75.75/46.4%, Qwen3 87.25/58.4%).
+
+### ✅ TASK #12 — MONOLITHIC CUDAGRAPH VERIFIED (2026-06-09, after C++ rebuild)
+The cudagraph attention TypeError was a stale-build skew (compiled .so had max_context_q_len_override
+at attention() slot 12, source didn't). Rebased onto the new origin/gramnarayan/qwen3-vlm-mtp (which
+adds max_context_q_len_override to BOTH the Python wrapper + C++) and rebuilt the C++ -> binding now
+matches the Python call. The DFlash-specific blocker (vectorized _scatter_context_kv) was already
+fixed. Result: DFlash + overlap + monolithic cudagraph capture runs E2E (capture ~145s).
+
+GSM8K 200-sample comparison across the 3 roadmap stages (all DFlash ON):
+| metric            | torch-simple | +overlap | +overlap+cudagraph |
+|-------------------|--------------|----------|--------------------|
+| Llama acc         | 75.75        | 75.25    | 73.50              |
+| Llama accept_rate | 46.38%       | 47.03%   | 46.60%             |
+| Qwen3 acc         | 87.25        | 87.50    | 88.25              |
+| Qwen3 accept_rate | 58.36%       | 57.50%   | 57.50%             |
+=> Acceptance UNCHANGED across all stages. Accuracy within sampling noise (200-sample stderr ~3%;
+   Qwen3 up, Llama -2.25pt but <1 stderr; identical acceptance + greedy => the small Llama wobble is
+   cudagraph batch-padding numerics flipping a few target argmax decisions, not a regression).
+
+REFACTOR (per user): free_gpu_memory_fraction=0.0 workaround moved OUT of
+DFlashOneModelFactory.get_cache_config_updates() (was easy to miss) and made EXPLICIT in the DFlash
+run configs (gsm8k_ad_compare.py, ad_dflash_qwen3_8b_bnr.py) with "TODO: Enable cache resize".
+Validated: the full cudagraph run above used the explicit-config path (factory no longer forces it).
+
+OPTIONAL TIGHTER CONFIRM: full 1319-sample GSM8K Llama cudagraph vs torch-simple to settle the 2.25pt.
+
+### ✅ FULL 1319-SAMPLE GSM8K MATRIX (2026-06-09) — settles the Llama cudagraph question
+| backend | model | config                | accuracy | accept_rate |
+|---------|-------|-----------------------|----------|-------------|
+| PyTorch | Llama | default (no spec)     | 74.26    | -           |
+| AD      | Llama | DFlash torch-simple   | 74.678   | 47.84%      |
+| AD      | Llama | DFlash cudagraph      | 74.678   | 47.87%      |
+| PyTorch | Qwen3 | default (no spec)     | 87.26    | -           |
+| AD      | Qwen3 | DFlash torch-simple   | 87.566   | 57.89%      |
+| AD      | Qwen3 | DFlash cudagraph      | 87.491   | 57.92%      |
+(AD rows: DFlash ON, overlap ON; compile backend is the only variable. Full GSM8K, 5-shot, greedy.)
+
+CONCLUSIONS:
+- CUDAGRAPH IS LOSSLESS: Llama torch-simple == cudagraph EXACTLY (74.678); Qwen3 87.566 vs 87.491
+  (1 question). The earlier 200-sample Llama "2pt drop" (75.75->73.50) was pure sampling noise.
+- AD DFlash ≈ PyTorch default reference: Llama 74.68 vs 74.26; Qwen3 87.5 vs 87.26 (<0.4pt, within
+  PyT stderr ~1.2%). The AD DFlash stack matches the production backend's accuracy at full scale.
+- Acceptance healthy + stable across compile backends (Llama ~47.8%, Qwen3 ~57.9%).
+Driver: debug/spikes/gsm8k_full_matrix.sh (PyT refs run separately after a set -u bug in the driver's
+pyt_run path; AD rows produced by the driver). Logs in debug/logs/full_matrix/.
+
+### ✅ AD vs PyTorch-NATIVE DFlash — full 1319-sample GSM8K (2026-06-09)
+Apples-to-apples: PyT-backend DFlash via debug/spikes/gsm8k_pyt_dflash.py (mirrors
+test_llm_api_pytorch::test_dflash: max_batch_size=8, overlap ON, CudaGraphConfig(max_batch_size=8),
+kv free_gpu_memory_fraction=0.6 -- PyT has no resize bug). SAME GSM8K protocol + SAME accept metric
+(numAcceptedTokens/numDraftTokens from get_stats) as the AD harness. get_stats() populates spec stats
+for the PyT backend too -- no probe needed.
+
+| backend | model | config              | accuracy | accept_rate |
+|---------|-------|---------------------|----------|-------------|
+| PyTorch | Llama | default (no spec)   | 74.26    | -           |
+| PyTorch | Llama | DFlash + cudagraph  | 73.92    | 49.36%      |
+| AD      | Llama | DFlash torch-simple | 74.678   | 47.84%      |
+| AD      | Llama | DFlash + cudagraph  | 74.678   | 47.87%      |
+| PyTorch | Qwen3 | default (no spec)   | 87.26    | -           |
+| PyTorch | Qwen3 | DFlash + cudagraph  | 87.225   | 56.44%      |
+| AD      | Qwen3 | DFlash torch-simple | 87.566   | 57.89%      |
+| AD      | Qwen3 | DFlash + cudagraph  | 87.491   | 57.92%      |
+
+ACCEPTANCE AD-vs-PyT (cudagraph): Llama 47.87% vs 49.36% (-1.49pt); Qwen3 57.92% vs 56.44% (+1.48pt).
+=> SIMILAR (within ~1.5pt, opposite-signed across models -> minor impl/numerics, not a systematic AD
+   deficit). ACCURACY matches everywhere (<0.8pt). Cudagraph lossless on AD (Llama 74.678==74.678).
+The small AD-vs-PyT acceptance delta could be chased via the context-KV parity test (task #4) if a
+tighter match is desired.
