@@ -459,13 +459,22 @@ class PythonMambaCacheManager(BaseResourceManager):
         ssm_state_shape = (nheads, head_dim, d_state)
 
         # create mamba conv and ssm states
-        conv_states = torch.empty(
+        # Zero-initialize (not torch.empty): an un-prefilled cache slot (e.g. an
+        # attention-DP idle/dummy generation request that is decoded without a
+        # prefill) is read by the causal-conv / SSM ops before anything writes it.
+        # Uninitialized HBM can be NaN/Inf, which the causal-conv then propagates
+        # into the residual stream (and the SSM replay path latches into the
+        # persistent recurrent state, spreading it across ranks via the MoE
+        # all-to-all). Whether the garbage is NaN vs finite depends on the
+        # allocation layout, which is exactly why the failure only surfaced under
+        # {ssm_replay=true × attention-DP × MTP}. Zeros are a valid empty state.
+        conv_states = torch.zeros(
             size=(num_local_layers, max_batch_size) + conv_state_shape,
             dtype=dtype,
             device=device,
         )
 
-        ssm_states = torch.empty(
+        ssm_states = torch.zeros(
             size=(num_local_layers, max_batch_size) + ssm_state_shape,
             dtype=self.mamba_ssm_cache_dtype,
             device=device,
@@ -842,8 +851,12 @@ class PythonMambaCacheManager(BaseResourceManager):
             # number of accepted tokens and flip the double-buffer index so the
             # next step's replay reads from the buffer that was just written by
             # the precompute kernel.
+            # Cast to the buffer dtype: new_tokens_lens is int32 while
+            # prev_num_accepted_tokens is int64, and the eager index_put_ is
+            # dtype-strict (the compiled path silently inserts the cast).
             self.mamba_cache.prev_num_accepted_tokens[state_indices_d] = \
-                num_accepted_tokens[num_contexts:num_contexts + num_gens]
+                num_accepted_tokens[num_contexts:num_contexts + num_gens].to(
+                    self.mamba_cache.prev_num_accepted_tokens.dtype)
             self.mamba_cache.cache_buf_idx[state_indices_d] = \
                 1 - self.mamba_cache.cache_buf_idx[state_indices_d]
         else:
