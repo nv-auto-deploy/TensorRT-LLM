@@ -758,13 +758,22 @@ class ResizeKVCache(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        # Run a forward pass to get the extra memory usage
-        cm.info.set_max_num_tokens_sample()
+        # Run a forward pass to get the extra memory usage. Speculative wrappers may append
+        # draft/query tokens after the sampled context; leave per-sequence headroom so the synthetic
+        # batch does not ask the model for positions past its configured context length.
+        extra_tokens_per_seq = 0
+        if cm._spec_config is not None:
+            extra_tokens_per_seq = getattr(mod, "block_size", None)
+            if extra_tokens_per_seq is None:
+                extra_tokens_per_seq = cm.info.batch_info.get_max_draft_len() + 1
+            extra_tokens_per_seq = int(extra_tokens_per_seq)
+        cm.info.set_max_num_tokens_sample(extra_tokens_per_seq=extra_tokens_per_seq)
         try:
-            if cm._spec_config is not None:
-                mod(**cm.named_args, cache_seq_interface=cm)
-            else:
-                mod(**cm.named_args)
+            with torch.inference_mode():
+                if cm._spec_config is not None:
+                    mod(**cm.named_args, cache_seq_interface=cm)
+                else:
+                    mod(**cm.named_args)
         except torch.OutOfMemoryError as e:
             self._log_info(
                 f"OutOfMemoryError in forward pass while trying to resize the kv-cache:\n{e}"

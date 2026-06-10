@@ -398,19 +398,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def reject_resize_kv_cache_for_dflash(self):
-        if isinstance(self.speculative_config, DFlashDecodingConfig):
-            resize_config = self.transforms.get("resize_kv_cache")
-            resize_enabled = resize_config is not None and resize_config.get("enabled", True)
-            if resize_enabled:
-                raise ValueError(
-                    "AutoDeploy DFlash does not support the resize_kv_cache transform yet. "
-                    "Set transforms.resize_kv_cache.enabled=False until the DFlash resize path is "
-                    "made weight-safe."
-                )
-        return self
-
-    @model_validator(mode="after")
     def extend_default_cuda_graph_config_to_max_batch_size(self):
         """Auto-extend the default cuda_graph_config to cover the top-level max_batch_size.
 

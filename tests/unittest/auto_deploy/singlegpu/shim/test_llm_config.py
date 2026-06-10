@@ -20,8 +20,6 @@ from transformers import LlamaConfig
 
 from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM, LlmArgs
 
-DFLASH_RESIZE_DISABLED_TRANSFORMS = {"resize_kv_cache": {"enabled": False}}
-
 
 def test_custom_values():
     """Test that AutoDeploy LlmArgs correctly accepts custom values."""
@@ -342,7 +340,6 @@ class TestSpeculativeConfigValidation:
         args = LlmArgs(
             model="test-model",
             speculative_config=spec_config,
-            transforms=DFLASH_RESIZE_DISABLED_TRANSFORMS,
         )
         # DFlash resolves to its own one-model factory; the original factory becomes the target.
         assert args.model_factory == "dflash_one_model"
@@ -364,12 +361,11 @@ class TestSpeculativeConfigValidation:
             model="test-model",
             model_factory="AutoModelForImageTextToText",
             speculative_config=spec_config,
-            transforms=DFLASH_RESIZE_DISABLED_TRANSFORMS,
         )
         assert args.model_factory == "dflash_one_model"
         assert args.target_model_factory == "AutoModelForImageTextToText"
 
-    def test_dflash_rejects_resize_kv_cache(self):
+    def test_dflash_accepts_default_resize_kv_cache(self):
         from tensorrt_llm.llmapi import DFlashDecodingConfig
 
         spec_config = DFlashDecodingConfig(
@@ -377,8 +373,10 @@ class TestSpeculativeConfigValidation:
             speculative_model="some/dflash-draft",
             target_layer_ids=[1, 9, 17, 25, 33],
         )
-        with pytest.raises(ValueError, match="resize_kv_cache"):
-            LlmArgs(model="test-model", speculative_config=spec_config)
+        args = LlmArgs(model="test-model", speculative_config=spec_config)
+
+        resize = args.transforms["resize_kv_cache"]
+        assert resize.get("enabled", True) is True
 
     def test_dflash_rejects_unsorted_target_layer_ids(self):
         from tensorrt_llm.llmapi import DFlashDecodingConfig
@@ -392,7 +390,6 @@ class TestSpeculativeConfigValidation:
             LlmArgs(
                 model="test-model",
                 speculative_config=spec_config,
-                transforms=DFLASH_RESIZE_DISABLED_TRANSFORMS,
             )
 
     def test_dflash_reads_defaults_from_draft_config(self, tmp_path):
@@ -415,7 +412,6 @@ class TestSpeculativeConfigValidation:
         args = LlmArgs(
             model="test-model",
             speculative_config=spec_config,
-            transforms=DFLASH_RESIZE_DISABLED_TRANSFORMS,
         )
 
         assert args.speculative_config.target_layer_ids == [1, 2, 3]

@@ -313,11 +313,6 @@ class DFlashOneModelFactory(ModelFactory):
         return self.target_factory.get_quant_config()
 
     def get_cache_config_updates(self) -> Dict[str, Any]:
-        # NOTE: DFlash currently cannot run the resize_kv_cache pass -- its large
-        # `set_max_num_tokens_sample` forward corrupts a target model weight in place (Qwen3 target ->
-        # lm_head; with resize skipped the output is coherent without any lm_head workaround). LlmArgs
-        # rejects DFlash configs while this transform is enabled; the proper fix is to make the resize
-        # sample forward weight-safe, then remove that validator.
         return dict(self.target_factory.get_cache_config_updates())
 
     def init_tokenizer(self) -> Optional[Any]:

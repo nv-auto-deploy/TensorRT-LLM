@@ -34,15 +34,24 @@ Per-issue worklog. Issue: the AD DFlash E2E smoke RUNS (no crash) but produces g
   GSM8K TABLE → OVERLAP → CUDAGRAPH).
 
 **REMAINING TODOs (priority order):**
-1. PROPER fix (task #9): make `resize_kv_cache`'s sample forward not corrupt model weights, so KV can
-   be sized for capacity again (remove the free_gpu_memory_fraction=0.0 override). Likely tied to
-   export `clone=False` weight sharing / `expose_graph_module_accessor`. Exact orphaning mechanism not
-   yet isolated.
-2. Remove remaining debug scaffolding before PR: `DFLASH_SKIP_CTX` bisection + `DFDBG_ACCEPT` print in
-   `models/custom/modeling_dflash.py`; spike env-branches (NORESIZE/NOCAP/DFLASH_SKIP_CTX) are in
-   debug/ and won't ship.
-3. Context-KV parity unit test (task #4) using HF ref `z-lab/Qwen3-4B-DFlash-b16/modeling_dflash.py`.
-4. Run the real accuracy test (test_llm_api_autodeploy.py) for DFlash end-to-end.
+1. Optional full-scale re-run with resize enabled: 200-sample or 1319-sample GSM8K, if a tighter
+   comparison against the 2026-06-09 matrix is needed.
+2. Run the real accuracy test (test_llm_api_autodeploy.py) for DFlash end-to-end.
+
+**2026-06-10 UPDATE -- task #9 resize path enabled:**
+- `resize_kv_cache` now runs its sizing forward under `torch.inference_mode()` and leaves speculative
+  per-sequence headroom before constructing the synthetic max-token batch. DFlash uses the wrapper's
+  `block_size`; other speculative wrappers fall back to `max_draft_len + 1`.
+- Removed the AutoDeploy `LlmArgs` validator that rejected DFlash with default `resize_kv_cache`.
+  The DFlash smoke and tracked debug harnesses no longer set `free_gpu_memory_fraction=0.0` to skip
+  resizing.
+- Focused validation:
+  - 7 selected config/resize unit tests passed.
+  - `test_qwen3_dflash_smoke` passed with `resize_kv_cache` enabled and `free_gpu_memory_fraction=0.9`.
+  - Llama-3.1-8B + `LLaMA3.1-8B-Instruct-DFlash-UltraChat`, 128-sample GSM8K, DFlash ON, trtllm,
+    resize active: `resize_kv_cache` resized to `max_tokens=131072` with
+    `free_gpu_memory_fraction=0.7`; accuracy `76.562`, accept rate `46.21%`
+    (`8165/17668`, approx `1.849` accepted draft tokens/step).
 
 --- (historical notes below; superseded where they conflict with the summary above) ---
 
@@ -111,7 +120,7 @@ tracking through resize. Related: export `clone=False` (shared param storage) + 
 `models/custom/modeling_dflash.py` (wrapper: _maybe_restore_target_lm_head, _forward_with_kv_cache),
 `models/hf.py` (expose_graph_module_accessor — proper-fix target), `transform/library/kvcache.py`
 (resize_kv_cache), `shim/interface.py` (resize_kv_cache_manager).
-**Spikes:** `debug/spikes/ad_dflash_qwen3_8b_bnr.py` (main E2E, env-toggled SPEC/REGSTYLE/ATTN/NOCAP),
+**Spikes:** `debug/spikes/ad_dflash_qwen3_8b_bnr.py` (main E2E, env-toggled SPEC/REGSTYLE/ATTN),
 `robust_bnr.sh` (retry runner), `dflash_build_load_repro.py`, `dflash_export_precompute_repro.py`.
 ## ====================================================================
 

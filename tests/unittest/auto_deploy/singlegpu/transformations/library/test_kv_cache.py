@@ -621,9 +621,13 @@ def test_resize_kv_cache_transform_runs_when_needed():
     # Create the transform with a proper config
     transform = ResizeKVCache(config=TransformConfig(stage=Stages.PATTERN_MATCHER))
 
+    resize_forward_observed = {}
+
     # Create a simple mock module that just returns None
     class MockModule:
         def __call__(self, **kwargs):
+            resize_forward_observed["inference_mode"] = torch.is_inference_mode_enabled()
+            resize_forward_observed["has_cache_seq_interface"] = "cache_seq_interface" in kwargs
             return None
 
     mock_module = MockModule()
@@ -637,6 +641,63 @@ def test_resize_kv_cache_transform_runs_when_needed():
 
     # Verify transform was not skipped
     assert info.skipped is False
+    assert resize_forward_observed == {
+        "inference_mode": True,
+        "has_cache_seq_interface": False,
+    }
+
+
+def test_resize_kv_cache_transform_spec_forward_uses_inference_mode():
+    """Speculative resize warmup should follow the runtime inference-mode contract."""
+    from tensorrt_llm.llmapi import DFlashDecodingConfig
+
+    spec_config = DFlashDecodingConfig(
+        max_draft_len=2,
+        speculative_model="some/dflash-draft",
+        target_layer_ids=[0],
+    )
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=32,
+        max_tokens=256,
+        free_gpu_memory_fraction=0.5,
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+        spec_config=spec_config,
+    )
+
+    cm.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    cm.initialize_resources()
+
+    transform = ResizeKVCache(config=TransformConfig(stage=Stages.PATTERN_MATCHER))
+    resize_forward_observed = {}
+
+    class MockSpecModule:
+        block_size = 8
+
+        def __call__(self, **kwargs):
+            csi = kwargs.get("cache_seq_interface")
+            num_prefill_tokens, _, _ = csi.info.batch_info.get_num_tokens()
+            resize_forward_observed["inference_mode"] = torch.is_inference_mode_enabled()
+            resize_forward_observed["cache_seq_interface"] = csi
+            resize_forward_observed["num_prefill_tokens"] = num_prefill_tokens
+            return None
+
+    result_mod, info = transform._apply_to_full_model(
+        MockSpecModule(), cm, MagicMock(), MagicMock()
+    )
+
+    assert result_mod is not None
+    assert info.skipped is False
+    assert resize_forward_observed == {
+        "inference_mode": True,
+        "cache_seq_interface": cm,
+        "num_prefill_tokens": 4 * (128 - MockSpecModule.block_size),
+    }
 
 
 def test_insert_cached_attention_uses_add_resource():

@@ -379,10 +379,7 @@ def test_qwen3_dflash_smoke():
             "cuda_graph_config": {"max_batch_size": 2},
             "kv_cache_config": {
                 "tokens_per_block": 4,
-                "free_gpu_memory_fraction": 0.0,
             },
-            # TODO: Enable DFlash cache resize once resize_kv_cache is weight-safe.
-            "transforms": {"resize_kv_cache": {"enabled": False}},
         },
         "benchmark": {"enabled": False},
         "prompt": {

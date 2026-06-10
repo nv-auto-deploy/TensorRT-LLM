@@ -61,20 +61,10 @@ def run():
         args["speculative_config"] = DFlashDecodingConfig(
             max_draft_len=4, speculative_model=draft, target_layer_ids=layer_ids
         )
-        # TODO: Enable cache resize. DFlash can't run the resize_kv_cache pass yet (its large sample
-        # forward corrupts a target weight in place); disable it via free_gpu_memory_fraction=0.0
-        # (-> needs_resize()==False). This also turns off memory-aware KV sizing, so keep the explicit
-        # max_tokens bound above. See debug/dflash_worklog_accuracy.md.
-        args.setdefault("kv_cache_config", {})["free_gpu_memory_fraction"] = 0.0
         # Spec decoding bring-up requires the overlap scheduler OFF (the AD spec-dec smoke does this
         # for every spec case). Overlap pipelines next-step scheduling against in-flight tokens, which
         # is incompatible with the one-model verify wrapper -> garbage if left on.
         args["disable_overlap_scheduler"] = True
-        # DEBUG bisection: NOCAP=1 disables the hidden-state capture transform. Only valid with
-        # DFLASH_SKIP_CTX=1 (the wrapper then never reads the capture buffers). Isolates whether the
-        # capture graph-rewrite corrupts the target verify path.
-        if os.environ.get("NOCAP") == "1":
-            args["transforms"] = {"detect_hidden_states_for_capture": {"enabled": False}}
     experiment_config = {
         "args": args,
         "prompt": {

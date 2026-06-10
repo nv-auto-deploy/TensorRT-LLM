@@ -1127,14 +1127,17 @@ class SequenceInfo:
             **extra_args,
         )
 
-    def set_max_num_tokens_sample(self) -> None:
+    def set_max_num_tokens_sample(self, extra_tokens_per_seq: int = 0) -> None:
         """Set an example sequence with max_num_tokens.
 
         The per-sequence length is capped to the maximum that fits in the paged KV cache
         (max_blocks_per_seq * tokens_per_block) to avoid exceeding block_offsets capacity.
+        ``extra_tokens_per_seq`` reserves headroom for model paths that append draft/query
+        tokens after the sampled context, such as DFlash's fixed-width query block.
         """
         max_cache_tokens_per_seq = self.max_blocks_per_seq * self.tokens_per_block
-        seq_len = min(self.max_num_tokens // self.max_batch_size, max_cache_tokens_per_seq)
+        max_sample_seq_len = max(1, max_cache_tokens_per_seq - extra_tokens_per_seq)
+        seq_len = min(self.max_num_tokens // self.max_batch_size, max_sample_seq_len)
         input_ids = torch.ones(self.max_batch_size, seq_len, dtype=torch.int)
         self.set_example_sequence(input_ids)
 
