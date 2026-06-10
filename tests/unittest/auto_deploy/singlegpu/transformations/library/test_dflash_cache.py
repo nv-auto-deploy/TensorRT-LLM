@@ -25,15 +25,9 @@ Exports a toy draft whose ``forward(q, k, v, ctx_len)`` emits the distinct sourc
     source op -- see ``debug/spikes/spike_b_ctx_len_export.py``);
   - two dense ctx K/V resources are registered with the slack-sized ``+block_size`` seq dim.
 
-This is a STRUCTURAL gate: it does not execute the rewritten graph. End-to-end execution needs the
-wrapper/factory ``ctx_len`` + cache-allocation plumbing (Steps 7-8); the op's runtime math is covered
-by ``tests/.../custom_ops/attention/test_dflash_attention_op.py``.
-
-TODO (upgrade once Step 3 ``modeling_dflash.py`` lands): replace the toy module with a small instance
-of the real prefill-version DFlash draft model and run the transform over its actual
-``dflash_attention`` sites (multiple draft layers, real ``ctx_len`` wiring). That exercises the genuine
-exported graph shape rather than a hand-built single-op stub. Keep this toy test as the fast unit-level
-regression guard for the rewrite mechanics.
+This is a STRUCTURAL gate: it does not execute the rewritten graph. The op's runtime math is covered
+by ``tests/.../custom_ops/attention/test_dflash_attention_op.py``; model-shaped export coverage lives
+in ``tests/.../models/test_dflash_model.py``.
 """
 
 from unittest.mock import MagicMock

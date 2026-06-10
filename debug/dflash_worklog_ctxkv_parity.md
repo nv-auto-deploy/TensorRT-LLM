@@ -5,6 +5,30 @@ SPDX-License-Identifier: Apache-2.0
 
 # DFlash AD — context-KV parity test: SCOPING / HANDOFF (read this first)
 
+## STATUS: DONE ✅ (2026-06-09)
+Test landed: `tests/unittest/auto_deploy/singlegpu/models/test_dflash_context_kv_parity.py`
+(`test_precompute_context_kv_matches_hf`, params `fp32-tight` + `bf16-production`). Both PASS.
+- Builds AD `DFlashModel` via the factory (mirrors `test_dflash_factory.py::test_draft_weights_load_strict`)
+  and the HF vanilla draft via `AutoModel.from_pretrained(Qwen3-8B-DFlash-b16, trust_remote_code=True)`,
+  same checkpoint into both. HF reference replicates the context-only slice of
+  `Qwen3DFlashAttention.forward` using HF's OWN `fc/hidden_norm/k_proj/v_proj/k_norm/rotary_emb`
+  + remote-module `apply_rotary_pos_emb` (imported via `type(hf).__module__`).
+- **RESULT — the port is correct; no context-KV math bug.**
+  - **fp32:** V bit-exact (maxabs 0.0); K matches to ~1e-4. Tight check PASSES.
+  - **bf16:** V STILL bit-exact (no norm/RoPE). K: maxabs ~8.6e-2, **mean-abs ~6e-4**, only ~0.09%
+    of elements over a 2e-2 tol; huge maxrel is the classic near-zero-K RoPE artifact. At |K|~10,
+    one bf16 ULP ≈ 0.08 ⇒ this is ~1 ULP of rounding in `k_norm + RoPE`, symmetric, NOT a systematic
+    shift. bf16 tol set to rtol 3e-2 / atol 1.6e-1 + a mean-abs guard (`< 1e-2 * mean|K_ref|`) so a
+    real (systematic) regression still fails while ULP outliers pass.
+- **The ~1.5pt AD-vs-PyT acceptance "gap" is NOT real** — verified on full GSM8K (user-confirmed
+  2026-06-09); it's within run-to-run / bf16 variance, not a regression. This parity test
+  independently corroborates that: the context-KV path is fp32-exact and bf16-V-exact, so there was
+  never a context-KV math error to explain a gap. No further chase needed; the test stands as a
+  guard against future context-KV regressions.
+
+(Original scoping below kept for provenance.)
+
+
 **Goal:** a unit test that numerically compares the AutoDeploy DFlash drafter's
 `precompute_context_kv` against a reference, feeding identical inputs and asserting the per-layer
 K/V match. Validates the AD context path and is the tool to localize the small AD-vs-PyT acceptance

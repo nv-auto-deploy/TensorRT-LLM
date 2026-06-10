@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn as nn
+from transformers import LlamaConfig
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401  (registers factories + ops)
@@ -97,6 +99,70 @@ def test_factory_validates_block_size():
     factory = _make_factory(max_draft_len=20)  # 21 > 16
     with pytest.raises(ValueError, match="block_size"):
         factory.build_model("meta")
+
+
+def test_factory_preserves_zero_mask_token_id(monkeypatch):
+    """An explicit mask_token_id=0 must not fall through to the draft config fallback."""
+    spec = DFlashDecodingConfig(
+        max_draft_len=1,
+        speculative_model="test-dflash-draft",
+        mask_token_id=0,
+        target_layer_ids=[0],
+    )
+    factory = DFlashOneModelFactory(
+        model="test-target",
+        speculative_config=spec,
+        skip_loading_weights=True,
+        max_seq_len=64,
+    )
+    draft_config = LlamaConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        num_hidden_layers=1,
+        vocab_size=32,
+    )
+    draft_config.block_size = 4
+    draft_config.dflash_config = {"target_layer_ids": [0], "mask_token_id": 7}
+    monkeypatch.setattr(factory, "prefetch_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(factory, "_build_draft_config", lambda: draft_config)
+    monkeypatch.setattr(factory.target_factory, "build_model", lambda _device: nn.Module())
+
+    model = factory.build_model("meta")
+
+    assert model.mask_token_id == 0
+
+
+def test_prefetch_checkpoint_fetches_dflash_draft(monkeypatch):
+    spec = DFlashDecodingConfig(
+        max_draft_len=1,
+        speculative_model="test-dflash-draft",
+        target_layer_ids=[0],
+    )
+    factory = DFlashOneModelFactory(
+        model="test-target",
+        speculative_config=spec,
+        skip_loading_weights=True,
+        max_seq_len=64,
+    )
+    calls = []
+
+    def record_target_prefetch(force=False, skip_loading_weights=None):
+        calls.append(("target", force, skip_loading_weights))
+
+    def record_draft_prefetch(force=False, skip_loading_weights=None):
+        calls.append(("draft", force, skip_loading_weights))
+
+    monkeypatch.setattr(factory.target_factory, "prefetch_checkpoint", record_target_prefetch)
+    monkeypatch.setattr(
+        factory.draft_checkpoint_factory, "prefetch_checkpoint", record_draft_prefetch
+    )
+
+    factory.prefetch_checkpoint(force=True, skip_loading_weights=False)
+
+    assert ("target", True, False) in calls
+    assert ("draft", True, False) in calls
 
 
 @torch.inference_mode()

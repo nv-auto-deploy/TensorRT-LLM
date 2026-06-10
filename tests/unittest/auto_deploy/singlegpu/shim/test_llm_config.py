@@ -16,8 +16,11 @@ from unittest.mock import MagicMock, patch
 
 import pydantic
 import pytest
+from transformers import LlamaConfig
 
 from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM, LlmArgs
+
+DFLASH_RESIZE_DISABLED_TRANSFORMS = {"resize_kv_cache": {"enabled": False}}
 
 
 def test_custom_values():
@@ -336,7 +339,11 @@ class TestSpeculativeConfigValidation:
             speculative_model="some/dflash-draft",
             target_layer_ids=[1, 9, 17, 25, 33],
         )
-        args = LlmArgs(model="test-model", speculative_config=spec_config)
+        args = LlmArgs(
+            model="test-model",
+            speculative_config=spec_config,
+            transforms=DFLASH_RESIZE_DISABLED_TRANSFORMS,
+        )
         # DFlash resolves to its own one-model factory; the original factory becomes the target.
         assert args.model_factory == "dflash_one_model"
         assert args.target_model_factory == "AutoModelForCausalLM"
@@ -357,16 +364,62 @@ class TestSpeculativeConfigValidation:
             model="test-model",
             model_factory="AutoModelForImageTextToText",
             speculative_config=spec_config,
+            transforms=DFLASH_RESIZE_DISABLED_TRANSFORMS,
         )
         assert args.model_factory == "dflash_one_model"
         assert args.target_model_factory == "AutoModelForImageTextToText"
 
-    def test_dflash_requires_target_layer_ids(self):
+    def test_dflash_rejects_resize_kv_cache(self):
         from tensorrt_llm.llmapi import DFlashDecodingConfig
 
-        spec_config = DFlashDecodingConfig(max_draft_len=4, speculative_model="some/dflash-draft")
-        with pytest.raises(ValueError, match="target_layer_ids"):
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=4,
+            speculative_model="some/dflash-draft",
+            target_layer_ids=[1, 9, 17, 25, 33],
+        )
+        with pytest.raises(ValueError, match="resize_kv_cache"):
             LlmArgs(model="test-model", speculative_config=spec_config)
+
+    def test_dflash_rejects_unsorted_target_layer_ids(self):
+        from tensorrt_llm.llmapi import DFlashDecodingConfig
+
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=4,
+            speculative_model="some/dflash-draft",
+            target_layer_ids=[1, 17, 9, 25, 33],
+        )
+        with pytest.raises(ValueError, match="target_layer_ids must be sorted"):
+            LlmArgs(
+                model="test-model",
+                speculative_config=spec_config,
+                transforms=DFLASH_RESIZE_DISABLED_TRANSFORMS,
+            )
+
+    def test_dflash_reads_defaults_from_draft_config(self, tmp_path):
+        from tensorrt_llm.llmapi import DFlashDecodingConfig
+
+        draft_config = LlamaConfig(
+            hidden_size=64,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=4,
+        )
+        draft_config.block_size = 16
+        draft_config.dflash_config = {
+            "target_layer_ids": [1, 2, 3],
+            "mask_token_id": 0,
+        }
+        draft_config.save_pretrained(tmp_path)
+
+        spec_config = DFlashDecodingConfig(max_draft_len=4, speculative_model=str(tmp_path))
+        args = LlmArgs(
+            model="test-model",
+            speculative_config=spec_config,
+            transforms=DFLASH_RESIZE_DISABLED_TRANSFORMS,
+        )
+
+        assert args.speculative_config.target_layer_ids == [1, 2, 3]
+        assert args.speculative_config.mask_token_id == 0
 
 
 # ================================

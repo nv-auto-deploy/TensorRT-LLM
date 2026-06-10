@@ -14,6 +14,7 @@
 # limitations under the License.
 
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +22,7 @@ import torch
 import torch.nn as nn
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
-from test_common.llm_data import hf_id_to_local_model_dir
+from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import EagleWrapper
@@ -35,7 +36,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.hidden_states import (
     DetectHiddenStatesForCapture,
 )
 from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
-from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import DFlashDecodingConfig, Eagle3DecodingConfig, MTPDecodingConfig
 
 
 def get_extra_seq_len_for_kv_cache(llm_args) -> int:
@@ -52,6 +53,17 @@ def get_extra_seq_len_for_kv_cache(llm_args) -> int:
         extra += get_num_extra_kv_tokens(spec_config)
 
     return extra
+
+
+def _dflash_paths():
+    root = llm_models_root()
+    if root is None:
+        pytest.skip("LLM_MODELS_ROOT not set")
+    target = Path(root) / "Qwen3" / "Qwen3-8B"
+    draft = Path(root) / "Qwen3-8B-DFlash-b16"
+    if not target.is_dir() or not draft.is_dir():
+        pytest.skip("Qwen3-8B / Qwen3-8B-DFlash-b16 checkpoints not found")
+    return str(target), str(draft)
 
 
 def _make_graph_module_with_placeholders(*names):
@@ -309,6 +321,83 @@ def test_qwen3_5_moe_mtp_smoke():
         "seed": 42,
     }
 
+    results = main(cfg)
+
+    prompts_and_outputs = results["prompts_and_outputs"]
+    assert len(prompts_and_outputs) == 1
+
+
+def test_qwen3_dflash_smoke():
+    """Test DFlash one-model runtime with a tiny Qwen3 target and draft."""
+    pytest.importorskip("flash_attn")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    test_prompt = "What is the capital of France?"
+    target_path, draft_path = _dflash_paths()
+    target_layer_ids = [1, 2]
+    mask_token_id = 151669
+    small_target_kwargs = {
+        "num_hidden_layers": 4,
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+        "max_position_embeddings": 64,
+    }
+    small_draft_kwargs = {
+        **small_target_kwargs,
+        "num_hidden_layers": 2,
+        "block_size": 4,
+        "dflash_config": {
+            "target_layer_ids": target_layer_ids,
+            "mask_token_id": mask_token_id,
+        },
+    }
+
+    experiment_config = {
+        "args": {
+            "model": target_path,
+            "tokenizer": target_path,
+            "runtime": "trtllm",
+            "world_size": 1,
+            "skip_loading_weights": True,
+            "model_kwargs": small_target_kwargs,
+            "speculative_model_kwargs": small_draft_kwargs,
+            "speculative_config": DFlashDecodingConfig(
+                max_draft_len=2,
+                speculative_model=draft_path,
+                mask_token_id=mask_token_id,
+                target_layer_ids=target_layer_ids,
+            ),
+            "attn_backend": "flashinfer",
+            "disable_overlap_scheduler": True,
+            "compile_backend": "torch-simple",
+            "max_batch_size": 2,
+            "max_num_tokens": 128,
+            "cuda_graph_config": {"max_batch_size": 2},
+            "kv_cache_config": {
+                "tokens_per_block": 4,
+                "free_gpu_memory_fraction": 0.0,
+            },
+            # TODO: Enable DFlash cache resize once resize_kv_cache is weight-safe.
+            "transforms": {"resize_kv_cache": {"enabled": False}},
+        },
+        "benchmark": {"enabled": False},
+        "prompt": {
+            "batch_size": 1,
+            "queries": test_prompt,
+            "sp_kwargs": {
+                "max_tokens": 8,
+                "top_k": None,
+                "temperature": 0.0,
+                "seed": 42,
+            },
+        },
+    }
+
+    cfg = ExperimentConfig(**experiment_config)
     results = main(cfg)
 
     prompts_and_outputs = results["prompts_and_outputs"]

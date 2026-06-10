@@ -19,6 +19,7 @@ from typing import Any, Dict, Literal, Optional, Type, Union
 import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from transformers import AutoConfig
 
 from tensorrt_llm.llmapi.llm_args import (
     BuildConfig,
@@ -176,14 +177,13 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         elif isinstance(spec_config, DFlashDecodingConfig):
             if spec_config.max_draft_len is None:
                 raise ValueError("DFlashDecodingConfig.max_draft_len must not be None.")
-            # DFlash captures the target layers whose hidden states feed the drafter's fc.
-            # v1 requires target_layer_ids to be set explicitly (PyTorch reads them from the draft
-            # config; auto-resolution from the draft config is an AutoDeploy follow-up).
+            self._resolve_dflash_config_defaults(spec_config)
             if not spec_config.target_layer_ids:
                 raise ValueError(
                     "AutoDeploy DFlash requires DFlashDecodingConfig.target_layer_ids to be set "
-                    "(the target layers captured for the drafter's cross-attention context)."
+                    "or present in the draft config's dflash_config."
                 )
+            self._validate_dflash_target_layer_ids(spec_config.target_layer_ids)
             capture_layers = set(spec_config.target_layer_ids)
         else:
             assert isinstance(spec_config, EagleDecodingConfig)
@@ -398,6 +398,19 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def reject_resize_kv_cache_for_dflash(self):
+        if isinstance(self.speculative_config, DFlashDecodingConfig):
+            resize_config = self.transforms.get("resize_kv_cache")
+            resize_enabled = resize_config is not None and resize_config.get("enabled", True)
+            if resize_enabled:
+                raise ValueError(
+                    "AutoDeploy DFlash does not support the resize_kv_cache transform yet. "
+                    "Set transforms.resize_kv_cache.enabled=False until the DFlash resize path is "
+                    "made weight-safe."
+                )
+        return self
+
+    @model_validator(mode="after")
     def extend_default_cuda_graph_config_to_max_batch_size(self):
         """Auto-extend the default cuda_graph_config to cover the top-level max_batch_size.
 
@@ -509,6 +522,52 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     def _requires_eagle_one_model(self) -> bool:
         """Whether speculative decoding should use the Eagle one-model factory path."""
         return self._required_one_model_factory() == "eagle_one_model"
+
+    @staticmethod
+    def _get_dflash_config_value(dflash_config: Any, key: str) -> Any:
+        if isinstance(dflash_config, dict):
+            return dflash_config.get(key)
+        return getattr(dflash_config, key, None)
+
+    def _resolve_dflash_config_defaults(self, spec_config: DFlashDecodingConfig) -> None:
+        target_layer_ids_explicit = "target_layer_ids" in spec_config.model_fields_set
+        mask_token_id_explicit = "mask_token_id" in spec_config.model_fields_set
+        has_draft_config_overrides = bool(self.speculative_model_kwargs)
+        needs_target_layer_ids = spec_config.target_layer_ids is None or (
+            has_draft_config_overrides and not target_layer_ids_explicit
+        )
+        needs_mask_token_id = spec_config.mask_token_id is None or (
+            has_draft_config_overrides and not mask_token_id_explicit
+        )
+        if not needs_target_layer_ids:
+            return
+        if spec_config.speculative_model is None:
+            return
+
+        draft_config = AutoConfig.from_pretrained(
+            str(spec_config.speculative_model),
+            trust_remote_code=True,
+            **(self.speculative_model_kwargs or {}),
+        )
+        dflash_config = getattr(draft_config, "dflash_config", {}) or {}
+        if needs_target_layer_ids:
+            layer_ids = self._get_dflash_config_value(dflash_config, "target_layer_ids")
+            if layer_ids is not None:
+                spec_config.target_layer_ids = list(layer_ids)
+        if needs_mask_token_id:
+            mask_token_id = self._get_dflash_config_value(dflash_config, "mask_token_id")
+            if mask_token_id is not None:
+                spec_config.mask_token_id = mask_token_id
+
+    @staticmethod
+    def _validate_dflash_target_layer_ids(layer_ids: list[int]) -> None:
+        if len(layer_ids) != len(set(layer_ids)):
+            raise ValueError("DFlashDecodingConfig.target_layer_ids must not contain duplicates.")
+        if layer_ids != sorted(layer_ids):
+            raise ValueError(
+                "DFlashDecodingConfig.target_layer_ids must be sorted in target layer order before "
+                "AutoDeploy converts them to the hidden-state capture set."
+            )
 
     def _required_one_model_factory(self) -> Optional[str]:
         """The one-model factory required by the speculative config, or None if unsupported.

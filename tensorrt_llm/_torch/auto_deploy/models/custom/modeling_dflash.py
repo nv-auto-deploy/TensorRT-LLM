@@ -692,65 +692,49 @@ class DFlashWrapper(nn.Module):
             1, (new_tokens_lens - 1).clamp_min(0).long().unsqueeze(1)
         ).squeeze(1)
 
-        import os as _os
+        # ---- Phase 2 (DFlash): commit accepted target-derived K/V into the ctx caches ----
+        if self.sync_before_hidden_state_capture:
+            torch.cuda.synchronize()
+        captured = self._collect_hidden_states(csi.named_args, num_total_tokens)
+        k_caches, v_caches = self._collect_ctx_cache_pairs(csi.named_args)
+        slot_idx = csi.get_arg("slot_idx", truncate=True)
+        input_pos = csi.get_arg("input_pos", truncate=True)
+        cu_seqlen = csi.get_arg("cu_seqlen", truncate=True)
+        ctx_len = self._scatter_context_kv(
+            captured,
+            k_caches,
+            v_caches,
+            slot_idx,
+            input_pos,
+            cu_seqlen,
+            new_tokens_lens,
+            num_prefill,
+        )
 
-        _skip_ctx = _os.environ.get("DFLASH_SKIP_CTX") == "1"
-        if _skip_ctx:
-            # BISECTION: skip the ctx scatter + draft pass entirely; return dummy (never-accepted)
-            # drafts. If the target then decodes coherently, the scatter/draft path is what corrupts
-            # the target; if still garbage, the corruption is in the target forward (capture/verify).
-            draft_tokens = torch.zeros(
-                num_sequences, self.max_draft_len, dtype=ids_dtype, device=device
-            )
-            ctx_len = torch.zeros(
-                num_sequences, dtype=torch.int32, device=device
-            )  # debug placeholder
-        else:
-            # ---- Phase 2 (DFlash): commit accepted target-derived K/V into the ctx caches ----
-            if self.sync_before_hidden_state_capture:
-                torch.cuda.synchronize()
-            captured = self._collect_hidden_states(csi.named_args, num_total_tokens)
-            k_caches, v_caches = self._collect_ctx_cache_pairs(csi.named_args)
-            slot_idx = csi.get_arg("slot_idx", truncate=True)
-            input_pos = csi.get_arg("input_pos", truncate=True)
-            cu_seqlen = csi.get_arg("cu_seqlen", truncate=True)
-            ctx_len = self._scatter_context_kv(
-                captured,
-                k_caches,
-                v_caches,
-                slot_idx,
-                input_pos,
-                cu_seqlen,
-                new_tokens_lens,
-                num_prefill,
-            )
+        # ---- Phase 5: single DFlash draft pass over the query block ----
+        query_ids = torch.full(
+            (num_sequences, self.block_size), self.mask_token_id, dtype=ids_dtype, device=device
+        )
+        query_ids[:, 0] = last_accepted
+        block_embeds = self.apply_draft_embedding(query_ids)  # [num_seq, block_size, H]
+        query_positions = ctx_len.long().unsqueeze(1) + torch.arange(self.block_size, device=device)
 
-            # ---- Phase 5: single DFlash draft pass over the query block ----
-            query_ids = torch.full(
-                (num_sequences, self.block_size), self.mask_token_id, dtype=ids_dtype, device=device
-            )
-            query_ids[:, 0] = last_accepted
-            block_embeds = self.apply_draft_embedding(query_ids)  # [num_seq, block_size, H]
-            query_positions = ctx_len.long().unsqueeze(1) + torch.arange(
-                self.block_size, device=device
-            )
-
-            draft_kwargs = self._filter_kwargs_for_submodule(csi.named_args, self.draft_model)
-            # We override position_ids/ctx_len with the DFlash query-block values.
-            draft_kwargs.pop("position_ids", None)
-            draft_kwargs.pop("ctx_len", None)
-            draft_output = self.draft_model(
-                inputs_embeds=block_embeds,
-                position_ids=query_positions,
-                ctx_len=ctx_len,
-                **draft_kwargs,
-            )
-            draft_logits = self.apply_lm_head(
-                draft_output.norm_hidden_state
-            )  # [num_seq, block_size, vocab]
-            draft_tokens = self._sample_greedy(draft_logits[:, 1 : self.max_draft_len + 1, :]).to(
-                ids_dtype
-            )
+        draft_kwargs = self._filter_kwargs_for_submodule(csi.named_args, self.draft_model)
+        # We override position_ids/ctx_len with the DFlash query-block values.
+        draft_kwargs.pop("position_ids", None)
+        draft_kwargs.pop("ctx_len", None)
+        draft_output = self.draft_model(
+            inputs_embeds=block_embeds,
+            position_ids=query_positions,
+            ctx_len=ctx_len,
+            **draft_kwargs,
+        )
+        draft_logits = self.apply_lm_head(
+            draft_output.norm_hidden_state
+        )  # [num_seq, block_size, vocab]
+        draft_tokens = self._sample_greedy(draft_logits[:, 1 : self.max_draft_len + 1, :]).to(
+            ids_dtype
+        )
 
         # ---- Phase 6: package output ----
         next_new_tokens = torch.empty(
@@ -758,10 +742,6 @@ class DFlashWrapper(nn.Module):
         )
         next_new_tokens[:, 0] = last_accepted
         next_new_tokens[:, 1:] = draft_tokens
-        _n = getattr(self, "_dbg_step", 0)
-        if _os.environ.get("DFDBG_ACCEPT") == "1":
-            print(f"[DFACC{_n}] lens={new_tokens_lens.tolist()}", flush=True)
-            self._dbg_step = _n + 1
         return DFlashWrapperOutput(
             logits=target_logits,
             new_tokens=new_tokens_2d,

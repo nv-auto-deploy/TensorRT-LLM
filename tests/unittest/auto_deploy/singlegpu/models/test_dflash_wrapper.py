@@ -95,9 +95,11 @@ def test_kv_cache_forward_helpers():
     """
     wrapper = _build_tiny_wrapper()
     hidden = 8
+    first_hidden = torch.full((4, hidden), 1.0)
+    second_hidden = torch.full((4, hidden), 2.0)
     named = {
-        "layers.9_hidden_states_cache": torch.randn(4, hidden),
-        "layers.1_hidden_states_cache": torch.randn(4, hidden),
+        "r1_hidden_states_cache": second_hidden,
+        "r0_hidden_states_cache": first_hidden,
         "ctx_v_cache_1": torch.zeros(2, 3),
         "ctx_k_cache_0": torch.zeros(2, 3),
         "ctx_k_cache_1": torch.zeros(2, 3),
@@ -105,6 +107,7 @@ def test_kv_cache_forward_helpers():
     }
     collected = wrapper._collect_hidden_states(named, num_tokens=4)
     assert collected.shape == (4, 2 * hidden)  # two capture buffers concatenated
+    torch.testing.assert_close(collected, torch.cat([first_hidden, second_hidden], dim=-1))
     k_caches, v_caches = wrapper._collect_ctx_cache_pairs(named)
     assert len(k_caches) == len(v_caches) == 2  # sorted: ctx_{k,v}_cache_0, _1
 

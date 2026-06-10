@@ -43,7 +43,7 @@ from .custom.modeling_dflash import (
 )
 from .eagle import TargetModelExportInfo  # reuse generic target export-info plumbing (summary §8)
 from .factory import DynamicShape, ModelFactory, ModelFactoryRegistry, SubModuleExportInfo
-from .hf import insert_keepalive_sentinel
+from .hf import AutoModelForCausalLMFactory, insert_keepalive_sentinel
 
 
 class DFlashDraftModelExportInfo(SubModuleExportInfo):
@@ -141,6 +141,14 @@ class DFlashOneModelFactory(ModelFactory):
             raise ValueError("speculative_config.speculative_model must be set.")
         self.draft_model_path = str(speculative_config.speculative_model)
         self.speculative_model_kwargs = speculative_model_kwargs or {}
+        self.draft_checkpoint_factory = AutoModelForCausalLMFactory(
+            model=self.draft_model_path,
+            model_kwargs=self.speculative_model_kwargs,
+            tokenizer=None,
+            tokenizer_kwargs=None,
+            skip_loading_weights=skip_loading_weights,
+            max_seq_len=max_seq_len,
+        )
 
         target_factory_cls = ModelFactoryRegistry.get(target_model_factory)
         self.target_factory = target_factory_cls(
@@ -162,7 +170,9 @@ class DFlashOneModelFactory(ModelFactory):
 
     def _build_draft_config(self):
         draft_config = AutoConfig.from_pretrained(
-            self.draft_model_path, trust_remote_code=True, **self.speculative_model_kwargs
+            self.draft_checkpoint_factory.model,
+            trust_remote_code=True,
+            **self.speculative_model_kwargs,
         )
         return draft_config
 
@@ -202,7 +212,11 @@ class DFlashOneModelFactory(ModelFactory):
                 f"DFlash requires max_draft_len + 1 ({verify_width}) <= block_size ({block_size}); "
                 f"got max_draft_len={self.speculative_config.max_draft_len}, block_size={block_size}."
             )
-        mask_token_id = self.speculative_config.mask_token_id or dflash_cfg.get("mask_token_id")
+        mask_token_id = (
+            self.speculative_config.mask_token_id
+            if self.speculative_config.mask_token_id is not None
+            else dflash_cfg.get("mask_token_id")
+        )
         if mask_token_id is None:
             raise ValueError(
                 "mask_token_id must be set on DFlashDecodingConfig or the draft config's dflash_config."
@@ -232,10 +246,18 @@ class DFlashOneModelFactory(ModelFactory):
 
         from safetensors.torch import load_file
 
-        files = sorted(glob.glob(os.path.join(self.draft_model_path, "*.safetensors")))
+        if not os.path.isdir(self.draft_checkpoint_factory.model):
+            self.draft_checkpoint_factory.prefetch_checkpoint(
+                force=False, skip_loading_weights=False
+            )
+            self.draft_model_path = str(self.draft_checkpoint_factory.model)
+
+        files = sorted(
+            glob.glob(os.path.join(self.draft_checkpoint_factory.model, "*.safetensors"))
+        )
         if not files:
             raise FileNotFoundError(
-                f"No *.safetensors found for the DFlash draft at {self.draft_model_path}."
+                f"No *.safetensors found for the DFlash draft at {self.draft_checkpoint_factory.model}."
             )
         state: Dict[str, Any] = {}
         for f in files:
@@ -257,11 +279,9 @@ class DFlashOneModelFactory(ModelFactory):
     ):
         assert isinstance(model, DFlashWrapper), f"Expected DFlashWrapper, got {type(model)}"
         # Mirror EagleOneModelFactory.load_or_random_init: initialize BOTH submodels. The target has
-        # its own factory; the DFlash draft has none (it is built inline in ``_build_model``), so we
-        # run the base ``load_or_random_init`` logic for it here -- materialize any (meta) params on
-        # ``device`` via ``_to_maybe_random``, then load the real draft checkpoint over them. Without
-        # this, the draft stayed on ``meta`` and the subsequent ``move_to_device`` in the load_weights
-        # transform raised "Cannot copy out of meta tensor; use to_empty()".
+        # its own factory; the DFlash draft is built inline in ``_build_model`` and uses
+        # ``draft_checkpoint_factory`` only for HF snapshot prefetch, so materialize any meta params
+        # here before loading the real draft checkpoint over them.
         self.target_factory.load_or_random_init(model.target_model, device, disable_preload)
         self._to_maybe_random(model.draft_model, device)
         if not self.skip_loading_weights:
@@ -295,13 +315,9 @@ class DFlashOneModelFactory(ModelFactory):
     def get_cache_config_updates(self) -> Dict[str, Any]:
         # NOTE: DFlash currently cannot run the resize_kv_cache pass -- its large
         # `set_max_num_tokens_sample` forward corrupts a target model weight in place (Qwen3 target ->
-        # lm_head; with resize skipped the output is coherent without any lm_head workaround). The
-        # mitigation is to set `kv_cache_config.free_gpu_memory_fraction=0.0` (->
-        # CachedSequenceInterface.needs_resize() == False, so the resize pass is skipped). We do NOT
-        # force that here -- it is applied explicitly at the DFlash call sites (tests/spikes) with a
-        # "TODO: Enable cache resize" marker, so the behavior is visible rather than hidden in the
-        # factory. The proper fix (make the resize sample forward weight-safe) is tracked in
-        # debug/dflash_worklog_accuracy.md.
+        # lm_head; with resize skipped the output is coherent without any lm_head workaround). LlmArgs
+        # rejects DFlash configs while this transform is enabled; the proper fix is to make the resize
+        # sample forward weight-safe, then remove that validator.
         return dict(self.target_factory.get_cache_config_updates())
 
     def init_tokenizer(self) -> Optional[Any]:
@@ -312,4 +328,6 @@ class DFlashOneModelFactory(ModelFactory):
 
     def prefetch_checkpoint(self, force: bool = False, skip_loading_weights: Optional[bool] = None):
         self.target_factory.prefetch_checkpoint(force, skip_loading_weights)
+        self.draft_checkpoint_factory.prefetch_checkpoint(force, skip_loading_weights)
+        self.draft_model_path = str(self.draft_checkpoint_factory.model)
         super().prefetch_checkpoint(force, skip_loading_weights)
