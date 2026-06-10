@@ -237,20 +237,50 @@ def _deinterleave_gate_up(
     gu_3d: torch.Tensor,  # [E, 2I, H/2]
     gate_up_scales: torch.Tensor,  # [E, 2I, H/32]
     gate_up_bias: torch.Tensor,  # [E, 2I]
+    gate_up_order: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split the HF interleaved 2I axis (gate at even rows, up at odd rows) into separate halves.
+    """Split the HF 2I axis into separate gate/up halves.
 
     Kept separate so downstream row-padding puts the zero-pad rows INSIDE each half before re-concat
     as ``[up | gate]`` — matches PT's ``dst_w3 = up`` / ``dst_w1 = gate`` chunk layout.
     """
-    return (
-        gu_3d[:, 0::2, :].contiguous(),  # gate_rows_w
-        gu_3d[:, 1::2, :].contiguous(),  # up_rows_w
-        gate_up_scales[:, 0::2, :].contiguous(),  # gate_rows_s
-        gate_up_scales[:, 1::2, :].contiguous(),  # up_rows_s
-        gate_up_bias[:, 0::2].contiguous(),  # gate_b
-        gate_up_bias[:, 1::2].contiguous(),  # up_b
-    )
+    if gate_up_order in ("interleaved", "gpt_oss_interleaved"):
+        return (
+            gu_3d[:, 0::2, :].contiguous(),  # gate_rows_w
+            gu_3d[:, 1::2, :].contiguous(),  # up_rows_w
+            gate_up_scales[:, 0::2, :].contiguous(),  # gate_rows_s
+            gate_up_scales[:, 1::2, :].contiguous(),  # up_rows_s
+            gate_up_bias[:, 0::2].contiguous(),  # gate_b
+            gate_up_bias[:, 1::2].contiguous(),  # up_b
+        )
+
+    gate_up_size = gu_3d.shape[1]
+    if gate_up_size % 2 != 0:
+        raise ValueError(f"gate_up 2I axis should be even, got {gate_up_size}.")
+    midpoint = gate_up_size // 2
+    first_w, second_w = gu_3d[:, :midpoint, :], gu_3d[:, midpoint:, :]
+    first_s, second_s = gate_up_scales[:, :midpoint, :], gate_up_scales[:, midpoint:, :]
+    first_b, second_b = gate_up_bias[:, :midpoint], gate_up_bias[:, midpoint:]
+
+    if gate_up_order in ("up_gate", "w3_w1"):
+        return (
+            second_w.contiguous(),
+            first_w.contiguous(),
+            second_s.contiguous(),
+            first_s.contiguous(),
+            second_b.contiguous(),
+            first_b.contiguous(),
+        )
+    if gate_up_order in ("gate_up", "w1_w3"):
+        return (
+            first_w.contiguous(),
+            second_w.contiguous(),
+            first_s.contiguous(),
+            second_s.contiguous(),
+            first_b.contiguous(),
+            second_b.contiguous(),
+        )
+    raise ValueError(f"Unsupported gate_up_order: {gate_up_order}.")
 
 
 def _pad_and_slice_axis(t: torch.Tensor, dim: int, target: int, lo: int, hi: int) -> torch.Tensor:
@@ -511,6 +541,7 @@ def prepare_trtllm_gen_moe_mxfp4_weights(
     tp_size: int = 1,
     tp_rank: int = 0,
     scratch: MXFP4PrepScratch | None = None,
+    gate_up_order: str = "interleaved",
 ) -> TRTLLMGenMXFP4MoEWeights:
     """Convert HF on-disk MXFP4 expert weights to the trtllm-gen kernel layout.
 
@@ -542,11 +573,11 @@ def prepare_trtllm_gen_moe_mxfp4_weights(
 
     assert down_blocks.size(0) == gate_up_blocks.size(0)
 
-    # 1. Flatten blocks ([..., 16] → flattened) and de-interleave gate/up halves.
+    # 1. Flatten blocks ([..., 16] → flattened) and split gate/up halves.
     gu_3d = _flatten_block_dim(gate_up_blocks)  # [E, 2I, H/2]
     dn_3d = _flatten_block_dim(down_blocks)  # [E, H, I/2]
     gate_rows_w, up_rows_w, gate_rows_s, up_rows_s, gate_b, up_b = _deinterleave_gate_up(
-        gu_3d, gate_up_scales, gate_up_bias
+        gu_3d, gate_up_scales, gate_up_bias, gate_up_order
     )
 
     # 2. TP slicing on the intermediate axis (no-op for tp_size == 1).

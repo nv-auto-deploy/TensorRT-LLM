@@ -136,6 +136,28 @@ def _call_op(prep, *, act_dtype, x, router_weight, router_bias, top_k=2):
     )
 
 
+def _call_routed_op(prep, *, act_dtype, x, selected_experts, routing_weights):
+    return torch.ops.auto_deploy.trtllm_quant_mxfp4_trtllm_gen_moe_from_routing_fused(
+        x,
+        selected_experts,
+        routing_weights,
+        prep.fc1_weights_mxfp4,
+        prep.fc2_weights_mxfp4,
+        prep.fc1_weights_scale_ue8m0,
+        prep.fc2_weights_scale_ue8m0,
+        prep.fc1_bias_f32,
+        prep.fc2_bias_f32,
+        # DeepSeek defaults: beta=0 because its SwiGLU is silu(gate) * up.
+        torch.ones((prep.fc1_bias_f32.shape[0],), dtype=torch.float32, device=x.device),
+        torch.zeros((prep.fc1_bias_f32.shape[0],), dtype=torch.float32, device=x.device),
+        torch.full((prep.fc1_bias_f32.shape[0],), 10.0, dtype=torch.float32, device=x.device),
+        prep.valid_hidden_size,
+        prep.valid_intermediate_size,
+        act_dtype,
+        prep.fc1_bias_f32.shape[0],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Section 1: weight-preparation invariants (CPU/CUDA, SM-agnostic shuffle ops)
 # ---------------------------------------------------------------------------
@@ -378,6 +400,54 @@ def test_prep_against_pt_reference_loader_byte_identical():
     torch.testing.assert_close(prep.fc2_bias_f32, fc2_bias_ref_t, atol=0, rtol=0)
 
 
+def test_up_gate_layout_prep_matches_equivalent_interleaved_layout():
+    """DeepSeek stores gate/up as ``[up | gate]``; GPT-OSS stores interleaved rows."""
+    device = "cuda"
+    gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias = _build_synthetic_mxfp4_inputs(
+        e=2,
+        h=128,
+        i=128,
+        device=device,
+    )
+
+    up_gate_blocks = torch.cat((gu_blocks[:, 1::2], gu_blocks[:, 0::2]), dim=1).contiguous()
+    up_gate_scales = torch.cat((gu_scales[:, 1::2], gu_scales[:, 0::2]), dim=1).contiguous()
+    up_gate_bias = torch.cat((gu_bias[:, 1::2], gu_bias[:, 0::2]), dim=1).contiguous()
+
+    interleaved = prepare_trtllm_gen_moe_mxfp4_weights(
+        gu_blocks,
+        gu_scales,
+        gu_bias,
+        dn_blocks,
+        dn_scales,
+        dn_bias,
+        hidden_size=128,
+        intermediate_size=128,
+        tp_size=1,
+        tp_rank=0,
+    )
+    up_gate = prepare_trtllm_gen_moe_mxfp4_weights(
+        up_gate_blocks,
+        up_gate_scales,
+        up_gate_bias,
+        dn_blocks,
+        dn_scales,
+        dn_bias,
+        hidden_size=128,
+        intermediate_size=128,
+        tp_size=1,
+        tp_rank=0,
+        gate_up_order="up_gate",
+    )
+
+    assert torch.equal(up_gate.fc1_weights_mxfp4, interleaved.fc1_weights_mxfp4)
+    assert torch.equal(up_gate.fc1_weights_scale_ue8m0, interleaved.fc1_weights_scale_ue8m0)
+    torch.testing.assert_close(up_gate.fc1_bias_f32, interleaved.fc1_bias_f32, atol=0, rtol=0)
+    assert torch.equal(up_gate.fc2_weights_mxfp4, interleaved.fc2_weights_mxfp4)
+    assert torch.equal(up_gate.fc2_weights_scale_ue8m0, interleaved.fc2_weights_scale_ue8m0)
+    torch.testing.assert_close(up_gate.fc2_bias_f32, interleaved.fc2_bias_f32, atol=0, rtol=0)
+
+
 # ---------------------------------------------------------------------------
 # Section 2: unified op act_dtype dispatch (Blackwell+ only)
 # ---------------------------------------------------------------------------
@@ -449,3 +519,45 @@ def test_trtllm_quant_mxfp4_trtllm_gen_moe_fused_invalid_act_dtype():
             router_weight=router_weight,
             router_bias=router_bias,
         )
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("act_dtype", ["bf16", "mxfp8"])
+def test_trtllm_quant_mxfp4_trtllm_gen_moe_from_routing_fused_act_dtype_dispatch(act_dtype):
+    """Routed DeepSeek-style op dispatches with external top-k tensors."""
+    torch.manual_seed(0)
+    device = "cuda"
+    E, H, I_, top_k = 4, 256, 64, 2
+    B = 8
+
+    inputs = _make_random_mxfp4_inputs(
+        num_experts=E, hidden_size=H, intermediate_size=I_, device=device
+    )
+    prep = prepare_trtllm_gen_moe_mxfp4_weights(
+        *inputs,
+        hidden_size=H,
+        intermediate_size=I_,
+        tp_size=1,
+        tp_rank=0,
+        gate_up_order="up_gate",
+    )
+
+    x = torch.randn(B, H, dtype=torch.bfloat16, device=device)
+    token_ids = torch.arange(B, device=device, dtype=torch.int64)
+    selected_experts = torch.stack((token_ids % E, (token_ids + 1) % E), dim=1)
+    assert selected_experts.shape == (B, top_k)
+    routing_weights = torch.tensor([[0.65, 0.35]], dtype=torch.bfloat16, device=device).expand(
+        B, top_k
+    )
+
+    y = _call_routed_op(
+        prep,
+        act_dtype=act_dtype,
+        x=x,
+        selected_experts=selected_experts,
+        routing_weights=routing_weights,
+    )
+
+    assert y.shape == (B, H), f"unexpected output shape {tuple(y.shape)}, want {(B, H)}"
+    assert y.dtype == torch.bfloat16, f"unexpected output dtype {y.dtype}"
+    assert torch.isfinite(y).all(), f"non-finite output for act_dtype={act_dtype!r}"

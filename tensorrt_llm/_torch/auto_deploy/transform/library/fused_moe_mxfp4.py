@@ -50,6 +50,7 @@ _MXFP4_RUNTIME_OPS = (
     torch.ops.auto_deploy.torch_mxfp4_moe,
     torch.ops.auto_deploy.triton_mxfp4_moe,
     torch.ops.auto_deploy.torch_mxfp4_moe_from_routing,
+    torch.ops.auto_deploy.triton_mxfp4_moe_from_routing,
 )
 
 # Backend selection for MXFP4 MoE quantization.
@@ -1320,6 +1321,293 @@ class FuseMXFP4Moe(BaseTransform):
     def get_config_class(cls) -> Type[TransformConfig]:
         return FuseMXFP4MoeConfig
 
+    @staticmethod
+    def _graph_uses_attr(gm: GraphModule, target: str) -> bool:
+        return any(n.op == "get_attr" and str(n.target) == target for n in gm.graph.nodes)
+
+    @staticmethod
+    def _register_prepared_parameter(module: nn.Module, name: str, tensor: torch.Tensor) -> None:
+        _delete_module_attr(module, name)
+        module.register_parameter(
+            name,
+            nn.Parameter(tensor.detach().clone(), requires_grad=False),
+        )
+
+    @staticmethod
+    def _routed_target_for_sm(sm_version: int):
+        if sm_version in (100, 103):
+            return (
+                torch.ops.auto_deploy.trtllm_quant_mxfp4_trtllm_gen_moe_from_routing_fused.default
+            )
+        if sm_version == 90:
+            return torch.ops.auto_deploy.triton_mxfp4_moe_from_routing.default
+        return None
+
+    @staticmethod
+    def _routed_ep_target_for_sm(sm_version: int):
+        if sm_version in (100, 103):
+            return (
+                torch.ops.auto_deploy.trtllm_quant_mxfp4_trtllm_gen_moe_from_routing_fused.default
+            )
+        if sm_version == 90:
+            return torch.ops.auto_deploy.triton_mxfp4_moe_from_routing_ep.default
+        return None
+
+    @staticmethod
+    def _routed_source_kind(node: Node) -> str | None:
+        if is_op(node, torch.ops.auto_deploy.torch_mxfp4_moe_from_routing):
+            return "base"
+        if is_op(node, torch.ops.auto_deploy.torch_mxfp4_moe_from_routing_ep):
+            return "ep"
+        return None
+
+    def _apply_routed_from_routing(
+        self,
+        gm: GraphModule,
+        *,
+        prepare_trtllm_gen_moe_mxfp4_weights,
+    ) -> int:
+        """Rewrite DeepSeek-style externally-routed MXFP4 MoE to the arch fast path.
+
+        DeepSeek V4 computes selected experts and routing weights in modeling
+        code.  The arch policy here is intentionally narrow:
+
+        * SM100/SM103: TRTLLMGen W4A8 (MXFP8 activations) with external top-k.
+        * SM90: Triton W4A16 (BF16/FP16 activations) with external top-k.
+        * Otherwise: leave the torch reference op unchanged.
+        """
+        routed_nodes = [
+            (n, source_kind)
+            for n in list(gm.graph.nodes)
+            if (source_kind := self._routed_source_kind(n)) is not None
+        ]
+        if not routed_nodes:
+            return 0
+
+        sm_version = int(get_sm_version())
+        num_matches = 0
+
+        for n, source_kind in routed_nodes:
+            target_op = (
+                self._routed_target_for_sm(sm_version)
+                if source_kind == "base"
+                else self._routed_ep_target_for_sm(sm_version)
+            )
+            if target_op is None:
+                continue
+
+            (
+                hidden_node,
+                selected_experts_node,
+                routing_weights_node,
+                gate_up_blocks_node,
+                gate_up_bias_node,
+                gate_up_scales_node,
+                alpha,
+                limit,
+                down_blocks_node,
+                down_bias_node,
+                down_scales_node,
+                gate_up_order,
+                swiglu_mode,
+                layer_type,
+                expert_start,
+                num_experts_total,
+            ) = extract_op_args(
+                n,
+                "hidden_states",
+                "selected_experts",
+                "routing_weights",
+                "gate_up_blocks",
+                "gate_up_bias",
+                "gate_up_scales",
+                "alpha",
+                "limit",
+                "down_blocks",
+                "down_bias",
+                "down_scales",
+                "gate_up_order",
+                "swiglu_mode",
+                "layer_type",
+                "expert_start",
+                "num_experts_total",
+            )
+
+            if gate_up_order not in ("up_gate", "w3_w1") or swiglu_mode != "deepseek":
+                continue
+
+            raw_get_attrs = (
+                gate_up_blocks_node,
+                down_blocks_node,
+                gate_up_scales_node,
+                down_scales_node,
+                gate_up_bias_node,
+                down_bias_node,
+            )
+            if not all(isinstance(a, Node) and a.op == "get_attr" for a in raw_get_attrs):
+                continue
+
+            raw_names = tuple(str(a.target) for a in raw_get_attrs)
+            gate_up_blocks = _get_attr_tensor(gm, raw_names[0])
+            down_blocks = _get_attr_tensor(gm, raw_names[1])
+            gate_up_scales = _get_attr_tensor(gm, raw_names[2])
+            down_scales = _get_attr_tensor(gm, raw_names[3])
+            gate_up_bias = _get_attr_tensor(gm, raw_names[4])
+            down_bias = _get_attr_tensor(gm, raw_names[5])
+
+            num_local_experts = int(gate_up_blocks.shape[0])
+            hidden_size = int(down_blocks.shape[1])
+            intermediate_size = int(gate_up_blocks.shape[1] // 2)
+            expert_start = 0 if expert_start is None else int(expert_start)
+            if num_experts_total is None or int(num_experts_total) < 0:
+                num_experts_total = expert_start + num_local_experts
+            else:
+                num_experts_total = int(num_experts_total)
+
+            if sm_version == 90:
+                n.target = target_op
+                if source_kind == "base":
+                    n.args = (
+                        hidden_node,
+                        selected_experts_node,
+                        routing_weights_node,
+                        gate_up_blocks_node,
+                        gate_up_bias_node,
+                        gate_up_scales_node,
+                        float(alpha),
+                        float(limit),
+                        down_blocks_node,
+                        down_bias_node,
+                        down_scales_node,
+                        gate_up_order,
+                        swiglu_mode,
+                        layer_type,
+                    )
+                else:
+                    n.args = (
+                        hidden_node,
+                        selected_experts_node,
+                        routing_weights_node,
+                        gate_up_blocks_node,
+                        gate_up_bias_node,
+                        gate_up_scales_node,
+                        float(alpha),
+                        float(limit),
+                        down_blocks_node,
+                        down_bias_node,
+                        down_scales_node,
+                        gate_up_order,
+                        swiglu_mode,
+                        layer_type,
+                        expert_start,
+                        num_experts_total,
+                    )
+                n.kwargs = {}
+                num_matches += 1
+                continue
+
+            experts_mod, experts_path, _ = get_submodule_of_param(gm, raw_names[0])
+            prep = prepare_trtllm_gen_moe_mxfp4_weights(
+                gate_up_blocks,
+                gate_up_scales,
+                gate_up_bias,
+                down_blocks,
+                down_scales,
+                down_bias,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                tp_size=1,
+                tp_rank=0,
+                gate_up_order="up_gate",
+            )
+
+            self._register_prepared_parameter(experts_mod, "fc1_w_trtllm", prep.fc1_weights_mxfp4)
+            self._register_prepared_parameter(
+                experts_mod, "fc1_w_scale_trtllm", prep.fc1_weights_scale_ue8m0
+            )
+            self._register_prepared_parameter(experts_mod, "fc1_bias_trtllm", prep.fc1_bias_f32)
+            self._register_prepared_parameter(experts_mod, "fc2_w_trtllm", prep.fc2_weights_mxfp4)
+            self._register_prepared_parameter(
+                experts_mod, "fc2_w_scale_trtllm", prep.fc2_weights_scale_ue8m0
+            )
+            self._register_prepared_parameter(experts_mod, "fc2_bias_trtllm", prep.fc2_bias_f32)
+
+            constants_device = prep.fc1_bias_f32.device
+            swiglu_alpha = torch.full(
+                (num_local_experts,),
+                float(alpha),
+                dtype=torch.float32,
+                device=constants_device,
+            )
+            swiglu_beta = torch.zeros(
+                (num_local_experts,),
+                dtype=torch.float32,
+                device=constants_device,
+            )
+            swiglu_limit = torch.full(
+                (num_local_experts,),
+                float(limit),
+                dtype=torch.float32,
+                device=constants_device,
+            )
+            self._register_prepared_parameter(experts_mod, "swiglu_alpha_trtllm", swiglu_alpha)
+            self._register_prepared_parameter(experts_mod, "swiglu_beta_trtllm", swiglu_beta)
+            self._register_prepared_parameter(experts_mod, "swiglu_limit_trtllm", swiglu_limit)
+
+            prefix_path = (experts_path + ".") if experts_path else ""
+            with gm.graph.inserting_before(n):
+                fc1_w_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_w_trtllm")
+                fc2_w_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_w_trtllm")
+                fc1_s_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_w_scale_trtllm")
+                fc2_s_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_w_scale_trtllm")
+                fc1_b_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_bias_trtllm")
+                fc2_b_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_bias_trtllm")
+                sa_attr = gm.graph.create_node("get_attr", prefix_path + "swiglu_alpha_trtllm")
+                sb_attr = gm.graph.create_node("get_attr", prefix_path + "swiglu_beta_trtllm")
+                sl_attr = gm.graph.create_node("get_attr", prefix_path + "swiglu_limit_trtllm")
+
+            n.target = target_op
+            n.args = (
+                hidden_node,
+                selected_experts_node,
+                routing_weights_node,
+                fc1_w_attr,
+                fc2_w_attr,
+                fc1_s_attr,
+                fc2_s_attr,
+                fc1_b_attr,
+                fc2_b_attr,
+                sa_attr,
+                sb_attr,
+                sl_attr,
+                prep.valid_hidden_size,
+                prep.valid_intermediate_size,
+                "mxfp8",
+                num_experts_total,
+                expert_start,
+                num_local_experts,
+                1,  # routing_method_type = RoutingMethodType.Renormalize
+            )
+            n.kwargs = {}
+
+            for stale_node in raw_get_attrs:
+                if len(stale_node.users) == 0:
+                    gm.graph.erase_node(stale_node)
+            for raw_name in raw_names:
+                if self._graph_uses_attr(gm, raw_name):
+                    continue
+                _, _, attr_short = raw_name.rpartition(".")
+                _delete_module_attr(experts_mod, attr_short)
+
+            num_matches += 1
+
+        if num_matches:
+            ad_logger.info(
+                f"fuse_mxfp4_moe: rewrote {num_matches} routed MXFP4 MoE node(s) "
+                f"for sm{sm_version}."
+            )
+        return num_matches
+
     def _apply(
         self,
         gm: GraphModule,
@@ -1363,6 +1651,11 @@ class FuseMXFP4Moe(BaseTransform):
 
         # Single MXFP4 trtllm-gen MoE op (act_dtype="bf16" or "mxfp8").
         target_op = torch.ops.auto_deploy.trtllm_quant_mxfp4_trtllm_gen_moe_fused.default
+
+        routed_matches = self._apply_routed_from_routing(
+            gm,
+            prepare_trtllm_gen_moe_mxfp4_weights=prepare_trtllm_gen_moe_mxfp4_weights,
+        )
 
         # ---- Pass 1: collect MoE node info, validate consistent shape ----
         # Arg index layout from ``_apply_trtllm`` (kept in sync; comment
@@ -1427,7 +1720,12 @@ class FuseMXFP4Moe(BaseTransform):
 
         num_matches = len(layer_infos)
         if num_matches == 0:
-            info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
+            info = TransformInfo(
+                skipped=(routed_matches == 0),
+                num_matches=routed_matches,
+                is_clean=(routed_matches == 0),
+                has_valid_shapes=True,
+            )
             return gm, info
 
         # ---- Pass 2: allocate scratch ONCE ----
@@ -1555,9 +1853,10 @@ class FuseMXFP4Moe(BaseTransform):
             f"with shared scratch (E={e_local_g}, I={per_rank_i_g}, H={H_g})"
         )
 
+        total_matches = num_matches + routed_matches
         info = TransformInfo(
             skipped=False,
-            num_matches=num_matches,
+            num_matches=total_matches,
             is_clean=False,
             has_valid_shapes=True,
         )

@@ -1332,12 +1332,24 @@ class StackedMoEShardableNode(ShardableNode):
 
     @classmethod
     def _ep_topology_args(
-        cls, ep_target: OpOverload, expert_start: int, ep_size: int, ep_rank: int
+        cls,
+        ep_target: OpOverload,
+        expert_start: int,
+        ep_size: int,
+        ep_rank: int,
+        num_experts_total: Optional[int] = None,
     ) -> Dict[str, int]:
         ep_positions = cls._arg_positions(ep_target)
         topology_args: Dict[str, int] = {}
         if "expert_start" in ep_positions:
             topology_args["expert_start"] = int(expert_start)
+        if "num_experts_total" in ep_positions:
+            if num_experts_total is None:
+                raise RuntimeError(
+                    f"EP op {ep_target} accepts num_experts_total but the source op "
+                    "did not expose a global expert count."
+                )
+            topology_args["num_experts_total"] = int(num_experts_total)
 
         has_ep_size = "ep_size" in ep_positions
         has_ep_rank = "ep_rank" in ep_positions
@@ -1452,6 +1464,7 @@ class StackedMoEShardableNode(ShardableNode):
                 expert_start=lo,
                 ep_size=ep_size,
                 ep_rank=ep_rank,
+                num_experts_total=num_experts,
             ),
         )
 
@@ -1485,6 +1498,7 @@ def _register_stacked_mxfp4_moe_variant(base_name: str, ep_name: str) -> None:
 
 for _base_name, _ep_name in (
     ("triton_mxfp4_moe", "triton_mxfp4_moe_ep"),
+    ("triton_mxfp4_moe_from_routing", "triton_mxfp4_moe_from_routing_ep"),
     ("torch_mxfp4_moe", "torch_mxfp4_moe_ep"),
     ("torch_mxfp4_moe_from_routing", "torch_mxfp4_moe_from_routing_ep"),
 ):

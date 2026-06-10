@@ -1075,8 +1075,13 @@ def test_stacked_mxfp4_deepseek_flat_graph_loads_production_shaped_rank7_slice()
     gm_out = _make_optimizer(world_size=world_size, rank=rank)(None, gm)
     ep_nodes = _call_nodes(gm_out, ep_op)
     assert len(ep_nodes) == 1
-    [expert_start] = extract_op_args(ep_nodes[0], "expert_start")
+    expert_start, num_experts_total = extract_op_args(
+        ep_nodes[0],
+        "expert_start",
+        "num_experts_total",
+    )
     assert expert_start == 224
+    assert num_experts_total == num_experts
 
     local_experts = num_experts // world_size
     for target in expert_targets.values():
@@ -1123,6 +1128,7 @@ def test_stacked_mxfp4_routing_driven_ir_contract_rewrites_to_matching_ep_varian
         selected_experts,
         routing_weights,
         expert_start,
+        num_experts_total,
         ep_size,
         ep_rank,
         gate_up_order,
@@ -1133,6 +1139,7 @@ def test_stacked_mxfp4_routing_driven_ir_contract_rewrites_to_matching_ep_varian
         "selected_experts",
         "routing_weights",
         "expert_start",
+        "num_experts_total",
         "ep_size",
         "ep_rank",
         "gate_up_order",
@@ -1142,6 +1149,7 @@ def test_stacked_mxfp4_routing_driven_ir_contract_rewrites_to_matching_ep_varian
     assert selected_experts is not None
     assert routing_weights is not None
     assert expert_start == 0
+    assert num_experts_total == 4
     assert ep_size is None
     assert ep_rank is None
     assert gate_up_order == "gate_up"
@@ -1168,7 +1176,12 @@ def test_stacked_mxfp4_routing_driven_rank1_preserves_expert_start_with_torch_ba
 
     ep_nodes = _call_nodes(gm_out, ep_op)
     assert len(ep_nodes) == 1
-    [expert_start] = extract_op_args(ep_nodes[0], "expert_start")
+    expert_start, num_experts_total = extract_op_args(
+        ep_nodes[0],
+        "expert_start",
+        "num_experts_total",
+    )
     assert expert_start == 2
+    assert num_experts_total == 4
     assert len(_call_nodes(gm_out, torch.ops.auto_deploy.torch_dist_all_reduce.default)) == 1
     assert len(_call_nodes(gm_out, torch.ops.auto_deploy.trtllm_dist_all_reduce.default)) == 0

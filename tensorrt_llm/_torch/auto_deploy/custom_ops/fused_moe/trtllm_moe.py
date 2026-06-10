@@ -1510,3 +1510,151 @@ def trtllm_quant_mxfp4_trtllm_gen_moe_fused_fake(
     out_shape = list(x.shape)
     out_shape[-1] = valid_hidden_size
     return x.new_empty(out_shape, dtype=x.dtype)
+
+
+@torch.library.custom_op(
+    "auto_deploy::trtllm_quant_mxfp4_trtllm_gen_moe_from_routing_fused",
+    mutates_args=(),
+)
+def trtllm_quant_mxfp4_trtllm_gen_moe_from_routing_fused(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_weights_mxfp4: torch.Tensor,
+    fc2_weights_mxfp4: torch.Tensor,
+    fc1_weights_scale_ue8m0: torch.Tensor,
+    fc2_weights_scale_ue8m0: torch.Tensor,
+    fc1_bias_f32: torch.Tensor,
+    fc2_bias_f32: torch.Tensor,
+    swiglu_alpha: torch.Tensor,
+    swiglu_beta: torch.Tensor,
+    swiglu_limit: torch.Tensor,
+    valid_hidden_size: int,
+    valid_intermediate_size: int,
+    act_dtype: str,
+    num_experts_total: int,
+    local_expert_offset: int = 0,
+    local_num_experts: int = -1,
+    routing_method_type: int = int(RoutingMethodType.Renormalize),
+) -> torch.Tensor:
+    """TensorRT-LLM Gen MXFP4 MoE using externally computed top-k routing.
+
+    DeepSeek V4 computes hash/sqrt-softplus routing in Python modeling code, so
+    this op consumes ``selected_experts`` and already-scaled ``routing_weights``
+    directly instead of deriving top-k from router logits.
+    """
+    x_shape = x.shape
+    x2d = x.view(-1, x_shape[-1])
+    selected_2d = selected_experts.reshape(x2d.shape[0], -1).to(torch.int32).contiguous()
+    weights_2d = routing_weights.reshape_as(selected_2d).to(torch.bfloat16).contiguous()
+    top_k = int(selected_2d.shape[-1])
+
+    expected_hidden = int(fc1_weights_mxfp4.shape[-1] * 2)
+    pad_size = expected_hidden - int(x2d.shape[-1])
+    if pad_size > 0:
+        x2d = torch.nn.functional.pad(x2d, (0, pad_size))
+
+    if local_num_experts < 0:
+        local_num_experts = int(fc1_weights_mxfp4.shape[0])
+    intermediate_size_padded = int(fc1_weights_mxfp4.shape[1] // 2)
+
+    if act_dtype == "mxfp8":
+        x_mxfp8, x_scale = torch.ops.trtllm.mxfp8_quantize(
+            x2d,
+            False,
+            alignment=512,
+        )
+        result = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+            None,  # routing_logits
+            None,  # routing_bias
+            x_mxfp8,
+            x_scale,
+            fc1_weights_mxfp4,
+            fc1_weights_scale_ue8m0,
+            fc1_bias_f32,
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
+            fc2_weights_mxfp4,
+            fc2_weights_scale_ue8m0,
+            fc2_bias_f32,
+            int(num_experts_total),
+            top_k,
+            None,  # n_group
+            None,  # topk_group
+            intermediate_size_padded,
+            valid_hidden_size,
+            valid_intermediate_size,
+            int(local_expert_offset),
+            int(local_num_experts),
+            None,  # routed_scaling_factor: routing_weights are already scaled
+            int(routing_method_type),
+            int(ActivationType.Swiglu),
+            topk_weights=weights_2d,
+            topk_ids=selected_2d,
+        )
+    elif act_dtype == "bf16":
+        result = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
+            None,  # routing_logits
+            None,  # routing_bias
+            x2d,
+            fc1_weights_mxfp4,
+            fc1_weights_scale_ue8m0,
+            fc1_bias_f32,
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
+            fc2_weights_mxfp4,
+            fc2_weights_scale_ue8m0,
+            fc2_bias_f32,
+            int(num_experts_total),
+            top_k,
+            None,  # n_group
+            None,  # topk_group
+            intermediate_size_padded,
+            valid_hidden_size,
+            valid_intermediate_size,
+            int(local_expert_offset),
+            int(local_num_experts),
+            None,  # routed_scaling_factor: routing_weights are already scaled
+            int(routing_method_type),
+            int(ActivationType.Swiglu),
+            topk_weights=weights_2d,
+            topk_ids=selected_2d,
+        )
+    else:
+        raise ValueError(
+            "trtllm_quant_mxfp4_trtllm_gen_moe_from_routing_fused: "
+            f"act_dtype must be 'bf16' or 'mxfp8', got {act_dtype!r}."
+        )
+
+    if result.shape[-1] > valid_hidden_size:
+        result = result[..., :valid_hidden_size].contiguous()
+    return result.view(*x_shape[:-1], valid_hidden_size)
+
+
+@trtllm_quant_mxfp4_trtllm_gen_moe_from_routing_fused.register_fake
+def trtllm_quant_mxfp4_trtllm_gen_moe_from_routing_fused_fake(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_weights_mxfp4: torch.Tensor,
+    fc2_weights_mxfp4: torch.Tensor,
+    fc1_weights_scale_ue8m0: torch.Tensor,
+    fc2_weights_scale_ue8m0: torch.Tensor,
+    fc1_bias_f32: torch.Tensor,
+    fc2_bias_f32: torch.Tensor,
+    swiglu_alpha: torch.Tensor,
+    swiglu_beta: torch.Tensor,
+    swiglu_limit: torch.Tensor,
+    valid_hidden_size: int,
+    valid_intermediate_size: int,
+    act_dtype: str,
+    num_experts_total: int,
+    local_expert_offset: int = 0,
+    local_num_experts: int = -1,
+    routing_method_type: int = int(RoutingMethodType.Renormalize),
+) -> torch.Tensor:
+    out_shape = list(x.shape)
+    out_shape[-1] = valid_hidden_size
+    return x.new_empty(out_shape, dtype=x.dtype)
