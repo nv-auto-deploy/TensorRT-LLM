@@ -283,6 +283,10 @@ transforms:
     stage: cache_init
     requires_shape_prop: true
     backend: flashinfer_mla
+  insert_cached_deepseek_v4_sparse_attention:
+    stage: cache_init
+    backend: deepseek_v4_sparse
+    enabled: false
   insert_cached_ssm_attention:
     stage: cache_init
     backend: triton_ssm
