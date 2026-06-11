@@ -19,6 +19,12 @@ from typing import List, Optional
 
 import torch
 
+# DeepSeek-V3 MLA fused a-projection shape (q_a 1536 + kv_a_with_mqa 576 = 2112,
+# in 7168, bf16).  torch_linear_simple routes this exact GEMM to the trtllm
+# dsv3 min-latency kernel; the kernel is only instantiated for these dims.
+_DSV3_A_IN = 7168
+_DSV3_A_FUSED_OUT = 2112
+
 
 @torch.library.custom_op("auto_deploy::torch_linear_simple", mutates_args=())
 def simple(
@@ -65,6 +71,18 @@ def simple(
     Returns:
         Output tensor of shape ``(..., out_features)``.
     """
+    # Backend selection: the DeepSeek-V3 MLA a-projection (q_a + kv_a_with_mqa
+    # fused by fuse_gemms into a 7168->2112 bf16 GEMM with no bias) dispatches to
+    # the trtllm dsv3 min-latency kernel (cuBLAS fallback for num_tokens > 16,
+    # handled inside the op).  Strictly shape+dtype gated so every other linear
+    # is unaffected.
+    if (
+        bias is None
+        and weight.dtype == torch.bfloat16
+        and weight.shape[0] == _DSV3_A_FUSED_OUT
+        and weight.shape[1] == _DSV3_A_IN
+    ):
+        return torch.ops.auto_deploy.dsv3_fused_a_gemm(input, weight)
     return torch.ops.aten.linear(input, weight, bias)
 
 
