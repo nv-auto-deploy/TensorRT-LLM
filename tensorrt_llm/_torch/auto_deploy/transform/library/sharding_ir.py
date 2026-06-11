@@ -1487,6 +1487,8 @@ for _base_name, _ep_name in (
     ("triton_mxfp4_moe", "triton_mxfp4_moe_ep"),
     ("torch_mxfp4_moe", "torch_mxfp4_moe_ep"),
     ("torch_mxfp4_moe_from_routing", "torch_mxfp4_moe_from_routing_ep"),
+    # NVFP4 from-routing: registers only if an _ep op exists (else no-ops).
+    ("torch_quant_nvfp4_moe_from_routing", "torch_quant_nvfp4_moe_from_routing_ep"),
 ):
     _register_stacked_mxfp4_moe_variant(_base_name, _ep_name)
 
