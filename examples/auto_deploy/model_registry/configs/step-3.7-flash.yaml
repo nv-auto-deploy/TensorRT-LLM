@@ -23,7 +23,12 @@ cuda_graph_config:
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128]
 kv_cache_config:
   dtype: bfloat16
-  enable_block_reuse: false
+  # idea_new01: enable KV block reuse (prefix caching). When requests in the
+  # in-flight batch share a common prefix, the KV manager reuses already-computed
+  # blocks instead of recomputing prefill. Cache-only / bit-exact (a reused block
+  # holds the same tokens+weights -> identical KV). Helps under concurrency where
+  # prefill competes with decode (chunked prefill); inert at c=1 (no contention).
+  enable_block_reuse: true
   free_gpu_memory_fraction: 0.7
   tokens_per_block: 64
 model_kwargs:
