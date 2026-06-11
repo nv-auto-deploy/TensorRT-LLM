@@ -632,6 +632,86 @@ def _step3p7_fused_router_topk_fake(
 
 
 # ---------------------------------------------------------------------------
+# Fused head-wise attention gate (sigmoid + per-head broadcast multiply)
+# ---------------------------------------------------------------------------
+#
+# Step applies a per-head gate to the attention output before o_proj:
+#     gate = sigmoid(g_proj(hidden_states))      # [B, S, N]
+#     attn = attn * gate.unsqueeze(-1)           # [B, S, N, D]
+# As separate torch ops that is a sigmoid launch plus a broadcast-multiply launch
+# per attention layer (x45 layers) on tiny [.., N, D] tensors at batch=1 decode --
+# two launch-bound elementwise kernels that no generic matcher (silu_mul / swiglu /
+# rmsnorm) touches. This custom op fuses the sigmoid + per-head broadcast-multiply
+# into one Triton launch (one kernel per layer instead of two). The gate-proj GEMV
+# is left as a separate (sharded) torch_linear_simple so its per-head column-shard
+# hint (tp_min_local_shape=1) is preserved; this op is a transparent elementwise
+# pass-through that keeps the [.., N/tp, D] head partition for the downstream
+# view -> o_proj -> all_reduce chain.
+
+
+@triton.jit
+def _step3p7_head_gate_kernel(
+    attn_ptr,
+    gate_ptr,
+    out_ptr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """``out[row, :] = attn[row, :] * sigmoid(gate[row])``; one program per (B*S*N) head row."""
+    row = tl.program_id(0)
+    logit = tl.load(gate_ptr + row).to(tl.float32)
+    # Match PyTorch's bf16 sigmoid: accurate fp32 sigmoid, then round to bf16 BEFORE the
+    # multiply, so the fused result mirrors `attn * gate.sigmoid()` to within bf16 rounding.
+    g = 1.0 / (1.0 + tl.exp(-logit))
+    g = g.to(tl.bfloat16).to(tl.float32)
+    d = tl.arange(0, BLOCK_D)
+    mask = d < D
+    a = tl.load(attn_ptr + row * D + d, mask=mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + row * D + d, (a * g).to(tl.bfloat16), mask=mask)
+
+
+@torch.library.custom_op("auto_deploy::step3p7_head_gate", mutates_args=())
+def step3p7_head_gate(attn_output: torch.Tensor, gate_logits: torch.Tensor) -> torch.Tensor:
+    """Fused head-wise attention gate: ``attn_output * sigmoid(gate_logits)[..., None]``.
+
+    Args:
+        attn_output: ``[..., N, D]`` attention output (one row of size ``D`` per head).
+        gate_logits: ``[..., N]`` per-head gate pre-activation (the ``g_proj`` output).
+
+    Returns a tensor with the same shape and dtype as ``attn_output``.
+    """
+    assert attn_output.dim() >= 2, "attn_output must be at least 2-D [..., N, D]"
+    assert attn_output.shape[:-1] == gate_logits.shape, (
+        f"gate_logits {tuple(gate_logits.shape)} must equal attn_output[..., N] "
+        f"{tuple(attn_output.shape[:-1])}"
+    )
+    # Production decode/prefill is bf16 on CUDA -> fused Triton. Any other dtype/device
+    # (e.g. the offline sharding-IR equivalence harness) falls back to the reference ops.
+    if not (
+        attn_output.is_cuda
+        and attn_output.dtype == torch.bfloat16
+        and gate_logits.dtype == torch.bfloat16
+    ):
+        return attn_output * gate_logits.sigmoid().unsqueeze(-1)
+
+    attn_output = attn_output.contiguous()
+    gate_logits = gate_logits.contiguous()
+    D = attn_output.shape[-1]
+    out = torch.empty_like(attn_output)
+    n_rows = gate_logits.numel()
+    BLOCK_D = triton.next_power_of_2(D)
+    _step3p7_head_gate_kernel[(n_rows,)](
+        attn_output, gate_logits, out, D, BLOCK_D, num_warps=1, num_stages=1
+    )
+    return out
+
+
+@step3p7_head_gate.register_fake
+def _step3p7_head_gate_fake(attn_output: torch.Tensor, gate_logits: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(attn_output)
+
+
+# ---------------------------------------------------------------------------
 # Sparse MoE block (routed experts + shared expert)
 # ---------------------------------------------------------------------------
 
@@ -807,16 +887,20 @@ class Step3p7Attention(nn.Module):
 
         # Head-wise gate: scale each head's output by sigmoid(per-head gate). g_proj is a per-head
         # column shard (tp_min_local_shape=1), so its [B, S, N] output is sharded over the same
-        # head partition as the attention output.
-        gate = torch.ops.auto_deploy.torch_linear_simple(
+        # head partition as the attention output. The sigmoid + per-head broadcast-multiply are
+        # fused into one Triton launch (step3p7_head_gate), dropping one launch-bound elementwise
+        # kernel per attention layer at batch=1 decode. The gate-proj GEMV stays a separate sharded
+        # linear so its per-head column-shard hint is preserved (the fused op is a transparent
+        # elementwise pass-through over the [.., N/tp, D] head partition).
+        gate_logits = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.g_proj.weight,
             None,
             tp_mode="colwise",
             tp_min_local_shape=1,
             layer_type="mha",
-        ).sigmoid()  # [B, S, N]
-        attn_output = attn_output * gate.unsqueeze(-1)
+        )  # [B, S, N]
+        attn_output = torch.ops.auto_deploy.step3p7_head_gate(attn_output, gate_logits)
 
         attn_output = torch.ops.auto_deploy.view(
             attn_output,
