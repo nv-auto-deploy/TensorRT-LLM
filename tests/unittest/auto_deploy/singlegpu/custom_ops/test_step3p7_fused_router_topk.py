@@ -16,8 +16,8 @@
 """Unit tests for the fused Step-3.7-Flash MoE routing custom op.
 
 The op ``auto_deploy::step3p7_fused_router_topk`` fuses the 7 separate torch
-ops of Step's sigmoid + per-expert-bias top-k router into a CuteDSL kernel.
-These tests validate that it is (1) numerically faithful to the
+ops of Step's sigmoid + per-expert-bias top-k router into an optimized Triton
+kernel. These tests validate that it is (1) numerically faithful to the
 separate-op reference, (2) safe to capture/replay inside a CUDA graph (the
 production execution mode), and (3) traceable by ``torch.export`` (uses
 ``register_fake`` and a ``torch.dtype`` argument).
@@ -27,7 +27,7 @@ import pytest
 import torch
 
 # Importing the model module registers the custom op at import time.
-from tensorrt_llm._torch.auto_deploy.models.custom import modeling_step3p7
+from tensorrt_llm._torch.auto_deploy.models.custom import modeling_step3p7  # noqa: F401
 
 
 def _reference_routing(router_logits, router_bias, top_k, scaling, out_dtype):
@@ -48,7 +48,6 @@ def _sorted_by_index(weights, indices):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.skipif(modeling_step3p7.cute is None, reason="requires Cutlass CuteDSL")
 @pytest.mark.parametrize("num_tokens", [1, 4, 17])
 @pytest.mark.parametrize("num_experts,top_k", [(288, 8)])
 @pytest.mark.parametrize("bias_dtype", [torch.float32, torch.bfloat16])
@@ -86,7 +85,6 @@ def test_fused_router_topk_matches_reference(num_tokens, num_experts, top_k, bia
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.skipif(modeling_step3p7.cute is None, reason="requires Cutlass CuteDSL")
 def test_fused_router_topk_cuda_graph():
     """The op must be capturable and replayable inside a CUDA graph."""
     device = "cuda"

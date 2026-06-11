@@ -69,26 +69,13 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
-
-try:
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass import BFloat16, Float32, Int32, Int64
-    from cutlass.cute.runtime import from_dlpack, make_fake_stream
-except ImportError:
-    cutlass = None
-    cute = None
-    BFloat16 = None
-    Float32 = None
-    Int32 = None
-    Int64 = None
-    from_dlpack = None
-    make_fake_stream = None
 
 from ... import custom_ops  # noqa: F401 -- register all sharding-aware ops
 from ..._compat import ActivationType
@@ -428,15 +415,12 @@ class Step3p7MLP(nn.Module):
 # ``[1, 288]`` fp32 tensor for each of the 42 MoE layers. As separate torch ops
 # that is ~7 launch-bound kernels per layer on the routed critical path (the
 # shared expert is overlapped on an aux stream by ``multi_stream_moe``). This
-# custom op fuses that router into one CuteDSL launch. There is intentionally no
-# fallback path: compile/runtime errors should surface directly.
+# custom op fuses that router into one optimized Triton launch.
 
 
 _STEP3P7_ROUTER_NUM_EXPERTS = 288
 _STEP3P7_ROUTER_TOP_K = 8
 _STEP3P7_ROUTER_SCALING_FACTOR = 3.0
-_STEP3P7_ROUTER_WPB_VALUES = (1, 2, 4)
-_STEP3P7_ROUTER_CUTE_CACHE = {}
 
 
 def _step3p7_router_production_contract(
@@ -446,7 +430,7 @@ def _step3p7_router_production_contract(
     routed_scaling_factor: float,
     out_dtype: torch.dtype,
 ) -> bool:
-    """Return whether the specialized Step-3.7 router kernel can handle this call."""
+    """Return whether the specialized Step-3.7 router kernels can handle this call."""
     return (
         router_logits.is_cuda
         and router_bias.is_cuda
@@ -462,17 +446,13 @@ def _step3p7_router_production_contract(
     )
 
 
-def _require_step3p7_router_cute(
+def _require_step3p7_router_optimized_triton(
     router_logits: torch.Tensor,
     router_bias: torch.Tensor,
     top_k: int,
     routed_scaling_factor: float,
     out_dtype: torch.dtype,
 ) -> None:
-    if cute is None or from_dlpack is None or make_fake_stream is None:
-        raise RuntimeError(
-            "Step-3.7 CuteDSL router requires cutlass.cute, from_dlpack, and make_fake_stream"
-        )
     if not _step3p7_router_production_contract(
         router_logits,
         router_bias,
@@ -481,8 +461,8 @@ def _require_step3p7_router_cute(
         out_dtype,
     ):
         raise ValueError(
-            "Step-3.7 CuteDSL router only supports CUDA fp32 logits and fp32/bf16 bias "
-            f"with {_STEP3P7_ROUTER_NUM_EXPERTS} experts, "
+            "Step-3.7 optimized Triton router only supports CUDA fp32 logits and fp32/bf16 "
+            f"bias with {_STEP3P7_ROUTER_NUM_EXPERTS} experts, "
             f"top-{_STEP3P7_ROUTER_TOP_K}, scaling={_STEP3P7_ROUTER_SCALING_FACTOR}, "
             "and bf16 output; got "
             f"logits_shape={tuple(router_logits.shape)}, logits_dtype={router_logits.dtype}, "
@@ -492,172 +472,108 @@ def _require_step3p7_router_cute(
         )
 
 
-if cute is not None:
-
-    def _make_step3p7_router_kernel(wpb_value: int):
-        @cute.kernel
-        def _step3p7_router_topk_cute_kernel(
-            logits: cute.Tensor,
-            bias: cute.Tensor,
-            selected: cute.Tensor,
-            weights: cute.Tensor,
-        ):
-            TOP_K = cutlass.const_expr(8)
-            LANES = cutlass.const_expr(32)
-            PER_LANE = cutlass.const_expr(9)
-            LOG2_E = cutlass.const_expr(1.4426950408889634)
-            SCALE_Q = cutlass.const_expr(262144.0)
-            IDX_MASK = cutlass.const_expr(0x1FF)
-            NEG_INF_I32 = cutlass.const_expr(-2147483648)
-            SCALING = cutlass.const_expr(3.0)
-            WPB = cutlass.const_expr(wpb_value)
-
-            bid, _, _ = cute.arch.block_idx()
-            tid, _, _ = cute.arch.thread_idx()
-            tid_i32 = Int32(tid)
-            bid_i32 = Int32(bid)
-
-            warp_id = tid_i32 >> 5
-            lane = tid_i32 & Int32(LANES - 1)
-            token_id = bid_i32 * Int32(WPB) + warp_id
-
-            probs = cute.make_fragment(PER_LANE, Float32)
-            packed = cute.make_fragment(PER_LANE, Int32)
-            for i in cutlass.range_constexpr(PER_LANE):
-                col = lane + Int32(i * LANES)
-                f = logits[token_id, col].to(Float32)
-                b = bias[col].to(Float32)
-                e = cute.arch.exp2(-f * Float32(LOG2_E))
-                prob = cute.arch.rcp_approx(Float32(1.0) + e)
-                probs[i] = prob
-                q = Int32(prob * Float32(SCALE_Q) + b * Float32(SCALE_Q))
-                packed[i] = (q << 9) | col
-
-            sum_p = Float32(0.0)
-            my_idx = Int32(0)
-            my_prob = Float32(0.0)
-
-            for k in cutlass.range_constexpr(TOP_K):
-                best_packed = packed[0]
-                for i in cutlass.range_constexpr(1, PER_LANE, 1):
-                    best_packed = max(best_packed, packed[i])
-
-                global_packed = cute.arch.warp_redux_sync(best_packed, "max")
-                owner_lane = global_packed & Int32(LANES - 1)
-
-                mp0 = probs[0] if packed[0] == global_packed else Float32(0.0)
-                mp1 = probs[1] if packed[1] == global_packed else Float32(0.0)
-                mp2 = probs[2] if packed[2] == global_packed else Float32(0.0)
-                mp3 = probs[3] if packed[3] == global_packed else Float32(0.0)
-                mp4 = probs[4] if packed[4] == global_packed else Float32(0.0)
-                mp5 = probs[5] if packed[5] == global_packed else Float32(0.0)
-                mp6 = probs[6] if packed[6] == global_packed else Float32(0.0)
-                mp7 = probs[7] if packed[7] == global_packed else Float32(0.0)
-                mp8 = probs[8] if packed[8] == global_packed else Float32(0.0)
-                s01 = mp0 + mp1
-                s23 = mp2 + mp3
-                s45 = mp4 + mp5
-                s67 = mp6 + mp7
-                s0123 = s01 + s23
-                s4567 = s45 + s67
-                s07 = s0123 + s4567
-                my_match_prob = s07 + mp8
-
-                packed[0] = Int32(NEG_INF_I32) if packed[0] == global_packed else packed[0]
-                packed[1] = Int32(NEG_INF_I32) if packed[1] == global_packed else packed[1]
-                packed[2] = Int32(NEG_INF_I32) if packed[2] == global_packed else packed[2]
-                packed[3] = Int32(NEG_INF_I32) if packed[3] == global_packed else packed[3]
-                packed[4] = Int32(NEG_INF_I32) if packed[4] == global_packed else packed[4]
-                packed[5] = Int32(NEG_INF_I32) if packed[5] == global_packed else packed[5]
-                packed[6] = Int32(NEG_INF_I32) if packed[6] == global_packed else packed[6]
-                packed[7] = Int32(NEG_INF_I32) if packed[7] == global_packed else packed[7]
-                packed[8] = Int32(NEG_INF_I32) if packed[8] == global_packed else packed[8]
-
-                prob_at_k = cute.arch.shuffle_sync(my_match_prob, owner_lane)
-                sum_p = sum_p + prob_at_k
-
-                if lane == Int32(k):
-                    my_idx = global_packed & Int32(IDX_MASK)
-                    my_prob = prob_at_k
-
-            inv = cute.arch.rcp_approx(sum_p + Float32(1e-20)) * Float32(SCALING)
-
-            if lane < Int32(TOP_K):
-                w = my_prob * inv
-                selected[token_id, lane] = my_idx.to(Int64)
-                weights[token_id, lane] = w.to(BFloat16)
-
-        return _step3p7_router_topk_cute_kernel
-
-    _STEP3P7_ROUTER_CUTE_KERNELS = {
-        wpb: _make_step3p7_router_kernel(wpb) for wpb in _STEP3P7_ROUTER_WPB_VALUES
-    }
-
-    def _make_step3p7_router_jit(wpb_value: int):
-        kernel = _STEP3P7_ROUTER_CUTE_KERNELS[wpb_value]
-
-        @cute.jit
-        def _step3p7_router_topk_cute_jit(
-            logits: cute.Tensor,
-            bias: cute.Tensor,
-            selected: cute.Tensor,
-            weights: cute.Tensor,
-            tokens: cutlass.Constexpr,
-            stream,
-        ):
-            grid_size = cutlass.const_expr((tokens + wpb_value - 1) // wpb_value)
-            kernel(logits, bias, selected, weights).launch(
-                grid=[grid_size, 1, 1],
-                block=[32 * wpb_value, 1, 1],
-                stream=stream,
-            )
-
-        return _step3p7_router_topk_cute_jit
-
-    _STEP3P7_ROUTER_CUTE_JITS = {
-        wpb: _make_step3p7_router_jit(wpb) for wpb in _STEP3P7_ROUTER_WPB_VALUES
-    }
-else:
-    _STEP3P7_ROUTER_CUTE_JITS = {}
+@triton.jit
+def _step3p7_router_rcp_approx(x):
+    return tl.inline_asm_elementwise(
+        "rcp.approx.ftz.f32 $0, $1;",
+        "=f,f",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
 
 
-def _pick_step3p7_router_wpb(num_tokens: int) -> int:
-    del num_tokens
-    return 1
+@triton.jit
+def _step3p7_router_fast_sigmoid(x):
+    x_half = x * 0.5
+    tanh_x = tl.inline_asm_elementwise(
+        "tanh.approx.f32 $0, $1;",
+        "=f,f",
+        [x_half],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    return tanh_x * 0.5 + 0.5
 
 
-def _run_step3p7_router_topk_cute(
+@triton.jit
+def _step3p7_router_topk_optimized_triton_kernel(
+    logits_ptr,
+    bias_ptr,
+    indices_ptr,
+    weights_ptr,
+    scaling_factor,
+):
+    """Triton r4-v20 router: hard-coded Step-3.7 top-8 over 288 experts."""
+    K: tl.constexpr = 8
+    BLOCK_LO: tl.constexpr = 256
+    BLOCK_HI: tl.constexpr = 32
+
+    pid = tl.program_id(0)
+    e_lo = tl.arange(0, BLOCK_LO)
+    e_hi = tl.arange(0, BLOCK_HI)
+    e_hi_global = e_hi + BLOCK_LO
+
+    base = pid * 288
+    logits_lo = tl.load(logits_ptr + base + e_lo).to(tl.float32)
+    logits_hi = tl.load(logits_ptr + base + e_hi_global).to(tl.float32)
+    bias_lo = tl.load(bias_ptr + e_lo).to(tl.float32)
+    bias_hi = tl.load(bias_ptr + e_hi_global).to(tl.float32)
+
+    scores_lo = _step3p7_router_fast_sigmoid(logits_lo) + bias_lo
+    scores_hi = _step3p7_router_fast_sigmoid(logits_hi) + bias_hi
+
+    score_lo_i32 = scores_lo.to(tl.int32, bitcast=True)
+    score_hi_i32 = scores_hi.to(tl.int32, bitcast=True)
+    packed_lo = (score_lo_i32 & -512) | e_lo
+    packed_hi = (score_hi_i32 & -512) | e_hi_global
+
+    k_offsets = tl.arange(0, K)
+    top_packed = tl.zeros([K], dtype=tl.int32)
+
+    ZERO_I32: tl.constexpr = 0
+    for k in tl.static_range(K):
+        max_lo = tl.max(packed_lo, axis=0)
+        max_hi = tl.max(packed_hi, axis=0)
+        max_packed = tl.maximum(max_lo, max_hi)
+        max_idx = max_packed & 0x1FF
+        top_packed = tl.where(k_offsets == k, max_packed, top_packed)
+        if k < K - 1:
+            packed_lo = tl.where(e_lo == max_idx, ZERO_I32, packed_lo)
+            packed_hi = tl.where(e_hi_global == max_idx, ZERO_I32, packed_hi)
+
+    top_indices = top_packed & 0x1FF
+    top_score_i32 = top_packed & -512
+    top_score_f32 = top_score_i32.to(tl.float32, bitcast=True)
+    top_bias = tl.load(bias_ptr + top_indices).to(tl.float32)
+    top_probs = top_score_f32 - top_bias
+
+    sum_probs = tl.sum(top_probs, axis=0)
+    inv_sum_x_sf = scaling_factor * _step3p7_router_rcp_approx(sum_probs + 1.0e-20)
+    out_weights = top_probs * inv_sum_x_sf
+
+    tl.store(indices_ptr + pid * K + k_offsets, top_indices.to(tl.int64))
+    tl.store(weights_ptr + pid * K + k_offsets, out_weights.to(tl.bfloat16))
+
+
+def _run_step3p7_router_topk_optimized_triton(
     router_logits: torch.Tensor,
     router_bias: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
+    routed_scaling_factor: float,
 ) -> None:
-    """Compile/cache and launch the Step-3.7 CuteDSL router kernel."""
-    num_tokens = int(router_logits.shape[0])
-    cache_key = (num_tokens, router_bias.dtype)
-    if cache_key not in _STEP3P7_ROUTER_CUTE_CACHE:
-        logits_cute = from_dlpack(router_logits, enable_tvm_ffi=True)
-        bias_cute = from_dlpack(router_bias, enable_tvm_ffi=True)
-        selected_cute = from_dlpack(selected_experts, enable_tvm_ffi=True)
-        weights_cute = from_dlpack(routing_weights, enable_tvm_ffi=True)
-        wpb = _pick_step3p7_router_wpb(num_tokens)
-        if num_tokens % wpb != 0:
-            wpb = 1
-        _STEP3P7_ROUTER_CUTE_CACHE[cache_key] = cute.compile(
-            _STEP3P7_ROUTER_CUTE_JITS[wpb],
-            logits_cute,
-            bias_cute,
-            selected_cute,
-            weights_cute,
-            num_tokens,
-            make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi --ptxas-options '--allow-expensive-optimizations true'",
-        )
-    _STEP3P7_ROUTER_CUTE_CACHE[cache_key](
+    grid = (router_logits.shape[0],)
+    _step3p7_router_topk_optimized_triton_kernel[grid](
         router_logits,
         router_bias,
         selected_experts,
         routing_weights,
+        float(routed_scaling_factor),
+        num_warps=1,
+        num_stages=1,
     )
 
 
@@ -671,7 +587,7 @@ def step3p7_fused_router_topk(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused sigmoid + per-expert-bias top-k MoE routing.
 
-    This implementation is intentionally CuteDSL-only with no fallback path.
+    This implementation is intentionally optimized-Triton-only with no fallback path.
 
     Returns:
         routing_weights: ``(T, top_k)`` tensor in ``out_dtype``.
@@ -684,18 +600,19 @@ def step3p7_fused_router_topk(
         (num_tokens, top_k), dtype=torch.int64, device=router_logits.device
     )
 
-    _require_step3p7_router_cute(
+    _require_step3p7_router_optimized_triton(
         router_logits,
         router_bias,
         top_k,
         routed_scaling_factor,
         out_dtype,
     )
-    _run_step3p7_router_topk_cute(
+    _run_step3p7_router_topk_optimized_triton(
         router_logits,
         router_bias,
         selected_experts,
         routing_weights,
+        routed_scaling_factor,
     )
     return routing_weights, selected_experts
 
@@ -764,7 +681,7 @@ class Step3p7MoE(nn.Module):
         # fp32 router GEMM (config.need_fp32_gate)
         router_logits = F.linear(hidden_flat.float(), self.gate.weight.float())
 
-        # Fused sigmoid + per-expert-bias top-k routing in one CuteDSL launch
+        # Fused sigmoid + per-expert-bias top-k routing in one optimized Triton launch
         # (replaces the 7 separate torch ops; numerics-faithful, see custom op above).
         routing_weights, selected_experts = torch.ops.auto_deploy.step3p7_fused_router_topk(
             router_logits,
