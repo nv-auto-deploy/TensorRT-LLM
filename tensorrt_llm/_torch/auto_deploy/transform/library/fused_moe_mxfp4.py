@@ -1482,6 +1482,7 @@ class FuseMXFP4Moe(BaseTransform):
                         gate_up_order,
                         swiglu_mode,
                         layer_type,
+                        num_experts_total,
                     )
                 else:
                     n.args = (

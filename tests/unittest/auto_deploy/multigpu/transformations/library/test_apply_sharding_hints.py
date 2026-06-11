@@ -756,6 +756,7 @@ def _make_deepseek_flat_mxfp4_routing_graph(base_op, layer=3, num_experts=4):
             "up_gate",
             "deepseek",
             "moe",
+            num_experts,
         ),
     )
     moe.meta["val"] = torch.empty(2, hidden_size)

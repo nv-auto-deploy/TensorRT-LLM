@@ -28,6 +28,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.prepare_trtllm_gen_moe
 )
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, TransformRegistry
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args
 
 # The transform calls ``prepare_trtllm_gen_moe_mxfp4_weights`` which itself
 # invokes ``torch.ops.trtllm.shuffle_matrix`` — registered CUDA-only.
@@ -193,6 +194,7 @@ def _build_pre_fuse_routed_gm(
         args = (*args, 1, E)
     else:
         target = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing.default
+        args = (*args, E)
 
     moe = graph.call_function(target, args=args)
     graph.output(moe)
@@ -424,6 +426,8 @@ def test_fuse_mxfp4_moe_routed_h100_rewrites_to_triton_from_routing():
     assert info.skipped is False
     assert info.num_matches == 1
     assert n.args[3].target == "experts.gate_up_proj_blocks"
+    (num_experts_total,) = extract_op_args(n, "num_experts_total")
+    assert num_experts_total == E
     assert hasattr(gm.experts, "gate_up_proj_blocks")
     assert not hasattr(gm.experts, "fc1_w_trtllm")
     out = gm(hidden, selected_experts, routing_weights)

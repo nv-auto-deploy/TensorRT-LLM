@@ -908,6 +908,7 @@ class AttentionSinkArgShardableNode(ShardableNode):
 for _sparse_attention_op_name in (
     "torch_deepseek_v4_sparse_attention",
     "torch_deepseek_v4_sparse_attention_with_cache",
+    "flashmla_deepseek_v4_sparse_attention_with_cache",
 ):
     try:
         _sparse_attention_op = getattr(torch.ops.auto_deploy, _sparse_attention_op_name)
@@ -1218,7 +1219,7 @@ _ROUTER_STACKED_MOE_SCHEMA = _StackedMoESchema(
 )
 _ROUTING_DRIVEN_STACKED_MOE_SCHEMA = _StackedMoESchema(
     expert_arg_names=_STACKED_MOE_EXPERT_ARGS,
-    optional_trailing_arg_names=("gate_up_order", "swiglu_mode", "layer_type"),
+    optional_trailing_arg_names=("gate_up_order", "swiglu_mode", "layer_type", "num_experts_total"),
 )
 
 

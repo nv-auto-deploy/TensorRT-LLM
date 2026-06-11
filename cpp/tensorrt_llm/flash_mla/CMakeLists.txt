@@ -229,6 +229,11 @@ target_compile_options(
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-c++11-narrowing>
     $<$<COMPILE_LANGUAGE:CXX>:-fno-lto>
+    # The FlashMLA API source only includes pybind11/pybind11.h, but the sparse
+    # interface exposes std::optional<at::Tensor>. Force Torch's pybind casters
+    # into that translation unit without patching the fetched source.
+    $<$<COMPILE_LANGUAGE:CXX>:-include>
+    $<$<COMPILE_LANGUAGE:CXX>:torch/csrc/utils/pybind.h>
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
     $<$<COMPILE_LANGUAGE:CUDA>:-std=c++20>
     $<$<COMPILE_LANGUAGE:CUDA>:-DNDEBUG>
@@ -240,9 +245,7 @@ target_compile_options(
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
     $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
-    $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v,--register-usage-level=10>
-    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
-    $<$<COMPILE_LANGUAGE:CUDA>:--source-in-ptx>)
+    $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v,--register-usage-level=10>)
 
 # Extension name definition
 target_compile_definitions(flash_mla_cpp_tllm
