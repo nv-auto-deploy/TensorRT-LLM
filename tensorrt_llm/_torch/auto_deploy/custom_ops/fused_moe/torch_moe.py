@@ -768,6 +768,167 @@ def torch_quant_nvfp4_moe_fake(
     return torch.empty_like(x)
 
 
+# Per-token chunk used when looping experts in the eager NVFP4 reference, mirroring
+# the MXFP4 from-routing reference.
+_TORCH_NVFP4_ROUTED_MOE_TOKEN_CHUNK = 16
+
+
+def _dequant_nvfp4_stacked_weight(
+    weight_packed: torch.Tensor,  # [N, K//2] uint8
+    block_scale: torch.Tensor,  # [N, K//16] float8_e4m3fn (modelopt layout)
+    weight_scale_2: torch.Tensor,  # per-tensor F32 scalar
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dequantize one packed NVFP4 weight matrix to a dense [N, K] tensor.
+
+    Reuses the same dequant oracle (``_dequantize_nvfp4``) that backs the
+    per-expert-LIST reference so numerics match.
+    """
+    from ..quantization.torch_quant import _dequantize_nvfp4
+
+    n = weight_packed.shape[0]
+    k = weight_packed.shape[1] * 2
+    return _dequantize_nvfp4(weight_packed, block_scale, weight_scale_2, (n, k), out_dtype)
+
+
+def _fake_quant_nvfp4_activation(x: torch.Tensor, input_scale: torch.Tensor) -> torch.Tensor:
+    """NVFP4 round-trip (quantize+dequantize) of activations.
+
+    Mirrors the activation fake-quant in ``torch_fake_quant_nvfp4_linear`` so the
+    eager reference reproduces the same codec error as the per-expert-LIST op.
+    ``input_scale`` is the per-tensor scale-2 (amax/(448*6)).
+    """
+    from ..quantization.torch_quant import _dequantize_nvfp4, _quantize_nvfp4
+
+    k = x.shape[-1]
+    x_2d = x.reshape(-1, k)
+    s2 = input_scale.to(torch.float32).reshape(())
+    x_packed, x_scale = _quantize_nvfp4(x_2d, block_size=16, weights_scaling_factor_2=s2)
+    x_deq = _dequantize_nvfp4(x_packed, x_scale, s2, (x_2d.shape[0], k), x.dtype)
+    return x_deq.reshape_as(x)
+
+
+@torch.library.custom_op("auto_deploy::torch_quant_nvfp4_moe_from_routing", mutates_args=())
+def torch_quant_nvfp4_moe_from_routing(
+    hidden_states: torch.Tensor,  # [B, S, H] or [B*S, H]
+    selected_experts: torch.Tensor,  # [B*S, top_k]
+    routing_weights: torch.Tensor,  # [B*S, top_k]
+    # gate_up path: cat[w3(up), w1(gate)] -> [E, 2I, H//2] packed fp4
+    gate_up_weight: torch.Tensor,  # [E, 2I, H//2] uint8
+    gate_up_scales: torch.Tensor,  # [E, 2I, H//16] float8_e4m3fn
+    gate_up_weight_scale_2: torch.Tensor,  # [E, 2] f32 (per concat-projection)
+    gate_up_input_scale: torch.Tensor,  # [E, 2] f32
+    # down path: w2 -> [E, H, I//2] packed fp4
+    down_weight: torch.Tensor,  # [E, H, I//2] uint8
+    down_scales: torch.Tensor,  # [E, H, I//16] float8_e4m3fn
+    down_weight_scale_2: torch.Tensor,  # [E] f32
+    down_input_scale: torch.Tensor,  # [E] f32
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
+    num_experts_total: int = -1,
+) -> torch.Tensor:
+    """Eager NVFP4 reference MoE from precomputed routing.
+
+    Mirrors ``torch_mxfp4_moe_from_routing`` (stacked-from-routing structure) but
+    dequantizes NVFP4 experts and applies the DeepSeek SwiGLU
+    (``y = W2( silu(gate) * up )`` with gate_up packed as cat[up, gate]).
+
+    Weight dequant uses ``_dequantize_nvfp4`` and the activation is NVFP4
+    round-tripped so the result matches the per-expert-LIST reference
+    ``torch_quant_nvfp4_moe`` (which dispatches to ``torch_fake_quant_nvfp4_linear``).
+    """
+    del num_experts_total
+    if not is_gated_mlp:
+        raise ValueError("torch_quant_nvfp4_moe_from_routing only supports gated MLP experts.")
+
+    torch_act_fn = _resolve_torch_fn(act_fn)
+
+    leading_shape = hidden_states.shape[:-1]
+    hidden_size = hidden_states.shape[-1]
+    x = hidden_states.reshape(-1, hidden_size).to(torch.float32)
+    out_dtype = hidden_states.dtype
+
+    selected_experts = selected_experts.reshape(x.shape[0], -1).to(torch.int64)
+    routing_weights = routing_weights.reshape_as(selected_experts).to(torch.float32)
+
+    local_experts = gate_up_weight.shape[0]
+    two_i = gate_up_weight.shape[1]
+    intermediate_size = two_i // 2
+
+    output = torch.zeros((x.shape[0], hidden_size), device=x.device, dtype=torch.float32)
+    for expert in range(local_experts):
+        # gate_up = cat[w3(up), w1(gate)] along rows; dequant each half with its
+        # own per-tensor weight_scale_2, then re-stack.
+        up_w = _dequant_nvfp4_stacked_weight(
+            gate_up_weight[expert, :intermediate_size],
+            gate_up_scales[expert, :intermediate_size],
+            gate_up_weight_scale_2[expert, 0],
+            torch.float32,
+        )
+        gate_w = _dequant_nvfp4_stacked_weight(
+            gate_up_weight[expert, intermediate_size:],
+            gate_up_scales[expert, intermediate_size:],
+            gate_up_weight_scale_2[expert, 1],
+            torch.float32,
+        )
+        down_w = _dequant_nvfp4_stacked_weight(
+            down_weight[expert],
+            down_scales[expert],
+            down_weight_scale_2[expert],
+            torch.float32,
+        )
+
+        token_mask = (selected_experts == expert).any(dim=1)
+        token_idx = token_mask.nonzero(as_tuple=False).squeeze(-1)
+        if token_idx.numel() == 0:
+            continue
+
+        for start in range(0, token_idx.numel(), _TORCH_NVFP4_ROUTED_MOE_TOKEN_CHUNK):
+            chunk = token_idx[start : start + _TORCH_NVFP4_ROUTED_MOE_TOKEN_CHUNK]
+            inp = x.index_select(0, chunk)
+
+            # gate/up: fake-quant activation, then dense matmul (per-half input_scale).
+            gate_in = _fake_quant_nvfp4_activation(inp, gate_up_input_scale[expert, 1])
+            up_in = _fake_quant_nvfp4_activation(inp, gate_up_input_scale[expert, 0])
+            gate_out = gate_in @ gate_w.t()
+            up_out = up_in @ up_w.t()
+            inter = torch_act_fn(gate_out) * up_out
+
+            # down: fake-quant activation, then dense matmul.
+            down_in = _fake_quant_nvfp4_activation(inter, down_input_scale[expert])
+            expert_out = down_in @ down_w.t()
+
+            # weighted sum over the routes that selected this expert.
+            route_scale = (
+                (selected_experts.index_select(0, chunk) == expert).to(torch.float32)
+                * routing_weights.index_select(0, chunk)
+            ).sum(dim=1, keepdim=True)
+            output.index_add_(0, chunk, expert_out * route_scale)
+
+    return output.reshape(*leading_shape, hidden_size).to(out_dtype)
+
+
+@torch_quant_nvfp4_moe_from_routing.register_fake
+def _torch_quant_nvfp4_moe_from_routing_fake(
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    gate_up_weight_scale_2: torch.Tensor,
+    gate_up_input_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scales: torch.Tensor,
+    down_weight_scale_2: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
+    num_experts_total: int = -1,
+) -> torch.Tensor:
+    del num_experts_total
+    return torch.empty_like(hidden_states)
+
+
 # GPT-OSS uses this style
 @torch.library.custom_op("auto_deploy::torch_moe_dense_mlp", mutates_args=())
 def torch_moe_dense_mlp(

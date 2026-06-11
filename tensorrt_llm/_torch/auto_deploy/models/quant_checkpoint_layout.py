@@ -528,6 +528,367 @@ def load_packed_mxfp4_expert_tensors(
     return packed
 
 
+_F8_E4M3_DTYPE = getattr(torch, "float8_e4m3fn", None)
+
+
+@dataclass(frozen=True)
+class PackedNVFP4Experts:
+    """Packed NVFP4 expert tensors in runtime layout.
+
+    Mirrors ``PackedMXFP4Experts`` but adds the NVFP4-only per-tensor scalars
+    (block-scale stays e4m3 instead of being reinterpreted to raw uint8).
+    """
+
+    gate_up_blocks: torch.Tensor
+    gate_up_scales: torch.Tensor
+    down_blocks: torch.Tensor
+    down_scales: torch.Tensor
+    gate_up_weight_scale_2: torch.Tensor
+    gate_up_input_scale: torch.Tensor
+    down_weight_scale_2: torch.Tensor
+    down_input_scale: torch.Tensor
+    expert_indices: tuple[int, ...]
+    hidden_size: int
+    intermediate_size: int
+
+
+@dataclass(frozen=True)
+class PackedNVFP4ExpertLayout(PackedMXFP4ExpertLayout):
+    """Regex-driven checkpoint layout for packed NVFP4 routed expert tensors.
+
+    NVFP4 experts carry four tensor kinds per projection
+    (``weight | weight_scale | weight_scale_2 | input_scale``) instead of the
+    two MXFP4 kinds (``weight | scale``). ``weight``/``weight_scale`` are 2D and
+    block-scaled (block 16, e4m3 scale); ``weight_scale_2``/``input_scale`` are
+    per-tensor F32 scalars. The class subclasses the MXFP4 layout to reuse its
+    packing machinery and only overrides what differs.
+    """
+
+    expert_block_size: int = 16
+    packed_values_per_byte: int = 2
+    weight_dtypes: tuple[str, ...] = ("U8",)
+    scale_dtype: str = "F8_E4M3"
+    quant_method: str = "nvfp4"
+    # Per-tensor F32 scalar kinds (shape []).
+    scalar_kinds: tuple[str, ...] = ("weight_scale_2", "input_scale")
+    scalar_dtype: str = "F32"
+
+    def _is_scalar_kind(self, tensor_kind: str) -> bool:
+        return tensor_kind in self.scalar_kinds
+
+    def validate_checkpoint_metadata(self, tensor_metadata: CheckpointMetadata) -> int:
+        parsed_metadata: dict[tuple[int, int, str], dict[str, TensorMetadata]] = {}
+        expert_projections: dict[tuple[int, int], set[str]] = {}
+        for name, metadata in tensor_metadata.items():
+            parsed = self.parse_key(name)
+            if parsed is None:
+                continue
+            if not isinstance(metadata, Mapping):
+                raise QuantizedCheckpointLayoutError(f"Invalid metadata for tensor {name}.")
+            key = (parsed.layer, parsed.expert, parsed.projection)
+            parsed_metadata.setdefault(key, {})[parsed.tensor_kind] = metadata
+            expert_projections.setdefault((parsed.layer, parsed.expert), set()).add(
+                parsed.projection
+            )
+
+        for (layer, expert, projection), tensors in parsed_metadata.items():
+            weight_name = self.format_key(layer, expert, projection, "weight")
+            scale_name = self.format_key(layer, expert, projection, "weight_scale")
+            weight_metadata = tensors.get("weight")
+            scale_metadata = tensors.get("weight_scale")
+            if not isinstance(weight_metadata, Mapping):
+                raise QuantizedCheckpointLayoutError(
+                    f"{scale_name} is missing companion weight {weight_name}."
+                )
+            if not isinstance(scale_metadata, Mapping):
+                raise QuantizedCheckpointLayoutError(
+                    f"{weight_name} is missing companion scale {scale_name}."
+                )
+            self._validate_weight_metadata(weight_name, weight_metadata)
+            self._validate_scale_metadata(weight_name, weight_metadata, scale_name, scale_metadata)
+            for scalar_kind in self.scalar_kinds:
+                scalar_name = self.format_key(layer, expert, projection, scalar_kind)
+                scalar_metadata = tensors.get(scalar_kind)
+                if not isinstance(scalar_metadata, Mapping):
+                    raise QuantizedCheckpointLayoutError(
+                        f"{weight_name} is missing companion scalar {scalar_name}."
+                    )
+                self._validate_scalar_metadata(scalar_name, scalar_metadata)
+
+        for (layer, expert), projections in expert_projections.items():
+            for projection in self.required_projection_names():
+                if projection in projections:
+                    continue
+                weight_name = self.format_key(layer, expert, projection, "weight")
+                raise QuantizedCheckpointLayoutError(
+                    "Packed NVFP4 expert metadata is missing required projection "
+                    f"{projection} for layer {layer}, expert {expert}: {weight_name}."
+                )
+            self._validate_expert_projection_shapes(parsed_metadata, layer, expert)
+
+        if not parsed_metadata:
+            raise QuantizedCheckpointLayoutError(
+                "Checkpoint metadata has no packed NVFP4 expert tensors."
+            )
+        return len(parsed_metadata)
+
+    def _validate_scalar_metadata(self, name: str, metadata: TensorMetadata) -> None:
+        dtype = _get_dtype(name, metadata)
+        if dtype != self.scalar_dtype:
+            raise QuantizedCheckpointLayoutError(
+                f"{name} should be {self.scalar_dtype} per-tensor scalar, got {dtype}."
+            )
+        shape = _get_shape(name, metadata)
+        if len(shape) not in (0, 1) or (len(shape) == 1 and shape[0] != 1):
+            raise QuantizedCheckpointLayoutError(
+                f"{name} should be a per-tensor scalar, got shape {list(shape)}."
+            )
+
+    def source_keys_for_packed_experts(
+        self, layer: int, expert_indices: Sequence[int]
+    ) -> tuple[str, ...]:
+        return tuple(
+            self.format_key(layer, expert, projection, tensor_kind)
+            for expert in expert_indices
+            for projection in self.required_projection_names()
+            for tensor_kind in ("weight", "weight_scale", *self.scalar_kinds)
+        )
+
+    def _packed_shape(self, rows: int, logical_cols: int) -> tuple[int, int]:
+        # NVFP4 runtime keeps weights as a flat [rows, logical_cols/2] uint8 block
+        # rather than the MXFP4 [rows, blocks, packed_block_width] layout.
+        return (rows, logical_cols // self.packed_values_per_byte)
+
+    def _load_weight_blocks(
+        self,
+        expert_map: Mapping[str, Mapping[str, torch.Tensor]],
+        layer: int,
+        expert: int,
+        projection: str,
+        *,
+        expected_shape: tuple[int, int],
+        packed_shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        name = self.format_key(layer, expert, projection, "weight")
+        tensor = self._get_required_tensor(expert_map, layer, expert, projection, "weight")
+        _validate_tensor_shape(name, tensor, expected_shape)
+        return self._reinterpret_weight_as_uint8(name, tensor).view(packed_shape)
+
+    def _load_scales(
+        self,
+        expert_map: Mapping[str, Mapping[str, torch.Tensor]],
+        layer: int,
+        expert: int,
+        projection: str,
+        *,
+        expected_shape: tuple[int, int],
+    ) -> torch.Tensor:
+        name = self.format_key(layer, expert, projection, "weight_scale")
+        tensor = self._get_required_tensor(expert_map, layer, expert, projection, "weight_scale")
+        _validate_tensor_shape(name, tensor, expected_shape)
+        # NVFP4 block-scales must stay float8_e4m3fn for the dequant math.
+        return self._reinterpret_scale_as_uint8(name, tensor).view(expected_shape)
+
+    def _load_scalar(
+        self,
+        expert_map: Mapping[str, Mapping[str, torch.Tensor]],
+        layer: int,
+        expert: int,
+        projection: str,
+        tensor_kind: str,
+    ) -> torch.Tensor:
+        tensor = self._get_required_tensor(expert_map, layer, expert, projection, tensor_kind)
+        return tensor.reshape(()).to(torch.float32)
+
+    def _reinterpret_scale_as_uint8(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        # NVFP4 block-scales are float8_e4m3fn and must be preserved as-is for the
+        # dequant math (the kernel/reference wants the e4m3 block scale, not uint8).
+        if _F8_E4M3_DTYPE is not None and tensor.dtype == _F8_E4M3_DTYPE:
+            return tensor.contiguous()
+        return super()._reinterpret_scale_as_uint8(name, tensor)
+
+    def pack_experts(
+        self,
+        state_dict: Mapping[str, torch.Tensor],
+        *,
+        layer: int,
+        hidden_size: int,
+        intermediate_size: int,
+        expert_indices: Sequence[int] | None = None,
+        num_experts: int | None = None,
+    ) -> PackedNVFP4Experts:
+        layer = _validate_nonnegative_int("layer", layer)
+        hidden_size = _validate_positive_divisible_by(
+            "hidden_size", hidden_size, self.expert_block_size
+        )
+        intermediate_size = _validate_positive_divisible_by(
+            "intermediate_size", intermediate_size, self.expert_block_size
+        )
+
+        expert_tensors = self._collect_expert_tensors(state_dict, layer)
+        expert_order = _normalize_expert_order(
+            expert_tensors,
+            expert_indices=expert_indices,
+            num_experts=num_experts,
+        )
+
+        gate_up_blocks: list[torch.Tensor] = []
+        gate_up_scales: list[torch.Tensor] = []
+        down_blocks: list[torch.Tensor] = []
+        down_scales: list[torch.Tensor] = []
+        gate_up_weight_scale_2: list[torch.Tensor] = []
+        gate_up_input_scale: list[torch.Tensor] = []
+        down_weight_scale_2: list[torch.Tensor] = []
+        down_input_scale: list[torch.Tensor] = []
+        for expert in expert_order:
+            expert_map = self._get_required_expert_map(expert_tensors, layer, expert)
+            gate_up_blocks.append(
+                torch.cat(
+                    [
+                        self._load_weight_blocks(
+                            expert_map,
+                            layer,
+                            expert,
+                            projection,
+                            expected_shape=(
+                                intermediate_size,
+                                hidden_size // self.packed_values_per_byte,
+                            ),
+                            packed_shape=self._packed_shape(intermediate_size, hidden_size),
+                        )
+                        for projection in self.gate_up_order
+                    ],
+                    dim=0,
+                )
+            )
+            gate_up_scales.append(
+                torch.cat(
+                    [
+                        self._load_scales(
+                            expert_map,
+                            layer,
+                            expert,
+                            projection,
+                            expected_shape=(
+                                intermediate_size,
+                                hidden_size // self.expert_block_size,
+                            ),
+                        )
+                        for projection in self.gate_up_order
+                    ],
+                    dim=0,
+                )
+            )
+            down_blocks.append(
+                self._load_weight_blocks(
+                    expert_map,
+                    layer,
+                    expert,
+                    self.down_projection,
+                    expected_shape=(
+                        hidden_size,
+                        intermediate_size // self.packed_values_per_byte,
+                    ),
+                    packed_shape=self._packed_shape(hidden_size, intermediate_size),
+                )
+            )
+            down_scales.append(
+                self._load_scales(
+                    expert_map,
+                    layer,
+                    expert,
+                    self.down_projection,
+                    expected_shape=(hidden_size, intermediate_size // self.expert_block_size),
+                )
+            )
+            # gate_up scalars: one per concatenated projection (w3 then w1).
+            gate_up_weight_scale_2.append(
+                torch.stack(
+                    [
+                        self._load_scalar(expert_map, layer, expert, projection, "weight_scale_2")
+                        for projection in self.gate_up_order
+                    ]
+                )
+            )
+            gate_up_input_scale.append(
+                torch.stack(
+                    [
+                        self._load_scalar(expert_map, layer, expert, projection, "input_scale")
+                        for projection in self.gate_up_order
+                    ]
+                )
+            )
+            down_weight_scale_2.append(
+                self._load_scalar(expert_map, layer, expert, self.down_projection, "weight_scale_2")
+            )
+            down_input_scale.append(
+                self._load_scalar(expert_map, layer, expert, self.down_projection, "input_scale")
+            )
+
+        return PackedNVFP4Experts(
+            gate_up_blocks=torch.stack(gate_up_blocks, dim=0),
+            gate_up_scales=torch.stack(gate_up_scales, dim=0),
+            down_blocks=torch.stack(down_blocks, dim=0),
+            down_scales=torch.stack(down_scales, dim=0),
+            gate_up_weight_scale_2=torch.stack(gate_up_weight_scale_2, dim=0),
+            gate_up_input_scale=torch.stack(gate_up_input_scale, dim=0),
+            down_weight_scale_2=torch.stack(down_weight_scale_2, dim=0),
+            down_input_scale=torch.stack(down_input_scale, dim=0),
+            expert_indices=expert_order,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+
+
+def load_packed_nvfp4_expert_tensors(
+    state_dict: dict[str, torch.Tensor],
+    prefix: str,
+    *,
+    checkpoint_layout: PackedNVFP4ExpertLayout,
+    target_names: Mapping[str, str],
+    layer: int,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> PackedNVFP4Experts | None:
+    """Materialize packed NVFP4 checkpoint expert tensors into runtime buffers.
+
+    Mirrors ``load_packed_mxfp4_expert_tensors`` but also emits the NVFP4-only
+    per-expert ``weight_scale_2``/``input_scale`` scalars for gate_up and down.
+    ``target_names`` must contain: ``gate_up_blocks``, ``gate_up_scales``,
+    ``down_blocks``, ``down_scales``, ``gate_up_weight_scale_2``,
+    ``gate_up_input_scale``, ``down_weight_scale_2``, ``down_input_scale``.
+    """
+
+    prefix = prefix or ""
+    if prefix + target_names["gate_up_blocks"] in state_dict:
+        return None
+    source_state = _strip_prefix_from_state_dict(state_dict, prefix)
+    if not checkpoint_layout.has_layer_expert_tensors(source_state, layer):
+        return None
+
+    packed = checkpoint_layout.pack_experts(
+        source_state,
+        layer=layer,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+    )
+    for source_key in checkpoint_layout.source_keys_for_packed_experts(
+        layer, packed.expert_indices
+    ):
+        state_dict.pop(prefix + source_key, None)
+    state_dict[prefix + target_names["gate_up_blocks"]] = packed.gate_up_blocks
+    state_dict[prefix + target_names["gate_up_scales"]] = packed.gate_up_scales
+    state_dict[prefix + target_names["down_blocks"]] = packed.down_blocks
+    state_dict[prefix + target_names["down_scales"]] = packed.down_scales
+    state_dict[prefix + target_names["gate_up_weight_scale_2"]] = packed.gate_up_weight_scale_2
+    state_dict[prefix + target_names["gate_up_input_scale"]] = packed.gate_up_input_scale
+    state_dict[prefix + target_names["down_weight_scale_2"]] = packed.down_weight_scale_2
+    state_dict[prefix + target_names["down_input_scale"]] = packed.down_input_scale
+    return packed
+
+
 def _strip_prefix_from_state_dict(
     state_dict: Mapping[str, torch.Tensor], prefix: str
 ) -> dict[str, torch.Tensor]:

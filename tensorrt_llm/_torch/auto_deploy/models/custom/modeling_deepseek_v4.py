@@ -44,6 +44,7 @@ from transformers.utils import ModelOutput
 from transformers.utils.hub import cached_file
 
 from ... import custom_ops  # noqa: F401 -- register custom ops
+from ..._compat import ActivationType
 from ...utils.quantization_utils import fake_fp4_act_quant as _fake_fp4_act_quant
 from ...utils.quantization_utils import fake_fp8_act_quant as _fake_fp8_act_quant
 from ...utils.quantization_utils import hadamard_rotate as _hadamard_rotate
@@ -52,10 +53,12 @@ from ..hf import AutoModelForCausalLMFactory
 from ..quant_checkpoint_layout import (
     FineGrainedFP8CheckpointLayout,
     PackedMXFP4ExpertLayout,
+    PackedNVFP4ExpertLayout,
     QuantCheckpointLayoutRegistry,
     QuantizedCheckpointLayout,
     QuantizedCheckpointLayoutError,
     load_packed_mxfp4_expert_tensors,
+    load_packed_nvfp4_expert_tensors,
 )
 
 
@@ -395,6 +398,51 @@ def build_deepseek_v4_packed_mxfp4_experts_layout() -> PackedMXFP4ExpertLayout:
     )
 
 
+# NVFP4 experts carry four tensor kinds per projection. Order the kind
+# alternation longest-prefix-first so ``weight`` cannot preempt
+# ``weight_scale``/``weight_scale_2``.
+_DEEPSEEK_V4_NVFP4_EXPERT_RE = re.compile(
+    r"layers\.(?P<layer>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
+    r"(?P<projection>w[123])\.(?P<kind>weight_scale_2|weight_scale|input_scale|weight)"
+)
+_DEEPSEEK_V4_NVFP4_KEY_TEMPLATE = "layers.{layer}.ffn.experts.{expert}.{projection}.{kind}"
+_DEEPSEEK_V4_NVFP4_LAYER_NAME_RE = _DEEPSEEK_V4_MXFP4_LAYER_NAME_RE
+_DEEPSEEK_V4_NVFP4_PROJECTIONS = ("w1", "w2", "w3")
+_DEEPSEEK_V4_NVFP4_GATE_UP_ORDER = ("w3", "w1")
+_DEEPSEEK_V4_NVFP4_DOWN_PROJECTION = "w2"
+_DEEPSEEK_V4_NVFP4_BLOCK_SIZE = 16
+
+DeepseekV4PackedNvfp4ExpertsCheckpointLayout = PackedNVFP4ExpertLayout
+
+
+def build_deepseek_v4_packed_nvfp4_experts_layout() -> PackedNVFP4ExpertLayout:
+    return PackedNVFP4ExpertLayout(
+        key_pattern=_DEEPSEEK_V4_NVFP4_EXPERT_RE,
+        key_template=_DEEPSEEK_V4_NVFP4_KEY_TEMPLATE,
+        layer_name_pattern=_DEEPSEEK_V4_NVFP4_LAYER_NAME_RE,
+        projections=_DEEPSEEK_V4_NVFP4_PROJECTIONS,
+        gate_up_order=_DEEPSEEK_V4_NVFP4_GATE_UP_ORDER,
+        down_projection=_DEEPSEEK_V4_NVFP4_DOWN_PROJECTION,
+        expert_block_size=_DEEPSEEK_V4_NVFP4_BLOCK_SIZE,
+    )
+
+
+def _deepseek_v4_moe_quant_algo(qconf: Mapping[str, object]) -> str:
+    """Return the routed-expert quant algorithm (upper-cased), or '' if unset."""
+    moe_quant_algo = qconf.get("moe_quant_algo")
+    if isinstance(moe_quant_algo, str):
+        return moe_quant_algo.upper()
+    return ""
+
+
+def _deepseek_v4_config_moe_quant_algo(config: object) -> str:
+    """Read the routed-expert quant algorithm from an HF config object."""
+    qconf = getattr(config, "quantization_config", None)
+    if isinstance(qconf, Mapping):
+        return _deepseek_v4_moe_quant_algo(qconf)
+    return ""
+
+
 def _deepseek_v4_scale_fmt(qconf: Mapping[str, object]) -> str:
     scale_fmt = qconf.get("scale_fmt")
     if not isinstance(scale_fmt, str) or not scale_fmt:
@@ -452,7 +500,13 @@ def _build_deepseek_v4_checkpoint_layout(
         return None
     scale_fmt = _deepseek_v4_scale_fmt(qconf)
     weight_block_size = _deepseek_v4_weight_block_size(qconf)
-    expert_layout = build_deepseek_v4_packed_mxfp4_experts_layout()
+    # ``moe_quant_algo`` selects the routed-expert consumer. NVFP4 experts use a
+    # distinct 4-kind layout; the non-expert fp8 layout (FineGrainedFP8 below) and
+    # the ``ue8m0`` scale_fmt check are about the fp8 weights and stay unchanged.
+    if _deepseek_v4_moe_quant_algo(qconf) == "NVFP4":
+        expert_layout = build_deepseek_v4_packed_nvfp4_experts_layout()
+    else:
+        expert_layout = build_deepseek_v4_packed_mxfp4_experts_layout()
 
     return QuantizedCheckpointLayout(
         finegrained_fp8=FineGrainedFP8CheckpointLayout(
@@ -877,8 +931,13 @@ class DeepseekV4MoE(nn.Module):
         self.swiglu_limit = config.swiglu_limit
         self.gate = DeepseekV4MoEGate(config, layer_idx)
         self.experts = nn.Module()
-        self._register_mxfp4_runtime_buffers()
-        self._register_load_state_dict_pre_hook(self._load_mxfp4_checkpoint_experts)
+        self.moe_quant_algo = _deepseek_v4_config_moe_quant_algo(config)
+        if self.moe_quant_algo == "NVFP4":
+            self._register_nvfp4_runtime_buffers()
+            self._register_load_state_dict_pre_hook(self._load_nvfp4_checkpoint_experts)
+        else:
+            self._register_mxfp4_runtime_buffers()
+            self._register_load_state_dict_pre_hook(self._load_mxfp4_checkpoint_experts)
         shared_intermediate_size = config.moe_intermediate_size * config.n_shared_experts
         self.shared_experts = DeepseekV4MLP(
             config.hidden_size,
@@ -994,26 +1053,161 @@ class DeepseekV4MoE(nn.Module):
             torch.empty(loaded.shape, dtype=loaded.dtype, device=current.device),
         )
 
+    def _register_nvfp4_runtime_buffers(self) -> None:
+        layout = build_deepseek_v4_packed_nvfp4_experts_layout()
+        block_size = layout.expert_block_size
+        packed_cols = layout.packed_values_per_byte
+        if self.hidden_size % block_size != 0 or self.intermediate_size % block_size != 0:
+            raise ValueError(
+                "DeepSeek V4 NVFP4 experts require hidden_size and "
+                f"moe_intermediate_size to be divisible by {block_size}."
+            )
+        scale_dtype = getattr(torch, "float8_e4m3fn", torch.uint8)
+        # gate_up = cat[w3, w1] -> 2I rows; weights packed 2 fp4 per byte.
+        self.experts.register_buffer(
+            "gate_up_proj_weight",
+            torch.zeros(
+                self.n_routed_experts,
+                2 * self.intermediate_size,
+                self.hidden_size // packed_cols,
+                dtype=torch.uint8,
+            ),
+            persistent=True,
+        )
+        self.experts.register_buffer(
+            "gate_up_proj_scales",
+            torch.zeros(
+                self.n_routed_experts,
+                2 * self.intermediate_size,
+                self.hidden_size // block_size,
+                dtype=scale_dtype,
+            ),
+            persistent=True,
+        )
+        self.experts.register_buffer(
+            "down_proj_weight",
+            torch.zeros(
+                self.n_routed_experts,
+                self.hidden_size,
+                self.intermediate_size // packed_cols,
+                dtype=torch.uint8,
+            ),
+            persistent=True,
+        )
+        self.experts.register_buffer(
+            "down_proj_scales",
+            torch.zeros(
+                self.n_routed_experts,
+                self.hidden_size,
+                self.intermediate_size // block_size,
+                dtype=scale_dtype,
+            ),
+            persistent=True,
+        )
+        # Per-tensor NVFP4 scalars (no bias). gate_up carries one per concatenated
+        # projection (w3 then w1); down carries a single scalar per expert.
+        self.experts.register_buffer(
+            "gate_up_proj_weight_scale_2",
+            torch.ones(self.n_routed_experts, 2, dtype=torch.float32),
+            persistent=True,
+        )
+        self.experts.register_buffer(
+            "gate_up_proj_input_scale",
+            torch.ones(self.n_routed_experts, 2, dtype=torch.float32),
+            persistent=True,
+        )
+        self.experts.register_buffer(
+            "down_proj_weight_scale_2",
+            torch.ones(self.n_routed_experts, dtype=torch.float32),
+            persistent=True,
+        )
+        self.experts.register_buffer(
+            "down_proj_input_scale",
+            torch.ones(self.n_routed_experts, dtype=torch.float32),
+            persistent=True,
+        )
+
+    def _load_nvfp4_checkpoint_experts(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        *args,
+    ) -> None:
+        del args
+        layout = build_deepseek_v4_packed_nvfp4_experts_layout()
+        target_names = {
+            "gate_up_blocks": f"{prefix}experts.gate_up_proj_weight",
+            "gate_up_scales": f"{prefix}experts.gate_up_proj_scales",
+            "down_blocks": f"{prefix}experts.down_proj_weight",
+            "down_scales": f"{prefix}experts.down_proj_scales",
+            "gate_up_weight_scale_2": f"{prefix}experts.gate_up_proj_weight_scale_2",
+            "gate_up_input_scale": f"{prefix}experts.gate_up_proj_input_scale",
+            "down_weight_scale_2": f"{prefix}experts.down_proj_weight_scale_2",
+            "down_input_scale": f"{prefix}experts.down_proj_input_scale",
+        }
+        packed = load_packed_nvfp4_expert_tensors(
+            state_dict,
+            "",
+            checkpoint_layout=layout,
+            target_names=target_names,
+            layer=self.layer_idx,
+            num_experts=self.n_routed_experts,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+        )
+        if packed is None:
+            return
+
+        self._resize_mxfp4_runtime_buffer("gate_up_proj_weight", packed.gate_up_blocks)
+        self._resize_mxfp4_runtime_buffer("gate_up_proj_scales", packed.gate_up_scales)
+        self._resize_mxfp4_runtime_buffer("down_proj_weight", packed.down_blocks)
+        self._resize_mxfp4_runtime_buffer("down_proj_scales", packed.down_scales)
+        self._resize_mxfp4_runtime_buffer(
+            "gate_up_proj_weight_scale_2", packed.gate_up_weight_scale_2
+        )
+        self._resize_mxfp4_runtime_buffer("gate_up_proj_input_scale", packed.gate_up_input_scale)
+        self._resize_mxfp4_runtime_buffer("down_proj_weight_scale_2", packed.down_weight_scale_2)
+        self._resize_mxfp4_runtime_buffer("down_proj_input_scale", packed.down_input_scale)
+
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         original_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, original_shape[-1])
         selected_experts, routing_weights = self.gate(hidden_states_flat, input_ids.reshape(-1))
-        routed = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
-            hidden_states_flat,
-            selected_experts,
-            routing_weights.to(hidden_states_flat.dtype),
-            self.experts.gate_up_proj_blocks,
-            self.experts.gate_up_proj_bias,
-            self.experts.gate_up_proj_scales,
-            1.0,
-            float(self.swiglu_limit),
-            self.experts.down_proj_blocks,
-            self.experts.down_proj_bias,
-            self.experts.down_proj_scales,
-            "up_gate",
-            "deepseek",
-            "moe",
-        )
+        if self.moe_quant_algo == "NVFP4":
+            routed = torch.ops.auto_deploy.torch_quant_nvfp4_moe_from_routing(
+                hidden_states_flat,
+                selected_experts,
+                routing_weights.to(hidden_states_flat.dtype),
+                self.experts.gate_up_proj_weight,
+                self.experts.gate_up_proj_scales,
+                self.experts.gate_up_proj_weight_scale_2,
+                self.experts.gate_up_proj_input_scale,
+                self.experts.down_proj_weight,
+                self.experts.down_proj_scales,
+                self.experts.down_proj_weight_scale_2,
+                self.experts.down_proj_input_scale,
+                True,  # is_gated_mlp
+                int(ActivationType.Silu),  # act_fn
+                self.n_routed_experts,  # num_experts_total
+            )
+        else:
+            routed = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
+                hidden_states_flat,
+                selected_experts,
+                routing_weights.to(hidden_states_flat.dtype),
+                self.experts.gate_up_proj_blocks,
+                self.experts.gate_up_proj_bias,
+                self.experts.gate_up_proj_scales,
+                1.0,
+                float(self.swiglu_limit),
+                self.experts.down_proj_blocks,
+                self.experts.down_proj_bias,
+                self.experts.down_proj_scales,
+                "up_gate",
+                "deepseek",
+                "moe",
+                self.n_routed_experts,
+            )
         return routed.view(*original_shape).to(hidden_states.dtype) + self.shared_experts(
             hidden_states
         )
