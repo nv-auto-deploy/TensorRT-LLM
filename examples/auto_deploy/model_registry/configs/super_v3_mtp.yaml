@@ -21,6 +21,9 @@ attention_dp_config:
   batching_wait_iters: 10
   timeout_iters: 16
 transforms:
+  compile_model:
+    # Piecewise CUDA graph capture is disabled for MTP until MTP supports it.
+    piecewise_enabled: false
   detect_sharding:
     allreduce_strategy: NCCL
     enable_attention_dp: true
