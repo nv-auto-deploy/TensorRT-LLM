@@ -1013,6 +1013,7 @@ class DeepseekV4MoE(nn.Module):
             "up_gate",
             "deepseek",
             "moe",
+            self.n_routed_experts,
         )
         return routed.view(*original_shape).to(hidden_states.dtype) + self.shared_experts(
             hidden_states

@@ -22,12 +22,13 @@ import torch
 import torch.nn as nn
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 (op registration)
-import tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4  # noqa: F401
+import tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4 as fused_moe_mxfp4
 from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.prepare_trtllm_gen_moe_mxfp4_weights import (
     prepare_trtllm_gen_moe_mxfp4_weights,
 )
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, TransformRegistry
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args
 
 # The transform calls ``prepare_trtllm_gen_moe_mxfp4_weights`` which itself
 # invokes ``torch.ops.trtllm.shuffle_matrix`` — registered CUDA-only.
@@ -139,6 +140,67 @@ def _build_pre_fuse_gm(raw_tensors: Tuple[torch.Tensor, ...]) -> torch.fx.GraphM
     return torch.fx.GraphModule(root, graph)
 
 
+def _build_pre_fuse_routed_gm(
+    raw_tensors: Tuple[torch.Tensor, ...],
+    *,
+    ep: bool = False,
+) -> torch.fx.GraphModule:
+    """Build a DeepSeek-style graph that still calls the torch reference routed op."""
+    gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias = raw_tensors
+
+    root = nn.Module()
+    root.experts = nn.Module()
+    raw_specs = [
+        ("gate_up_proj_blocks", gu_blocks),
+        ("gate_up_proj_scales", gu_scales),
+        ("gate_up_proj_bias", gu_bias),
+        ("down_proj_blocks", dn_blocks),
+        ("down_proj_scales", dn_scales),
+        ("down_proj_bias", dn_bias),
+    ]
+    for name, t in raw_specs:
+        root.experts.register_parameter(name, nn.Parameter(t.clone(), requires_grad=False))
+
+    graph = torch.fx.Graph()
+    hidden = graph.placeholder("hidden")
+    selected_experts = graph.placeholder("selected_experts")
+    routing_weights = graph.placeholder("routing_weights")
+
+    gu_blocks_n = graph.get_attr("experts.gate_up_proj_blocks")
+    gu_scales_n = graph.get_attr("experts.gate_up_proj_scales")
+    gu_bias_n = graph.get_attr("experts.gate_up_proj_bias")
+    dn_blocks_n = graph.get_attr("experts.down_proj_blocks")
+    dn_scales_n = graph.get_attr("experts.down_proj_scales")
+    dn_bias_n = graph.get_attr("experts.down_proj_bias")
+
+    args = (
+        hidden,
+        selected_experts,
+        routing_weights,
+        gu_blocks_n,
+        gu_bias_n,
+        gu_scales_n,
+        1.0,
+        10.0,
+        dn_blocks_n,
+        dn_bias_n,
+        dn_scales_n,
+        "up_gate",
+        "deepseek",
+        "moe",
+    )
+    if ep:
+        target = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing_ep.default
+        args = (*args, 1, E)
+    else:
+        target = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing.default
+        args = (*args, E)
+
+    moe = graph.call_function(target, args=args)
+    graph.output(moe)
+    return torch.fx.GraphModule(root, graph)
+
+
 def _run_fuse(gm: torch.fx.GraphModule, dist_config: DistConfig):
     """Apply just ``FuseMXFP4Moe`` with the given ``dist_config``."""
     shared_config = SharedConfig(
@@ -156,6 +218,12 @@ def _moe_node(gm: torch.fx.GraphModule) -> torch.fx.Node:
     target_op = torch.ops.auto_deploy.trtllm_quant_mxfp4_trtllm_gen_moe_fused.default
     nodes = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is target_op]
     assert len(nodes) == 1, f"expected exactly one MoE op node, found {len(nodes)}"
+    return nodes[0]
+
+
+def _single_call_node(gm: torch.fx.GraphModule, target_op) -> torch.fx.Node:
+    nodes = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is target_op]
+    assert len(nodes) == 1, f"expected exactly one {target_op} node, found {len(nodes)}"
     return nodes[0]
 
 
@@ -290,3 +358,78 @@ def test_fuse_mxfp4_moe_idempotent_on_already_prepped_graph():
     _, info2 = _run_fuse(gm, dc)
     assert info2.skipped is True, "second run should skip — no raw HF buffers left to prep"
     assert info2.num_matches == 0
+
+
+def test_fuse_mxfp4_moe_routed_target_policy():
+    """Routed DeepSeek MXFP4 target policy is explicit and hardware-gated."""
+    assert (
+        fused_moe_mxfp4.FuseMXFP4Moe._routed_target_for_sm(100)
+        == torch.ops.auto_deploy.trtllm_quant_mxfp4_trtllm_gen_moe_from_routing_fused.default
+    )
+    assert (
+        fused_moe_mxfp4.FuseMXFP4Moe._routed_target_for_sm(103)
+        == torch.ops.auto_deploy.trtllm_quant_mxfp4_trtllm_gen_moe_from_routing_fused.default
+    )
+    assert (
+        fused_moe_mxfp4.FuseMXFP4Moe._routed_target_for_sm(90)
+        == torch.ops.auto_deploy.triton_mxfp4_moe_from_routing.default
+    )
+    assert fused_moe_mxfp4.FuseMXFP4Moe._routed_target_for_sm(80) is None
+
+
+def test_fuse_mxfp4_moe_routed_h100_rewrites_to_triton_from_routing():
+    """On an actual SM90 GPU, the routed path selects and runs the Triton W4A16 op."""
+    if fused_moe_mxfp4.get_sm_version() != 90:
+        pytest.skip("H100/SM90 runtime coverage only")
+
+    raw = _make_raw_mxfp4_tensors(device="cuda")
+    gm = _build_pre_fuse_routed_gm(raw)
+    hidden = torch.linspace(
+        -0.15,
+        0.2,
+        steps=6 * H,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).reshape(6, H)
+    selected_experts = torch.tensor(
+        [[0, 1], [2, 3], [1, 2], [3, 0], [0, 2], [1, 3]],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    routing_weights = torch.tensor(
+        [[0.60, 0.40], [0.55, 0.45], [0.35, 0.65], [0.25, 0.75], [0.70, 0.30], [0.20, 0.80]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias = raw
+    reference = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
+        hidden,
+        selected_experts,
+        routing_weights,
+        gu_blocks,
+        gu_bias,
+        gu_scales,
+        1.0,
+        10.0,
+        dn_blocks,
+        dn_bias,
+        dn_scales,
+        "up_gate",
+        "deepseek",
+    )
+
+    dc = DistConfig(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1)
+    _, info = _run_fuse(gm, dc)
+
+    target = torch.ops.auto_deploy.triton_mxfp4_moe_from_routing.default
+    n = _single_call_node(gm, target)
+    assert info.skipped is False
+    assert info.num_matches == 1
+    assert n.args[3].target == "experts.gate_up_proj_blocks"
+    (num_experts_total,) = extract_op_args(n, "num_experts_total")
+    assert num_experts_total == E
+    assert hasattr(gm.experts, "gate_up_proj_blocks")
+    assert not hasattr(gm.experts, "fc1_w_trtllm")
+    out = gm(hidden, selected_experts, routing_weights)
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out, reference, rtol=5e-2, atol=5e-2)
