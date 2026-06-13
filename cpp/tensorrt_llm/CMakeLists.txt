@@ -180,6 +180,7 @@ set(TRTLLM_LINK_LIBS
     common_src
     kernels_src
     flash_mla_src
+    mhcKernels_src
     context_attention_src
     decoder_attention_src
     trtllm_gen_fmha
