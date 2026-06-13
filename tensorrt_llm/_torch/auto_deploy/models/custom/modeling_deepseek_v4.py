@@ -26,7 +26,6 @@ compressed-row construction plus attention over those rows and the sink term.
 import json
 import math
 import operator
-import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -779,11 +778,6 @@ def _sparse_attention(
         rope_dim=rope_dim,
         rms_norm_eps=rms_norm_eps,
     )
-
-
-def _mhc_fused_enabled() -> bool:
-    """Gate the fused mHC kernels behind AD_MHC_FUSED (default OFF = eager)."""
-    return os.environ.get("AD_MHC_FUSED", "0") == "1"
 
 
 def _hc_split_sinkhorn(
@@ -1729,18 +1723,6 @@ class DeepseekV4Block(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if _mhc_fused_enabled():
-            post, comb, layer_input = torch.ops.auto_deploy.mhc_hc_pre(
-                x,
-                hc_fn,
-                hc_scale,
-                hc_base,
-                self.hc_mult,
-                self.hc_sinkhorn_iters,
-                self.norm_eps,
-                self.hc_eps,
-            )
-            return layer_input.to(x.dtype), post, comb
         original_shape = x.shape
         flat = x.flatten(2).float()
         rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
@@ -1763,8 +1745,6 @@ class DeepseekV4Block(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ) -> torch.Tensor:
-        if _mhc_fused_enabled():
-            return torch.ops.auto_deploy.mhc_hc_post(residual, x, post, comb).to(x.dtype)
         y = post.unsqueeze(-1) * x.unsqueeze(-2)
         y = y + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
         return y.to(x.dtype)
