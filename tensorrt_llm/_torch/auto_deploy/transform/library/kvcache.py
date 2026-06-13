@@ -664,15 +664,20 @@ class InsertCachedAttention(_InsertCachedOperator):
 
 @TransformRegistry.register("insert_cached_deepseek_v4_sparse_attention")
 class InsertCachedDeepSeekV4SparseAttention(_InsertCachedOperator):
-    """Opt-in transform for the DeepSeek V4 sparse cached reference backend."""
+    """Opt-in transform for DeepSeek V4 sparse cached attention backends."""
+
+    _SUPPORTED_BACKENDS = {
+        "deepseek_v4_sparse",
+        "flashmla_deepseek_v4_sparse",
+    }
 
     def _apply(self, *args, **kwargs):
         if self.config.backend is None:
             self.config.backend = "deepseek_v4_sparse"
-        elif self.config.backend != "deepseek_v4_sparse":
+        elif self.config.backend not in self._SUPPORTED_BACKENDS:
             raise ValueError(
                 "insert_cached_deepseek_v4_sparse_attention only supports "
-                f"backend='deepseek_v4_sparse', got {self.config.backend!r}."
+                f"backends {sorted(self._SUPPORTED_BACKENDS)}, got {self.config.backend!r}."
             )
         return super()._apply(*args, **kwargs)
 
