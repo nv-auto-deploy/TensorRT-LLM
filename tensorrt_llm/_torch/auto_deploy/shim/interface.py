@@ -1162,7 +1162,10 @@ class CachedSequenceInterface:
         # the transform-time _kv_group_windows can become stale.  Downstream callers
         # (ad_executor.get_cache_indices(window_size=...)) need the post-clamp
         # values to hit the correct pool key in C++.
-        if kv_managed and self._kv_group_windows:
+        # NOTE: do NOT gate on `kv_managed`. DSV4-sparse uses PagedResourceHandler (kv_managed
+        # empty) yet a C++ KVCacheManager with clamped pools still exists, so the stale
+        # transform-time windows must still refresh or get_batch_cache_indices misses the pool.
+        if self._kv_group_windows:
             manager_windows = list(dict.fromkeys(self._kv_cache_manager.max_attention_window_vec))
             if manager_windows and manager_windows != self._kv_group_windows:
                 ad_logger.info(

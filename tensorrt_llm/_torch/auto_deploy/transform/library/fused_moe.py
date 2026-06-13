@@ -3163,6 +3163,10 @@ def _apply_routed_nvfp4_from_routing(
         for input_node in input_nodes:
             if input_node.op == "get_attr" and len(input_node.users) == 0:
                 graph.erase_node(input_node)
+        # Drop this layer's raw stacked NVFP4 expert buffers now: all of them live under one
+        # `experts` submodule, so deleting it frees raw before the next layer's prepped is built.
+        # Keeps peak at ~one model copy instead of raw+prepped doubled (else the replicated MoE OOMs).
+        remove_original_experts(gm, [[gate_up_weight]])
         fused_key_counter += 1
 
     eliminate_dead_code(gm)
