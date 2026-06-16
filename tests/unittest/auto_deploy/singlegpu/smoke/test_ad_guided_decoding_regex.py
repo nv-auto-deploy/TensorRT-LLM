@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,6 +37,14 @@ def test_ad_guided_decoding_regex_e2e():
     # NOTE: trtllm attention backend fails on B200 (likely illegal memory access); use flashinfer.
     experiment_config["args"]["attn_backend"] = "flashinfer"
     experiment_config["args"]["guided_decoding_backend"] = guided_decoding_backend
+    experiment_config["args"]["max_batch_size"] = 1
+    experiment_config["args"]["max_input_len"] = 64
+    experiment_config["args"]["max_seq_len"] = 128
+    experiment_config["args"]["max_num_tokens"] = 128
+    experiment_config["args"]["cuda_graph_config"] = {
+        "batch_sizes": [1],
+        "max_batch_size": 1,
+    }
 
     experiment_config["prompt"]["batch_size"] = 1
     experiment_config["prompt"]["queries"] = test_case["prompt"]
@@ -46,7 +54,7 @@ def test_ad_guided_decoding_regex_e2e():
     # Need to introduce the guided decoding params after ExperimentConfig construction
     # because otherwise they get unpacked as a dict.
     cfg.prompt.sp_kwargs = {
-        "max_tokens": 10,
+        "max_tokens": 16,
         "top_k": None,
         "temperature": 0.1,
         "guided_decoding": GuidedDecodingParams(regex=test_case["regex"]),

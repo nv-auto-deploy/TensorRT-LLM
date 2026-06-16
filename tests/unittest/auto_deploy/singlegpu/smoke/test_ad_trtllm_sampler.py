@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,6 +31,14 @@ def test_ad_trtllm_sampler_smoke():
     # NOTE: trtllm attention backend fails on B200 (likely illegal memory access); use flashinfer.
     experiment_config["args"]["attn_backend"] = "flashinfer"
     experiment_config["args"]["sampler_type"] = SamplerType.TRTLLMSampler
+    experiment_config["args"]["max_batch_size"] = 1
+    experiment_config["args"]["max_input_len"] = 64
+    experiment_config["args"]["max_seq_len"] = 128
+    experiment_config["args"]["max_num_tokens"] = 128
+    experiment_config["args"]["cuda_graph_config"] = {
+        "batch_sizes": [1],
+        "max_batch_size": 1,
+    }
 
     # Setup simple prompt
     experiment_config["prompt"]["batch_size"] = 1
