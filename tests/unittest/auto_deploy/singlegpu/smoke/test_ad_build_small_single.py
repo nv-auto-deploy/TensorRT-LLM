@@ -298,22 +298,6 @@ def test_build_ad(model_hub_id: str, llm_extra_args: dict):
     experiment_config = get_small_model_config(model_hub_id, **llm_extra_args)
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
     experiment_config["args"]["world_size"] = 0  # Default world_size set to 0
-    if (
-        model_hub_id == "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
-        and llm_extra_args.get("transforms", {})
-        .get("compile_model", {})
-        .get("backend")
-        == "torch-cudagraph"
-    ):
-        experiment_config["args"]["max_batch_size"] = 1
-        experiment_config["args"]["max_input_len"] = 64
-        experiment_config["args"]["max_seq_len"] = 128
-        experiment_config["args"]["max_num_tokens"] = 128
-        experiment_config["args"]["cuda_graph_config"] = {
-            "batch_sizes": [1],
-            "max_batch_size": 1,
-        }
-        experiment_config["prompt"]["batch_size"] = 1
 
     print(f"Experiment Config: {experiment_config}")
     experiment_config = ExperimentConfig(**experiment_config)

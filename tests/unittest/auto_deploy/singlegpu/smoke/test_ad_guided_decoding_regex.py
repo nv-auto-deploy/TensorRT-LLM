@@ -37,14 +37,6 @@ def test_ad_guided_decoding_regex_e2e():
     # NOTE: trtllm attention backend fails on B200 (likely illegal memory access); use flashinfer.
     experiment_config["args"]["attn_backend"] = "flashinfer"
     experiment_config["args"]["guided_decoding_backend"] = guided_decoding_backend
-    experiment_config["args"]["max_batch_size"] = 1
-    experiment_config["args"]["max_input_len"] = 64
-    experiment_config["args"]["max_seq_len"] = 128
-    experiment_config["args"]["max_num_tokens"] = 128
-    experiment_config["args"]["cuda_graph_config"] = {
-        "batch_sizes": [1],
-        "max_batch_size": 1,
-    }
 
     experiment_config["prompt"]["batch_size"] = 1
     experiment_config["prompt"]["queries"] = test_case["prompt"]

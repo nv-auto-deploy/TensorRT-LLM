@@ -101,9 +101,10 @@ def prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str):
 @pytest.mark.parametrize("model_name", ["TinyLlama/TinyLlama-1.1B-Chat-v1.0"])
 def test_trtllm_bench(llm_root, compile_backend, model_name):  # noqa: F811
     args = get_small_model_config(model_name)["args"]
-    # remove kv_cache_config and max_batch_size to avoid conflicts with trtllm-bench
+    # remove args that conflict with trtllm-bench workload-derived settings
     args.pop("kv_cache_config", None)
     args.pop("max_batch_size", None)
+    args.pop("max_seq_len", None)
     compile_model_config = {
         "stage": "compile",
         "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
