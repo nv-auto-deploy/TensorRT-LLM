@@ -663,6 +663,26 @@ def apply_chat_template(
             return tokenizer.encode(prompt)
         return prompt
 
+    # Handle DeepSeek V4 (AutoDeploy) tokenizer with custom chat template.
+    # Its chat template is custom Python (a marker + apply_chat_template), not a
+    # Jinja template, so the resolve_hf_chat_template path below cannot render it.
+    # Lazy import: the AD modeling module is heavy and importing it at the top of
+    # this core module would risk a circular import.
+    try:
+        from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import \
+            ADDeepseekV4Tokenizer
+    except Exception:
+        ADDeepseekV4Tokenizer = None
+
+    v4_tokenizer = (tokenizer.tokenizer if isinstance(
+        tokenizer, TransformersTokenizer) else tokenizer)
+    if ADDeepseekV4Tokenizer is not None and isinstance(v4_tokenizer,
+                                                        ADDeepseekV4Tokenizer):
+        prompt = v4_tokenizer.apply_chat_template(conversation, tokenize=False)
+        if enable_tokenize:
+            return v4_tokenizer.encode(prompt)
+        return prompt
+
     # Check for PASSTHROUGH early — before we need tokenizer/processor/template.
     # The registry may already know this model skips chat templates entirely.
     registry_format = MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
