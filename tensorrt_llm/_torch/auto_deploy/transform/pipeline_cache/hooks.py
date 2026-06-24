@@ -220,6 +220,70 @@ def _rebuild_shard_fp8_block_scale_hook(spec: dict[str, Any]) -> Callable:
     )
 
 
+def _rebuild_shard_slice_first_dim_hook(spec: dict[str, Any]) -> Callable:
+    from ..library.sharding import _load_hook, _slice_first_dim
+
+    f_split = partial(_slice_first_dim, start=spec["start"], end=spec["end"])
+    return partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=spec["param_key"],
+        param_shape=torch.Size(spec["param_shape"]),
+    )
+
+
+def _rebuild_shard_tp_moe_scale_hook(spec: dict[str, Any]) -> Callable:
+    from ..library.sharding import (
+        FineGrainedFP8WeightShardingInfo,
+        _load_hook,
+        _shard_nvfp4_moe_scale,
+    )
+
+    orig_weight_shape = torch.Size(spec["orig_weight_shape"])
+    dim = spec["dim"]
+    rank = spec["rank"]
+    world_size = spec["world_size"]
+    scale_name = spec["scale_name"]
+    # Re-derive f_split from scale_name, mirroring _tp_shard_moe_scale.
+    if scale_name == "weight_scale":
+        f_split = partial(
+            _shard_nvfp4_moe_scale,
+            orig_weight_shape=orig_weight_shape,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+        )
+    elif scale_name == "weight_scale_inv":
+        f_split = partial(
+            FineGrainedFP8WeightShardingInfo._get_sharded_scale,
+            weight_original_n=orig_weight_shape[dim],
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+        )
+    else:
+        raise ValueError(f"Pipeline cache: unsupported MoE TP scale name {scale_name!r}")
+    return partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=spec["param_key"],
+        param_shape=torch.Size(spec["param_shape"]),
+    )
+
+
+def _rebuild_shard_ep_expert_slice_hook(spec: dict[str, Any]) -> Callable:
+    from ..library.sharding import _load_hook
+    from ..library.sharding_ir import StackedMoEShardableNode
+
+    f_split = partial(StackedMoEShardableNode._slice_experts, lo=spec["lo"], hi=spec["hi"])
+    return partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=spec["param_key"],
+        param_shape=torch.Size(spec["param_shape"]),
+    )
+
+
 def _rebuild_shard_grouped_fp8_scale_hook(spec: dict[str, Any]) -> Callable:
     from ..library.sharding import _load_hook
     from ..library.sharding_ir import _split_grouped_fp8_scale
@@ -352,9 +416,12 @@ _HOOK_REBUILDERS = {
     "finegrained_fp8_load_hook": _rebuild_finegrained_fp8_load_hook,
     "importable_load_hook": _rebuild_importable_hook,
     "mxfp4_expert_layout_load_hook": _rebuild_mxfp4_expert_layout_hook,
+    "shard_ep_expert_slice": _rebuild_shard_ep_expert_slice_hook,
     "shard_fp4_weight_scale": _rebuild_shard_fp4_weight_scale_hook,
     "shard_fp8_block_scale": _rebuild_shard_fp8_block_scale_hook,
     "shard_grouped_fp8_scale": _rebuild_shard_grouped_fp8_scale_hook,
+    "shard_slice_first_dim": _rebuild_shard_slice_first_dim_hook,
+    "shard_tp_moe_scale": _rebuild_shard_tp_moe_scale_hook,
     "shard_tp": _rebuild_shard_tp_hook,
 }
 

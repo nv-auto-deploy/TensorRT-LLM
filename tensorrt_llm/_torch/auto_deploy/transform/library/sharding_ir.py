@@ -1456,14 +1456,26 @@ class StackedMoEShardableNode(ShardableNode):
 
         arg.meta["val"] = local_tensor
         f_split = partial(cls._slice_experts, lo=lo, hi=hi)
-        submod._register_load_state_dict_pre_hook(
-            partial(
-                _load_hook,
-                f_split=f_split,
-                param_key=attr_name,
-                param_shape=local_tensor.shape,
-            )
+        hook = partial(
+            _load_hook,
+            f_split=f_split,
+            param_key=attr_name,
+            param_shape=local_tensor.shape,
         )
+        # The f_split closure (a partial over a bound classmethod) is not
+        # JSON-serializable, so attach an explicit reconstruction spec; otherwise
+        # the pipeline cache treats the hook as unrecognized and skips saving.
+        mark_pipeline_cache_hook(
+            hook,
+            {
+                "type": "shard_ep_expert_slice",
+                "param_key": attr_name,
+                "param_shape": list(local_tensor.shape),
+                "lo": int(lo),
+                "hi": int(hi),
+            },
+        )
+        submod._register_load_state_dict_pre_hook(hook)
         invalidate_weight_node_cache(gm)
         return arg
 

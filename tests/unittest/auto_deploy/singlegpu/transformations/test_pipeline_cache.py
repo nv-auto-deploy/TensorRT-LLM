@@ -1244,6 +1244,147 @@ def test_hook_spec_round_trip_sharding_ir_grouped_fp8_scale():
     assert torch.equal(state_dict["weight_scale_inv"], sharded)
 
 
+def test_hook_spec_round_trip_sharding_ir_ep_expert_slice():
+    """An EP expert-slice load hook round-trips through a spec and re-slices experts on reload."""
+    from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _load_hook
+    from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import (
+        StackedMoEShardableNode,
+    )
+
+    gm = symbolic_trace(_ToyModule())
+    lo, hi = 128, 160
+    full = torch.arange(192 * 4, dtype=torch.float32).reshape(192, 4)
+    sliced = StackedMoEShardableNode._slice_experts(full, lo, hi)
+    f_split = partial(StackedMoEShardableNode._slice_experts, lo=lo, hi=hi)
+    hook = partial(
+        _load_hook,
+        f_split=f_split,
+        param_key="gate_up_proj_blocks",
+        param_shape=sliced.shape,
+    )
+    gm._register_load_state_dict_pre_hook(
+        mark_pipeline_cache_hook(
+            hook,
+            {
+                "type": "shard_ep_expert_slice",
+                "param_key": "gate_up_proj_blocks",
+                "param_shape": list(sliced.shape),
+                "lo": lo,
+                "hi": hi,
+            },
+        )
+    )
+
+    specs, has_unknown = collect_hook_specs(gm)
+
+    assert not has_unknown
+    assert len(specs) == 1
+    assert specs[0]["type"] == "shard_ep_expert_slice"
+    assert json.loads(json.dumps(specs)) == specs
+
+    fresh = symbolic_trace(_ToyModule())
+    reattach_hooks(fresh, specs)
+    assert len(fresh._load_state_dict_pre_hooks) == 1
+
+    rebuilt = next(iter(fresh._load_state_dict_pre_hooks.values()))
+    rebuilt_fn = rebuilt.hook if hasattr(rebuilt, "hook") else rebuilt
+    state_dict = {"gate_up_proj_blocks": full.clone()}
+    rebuilt_fn(state_dict, "", {}, True, [], [], [])
+    assert torch.equal(state_dict["gate_up_proj_blocks"], sliced)
+
+
+def test_hook_spec_round_trip_shard_slice_first_dim():
+    """A BMM dim-0 slice load hook round-trips through a spec and re-slices on reload."""
+    from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
+        _load_hook,
+        _slice_first_dim,
+    )
+
+    gm = symbolic_trace(_ToyModule())
+    start, end = 16, 32
+    full = torch.arange(64 * 3, dtype=torch.float32).reshape(64, 3)
+    f_split = partial(_slice_first_dim, start=start, end=end)
+    sliced = f_split(full)
+    hook = partial(_load_hook, f_split=f_split, param_key="weight", param_shape=sliced.shape)
+    gm._register_load_state_dict_pre_hook(
+        mark_pipeline_cache_hook(
+            hook,
+            {
+                "type": "shard_slice_first_dim",
+                "param_key": "weight",
+                "param_shape": list(sliced.shape),
+                "start": start,
+                "end": end,
+            },
+        )
+    )
+
+    specs, has_unknown = collect_hook_specs(gm)
+    assert not has_unknown
+    assert specs[0]["type"] == "shard_slice_first_dim"
+    assert json.loads(json.dumps(specs)) == specs
+
+    fresh = symbolic_trace(_ToyModule())
+    reattach_hooks(fresh, specs)
+    hook_obj = next(iter(fresh._load_state_dict_pre_hooks.values()))
+    hook_fn = hook_obj.hook if hasattr(hook_obj, "hook") else hook_obj
+    state_dict = {"weight": full.clone()}
+    hook_fn(state_dict, "", {}, True, [], [], [])
+    assert torch.equal(state_dict["weight"], sliced)
+
+
+def test_hook_spec_round_trip_shard_tp_moe_scale():
+    """A MoE TP scale load hook round-trips and re-shards the FineGrained FP8 scale on reload."""
+    from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
+        FineGrainedFP8WeightShardingInfo,
+        _load_hook,
+    )
+
+    gm = symbolic_trace(_ToyModule())
+    dim, rank, world_size = 0, 1, 4
+    orig_weight_shape = torch.Size([512, 256])
+    scale = torch.arange(4 * 2, dtype=torch.float32).reshape(4, 2)
+    f_split = partial(
+        FineGrainedFP8WeightShardingInfo._get_sharded_scale,
+        weight_original_n=orig_weight_shape[dim],
+        dim=dim,
+        rank=rank,
+        world_size=world_size,
+    )
+    sharded = f_split(scale)
+    hook = partial(
+        _load_hook, f_split=f_split, param_key="weight_scale_inv", param_shape=sharded.shape
+    )
+    gm._register_load_state_dict_pre_hook(
+        mark_pipeline_cache_hook(
+            hook,
+            {
+                "type": "shard_tp_moe_scale",
+                "scale_name": "weight_scale_inv",
+                "param_key": "weight_scale_inv",
+                "param_shape": list(sharded.shape),
+                "orig_weight_shape": list(orig_weight_shape),
+                "dim": dim,
+                "rank": rank,
+                "world_size": world_size,
+            },
+        )
+    )
+
+    specs, has_unknown = collect_hook_specs(gm)
+    assert not has_unknown
+    assert specs[0]["type"] == "shard_tp_moe_scale"
+    assert json.loads(json.dumps(specs)) == specs
+
+    fresh = symbolic_trace(_ToyModule())
+    reattach_hooks(fresh, specs)
+    hook_obj = next(iter(fresh._load_state_dict_pre_hooks.values()))
+    hook_fn = hook_obj.hook if hasattr(hook_obj, "hook") else hook_obj
+    state_dict = {"weight_scale_inv": scale.clone()}
+    hook_fn(state_dict, "", {}, True, [], [], [])
+    assert torch.equal(state_dict["weight_scale_inv"], sharded)
+
+
 def test_hook_spec_round_trip_post_load_hooks():
     """An importable post-load hook round-trips as a 'post' phase spec and runs on reload."""
     gm = symbolic_trace(_ToyModule())

@@ -905,9 +905,10 @@ class BMMShardingInfo(ShardingTransformInfo):
                 end_idx: End index for sharding
             """
 
-            # Define slice function for the sharding
-            def slice_tensor(t: torch.Tensor) -> torch.Tensor:
-                return t[start_idx:end_idx]
+            # Define slice function for the sharding. Use an importable partial
+            # (not a local closure) so the load hook can be serialized by the
+            # pipeline cache below.
+            slice_tensor = partial(_slice_first_dim, start=start_idx, end=end_idx)
 
             if tensor_node.op == "get_attr":
                 # Handle parameter tensor
@@ -925,6 +926,19 @@ class BMMShardingInfo(ShardingTransformInfo):
                     f_split=slice_tensor,
                     param_key=weight_key,
                     param_shape=param_new.shape,
+                )
+                # slice_tensor is a partial (not JSON-serializable), so attach an
+                # explicit reconstruction spec; otherwise the pipeline cache treats
+                # the hook as unrecognized and skips saving.
+                mark_pipeline_cache_hook(
+                    hook,
+                    {
+                        "type": "shard_slice_first_dim",
+                        "param_key": weight_key,
+                        "param_shape": list(param_new.shape),
+                        "start": int(start_idx),
+                        "end": int(end_idx),
+                    },
                 )
                 gm._register_load_state_dict_pre_hook(hook)
             else:
@@ -1458,6 +1472,11 @@ def _load_hook_remove(
     key = prefix + param_key
     ad_logger.debug(f"Sharder LOAD hook is called for '{key}'")
     state_dict.pop(key, None)
+
+
+def _slice_first_dim(t: torch.Tensor, *, start: int, end: int) -> torch.Tensor:
+    """Importable dim-0 slice used as a pipeline-cache-serializable ``f_split``."""
+    return t[start:end]
 
 
 def validate_allreduce_strategy(v):
@@ -1995,6 +2014,23 @@ def _tp_shard_moe_scale(
         f_split=f_split,
         param_key=attr_name,
         param_shape=sharded_scale.shape,
+    )
+    # f_split is a partial (not JSON-serializable), so attach an explicit
+    # reconstruction spec; otherwise the pipeline cache treats the hook as
+    # unrecognized and skips saving. The rebuilder re-derives f_split from
+    # scale_name, mirroring the branching above.
+    mark_pipeline_cache_hook(
+        hook,
+        {
+            "type": "shard_tp_moe_scale",
+            "scale_name": scale_name,
+            "param_key": attr_name,
+            "param_shape": list(sharded_scale.shape),
+            "orig_weight_shape": list(orig_weight_shape),
+            "dim": int(dim),
+            "rank": rank,
+            "world_size": world_size,
+        },
     )
     submod._register_load_state_dict_pre_hook(hook)
 
