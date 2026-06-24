@@ -2591,3 +2591,127 @@ def test_dense_torch_attention_cache_insertion_remains_separate() -> None:
     assert (
         torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache.default not in targets
     )
+
+
+def _build_paged_caches(
+    num_seq: int,
+    pages_per_seq: int,
+    tokens_per_block: int,
+    state_dim: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device=device).manual_seed(seed)
+    num_pages = num_seq * pages_per_seq
+    kv_cache = torch.randn(
+        num_pages, tokens_per_block, state_dim, dtype=dtype, device=device, generator=generator
+    )
+    gate_cache = torch.randn(
+        num_pages, tokens_per_block, state_dim, dtype=dtype, device=device, generator=generator
+    )
+    cu_num_pages = torch.arange(
+        0, (num_seq + 1) * pages_per_seq, pages_per_seq, dtype=torch.int32, device=device
+    )
+    cache_loc = torch.arange(num_pages, dtype=torch.int32, device=device)
+    seq_idx = torch.arange(num_seq, dtype=torch.int64, device=device)
+    return kv_cache, gate_cache, cu_num_pages, cache_loc, seq_idx
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fp4 quant / hadamard rotate need CUDA")
+@pytest.mark.parametrize("max_compressed_len", [1, 5, 7])
+@pytest.mark.parametrize("num_decode_rows", [1, 3])
+def test_overlap_fullrange_matches_generic_paged_gather(
+    num_decode_rows: int, max_compressed_len: int
+) -> None:
+    """The full-range overlap helper must be bit-exact vs the per-row scattered gather.
+
+    ``_select_decode_ratio4_indexer_rows`` formerly called
+    ``_batched_compressed_rows_from_paged_state`` flattened over every candidate row. The
+    new ``_batched_overlap_compressed_rows_fullrange`` collapses the four scattered gathers
+    to two contiguous ones and derives ``previous`` blocks by a row shift. The two must
+    produce identical compressed index rows.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    compress_ratio = 4
+    head_dim = 8
+    state_dim = 2 * head_dim  # overlap mode -> channels == 2
+    rope_dim = 4
+    rms_norm_eps = 1e-6
+
+    tokens_per_block = compress_ratio
+    needed_tokens = max_compressed_len * compress_ratio
+    pages_per_seq = max((needed_tokens + tokens_per_block - 1) // tokens_per_block, 1)
+
+    # Caches are stored in fp32 in production and read at the query dtype.
+    kv_cache, gate_cache, cu_num_pages, cache_loc, seq_idx = _build_paged_caches(
+        num_decode_rows,
+        pages_per_seq,
+        tokens_per_block,
+        state_dim,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    table_len = max(needed_tokens + 8, 8)
+    cos_table, sin_table = (t.to(device) for t in _rope_tables(table_len, rope_dim))
+    ape = torch.randn(1, state_dim, dtype=torch.float32, device=device)
+    norm_weight = torch.randn(head_dim, dtype=torch.float32, device=device)
+
+    candidate_rows = torch.arange(max_compressed_len, dtype=torch.long, device=device)
+    candidate_rows = candidate_rows.view(1, -1).expand(num_decode_rows, -1)
+    # Mimic the indexer's query-relative rope position for a plausible decode step.
+    input_pos = torch.full((num_decode_rows,), needed_tokens - 1, dtype=torch.long, device=device)
+    position_ids_decode = input_pos
+    row_position_id = position_ids_decode.unsqueeze(1) - (
+        input_pos.unsqueeze(1) - candidate_rows * compress_ratio
+    )
+
+    flat_seq_idx = seq_idx.unsqueeze(1).expand_as(candidate_rows).reshape(-1)
+    flat_rows = candidate_rows.reshape(-1)
+    flat_row_position_id = row_position_id.reshape(-1)
+
+    expected = dsv4_sparse._batched_compressed_rows_from_paged_state(
+        kv_cache,
+        gate_cache,
+        flat_seq_idx,
+        flat_rows,
+        flat_row_position_id,
+        cu_num_pages,
+        cache_loc,
+        ape,
+        norm_weight,
+        cos_table,
+        sin_table,
+        rms_norm_eps,
+        rope_dim,
+        compress_ratio,
+        head_dim,
+        dtype,
+        rotate=True,
+    ).view(num_decode_rows, max_compressed_len, head_dim)
+
+    actual = dsv4_sparse._batched_overlap_compressed_rows_fullrange(
+        kv_cache,
+        gate_cache,
+        seq_idx,
+        row_position_id,
+        cu_num_pages,
+        cache_loc,
+        ape,
+        norm_weight,
+        cos_table,
+        sin_table,
+        rms_norm_eps,
+        rope_dim,
+        compress_ratio,
+        head_dim,
+        max_compressed_len,
+        dtype,
+        rotate=True,
+    )
+
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected), (actual - expected).abs().max().item()

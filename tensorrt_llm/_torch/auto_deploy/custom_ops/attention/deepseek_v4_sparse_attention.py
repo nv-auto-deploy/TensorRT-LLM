@@ -1366,6 +1366,99 @@ def _batched_compressed_rows_from_paged_state(
     )
 
 
+def _batched_overlap_compressed_rows_fullrange(
+    compressor_kv_cache: torch.Tensor,
+    compressor_gate_cache: torch.Tensor,
+    seq_idx: torch.Tensor,
+    row_position_id: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    compressor_ape: torch.Tensor,
+    compressor_norm_weight: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    rms_norm_eps: float,
+    rope_dim: int,
+    compress_ratio: int,
+    head_dim: int,
+    max_compressed_len: int,
+    dtype: torch.dtype,
+    rotate: bool = False,
+) -> torch.Tensor:
+    """Decode-time overlap compressed rows for the *full* candidate set [0, max_compressed_len).
+
+    This is a launch/bandwidth-reduced specialization of
+    ``_batched_compressed_rows_from_paged_state`` (overlap branch) for the case where every
+    candidate row 0..max_compressed_len-1 is requested for every sequence (the lightning
+    indexer decode path). In that case the per-row ``previous`` block is exactly the
+    ``current`` block of the preceding row, so instead of four scattered ``index_select``
+    gathers over ``[B, M, ratio]`` grids (previous/current x kv/gate, each token fetched
+    twice) we issue a single contiguous gather per cache over ``[B, M*ratio]`` and derive
+    the ``previous`` states by a one-row shift. The pool/rmsnorm/rope math is identical to
+    the generic helper, so outputs match bit-for-bit (validated in the op unit tests).
+
+    Args:
+        seq_idx: ``[B]`` sequence/slot index per decode row.
+        row_position_id: ``[B, max_compressed_len]`` query-relative rope position per row.
+    Returns:
+        ``[B, max_compressed_len, head_dim]`` compressed (post-rope/quant) index rows.
+    """
+    num_rows = int(seq_idx.shape[0])
+    m = int(max_compressed_len)
+    device = seq_idx.device
+
+    full_positions = torch.arange(m * compress_ratio, dtype=torch.long, device=device)
+    full_positions = full_positions.view(1, -1).expand(num_rows, -1)
+    current_kv_state, current_page_valid = _decode_cache_rows_from_positions(
+        compressor_kv_cache, seq_idx, full_positions, cu_num_pages, cache_loc, dtype
+    )
+    current_gate_state, _ = _decode_cache_rows_from_positions(
+        compressor_gate_cache, seq_idx, full_positions, cu_num_pages, cache_loc, dtype
+    )
+    state_dim = int(current_kv_state.shape[-1])
+    current_kv_state = current_kv_state.view(num_rows, m, compress_ratio, state_dim)
+    current_gate_state = current_gate_state.view(num_rows, m, compress_ratio, state_dim)
+    current_page_valid = current_page_valid.view(num_rows, m, compress_ratio)
+
+    # previous block of row r == current block of row r-1; row 0 has no previous block.
+    zero_state = current_kv_state.new_zeros(num_rows, 1, compress_ratio, state_dim)
+    previous_kv_state = torch.cat((zero_state, current_kv_state[:, :-1]), dim=1)
+    previous_gate_state = torch.cat((zero_state, current_gate_state[:, :-1]), dim=1)
+    false_valid = current_page_valid.new_zeros(num_rows, 1, compress_ratio)
+    previous_page_valid = torch.cat((false_valid, current_page_valid[:, :-1]), dim=1)
+    row_has_previous = (
+        torch.arange(m, device=device).view(1, m, 1) >= 1
+    )  # previous_positions >= 0 iff row >= 1
+    previous_valid = row_has_previous & previous_page_valid
+
+    previous_kv = previous_kv_state[..., :head_dim]
+    previous_gate = previous_gate_state[..., :head_dim]
+    previous_gate = previous_gate + compressor_ape[:, :head_dim].to(
+        device=previous_gate.device, dtype=dtype
+    )
+    previous_kv = torch.where(previous_valid.unsqueeze(-1), previous_kv, previous_kv.new_zeros(()))
+    previous_gate = torch.where(
+        previous_valid.unsqueeze(-1),
+        previous_gate,
+        previous_gate.new_full((), -1.0e20),
+    )
+
+    current_kv = current_kv_state[..., head_dim : 2 * head_dim]
+    current_gate = current_gate_state[..., head_dim : 2 * head_dim]
+    current_gate = current_gate + compressor_ape[:, head_dim : 2 * head_dim].to(
+        device=current_gate.device, dtype=dtype
+    )
+    kv = torch.cat((previous_kv, current_kv), dim=2)
+    gate = torch.cat((previous_gate, current_gate), dim=2)
+
+    pooled = (kv * gate.softmax(dim=2)).sum(dim=2)
+    pooled = _rms_norm_ref(pooled, compressor_norm_weight, rms_norm_eps)
+    row_position_id = row_position_id.to(torch.long).clamp(min=0, max=cos_table.shape[0] - 1)
+    cos = cos_table[row_position_id]
+    sin = sin_table[row_position_id]
+    return _apply_compressed_rope_and_quantize(pooled, cos, sin, rope_dim, rotate=rotate)
+
+
 def _update_decode_compressed_caches(
     compressor_kv_decode: torch.Tensor,
     compressor_gate_decode: torch.Tensor,
@@ -1462,19 +1555,19 @@ def _select_decode_ratio4_indexer_rows(
 
     candidate_rows = torch.arange(max_compressed_len, dtype=torch.long, device=q_index.device)
     candidate_rows = candidate_rows.view(1, -1).expand(q_index.shape[0], -1)
-    flat_seq_idx = seq_idx.unsqueeze(1).expand_as(candidate_rows).reshape(-1)
-    flat_rows = candidate_rows.reshape(-1)
     row_position_id = position_ids_decode.unsqueeze(1) - (
         input_pos.unsqueeze(1) - candidate_rows * 4
     )
-    flat_row_position_id = row_position_id.reshape(-1)
     index_head_dim = int(q_index.shape[-1])
-    index_k = _batched_compressed_rows_from_paged_state(
+    # Every candidate row 0..max_compressed_len-1 is requested for each decode row, so the
+    # overlap "previous" block of a row is the "current" block of the preceding row. Gather
+    # the full contiguous token range once per cache and derive previous via a row shift,
+    # instead of four scattered index_select gathers (the decode-dominant kernel).
+    index_k = _batched_overlap_compressed_rows_fullrange(
         indexer_compressor_kv_cache,
         indexer_compressor_gate_cache,
-        flat_seq_idx,
-        flat_rows,
-        flat_row_position_id,
+        seq_idx,
+        row_position_id,
         cu_num_pages,
         cache_loc,
         indexer_compressor_ape,
@@ -1485,10 +1578,10 @@ def _select_decode_ratio4_indexer_rows(
         rope_dim,
         4,
         index_head_dim,
+        max_compressed_len,
         q_index.dtype,
         rotate=True,
     )
-    index_k = index_k.view(q_index.shape[0], max_compressed_len, index_head_dim)
     index_score = torch.matmul(q_index, index_k.transpose(-1, -2)).float()
     index_score = (index_score.relu() * indexer_weights.float().unsqueeze(-1)).sum(dim=1)
     if dist_common.is_initialized() and dist_common.get_world_size() > 1:
