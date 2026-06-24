@@ -22,7 +22,7 @@ import math
 import operator
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Protocol, TypeAlias, runtime_checkable
 
 import torch
@@ -53,6 +53,10 @@ class PackedMXFP4ExpertCheckpointLayout(Protocol):
     """Consumer contract for packed MXFP4 expert tensors in checkpoint layouts."""
 
     quant_method: str
+
+    def to_serializable_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable view used by the AutoDeploy pipeline cache."""
+        ...
 
     def layer_from_runtime_name(self, name: str) -> int | None:
         """Return the checkpoint layer index encoded in a runtime buffer name, if present."""
@@ -120,6 +124,40 @@ class PackedMXFP4ExpertLayout:
     weight_dtypes: tuple[str, ...] = ("I8",)
     scale_dtype: str = "F8_E8M0"
     quant_method: str = "mxfp4"
+
+    def to_serializable_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable view used by the AutoDeploy pipeline cache.
+
+        Compiled regex fields are emitted as ``{"__regex__": ..., "flags": ...}``
+        and tuple fields as lists so the payload round-trips through JSON;
+        ``from_serializable_dict`` restores both on rebuild.
+        """
+        payload: dict[str, object] = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if isinstance(value, re.Pattern):
+                payload[f.name] = {"__regex__": value.pattern, "flags": value.flags}
+            elif isinstance(value, tuple):
+                payload[f.name] = list(value)
+            else:
+                payload[f.name] = value
+        return payload
+
+    @classmethod
+    def from_serializable_dict(cls, data: Mapping[str, object]) -> "PackedMXFP4ExpertLayout":
+        """Rebuild a layout from :meth:`to_serializable_dict` output."""
+        field_names = {f.name for f in fields(cls)}
+        kwargs: dict[str, object] = {}
+        for key, value in data.items():
+            if key not in field_names:
+                continue
+            if isinstance(value, Mapping) and "__regex__" in value:
+                kwargs[key] = re.compile(value["__regex__"], value.get("flags", 0))
+            elif isinstance(value, list):
+                kwargs[key] = tuple(value)
+            else:
+                kwargs[key] = value
+        return cls(**kwargs)
 
     def parse_key(self, name: str) -> PackedMXFP4ExpertTensorKey | None:
         match = self.key_pattern.fullmatch(name)
@@ -584,6 +622,29 @@ class FineGrainedFP8CheckpointLayout:
     scale_dtype: str = "F8_E8M0"
     exclude_patterns: tuple[str, ...] = ()
     quant_method: str = "finegrained_fp8"
+
+    def to_serializable_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable view used by the AutoDeploy pipeline cache.
+
+        Tuple fields are emitted as lists so the payload round-trips through JSON;
+        ``from_serializable_dict`` restores the tuple fields on rebuild.
+        """
+        payload: dict[str, object] = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            payload[f.name] = list(value) if isinstance(value, tuple) else value
+        return payload
+
+    @classmethod
+    def from_serializable_dict(cls, data: Mapping[str, object]) -> "FineGrainedFP8CheckpointLayout":
+        """Rebuild a layout from :meth:`to_serializable_dict` output."""
+        field_names = {f.name for f in fields(cls)}
+        kwargs = {
+            key: (tuple(value) if isinstance(value, list) else value)
+            for key, value in data.items()
+            if key in field_names
+        }
+        return cls(**kwargs)
 
     def is_weight_targeted(
         self,

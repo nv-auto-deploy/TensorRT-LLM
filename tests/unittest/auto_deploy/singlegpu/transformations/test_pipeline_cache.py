@@ -1069,6 +1069,181 @@ def test_hook_spec_round_trip_sharding_ir_fp8_block_scale():
     assert torch.equal(state_dict["weight_scale_inv"], sharded)
 
 
+def test_hook_spec_round_trip_finegrained_fp8_load_hook():
+    """A FineGrained FP8 load hook carrying a checkpoint-layout dataclass round-trips.
+
+    The ``checkpoint_layout`` kwarg is a dataclass the generic serializer cannot
+    encode, so the hook is marked with an explicit spec; otherwise the cache would
+    report it as unrecognized (has_unknown) and skip saving.
+    """
+    from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import (
+        FineGrainedFP8CheckpointLayout,
+    )
+    from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
+        FineGrainedFP8LinearQuantization,
+    )
+
+    layout = FineGrainedFP8CheckpointLayout(
+        weight_name_patterns=(r"layers\.\d+\.attn\.wq_a\.weight$",),
+        weight_block_size=(128, 128),
+        scale_fmt="ue8m0",
+    )
+    weight_name = "layers.0.attn.wq_a.weight"
+    gm = symbolic_trace(_ToyModule())
+    quant = FineGrainedFP8LinearQuantization.__new__(FineGrainedFP8LinearQuantization)
+    quant._register_load_hook(gm, weight_name, {"checkpoint_layout": layout})
+
+    specs, has_unknown = collect_hook_specs(gm)
+
+    assert not has_unknown
+    assert len(specs) == 1
+    assert specs[0]["type"] == "finegrained_fp8_load_hook"
+    assert specs[0]["weight_name"] == weight_name
+    assert json.loads(json.dumps(specs)) == specs
+
+    fresh = symbolic_trace(_ToyModule())
+    reattach_hooks(fresh, json.loads(json.dumps(specs)))
+    assert len(fresh._load_state_dict_pre_hooks) == 1
+
+    # The rebuilt hook renames the block scale to the runtime scale name, matching
+    # the original hook's behavior.
+    hook = next(iter(fresh._load_state_dict_pre_hooks.values()))
+    hook_fn = hook.hook if hasattr(hook, "hook") else hook
+    state_dict = {
+        weight_name: torch.zeros(256, 256, dtype=torch.float8_e4m3fn),
+        "layers.0.attn.wq_a.scale": torch.ones(2, 2, dtype=torch.float32),
+    }
+    hook_fn(state_dict, "")
+    assert "layers.0.attn.wq_a.weight_scale_inv" in state_dict
+    assert "layers.0.attn.wq_a.scale" not in state_dict
+
+
+def test_hook_spec_round_trip_mxfp4_expert_layout_load_hook():
+    """An MXFP4 expert-layout load hook carrying a regex-driven layout dataclass round-trips.
+
+    ``checkpoint_layout`` is a dataclass with compiled regex fields the generic
+    serializer cannot encode, so the hook is marked with an explicit spec; otherwise
+    the cache would report it as unrecognized (has_unknown) and skip saving.
+    """
+    import re
+
+    from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import (
+        PackedMXFP4ExpertLayout,
+    )
+    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4 import (
+        _load_mxfp4_expert_layout_hook,
+    )
+
+    layout = PackedMXFP4ExpertLayout(
+        key_pattern=re.compile(
+            r"layers\.(?P<layer>\d+)\.ffn\.experts\.(?P<expert>\d+)"
+            r"\.(?P<projection>w[123])\.(?P<kind>weight|scale)"
+        ),
+        key_template="layers.{layer}.ffn.experts.{expert}.{projection}.{kind}",
+        layer_name_pattern=re.compile(r"(?:^|[._])layers[._](?P<layer>\d+)[._]ffn[._]"),
+        projections=("w1", "w2", "w3"),
+        gate_up_order=("w3", "w1"),
+        down_projection="w2",
+    )
+    target_names = {
+        "gate_up_blocks": "layers.0.ffn.experts.gate_up_proj_blocks",
+        "gate_up_scales": "layers.0.ffn.experts.gate_up_proj_scales",
+        "down_blocks": "layers.0.ffn.experts.down_proj_blocks",
+        "down_scales": "layers.0.ffn.experts.down_proj_scales",
+    }
+    gm = symbolic_trace(_ToyModule())
+    hook = partial(
+        _load_mxfp4_expert_layout_hook,
+        checkpoint_layout=layout,
+        target_names=target_names,
+        layer=0,
+        num_experts=256,
+        hidden_size=4096,
+        intermediate_size=2048,
+    )
+    gm._register_load_state_dict_pre_hook(
+        mark_pipeline_cache_hook(
+            hook,
+            {
+                "type": "mxfp4_expert_layout_load_hook",
+                "checkpoint_layout": layout.to_serializable_dict(),
+                "target_names": dict(target_names),
+                "layer": 0,
+                "num_experts": 256,
+                "hidden_size": 4096,
+                "intermediate_size": 2048,
+            },
+        )
+    )
+
+    specs, has_unknown = collect_hook_specs(gm)
+
+    assert not has_unknown
+    assert len(specs) == 1
+    assert specs[0]["type"] == "mxfp4_expert_layout_load_hook"
+    assert json.loads(json.dumps(specs)) == specs
+
+    fresh = symbolic_trace(_ToyModule())
+    reattach_hooks(fresh, json.loads(json.dumps(specs)))
+    assert len(fresh._load_state_dict_pre_hooks) == 1
+
+    # The rebuilt hook carries a recompiled, functional layout.
+    rebuilt = next(iter(fresh._load_state_dict_pre_hooks.values()))
+    rebuilt_fn = rebuilt.hook if hasattr(rebuilt, "hook") else rebuilt
+    rebuilt_layout = rebuilt_fn.keywords["checkpoint_layout"]
+    assert rebuilt_layout.parse_key("layers.0.ffn.experts.5.w1.weight") is not None
+    assert rebuilt_layout.layer_from_runtime_name("model.layers.3.ffn.experts.x") == 3
+    assert rebuilt_fn.keywords["target_names"] == target_names
+
+
+def test_hook_spec_round_trip_sharding_ir_grouped_fp8_scale():
+    """A grouped-FP8 scale shard hook round-trips through a spec and re-shards on reload."""
+    from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import (
+        _grouped_fp8_scale_pipeline_cache_spec,
+        _split_grouped_fp8_scale,
+    )
+
+    gm = symbolic_trace(_ToyModule())
+    num_groups = 8
+    rank = 1
+    world_size = 8
+    scale = torch.arange(num_groups * 4 * 3, dtype=torch.float32).reshape(num_groups * 4, 3)
+    f_split = partial(
+        _split_grouped_fp8_scale, num_groups=num_groups, rank=rank, world_size=world_size
+    )
+    sharded = f_split(scale)
+    sn = WeightNode(
+        node=next(iter(gm.graph.nodes)),
+        tensor=scale,
+        node_key="weight_scale_inv",
+        submod=gm,
+    )
+    _shard_scale_and_hook(
+        gm,
+        sn,
+        sharded,
+        f_split,
+        _grouped_fp8_scale_pipeline_cache_spec(sn, sharded, num_groups, rank, world_size),
+    )
+
+    specs, has_unknown = collect_hook_specs(gm)
+
+    assert not has_unknown
+    assert len(specs) == 1
+    assert specs[0]["type"] == "shard_grouped_fp8_scale"
+    assert json.loads(json.dumps(specs)) == specs
+
+    fresh = symbolic_trace(_ToyModule())
+    reattach_hooks(fresh, specs)
+    assert len(fresh._load_state_dict_pre_hooks) == 1
+
+    hook = next(iter(fresh._load_state_dict_pre_hooks.values()))
+    hook_fn = hook.hook if hasattr(hook, "hook") else hook
+    state_dict = {"weight_scale_inv": scale.clone()}
+    hook_fn(state_dict, "", {}, True, [], [], [])
+    assert torch.equal(state_dict["weight_scale_inv"], sharded)
+
+
 def test_hook_spec_round_trip_post_load_hooks():
     """An importable post-load hook round-trips as a 'post' phase spec and runs on reload."""
     gm = symbolic_trace(_ToyModule())

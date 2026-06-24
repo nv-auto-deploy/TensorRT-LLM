@@ -30,6 +30,7 @@ from ...utils.logger import ad_logger
 from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import extract_op_args, is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
+from ...utils.pipeline_cache_hooks import mark_pipeline_cache_hook
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
 
 # MXFP4 layout constants (mirror the on-disk HF format the trtllm-gen kernel
@@ -341,17 +342,35 @@ def _register_mxfp4_expert_layout_hook(
             "MXFP4 expert runtime buffers should be at least rank 4, got "
             f"{gate_up_blocks.shape} and {down_blocks.shape}."
         )
-    gm._register_load_state_dict_pre_hook(
-        partial(
-            _load_mxfp4_expert_layout_hook,
-            checkpoint_layout=checkpoint_layout,
-            target_names=target_names,
-            layer=layer,
-            num_experts=int(gate_up_blocks.shape[0]),
-            hidden_size=int(down_blocks.shape[1]),
-            intermediate_size=int(gate_up_blocks.shape[1] // 2),
-        )
+    num_experts = int(gate_up_blocks.shape[0])
+    hidden_size = int(down_blocks.shape[1])
+    intermediate_size = int(gate_up_blocks.shape[1] // 2)
+    hook = partial(
+        _load_mxfp4_expert_layout_hook,
+        checkpoint_layout=checkpoint_layout,
+        target_names=target_names,
+        layer=layer,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
     )
+    # The checkpoint_layout kwarg is a dataclass (with compiled regex fields) that
+    # the pipeline cache's generic serializer cannot encode, so attach an explicit
+    # reconstruction spec; otherwise the cache treats the hook as unrecognized and
+    # silently skips saving.
+    mark_pipeline_cache_hook(
+        hook,
+        {
+            "type": "mxfp4_expert_layout_load_hook",
+            "checkpoint_layout": checkpoint_layout.to_serializable_dict(),
+            "target_names": dict(target_names),
+            "layer": layer,
+            "num_experts": num_experts,
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+        },
+    )
+    gm._register_load_state_dict_pre_hook(hook)
     return True
 
 

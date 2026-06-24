@@ -149,6 +149,23 @@ def _fp4_weight_scale_pipeline_cache_spec(
     }
 
 
+def _grouped_fp8_scale_pipeline_cache_spec(
+    sn: WeightNode,
+    sharded_scale: torch.Tensor,
+    num_groups: int,
+    rank: int,
+    world_size: int,
+) -> Dict[str, Any]:
+    return {
+        "type": "shard_grouped_fp8_scale",
+        "param_key": sn.node_key,
+        "param_shape": list(sharded_scale.shape),
+        "num_groups": int(num_groups),
+        "rank": rank,
+        "world_size": world_size,
+    }
+
+
 def _rowwise_bias_load_hook(state_dict, prefix, *args, rank, param_key):
     """Always-apply load hook for the rank0-only row-parallel bias: zero on rank != 0.
 
@@ -592,7 +609,16 @@ class GroupedFineGrainedFP8LinearShardableNode(ShardableNode):
             world_size=dc.tp_size,
         )
         scale_weight_node = _weight_node_from_attr(gm, scale_node, scale_tensor)
-        _shard_scale_and_hook(gm, scale_weight_node, scale_split(scale_tensor), scale_split)
+        sharded_scale = scale_split(scale_tensor)
+        _shard_scale_and_hook(
+            gm,
+            scale_weight_node,
+            sharded_scale,
+            scale_split,
+            _grouped_fp8_scale_pipeline_cache_spec(
+                scale_weight_node, sharded_scale, num_groups, dc.tp_rank, dc.tp_size
+            ),
+        )
 
         view_localizes_groups = self._input_is_tp_scaled_group_view(input_node, group_dim)
         if view_localizes_groups:

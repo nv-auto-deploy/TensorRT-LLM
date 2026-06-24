@@ -220,6 +220,24 @@ def _rebuild_shard_fp8_block_scale_hook(spec: dict[str, Any]) -> Callable:
     )
 
 
+def _rebuild_shard_grouped_fp8_scale_hook(spec: dict[str, Any]) -> Callable:
+    from ..library.sharding import _load_hook
+    from ..library.sharding_ir import _split_grouped_fp8_scale
+
+    f_split = partial(
+        _split_grouped_fp8_scale,
+        num_groups=spec["num_groups"],
+        rank=spec["rank"],
+        world_size=spec["world_size"],
+    )
+    return partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=spec["param_key"],
+        param_shape=torch.Size(spec["param_shape"]),
+    )
+
+
 def _rebuild_shard_fp4_weight_scale_hook(spec: dict[str, Any]) -> Callable:
     from ..library.sharding import _load_hook, _shard_fp4_weight_scale
 
@@ -237,6 +255,34 @@ def _rebuild_shard_fp4_weight_scale_hook(spec: dict[str, Any]) -> Callable:
         f_split=f_split,
         param_key=spec["param_key"],
         param_shape=torch.Size(spec["param_shape"]),
+    )
+
+
+def _rebuild_finegrained_fp8_load_hook(spec: dict[str, Any]) -> Callable:
+    from ...models.quant_checkpoint_layout import FineGrainedFP8CheckpointLayout
+    from ..library.quantization import FineGrainedFP8LinearQuantization
+
+    layout = FineGrainedFP8CheckpointLayout.from_serializable_dict(spec["checkpoint_layout"])
+    # The hook only touches ``self`` through static helpers, so a constructor-free
+    # instance is enough to re-bind the method without re-running the transform.
+    owner = FineGrainedFP8LinearQuantization.__new__(FineGrainedFP8LinearQuantization)
+    hook_fn = types.MethodType(FineGrainedFP8LinearQuantization.load_hook, owner)
+    return partial(hook_fn, weight_name=spec["weight_name"], checkpoint_layout=layout)
+
+
+def _rebuild_mxfp4_expert_layout_hook(spec: dict[str, Any]) -> Callable:
+    from ...models.quant_checkpoint_layout import PackedMXFP4ExpertLayout
+    from ..library.fused_moe_mxfp4 import _load_mxfp4_expert_layout_hook
+
+    layout = PackedMXFP4ExpertLayout.from_serializable_dict(spec["checkpoint_layout"])
+    return partial(
+        _load_mxfp4_expert_layout_hook,
+        checkpoint_layout=layout,
+        target_names=dict(spec["target_names"]),
+        layer=spec["layer"],
+        num_experts=spec["num_experts"],
+        hidden_size=spec["hidden_size"],
+        intermediate_size=spec["intermediate_size"],
     )
 
 
@@ -303,9 +349,12 @@ def _rebuild_importable_hook(
 _HOOK_REBUILDERS = {
     "alias": _rebuild_alias_hook,
     "dedup": _rebuild_dedup_hook,
+    "finegrained_fp8_load_hook": _rebuild_finegrained_fp8_load_hook,
     "importable_load_hook": _rebuild_importable_hook,
+    "mxfp4_expert_layout_load_hook": _rebuild_mxfp4_expert_layout_hook,
     "shard_fp4_weight_scale": _rebuild_shard_fp4_weight_scale_hook,
     "shard_fp8_block_scale": _rebuild_shard_fp8_block_scale_hook,
+    "shard_grouped_fp8_scale": _rebuild_shard_grouped_fp8_scale_hook,
     "shard_tp": _rebuild_shard_tp_hook,
 }
 
