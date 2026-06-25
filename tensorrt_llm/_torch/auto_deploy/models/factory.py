@@ -30,7 +30,16 @@ from torch._prims_common import DeviceLikeType
 from torch.export import Dim
 from torch.fx import GraphModule
 
+from ..utils.logger import ad_logger
+
 DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
+
+# Env var to make random weight initialization reproducible across processes. When set to an
+# integer, ``_to_maybe_random`` seeds the RNG before sampling weights so that two independent
+# runs that build the same architecture produce identical random weights. This is required for
+# numerical-diff comparisons across separate ``skip_loading_weights=True`` builds (e.g. the perf
+# proxy correctness gate). Unset (default) preserves the original unseeded behavior.
+RANDOM_INIT_SEED_ENV = "AUTO_DEPLOY_RANDOM_INIT_SEED"
 
 
 class ShardingConfigSource(Enum):
@@ -391,7 +400,21 @@ class ModelFactory(ABC):
 
         NOTE: this utility is written in such a fashion that not more memory than what the model
         shard needs is reserved and/or allocated.
+
+        If ``AUTO_DEPLOY_RANDOM_INIT_SEED`` is set to an integer, the RNG is seeded first so the
+        random weights are reproducible across independent processes (needed for cross-run
+        numerical-diff comparisons). Unset preserves the original unseeded behavior.
         """
+        seed_env = os.environ.get(RANDOM_INIT_SEED_ENV)
+        if seed_env is not None:
+            seed = int(seed_env)
+            # Seeds the CPU generator and all CUDA devices, so the per-rank random shards are
+            # deterministic given the same architecture and traversal order.
+            torch.manual_seed(seed)
+            ad_logger.info(
+                f"Seeding random weight initialization with {RANDOM_INIT_SEED_ENV}={seed}"
+            )
+
         model._apply(
             # NOTE (lucaslie): torch.normal is not supported for all dtypes
             lambda t: torch.normal(0.0, 1.0, size=t.shape, device=device).to(t.dtype)
