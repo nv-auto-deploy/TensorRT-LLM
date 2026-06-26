@@ -22,6 +22,14 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:  # pragma: no cover - triton always present on CUDA builds
+    _HAS_TRITON = False
+
 from ..._compat import KvCacheConfig
 from ...distributed import common as dist_common
 from ...utils.node_utils import extract_op_args
@@ -1895,6 +1903,379 @@ def _sparse_attention_query_chunk_size(
     return min(num_tokens, chunk_size)
 
 
+_LOG2E = 1.4426950408889634
+# Scores for masked / out-of-range / padded key slots are floored to this value
+# *before* the exp2.  A large finite negative (rather than -inf) keeps the online
+# softmax running-max arithmetic NaN-free when an entire query has no valid key
+# (the sink-only case) — see _fused_sparse_attention_kernel.
+_SPARSE_ATTN_NEG = -1.0e30
+
+# Fused-kernel launch heuristics (tuned for the decode tpot path on Blackwell).
+_SPARSE_ATTN_SM_TARGET = 132  # min SM count across supported GPUs (H100/B200)
+_SPARSE_ATTN_SPLITK_MAX_TOKENS = 8  # use split-K only for decode / small batches
+_SPARSE_ATTN_DECODE_HEAD_BLOCK = 8  # balances CTA count vs MMA tile efficiency (swept)
+_SPARSE_ATTN_DECODE_NUM_WARPS = 8  # warps for the split-K partial kernel (swept)
+_SPARSE_ATTN_MAX_PARTS = 32  # cap on split-K key partitions
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _fused_sparse_attention_kernel(
+        q_ptr,  # [num_tokens, num_heads, D]
+        kv_ptr,  # [batch_size, kv_rows, D]
+        topk_ptr,  # [num_tokens, k_select] int
+        sink_ptr,  # [num_heads]
+        batch_ptr,  # [num_tokens] int -> batch row of kv
+        out_ptr,  # [num_tokens, num_heads, D]
+        num_heads,
+        kv_rows,
+        k_select,
+        SCALE_LOG2: tl.constexpr,  # softmax_scale * log2(e)
+        D: tl.constexpr,
+        D_BLOCK: tl.constexpr,  # next_pow2(D)
+        SEQ_BLOCK: tl.constexpr,
+        HEAD_BLOCK: tl.constexpr,
+    ):
+        """Fused on-the-fly selected-KV sparse attention (flash-MQA style).
+
+        Grid: (num_tokens, cdiv(num_heads, HEAD_BLOCK)).  Each program handles one
+        query token and HEAD_BLOCK heads (which all attend the *same* gathered KV
+        rows — K==V), so the selected/compressed KV rows are read from HBM exactly
+        once and reused across heads and across the score/output matmuls.  No fp32
+        [num_tokens, k_select, D] tensor is ever materialized.  fp32 online softmax
+        matches the reference reduction; the per-head ``attn_sink`` logit is folded
+        into the denominator (no value contribution) after the key loop.
+        """
+        token_id = tl.program_id(0)
+        head_group = tl.program_id(1)
+        head_start = head_group * HEAD_BLOCK
+
+        # Inlined literals: jit kernels cannot read module-level globals.
+        NEG: tl.constexpr = -1.0e30  # masked-key score floor (NaN-safe vs -inf)
+        LOG2E: tl.constexpr = 1.4426950408889634
+
+        batch_id = tl.load(batch_ptr + token_id).to(tl.int64)
+        head_offsets = tl.arange(0, HEAD_BLOCK)
+        heads = head_start + head_offsets
+        head_mask = heads < num_heads
+        d_offsets = tl.arange(0, D_BLOCK)
+        d_mask = d_offsets < D
+
+        q_base = token_id.to(tl.int64) * num_heads * D
+        q_ptrs = q_ptr + q_base + heads[:, None] * D + d_offsets[None, :]
+        q = tl.load(q_ptrs, mask=head_mask[:, None] & d_mask[None, :], other=0.0)
+
+        m_i = tl.full([HEAD_BLOCK], NEG, dtype=tl.float32)
+        l_i = tl.zeros([HEAD_BLOCK], dtype=tl.float32)
+        acc = tl.zeros([HEAD_BLOCK, D_BLOCK], dtype=tl.float32)
+
+        kv_batch_base = batch_id * kv_rows
+        topk_base = token_id.to(tl.int64) * k_select
+
+        for start in range(0, k_select, SEQ_BLOCK):
+            kcol = start + tl.arange(0, SEQ_BLOCK)
+            kcol_mask = kcol < k_select
+            idx = tl.load(topk_ptr + topk_base + kcol, mask=kcol_mask, other=-1).to(tl.int64)
+            valid = (idx >= 0) & (idx < kv_rows) & kcol_mask
+            idx_c = tl.minimum(tl.maximum(idx, 0), kv_rows - 1)
+            kv_ptrs = kv_ptr + (kv_batch_base + idx_c)[:, None] * D + d_offsets[None, :]
+            kvb = tl.load(kv_ptrs, mask=valid[:, None] & d_mask[None, :], other=0.0)
+
+            scores = tl.dot(q, tl.trans(kvb)).to(tl.float32) * SCALE_LOG2  # [HB, SB]
+            scores = tl.where(valid[None, :], scores, NEG)
+
+            m_ij = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_ij)
+            alpha = tl.math.exp2(m_i - m_new)
+            p = tl.math.exp2(scores - m_new[:, None])
+            p = tl.where(valid[None, :], p, 0.0)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p.to(kvb.dtype), kvb).to(tl.float32)
+            m_i = m_new
+
+        # Fold the per-head sink logit (raw, not scaled) into the denominator only.
+        sink = tl.load(sink_ptr + heads, mask=head_mask, other=0.0).to(tl.float32) * LOG2E
+        m_new = tl.maximum(m_i, sink)
+        alpha = tl.math.exp2(m_i - m_new)
+        l_i = l_i * alpha + tl.math.exp2(sink - m_new)
+        acc = acc * alpha[:, None]
+
+        out = acc / tl.maximum(l_i, 1e-38)[:, None]
+        out_ptrs = out_ptr + q_base + heads[:, None] * D + d_offsets[None, :]
+        tl.store(
+            out_ptrs,
+            out.to(out_ptr.dtype.element_ty),
+            mask=head_mask[:, None] & d_mask[None, :],
+        )
+
+    @triton.jit
+    def _fused_sparse_attention_splitk_kernel(
+        q_ptr,  # [num_tokens, num_heads, D]
+        kv_ptr,  # [batch_size, kv_rows, D]
+        topk_ptr,  # [num_tokens, k_select] int
+        batch_ptr,  # [num_tokens] int -> batch row of kv
+        ws_acc_ptr,  # [num_tokens, num_heads, NUM_PARTS, D_BLOCK] fp32
+        ws_ml_ptr,  # [num_tokens, num_heads, NUM_PARTS, 2] fp32 (m, l)
+        num_heads,
+        kv_rows,
+        k_select,
+        SCALE_LOG2: tl.constexpr,
+        D: tl.constexpr,
+        D_BLOCK: tl.constexpr,
+        SEQ_BLOCK: tl.constexpr,
+        HEAD_BLOCK: tl.constexpr,
+        NUM_PARTS: tl.constexpr,
+    ):
+        """Split-K partial of the fused sparse attend (no sink, no normalization).
+
+        Grid: (num_tokens, cdiv(num_heads, HEAD_BLOCK), NUM_PARTS).  Each program
+        scores a contiguous slice of the selected-key columns and writes its partial
+        (acc, m, l) to workspace.  Splitting the key reduction across NUM_PARTS CTAs
+        fills the GPU at decode (few tokens, many heads sharing one KV) where pure
+        head/token parallelism leaves most SMs idle.  Reduction + sink fold happen in
+        _fused_sparse_attention_reduce_kernel.
+        """
+        NEG: tl.constexpr = -1.0e30
+
+        token_id = tl.program_id(0)
+        head_group = tl.program_id(1)
+        part_id = tl.program_id(2)
+        head_start = head_group * HEAD_BLOCK
+
+        batch_id = tl.load(batch_ptr + token_id).to(tl.int64)
+        head_offsets = tl.arange(0, HEAD_BLOCK)
+        heads = head_start + head_offsets
+        head_mask = heads < num_heads
+        d_offsets = tl.arange(0, D_BLOCK)
+        d_mask = d_offsets < D
+
+        q_base = token_id.to(tl.int64) * num_heads * D
+        q_ptrs = q_ptr + q_base + heads[:, None] * D + d_offsets[None, :]
+        q = tl.load(q_ptrs, mask=head_mask[:, None] & d_mask[None, :], other=0.0)
+
+        m_i = tl.full([HEAD_BLOCK], NEG, dtype=tl.float32)
+        l_i = tl.zeros([HEAD_BLOCK], dtype=tl.float32)
+        acc = tl.zeros([HEAD_BLOCK, D_BLOCK], dtype=tl.float32)
+
+        kv_batch_base = batch_id * kv_rows
+        topk_base = token_id.to(tl.int64) * k_select
+
+        total_blocks = tl.cdiv(k_select, SEQ_BLOCK)
+        blocks_per_part = tl.cdiv(total_blocks, NUM_PARTS)
+        part_start_block = part_id * blocks_per_part
+        part_end_block = tl.minimum(part_start_block + blocks_per_part, total_blocks)
+
+        for block_id in range(part_start_block, part_end_block):
+            kcol = block_id * SEQ_BLOCK + tl.arange(0, SEQ_BLOCK)
+            kcol_mask = kcol < k_select
+            idx = tl.load(topk_ptr + topk_base + kcol, mask=kcol_mask, other=-1).to(tl.int64)
+            valid = (idx >= 0) & (idx < kv_rows) & kcol_mask
+            idx_c = tl.minimum(tl.maximum(idx, 0), kv_rows - 1)
+            kv_ptrs = kv_ptr + (kv_batch_base + idx_c)[:, None] * D + d_offsets[None, :]
+            kvb = tl.load(kv_ptrs, mask=valid[:, None] & d_mask[None, :], other=0.0)
+
+            scores = tl.dot(q, tl.trans(kvb)).to(tl.float32) * SCALE_LOG2
+            scores = tl.where(valid[None, :], scores, NEG)
+            m_ij = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_ij)
+            alpha = tl.math.exp2(m_i - m_new)
+            p = tl.math.exp2(scores - m_new[:, None])
+            p = tl.where(valid[None, :], p, 0.0)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p.to(kvb.dtype), kvb).to(tl.float32)
+            m_i = m_new
+
+        acc_ptrs = (
+            ws_acc_ptr
+            + (token_id.to(tl.int64) * num_heads + heads[:, None]) * NUM_PARTS * D_BLOCK
+            + part_id * D_BLOCK
+            + d_offsets[None, :]
+        )
+        tl.store(acc_ptrs, acc, mask=head_mask[:, None] & d_mask[None, :])
+        ml_base = (
+            ws_ml_ptr + (token_id.to(tl.int64) * num_heads + heads) * NUM_PARTS * 2 + part_id * 2
+        )
+        tl.store(ml_base, m_i, mask=head_mask)
+        tl.store(ml_base + 1, l_i, mask=head_mask)
+
+    @triton.jit
+    def _fused_sparse_attention_reduce_kernel(
+        ws_acc_ptr,  # [num_tokens, num_heads, NUM_PARTS, D_BLOCK] fp32
+        ws_ml_ptr,  # [num_tokens, num_heads, NUM_PARTS, 2] fp32
+        sink_ptr,  # [num_heads]
+        out_ptr,  # [num_tokens, num_heads, D]
+        num_heads,
+        D: tl.constexpr,
+        D_BLOCK: tl.constexpr,
+        NUM_PARTS: tl.constexpr,
+    ):
+        """Combine NUM_PARTS partials, fold the sink logit, normalize, write output.
+
+        Grid: (num_tokens, num_heads).
+        """
+        token_id = tl.program_id(0)
+        head_id = tl.program_id(1)
+        LOG2E: tl.constexpr = 1.4426950408889634
+
+        d_offsets = tl.arange(0, D_BLOCK)
+        d_mask = d_offsets < D
+        base = token_id.to(tl.int64) * num_heads + head_id
+
+        ml0 = ws_ml_ptr + base * NUM_PARTS * 2
+        m_cur = tl.load(ml0)
+        l_cur = tl.load(ml0 + 1)
+        acc_cur = tl.load(
+            ws_acc_ptr + base * NUM_PARTS * D_BLOCK + d_offsets, mask=d_mask, other=0.0
+        )
+
+        for p in tl.static_range(1, NUM_PARTS):
+            mlp = ws_ml_ptr + base * NUM_PARTS * 2 + p * 2
+            m_p = tl.load(mlp)
+            l_p = tl.load(mlp + 1)
+            acc_p = tl.load(
+                ws_acc_ptr + base * NUM_PARTS * D_BLOCK + p * D_BLOCK + d_offsets,
+                mask=d_mask,
+                other=0.0,
+            )
+            m_new = tl.maximum(m_cur, m_p)
+            a = tl.math.exp2(m_cur - m_new)
+            b = tl.math.exp2(m_p - m_new)
+            l_cur = l_cur * a + l_p * b
+            acc_cur = acc_cur * a + acc_p * b
+            m_cur = m_new
+
+        sink = tl.load(sink_ptr + head_id).to(tl.float32) * LOG2E
+        m_new = tl.maximum(m_cur, sink)
+        a = tl.math.exp2(m_cur - m_new)
+        l_cur = l_cur * a + tl.math.exp2(sink - m_new)
+        acc_cur = acc_cur * a
+
+        out = acc_cur / tl.maximum(l_cur, 1e-38)
+        out_ptrs = out_ptr + base * D + d_offsets
+        tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty), mask=d_mask)
+
+
+def _can_use_fused_sparse_attention(
+    q: torch.Tensor, kv: torch.Tensor, topk_idxs: torch.Tensor
+) -> bool:
+    """Whether the fused Triton attend kernel supports these inputs.
+
+    The pure-torch chunk loop remains the fallback for CPU, fp32, empty-kv, and
+    tiny-head-dim shapes (the latter cannot use ``tl.dot``).
+    """
+    return (
+        _HAS_TRITON
+        and q.is_cuda
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and kv.shape[1] > 0  # kv_rows
+        and q.shape[-1] >= 16  # head_dim large enough for tl.dot contraction
+        and topk_idxs.shape[-1] > 0  # k_select
+    )
+
+
+def _fused_sparse_attention_triton(
+    q_flat: torch.Tensor,  # [num_tokens, num_heads, D]
+    kv: torch.Tensor,  # [batch_size, kv_rows, D]
+    attn_sink: torch.Tensor,  # [num_heads]
+    topk_flat: torch.Tensor,  # [num_tokens, k_select]
+    softmax_scale: float,
+    batch_idxs: torch.Tensor,  # [num_tokens]
+) -> torch.Tensor:
+    num_tokens, num_heads, head_dim = q_flat.shape
+    _, kv_rows, _ = kv.shape
+    k_select = topk_flat.shape[1]
+
+    q_flat = q_flat.contiguous()
+    kv = kv.contiguous()
+    topk_flat = topk_flat.contiguous()
+    sink = attn_sink.contiguous()
+    # Keep batch_idxs in its native int dtype (the kernels upcast to int64); an
+    # explicit .to(int32) here would add a cast kernel into the captured cudagraph.
+    batch_idxs = batch_idxs.contiguous()
+    out = torch.empty_like(q_flat)
+
+    scale_log2 = softmax_scale * _LOG2E
+    d_block = triton.next_power_of_2(head_dim)
+    seq_block = 64
+    total_blocks = triton.cdiv(k_select, seq_block)
+
+    # Pick head grouping: at decode (few query tokens) a small HEAD_BLOCK exposes
+    # more head-groups and shrinks the fp32 acc register footprint; at prefill the
+    # simple kernel already saturates the GPU with token*head parallelism.
+    if num_tokens <= _SPARSE_ATTN_SPLITK_MAX_TOKENS:
+        head_block = min(_SPARSE_ATTN_DECODE_HEAD_BLOCK, num_heads)
+    else:
+        head_block = 16 if num_heads >= 16 else triton.next_power_of_2(num_heads)
+    head_groups = triton.cdiv(num_heads, head_block)
+    base_programs = num_tokens * head_groups
+    use_splitk = base_programs < _SPARSE_ATTN_SM_TARGET and total_blocks > 1
+
+    if use_splitk:
+        # Split the key reduction across NUM_PARTS CTAs to fill idle SMs, then
+        # combine + fold sink + normalize in a cheap reduction kernel.
+        num_parts = min(total_blocks, _SPARSE_ATTN_MAX_PARTS)
+        ws_acc = torch.empty(
+            num_tokens, num_heads, num_parts, d_block, device=q_flat.device, dtype=torch.float32
+        )
+        ws_ml = torch.empty(
+            num_tokens, num_heads, num_parts, 2, device=q_flat.device, dtype=torch.float32
+        )
+        grid = (num_tokens, head_groups, num_parts)
+        _fused_sparse_attention_splitk_kernel[grid](
+            q_flat,
+            kv,
+            topk_flat,
+            batch_idxs,
+            ws_acc,
+            ws_ml,
+            num_heads,
+            kv_rows,
+            k_select,
+            SCALE_LOG2=scale_log2,
+            D=head_dim,
+            D_BLOCK=d_block,
+            SEQ_BLOCK=seq_block,
+            HEAD_BLOCK=head_block,
+            NUM_PARTS=num_parts,
+            num_warps=_SPARSE_ATTN_DECODE_NUM_WARPS,
+            num_stages=2,
+        )
+        _fused_sparse_attention_reduce_kernel[(num_tokens, num_heads)](
+            ws_acc,
+            ws_ml,
+            sink,
+            out,
+            num_heads,
+            D=head_dim,
+            D_BLOCK=d_block,
+            NUM_PARTS=num_parts,
+            num_warps=4,
+        )
+        return out
+
+    grid = (num_tokens, head_groups)
+    _fused_sparse_attention_kernel[grid](
+        q_flat,
+        kv,
+        topk_flat,
+        sink,
+        batch_idxs,
+        out,
+        num_heads,
+        kv_rows,
+        k_select,
+        SCALE_LOG2=scale_log2,
+        D=head_dim,
+        D_BLOCK=d_block,
+        SEQ_BLOCK=seq_block,
+        HEAD_BLOCK=head_block,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
 def _deepseek_v4_sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -1938,6 +2319,16 @@ def _deepseek_v4_sparse_attention(
     topk_flat = topk_idxs.reshape(num_tokens, k_select)
     batch_idxs = torch.arange(batch_size, device=q.device).view(batch_size, 1)
     batch_idxs = batch_idxs.expand(batch_size, seq_len).reshape(num_tokens)
+
+    if _can_use_fused_sparse_attention(q, kv, topk_idxs):
+        # Fused on-the-fly gather+attend kernel: reads selected/compressed KV by
+        # index inside the matmul instead of materializing the fp32 selected-KV
+        # tensor and round-tripping it through HBM for the two matmuls + softmax.
+        out_flat = _fused_sparse_attention_triton(
+            q_flat, kv, attn_sink, topk_flat, softmax_scale, batch_idxs
+        )
+        return out_flat.reshape(q.shape)
+
     output_flat = output.reshape(num_tokens, num_heads, q_head_dim)
     sink_logits = attn_sink.to(dtype=compute_dtype).reshape(1, num_heads, 1)
 
