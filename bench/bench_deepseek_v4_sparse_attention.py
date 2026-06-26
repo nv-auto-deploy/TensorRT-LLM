@@ -3,14 +3,26 @@
 """Microbench for the DeepSeek V4 sparse-attention attend kernel.
 
 Benchmarks ``_deepseek_v4_sparse_attention`` (the function fused by idea_0001)
-on the two shapes the real workload hits:
+on the shapes the real workload hits:
 
-* decode  : num_tokens=1, num_heads=64, L(selected)=640, D=512  -> measured under
-            CUDA-graph replay (faithful proxy for tpot, which runs under cudagraph)
+* decode (PRIMARY, tpot proxy) : num_tokens=1, L(selected)=640, D=512.  The model
+            has num_attention_heads=64 but the e2e config shards MLA over TP=8
+            (shard_layers:[mla,moe], tp:8), so the *per-rank* decode shape the
+            kernel actually sees is num_heads = 64/8 = **8**.  This is the shape
+            autotuning must target; H=64 is kept only as the original (off-shape)
+            reference.
 * prefill : num_tokens=512, num_heads=64, k_select=640, kv_rows=2048, D=512 (eager)
 
+PRIMARY metric = decode at H=8 timed under **amortized (stacked) CUDA-graph
+replay**.  A single g.replay() per call measures the host launch cadence
+(~10us) which hides the (shorter) GPU kernel time and is invariant to kernel
+changes; in real serving the attend runs back-to-back *inside* the per-decode
+cudagraph, so its true contribution is the serial GPU time.  We capture many
+calls into one graph and divide, which both reveals sub-floor kernel wins and
+matches the e2e-relevant cost.
+
 DSV4-Flash dims: head_dim=512, num_attention_heads=64, sliding_window=128,
-index_topk=512  (so decode selected rows ~= window+index_topk = 640).
+index_topk=512  (so decode selected rows ~= window+index_topk = 640).  TP=8.
 """
 
 from __future__ import annotations
@@ -24,18 +36,19 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention import (
 )
 
 D = 512
-NUM_HEADS = 64
+NUM_HEADS = 64  # model total; the e2e per-rank count after TP=8 sharding is 8
+TP = 8
 SCALE = D**-0.5
 DTYPE = torch.bfloat16
 DEV = "cuda"
 
 
-def _make_decode_inputs(L: int = 640):
-    """Decode: 1 query token, 64 heads, L selected kv rows (rel_topk = arange)."""
+def _make_decode_inputs(num_heads: int, L: int = 640):
+    """Decode: 1 query token, ``num_heads`` heads, L selected kv rows (rel_topk = arange)."""
     torch.manual_seed(0)
-    q = torch.randn(1, 1, NUM_HEADS, D, device=DEV, dtype=DTYPE)
+    q = torch.randn(1, 1, num_heads, D, device=DEV, dtype=DTYPE)
     kv = torch.randn(1, L, D, device=DEV, dtype=DTYPE)
-    attn_sink = torch.randn(NUM_HEADS, device=DEV, dtype=DTYPE)
+    attn_sink = torch.randn(num_heads, device=DEV, dtype=DTYPE)
     # identity selection (the decode path passes rel_topk = arange over selected rows)
     topk = torch.arange(L, device=DEV, dtype=torch.int64).view(1, 1, L)
     return q, kv, attn_sink, topk
@@ -65,12 +78,12 @@ def _time_eager(fn, iters: int = 100, warmup: int = 10) -> float:
     return (time.perf_counter() - t0) / iters * 1000.0
 
 
-def _time_graph(fn, iters: int = 200, warmup: int = 5) -> float:
-    """Time fn() under CUDA-graph replay (hides launch overhead, like real serving)."""
+def _time_graph_single(fn, iters: int = 500, warmup: int = 20) -> float:
+    """One captured call per replay -> measures the HOST g.replay() cadence floor."""
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
-        for _ in range(3):
+        for _ in range(5):
             fn()
     torch.cuda.current_stream().wait_stream(s)
     g = torch.cuda.CUDAGraph()
@@ -86,31 +99,68 @@ def _time_graph(fn, iters: int = 200, warmup: int = 5) -> float:
     return (time.perf_counter() - t0) / iters * 1000.0
 
 
-def main():
-    fn_attend = dsv4._deepseek_v4_sparse_attention
+def _time_graph_amortized(
+    fn, reps: int = 64, iters: int = 100, warmup: int = 10, best_of: int = 3
+) -> float:
+    """Amortized true GPU kernel time (the e2e-relevant cost).
 
-    # ---- decode (primary; cudagraph) ----
-    q, kv, sink, topk = _make_decode_inputs()
-    call = lambda: fn_attend(q, kv, sink, topk, SCALE)  # noqa: E731
-    eager_dec = _time_eager(call)
+    Capture ``reps`` back-to-back calls into ONE graph and amortize the single
+    host launch over them; this reveals sub-host-floor kernel wins the
+    single-call timer cannot see.  best_of takes the min over repeats to
+    suppress clock/thermal jitter on these tiny kernels.
+    """
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(5):
+            fn()
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(reps):
+            fn()
+    for _ in range(warmup):
+        g.replay()
+    torch.cuda.synchronize()
+    best = float("inf")
+    for _ in range(best_of):
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            g.replay()
+        torch.cuda.synchronize()
+        best = min(best, (time.perf_counter() - t0) / iters / reps * 1000.0)
+    return best
+
+
+def _bench_decode(num_heads: int, tag: str) -> float:
+    q, kv, sink, topk = _make_decode_inputs(num_heads)
+    call = lambda: dsv4._deepseek_v4_sparse_attention(q, kv, sink, topk, SCALE)  # noqa: E731
     try:
-        graph_dec = _time_graph(call)
+        gpu = _time_graph_amortized(call)
+        host = _time_graph_single(call)
     except Exception as e:  # noqa: BLE001
-        graph_dec = float("nan")
-        print(f"[warn] decode graph capture failed: {e}")
+        gpu = host = float("nan")
+        print(f"[warn] decode graph capture failed ({tag}): {e}")
     print(
-        f"shape=decode(B1,H64,L640,D512) microbench_ms={graph_dec:.5f} "
-        f"(graph) eager_ms={eager_dec:.5f}"
+        f"shape=decode-{tag}(B1,H{num_heads},L640,D512) microbench_ms={gpu:.5f} "
+        f"(amortized GPU; host-floor={host * 1000:.2f}us)"
     )
+    return gpu
+
+
+def main():
+    # ---- decode PRIMARY: per-rank shape (H = 64 / TP = 8) ----
+    primary = _bench_decode(NUM_HEADS // TP, tag="tp8")  # H=8, the real per-rank shape
+    # ---- decode reference: full H=64 (original off-shape sweep target) ----
+    _bench_decode(NUM_HEADS, tag="h64")
 
     # ---- prefill (eager) ----
     q, kv, sink, topk = _make_prefill_inputs()
-    call = lambda: fn_attend(q, kv, sink, topk, SCALE)  # noqa: E731
+    call = lambda: dsv4._deepseek_v4_sparse_attention(q, kv, sink, topk, SCALE)  # noqa: E731
     eager_pre = _time_eager(call, iters=30, warmup=5)
     print(f"shape=prefill(T512,H64,K640,kv2048,D512) microbench_ms={eager_pre:.5f} (eager)")
 
-    # primary number = decode under cudagraph (matches tpot metric)
-    primary = graph_dec if graph_dec == graph_dec else eager_dec  # nan check
+    # primary number = H=8 decode amortized GPU time (the real per-rank tpot shape)
     print(f"PRIMARY_microbench_ms={primary:.5f}")
 
 

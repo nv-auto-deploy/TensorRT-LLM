@@ -88,6 +88,25 @@ def test_decode_shape_matches_reference(dtype):
     _check(q, kv, sink, topk, D**-0.5)
 
 
+@pytest.mark.parametrize("num_heads", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_decode_per_rank_sharded_heads(num_heads, dtype):
+    """Decode at the TP-sharded per-rank head counts (64/TP for TP in 64..4).
+
+    The e2e config shards MLA over TP=8, so the per-rank decode shape the kernel
+    actually sees is H=8 (and H=16 at TP=4, etc.), not the full H=64.  This is the
+    shape the split-K head_block / num_parts heuristics are tuned for, so it must
+    stay correct as those heuristics change.  B=1, S=1, D=512, L=640.
+    """
+    torch.manual_seed(0)
+    B, S, D, L = 1, 1, 512, 640
+    q = torch.randn(B, S, num_heads, D, device="cuda", dtype=dtype)
+    kv = torch.randn(B, L, D, device="cuda", dtype=dtype)
+    sink = torch.randn(num_heads, device="cuda", dtype=dtype)
+    topk = torch.arange(L, device="cuda", dtype=torch.int64).view(1, 1, L).expand(B, S, L)
+    _check(q, kv, sink, topk, D**-0.5)
+
+
 def test_prefill_shape_matches_reference():
     """Multi-token prefill with random selection + ~10% masked (-1)."""
     torch.manual_seed(1)

@@ -1915,7 +1915,14 @@ _SPARSE_ATTN_SM_TARGET = 132  # min SM count across supported GPUs (H100/B200)
 _SPARSE_ATTN_SPLITK_MAX_TOKENS = 8  # use split-K only for decode / small batches
 _SPARSE_ATTN_DECODE_HEAD_BLOCK = 8  # balances CTA count vs MMA tile efficiency (swept)
 _SPARSE_ATTN_DECODE_NUM_WARPS = 8  # warps for the split-K partial kernel (swept)
+_SPARSE_ATTN_REDUCE_NUM_WARPS = 8  # warps for the split-K reduce kernel (swept; 4->8
+# nearly halves its tail at the D=512 partial width — the reduce loads NUM_PARTS
+# fp32 acc rows of width D_BLOCK, so more warps cover the row in fewer steps)
 _SPARSE_ATTN_MAX_PARTS = 32  # cap on split-K key partitions
+_SPARSE_ATTN_DECODE_CTA_TARGET = 80  # split-K grid CTA budget (head_groups*num_parts):
+# ~one wave of SMs on H100(132)/B200(148).  Swept: the decode attend plateaus in
+# latency from ~40-80 CTAs and regresses sharply past ~160 (a 2nd SM wave), so
+# HEAD_BLOCK is sized to land head_groups*num_parts near this, not above it.
 
 
 if _HAS_TRITON:
@@ -2199,12 +2206,26 @@ def _fused_sparse_attention_triton(
     d_block = triton.next_power_of_2(head_dim)
     seq_block = 64
     total_blocks = triton.cdiv(k_select, seq_block)
+    # Split-K key partitions (used iff use_splitk below).  Computed up front so the
+    # decode HEAD_BLOCK can be sized against the resulting head_groups*num_parts.
+    num_parts = min(total_blocks, _SPARSE_ATTN_MAX_PARTS)
 
-    # Pick head grouping: at decode (few query tokens) a small HEAD_BLOCK exposes
-    # more head-groups and shrinks the fp32 acc register footprint; at prefill the
-    # simple kernel already saturates the GPU with token*head parallelism.
+    # Pick head grouping.  At decode (few query tokens) the GPU is occupancy-starved,
+    # so the split-K path also shrinks HEAD_BLOCK to expose more head-groups, sizing
+    # head_groups*num_parts to ~one wave of SMs (_SPARSE_ATTN_DECODE_CTA_TARGET).
+    # HEAD_BLOCK is kept as large as possible (better MMA M-utilization, smaller fp32
+    # acc footprint) subject to that CTA budget: at full H=64 this is the original
+    # HEAD_BLOCK=8 (8 head-groups), and under TP sharding (per-rank H=8) it drops to 1
+    # to recover the head-parallel CTAs lost to sharding.  At prefill the simple
+    # kernel already saturates the GPU with token*head parallelism.
     if num_tokens <= _SPARSE_ATTN_SPLITK_MAX_TOKENS:
-        head_block = min(_SPARSE_ATTN_DECODE_HEAD_BLOCK, num_heads)
+        if total_blocks > 1:
+            target_groups = max(1, _SPARSE_ATTN_DECODE_CTA_TARGET // num_parts)
+            head_block = max(
+                1, min(_SPARSE_ATTN_DECODE_HEAD_BLOCK, triton.cdiv(num_heads, target_groups))
+            )
+        else:
+            head_block = min(_SPARSE_ATTN_DECODE_HEAD_BLOCK, num_heads)
     else:
         head_block = 16 if num_heads >= 16 else triton.next_power_of_2(num_heads)
     head_groups = triton.cdiv(num_heads, head_block)
@@ -2214,7 +2235,6 @@ def _fused_sparse_attention_triton(
     if use_splitk:
         # Split the key reduction across NUM_PARTS CTAs to fill idle SMs, then
         # combine + fold sink + normalize in a cheap reduction kernel.
-        num_parts = min(total_blocks, _SPARSE_ATTN_MAX_PARTS)
         ws_acc = torch.empty(
             num_tokens, num_heads, num_parts, d_block, device=q_flat.device, dtype=torch.float32
         )
@@ -2250,7 +2270,7 @@ def _fused_sparse_attention_triton(
             D=head_dim,
             D_BLOCK=d_block,
             NUM_PARTS=num_parts,
-            num_warps=4,
+            num_warps=_SPARSE_ATTN_REDUCE_NUM_WARPS,
         )
         return out
 
