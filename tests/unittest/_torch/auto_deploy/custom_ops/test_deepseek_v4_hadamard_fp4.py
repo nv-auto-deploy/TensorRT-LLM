@@ -117,6 +117,40 @@ def test_matches_reference_other_pow2_dims(dim):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "R",
+    [
+        1024,  # threshold: first row count routed to the BLOCK_R=2 blocked kernel
+        2048,
+        2049,  # odd R -> exercises the blocked-kernel tail mask (last row masked off)
+        8000,  # prefill indexer-q (B=1,S=1000,index_n_heads_local=8)
+    ],
+)
+@pytest.mark.parametrize("scale", [0.02, 1.0, 40.0])
+def test_blocked_path_matches_reference(dtype, R, scale):
+    # R >= 1024 routes through _hadamard_fp4_kernel_blocked; must stay bit-identical
+    # to the 1-row path / reference (the row axis is a pure batched outer dim).
+    torch.manual_seed(2)
+    x = (torch.randn((R, 128), device="cuda", dtype=dtype) * scale).contiguous()
+    out = _fused(x)
+    ref = _ref(x)
+    assert out.shape == x.shape and out.dtype == x.dtype
+    assert torch.equal(out, ref), (
+        f"max abs diff {(out.float() - ref.float()).abs().max().item():.3e}"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dim", [32, 64, 256])
+def test_blocked_path_other_pow2_dims(dim):
+    # Large R + non-128 dims still routes through the blocked kernel.
+    torch.manual_seed(3)
+    x = (torch.randn((1500, dim), device="cuda", dtype=torch.bfloat16) * 1.3).contiguous()
+    assert torch.equal(_fused(x), _ref(x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_zero_input_is_zero():
     # all-zero input exercises the amax==0 / log2(0) guard path of ceil_pow2_scale;
     # the rotation of zeros is zero and the fp4 quant of zeros is zero.
