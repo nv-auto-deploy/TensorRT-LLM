@@ -166,6 +166,11 @@ def deepseek_v4_routing_fn(
     BLOCK_K = _next_power_of_2(top_k)
     grid = (num_tokens,)
 
+    # Single-warp launch: every program does an E-wide (~256) reduction repeated
+    # TOP_K times. With 1 warp those reductions are pure intra-warp shuffles (no
+    # shared-mem barrier), and at prefill the small thread count lets more CTAs
+    # stay resident per SM. Measured uniformly fastest across decode B=1/2 and
+    # prefill (256/1000/2048 tokens) vs the Triton default of 4 warps.
     _deepseek_v4_routing_kernel[grid](
         router_logits,
         bias,
@@ -185,6 +190,7 @@ def deepseek_v4_routing_fn(
         BLOCK_E=BLOCK_E,
         TOP_K=top_k,
         BLOCK_K=BLOCK_K,
+        num_warps=1,
     )
     return indices, weights
 
