@@ -137,7 +137,32 @@ def deepseek_v4_compress_pool(kv: torch.Tensor, gate: torch.Tensor) -> torch.Ten
 
     kvc = kv.contiguous()
     gatec = gate.contiguous()
-    BLOCK_D = min(128, triton.next_power_of_2(D))
+
+    # Element-to-thread mapping over the D axis, adapted to the launch occupancy.
+    # Each program owns one ``(row, D-block)`` tile and is a single warp
+    # (``num_warps=1``).  The grid is ``(N, cdiv(D, BLOCK_D))`` so the total CTA
+    # count is ``N * cdiv(D, BLOCK_D)``.
+    #
+    #   * Large-N launches (e.g. the 75%-of-decode PRIMARY ``N=1024, D=128`` and
+    #     all prefill shapes) already supply >=512 CTAs at the maximal D-block, so
+    #     ``BLOCK_D=128`` is kept -- it gives the best coalescing (a full 256B
+    #     contiguous segment per ratio-row) and the fewest CTAs / least grid
+    #     scheduling overhead.  Splitting D further only *adds* CTAs and regresses
+    #     these shapes (bd64 +8%, bd32 +62% on PRIMARY, measured B200/sm100).
+    #   * Small-N decode shapes are occupancy-starved at ``BLOCK_D=128``: the
+    #     main-compressor new-row path ``N<=2, D=512`` launches only 4-8 CTAs onto
+    #     148 SMs.  Fanning the D axis across more CTAs (smaller ``BLOCK_D``)
+    #     recovers the launch-overhead floor -- small-N decode -15%, prefill
+    #     ``N=256, D=128`` -3% -- saturating at a coalescing floor of ``BLOCK_D=16``
+    #     (going below is mixed/noise).
+    #
+    # So: start at the maximal D-block and halve while the grid is below the
+    # machine-fill target (~512 CTAs), down to a floor of 16.  Large-N (incl.
+    # PRIMARY) keeps the byte-identical ``BLOCK_D=128`` launch.
+    cap = min(128, triton.next_power_of_2(D))
+    BLOCK_D = cap
+    while BLOCK_D > 16 and N * triton.cdiv(D, BLOCK_D) < 512:
+        BLOCK_D //= 2
     grid = (N, triton.cdiv(D, BLOCK_D))
     _dsv4_compress_pool_kernel[grid](
         kvc,
