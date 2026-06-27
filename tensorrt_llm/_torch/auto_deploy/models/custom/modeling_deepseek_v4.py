@@ -1084,7 +1084,7 @@ class DeepseekV4Compressor(nn.Module):
             kv = _overlap_transform(kv, self.head_dim, 0.0)
             score = _overlap_transform(score, self.head_dim, -1.0e20)
 
-        compressed = (kv * score.softmax(dim=2)).sum(dim=2).to(output_dtype)
+        compressed = torch.ops.auto_deploy.deepseek_v4_compress_pool(kv, score).to(output_dtype)
         compressed = self.norm(compressed)
 
         row_start = row_offsets * ratio

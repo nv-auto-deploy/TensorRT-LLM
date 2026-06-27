@@ -308,7 +308,7 @@ def _build_full_compressed_kv(
         kv = _overlap_transform_projected(kv, head_dim, 0.0)
         gate = _overlap_transform_projected(gate, head_dim, -1.0e20)
 
-    compressed = (kv * gate.softmax(dim=2)).sum(dim=2)
+    compressed = torch.ops.auto_deploy.deepseek_v4_compress_pool(kv, gate)
     compressed = _rms_norm_ref(compressed, compressor_norm_weight, rms_norm_eps)
 
     row_start = row_offsets * compress_ratio
@@ -724,7 +724,7 @@ def _compressed_row_from_paged_state(
 
     kv = torch.stack(kv_rows, dim=0)
     gate = torch.stack(gate_rows, dim=0)
-    pooled = (kv * gate.softmax(dim=0)).sum(dim=0)
+    pooled = torch.ops.auto_deploy.deepseek_v4_compress_pool(kv, gate)
     pooled = _rms_norm_ref(pooled.unsqueeze(0), compressor_norm_weight, rms_norm_eps).squeeze(0)
     del state_dim
     row_position_id = max(0, min(row_position_id, cos_table.shape[0] - 1))
@@ -1360,7 +1360,7 @@ def _batched_compressed_rows_from_paged_state(
         gate = gate_state[..., :head_dim]
         gate = gate + compressor_ape[:, :head_dim].to(device=gate.device, dtype=dtype)
 
-    pooled = (kv * gate.softmax(dim=1)).sum(dim=1)
+    pooled = torch.ops.auto_deploy.deepseek_v4_compress_pool(kv, gate)
     pooled = _rms_norm_ref(pooled, compressor_norm_weight, rms_norm_eps)
     row_position_id = row_position_id.to(torch.long).clamp(min=0, max=cos_table.shape[0] - 1)
     cos = cos_table[row_position_id]
@@ -1459,7 +1459,7 @@ def _batched_overlap_compressed_rows_fullrange(
     kv = torch.cat((previous_kv, current_kv), dim=2)
     gate = torch.cat((previous_gate, current_gate), dim=2)
 
-    pooled = (kv * gate.softmax(dim=2)).sum(dim=2)
+    pooled = torch.ops.auto_deploy.deepseek_v4_compress_pool(kv, gate)
     pooled = _rms_norm_ref(pooled, compressor_norm_weight, rms_norm_eps)
     row_position_id = row_position_id.to(torch.long).clamp(min=0, max=cos_table.shape[0] - 1)
     cos = cos_table[row_position_id]
