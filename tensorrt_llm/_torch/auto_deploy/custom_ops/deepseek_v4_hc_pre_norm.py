@@ -50,17 +50,49 @@ import triton
 import triton.language as tl
 
 
-def _hc_combine_configs():
-    # The kernel is a single-CTA-per-row reduction over BLOCK_H (==next_pow2(H))
-    # with a fully-unrolled HM loop, so num_stages is near-inert; the live knob is
-    # num_warps. Decode (N small) wants the widest CTA (nw=32 hides the 4*H fp32
-    # load latency); prefill (N large) saturates SMs and favors fewer warps/CTA.
-    return [
-        triton.Config({}, num_warps=nw, num_stages=ns) for nw in (4, 8, 16, 32) for ns in (1, 2)
-    ]
+def _hc_launch_config(n: int, block_h: int):
+    """Pick (num_warps, num_stages, maxnreg) for the combine+RMSNorm launch.
+
+    The kernel is one CTA per token row reducing over ``BLOCK_H`` (==next_pow2(H))
+    with a fully-unrolled ``HM`` loop, so ``num_stages`` is near-inert (pinned to 2)
+    and the live knob is ``num_warps`` (plus a register cap for the decode case).
+
+    The choice is shape-dependent and is made **deterministically** here rather than
+    via ``@triton.autotune``. These kernels are tiny (~2-5us of GPU time) and run
+    launch-overhead-bound under Triton's ``do_bench`` (it measures ~8-15us of host
+    launch cadence, not the GPU time), so the autotuner only resolves *coarse* gaps:
+    it reliably finds the ~7% decode ``nw=16 -> nw=32`` win but cannot resolve the
+    ~1.7% ``maxnreg`` gain nor separate ``nw=8`` from ``nw=32`` for prefill, leaving
+    prefill bimodal (it intermittently picks the register-capped ``nw=32`` config,
+    which *spills* the wide prefill CTA for a ~+6% regression). Picking from the
+    microbenched optimum here is exact and carries no per-shape warmup bench cost.
+
+    For the H=4096 model shape (BLOCK_H=4096):
+      * decode  (n<=4)   -> nw=32, maxnreg=128: the widest CTA hides the 4*H fp32
+        load latency (~-7% vs the old nw=16); capping registers nudges ptxas into a
+        ~1.7% faster schedule for the single-/few-CTA case.
+      * prefill (n>=256) -> nw=8: SM-saturated, fewer warps/CTA (~-3% vs nw=16).
+      * otherwise        -> nw=16: the former default (no regression on mid sizes).
+    ``maxnreg`` is applied only to the wide decode CTA; it would spill the narrower
+    prefill/mid CTAs, so they keep the compiler default.
+    """
+    if n <= 4:
+        num_warps = 32
+    elif n >= 256:
+        num_warps = 8
+    else:
+        num_warps = 16
+    # Small hidden dims (non-model shapes) never need a wide CTA.
+    if block_h < 1024:
+        num_warps = min(num_warps, 8)
+    if block_h < 256:
+        num_warps = min(num_warps, 4)
+    # The register cap only helps the wide single-/few-CTA decode launch; it would
+    # spill narrower CTAs, so apply it only when the full-width nw=32 survived.
+    maxnreg = 128 if num_warps == 32 else None
+    return num_warps, 2, maxnreg
 
 
-@triton.autotune(configs=_hc_combine_configs(), key=["N", "H", "HM"])
 @triton.jit
 def _hc_weighted_combine_kernel(
     pre_ptr,  # [N, HM] fp32
@@ -149,8 +181,14 @@ def deepseek_v4_hc_combine_rmsnorm(
 
     block_h = triton.next_power_of_2(H)
 
-    # num_warps / num_stages are selected per (N, H, HM) by @triton.autotune on
-    # _hc_weighted_combine_kernel (replaces the former coarse block_h-only branch).
+    # Per-shape launch config tuned by microbench (replaces the former coarse
+    # block_h-only num_warps branch); see _hc_launch_config for why this is picked
+    # deterministically instead of via @triton.autotune.
+    num_warps, num_stages, maxnreg = _hc_launch_config(n, block_h)
+    launch_kwargs = dict(HM=hc_mult, BLOCK_H=block_h, num_warps=num_warps, num_stages=num_stages)
+    if maxnreg is not None:
+        launch_kwargs["maxnreg"] = maxnreg
+
     grid = (n,)
     _hc_weighted_combine_kernel[grid](
         pre_f,
@@ -160,8 +198,7 @@ def deepseek_v4_hc_combine_rmsnorm(
         n,
         H,
         eps,
-        HM=hc_mult,
-        BLOCK_H=block_h,
+        **launch_kwargs,
     )
     return out.reshape(*lead, H)
 
