@@ -22,6 +22,8 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 
+from ..._compat import is_sm_100f
+
 # NOTE: ``triton_kernels`` is an optional dependency. The torch-reference MXFP4 ops
 # (``torch_mxfp4_moe`` etc.) must remain importable and usable without it, so all
 # ``triton_kernels`` symbols are imported lazily inside the functions that need them.
@@ -448,6 +450,220 @@ def _run_torch_mxfp4_mlp_core(
     )
 
 
+# ---------------------------------------------------------------------------
+# TRT-LLM-Gen W4A16 (bf16-act) MXFP4 MoE decode path (Blackwell / SM100)
+# ---------------------------------------------------------------------------
+# DSV4-Flash feeds *precomputed* routing (selected_experts / routing_weights, its
+# custom sqrtsoftplus+hash routing stays upstream) to ``torch_mxfp4_moe_from_routing(_ep)``.
+# The torch reference then dequantizes the routed expert slots and runs the SwiGLU MLP in
+# fp32 bmm — the #1 decode-time op (idea_0002 routed it off the full-expert dequant; the
+# remaining per-slot dequant+bmm is the dominant residual). The trtllm-gen W4A16 runner
+# ``bf16_mxe2m1_block_scale_moe_runner`` does the same math in one hand-tuned cubin and is
+# 21-28x faster at DSV4 EP=8 decode shapes (idea_0008 microbench), 17x faster than matmul_ogs
+# (which regressed +34%, idea_0005). The kernel consumes mxfp4 weights + bf16 activations
+# directly; precomputed routing is forwarded as topk_ids/topk_weights (used verbatim — PT folds
+# routed_scaling_factor into token_final_scales the same way, routing.py:380/419).
+
+# Kernel-ready (pad/shard/shuffle) weights + per-expert SwiGLU tensors, keyed by raw-weight
+# identity. The prep is expensive (per-expert TMA-layout shuffle) and must run once before
+# CUDA-graph capture; captured decode steps reuse the cache, mirroring
+# ``_prepare_weights_scales_cached`` for the matmul_ogs path.
+_TRTLLM_GEN_MXFP4_CACHE: OrderedDict[WeightCacheKey, tuple[object, list[weakref.finalize]]] = (
+    OrderedDict()
+)
+
+
+def _reinterleave_up_gate(t: torch.Tensor, intermediate_size: int) -> torch.Tensor:
+    """Convert DSV4 ``up_gate`` split-half (``[up(I) | gate(I)]`` on the 2I axis) into the
+    HF-interleaved layout (gate at even rows, up at odd rows) that
+    :func:`prepare_trtllm_gen_moe_mxfp4_weights` (gpt-oss layout) expects.
+
+    The torch reference (``gate_up_order='up_gate'``) reads ``up = t[:, :I]`` /
+    ``gate = t[:, I:]``; prepare's ``_deinterleave_gate_up`` reads ``gate = t[:, 0::2]`` /
+    ``up = t[:, 1::2]``. Re-interleaving so even=gate, odd=up makes prepare see the same
+    gate/up halves the reference does — THE fix that lifts cos 0.012 -> 0.977 (idea_0008).
+    Handles weights ``[E, 2I, H/32, 16]``, scales ``[E, 2I, H/32]`` and bias ``[E, 2I]``.
+    """
+    up = t[:, :intermediate_size]
+    gate = t[:, intermediate_size:]
+    interleaved = torch.stack([gate, up], dim=2)  # [E, I, 2, ...] -> rows g0,u0,g1,u1,...
+    return interleaved.reshape(t.shape[0], 2 * intermediate_size, *t.shape[2:]).contiguous()
+
+
+def _prepare_trtllm_gen_mxfp4_cached(
+    hidden_size: int,
+    intermediate_size: int,
+    gate_up_blocks: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    gate_up_bias: torch.Tensor,
+    down_blocks: torch.Tensor,
+    down_bias: torch.Tensor,
+    down_scales: torch.Tensor,
+    alpha: float,
+    limit: float,
+):
+    """Re-interleave DSV4 gate/up + run :func:`prepare_trtllm_gen_moe_mxfp4_weights`, cached.
+
+    Returns ``(prepared_weights, swiglu_alpha, swiglu_beta, swiglu_limit)``. The SwiGLU params
+    (alpha from the op, beta=0, limit from the op) make the kernel's gated activation
+    ``clamp(gate, max=limit) * sigmoid(alpha * clamp(gate, max=limit)) * clamp(up, ±limit)``
+    bit-equivalent to the torch reference's deepseek SwiGLU (``swiglu_mode='deepseek'`` with the
+    same clamp), so values stay faithful even when activations exceed ``limit``.
+    """
+    raw_tensors = (
+        gate_up_blocks,
+        gate_up_scales,
+        gate_up_bias,
+        down_blocks,
+        down_scales,
+        down_bias,
+    )
+    key: WeightCacheKey = (
+        "trtllm_gen_w4a16",
+        hidden_size,
+        intermediate_size,
+        float(alpha),
+        float(limit),
+        *(_tensor_cache_key(tensor) for tensor in raw_tensors),
+    )
+    entry = _TRTLLM_GEN_MXFP4_CACHE.get(key)
+    if entry is not None:
+        _TRTLLM_GEN_MXFP4_CACHE.move_to_end(key)
+        return entry[0]
+
+    from .prepare_trtllm_gen_moe_mxfp4_weights import prepare_trtllm_gen_moe_mxfp4_weights
+
+    gu_blocks_i = _reinterleave_up_gate(gate_up_blocks, intermediate_size)
+    gu_scales_i = _reinterleave_up_gate(gate_up_scales, intermediate_size)
+    gu_bias_i = _reinterleave_up_gate(gate_up_bias, intermediate_size)
+    prepared = prepare_trtllm_gen_moe_mxfp4_weights(
+        gu_blocks_i,
+        gu_scales_i,
+        gu_bias_i,
+        down_blocks,
+        down_scales,
+        down_bias,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        tp_size=1,
+        tp_rank=0,
+    )
+    e_local = gate_up_blocks.shape[0]
+    dev = gate_up_blocks.device
+    # deepseek SwiGLU: silu-style gate (alpha, no +1 term -> beta=0) with the op's clamp limit.
+    # limit<=0 in the reference means "no clamp"; the kernel uses +inf for that.
+    kernel_limit = float(limit) if limit > 0.0 else float("inf")
+    swiglu_alpha = torch.full((e_local,), float(alpha), dtype=torch.float32, device=dev)
+    swiglu_beta = torch.zeros(e_local, dtype=torch.float32, device=dev)
+    swiglu_limit = torch.full((e_local,), kernel_limit, dtype=torch.float32, device=dev)
+    bundle = (prepared, swiglu_alpha, swiglu_beta, swiglu_limit)
+
+    _TRTLLM_GEN_MXFP4_CACHE[key] = (bundle, _register_cache_finalizers(key, raw_tensors))
+    while len(_TRTLLM_GEN_MXFP4_CACHE) > 256:
+        _, (_, finalizers) = _TRTLLM_GEN_MXFP4_CACHE.popitem(last=False)
+        _detach_finalizers(finalizers)
+    return bundle
+
+
+def _run_trtllm_gen_mxfp4_from_routing(
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    gate_up_blocks: torch.Tensor,
+    gate_up_bias: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    down_blocks: torch.Tensor,
+    down_bias: torch.Tensor,
+    down_scales: torch.Tensor,
+    expert_start: int,
+    alpha: float = 1.0,
+    limit: float = float("inf"),
+) -> torch.Tensor:
+    """Run the routed MXFP4 MLP via the trtllm-gen W4A16 bf16-act runner.
+
+    Produces this rank's *local* partial output (tokens routed to off-rank experts contribute
+    zero, exactly like the torch reference's ``valid_route`` masking); the sharding transform's
+    all_reduce sums local partials across EP ranks. Mirrors the trtllm-gen EP-allreduce pattern
+    used by the NVFP4/FP8 paths (local expert coords, ``local_expert_offset=0``).
+    """
+    leading_shape = hidden_states.shape[:-1]
+    hidden_size = hidden_states.shape[-1]
+    x2d = hidden_states.reshape(-1, hidden_size).to(torch.bfloat16)
+    num_tokens = x2d.shape[0]
+
+    local_experts = gate_up_blocks.shape[0]
+    intermediate_size = gate_up_blocks.shape[1] // 2  # gate_up "2I" rows / 2
+
+    prepared, sg_alpha, sg_beta, sg_limit = _prepare_trtllm_gen_mxfp4_cached(
+        hidden_size,
+        intermediate_size,
+        gate_up_blocks,
+        gate_up_scales,
+        gate_up_bias,
+        down_blocks,
+        down_bias,
+        down_scales,
+        alpha,
+        limit,
+    )
+
+    # Global -> local expert coords + remote-route masking. Off-rank routes are tagged with the
+    # invalid sentinel ``expert_id == local_experts`` (== num_experts here) so the kernel SKIPS
+    # them — matching the trtllm-gen EP convention (``invalid_expert_id = num_experts`` in
+    # ``_run_moe_with_alltoall``). Clamping them onto a valid expert instead floods that expert's
+    # routing histogram and drops real routes (capacity overflow), under-computing the output.
+    sel = selected_experts.reshape(num_tokens, -1)
+    top_k = sel.shape[-1]
+    local_idx = sel.to(torch.int64) - int(expert_start)
+    valid = (local_idx >= 0) & (local_idx < local_experts)
+    local_idx = torch.where(valid, local_idx, torch.full_like(local_idx, local_experts)).to(
+        torch.int32
+    )
+    weights = (routing_weights.reshape(num_tokens, top_k).to(torch.float32) * valid).to(
+        torch.bfloat16
+    )
+
+    # Pad activations to the kernel's expected (padded) hidden dim (multiple of 512).
+    expected_hidden = int(prepared.fc1_weights_mxfp4.shape[-1] * 2)
+    if expected_hidden > hidden_size:
+        x2d = torch.nn.functional.pad(x2d, (0, expected_hidden - hidden_size))
+
+    intermediate_size_padded = int(prepared.fc1_weights_mxfp4.shape[1] // 2)
+    result = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
+        None,  # routing_logits (precomputed routing -> None)
+        None,  # routing_bias
+        x2d,
+        prepared.fc1_weights_mxfp4,
+        prepared.fc1_weights_scale_ue8m0,
+        prepared.fc1_bias_f32,
+        sg_alpha,
+        sg_beta,
+        sg_limit,
+        prepared.fc2_weights_mxfp4,
+        prepared.fc2_weights_scale_ue8m0,
+        prepared.fc2_bias_f32,
+        local_experts,  # num_experts (local routing space; topk_ids in [0, local_experts))
+        int(top_k),
+        None,  # n_group
+        None,  # topk_group
+        intermediate_size_padded,
+        prepared.valid_hidden_size,
+        prepared.valid_intermediate_size,
+        0,  # local_expert_offset (local expert coords)
+        local_experts,  # local_num_experts
+        None,  # routed_scaling_factor (already folded into routing_weights upstream)
+        1,  # routing_method_type = Renormalize (no-op: topk precomputed)
+        0,  # act_type = SwiGlu
+        topk_weights=weights,
+        topk_ids=local_idx,
+    )
+
+    valid_h = prepared.valid_hidden_size
+    if result.shape[-1] > valid_h:
+        result = result[..., :valid_h].contiguous()
+    return result.reshape(*leading_shape, valid_h).to(hidden_states.dtype)
+
+
 def _run_torch_mxfp4_from_routing_core(
     hidden_states: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -464,6 +680,25 @@ def _run_torch_mxfp4_from_routing_core(
     gate_up_order: str = "up_gate",
     swiglu_mode: str = "deepseek",
 ) -> torch.Tensor:
+    # Blackwell fast path: the DSV4 (up_gate / deepseek-SwiGLU) routed MXFP4 MLP runs on the
+    # trtllm-gen W4A16 bf16-act runner instead of the fp32 dequant+bmm reference. gpt-oss
+    # (interleaved / gpt_oss-SwiGLU) and non-SM100 keep the torch reference below.
+    if is_sm_100f() and gate_up_order == "up_gate" and swiglu_mode == "deepseek":
+        return _run_trtllm_gen_mxfp4_from_routing(
+            hidden_states,
+            selected_experts,
+            routing_weights,
+            gate_up_blocks,
+            gate_up_bias,
+            gate_up_scales,
+            down_blocks,
+            down_bias,
+            down_scales,
+            expert_start,
+            alpha,
+            limit,
+        )
+
     leading_shape = hidden_states.shape[:-1]
     hidden_size = hidden_states.shape[-1]
     x = hidden_states.reshape(-1, hidden_size).to(torch.float32)
