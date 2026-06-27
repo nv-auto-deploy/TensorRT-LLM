@@ -33,9 +33,7 @@ except ImportError:  # pragma: no cover - triton always present on CUDA builds
 from ..._compat import KvCacheConfig
 from ...distributed import common as dist_common
 from ...utils.node_utils import extract_op_args
-from ...utils.quantization_utils import fake_fp4_act_quant as _fake_fp4_act_quant
 from ...utils.quantization_utils import fake_fp8_act_quant as _fake_fp8_act_quant
-from ...utils.quantization_utils import hadamard_rotate as _hadamard_rotate
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -225,7 +223,7 @@ def _apply_compressed_rope_and_quantize(
     pe = _apply_interleaved_rope_ref(pe, cos, sin)
     compressed = torch.cat((nope, pe), dim=-1)
     if rotate:
-        return _fake_fp4_act_quant(_hadamard_rotate(compressed), block_size=32)
+        return torch.ops.auto_deploy.deepseek_v4_hadamard_fp4(compressed, 32)
     nope, pe = torch.split(compressed, [nope_dim, rope_dim], dim=-1)
     nope = _fake_fp8_act_quant(nope, block_size=64)
     return torch.cat((nope, pe), dim=-1)

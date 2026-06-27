@@ -44,9 +44,7 @@ from transformers.utils import ModelOutput
 from transformers.utils.hub import cached_file
 
 from ... import custom_ops  # noqa: F401 -- register custom ops
-from ...utils.quantization_utils import fake_fp4_act_quant as _fake_fp4_act_quant
 from ...utils.quantization_utils import fake_fp8_act_quant as _fake_fp8_act_quant
-from ...utils.quantization_utils import hadamard_rotate as _hadamard_rotate
 from ..factory import ModelFactoryRegistry
 from ..hf import AutoModelForCausalLMFactory
 from ..quant_checkpoint_layout import (
@@ -1100,7 +1098,7 @@ class DeepseekV4Compressor(nn.Module):
         )
         compressed = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(nope, pe, cos, sin, False)
         if self.rotate:
-            return _fake_fp4_act_quant(_hadamard_rotate(compressed), block_size=32)
+            return torch.ops.auto_deploy.deepseek_v4_hadamard_fp4(compressed, 32)
 
         nope, pe = torch.split(
             compressed,
@@ -1175,7 +1173,7 @@ class DeepseekV4Indexer(nn.Module):
             dim=-1,
         )
         q = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(q_nope, q_pe, cos, sin, False)
-        q = _fake_fp4_act_quant(_hadamard_rotate(q), block_size=32)
+        q = torch.ops.auto_deploy.deepseek_v4_hadamard_fp4(q, 32)
 
         weights = _linear_module(
             hidden_states,
