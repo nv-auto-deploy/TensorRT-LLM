@@ -40,7 +40,29 @@ import torch
 import triton
 import triton.language as tl
 
+# Autotune the launch occupancy (num_warps / num_stages) per compressed-pool
+# shape.  Each program owns one ``(row, D-block)`` ``[BLOCK_R, BLOCK_D]`` tile and
+# reduces the tiny ratio axis (``R <= 8``) in registers.  The decode grid is large
+# -- the indexer fullrange path launches ``N = B * max_compressed_len`` (~1024)
+# programs -- so it already saturates the SMs and every extra warp/program only
+# adds a cross-warp reduction barrier with no parallelism gain.  ``num_warps=1``
+# (a single-warp shuffle reduction, no shared-memory barrier) measured 2-6x faster
+# than the old hardcoded ``num_warps=4`` across every decode AND prefill shape on
+# B200/sm100; ``num_stages`` is inert (the kernel is loop-free).  Keyed on
+# ``(R, D)`` -- the only dims that change the optimal occupancy -- so each
+# compressor (indexer ``D=128`` / main ``D=512``) tunes once and the choice is
+# reused across all ``N`` (``num_warps=1`` wins for every ``N``).  This mirrors the
+# hardcoded ``num_warps=1`` already shipped for the analogous ``_act_quant_kernel``
+# per-channel reduction, expressed here as an autotune so the cross-warp configs
+# are kept as a measured safety margin.
+_DSV4_COMPRESS_POOL_CONFIGS = [
+    triton.Config({}, num_warps=1, num_stages=1),
+    triton.Config({}, num_warps=2, num_stages=1),
+    triton.Config({}, num_warps=4, num_stages=1),
+]
 
+
+@triton.autotune(configs=_DSV4_COMPRESS_POOL_CONFIGS, key=["R", "D"])
 @triton.jit
 def _dsv4_compress_pool_kernel(
     kv_ptr,  # [N, R, D] contiguous
@@ -126,7 +148,6 @@ def deepseek_v4_compress_pool(kv: torch.Tensor, gate: torch.Tensor) -> torch.Ten
         D,
         BLOCK_R=triton.next_power_of_2(R),
         BLOCK_D=BLOCK_D,
-        num_warps=4,
     )
     return out
 
