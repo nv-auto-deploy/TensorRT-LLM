@@ -50,6 +50,17 @@ import triton
 import triton.language as tl
 
 
+def _hc_combine_configs():
+    # The kernel is a single-CTA-per-row reduction over BLOCK_H (==next_pow2(H))
+    # with a fully-unrolled HM loop, so num_stages is near-inert; the live knob is
+    # num_warps. Decode (N small) wants the widest CTA (nw=32 hides the 4*H fp32
+    # load latency); prefill (N large) saturates SMs and favors fewer warps/CTA.
+    return [
+        triton.Config({}, num_warps=nw, num_stages=ns) for nw in (4, 8, 16, 32) for ns in (1, 2)
+    ]
+
+
+@triton.autotune(configs=_hc_combine_configs(), key=["N", "H", "HM"])
 @triton.jit
 def _hc_weighted_combine_kernel(
     pre_ptr,  # [N, HM] fp32
@@ -137,13 +148,9 @@ def deepseek_v4_hc_combine_rmsnorm(
         return out.reshape(*lead, H)
 
     block_h = triton.next_power_of_2(H)
-    if block_h >= 4096:
-        num_warps = 16
-    elif block_h >= 1024:
-        num_warps = 8
-    else:
-        num_warps = 4
 
+    # num_warps / num_stages are selected per (N, H, HM) by @triton.autotune on
+    # _hc_weighted_combine_kernel (replaces the former coarse block_h-only branch).
     grid = (n,)
     _hc_weighted_combine_kernel[grid](
         pre_f,
@@ -155,7 +162,6 @@ def deepseek_v4_hc_combine_rmsnorm(
         eps,
         HM=hc_mult,
         BLOCK_H=block_h,
-        num_warps=num_warps,
     )
     return out.reshape(*lead, H)
 
