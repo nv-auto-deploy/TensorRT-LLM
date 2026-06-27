@@ -584,18 +584,20 @@ _W8A8_BLOCK_FP8_MATMUL_CONFIGS = [
     triton.Config(
         {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=3
     ),
-    # Prefill / large-M (BLOCK_SIZE_M>=64): num_warps=8 only (deterministic family).
-    triton.Config(
-        {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=4
-    ),
+    # Prefill / large-M (BLOCK_SIZE_M>=64): num_warps=8, BLOCK_SIZE_N=128 only.
+    # IMPORTANT: the stock kernel is run-to-run NON-deterministic on sm100 at large
+    # M (>=256) with large K (>=2048) for several (BLOCK_SIZE_*, num_warps) combos
+    # -- a sparse fp8-MMA pipelining glitch (global RMSE stays ~1e-3 but a few
+    # near-cancellation outputs flip). The old BLOCK_SIZE_M=128/num_warps=4 launch
+    # was itself racy. BLOCK_SIZE_N=256 is faster but RACY at some shapes (e.g.
+    # N=7168,K=2304); BLOCK_SIZE_N=128 with num_warps=8 was verified deterministic
+    # at every measured shape AND still ~2x faster than the old launch, so prefill is
+    # both faster and deterministic. (Prefill does not affect tpot; correctness wins.)
     triton.Config(
         {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=4
     ),
     triton.Config(
         {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=4
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=4
     ),
 ]
 
