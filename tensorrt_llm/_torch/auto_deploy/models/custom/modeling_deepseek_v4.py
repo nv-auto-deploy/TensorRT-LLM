@@ -1533,7 +1533,7 @@ class DeepseekV4Block(nn.Module):
         flat = x.flatten(2).float()
         rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = _linear(flat, hc_fn) * rsqrt
-        pre, post, comb = _hc_split_sinkhorn(
+        pre, post, comb = torch.ops.auto_deploy.hc_split_sinkhorn(
             mixes,
             hc_scale,
             hc_base,
