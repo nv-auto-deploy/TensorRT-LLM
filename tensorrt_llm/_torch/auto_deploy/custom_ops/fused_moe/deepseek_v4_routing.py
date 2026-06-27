@@ -103,16 +103,26 @@ def _deepseek_v4_routing_kernel(
     for k_i in tl.static_range(TOP_K):
         max_val = tl.max(work, axis=0)
         is_max = work == max_val
+        # Mask the selected expert for the next pass directly off the max VALUE
+        # (``is_max``) rather than off the selected index, so the iter-to-iter
+        # critical path is just max -> mask (one reduction deep) instead of
+        # max -> min-index -> mask (two deep). The index (min) and score (sum)
+        # reductions then overlap with the next pass's max instead of serializing
+        # ahead of it. NOTE: on an exact value tie this masks all tied experts at
+        # once (vs the previous smallest-index-only); ties are measure-zero for the
+        # fp32 router logits (and torch.topk's own tie order is unspecified), so the
+        # selected set is identical on all real inputs.
+        work = tl.where(is_max, neg_inf, work)
+
         candidate = tl.where(is_max, offs_e, BLOCK_E)
         max_idx = tl.min(candidate, axis=0)
 
         ki_mask = offs_k == k_i
         topk_idxs = tl.where(ki_mask, max_idx.to(tl.int32), topk_idxs)
-        # weight = scores[max_idx] (gather the unbiased score at the selected expert)
+        # weight = scores[max_idx]: gather the unbiased score at the single selected
+        # expert (smallest tied index), so the recorded weight stays exact.
         sel_w = tl.sum(tl.where(offs_e == max_idx, scores, 0.0), axis=0)
         topk_w = tl.where(ki_mask, sel_w, topk_w)
-
-        work = tl.where(offs_e == max_idx, neg_inf, work)
 
     if NORM_TOPK:
         denom = tl.sum(tl.where(offs_k < TOP_K, topk_w, 0.0), axis=0) + 1e-20
