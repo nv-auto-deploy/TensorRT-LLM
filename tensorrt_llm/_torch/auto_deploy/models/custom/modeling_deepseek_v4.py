@@ -1558,9 +1558,12 @@ class DeepseekV4Block(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ) -> torch.Tensor:
-        y = post.unsqueeze(-1) * x.unsqueeze(-2)
-        y = y + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
-        return y.to(x.dtype)
+        # Fused residual-stream composition collapsing the two broadcast-muls +
+        # M-axis sum + add + bf16 cast into one Triton launch, and skipping the
+        # [N, hc_mult, hc_mult, H] fp32 intermediate. Bit-faithful (fp32
+        # accumulate, single bf16 store); see deepseek_v4_hc_post.py.
+        #   y[n, o, :] = post[n, o] * x[n, :] + sum_m comb[n, m, o] * residual[n, m, :]
+        return torch.ops.auto_deploy.deepseek_v4_hc_post(x, residual, post, comb)
 
     def forward(
         self,
