@@ -533,7 +533,14 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str
 
     grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)  # noqa: E731
     round_scale = input_scale_fmt.lower() == "ue8m0"
-    _act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size, ROUND_SCALE=round_scale)
+    # Each program reduces exactly one `block_size` (=128) chunk to a single scale
+    # -- a tiny single-reduction workload. One warp (32 lanes, ~4 elems/lane,
+    # intra-warp shuffle, no shared-mem barrier) beats the Triton default
+    # num_warps=4 (128 lanes + a cross-warp reduction) by ~5% on the DeepSeek-V4
+    # decode mean and ~1-2% at prefill, with zero numeric change (drift-controlled
+    # round-robin CUDA-graph microbench on B200/sm100). num_stages is left at the
+    # default -- this kernel is loop-free, so software pipelining is inert.
+    _act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size, ROUND_SCALE=round_scale, num_warps=1)
     return y, s
 
 
