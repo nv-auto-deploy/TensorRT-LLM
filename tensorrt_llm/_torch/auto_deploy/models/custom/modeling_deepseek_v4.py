@@ -1007,9 +1007,16 @@ class DeepseekV4MoE(nn.Module):
             "deepseek",
             "moe",
         )
-        return routed.view(*original_shape).to(hidden_states.dtype) + self.shared_experts(
-            hidden_states
-        )
+        # Sum the routed (EP) and shared (TP) partials while both are still flat
+        # [num_tokens, hidden] so the post-sharding graph contains a *direct*
+        # ``add(all_reduce(routed_local), all_reduce(shared_local))``. Both all_reduces
+        # reduce over the same (world) process group, so ``fuse_collinear_allreduce``
+        # collapses them into a single collective (AR(r)+AR(s)=AR(r+s)). Running the
+        # shared MLP on the flat activation keeps both addends the same rank/shape; the
+        # reshape+cast is deferred to after the add (mathematically identical, since the
+        # MLP and the add are both elementwise per token).
+        combined = routed + self.shared_experts(hidden_states_flat)
+        return combined.view(*original_shape).to(hidden_states.dtype)
 
 
 class DeepseekV4Compressor(nn.Module):

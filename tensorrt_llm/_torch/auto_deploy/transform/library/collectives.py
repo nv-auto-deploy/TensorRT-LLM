@@ -20,14 +20,15 @@ The torch backend (demollm mode) does not benefit from fusion.
 """
 
 from functools import partial
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
-from torch.fx import GraphModule
+from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
+from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
@@ -187,5 +188,161 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             num_matches=num_matches,
             is_clean=num_matches == 0,
             has_valid_shapes=num_matches == 0,
+        )
+        return gm, info
+
+
+# ============================================================================
+# Collinear all-reduce fusion: all_reduce(a) + all_reduce(b) -> all_reduce(a + b)
+# ============================================================================
+
+# Real (post-sharding) distributed all-reduce ops. Both reduce over the *world*
+# process group -- ``trtllm_allreduce`` builds its Mapping with
+# ``tp_size == world_size`` (custom_ops/distributed/trtllm_dist.py) and
+# ``torch_dist_all_reduce`` uses the default group -- so any two of them can be
+# folded: AR(a) + AR(b) == AR(a + b).
+_DIST_ALLREDUCE_OPS = (
+    torch.ops.auto_deploy.trtllm_dist_all_reduce,
+    torch.ops.auto_deploy.torch_dist_all_reduce,
+)
+
+# No-op (shape- and dtype-preserving) wrappers we may walk past between an
+# all_reduce and the consuming add. View/reshape are intentionally excluded:
+# peeling a shape-changing op would leave the two all_reduce inputs with
+# mismatched shapes, so ``in_a + in_b`` would not reproduce the original add.
+_NOOP_WRAPPER_OPS = (
+    torch.ops.aten.clone.default,
+    torch.ops.aten.contiguous.default,
+)
+
+# Cast ops we may walk past *only* when they are no-ops (input dtype == output
+# dtype). The row-parallel MLP's trailing ``.to(x.dtype)`` lowers to
+# ``aten.to.dtype`` (and ``aten._to_copy`` in other paths); when the activation is
+# already in the target dtype this is a pure identity, so folding the add in front
+# of the all_reduce is value-preserving.
+_CAST_OPS = (
+    torch.ops.aten._to_copy.default,
+    torch.ops.aten.to.dtype,
+)
+
+
+def _peel_to_allreduce(node: Node) -> Optional[Node]:
+    """Walk a single-user chain of no-op wrappers back to a distributed all_reduce.
+
+    Returns the all_reduce ``Node`` if ``node`` is -- after skipping no-op
+    clone/contiguous/dtype-preserving cast wrappers -- produced by one of the
+    distributed all-reduce ops, *and* every link on the way (including the
+    all_reduce itself) has exactly one user. The single-user requirement makes the
+    whole chain dead once the add is rewritten, so the fold is a net -1 collective
+    rather than +1. Returns ``None`` if any condition fails.
+    """
+    current = node
+    while isinstance(current, Node):
+        if is_op(current, _DIST_ALLREDUCE_OPS):
+            return current if len(current.users) == 1 else None
+        if len(current.users) != 1:
+            return None
+        if is_op(current, _NOOP_WRAPPER_OPS):
+            current = current.args[0]
+            continue
+        if is_op(current, _CAST_OPS):
+            src = current.args[0]
+            if not isinstance(src, Node):
+                return None
+            src_val = src.meta.get("val")
+            cur_val = current.meta.get("val")
+            # Only skip a genuine no-op cast (same dtype). A real dtype change
+            # before vs. after the reduction would alter accumulation precision.
+            if src_val is not None and cur_val is not None and src_val.dtype == cur_val.dtype:
+                current = src
+                continue
+            return None
+        return None
+    return None
+
+
+@TransformRegistry.register("fuse_collinear_allreduce")
+class FuseCollinearAllreduce(BaseTransform):
+    """Fold two same-group all-reduces feeding one add into a single all-reduce.
+
+    all_reduce is linear across ranks, so ``AR(a) + AR(b) == AR(a + b)``. In
+    AutoDeploy every ``*_dist_all_reduce`` reduces over the *world* process group,
+    so the EP all_reduce inserted by ``apply_sharding_hints`` for a routed MoE op
+    and the TP all_reduce of a row-parallel linear are both world reductions and
+    can be folded when they meet at an add.
+
+    Canonical case: DeepSeek-V4's MoE forward returns
+    ``routed_experts (EP all_reduce) + shared_experts (TP all_reduce)`` -- two
+    collectives per MoE layer where one suffices.
+
+    Fires only when both all_reduces (a) use the same op + strategy, (b) feed the
+    add as their sole consumer (so the fold is a net -1 collective, not +1), and
+    (c) carry matching input shapes (so ``a + b`` reproduces the original add).
+    This runs in post_load_fusion, after ``apply_sharding_hints`` has materialized
+    the real collectives.
+    """
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        if not self.config.enabled:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        graph = gm.graph
+        cnt = 0
+        for node in list(graph.nodes):
+            if not is_op(node, torch.ops.aten.add.Tensor) or len(node.args) < 2:
+                continue
+            lhs, rhs = node.args[0], node.args[1]
+            if not (isinstance(lhs, Node) and isinstance(rhs, Node)):
+                continue
+            ar_a = _peel_to_allreduce(lhs)
+            ar_b = _peel_to_allreduce(rhs)
+            if ar_a is None or ar_b is None or ar_a is ar_b:
+                continue
+            # Same collective op (=> same world group) and same strategy.
+            if ar_a.target is not ar_b.target:
+                continue
+            strat_a = ar_a.args[1] if len(ar_a.args) > 1 else ar_a.kwargs.get("strategy")
+            strat_b = ar_b.args[1] if len(ar_b.args) > 1 else ar_b.kwargs.get("strategy")
+            if strat_a != strat_b:
+                continue
+            in_a, in_b = ar_a.args[0], ar_b.args[0]
+            if not (isinstance(in_a, Node) and isinstance(in_b, Node)):
+                continue
+            val_a = in_a.meta.get("val")
+            val_b = in_b.meta.get("val")
+            # Matching shapes => (in_a + in_b) reproduces the original add exactly.
+            if val_a is None or val_b is None or tuple(val_a.shape) != tuple(val_b.shape):
+                continue
+
+            with graph.inserting_before(node):
+                summed = graph.call_function(torch.ops.aten.add.Tensor, args=(in_a, in_b))
+                summed.meta["val"] = torch.empty(val_a.shape, dtype=val_a.dtype, device="meta")
+                fused_ar = graph.call_function(ar_a.target, args=(summed, strat_a))
+                ref_val = node.meta.get("val")
+                if ref_val is not None:
+                    fused_ar.meta["val"] = torch.empty(
+                        ref_val.shape, dtype=ref_val.dtype, device="meta"
+                    )
+            node.replace_all_uses_with(fused_ar)
+            cnt += 1
+
+        if cnt > 0:
+            graph.eliminate_dead_code()
+            gm.recompile()
+            ad_logger.info(f"fused {cnt} collinear all_reduce pair(s) -> single all_reduce")
+
+        info = TransformInfo(
+            skipped=False,
+            num_matches=cnt,
+            is_clean=cnt == 0,
+            has_valid_shapes=cnt == 0,
         )
         return gm, info
