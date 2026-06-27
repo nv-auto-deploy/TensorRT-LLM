@@ -562,15 +562,24 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str
 #     BLOCK_SIZE_M=128/num_warps=4 launch. The autotuner selects on latency only,
 #     so the racy num_warps=4 large-tile configs are deliberately excluded.
 _W8A8_BLOCK_FP8_MATMUL_CONFIGS = [
-    # Decode / small-M (BLOCK_SIZE_M=16): BLOCK_SIZE_N=64 latency win, num_warps=4.
-    # The K-loop-latency-bound K=7168 GEMV (which dominates the decode mean) is ~15%
-    # faster with num_warps=4 than 8; num_warps=8 only marginally helps the small-K
-    # decode shapes. Offering both makes the autotuner's do_bench flip on the
-    # ~18-21us K=7168 kernels run-to-run (it cannot reliably resolve the gap), so we
-    # pin decode to num_warps=4 for a lower, variance-free decode mean. The two
-    # num_stages entries are a near-tie (harmless if the autotuner swaps them).
+    # Decode / small-M (BLOCK_SIZE_M=16), num_warps=4. The M=1 GEMV is dominated by
+    # the K=7168 projections; the right BLOCK_SIZE_N depends on N:
+    #   * small N (<=~4k): BLOCK_SIZE_N=32 spreads the work over more CTAs and is
+    #     ~20% faster than 64 (e.g. N=256/K=7168: 14.3 vs 18.1 us).
+    #   * large N (e.g. 7168): BLOCK_SIZE_N=64 wins -- 32 would launch >2x the SM
+    #     count and run a second wave (N=7168/K=2048: 8.3 vs 11.9 us).
+    # The autotuner (keyed on N) resolves the 20-30% gap reliably. num_warps is
+    # pinned to 4 (vs 8) because the K=7168 GEMV is ~15% faster at 4 and the 4-vs-8
+    # gap is too small for do_bench to resolve, which would re-introduce run-to-run
+    # selection flicker. num_stages 3/4 is a harmless near-tie.
+    triton.Config(
+        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=4
+    ),
     triton.Config(
         {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=4
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=3
     ),
     triton.Config(
         {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=3
