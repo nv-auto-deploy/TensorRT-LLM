@@ -1529,8 +1529,8 @@ class DeepseekV4Block(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm: "DeepseekV4RMSNorm",
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        original_shape = x.shape
         flat = x.flatten(2).float()
         rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = _linear(flat, hc_fn) * rsqrt
@@ -1542,8 +1542,14 @@ class DeepseekV4Block(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        y = torch.sum(pre.unsqueeze(-1) * flat.view(original_shape), dim=2)
-        return y.to(x.dtype), post, comb
+        # Fused weighted-combine over the hc_mult axis folded with the immediately
+        # following block RMSNorm: y = norm(sum_m pre[m] * flat[m*H:]). Replaces a
+        # broadcast-mul + sum-reduce + bf16 cast + the RMSNorm kernel swarm with a
+        # single launch and skips the [N, hc_mult, H] fp32 intermediate.
+        y = torch.ops.auto_deploy.deepseek_v4_hc_combine_rmsnorm(
+            pre, flat, norm.weight, norm.eps, self.hc_mult, x.dtype
+        )
+        return y, post, comb
 
     @staticmethod
     def _hc_post(
@@ -1569,13 +1575,15 @@ class DeepseekV4Block(nn.Module):
         input_ids: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
+        # _hc_pre now returns the post-combine hidden states already normalized by
+        # attn_norm (fused), so the explicit norm call is dropped here.
         hidden_states, post, comb = self._hc_pre(
             hidden_states,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
+            self.attn_norm,
         )
-        hidden_states = self.attn_norm(hidden_states)
         hidden_states = self.attn(hidden_states, position_embeddings, position_ids)
         hidden_states = self._hc_post(hidden_states, residual, post, comb)
 
@@ -1585,8 +1593,8 @@ class DeepseekV4Block(nn.Module):
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
+            self.ffn_norm,
         )
-        hidden_states = self.ffn_norm(hidden_states)
         hidden_states = self.ffn(hidden_states, input_ids)
         return self._hc_post(hidden_states, residual, post, comb)
 
