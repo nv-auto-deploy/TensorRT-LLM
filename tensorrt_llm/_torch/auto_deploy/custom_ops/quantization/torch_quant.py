@@ -540,6 +540,61 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str
 # Adapted from sgl-project/sglang fp8 block matmul kernel, vendored here to
 # decouple from transformers.integrations.finegrained_fp8 (which removed
 # w8a8_block_fp8_matmul_triton in transformers 5.5.x).
+#
+# Autotune over (BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M, num_warps, num_stages).
+# BLOCK_SIZE_K is intentionally NOT autotuned -- it is passed at the call site and
+# pinned to the quantization group_k so the in-loop scale index
+# ``offs_ks = (k * BLOCK_SIZE_K) // group_k`` never straddles a scale block
+# (a K-tile that does not divide group_k would load one scale for several groups
+# and corrupt the result). BLOCK_SIZE_N / BLOCK_SIZE_M fetch per-element scales so
+# they are free to tune.
+#
+# Tuning was driven by a CUDA-graph-amortized microbench on B200 (sm100) over the
+# DeepSeek-V4 MLA/dense per-rank projection shapes:
+#   * M=1/2 decode is a K-loop-latency-bound GEMV (K=7168 hits an ~18us floor
+#     independent of N). BLOCK_SIZE_N=64 + tuned warps/stages beats the old fixed
+#     BLOCK_SIZE_N=128 by ~28% on the decode mean.
+#   * For M>=64 large-K (>=2048) prefill the stock kernel is run-to-run
+#     NON-deterministic on sm100 with num_warps=4 (a sparse fp8-MMA pipelining
+#     glitch; global RMSE stays ~1e-3 but a few near-cancellation outputs flip).
+#     Every BLOCK_SIZE_M>=64 config below therefore uses num_warps=8, which was
+#     verified deterministic at the worst shape AND ~2.8x faster than the old
+#     BLOCK_SIZE_M=128/num_warps=4 launch. The autotuner selects on latency only,
+#     so the racy num_warps=4 large-tile configs are deliberately excluded.
+_W8A8_BLOCK_FP8_MATMUL_CONFIGS = [
+    # Decode / small-M (BLOCK_SIZE_M=16): BLOCK_SIZE_N=64 latency win.
+    triton.Config(
+        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=4
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=3
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=3
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=4
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=3
+    ),
+    # Prefill / large-M (BLOCK_SIZE_M>=64): num_warps=8 only (deterministic family).
+    triton.Config(
+        {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=4
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=4
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=4
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=4
+    ),
+]
+
+
+@triton.autotune(configs=_W8A8_BLOCK_FP8_MATMUL_CONFIGS, key=["M", "N", "K"])
 @triton.jit
 def _w8a8_block_fp8_matmul_kernel(
     A,
@@ -644,12 +699,9 @@ def _w8a8_block_fp8_matmul_triton(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
-    BLOCK_SIZE_M = 128
-    if M < BLOCK_SIZE_M:
-        BLOCK_SIZE_M = max(triton.next_power_of_2(M), 16)
-    BLOCK_SIZE_K = block_k
-    BLOCK_SIZE_N = block_n
-
+    # BLOCK_SIZE_M / BLOCK_SIZE_N / GROUP_SIZE_M / num_warps / num_stages come from
+    # the @triton.autotune config (keyed on M, N, K). BLOCK_SIZE_K is pinned to the
+    # quantization block size for scale-indexing correctness (see kernel comment).
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
 
@@ -674,10 +726,7 @@ def _w8a8_block_fp8_matmul_triton(
         As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=8,
+        BLOCK_SIZE_K=block_k,
     )
     return C
 
