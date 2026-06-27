@@ -844,9 +844,13 @@ def _w8a8_block_fp8_matmul_splitk_kernel(
 
 
 # Split-K launch config for the decode GEMV. Tuned (kernel_layout axis) on B200 over
-# the DeepSeek-V4 MLA/dense K=7168 decode projection shapes.
+# the DeepSeek-V4 MLA/dense K=7168 decode projection shapes (N in {256,576,1536,2304}).
 _SPLITK_BLOCK_SIZE_M = 16
-_SPLITK_DEFAULT = {"SPLIT_K": 8, "BLOCK_SIZE_N": 64, "num_warps": 4, "num_stages": 3}
+# SPLIT_K=24 over the 56-K-block (K=7168) reduction puts ~2-3 K-blocks per CTA and
+# fills the SMs; it is within ~1% of the per-shape optimum (16..32) for every shape.
+_SPLITK_SPLIT_K = 24
+_SPLITK_NUM_WARPS = 4
+_SPLITK_NUM_STAGES = 3
 # Gate: small M (decode) + long K reduction, where the base grid is CTA-starved.
 _SPLITK_MAX_M = 4
 _SPLITK_MIN_K = 4096
@@ -854,6 +858,20 @@ _SPLITK_MIN_K = 4096
 
 def _use_splitk_decode(M: int, N: int, K: int) -> bool:
     return M <= _SPLITK_MAX_M and K >= _SPLITK_MIN_K
+
+
+def _splitk_block_n(N: int) -> int:
+    """BLOCK_SIZE_N for the split-K decode GEMV, scaled with N.
+
+    Small N is CTA-starved so a narrow N-tile spreads work over more CTAs; large N
+    has enough output tiles that a wide N-tile (better MMA / fewer atomic stores)
+    wins. Measured B200 optima: N=256->32, N=576->64, N>=1024 (1536/2304)->128.
+    """
+    if N <= 512:
+        return 32
+    if N >= 1024:
+        return 128
+    return 64
 
 
 def _w8a8_block_fp8_matmul_splitk(
@@ -868,18 +886,22 @@ def _w8a8_block_fp8_matmul_splitk(
     N: int,
     K: int,
     *,
-    SPLIT_K: int = _SPLITK_DEFAULT["SPLIT_K"],
-    BLOCK_SIZE_N: int = _SPLITK_DEFAULT["BLOCK_SIZE_N"],
-    num_warps: int = _SPLITK_DEFAULT["num_warps"],
-    num_stages: int = _SPLITK_DEFAULT["num_stages"],
+    SPLIT_K: Optional[int] = None,
+    BLOCK_SIZE_N: Optional[int] = None,
+    num_warps: int = _SPLITK_NUM_WARPS,
+    num_stages: int = _SPLITK_NUM_STAGES,
 ) -> torch.Tensor:
     """Split-K block-FP8 GEMM for the decode GEMV (see kernel docstring above).
 
     Accumulates fp32 partials from ``SPLIT_K`` contraction-slices via atomics into a
-    pre-zeroed fp32 buffer, then casts to ``output_dtype``. The launch config is
-    exposed as keyword args so the microbench can sweep it; the dispatch in
-    ``_w8a8_block_fp8_matmul_triton`` uses the tuned ``_SPLITK_DEFAULT``.
+    pre-zeroed fp32 buffer, then casts to ``output_dtype``. ``SPLIT_K`` /
+    ``BLOCK_SIZE_N`` default (``None``) to the tuned heuristic (``_SPLITK_SPLIT_K`` /
+    ``_splitk_block_n``); the microbench passes them explicitly to sweep the config.
     """
+    if SPLIT_K is None:
+        SPLIT_K = _SPLITK_SPLIT_K
+    if BLOCK_SIZE_N is None:
+        BLOCK_SIZE_N = _splitk_block_n(N)
     C_shape = A.shape[:-1] + (N,)
     # fp32 accumulator, pre-zeroed for the atomic reduction across SPLIT_K CTAs.
     C_acc = A.new_zeros(C_shape, dtype=torch.float32)
