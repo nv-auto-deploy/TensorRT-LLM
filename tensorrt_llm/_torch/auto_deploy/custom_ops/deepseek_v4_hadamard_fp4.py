@@ -166,7 +166,18 @@ def deepseek_v4_hadamard_fp4(x: torch.Tensor, block_size: int = 32) -> torch.Ten
         INV_SQRT_DIM=float(dim**-0.5),
         FP4_MAX=_FP4_MAX,
         FP4_MIN=_FP4_MIN,
-        num_warps=4,
+        # Occupancy (idea_0046): one warp per program. Each program handles a
+        # single DIM<=256 row, so 32 lanes (1 warp) cover it with intra-warp
+        # shuffles for the FP4 block reductions; extra warps add cross-warp smem
+        # barriers. Robust interleaved microbench (B200, clock-pinned, noise
+        # gauge ~0%): nw1 is parity at the tiny decode shapes (R<=32, e.g. the
+        # R=8 indexer-q site is latency-bound with few CTAs) and a real win once
+        # enough rows saturate the SMs (R=512 -1.8%, R=1024 -6.4%) -- i.e. it
+        # helps the prefill / large-compressor paths and never regresses decode.
+        # num_stages=1 is pinned as a zero-cost guard: the kernel is loop-free so
+        # there is nothing to pipeline (nw*/default == nw*/s1, fully inert).
+        num_warps=1,
+        num_stages=1,
     )
     return out
 
