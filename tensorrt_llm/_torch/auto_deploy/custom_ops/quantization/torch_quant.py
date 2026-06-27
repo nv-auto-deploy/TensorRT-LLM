@@ -562,21 +562,18 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str
 #     BLOCK_SIZE_M=128/num_warps=4 launch. The autotuner selects on latency only,
 #     so the racy num_warps=4 large-tile configs are deliberately excluded.
 _W8A8_BLOCK_FP8_MATMUL_CONFIGS = [
-    # Decode / small-M (BLOCK_SIZE_M=16): BLOCK_SIZE_N=64 latency win.
+    # Decode / small-M (BLOCK_SIZE_M=16): BLOCK_SIZE_N=64 latency win, num_warps=4.
+    # The K-loop-latency-bound K=7168 GEMV (which dominates the decode mean) is ~15%
+    # faster with num_warps=4 than 8; num_warps=8 only marginally helps the small-K
+    # decode shapes. Offering both makes the autotuner's do_bench flip on the
+    # ~18-21us K=7168 kernels run-to-run (it cannot reliably resolve the gap), so we
+    # pin decode to num_warps=4 for a lower, variance-free decode mean. The two
+    # num_stages entries are a near-tie (harmless if the autotuner swaps them).
     triton.Config(
         {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=4
     ),
     triton.Config(
         {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=3
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=3
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=4
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=3
     ),
     # Prefill / large-M (BLOCK_SIZE_M>=64): num_warps=8 only (deterministic family).
     triton.Config(
