@@ -614,21 +614,6 @@ def _build_rope_tables(
     return freqs.cos(), freqs.sin()
 
 
-def _apply_interleaved_rope(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    inverse: bool = False,
-) -> torch.Tensor:
-    if inverse:
-        sin = -sin
-    x_even = x[..., 0::2]
-    x_odd = x[..., 1::2]
-    out_even = x_even * cos - x_odd * sin
-    out_odd = x_even * sin + x_odd * cos
-    return torch.stack((out_even, out_odd), dim=-1).flatten(-2).to(x.dtype)
-
-
 def _window_topk_idxs(
     window_size: int,
     batch_size: int,
@@ -1103,8 +1088,7 @@ class DeepseekV4Compressor(nn.Module):
             [self.head_dim - self.rope_head_dim, self.rope_head_dim],
             dim=-1,
         )
-        pe = _apply_interleaved_rope(pe, cos, sin)
-        compressed = torch.cat((nope, pe), dim=-1)
+        compressed = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(nope, pe, cos, sin, False)
         if self.rotate:
             return _fake_fp4_act_quant(_hadamard_rotate(compressed), block_size=32)
 
@@ -1180,8 +1164,8 @@ class DeepseekV4Indexer(nn.Module):
             [self.index_head_dim - self.rope_head_dim, self.rope_head_dim],
             dim=-1,
         )
-        q_pe = _apply_interleaved_rope(q_pe, cos.unsqueeze(2), sin.unsqueeze(2))
-        q = _fake_fp4_act_quant(_hadamard_rotate(torch.cat((q_nope, q_pe), dim=-1)), block_size=32)
+        q = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(q_nope, q_pe, cos, sin, False)
+        q = _fake_fp4_act_quant(_hadamard_rotate(q), block_size=32)
 
         weights = _linear_module(
             hidden_states,
@@ -1340,11 +1324,12 @@ class DeepseekV4Attention(nn.Module):
 
         q_nope, q_pe = torch.split(q, [self.nope_head_dim, self.rope_head_dim], dim=-1)
         kv_nope, kv_pe = torch.split(kv, [self.nope_head_dim, self.rope_head_dim], dim=-1)
-        q_pe = _apply_interleaved_rope(q_pe, cos.unsqueeze(2), sin.unsqueeze(2))
-        kv_pe = _apply_interleaved_rope(kv_pe, cos, sin)
         kv_nope = _fake_fp8_act_quant(kv_nope, block_size=64)
-        q = torch.cat((q_nope, q_pe), dim=-1)
-        kv = torch.cat((kv_nope, kv_pe), dim=-1)
+        # Fused interleaved-RoPE + concat: rotates the pe slice and writes
+        # ``cat((nope, rope(pe)))`` in one kernel — removes the rope elementwise
+        # swarm, the rope ``stack`` and the explicit ``cat`` per call.
+        q = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(q_nope, q_pe, cos, sin, False)
+        kv = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(kv_nope, kv_pe, cos, sin, False)
 
         empty_compressor_state = kv.new_empty(batch_size, seq_len, 0)
         empty_compressor_ape = kv.new_empty(0, 0)
@@ -1464,8 +1449,9 @@ class DeepseekV4Attention(nn.Module):
             [self.nope_head_dim, self.rope_head_dim],
             dim=-1,
         )
-        out_pe = _apply_interleaved_rope(out_pe, cos.unsqueeze(2), sin.unsqueeze(2), inverse=True)
-        attn_output = torch.cat((out_nope, out_pe), dim=-1)
+        attn_output = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(
+            out_nope, out_pe, cos, sin, True
+        )
         attn_output = torch.ops.auto_deploy.view(
             attn_output,
             [batch_size, seq_len, self.n_groups, self.group_head_width],
