@@ -28,6 +28,8 @@ import triton
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
     _safe_act_quant,
+    _use_splitk_decode,
+    _w8a8_block_fp8_matmul_splitk,
     _w8a8_block_fp8_matmul_triton,
 )
 
@@ -135,3 +137,73 @@ def test_decode_gemv_multi_kblock():
         out, ref = _run(1, N, K, seed=1)
         scale = ref.abs().amax().clamp(min=1e-6)
         assert ((out.float() - ref).abs().amax() / scale).item() < 1.5e-2, f"N={N} K={K}"
+
+
+# ----------------------------------------------------------------------------------
+# Split-K decode path (idea_0025, kernel_layout). The split-K kernel partitions the
+# K reduction across SPLIT_K CTAs and reduces fp32 partials via atomics; the result
+# must match the same fp64 dequant->matmul ground truth as the full-K kernel.
+# ----------------------------------------------------------------------------------
+
+
+def _run_splitk(M, N, K, split_k, block_size_n=64, num_warps=4, seed=0):
+    """Drive the split-K helper directly (independent of the dispatch gate)."""
+    torch.manual_seed(seed)
+    block_n = block_k = 128
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    a_fp8, a_s = _safe_act_quant(a.contiguous(), block_k)
+    b_fp8, b_s = _quant_weight_block_fp8(b, block_n, block_k)
+    out = _w8a8_block_fp8_matmul_splitk(
+        a_fp8,
+        b_fp8,
+        a_s,
+        b_s,
+        block_n,
+        block_k,
+        torch.bfloat16,
+        M,
+        N,
+        K,
+        SPLIT_K=split_k,
+        BLOCK_SIZE_N=block_size_n,
+        num_warps=num_warps,
+    )
+    ref = (_dequant_act(a_fp8, a_s).double() @ _dequant_weight(b_fp8, b_s).double().t()).float()
+    return out, ref
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
+@pytest.mark.parametrize("split_k", [2, 4, 7, 8, 16])
+@pytest.mark.parametrize("M", [1, 2])
+@pytest.mark.parametrize("N,K", [(1536, 7168), (576, 7168), (2304, 7168), (256, 7168)])
+def test_splitk_matches_reference(M, N, K, split_k):
+    """Split-K GEMV == fp64 ground truth for the K=7168 decode projection shapes,
+    across SPLIT_K values (incl. 7 and 16 that do NOT divide the 56 K-blocks evenly,
+    exercising the ragged-tail K-mask)."""
+    out, ref = _run_splitk(M, N, K, split_k)
+    assert out.shape == (M, N) and out.dtype == torch.bfloat16
+    scale = ref.abs().amax().clamp(min=1e-6)
+    max_rel = ((out.float() - ref).abs().amax() / scale).item()
+    assert max_rel < 1.5e-2, f"M={M} N={N} K={K} SPLIT_K={split_k}: max_rel={max_rel:.4e}"
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
+@pytest.mark.parametrize("split_k", [4, 8])
+@pytest.mark.parametrize("block_size_n", [32, 64, 128])
+def test_splitk_block_n_and_ragged_n(split_k, block_size_n):
+    """Split-K with N NOT a multiple of BLOCK_SIZE_N (576) across BLOCK_SIZE_N
+    choices -- guards the masked-tile atomic store."""
+    out, ref = _run_splitk(1, 576, 7168, split_k, block_size_n=block_size_n)
+    scale = ref.abs().amax().clamp(min=1e-6)
+    max_rel = ((out.float() - ref).abs().amax() / scale).item()
+    assert max_rel < 1.5e-2, f"N=576 BLOCK_N={block_size_n} SPLIT_K={split_k}: {max_rel:.4e}"
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
+def test_splitk_dispatch_gate():
+    """The dispatch gate routes only small-M + long-K shapes to split-K."""
+    assert _use_splitk_decode(1, 256, 7168)
+    assert _use_splitk_decode(2, 1536, 7168)
+    assert not _use_splitk_decode(64, 1536, 7168)  # prefill M
+    assert not _use_splitk_decode(1, 7168, 2048)  # short K (already CTA-rich)

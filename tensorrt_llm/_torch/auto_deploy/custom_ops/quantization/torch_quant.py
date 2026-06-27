@@ -712,6 +712,18 @@ def _w8a8_block_fp8_matmul_triton(
     assert triton.cdiv(K, block_k) == Bs.shape[1]
 
     C_shape = A.shape[:-1] + (N,)
+
+    # Split-K decode path: at small M (decode GEMV) with a long K reduction the
+    # default one-CTA-per-(M,N)-tile kernel walks the entire K dimension in a single
+    # serial loop and launches only ``cdiv(N, BLOCK_N)`` CTAs (e.g. M=1,N=256,K=7168
+    # -> 4-8 CTAs over 56 K-blocks), leaving the GPU almost idle and bottlenecked on
+    # K-loop latency. ``_w8a8_block_fp8_matmul_splitk`` partitions the K reduction
+    # across ``SPLIT_K`` CTAs (grid axis 1) and reduces the fp32 partials, raising
+    # occupancy ~SPLIT_K x. Restricted to small M + large K where the base grid is
+    # CTA-starved; everything else keeps the autotuned full-K kernel.
+    if _use_splitk_decode(M, N, K):
+        return _w8a8_block_fp8_matmul_splitk(A, B, As, Bs, block_n, block_k, output_dtype, M, N, K)
+
     C = A.new_empty(C_shape, dtype=output_dtype)
 
     # BLOCK_SIZE_M / BLOCK_SIZE_N / GROUP_SIZE_M / num_warps / num_stages come from
@@ -744,6 +756,169 @@ def _w8a8_block_fp8_matmul_triton(
         BLOCK_SIZE_K=block_k,
     )
     return C
+
+
+# Split-K decode GEMV reduction layout (kernel_layout axis, idea_0025).
+#
+# The full-K kernel above assigns one CTA per (M,N) output tile and walks the whole
+# K dimension serially. At decode M (1/2) with K=7168 (56 K-blocks of 128) the base
+# grid is only cdiv(N, BLOCK_N) CTAs (4-36 for the DeepSeek-V4 MLA/dense projection
+# Ns), so the kernel is reduction-/latency-bound and the GPU is almost idle.
+#
+# This kernel splits the K reduction across ``SPLIT_K`` CTAs (grid axis 1). Each CTA
+# strides through ``k = pid_sk, pid_sk+SPLIT_K, ...`` K-blocks (balanced + handles a
+# K-block count not divisible by SPLIT_K via the existing K-mask), accumulates its
+# partial in fp32, and ``tl.atomic_add``s into a pre-zeroed fp32 accumulator. The
+# split is along the contraction only, so the result equals the serial sum up to
+# fp32 add-ordering (~1e-7 rel, far under the fp8 quant error); decode is bit-stable
+# enough for the strict M=1/2 accuracy bar. BLOCK_SIZE_K stays pinned to the
+# quantization group_k so the per-block scale index never straddles a scale block.
+@triton.jit
+def _w8a8_block_fp8_matmul_splitk_kernel(
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    M,
+    N,
+    K,
+    group_n,
+    group_k,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_As_m,
+    stride_As_k,
+    stride_Bs_k,
+    stride_Bs_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    pid_sk = tl.program_id(axis=1)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    # Start each split at its own K-block; stride by SPLIT_K K-blocks per loop step.
+    a_ptrs = A + (
+        offs_am[:, None] * stride_am + (pid_sk * BLOCK_SIZE_K + offs_k)[None, :] * stride_ak
+    )
+    b_ptrs = B + (
+        (pid_sk * BLOCK_SIZE_K + offs_k)[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    )
+
+    As_ptrs = As + offs_am * stride_As_m
+    offs_bsn = offs_bn // group_n
+    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    num_k = tl.cdiv(K, BLOCK_SIZE_K)
+    for k in range(pid_sk, num_k, SPLIT_K):
+        k_remaining = K - k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
+
+        offs_ks = (k * BLOCK_SIZE_K) // group_k
+        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        a_ptrs += SPLIT_K * BLOCK_SIZE_K * stride_ak
+        b_ptrs += SPLIT_K * BLOCK_SIZE_K * stride_bk
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
+
+
+# Split-K launch config for the decode GEMV. Tuned (kernel_layout axis) on B200 over
+# the DeepSeek-V4 MLA/dense K=7168 decode projection shapes.
+_SPLITK_BLOCK_SIZE_M = 16
+_SPLITK_DEFAULT = {"SPLIT_K": 8, "BLOCK_SIZE_N": 64, "num_warps": 4, "num_stages": 3}
+# Gate: small M (decode) + long K reduction, where the base grid is CTA-starved.
+_SPLITK_MAX_M = 4
+_SPLITK_MIN_K = 4096
+
+
+def _use_splitk_decode(M: int, N: int, K: int) -> bool:
+    return M <= _SPLITK_MAX_M and K >= _SPLITK_MIN_K
+
+
+def _w8a8_block_fp8_matmul_splitk(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    output_dtype: torch.dtype,
+    M: int,
+    N: int,
+    K: int,
+    *,
+    SPLIT_K: int = _SPLITK_DEFAULT["SPLIT_K"],
+    BLOCK_SIZE_N: int = _SPLITK_DEFAULT["BLOCK_SIZE_N"],
+    num_warps: int = _SPLITK_DEFAULT["num_warps"],
+    num_stages: int = _SPLITK_DEFAULT["num_stages"],
+) -> torch.Tensor:
+    """Split-K block-FP8 GEMM for the decode GEMV (see kernel docstring above).
+
+    Accumulates fp32 partials from ``SPLIT_K`` contraction-slices via atomics into a
+    pre-zeroed fp32 buffer, then casts to ``output_dtype``. The launch config is
+    exposed as keyword args so the microbench can sweep it; the dispatch in
+    ``_w8a8_block_fp8_matmul_triton`` uses the tuned ``_SPLITK_DEFAULT``.
+    """
+    C_shape = A.shape[:-1] + (N,)
+    # fp32 accumulator, pre-zeroed for the atomic reduction across SPLIT_K CTAs.
+    C_acc = A.new_zeros(C_shape, dtype=torch.float32)
+
+    grid = (
+        triton.cdiv(M, _SPLITK_BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
+        SPLIT_K,
+    )
+    _w8a8_block_fp8_matmul_splitk_kernel[grid](
+        A,
+        B,
+        C_acc,
+        As,
+        Bs,
+        M,
+        N,
+        K,
+        block_n,
+        block_k,
+        A.stride(-2),
+        A.stride(-1),
+        B.stride(1),
+        B.stride(0),
+        C_acc.stride(-2),
+        C_acc.stride(-1),
+        As.stride(-2),
+        As.stride(-1),
+        Bs.stride(1),
+        Bs.stride(0),
+        BLOCK_SIZE_M=_SPLITK_BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=block_k,
+        SPLIT_K=SPLIT_K,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    if output_dtype == torch.float32:
+        return C_acc
+    return C_acc.to(output_dtype)
 
 
 @torch.library.custom_op("auto_deploy::torch_fake_quant_finegrained_fp8_linear", mutates_args=())
