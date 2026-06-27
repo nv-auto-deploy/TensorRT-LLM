@@ -1924,6 +1924,20 @@ _SPARSE_ATTN_DECODE_CTA_TARGET = 80  # split-K grid CTA budget (head_groups*num_
 # latency from ~40-80 CTAs and regresses sharply past ~160 (a 2nd SM wave), so
 # HEAD_BLOCK is sized to land head_groups*num_parts near this, not above it.
 
+# Small-head decode (head-parallelism-starved: per-rank head count <= HEAD_BLOCK, e.g.
+# the DSV4-Flash TP8 per-rank H=8 shape).  Here the CTA-target heuristic above floors
+# HEAD_BLOCK to 1, leaving thin M=1 split-K tiles.  Halving SEQ_BLOCK (more split-K
+# parts), packing a few heads per CTA (fatter MMA M-tile), using only 4 split-K warps
+# (8 over-subscribes the small tile) and 16 reduce warps (cover the D-wide partial row
+# in one pass) cut the H=8/L=640/D=512 decode attend by ~4.5% (swept; idea_0020).
+# Larger H (e.g. full H=64) already has enough head-parallel CTAs and is *not* routed
+# here — it regresses under this config, so the predicate is strictly H <= MAX_HEADS.
+_SPARSE_ATTN_DECODE_SMALL_H_MAX_HEADS = 8
+_SPARSE_ATTN_DECODE_SMALL_H_SEQ_BLOCK = 32
+_SPARSE_ATTN_DECODE_SMALL_H_HEAD_BLOCK = 4
+_SPARSE_ATTN_DECODE_SMALL_H_NUM_WARPS = 4  # split-K partial warps for the small M-tile
+_SPARSE_ATTN_DECODE_SMALL_H_REDUCE_NUM_WARPS = 16
+
 
 if _HAS_TRITON:
 
@@ -2204,7 +2218,21 @@ def _fused_sparse_attention_triton(
 
     scale_log2 = softmax_scale * _LOG2E
     d_block = triton.next_power_of_2(head_dim)
-    seq_block = 64
+
+    is_decode = num_tokens <= _SPARSE_ATTN_SPLITK_MAX_TOKENS
+    # Head-parallelism-starved decode (per-rank head count <= HEAD_BLOCK, e.g. TP8
+    # per-rank H=8): take the small-head split-K config (smaller SEQ_BLOCK / fewer
+    # split-K warps / more reduce warps).  See _SPARSE_ATTN_DECODE_SMALL_H_* above.
+    small_head = is_decode and num_heads <= _SPARSE_ATTN_DECODE_SMALL_H_MAX_HEADS
+
+    sk_num_warps = _SPARSE_ATTN_DECODE_NUM_WARPS
+    rd_num_warps = _SPARSE_ATTN_REDUCE_NUM_WARPS
+    if small_head:
+        seq_block = _SPARSE_ATTN_DECODE_SMALL_H_SEQ_BLOCK
+        sk_num_warps = _SPARSE_ATTN_DECODE_SMALL_H_NUM_WARPS
+        rd_num_warps = _SPARSE_ATTN_DECODE_SMALL_H_REDUCE_NUM_WARPS
+    else:
+        seq_block = 64
     total_blocks = triton.cdiv(k_select, seq_block)
     # Split-K key partitions (used iff use_splitk below).  Computed up front so the
     # decode HEAD_BLOCK can be sized against the resulting head_groups*num_parts.
@@ -2215,10 +2243,13 @@ def _fused_sparse_attention_triton(
     # head_groups*num_parts to ~one wave of SMs (_SPARSE_ATTN_DECODE_CTA_TARGET).
     # HEAD_BLOCK is kept as large as possible (better MMA M-utilization, smaller fp32
     # acc footprint) subject to that CTA budget: at full H=64 this is the original
-    # HEAD_BLOCK=8 (8 head-groups), and under TP sharding (per-rank H=8) it drops to 1
-    # to recover the head-parallel CTAs lost to sharding.  At prefill the simple
-    # kernel already saturates the GPU with token*head parallelism.
-    if num_tokens <= _SPARSE_ATTN_SPLITK_MAX_TOKENS:
+    # HEAD_BLOCK=8 (8 head-groups).  Under TP sharding (per-rank H<=8) the default
+    # would floor HEAD_BLOCK to 1; the small-head path instead packs a few heads per
+    # CTA (fatter M-tile) over more split-K parts.  At prefill the simple kernel
+    # already saturates the GPU with token*head parallelism.
+    if small_head:
+        head_block = min(_SPARSE_ATTN_DECODE_SMALL_H_HEAD_BLOCK, num_heads)
+    elif is_decode:
         if total_blocks > 1:
             target_groups = max(1, _SPARSE_ATTN_DECODE_CTA_TARGET // num_parts)
             head_block = max(
@@ -2258,7 +2289,7 @@ def _fused_sparse_attention_triton(
             SEQ_BLOCK=seq_block,
             HEAD_BLOCK=head_block,
             NUM_PARTS=num_parts,
-            num_warps=_SPARSE_ATTN_DECODE_NUM_WARPS,
+            num_warps=sk_num_warps,
             num_stages=2,
         )
         _fused_sparse_attention_reduce_kernel[(num_tokens, num_heads)](
@@ -2270,7 +2301,7 @@ def _fused_sparse_attention_triton(
             D=head_dim,
             D_BLOCK=d_block,
             NUM_PARTS=num_parts,
-            num_warps=_SPARSE_ATTN_REDUCE_NUM_WARPS,
+            num_warps=rd_num_warps,
         )
         return out
 
