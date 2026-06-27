@@ -838,18 +838,28 @@ class DeepseekV4MoEGate(nn.Module):
             raise ValueError(f"Unsupported DeepSeek V4 scoring_func: {self.score_func}")
 
         router_logits = _linear(hidden_states_flat.to(self.weight.dtype), self.weight).float()
-        scores = F.softplus(router_logits).sqrt()
 
         if self.hash_routing:
+            scores = F.softplus(router_logits).sqrt()
             selected_experts = self.tid2eid[input_ids_flat.to(torch.long)].to(torch.int64)
-        else:
-            selected_experts = (scores + self.bias).topk(self.top_k, dim=-1).indices
+            routing_weights = scores.gather(1, selected_experts)
+            if self.norm_topk_prob:
+                routing_weights = routing_weights / (
+                    routing_weights.sum(dim=-1, keepdim=True) + 1e-20
+                )
+            routing_weights = routing_weights * self.routed_scaling_factor
+            return selected_experts, routing_weights
 
-        routing_weights = scores.gather(1, selected_experts)
-        if self.norm_topk_prob:
-            routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        routing_weights = routing_weights * self.routed_scaling_factor
-        return selected_experts, routing_weights
+        # Non-hash layers: fuse the sqrtsoftplus scoring + bias-add + top-k + gather +
+        # renorm + scale chain into one Triton kernel (collapses the tiny per-token
+        # top-k/sort/elementwise kernel sea around the router head).
+        return torch.ops.auto_deploy.deepseek_v4_routing(
+            router_logits,
+            self.bias,
+            self.top_k,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+        )
 
 
 class DeepseekV4MoE(nn.Module):
