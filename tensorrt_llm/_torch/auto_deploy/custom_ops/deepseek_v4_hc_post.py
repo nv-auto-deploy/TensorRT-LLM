@@ -58,46 +58,49 @@ import triton
 import triton.language as tl
 
 
-def _hc_post_launch_config(n: int):
-    """Pick ``(num_warps, num_stages, block_h)`` for the ``_hc_post_compose_kernel`` launch.
+def _hc_post_launch_config(n: int, hc_mult: int):
+    """Pick ``(num_warps, num_stages, block_h, o_per_cta)`` for the kernel launch.
 
-    The kernel is grid ``(n, cdiv(H, BLOCK_H))`` — narrow ``BLOCK_H``-wide CTAs,
-    each accumulating all ``HM`` output streams via a tiny ``axis=0`` reduction
-    over the ``[BM, BLOCK_H]`` residual tile. The original hardcoded
-    ``num_warps=4`` (128 threads) lays that tile out so the ``axis=0`` reduction
-    needs *cross-warp* communication, which is pathologically slow for such a
-    thin reduction: on B200 (H=4096, hc_mult=4) ``nw=4`` measures ~4.6us vs
-    ~1.7us at ``nw<=2`` — a ~2.7x penalty.
+    The kernel grid is ``(n, cdiv(HM, O_PER_CTA), cdiv(H, BLOCK_H))``. ``O_PER_CTA``
+    is how many of the ``HM`` output residual streams each CTA computes — the
+    *output-stream* (``hc_mult``) tiling of the ``[hc_mult, H]`` per-token output:
 
-    Microbench (CUDA-graph stacked amortized timing) picks, per token count:
+      * ``O_PER_CTA == HM`` -> one CTA computes **all** streams (loads the
+        ``[HM, BLOCK_H]`` residual tile **once**, reuses it). Minimum HBM traffic.
+      * ``O_PER_CTA == 1``  -> ``HM`` CTAs per (token, H-tile), each computing one
+        stream (so each re-loads the full residual tile -> ``HM``x redundant
+        residual reads, but ``HM``x more CTAs / in-flight warps).
 
-      * ``n == 1`` (decode, the primary concurrency-1 tpot shape) -> ``nw=1``,
-        ``BLOCK_H=256``. At the full ``BLOCK_H=512`` the H=4096 stream tiles into
-        only ``cdiv(4096, 512) = 8`` CTAs (8 warps total at ``nw=1``) — far too
-        few in-flight warps to hide the load->reduce->store latency, leaving the
-        single decode token bound by one CTA's serial tail. Halving the H-tile to
-        ``BLOCK_H=256`` doubles the grid to ``(1, 16)`` (16 in-flight warps),
-        which hides that tail: ``1.91us -> 1.75us`` (-8.2%). The relationship is
-        non-monotonic (``BLOCK_H`` 256 and 32 win, 128/64 lose) — 256 is the
-        robust minimum across repeated runs.
-      * ``n >= 2`` (decode batch / prefill, up to n=1000)         -> ``nw=2``,
-        ``BLOCK_H=512``. Here ``n`` already supplies ample CTAs, so any finer
-        H-tile only fragments the (``nw=2``) tile and regresses sharply
-        (``BLOCK_H=256`` is ~2x slower at n=2 and >10x at n>=256). 512 is best
-        across the whole prefill range (1.77us at n=2, 3.2us at n=256, 8.4us at
-        n=1000).
+    Microbench (CUDA-graph stacked amortized timing) on B200 (H=4096, hc_mult=4):
 
-    ``num_stages`` is pinned to 2: the ``HM`` loop is fully unrolled (HM=4) so
-    extra pipeline stages buy nothing, and ``ns=3`` regresses the ``nw=1`` decode
-    case ~12%. Chosen deterministically rather than via ``@triton.autotune``
+      * ``n <= 16`` (decode, incl. the primary concurrency-1 tpot shape) ->
+        ``O_PER_CTA=1``, ``BLOCK_H=512``, ``nw=2``. The all-streams launch only
+        fills ``8n`` CTAs (``cdiv(4096,512)=8`` H-tiles), so for small ``n`` the
+        GPU is starved of in-flight warps and the single token is bound by one
+        CTA's serial load->reduce->store tail. Splitting the output-stream axis
+        onto the grid gives ``4x`` the CTAs *without* fragmenting the (coalesced,
+        full-width) H-tile loads — unlike a finer ``BLOCK_H``, which fragments the
+        loads and is non-monotonically worse. Result: **n=1 1.75us -> 1.37us
+        (-22%)** (bit-identical: each stream's fp32 reduction is unchanged, only
+        its owning CTA differs). The win tapers as ``n`` fills the GPU on its own
+        (n=1 -22%, n=8 -18%, n=16 -8%), crossing over near n~24.
+      * ``n > 16`` (prefill, up to n=1000) -> ``O_PER_CTA=HM``, ``BLOCK_H=512``,
+        ``nw=2``. Here ``n`` already supplies ample CTAs, so the ``HM``x redundant
+        residual reads of ``O_PER_CTA=1`` dominate and regress sharply
+        (``O_PER_CTA=1`` is +73% at n=256, +114% at n=1000). Loading the residual
+        tile once is best (3.2us at n=256, 8.4us at n=1000).
+
+    ``nw=4/8`` regress the decode o-split path badly (2.2us / 3.7us at n=1) and
+    ``num_stages`` is pinned to 2 (the unrolled ``HM`` loop gains nothing from more
+    pipeline stages). Chosen deterministically rather than via ``@triton.autotune``
     because these sub-floor kernels defeat the autotuner's ``do_bench`` (it
     resolves the host launch cadence, not GPU time) and the model's varying
     prefill token counts would otherwise force a synchronizing re-tune each shape
     (cf. sibling ``_hc_weighted_combine_kernel`` / idea_0054).
     """
-    if n == 1:
-        return 1, 2, 256
-    return 2, 2, 512
+    if n <= 16:
+        return 2, 2, 512, 1
+    return 2, 2, 512, hc_mult
 
 
 @triton.jit
@@ -111,20 +114,30 @@ def _hc_post_compose_kernel(
     H,
     HM: tl.constexpr,  # hc_mult
     BM: tl.constexpr,  # next_power_of_2(hc_mult)
+    O_PER_CTA: tl.constexpr,  # output streams computed by this CTA (output-stream tiling)
     BLOCK_H: tl.constexpr,
 ):
-    """One program per (token row, H-tile). Computes all HM output streams.
+    """One program per (token row, output-stream block, H-tile).
 
     y[n, o, h] = post[n, o] * x[n, h] + sum_m comb[n, m, o] * residual[n, m, h]
 
-    The HM residual streams for this H-tile are loaded once into a fp32
-    ``[BM, BLOCK_H]`` register tile and reused across every output stream o, so
-    the kernel reads each residual / x element exactly once and writes each
-    output element exactly once. Padding rows (m >= HM) are masked to 0 and drop
-    out of both the residual tile and the per-stream comb weights.
+    The ``HM`` residual streams for this H-tile are loaded once into a fp32
+    ``[BM, BLOCK_H]`` register tile and reused across the ``O_PER_CTA`` output
+    streams this CTA owns (streams ``pid_o*O_PER_CTA .. +O_PER_CTA``). The kernel
+    reads each residual / x element once *per CTA* and writes each of its output
+    elements once. Padding rows (m >= HM) are masked to 0 and drop out of both
+    the residual tile and the per-stream comb weights.
+
+    ``O_PER_CTA`` is a compile-time output-stream tiling knob (see
+    ``_hc_post_launch_config``): ``O_PER_CTA == HM`` is the all-streams,
+    load-residual-once layout (prefill); ``O_PER_CTA < HM`` splits the output
+    streams onto the grid for ``HM/O_PER_CTA``x more CTAs (decode). The
+    ``O_PER_CTA >= HM`` branch is a constexpr, so the prefill path compiles to a
+    branch-free ``for o in range(HM)`` identical to the original kernel.
     """
     pid_n = tl.program_id(0)
-    pid_h = tl.program_id(1)
+    pid_o = tl.program_id(1)
+    pid_h = tl.program_id(2)
     if pid_n >= N:
         return
 
@@ -145,11 +158,23 @@ def _hc_post_compose_kernel(
     comb_base = comb_ptr + pid_n * (HM * HM)
     out_base = out_ptr + pid_n * (HM * H)
 
-    for o in range(HM):
-        p = tl.load(post_base + o)  # scalar fp32
-        c = tl.load(comb_base + m * HM + o, mask=mmask, other=0.0)  # comb[:, o] -> [BM]
-        acc = p * x + tl.sum(c[:, None] * res_tile, axis=0)  # [BLOCK_H]
-        tl.store(out_base + o * H + h, acc.to(out_ptr.dtype.element_ty), mask=hmask)
+    if O_PER_CTA >= HM:
+        # All-streams layout (prefill / large n): pid_o == 0, no per-stream guard.
+        for o in range(HM):
+            p = tl.load(post_base + o)  # scalar fp32
+            c = tl.load(comb_base + m * HM + o, mask=mmask, other=0.0)  # comb[:, o] -> [BM]
+            acc = p * x + tl.sum(c[:, None] * res_tile, axis=0)  # [BLOCK_H]
+            tl.store(out_base + o * H + h, acc.to(out_ptr.dtype.element_ty), mask=hmask)
+    else:
+        # Output-stream-split layout (decode): this CTA owns O_PER_CTA streams.
+        o_start = pid_o * O_PER_CTA
+        for oo in range(O_PER_CTA):
+            o = o_start + oo
+            if o < HM:
+                p = tl.load(post_base + o)
+                c = tl.load(comb_base + m * HM + o, mask=mmask, other=0.0)
+                acc = p * x + tl.sum(c[:, None] * res_tile, axis=0)
+                tl.store(out_base + o * H + h, acc.to(out_ptr.dtype.element_ty), mask=hmask)
 
 
 @torch.library.custom_op("auto_deploy::deepseek_v4_hc_post", mutates_args=())
@@ -198,9 +223,9 @@ def deepseek_v4_hc_post(
     if n == 0:
         return out.reshape(*lead, hc_mult, H)
 
-    num_warps, num_stages, block_h_max = _hc_post_launch_config(n)
+    num_warps, num_stages, block_h_max, o_per_cta = _hc_post_launch_config(n, hc_mult)
     block_h = min(block_h_max, triton.next_power_of_2(H))
-    grid = (n, triton.cdiv(H, block_h))
+    grid = (n, triton.cdiv(hc_mult, o_per_cta), triton.cdiv(H, block_h))
     _hc_post_compose_kernel[grid](
         x_f,
         res_f,
@@ -211,6 +236,7 @@ def deepseek_v4_hc_post(
         H,
         HM=hc_mult,
         BM=triton.next_power_of_2(hc_mult),
+        O_PER_CTA=o_per_cta,
         BLOCK_H=block_h,
         num_warps=num_warps,
         num_stages=num_stages,
