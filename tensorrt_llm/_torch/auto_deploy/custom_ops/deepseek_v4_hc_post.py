@@ -58,6 +58,37 @@ import triton
 import triton.language as tl
 
 
+def _hc_post_launch_config(n: int):
+    """Pick ``(num_warps, num_stages)`` for the ``_hc_post_compose_kernel`` launch.
+
+    The kernel is grid ``(n, cdiv(H, BLOCK_H))`` with ``BLOCK_H == 512`` — i.e.
+    narrow 512-wide CTAs, each accumulating all ``HM`` output streams via a tiny
+    ``axis=0`` reduction over the ``[BM, BLOCK_H]`` residual tile. The original
+    hardcoded ``num_warps=4`` (128 threads) lays that tile out so the ``axis=0``
+    reduction needs *cross-warp* communication, which is pathologically slow for
+    such a thin reduction: on B200 (H=4096, hc_mult=4) ``nw=4`` measures ~4.6us
+    vs ~1.7us at ``nw<=2`` — a ~2.7x penalty.
+
+    Microbench (CUDA-graph stacked amortized timing) picks, per token count:
+
+      * ``n == 1`` (decode, the primary concurrency-1 tpot shape) -> ``nw=1``
+        (1.71us; a single warp keeps the reduction warp-local via shuffles).
+      * ``n >= 2`` (decode batch / prefill, up to n=1000)         -> ``nw=2``
+        (1.78us at n>=2, 3.2us at n=256, 8.5us at n=1000 — best across the
+        prefill range at BLOCK_H=512).
+
+    ``num_stages`` is pinned to 2: the ``HM`` loop is fully unrolled (HM=4) so
+    extra pipeline stages buy nothing, and ``ns=3`` regresses the ``nw=1`` decode
+    case ~12%. Chosen deterministically rather than via ``@triton.autotune``
+    because these sub-floor kernels defeat the autotuner's ``do_bench`` (it
+    resolves the host launch cadence, not GPU time) and the model's varying
+    prefill token counts would otherwise force a synchronizing re-tune each shape
+    (cf. sibling ``_hc_weighted_combine_kernel`` / idea_0054).
+    """
+    num_warps = 1 if n == 1 else 2
+    return num_warps, 2
+
+
 @triton.jit
 def _hc_post_compose_kernel(
     x_ptr,  # [N, H] x.dtype (e.g. bf16)
@@ -158,6 +189,7 @@ def deepseek_v4_hc_post(
 
     block_h = min(512, triton.next_power_of_2(H))
     grid = (n, triton.cdiv(H, block_h))
+    num_warps, num_stages = _hc_post_launch_config(n)
     _hc_post_compose_kernel[grid](
         x_f,
         res_f,
@@ -169,7 +201,8 @@ def deepseek_v4_hc_post(
         HM=hc_mult,
         BM=triton.next_power_of_2(hc_mult),
         BLOCK_H=block_h,
-        num_warps=4,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return out.reshape(*lead, hc_mult, H)
 
