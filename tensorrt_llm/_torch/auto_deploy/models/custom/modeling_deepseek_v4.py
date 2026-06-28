@@ -1717,7 +1717,15 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             hidden_states = layer(hidden_states, position_embeddings, position_ids, input_ids)
         hidden_states = self._hc_head(hidden_states)
         hidden_states = self.norm(hidden_states)
-        logits = _linear(hidden_states.float(), self.head.weight.float(), None).float()
+        # ``layer_type="lm_head"`` tags this vocab projection so
+        # ``apply_sharding_hints`` column-splits ``head.weight`` (vocab dim) +
+        # all_gathers the logits under TP, instead of replicating it. Replicated,
+        # every rank re-casts and matmuls the full [vocab, hidden] weight each
+        # step; sharded, both the bf16->fp32 weight cast and the fp32 logits GEMM
+        # shrink by tp_size. Mathematically exact (output columns are independent).
+        logits = _linear(
+            hidden_states.float(), self.head.weight.float(), None, layer_type="lm_head"
+        ).float()
         return DeepseekV4CausalLMOutput(logits=logits)
 
 

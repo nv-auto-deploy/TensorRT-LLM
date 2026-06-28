@@ -1845,12 +1845,21 @@ class ApplyShardingHints(BaseTransform):
                         shardable_node, (MoEShardableNode, StackedMoEShardableNode)
                     ):
                         continue
-                    # Gather-shard simple_shard_filter matches (e.g. lm_head) regardless of
-                    # shard_layers: column split + all_gather of the huge vocab projection.
-                    if simple_shard_filter and is_any_lin_op(node):
-                        wnodes = extract_weight_nodes(node)
-                        key = wnodes.weights[0].node_key if wnodes.weights else ""
-                        if any(kw in key for kw in simple_shard_filter):
+                    # Gather-shard the LM-head vocab projection (column split +
+                    # all_gather) regardless of shard_layers -- the hint-driven
+                    # sharder would otherwise leave it replicated, so every rank
+                    # re-casts and matmuls the full [vocab, hidden] weight each
+                    # step. Triggered either by a model-emitted layer_type="lm_head"
+                    # hint (e.g. DeepSeek-V4 head) or a simple_shard_filter
+                    # weight-name match.
+                    if is_any_lin_op(node):
+                        [lt] = extract_op_args(node, "layer_type")
+                        gather_head = lt == "lm_head"
+                        if not gather_head and simple_shard_filter:
+                            wnodes = extract_weight_nodes(node)
+                            key = wnodes.weights[0].node_key if wnodes.weights else ""
+                            gather_head = any(kw in key for kw in simple_shard_filter)
+                        if gather_head:
                             num_updates += _simple_shard_node(gm, node, dc)
                             continue
                     if shard_layers is not None:

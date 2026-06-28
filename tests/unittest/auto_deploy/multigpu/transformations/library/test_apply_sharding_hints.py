@@ -275,6 +275,72 @@ def test_apply_hints(world_size, expect_skipped, expect_up_shape, expect_down_sh
     assert has_dist_ar == (not expect_skipped)
 
 
+LM_HEAD_VOCAB, LM_HEAD_HIDDEN = 16, 8
+
+
+class LMHeadModule(nn.Module):
+    """DeepSeek-V4-style head: an fp32 weight cast feeding a ``layer_type="lm_head"`` linear."""
+
+    def __init__(self, vocab=LM_HEAD_VOCAB, hidden=LM_HEAD_HIDDEN):
+        super().__init__()
+        self.head = nn.Linear(hidden, vocab, bias=False)
+
+    def forward(self, x):
+        return torch.ops.auto_deploy.torch_linear_simple(
+            x.float(), self.head.weight.float(), None, layer_type="lm_head"
+        ).float()
+
+
+def _export_lm_head():
+    model = LMHeadModule().cuda()
+    x = torch.randn(2, LM_HEAD_HIDDEN, device="cuda")
+    return torch_export_to_gm(model, args=(x,), clone=True), model, x
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "world_size, expect_skipped, expect_head_shape, expect_gather",
+    [
+        (1, True, (LM_HEAD_VOCAB, LM_HEAD_HIDDEN), False),
+        (2, False, (LM_HEAD_VOCAB // 2, LM_HEAD_HIDDEN), True),
+    ],
+)
+def test_apply_hints_lm_head_gather_shards_regardless_of_shard_layers(
+    world_size, expect_skipped, expect_head_shape, expect_gather
+):
+    """A ``layer_type="lm_head"`` linear is gather-sharded (column split + all_gather) under TP.
+
+    Even when ``shard_layers=["mla", "moe"]`` excludes the head (the DeepSeek-V4
+    config), it must still be sharded -- otherwise every rank re-casts and matmuls
+    the full [vocab, hidden] weight each step. The inline ``self.head.weight.float()``
+    cast also shrinks because the parameter itself is physically sharded. Column
+    split + all_gather is mathematically exact (output columns are independent).
+    """
+    gm, _, _ = _export_lm_head()
+    opt = InferenceOptimizer(
+        factory=None,
+        config={"apply_sharding_hints": {"stage": "sharding", "shard_layers": ["mla", "moe"]}},
+    )
+    opt.shared_config = SharedConfig(
+        local_rank=0,
+        world_size=world_size,
+        dist_config=DistConfig(
+            world_size=world_size, rank=0, tp_size=world_size, moe_ep_size=world_size
+        ),
+    )
+    gm_out = opt(None, gm)
+
+    info = gm_out.meta["_autodeploy"]["transform_history"]["apply_sharding_hints"]
+    assert info.skipped is expect_skipped
+
+    assert gm_out.head.weight.shape == expect_head_shape
+
+    has_gather = any(
+        is_op(n, torch.ops.auto_deploy.torch_dist_all_gather.default) for n in gm_out.graph.nodes
+    )
+    assert has_gather == expect_gather
+
+
 def _export_deepseek_v4_contract_block():
     model = DeepSeekV4IRContractBlock()
     x = torch.randn(2, 3, DSV4_HIDDEN)
