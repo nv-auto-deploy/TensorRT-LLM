@@ -1668,7 +1668,14 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             [DeepseekV4Block(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = DeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Store the LM-head weight in fp32 so the per-step bf16->fp32 recast in
+        # ``forward`` (``self.head.weight.float()``) is hoisted to a one-time
+        # load-time cast. ``_load_checkpoint`` copy-casts the bf16 checkpoint
+        # tensor into this fp32 param (no ``assign=True``), so the stored values
+        # equal ``bf16(W).float()`` and the logits GEMM is bit-identical.
+        self.head = nn.Linear(
+            config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32
+        )
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.hc_mult = config.hc_mult
         hc_dim = config.hc_mult * config.hidden_size
@@ -1723,8 +1730,10 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         # every rank re-casts and matmuls the full [vocab, hidden] weight each
         # step; sharded, both the bf16->fp32 weight cast and the fp32 logits GEMM
         # shrink by tp_size. Mathematically exact (output columns are independent).
+        # ``self.head.weight`` is already fp32 (cast once at load), so no per-step
+        # bf16->fp32 weight recast is emitted into the decode graph here.
         logits = _linear(
-            hidden_states.float(), self.head.weight.float(), None, layer_type="lm_head"
+            hidden_states.float(), self.head.weight, None, layer_type="lm_head"
         ).float()
         return DeepseekV4CausalLMOutput(logits=logits)
 
