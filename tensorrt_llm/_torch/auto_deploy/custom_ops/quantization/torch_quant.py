@@ -846,8 +846,7 @@ def _w8a8_block_fp8_matmul_splitk_kernel(
 # Split-K launch config for the decode GEMV. Tuned (kernel_layout axis) on B200 over
 # the DeepSeek-V4 MLA/dense K=7168 decode projection shapes (N in {256,576,1536,2304}).
 _SPLITK_BLOCK_SIZE_M = 16
-# SPLIT_K=24 over the 56-K-block (K=7168) reduction puts ~2-3 K-blocks per CTA and
-# fills the SMs; it is within ~1% of the per-shape optimum (16..32) for every shape.
+# Mid-N default / fallback SPLIT_K (see ``_splitk_split_k`` for the per-N schedule).
 _SPLITK_SPLIT_K = 24
 _SPLITK_NUM_WARPS = 4
 _SPLITK_NUM_STAGES = 3
@@ -874,6 +873,40 @@ def _splitk_block_n(N: int) -> int:
     return 64
 
 
+def _splitk_split_k(N: int) -> int:
+    """SPLIT_K (K-reduction CTA fan-out) for the split-K decode GEMV, scaled with N.
+
+    The K=7168 reduction is partitioned across ``SPLIT_K`` CTAs per output tile, so
+    the launch grid is ``cdiv(N, BLOCK_SIZE_N) * SPLIT_K`` and the atomic-reduction
+    count scales with ``SPLIT_K``. The best grid is ~2-3 waves on the B200 SM array:
+    narrow-N tiles (``N < 1024`` -> BLOCK_SIZE_N 32/64) yield few n-tiles and are
+    CTA-starved, so they want a *deeper* K-split (more CTAs); wide 128-N tiles
+    already have enough n-tiles, so a *shallower* split cuts atomic-reduction
+    over-subscription. Measured B200 optima (BLOCK_SIZE_K=128, K=7168, M=1):
+    N=256->48, N=576->48, N=1536->24, N=2304->16 (each ~-3.5..-4.0% vs the old
+    fixed SPLIT_K=24; idea_0063, kernel_tile). idea_0025's fixed 24 was tuned over
+    SPLIT_K<=32 and missed the deeper split the narrow-N shapes want.
+    """
+    if N < 1024:
+        return 48
+    if N <= 1792:
+        return _SPLITK_SPLIT_K  # 24
+    return 16
+
+
+def _splitk_block_k(N: int, block_k: int) -> int:
+    """MMA contraction-tile depth (``BLOCK_SIZE_K``) for the split-K decode GEMV.
+
+    Decoupled from the quantization scale group ``block_k`` (idea_0063): it must
+    divide ``block_k`` so an MMA tile stays inside one scale block, but a *smaller*
+    tile keeps the atomic-reduction count fixed at ``SPLIT_K`` while raising the
+    K-loop trip count, which deepens the software pipeline (more in-flight B-tile
+    loads to hide HBM latency on this memory-bound GEMV). Pinned to ``block_k`` here;
+    the kernel_tile sweep tunes per-N.
+    """
+    return block_k
+
+
 def _w8a8_block_fp8_matmul_splitk(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -888,6 +921,7 @@ def _w8a8_block_fp8_matmul_splitk(
     *,
     SPLIT_K: Optional[int] = None,
     BLOCK_SIZE_N: Optional[int] = None,
+    BLOCK_SIZE_K: Optional[int] = None,
     num_warps: int = _SPLITK_NUM_WARPS,
     num_stages: int = _SPLITK_NUM_STAGES,
 ) -> torch.Tensor:
@@ -895,13 +929,26 @@ def _w8a8_block_fp8_matmul_splitk(
 
     Accumulates fp32 partials from ``SPLIT_K`` contraction-slices via atomics into a
     pre-zeroed fp32 buffer, then casts to ``output_dtype``. ``SPLIT_K`` /
-    ``BLOCK_SIZE_N`` default (``None``) to the tuned heuristic (``_SPLITK_SPLIT_K`` /
-    ``_splitk_block_n``); the microbench passes them explicitly to sweep the config.
+    ``BLOCK_SIZE_N`` / ``BLOCK_SIZE_K`` default (``None``) to the tuned heuristic
+    (``_splitk_split_k`` / ``_splitk_block_n`` / ``_splitk_block_k``); the microbench
+    passes them explicitly to sweep the config.
+
+    ``BLOCK_SIZE_K`` is the MMA contraction-tile depth and is *decoupled* from the
+    quantization ``block_k`` (the scale group). It must divide ``block_k`` so a tile
+    never straddles a scale-block boundary (the kernel loads one scale per tile,
+    indexed ``(k * BLOCK_SIZE_K) // group_k``); a smaller tile keeps the same atomic
+    count as ``SPLIT_K`` but raises the K-loop iteration count (deeper pipelining).
     """
     if SPLIT_K is None:
-        SPLIT_K = _SPLITK_SPLIT_K
+        SPLIT_K = _splitk_split_k(N)
     if BLOCK_SIZE_N is None:
         BLOCK_SIZE_N = _splitk_block_n(N)
+    if BLOCK_SIZE_K is None:
+        BLOCK_SIZE_K = _splitk_block_k(N, block_k)
+    # The MMA tile must fit inside a single scale block (one scale loaded per tile).
+    assert block_k % BLOCK_SIZE_K == 0, (
+        f"BLOCK_SIZE_K={BLOCK_SIZE_K} must divide quant block_k={block_k}"
+    )
     C_shape = A.shape[:-1] + (N,)
     # fp32 accumulator, pre-zeroed for the atomic reduction across SPLIT_K CTAs.
     C_acc = A.new_zeros(C_shape, dtype=torch.float32)
@@ -933,7 +980,7 @@ def _w8a8_block_fp8_matmul_splitk(
         Bs.stride(0),
         BLOCK_SIZE_M=_SPLITK_BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=block_k,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
         SPLIT_K=SPLIT_K,
         num_warps=num_warps,
         num_stages=num_stages,

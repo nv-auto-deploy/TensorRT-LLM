@@ -146,7 +146,7 @@ def test_decode_gemv_multi_kblock():
 # ----------------------------------------------------------------------------------
 
 
-def _run_splitk(M, N, K, split_k, block_size_n=64, num_warps=4, seed=0):
+def _run_splitk(M, N, K, split_k, block_size_n=64, block_size_k=None, num_warps=4, seed=0):
     """Drive the split-K helper directly (independent of the dispatch gate)."""
     torch.manual_seed(seed)
     block_n = block_k = 128
@@ -167,6 +167,7 @@ def _run_splitk(M, N, K, split_k, block_size_n=64, num_warps=4, seed=0):
         K,
         SPLIT_K=split_k,
         BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_size_k,
         num_warps=num_warps,
     )
     ref = (_dequant_act(a_fp8, a_s).double() @ _dequant_weight(b_fp8, b_s).double().t()).float()
@@ -198,6 +199,31 @@ def test_splitk_block_n_and_ragged_n(split_k, block_size_n):
     scale = ref.abs().amax().clamp(min=1e-6)
     max_rel = ((out.float() - ref).abs().amax() / scale).item()
     assert max_rel < 1.5e-2, f"N=576 BLOCK_N={block_size_n} SPLIT_K={split_k}: {max_rel:.4e}"
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
+@pytest.mark.parametrize("block_size_k", [32, 64, 128])
+@pytest.mark.parametrize("split_k", [12, 24, 48])
+@pytest.mark.parametrize("N,K", [(1536, 7168), (576, 7168), (2304, 7168), (256, 7168)])
+def test_splitk_block_size_k(N, K, split_k, block_size_k):
+    """BLOCK_SIZE_K (MMA tile depth) decoupled from the quant scale group (idea_0063).
+
+    A tile of BLOCK_SIZE_K in {32,64,128} stays inside one 128-wide scale block, so
+    the per-tile scale index ``(k*BLOCK_SIZE_K)//group_k`` must still reconstruct the
+    fp64 ground truth across SPLIT_K and the K=7168 decode projection Ns (M=1)."""
+    out, ref = _run_splitk(1, N, K, split_k, block_size_k=block_size_k)
+    assert out.shape == (1, N) and out.dtype == torch.bfloat16
+    scale = ref.abs().amax().clamp(min=1e-6)
+    max_rel = ((out.float() - ref).abs().amax() / scale).item()
+    assert max_rel < 1.5e-2, f"N={N} K={K} SPLIT_K={split_k} BK={block_size_k}: {max_rel:.4e}"
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
+def test_splitk_block_size_k_must_divide_group():
+    """BLOCK_SIZE_K that does not divide the quant block_k straddles a scale block
+    and is rejected (guards the scale-index correctness invariant)."""
+    with pytest.raises(AssertionError, match="must divide quant block_k"):
+        _run_splitk(1, 256, 7168, 24, block_size_k=96)
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
