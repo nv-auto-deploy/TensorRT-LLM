@@ -1161,17 +1161,26 @@ class DeepseekV4Indexer(nn.Module):
         sin: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
+        # Indexer index-score projection is replicated (tp_mode="none"), NOT
+        # head-sharded. The index score is reduced over ALL index heads (sum over
+        # the head dim), so a head-sharded projection forces a partial-score
+        # all_reduce across TP ranks (the f32 RING_LL collective at select_topk and
+        # in the sparse-attention custom op). Computing the (small) projection in
+        # full on every rank makes the score already-global -> the all_reduce is
+        # dropped. The wq_b GEMV grows tp_size x in output width but stays tiny at
+        # bs=1, while a full f32 collective per layer/step is removed. Reference
+        # exact: partial-head-sum + all_reduce == full-head-sum (up to fp order).
         q = _linear_module(
             q_lora,
             self.wq_b,
-            tp_mode="colwise",
+            tp_mode="none",
             layer_type="mla",
             tp_min_local_shape=self.index_head_dim,
         )
         q = torch.ops.auto_deploy.view(
             q,
             [batch_size, seq_len, self.index_n_heads, self.index_head_dim],
-            tp_scaled_dim=2,
+            tp_scaled_dim=-1,
             layer_type="mla",
         )
         q_nope, q_pe = torch.split(
@@ -1185,7 +1194,7 @@ class DeepseekV4Indexer(nn.Module):
         weights = _linear_module(
             hidden_states,
             self.weights_proj,
-            tp_mode="colwise",
+            tp_mode="none",
             layer_type="mla",
         )
         weights = weights.float() * (self.softmax_scale * self.index_n_heads**-0.5)
@@ -1206,7 +1215,9 @@ class DeepseekV4Indexer(nn.Module):
         ).transpose(1, 2)
         index_score = index_score.float()
         index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
-        index_score = torch.ops.auto_deploy.all_reduce(index_score, layer_type="mla")
+        # No cross-rank all_reduce: the index projection is replicated (see
+        # DeepseekV4Indexer.project), so ``index_score`` already sums over all
+        # index heads on every rank.
 
         batch_size = q.shape[0]
         compressed_positions = torch.arange(

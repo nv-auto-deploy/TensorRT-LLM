@@ -31,7 +31,6 @@ except ImportError:  # pragma: no cover - triton always present on CUDA builds
     _HAS_TRITON = False
 
 from ..._compat import KvCacheConfig
-from ...distributed import common as dist_common
 from ...utils.node_utils import extract_op_args
 from ...utils.quantization_utils import fake_fp8_act_quant as _fake_fp8_act_quant
 from ..attention_interface import (
@@ -928,8 +927,9 @@ def _select_ratio4_indexer_rows(
     )
     index_score = torch.matmul(q_index, index_k.transpose(-1, -2)).float()
     index_score = (index_score.relu() * indexer_weights.float().unsqueeze(-1)).sum(dim=0)
-    if dist_common.is_initialized() and dist_common.get_world_size() > 1:
-        dist_common.all_reduce(index_score, op=dist_common.ReduceOp.SUM)
+    # ``q_index``/``indexer_weights`` are replicated across TP ranks (the indexer
+    # index-score projection is no longer head-sharded; see DeepseekV4Indexer),
+    # so ``index_score`` already sums over all index heads -- no all_reduce needed.
 
     topk_count = min(index_topk, visible_len)
     selected = index_score.topk(topk_count, dim=-1).indices.to(torch.int64)
@@ -1590,8 +1590,9 @@ def _select_decode_ratio4_indexer_rows(
     )
     index_score = torch.matmul(q_index, index_k.transpose(-1, -2)).float()
     index_score = (index_score.relu() * indexer_weights.float().unsqueeze(-1)).sum(dim=1)
-    if dist_common.is_initialized() and dist_common.get_world_size() > 1:
-        dist_common.all_reduce(index_score, op=dist_common.ReduceOp.SUM)
+    # ``q_index``/``indexer_weights`` are replicated across TP ranks (the indexer
+    # index-score projection is no longer head-sharded; see DeepseekV4Indexer),
+    # so ``index_score`` already sums over all index heads -- no all_reduce needed.
 
     visible_len = ((input_pos + 1) // 4).clamp(max=max_compressed_len)
     visible = candidate_rows < visible_len.unsqueeze(1)
