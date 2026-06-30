@@ -195,6 +195,24 @@ def _rms_norm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
     return output.to(x.dtype)
 
 
+def _compressor_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm for the *main-compressor* pooled states (idea_0014).
+
+    Routes through the fused ``auto_deploy::triton_rms_norm`` op -- one kernel that does
+    the fp32 cast, square, mean, rsqrt and weighted scale, replacing the ~6 eager kernels
+    ``_rms_norm_ref`` emits. The Triton kernel forces fp32 internals and an fp32 weight
+    multiply, so it is *byte-identical* to ``_rms_norm_ref`` for the compressor head_dim
+    shapes (validated). Falls back to the eager reference on non-CUDA or when no per-channel
+    norm weight is present (the op requires a 1-D weight of width ``head_dim``).
+
+    Only the main-compressor (rotate=False) sites use this; the lightning-indexer norm
+    (which feeds top-k selection) is intentionally left on ``_rms_norm_ref``.
+    """
+    if x.device.type == "cuda" and weight.dim() == 1 and weight.numel() == x.shape[-1]:
+        return torch.ops.auto_deploy.triton_rms_norm(x, weight, eps)
+    return _rms_norm_ref(x, weight, eps)
+
+
 def _apply_interleaved_rope_ref(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -220,13 +238,24 @@ def _apply_compressed_rope_and_quantize(
         raise ValueError(f"rope_dim must be in [0, {compressed.shape[-1]}], got {rope_dim}")
     nope_dim = compressed.shape[-1] - rope_dim
     nope, pe = torch.split(compressed, [nope_dim, rope_dim], dim=-1)
-    pe = _apply_interleaved_rope_ref(pe, cos, sin)
-    compressed = torch.cat((nope, pe), dim=-1)
     if rotate:
+        # Indexer RoPE->Hadamard tail (rotate=True) -- left intact (out of scope per
+        # idea_0014: "without revisiting the discarded RoPE-to-Hadamard sites").
+        pe = _apply_interleaved_rope_ref(pe, cos, sin)
+        compressed = torch.cat((nope, pe), dim=-1)
         return torch.ops.auto_deploy.deepseek_v4_hadamard_fp4(compressed, 32)
-    nope, pe = torch.split(compressed, [nope_dim, rope_dim], dim=-1)
+    # Main-compressor rotate=False tail. fp8-quantize the nope slice, then collapse the
+    # interleaved RoPE on the pe slice AND the final concat into ONE fused Triton kernel
+    # (auto_deploy::deepseek_v4_fused_rope_concat -- the same op the main q/kv/out paths
+    # already use). This removes the eager rope's ~6-7 elementwise muls + stack, the
+    # redundant intermediate ``cat((nope, pe))`` + re-``split`` (the round-trip returns
+    # the identical nope/rope'd-pe it just built), and the final ``cat`` -- ~9 launches
+    # per call collapse to 1. fp8(nope) is byte-identical to before; the rope differs by
+    # <=1 ULP (FMA folding; see test_deepseek_v4_fused_rope_concat.py).
     nope = _fake_fp8_act_quant(nope, block_size=64)
-    return torch.cat((nope, pe), dim=-1)
+    if rope_dim == 0:
+        return torch.cat((nope, pe), dim=-1)
+    return torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(nope, pe, cos, sin, False)
 
 
 def _overlap_transform_projected(
@@ -307,7 +336,7 @@ def _build_full_compressed_kv(
         gate = _overlap_transform_projected(gate, head_dim, -1.0e20)
 
     compressed = torch.ops.auto_deploy.deepseek_v4_compress_pool(kv, gate)
-    compressed = _rms_norm_ref(compressed, compressor_norm_weight, rms_norm_eps)
+    compressed = _compressor_rms_norm(compressed, compressor_norm_weight, rms_norm_eps)
 
     row_start = row_offsets * compress_ratio
     row_start = torch.minimum(row_start, torch.full_like(row_start, seq_len - 1))
@@ -1397,7 +1426,7 @@ def _batched_compressed_rows_from_paged_state(
         gate = gate + compressor_ape[:, :head_dim].to(device=gate.device, dtype=dtype)
 
     pooled = torch.ops.auto_deploy.deepseek_v4_compress_pool(kv, gate)
-    pooled = _rms_norm_ref(pooled, compressor_norm_weight, rms_norm_eps)
+    pooled = _compressor_rms_norm(pooled, compressor_norm_weight, rms_norm_eps)
     row_position_id = row_position_id.to(torch.long).clamp(min=0, max=cos_table.shape[0] - 1)
     cos = cos_table[row_position_id]
     sin = sin_table[row_position_id]
