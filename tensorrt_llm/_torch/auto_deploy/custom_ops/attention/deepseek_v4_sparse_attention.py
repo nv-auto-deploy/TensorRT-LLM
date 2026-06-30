@@ -1246,6 +1246,22 @@ def _decode_local_cache_rows(
     window_size: int,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # The local-window position generation + page-address translation is a fixed
+    # ~20-kernel element-wise chain that runs once per layer per decode step. Fuse
+    # it into one Triton kernel (page_ids/page_offsets/valid), leaving only the
+    # final cache-row gather as a separate op. Byte-identical addresses + mask.
+    if _HAS_TRITON and swa_cache.is_cuda:
+        page_ids, page_offsets, valid = _fused_local_window_pagemap(
+            input_pos,
+            seq_idx,
+            cu_num_pages,
+            cache_loc,
+            window_size,
+            int(swa_cache.shape[1]),
+        )
+        rows = swa_cache[page_ids, page_offsets].to(dtype)
+        return rows, valid
+
     offsets = torch.arange(window_size, dtype=torch.long, device=input_pos.device)
     positions = input_pos.unsqueeze(1) - window_size + 1 + offsets.view(1, -1)
     valid = (positions >= 0) & (positions <= input_pos.unsqueeze(1))
@@ -2308,6 +2324,110 @@ if _HAS_TRITON:
         out = acc_cur / tl.maximum(l_cur, 1e-38)
         out_ptrs = out_ptr + base * D + d_offsets
         tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty), mask=d_mask)
+
+    @triton.jit
+    def _decode_local_window_pagemap_kernel(
+        input_pos_ptr,  # [N] int -- current decode position per sequence
+        seq_idx_ptr,  # [N] int -- sequence row per decode token
+        cu_num_pages_ptr,  # [num_seq + 1] -- prefix-sum page-table offsets
+        cache_loc_ptr,  # [total_pages] -- physical page id per page-table slot
+        page_ids_ptr,  # [N, W] int64 out
+        page_offsets_ptr,  # [N, W] int64 out
+        valid_ptr,  # [N, W] bool out
+        n_elements,  # N * W
+        W,  # window_size (row stride of the [N, W] grid)
+        TOKENS_PER_BLOCK,
+        CACHE_LOC_MAX,  # cache_loc.numel() - 1
+        BLOCK: tl.constexpr,
+    ):
+        """One-launch local-window page map: position gen + validity + translate.
+
+        Fuses the per-decode-step local-window integer chain -- the position
+        generation of ``_decode_local_cache_rows`` (arange / sub / add / two
+        compares / boolean-and) followed by the page-address translation of
+        ``_decode_page_ids_and_offsets`` (clamp / floordiv / remainder / the two
+        ``cu_num_pages`` lookups / add / compare / boolean-and / where / clamp /
+        ``cache_loc`` lookup) -- into a single kernel.  The final
+        ``swa_cache[page_ids, page_offsets]`` row gather is left to the caller
+        unchanged.  All divisions/remainders act on non-negative operands, so the
+        produced ``(page_ids, page_offsets)`` addresses and the combined validity
+        mask are byte-identical to the reference element-wise chain.
+        """
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elements
+        n = offs // W
+        w = offs % W
+        input_pos = tl.load(input_pos_ptr + n, mask=mask, other=0).to(tl.int64)
+        seq_idx = tl.load(seq_idx_ptr + n, mask=mask, other=0).to(tl.int64)
+
+        # Local-window position generation (mirror _decode_local_cache_rows):
+        # positions = input_pos - window_size + 1 + arange(window_size).
+        pos = input_pos - W + 1 + w
+        valid_pos = (pos >= 0) & (pos <= input_pos)
+
+        # Page-address translation (mirror _decode_page_ids_and_offsets).
+        safe_pos = tl.maximum(pos, 0)
+        page_ordinal = safe_pos // TOKENS_PER_BLOCK
+        page_offset = safe_pos % TOKENS_PER_BLOCK
+        page_start = tl.load(cu_num_pages_ptr + seq_idx, mask=mask, other=0).to(tl.int64)
+        page_end = tl.load(cu_num_pages_ptr + seq_idx + 1, mask=mask, other=0).to(tl.int64)
+        page_table_idx = page_start + page_ordinal
+        page_valid = (pos >= 0) & (page_table_idx < page_end)
+        safe_idx = tl.where(page_valid, page_table_idx, page_start)
+        safe_idx = tl.minimum(tl.maximum(safe_idx, 0), CACHE_LOC_MAX)
+        page_id = tl.load(cache_loc_ptr + safe_idx, mask=mask, other=0).to(tl.int64)
+
+        valid = valid_pos & page_valid
+        tl.store(page_ids_ptr + offs, page_id, mask=mask)
+        tl.store(page_offsets_ptr + offs, page_offset, mask=mask)
+        tl.store(valid_ptr + offs, valid, mask=mask)
+
+
+def _fused_local_window_pagemap(
+    input_pos: torch.Tensor,  # [N]
+    seq_idx: torch.Tensor,  # [N]
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    window_size: int,
+    tokens_per_block: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Triton wrapper for the fused local-window page map.
+
+    Returns ``(page_ids, page_offsets, valid)`` -- both addresses ``int64`` of
+    shape ``[N, window_size]`` and the combined (position && page) validity mask,
+    bit-identical to ``_decode_local_cache_rows``' position gen + the
+    ``_decode_page_ids_and_offsets`` translate.  The caller does the final
+    ``swa_cache[page_ids, page_offsets]`` gather.
+    """
+    if cache_loc.numel() == 0:
+        raise ValueError("cache_loc must contain at least one page id")
+    num_decode = int(input_pos.shape[0])
+    device = input_pos.device
+    page_ids = torch.empty(num_decode, window_size, dtype=torch.long, device=device)
+    page_offsets = torch.empty(num_decode, window_size, dtype=torch.long, device=device)
+    valid = torch.empty(num_decode, window_size, dtype=torch.bool, device=device)
+    n_elements = num_decode * window_size
+    if n_elements == 0:
+        return page_ids, page_offsets, valid
+    BLOCK = 256
+    grid = (triton.cdiv(n_elements, BLOCK),)
+    _decode_local_window_pagemap_kernel[grid](
+        input_pos.contiguous(),
+        seq_idx.contiguous(),
+        cu_num_pages,
+        cache_loc,
+        page_ids,
+        page_offsets,
+        valid,
+        n_elements,
+        window_size,
+        tokens_per_block,
+        cache_loc.numel() - 1,
+        BLOCK=BLOCK,
+        num_warps=4,
+    )
+    return page_ids, page_offsets, valid
 
 
 def _can_use_fused_sparse_attention(
