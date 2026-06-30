@@ -614,13 +614,15 @@ def _run_trtllm_gen_mxfp4_from_routing(
     # routing histogram and drops real routes (capacity overflow), under-computing the output.
     sel = selected_experts.reshape(num_tokens, -1)
     top_k = sel.shape[-1]
-    local_idx = sel.to(torch.int64) - int(expert_start)
-    valid = (local_idx >= 0) & (local_idx < local_experts)
-    local_idx = torch.where(valid, local_idx, torch.full_like(local_idx, local_experts)).to(
-        torch.int32
-    )
-    weights = (routing_weights.reshape(num_tokens, top_k).to(torch.float32) * valid).to(
-        torch.bfloat16
+    # Fuse the global->local subtraction, range mask, invalid-sentinel select, int32 cast,
+    # and routing-weight mask/bf16-cast (plus the upstream model-side bf16 cast) into one
+    # Triton program. Off-rank / out-of-range routes get the sentinel ``local_experts`` so
+    # the runner SKIPS them; valid weights are bit-identical bf16, invalid ones are bf16(0).
+    local_idx, weights = torch.ops.auto_deploy.deepseek_v4_localize_routing(
+        sel,
+        routing_weights.reshape(num_tokens, top_k),
+        int(expert_start),
+        int(local_experts),
     )
 
     # Pad activations to the kernel's expected (padded) hidden dim (multiple of 512).

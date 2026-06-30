@@ -994,7 +994,10 @@ class DeepseekV4MoE(nn.Module):
         routed = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
             hidden_states_flat,
             selected_experts,
-            routing_weights.to(hidden_states_flat.dtype),
+            # Pass fp32 routing weights straight through: the trtllm-gen path's fused
+            # ``deepseek_v4_localize_routing`` casts to bf16 internally (bit-identical to
+            # the old ``.to(bf16)`` -> f32 -> bf16 round-trip), so this cast is now dead.
+            routing_weights,
             self.experts.gate_up_proj_blocks,
             self.experts.gate_up_proj_bias,
             self.experts.gate_up_proj_scales,
