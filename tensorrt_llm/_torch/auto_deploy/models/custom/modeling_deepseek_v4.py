@@ -1380,20 +1380,26 @@ class DeepseekV4Attention(nn.Module):
                     cos_compress,
                     sin_compress,
                 )
-                index_k = self.indexer.compressor.compress_projected(
-                    indexer_compressor_kv,
-                    indexer_compressor_gate,
-                    cos_compress_table,
-                    sin_compress_table,
-                    position_ids,
-                    hidden_states.dtype,
-                )
-                compressed_idxs = self.indexer.select_topk(
-                    indexer_q,
-                    index_k,
-                    indexer_weights,
+                # The model-side indexer compression (`compress_projected`) and
+                # top-k scoring (`select_topk`) are dead work under the cached
+                # sparse-attention op: both the cached prefill path
+                # (`_cached_compressed_attention`) and the decode path
+                # (`_decode_compressed_cache_attention`) recompute the index-score
+                # selection from the indexer compressor caches and consume the
+                # model-produced top-k tensor only for its static width
+                # (`index_topk = topk_idxs.shape[-1] - window_size`). Emit a
+                # width-correct placeholder (same `[batch, seq_len, index_topk]`
+                # shape `select_topk` produces) instead, skipping the duplicate
+                # compress-pool + index-score matmul + top-k block per ratio-4
+                # layer. The placeholder values are never read by the cached op,
+                # so the cached prefill/decode outputs are bit-identical.
+                compressed_idxs = _compress_topk_idxs(
+                    self.compress_ratio,
+                    batch_size,
                     seq_len,
                     seq_len,
+                    self.indexer.index_topk,
+                    hidden_states.device,
                 )
                 indexer_compressor_ape = self.indexer.compressor.ape
                 indexer_compressor_norm_weight = self.indexer.compressor.norm.weight
