@@ -163,6 +163,8 @@ transforms:
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
+  bake_grouped_finegrained_fp8_weight:
+    stage: post_load_fusion
   fuse_gemms_mixed_children:
     stage: post_load_fusion
     enabled: false

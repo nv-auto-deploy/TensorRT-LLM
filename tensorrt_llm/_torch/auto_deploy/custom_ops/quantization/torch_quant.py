@@ -1084,8 +1084,18 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
         raise ValueError(f"input must have at least grouped and K dimensions, got {input.shape}")
     if weight_quantized.dim() != 2:
         raise ValueError(f"weight must have shape [G * R, K], got {weight_quantized.shape}")
-    if weight_quantized.dtype != torch.float8_e4m3fn:
-        raise TypeError("Grouped FineGrained FP8 path requires float8_e4m3fn weight")
+    # The weight is either the raw ``float8_e4m3fn`` checkpoint tensor (dequantized on every
+    # call below) or a tensor whose exact BF16 runtime value was pre-materialized at load time
+    # by the ``bake_grouped_finegrained_fp8_weight`` post_load_fusion transform. The static
+    # FP8->BF16 conversion + per-block scale expansion depends only on the checkpoint weight and
+    # scale, so hoisting it leaves the dynamic input quantize-dequantize and grouped BMM below
+    # bit-for-bit identical.
+    weight_is_fp8 = weight_quantized.dtype == torch.float8_e4m3fn
+    if not weight_is_fp8 and not weight_quantized.is_floating_point():
+        raise TypeError(
+            "Grouped FineGrained FP8 path requires a float8_e4m3fn weight or a pre-dequantized "
+            f"floating-point weight, got {weight_quantized.dtype}"
+        )
 
     weight_scale_inv = _expect_single_scale(weight_scale, "weight_scale")
     num_groups = input.shape[-2]
@@ -1109,13 +1119,18 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
         input_contiguous
     )
 
-    weight_dequant = _dequant_block_fp8_weight(
-        weight_quantized,
-        weight_scale_inv,
-        block_n,
-        block_k,
-        dtype=input.dtype,
-    )
+    if weight_is_fp8:
+        weight_dequant = _dequant_block_fp8_weight(
+            weight_quantized,
+            weight_scale_inv,
+            block_n,
+            block_k,
+            dtype=input.dtype,
+        )
+    else:
+        # Weight already holds its dequantized BF16 runtime value (baked at load time); the
+        # ``.to`` is a no-op when it already matches ``input.dtype`` so no kernel is launched.
+        weight_dequant = weight_quantized.to(input.dtype)
     rank = out_rows // num_groups
     weight_grouped = weight_dequant.view(num_groups, rank, in_features)
     output = torch.matmul(
