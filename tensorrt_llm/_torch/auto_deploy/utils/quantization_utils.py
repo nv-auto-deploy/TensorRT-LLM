@@ -124,6 +124,12 @@ def fake_fp8_act_quant(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
     if dim == 0 or dim % block_size != 0:
         return x
 
+    # CUDA: collapse the ~14-kernel decomposition (abs/amax/log2/ceil/pow/clamp/2x bf16
+    # cast/mul) into one Triton kernel that is byte-identical to the eager body below
+    # (see custom_ops/deepseek_v4_fake_fp8.py and test_deepseek_v4_fake_fp8.py).
+    if x.is_cuda:
+        return torch.ops.auto_deploy.deepseek_v4_fake_fp8_act_quant(x, block_size)
+
     dtype = x.dtype
     x_float = x.float()
     grouped = x_float.reshape(-1, dim // block_size, block_size)
