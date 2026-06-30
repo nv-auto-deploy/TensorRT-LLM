@@ -15,7 +15,7 @@
 
 """DeepSeek V4 sparse attention source and cached reference ops."""
 
-from typing import NamedTuple, Optional
+from typing import List, NamedTuple, Optional, Tuple
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -41,6 +41,7 @@ from ..attention_interface import (
     Constant,
     MHACallable,
     PagedResourceHandler,
+    PrepareMetadataCallable,
     ResourceHandlerDict,
 )
 
@@ -1147,12 +1148,18 @@ def _write_decode_cache_rows(
     input_pos: torch.Tensor,
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
+    page_ids: Optional[torch.Tensor] = None,
+    page_offsets: Optional[torch.Tensor] = None,
 ) -> None:
     if values.numel() == 0:
         return
-    page_ids, page_offsets, _ = _decode_page_ids_and_offsets(
-        cache, seq_idx, input_pos, cu_num_pages, cache_loc
-    )
+    # ``page_ids``/``page_offsets`` are the precomputed current-token write
+    # address (see ``deepseek_v4_sparse_prepare_decode_page_addr``). When given,
+    # the per-layer page-map translation is skipped (bit-identical addresses).
+    if page_ids is None:
+        page_ids, page_offsets, _ = _decode_page_ids_and_offsets(
+            cache, seq_idx, input_pos, cu_num_pages, cache_loc
+        )
     cache[page_ids, page_offsets] = values.to(cache.dtype)
 
 
@@ -1484,6 +1491,8 @@ def _update_decode_compressed_caches(
     rope_dim: int,
     compress_ratio: int,
     max_compressed_len: int,
+    cur_page_ids: Optional[torch.Tensor] = None,
+    cur_page_offsets: Optional[torch.Tensor] = None,
 ) -> None:
     mode = _compression_mode(compress_ratio)
     if not mode.enabled or compressor_kv_decode.numel() == 0:
@@ -1491,11 +1500,29 @@ def _update_decode_compressed_caches(
 
     state_dim = int(compressor_kv_decode.shape[-1])
     head_dim = state_dim // mode.channels
+    # The compressor kv/gate caches store the *current* token at ``input_pos``,
+    # so they reuse the hoisted current-token write address. The mhc_cache
+    # write below targets a compressed row (``row_logical_pos``), a different
+    # logical position, and keeps its own per-layer translation.
     _write_decode_cache_rows(
-        compressor_kv_cache, compressor_kv_decode, seq_idx, input_pos, cu_num_pages, cache_loc
+        compressor_kv_cache,
+        compressor_kv_decode,
+        seq_idx,
+        input_pos,
+        cu_num_pages,
+        cache_loc,
+        cur_page_ids,
+        cur_page_offsets,
     )
     _write_decode_cache_rows(
-        compressor_gate_cache, compressor_gate_decode, seq_idx, input_pos, cu_num_pages, cache_loc
+        compressor_gate_cache,
+        compressor_gate_decode,
+        seq_idx,
+        input_pos,
+        cu_num_pages,
+        cache_loc,
+        cur_page_ids,
+        cur_page_offsets,
     )
 
     old_completed = input_pos // compress_ratio
@@ -1730,6 +1757,8 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
     slot_idx: torch.Tensor,
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
+    cur_page_ids: Optional[torch.Tensor],
+    cur_page_offsets: Optional[torch.Tensor],
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -1753,9 +1782,23 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
     seq_idx_decode = torch.arange(num_decode, dtype=torch.long, device=input_pos.device)
     input_pos_decode = input_pos.reshape(-1)[:num_decode].to(torch.long)
     position_ids_decode = position_ids.reshape(-1)[:num_decode].to(torch.long)
+    # Current-token write address, hoisted once per forward by
+    # ``deepseek_v4_sparse_prepare_decode_page_addr`` and shared by every layer.
+    # Slice to the active decode sequences; ``None`` falls back to per-layer
+    # translation inside ``_write_decode_cache_rows``.
+    if cur_page_ids is not None:
+        cur_page_ids = cur_page_ids[:num_decode]
+        cur_page_offsets = cur_page_offsets[:num_decode]
 
     _write_decode_cache_rows(
-        swa_cache, kv_decode, seq_idx_decode, input_pos_decode, cu_num_pages, cache_loc
+        swa_cache,
+        kv_decode,
+        seq_idx_decode,
+        input_pos_decode,
+        cu_num_pages,
+        cache_loc,
+        cur_page_ids,
+        cur_page_offsets,
     )
     if compress_ratio:
         assert window_size is not None
@@ -1782,6 +1825,8 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             rope_dim,
             compress_ratio,
             max_compressed_len,
+            cur_page_ids,
+            cur_page_offsets,
         )
         mode = _compression_mode(compress_ratio)
         if mode.uses_indexer:
@@ -1796,6 +1841,8 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
                 input_pos_decode,
                 cu_num_pages,
                 cache_loc,
+                cur_page_ids,
+                cur_page_offsets,
             )
             _write_decode_cache_rows(
                 indexer_compressor_gate_cache,
@@ -1804,6 +1851,8 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
                 input_pos_decode,
                 cu_num_pages,
                 cache_loc,
+                cur_page_ids,
+                cur_page_offsets,
             )
         indexer_q_decode = _flatten_decode_tokens(indexer_q, num_decode)
         indexer_weights_decode = _flatten_decode_tokens(indexer_weights, num_decode)
@@ -2537,6 +2586,63 @@ def torch_deepseek_v4_sparse_attention_fake(
 
 
 @torch.library.custom_op(
+    "auto_deploy::deepseek_v4_sparse_prepare_decode_page_addr", mutates_args=()
+)
+def deepseek_v4_sparse_prepare_decode_page_addr(
+    input_pos: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    tokens_per_block: int,
+) -> List[torch.Tensor]:
+    """Precompute the current-token paged write address once per forward.
+
+    Every DeepSeek V4 sparse-attention layer writes the freshly produced
+    KV / compressor / indexer rows for the *current* decode token to the same
+    logical position ``input_pos`` of caches that share one page table
+    (``cu_num_pages`` / ``cache_loc``) and one ``tokens_per_block``.  The
+    ``(page_id, page_offset)`` translation is therefore identical across all
+    layers and across all of those caches, yet the per-layer op currently
+    recomputes it once per current-token write (5x per layer).  Hoisting it
+    into this prepare op -- a single graph node whose result feeds every layer
+    -- removes that redundant, launch-bound page-map work while leaving the
+    stored values byte-identical.
+
+    Returns ``[page_ids, page_offsets]`` (both int64, shape ``[num_seq]``); the
+    decode op slices ``[:num_decode]``.  Mirrors ``_decode_page_ids_and_offsets``
+    for ``seq_idx = arange(num_seq)`` and ``positions = input_pos`` so the
+    produced addresses are bit-identical to the per-layer computation.
+    """
+    num_seq = int(cu_num_pages.shape[0]) - 1
+    positions_long = input_pos.reshape(-1)[:num_seq].to(torch.long)
+    seq_idx_long = torch.arange(num_seq, dtype=torch.long, device=positions_long.device)
+    safe_positions = positions_long.clamp(min=0)
+    page_ordinals = safe_positions // tokens_per_block
+    page_offsets = safe_positions % tokens_per_block
+    page_start = cu_num_pages[seq_idx_long].to(torch.long)
+    page_end = cu_num_pages[seq_idx_long + 1].to(torch.long)
+    page_table_idx = page_start + page_ordinals
+    valid = (positions_long >= 0) & (page_table_idx < page_end)
+    safe_page_table_idx = torch.where(valid, page_table_idx, page_start)
+    safe_page_table_idx = safe_page_table_idx.clamp(min=0, max=cache_loc.numel() - 1)
+    page_ids = cache_loc[safe_page_table_idx].to(torch.long)
+    return [page_ids, page_offsets]
+
+
+@deepseek_v4_sparse_prepare_decode_page_addr.register_fake
+def deepseek_v4_sparse_prepare_decode_page_addr_fake(
+    input_pos: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    tokens_per_block: int,
+) -> List[torch.Tensor]:
+    num_seq = cu_num_pages.shape[0] - 1
+    return [
+        torch.empty(num_seq, dtype=torch.long, device=input_pos.device),
+        torch.empty(num_seq, dtype=torch.long, device=input_pos.device),
+    ]
+
+
+@torch.library.custom_op(
     "auto_deploy::torch_deepseek_v4_sparse_attention_with_cache",
     mutates_args=(
         "swa_cache",
@@ -2573,6 +2679,8 @@ def torch_deepseek_v4_sparse_attention_with_cache(
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
     last_page_len: torch.Tensor,
+    cur_page_ids: torch.Tensor,
+    cur_page_offsets: torch.Tensor,
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -2647,6 +2755,8 @@ def torch_deepseek_v4_sparse_attention_with_cache(
             slot_idx,
             cu_num_pages,
             cache_loc,
+            cur_page_ids,
+            cur_page_offsets,
             swa_cache,
             mhc_cache,
             compressor_kv_cache,
@@ -2877,6 +2987,8 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
     last_page_len: torch.Tensor,
+    cur_page_ids: torch.Tensor,
+    cur_page_offsets: torch.Tensor,
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -2942,6 +3054,8 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
         cu_num_pages,
         cache_loc,
         last_page_len,
+        cur_page_ids,
+        cur_page_offsets,
         swa_cache,
         mhc_cache,
         compressor_kv_cache,
@@ -2991,6 +3105,37 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
             "cache_loc",
             "last_page_len",
         ]
+
+    @classmethod
+    def get_prepare_extra_metadata_info(
+        cls, any_source_attn_node: Node, sequence_info=None
+    ) -> Tuple[Optional[PrepareMetadataCallable], int, List[Constant]]:
+        """Hoist the current-token paged write address out of the per-layer op.
+
+        Every layer writes the current decode token to logical position
+        ``input_pos`` of caches that share one page table (``cu_num_pages`` /
+        ``cache_loc``) and one ``tokens_per_block``, so the
+        ``(page_id, page_offset)`` translation is identical across all layers
+        and is recomputed redundantly today.  This registers
+        ``deepseek_v4_sparse_prepare_decode_page_addr`` as a once-per-forward
+        prepare op whose two outputs (``cur_page_ids`` / ``cur_page_offsets``)
+        are wired as extra metadata into every cached-attention invocation.
+
+        ``sequence_info`` is forwarded by the cache-insertion transform and
+        supplies ``tokens_per_block`` (the cache page size) as a constant arg.
+        """
+        if sequence_info is None:
+            raise RuntimeError(
+                "DeepSeek V4 sparse attention requires sequence_info to hoist the "
+                "current-token page address; the cache-insertion transform must "
+                "forward it to get_prepare_extra_metadata_info."
+            )
+        tokens_per_block = int(sequence_info.tokens_per_block)
+        return (
+            torch.ops.auto_deploy.deepseek_v4_sparse_prepare_decode_page_addr.default,
+            2,
+            [tokens_per_block],
+        )
 
     @classmethod
     def get_cache_initializers(
