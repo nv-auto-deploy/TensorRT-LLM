@@ -1170,10 +1170,21 @@ def _decode_cache_rows_from_positions(
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
     dtype: torch.dtype,
+    page_map: Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    page_ids, page_offsets, valid = _decode_page_ids_and_offsets(
-        cache, seq_idx, positions, cu_num_pages, cache_loc
-    )
+    # ``page_map`` is a precomputed ``(page_ids, page_offsets, valid)`` triple from
+    # ``_decode_page_ids_and_offsets``. Every DeepSeek-V4 sparse cache shares one
+    # page table (``cu_num_pages``/``cache_loc``) and one ``tokens_per_block``, so
+    # the translation for a given ``positions`` is identical regardless of which
+    # cache it indexes. Callers that read the same positions from a kv/gate pair
+    # (or the same logical row for a paired read+write) compute the map once and
+    # reuse it here, skipping a redundant ~16-kernel integer translation chain.
+    if page_map is None:
+        page_ids, page_offsets, valid = _decode_page_ids_and_offsets(
+            cache, seq_idx, positions, cu_num_pages, cache_loc
+        )
+    else:
+        page_ids, page_offsets, valid = page_map
     return cache[page_ids, page_offsets].to(dtype), valid
 
 
@@ -1288,6 +1299,16 @@ def _batched_compressed_rows_from_paged_state(
         current_positions = anchor.unsqueeze(1) + offsets.view(1, -1)
         previous_valid = previous_positions >= 0
 
+        # kv and gate caches share one page table + tokens_per_block, so the reads
+        # at ``previous_positions`` (resp. ``current_positions``) resolve to the same
+        # page map across both caches. Compute each distinct map once and reuse it
+        # for the kv and gate gather -- 4 page-map chains -> 2.
+        previous_map = _decode_page_ids_and_offsets(
+            compressor_kv_cache, seq_idx, previous_positions, cu_num_pages, cache_loc
+        )
+        current_map = _decode_page_ids_and_offsets(
+            compressor_kv_cache, seq_idx, current_positions, cu_num_pages, cache_loc
+        )
         previous_kv_state, previous_page_valid = _decode_cache_rows_from_positions(
             compressor_kv_cache,
             seq_idx,
@@ -1295,6 +1316,7 @@ def _batched_compressed_rows_from_paged_state(
             cu_num_pages,
             cache_loc,
             dtype,
+            previous_map,
         )
         previous_gate_state, _ = _decode_cache_rows_from_positions(
             compressor_gate_cache,
@@ -1303,6 +1325,7 @@ def _batched_compressed_rows_from_paged_state(
             cu_num_pages,
             cache_loc,
             dtype,
+            previous_map,
         )
         current_kv_state, _ = _decode_cache_rows_from_positions(
             compressor_kv_cache,
@@ -1311,6 +1334,7 @@ def _batched_compressed_rows_from_paged_state(
             cu_num_pages,
             cache_loc,
             dtype,
+            current_map,
         )
         current_gate_state, _ = _decode_cache_rows_from_positions(
             compressor_gate_cache,
@@ -1319,6 +1343,7 @@ def _batched_compressed_rows_from_paged_state(
             cu_num_pages,
             cache_loc,
             dtype,
+            current_map,
         )
         previous_valid = previous_valid & previous_page_valid
 
@@ -1345,6 +1370,10 @@ def _batched_compressed_rows_from_paged_state(
         gate = torch.cat((previous_gate, current_gate), dim=1)
     else:
         positions = anchor.unsqueeze(1) + offsets.view(1, -1)
+        # kv and gate share the page map for these positions (see overlap branch).
+        positions_map = _decode_page_ids_and_offsets(
+            compressor_kv_cache, seq_idx, positions, cu_num_pages, cache_loc
+        )
         kv_state, _ = _decode_cache_rows_from_positions(
             compressor_kv_cache,
             seq_idx,
@@ -1352,6 +1381,7 @@ def _batched_compressed_rows_from_paged_state(
             cu_num_pages,
             cache_loc,
             dtype,
+            positions_map,
         )
         gate_state, _ = _decode_cache_rows_from_positions(
             compressor_gate_cache,
@@ -1360,6 +1390,7 @@ def _batched_compressed_rows_from_paged_state(
             cu_num_pages,
             cache_loc,
             dtype,
+            positions_map,
         )
         kv = kv_state[..., :head_dim]
         gate = gate_state[..., :head_dim]
@@ -1422,11 +1453,17 @@ def _batched_overlap_compressed_rows_fullrange(
 
     full_positions = torch.arange(m * compress_ratio, dtype=torch.long, device=device)
     full_positions = full_positions.view(1, -1).expand(num_rows, -1)
+    # kv and gate share the page map for ``full_positions`` (caches share one page
+    # table + tokens_per_block); compute it once instead of once per cache. This is
+    # the decode-dominant gather, so the duplicate chain is the largest to remove.
+    full_map = _decode_page_ids_and_offsets(
+        compressor_kv_cache, seq_idx, full_positions, cu_num_pages, cache_loc
+    )
     current_kv_state, current_page_valid = _decode_cache_rows_from_positions(
-        compressor_kv_cache, seq_idx, full_positions, cu_num_pages, cache_loc, dtype
+        compressor_kv_cache, seq_idx, full_positions, cu_num_pages, cache_loc, dtype, full_map
     )
     current_gate_state, _ = _decode_cache_rows_from_positions(
-        compressor_gate_cache, seq_idx, full_positions, cu_num_pages, cache_loc, dtype
+        compressor_gate_cache, seq_idx, full_positions, cu_num_pages, cache_loc, dtype, full_map
     )
     state_dim = int(current_kv_state.shape[-1])
     current_kv_state = current_kv_state.view(num_rows, m, compress_ratio, state_dim)
@@ -1549,8 +1586,20 @@ def _update_decode_compressed_caches(
         compressor_kv_decode.dtype,
     )
     row_logical_pos = row_idx * compress_ratio
+    # The mhc read (previous_rows) and the write below both target ``row_logical_pos``
+    # of mhc_cache, so they resolve to one page map. Compute it once and feed both
+    # the read and the write -- the second translation chain is removed.
+    mhc_page_ids, mhc_page_offsets, _ = _decode_page_ids_and_offsets(
+        mhc_cache, seq_idx, row_logical_pos, cu_num_pages, cache_loc
+    )
     previous_rows, _ = _decode_cache_rows_from_positions(
-        mhc_cache, seq_idx, row_logical_pos, cu_num_pages, cache_loc, mhc_cache.dtype
+        mhc_cache,
+        seq_idx,
+        row_logical_pos,
+        cu_num_pages,
+        cache_loc,
+        mhc_cache.dtype,
+        (mhc_page_ids, mhc_page_offsets, None),
     )
     rows_to_write = torch.where(
         row_valid.unsqueeze(-1),
@@ -1558,7 +1607,14 @@ def _update_decode_compressed_caches(
         previous_rows,
     )
     _write_decode_cache_rows(
-        mhc_cache, rows_to_write, seq_idx, row_logical_pos, cu_num_pages, cache_loc
+        mhc_cache,
+        rows_to_write,
+        seq_idx,
+        row_logical_pos,
+        cu_num_pages,
+        cache_loc,
+        mhc_page_ids,
+        mhc_page_offsets,
     )
 
 
