@@ -1084,12 +1084,13 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
         raise ValueError(f"input must have at least grouped and K dimensions, got {input.shape}")
     if weight_quantized.dim() != 2:
         raise ValueError(f"weight must have shape [G * R, K], got {weight_quantized.shape}")
-    # The weight is either the raw ``float8_e4m3fn`` checkpoint tensor (dequantized on every
-    # call below) or a tensor whose exact BF16 runtime value was pre-materialized at load time
-    # by the ``bake_grouped_finegrained_fp8_weight`` post_load_fusion transform. The static
-    # FP8->BF16 conversion + per-block scale expansion depends only on the checkpoint weight and
-    # scale, so hoisting it leaves the dynamic input quantize-dequantize and grouped BMM below
-    # bit-for-bit identical.
+    # The weight is either the raw ``float8_e4m3fn`` checkpoint tensor (consumed directly by the
+    # block-FP8 matmul below) or a tensor whose exact BF16 runtime value was pre-materialized at
+    # load time by the ``bake_grouped_finegrained_fp8_weight`` post_load_fusion transform. When
+    # the weight is FP8 we keep both operands in FP8 and run a direct grouped block-FP8 W8A8
+    # matmul (idea_0025); when it has already been baked to a floating-point dtype we fall back to
+    # the dynamic input quantize-dequantize + grouped BMM, which stays bit-for-bit identical to
+    # the prior behavior on that branch.
     weight_is_fp8 = weight_quantized.dtype == torch.float8_e4m3fn
     if not weight_is_fp8 and not weight_quantized.is_floating_point():
         raise TypeError(
@@ -1113,31 +1114,67 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
     block_k = triton.cdiv(in_features, scale_k)
 
     input_contiguous = input.contiguous()
-    qinput, input_scales = _safe_act_quant(input_contiguous, block_k, input_scale_fmt)
-    qinput_blocks = qinput.reshape(*input_contiguous.shape[:-1], -1, block_k)
-    input_dequant = (qinput_blocks.to(input.dtype) * input_scales.unsqueeze(-1)).reshape_as(
-        input_contiguous
-    )
+    rank = out_rows // num_groups
+    lead_shape = input.shape[:-2]
 
     if weight_is_fp8:
-        weight_dequant = _dequant_block_fp8_weight(
-            weight_quantized,
-            weight_scale_inv,
-            block_n,
-            block_k,
-            dtype=input.dtype,
-        )
+        # Direct grouped block-FP8 W8A8 matmul: keep both operands in FP8 and let the proven
+        # block-FP8 kernel apply the per-block input/weight scales inside its FP32 accumulator.
+        # This removes the per-call input quantize->dequantize round-trip and the FP8->BF16 weight
+        # dequant entirely, and reads the FP8 weight (1 byte/elem) instead of a dequantized BF16
+        # weight (2 byte/elem) -- the dominant HBM cost of this memory-bound decode GEMV. It is the
+        # same arithmetic the non-grouped FineGrained FP8 path already uses, and is numerically
+        # *more* faithful than the prior dequant->BF16-BMM (no BF16 rounding of the dequantized
+        # operands; the per-block scale is constant within a block so factoring it out of the
+        # contraction is exact). Under tensor parallelism the DeepSeek-V4 MLA ``wo_a`` per-rank
+        # group count is 1, so this is a single 2D block-FP8 GEMM (K=4096 -> the split-K decode
+        # path); ``num_groups > 1`` falls back to a per-group launch of the same proven kernel.
+        qinput, input_scales = _safe_act_quant(input_contiguous, block_k, input_scale_fmt)
+        m_tokens = qinput.numel() // (num_groups * in_features)
+        qin = qinput.reshape(m_tokens, num_groups, in_features)
+        sin = input_scales.reshape(m_tokens, num_groups, input_scales.shape[-1])
+        if num_groups == 1:
+            out2d = _w8a8_block_fp8_matmul_triton(
+                qin[:, 0, :],
+                weight_quantized,
+                sin[:, 0, :],
+                weight_scale_inv,
+                [block_n, block_k],
+                output_dtype=input.dtype,
+            )
+            output = out2d.reshape(*lead_shape, out_rows)
+        else:
+            weight_grouped = weight_quantized.view(num_groups, rank, in_features)
+            scale_rows = scale_n // num_groups
+            scale_grouped = weight_scale_inv.view(num_groups, scale_rows, scale_k)
+            parts = [
+                _w8a8_block_fp8_matmul_triton(
+                    qin[:, g, :].contiguous(),
+                    weight_grouped[g].contiguous(),
+                    sin[:, g, :].contiguous(),
+                    scale_grouped[g].contiguous(),
+                    [block_n, block_k],
+                    output_dtype=input.dtype,
+                )
+                for g in range(num_groups)
+            ]
+            output = torch.stack(parts, dim=1).reshape(*lead_shape, out_rows)
     else:
-        # Weight already holds its dequantized BF16 runtime value (baked at load time); the
-        # ``.to`` is a no-op when it already matches ``input.dtype`` so no kernel is launched.
-        weight_dequant = weight_quantized.to(input.dtype)
-    rank = out_rows // num_groups
-    weight_grouped = weight_dequant.view(num_groups, rank, in_features)
-    output = torch.matmul(
-        input_dequant.unsqueeze(-2),
-        weight_grouped.transpose(-1, -2),
-    ).squeeze(-2)
-    output = output.flatten(-2)
+        # Weight already holds its dequantized floating-point runtime value (baked at load time by
+        # the ``bake_grouped_finegrained_fp8_weight`` transform). Fall back to the dynamic input
+        # quantize-dequantize + grouped BMM; bit-for-bit identical to the prior behavior here.
+        qinput, input_scales = _safe_act_quant(input_contiguous, block_k, input_scale_fmt)
+        qinput_blocks = qinput.reshape(*input_contiguous.shape[:-1], -1, block_k)
+        input_dequant = (qinput_blocks.to(input.dtype) * input_scales.unsqueeze(-1)).reshape_as(
+            input_contiguous
+        )
+        weight_grouped = weight_quantized.to(input.dtype).view(num_groups, rank, in_features)
+        output = torch.matmul(
+            input_dequant.unsqueeze(-2),
+            weight_grouped.transpose(-1, -2),
+        ).squeeze(-2)
+        output = output.flatten(-2)
+
     if bias is not None:
         output = output + bias.reshape(out_rows).to(output.dtype)
     return output.to(dtype=input.dtype)
