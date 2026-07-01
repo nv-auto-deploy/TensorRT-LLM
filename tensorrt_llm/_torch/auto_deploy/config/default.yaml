@@ -202,6 +202,15 @@ transforms:
   fuse_finegrained_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+  # Share one block-FP8 activation quant across sibling FineGrained FP8 linears that
+  # consume the same activation (e.g. DeepSeek-V4 attn wq_a+wkv, wq_b+indexer.wq_b,
+  # shared-expert w1+w3). Runs AFTER fuse_finegrained_fp8_linear so it only fires on
+  # the torch reference path (fuse disabled); a no-op once linears are routed to
+  # trtllm/deepgemm (which quantize internally). run_shape_prop populates meta on the
+  # hoisted quant + matmul nodes.
+  fuse_fp8_act_quant_cse:
+    stage: post_load_fusion
+    run_shape_prop: true
   fuse_mxfp4_moe:
     stage: post_load_fusion
     expect_mem_change: true  # adds padding for trtllm-gen kernel alignment during weight repack

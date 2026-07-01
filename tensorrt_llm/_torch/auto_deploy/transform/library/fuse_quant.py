@@ -12,10 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import operator
+from collections import defaultdict
 from typing import Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
+import triton
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
@@ -27,7 +30,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
-from ...utils.node_utils import is_op
+from ...utils.node_utils import extract_op_args, is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import (
     BaseTransform,
@@ -695,5 +698,148 @@ class FuseFineGrainedFP8Linear(BaseTransform):
             num_matches=cnt,
             is_clean=(cnt == 0),
             has_valid_shapes=(cnt == 0),
+        )
+        return gm, info
+
+
+# ============================================================================
+# FineGrained FP8 activation-quant common-subexpression elimination
+# ============================================================================
+
+
+def _finegrained_fp8_block_k(
+    gm: GraphModule, weight_node: object, weight_scale_arg: object
+) -> Optional[int]:
+    """Derive the activation-quant block size (block_k) of a FineGrained FP8 linear.
+
+    ``torch_fake_quant_finegrained_fp8_linear`` infers ``block_k = cdiv(K, scale_k)``
+    from the weight ``[N, K]`` and per-block weight scale ``[N/block_n, K/block_k]``
+    shapes and quantizes the activation in groups of that size. Two linears can share
+    one activation quant only when this block size matches, so the transform groups on
+    it. Returns ``None`` when the shapes cannot be resolved (the node is skipped).
+    """
+    if not isinstance(weight_node, Node):
+        return None
+    if not isinstance(weight_scale_arg, (list, tuple)) or len(weight_scale_arg) == 0:
+        return None
+    scale_node = weight_scale_arg[0]
+    weight = _resolve_attr_tensor(gm, weight_node)
+    scale = _resolve_attr_tensor(gm, scale_node)
+    if weight is None or scale is None or weight.dim() != 2 or scale.dim() != 2:
+        return None
+    K = weight.shape[1]
+    scale_k = scale.shape[1]
+    if scale_k == 0:
+        return None
+    return int(triton.cdiv(K, scale_k))
+
+
+@TransformRegistry.register("fuse_fp8_act_quant_cse")
+class FuseFP8ActQuantCSE(BaseTransform):
+    """Share one block-FP8 activation quant across sibling FineGrained FP8 linears.
+
+    Models with MLA + MoE (DeepSeek-V4, etc.) feed the *same* activation tensor into
+    several FineGrained FP8 linears, e.g.:
+      * ``attn.wq_a`` + ``attn.wkv``               (both on the attention-norm output)
+      * ``attn.wq_b`` + ``attn.indexer.wq_b``      (both on the q-lora)
+      * shared-expert ``w1`` + ``w3``              (both on the MoE/MLP input)
+
+    Each ``torch_fake_quant_finegrained_fp8_linear`` re-runs ``_safe_act_quant`` (the
+    ``_act_quant_kernel`` Triton launch) on that identical tensor with the identical
+    block size, producing a byte-identical ``(fp8, scale)`` pair every time -- pure
+    redundant work (this kernel is the largest single hit-count Triton launch in the
+    DeepSeek-V4 decode window).
+
+    This transform hoists one ``torch_fp8_finegrained_act_quant`` per
+    ``(input, block_k, input_scale_fmt)`` group with >= 2 members and rewrites every
+    member to the matmul-only ``torch_fake_quant_finegrained_fp8_linear_prequant``,
+    deleting the redundant quant launches. Singleton groups are left untouched
+    (splitting them would be neutral). Reference-exact: the quant kernel is a
+    deterministic pure function, so one shared launch equals each per-linear recompute
+    bit for bit.
+
+    Runs in post_load_fusion AFTER ``fuse_finegrained_fp8_linear``. When the TRT-LLM
+    finegrained fuse is enabled the linears are already routed to deepgemm / cuBLAS
+    (which quantize internally), so this transform matches nothing -- it only fires on
+    the torch reference path (fuse disabled), which is what DeepSeek-V4 runs.
+    """
+
+    config: TransformConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return TransformConfig
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        lin_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
+        act_op = torch.ops.auto_deploy.torch_fp8_finegrained_act_quant.default
+        prequant_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_prequant.default
+
+        # Group linear nodes by (shared input node, block_k, input_scale_fmt). Nodes are
+        # visited in topological order, so each group's members[] is already ordered and
+        # members[0] is the earliest -- a safe insertion point for the shared quant.
+        groups: "dict[Tuple[Node, int, str], list[Node]]" = defaultdict(list)
+        for node in gm.graph.nodes:
+            if not is_op(node, lin_op):
+                continue
+            inp, weight, weight_scale, fmt = extract_op_args(
+                node, "input", "weight_quantized", "weight_scale", "input_scale_fmt"
+            )
+            if not isinstance(inp, Node):
+                continue
+            block_k = _finegrained_fp8_block_k(gm, weight, weight_scale)
+            if block_k is None:
+                continue
+            groups[(inp, block_k, fmt or "")].append(node)
+
+        num_groups = 0
+        num_linears = 0
+        num_quant_removed = 0
+        for (inp, block_k, fmt), members in groups.items():
+            if len(members) < 2:
+                continue
+            num_groups += 1
+            num_quant_removed += len(members) - 1  # N quant launches collapse to 1
+
+            # One shared activation quant, inserted right before the earliest member
+            # (which already dominates -- it consumes `inp`, so it follows `inp` and all
+            # graph placeholders). The getitems unpack the (qfp8, scale) tuple.
+            first = members[0]
+            with gm.graph.inserting_before(first):
+                act_node = gm.graph.call_function(act_op, args=(inp, int(block_k), fmt))
+                qfp8 = gm.graph.call_function(operator.getitem, args=(act_node, 0))
+                qscale = gm.graph.call_function(operator.getitem, args=(act_node, 1))
+
+            for member in members:
+                _, weight, bias, weight_scale = extract_op_args(
+                    member, "input", "weight_quantized", "bias", "weight_scale"
+                )
+                with gm.graph.inserting_before(member):
+                    new_node = gm.graph.call_function(
+                        prequant_op,
+                        args=(qfp8, qscale, weight, bias, weight_scale),
+                    )
+                member.replace_all_uses_with(new_node)
+                gm.graph.erase_node(member)
+                num_linears += 1
+
+        if num_groups:
+            ad_logger.info(
+                f"fuse_fp8_act_quant_cse: shared {num_groups} activation-quant group(s) "
+                f"across {num_linears} FineGrained FP8 linears, removed "
+                f"{num_quant_removed} redundant act-quant launch(es) per forward"
+            )
+
+        info = TransformInfo(
+            skipped=(num_groups == 0),
+            num_matches=num_groups,
+            is_clean=(num_groups == 0),
+            has_valid_shapes=(num_groups == 0),
         )
         return gm, info

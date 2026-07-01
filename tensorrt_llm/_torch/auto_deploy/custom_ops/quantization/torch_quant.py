@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import triton
@@ -1054,6 +1054,92 @@ def _torch_fake_quant_finegrained_fp8_linear_fake(
     """Fake implementation for torch.export tracing."""
     out_features = weight_quantized.shape[0]
     return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
+
+
+@torch.library.custom_op("auto_deploy::torch_fp8_finegrained_act_quant", mutates_args=())
+def torch_fp8_finegrained_act_quant(
+    input: torch.Tensor,  # [..., K]
+    block_size: int,  # block_k (the activation quant group, == matmul block_k)
+    input_scale_fmt: str = "",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Stand-alone block-wise FP8 activation quantization.
+
+    This is exactly the activation-quant half of
+    ``torch_fake_quant_finegrained_fp8_linear`` (the ``_safe_act_quant`` /
+    ``_act_quant_kernel`` Triton launch), split out as its own op so the
+    ``fuse_fp8_act_quant_cse`` graph transform can hoist it out of the linear and
+    share one ``(qfp8, scale)`` pair across sibling linears that consume the same
+    activation tensor with the same block size. Because ``_safe_act_quant`` is a
+    deterministic pure function of ``(input, block_size, input_scale_fmt)``, the
+    shared result is byte-identical to each per-linear recompute.
+    """
+    return _safe_act_quant(input, block_size, input_scale_fmt)
+
+
+@torch_fp8_finegrained_act_quant.register_fake
+def _torch_fp8_finegrained_act_quant_fake(
+    input: torch.Tensor,
+    block_size: int,
+    input_scale_fmt: str = "",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    qinput = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+    scale = input.new_empty(*input.shape[:-1], input.shape[-1] // block_size, dtype=input.dtype)
+    return qinput, scale
+
+
+@torch.library.custom_op(
+    "auto_deploy::torch_fake_quant_finegrained_fp8_linear_prequant", mutates_args=()
+)
+def torch_fake_quant_finegrained_fp8_linear_prequant(
+    qinput: torch.Tensor,  # [..., K] float8_e4m3fn (pre-quantized activation)
+    input_scale: torch.Tensor,  # [..., K//block_k] per-block act scale (model dtype)
+    weight_quantized: torch.Tensor,  # [N, K] float8_e4m3fn
+    bias: Optional[torch.Tensor],  # [N] or None
+    weight_scale: List[torch.Tensor],  # [weight_scale_inv]
+) -> torch.Tensor:
+    """Matmul half of ``torch_fake_quant_finegrained_fp8_linear``.
+
+    Consumes a pre-quantized activation + per-block scale (produced once by
+    ``torch_fp8_finegrained_act_quant`` and shared across sibling linears) and runs
+    the same block-FP8 W8A8 matmul + bias the original op runs after its in-line
+    ``_safe_act_quant``. The output dtype is recovered from ``input_scale.dtype``,
+    which ``_safe_act_quant`` allocates in the original activation dtype, so the
+    result is bit-for-bit identical to the fused op.
+    """
+    weight_scale_inv = weight_scale[0]
+    out_dtype = input_scale.dtype
+    N, K = weight_quantized.shape
+    scale_n, scale_k = weight_scale_inv.shape
+    block_n = triton.cdiv(N, scale_n)
+    block_k = triton.cdiv(K, scale_k)
+
+    output = _w8a8_block_fp8_matmul_triton(
+        qinput,
+        weight_quantized,
+        input_scale,
+        weight_scale_inv,
+        [block_n, block_k],
+        output_dtype=out_dtype,
+    )
+
+    if bias is not None:
+        output = output + bias
+
+    return output.to(dtype=out_dtype)
+
+
+@torch_fake_quant_finegrained_fp8_linear_prequant.register_fake
+def _torch_fake_quant_finegrained_fp8_linear_prequant_fake(
+    qinput: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+) -> torch.Tensor:
+    out_features = weight_quantized.shape[0]
+    return torch.empty(
+        (*qinput.shape[:-1], out_features), dtype=input_scale.dtype, device=qinput.device
+    )
 
 
 @torch.library.custom_op(
