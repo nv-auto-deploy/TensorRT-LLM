@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - triton always present on CUDA builds
     _HAS_TRITON = False
 
 from ..._compat import KvCacheConfig
-from ...utils.node_utils import extract_op_args
+from ...utils.node_utils import extract_op_args, is_op
 from ...utils.quantization_utils import fake_fp8_act_quant as _fake_fp8_act_quant
 from ..attention_interface import (
     AttentionDescriptor,
@@ -1158,19 +1158,26 @@ def _flatten_decode_tokens(tensor: torch.Tensor, num_decode: int) -> torch.Tenso
     return tensor.reshape(-1, *tensor.shape[2:])[:num_decode]
 
 
-def _decode_page_ids_and_offsets(
-    cache: torch.Tensor,
+def _page_ids_and_offsets_from_tpb(
+    tokens_per_block: int,
     seq_idx: torch.Tensor,
     positions: torch.Tensor,
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Paged ``(page_ids, page_offsets, valid)`` translation for ``positions``.
+
+    Single source of truth for the DeepSeek-V4 sparse-attention page-map math.
+    ``_decode_page_ids_and_offsets`` (per-layer, reads ``tokens_per_block`` from a
+    cache tensor) and ``deepseek_v4_sparse_prepare_decode_page_addr`` (once-per-forward
+    hoist, receives ``tokens_per_block`` as a constant) both call this so the hoisted
+    addresses are bit-identical to the per-layer translation they replace.
+    """
     if cache_loc.numel() == 0:
         raise ValueError("cache_loc must contain at least one page id")
 
     positions_long = positions.to(torch.long)
     safe_positions = positions_long.clamp(min=0)
-    tokens_per_block = int(cache.shape[1])
     page_ordinals = safe_positions // tokens_per_block
     page_offsets = safe_positions % tokens_per_block
 
@@ -1185,6 +1192,18 @@ def _decode_page_ids_and_offsets(
     safe_page_table_idx = safe_page_table_idx.clamp(min=0, max=cache_loc.numel() - 1)
     page_ids = cache_loc[safe_page_table_idx].to(torch.long)
     return page_ids, page_offsets, valid
+
+
+def _decode_page_ids_and_offsets(
+    cache: torch.Tensor,
+    seq_idx: torch.Tensor,
+    positions: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _page_ids_and_offsets_from_tpb(
+        int(cache.shape[1]), seq_idx, positions, cu_num_pages, cache_loc
+    )
 
 
 def _write_decode_cache_rows(
@@ -1351,26 +1370,52 @@ def _batched_compressed_rows_from_paged_state(
     head_dim: int,
     dtype: torch.dtype,
     rotate: bool = False,
+    overlap_page_map: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
-    offsets = torch.arange(compress_ratio, dtype=torch.long, device=row_idx.device)
-    anchor = row_idx.to(torch.long) * compress_ratio
-
     mode = _compression_mode(compress_ratio)
     if mode.overlap:
-        previous_positions = anchor.unsqueeze(1) - compress_ratio + offsets.view(1, -1)
-        current_positions = anchor.unsqueeze(1) + offsets.view(1, -1)
-        previous_valid = previous_positions >= 0
+        if overlap_page_map is not None:
+            # Hoisted once-per-forward ratio-4 page map covering the contiguous
+            # ``[anchor - ratio, anchor + ratio)`` band: the first ``ratio`` columns
+            # are the ``previous`` block, the last ``ratio`` the ``current`` block.
+            # Every ratio-4 layer resolves the identical (seq_idx, positions)
+            # addresses, so this ``_decode_page_ids_and_offsets`` chain runs once in
+            # ``deepseek_v4_sparse_prepare_decode_page_addr`` instead of twice per
+            # layer (addresses bit-identical to the per-layer translation below).
+            ovl_page_ids, ovl_page_offsets, ovl_valid = overlap_page_map
+            previous_positions = None
+            current_positions = None
+            previous_map = (
+                ovl_page_ids[:, :compress_ratio],
+                ovl_page_offsets[:, :compress_ratio],
+                ovl_valid[:, :compress_ratio],
+            )
+            current_map = (
+                ovl_page_ids[:, compress_ratio:],
+                ovl_page_offsets[:, compress_ratio:],
+                ovl_valid[:, compress_ratio:],
+            )
+            # ``valid`` already encodes ``positions >= 0`` (see helper), so
+            # ``previous_map[2]`` equals ``(previous_positions >= 0) & page_ok`` and
+            # the ``previous_valid & previous_page_valid`` below stays bit-identical.
+            previous_valid = previous_map[2]
+        else:
+            offsets = torch.arange(compress_ratio, dtype=torch.long, device=row_idx.device)
+            anchor = row_idx.to(torch.long) * compress_ratio
+            previous_positions = anchor.unsqueeze(1) - compress_ratio + offsets.view(1, -1)
+            current_positions = anchor.unsqueeze(1) + offsets.view(1, -1)
+            previous_valid = previous_positions >= 0
 
-        # kv and gate caches share one page table + tokens_per_block, so the reads
-        # at ``previous_positions`` (resp. ``current_positions``) resolve to the same
-        # page map across both caches. Compute each distinct map once and reuse it
-        # for the kv and gate gather -- 4 page-map chains -> 2.
-        previous_map = _decode_page_ids_and_offsets(
-            compressor_kv_cache, seq_idx, previous_positions, cu_num_pages, cache_loc
-        )
-        current_map = _decode_page_ids_and_offsets(
-            compressor_kv_cache, seq_idx, current_positions, cu_num_pages, cache_loc
-        )
+            # kv and gate caches share one page table + tokens_per_block, so the reads
+            # at ``previous_positions`` (resp. ``current_positions``) resolve to the same
+            # page map across both caches. Compute each distinct map once and reuse it
+            # for the kv and gate gather -- 4 page-map chains -> 2.
+            previous_map = _decode_page_ids_and_offsets(
+                compressor_kv_cache, seq_idx, previous_positions, cu_num_pages, cache_loc
+            )
+            current_map = _decode_page_ids_and_offsets(
+                compressor_kv_cache, seq_idx, current_positions, cu_num_pages, cache_loc
+            )
         previous_kv_state, previous_page_valid = _decode_cache_rows_from_positions(
             compressor_kv_cache,
             seq_idx,
@@ -1431,6 +1476,8 @@ def _batched_compressed_rows_from_paged_state(
         kv = torch.cat((previous_kv, current_kv), dim=1)
         gate = torch.cat((previous_gate, current_gate), dim=1)
     else:
+        offsets = torch.arange(compress_ratio, dtype=torch.long, device=row_idx.device)
+        anchor = row_idx.to(torch.long) * compress_ratio
         positions = anchor.unsqueeze(1) + offsets.view(1, -1)
         # kv and gate share the page map for these positions (see overlap branch).
         positions_map = _decode_page_ids_and_offsets(
@@ -1490,6 +1537,7 @@ def _batched_overlap_compressed_rows_fullrange(
     max_compressed_len: int,
     dtype: torch.dtype,
     rotate: bool = False,
+    full_page_map: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Decode-time overlap compressed rows for the *full* candidate set [0, max_compressed_len).
 
@@ -1513,14 +1561,22 @@ def _batched_overlap_compressed_rows_fullrange(
     m = int(max_compressed_len)
     device = seq_idx.device
 
-    full_positions = torch.arange(m * compress_ratio, dtype=torch.long, device=device)
-    full_positions = full_positions.view(1, -1).expand(num_rows, -1)
-    # kv and gate share the page map for ``full_positions`` (caches share one page
-    # table + tokens_per_block); compute it once instead of once per cache. This is
-    # the decode-dominant gather, so the duplicate chain is the largest to remove.
-    full_map = _decode_page_ids_and_offsets(
-        compressor_kv_cache, seq_idx, full_positions, cu_num_pages, cache_loc
-    )
+    if full_page_map is not None:
+        # Hoisted once-per-forward ratio-4 full-range page map for positions
+        # ``[0, m * ratio)``. This is the decode-dominant page-map chain and resolves
+        # to identical addresses across every ratio-4 layer, so it is computed once in
+        # ``deepseek_v4_sparse_prepare_decode_page_addr`` (bit-identical addresses).
+        full_positions = None
+        full_map = full_page_map
+    else:
+        full_positions = torch.arange(m * compress_ratio, dtype=torch.long, device=device)
+        full_positions = full_positions.view(1, -1).expand(num_rows, -1)
+        # kv and gate share the page map for ``full_positions`` (caches share one page
+        # table + tokens_per_block); compute it once instead of once per cache. This is
+        # the decode-dominant gather, so the duplicate chain is the largest to remove.
+        full_map = _decode_page_ids_and_offsets(
+            compressor_kv_cache, seq_idx, full_positions, cu_num_pages, cache_loc
+        )
     current_kv_state, current_page_valid = _decode_cache_rows_from_positions(
         compressor_kv_cache, seq_idx, full_positions, cu_num_pages, cache_loc, dtype, full_map
     )
@@ -1592,6 +1648,7 @@ def _update_decode_compressed_caches(
     max_compressed_len: int,
     cur_page_ids: Optional[torch.Tensor] = None,
     cur_page_offsets: Optional[torch.Tensor] = None,
+    overlap_page_map: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> None:
     mode = _compression_mode(compress_ratio)
     if not mode.enabled or compressor_kv_decode.numel() == 0:
@@ -1646,6 +1703,7 @@ def _update_decode_compressed_caches(
         compress_ratio,
         head_dim,
         compressor_kv_decode.dtype,
+        overlap_page_map=overlap_page_map,
     )
     row_logical_pos = row_idx * compress_ratio
     # The mhc read (previous_rows) and the write below both target ``row_logical_pos``
@@ -1698,6 +1756,7 @@ def _select_decode_ratio4_indexer_rows(
     rms_norm_eps: float,
     rope_dim: int,
     max_compressed_len: int,
+    full_page_map: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if index_topk <= 0:
         empty_rows = torch.empty(q_index.shape[0], 0, dtype=torch.int64, device=q_index.device)
@@ -1732,6 +1791,7 @@ def _select_decode_ratio4_indexer_rows(
         max_compressed_len,
         q_index.dtype,
         rotate=True,
+        full_page_map=full_page_map,
     )
     index_score = torch.matmul(q_index, index_k.transpose(-1, -2)).float()
     index_score = (index_score.relu() * indexer_weights.float().unsqueeze(-1)).sum(dim=1)
@@ -1780,6 +1840,7 @@ def _decode_compressed_cache_attention(
     softmax_scale: float,
     rms_norm_eps: float,
     rope_dim: int,
+    full_page_map: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     local_kv, local_valid = _decode_local_cache_rows(
         swa_cache,
@@ -1811,6 +1872,7 @@ def _decode_compressed_cache_attention(
             rms_norm_eps,
             rope_dim,
             max_compressed_len,
+            full_page_map=full_page_map,
         )
         compressed_positions = selected_rows.clamp(min=0) * compress_ratio
         compressed_kv, page_valid = _decode_cache_rows_from_positions(
@@ -1877,6 +1939,12 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
     cache_loc: torch.Tensor,
     cur_page_ids: Optional[torch.Tensor],
     cur_page_offsets: Optional[torch.Tensor],
+    ovl_page_ids: Optional[torch.Tensor],
+    ovl_page_offsets: Optional[torch.Tensor],
+    ovl_valid: Optional[torch.Tensor],
+    full_page_ids: Optional[torch.Tensor],
+    full_page_offsets: Optional[torch.Tensor],
+    full_valid: Optional[torch.Tensor],
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -1907,6 +1975,25 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
     if cur_page_ids is not None:
         cur_page_ids = cur_page_ids[:num_decode]
         cur_page_offsets = cur_page_offsets[:num_decode]
+
+    # Ratio-4 compressed-row / full-range page maps, hoisted once per forward by
+    # ``deepseek_v4_sparse_prepare_decode_page_addr`` and shared by every ratio-4
+    # layer (they resolve the identical (seq_idx, positions) addresses). Slice to
+    # the active decode sequences; ``None`` falls back to per-layer translation
+    # inside the batched compressor helpers.
+    overlap_page_map = None
+    full_page_map = None
+    if compress_ratio == 4 and ovl_page_ids is not None and full_page_ids is not None:
+        overlap_page_map = (
+            ovl_page_ids[:num_decode],
+            ovl_page_offsets[:num_decode],
+            ovl_valid[:num_decode],
+        )
+        full_page_map = (
+            full_page_ids[:num_decode],
+            full_page_offsets[:num_decode],
+            full_valid[:num_decode],
+        )
 
     _write_decode_cache_rows(
         swa_cache,
@@ -1945,6 +2032,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             max_compressed_len,
             cur_page_ids,
             cur_page_offsets,
+            overlap_page_map,
         )
         mode = _compression_mode(compress_ratio)
         if mode.uses_indexer:
@@ -1999,6 +2087,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             softmax_scale,
             rms_norm_eps,
             rope_dim,
+            full_page_map=full_page_map,
         )
     else:
         decode_output = _decode_topk_cache_attention(
@@ -2815,6 +2904,7 @@ def deepseek_v4_sparse_prepare_decode_page_addr(
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
     tokens_per_block: int,
+    overlap_max_compressed_len: int = 0,
 ) -> List[torch.Tensor]:
     """Precompute the current-token paged write address once per forward.
 
@@ -2847,7 +2937,42 @@ def deepseek_v4_sparse_prepare_decode_page_addr(
     safe_page_table_idx = torch.where(valid, page_table_idx, page_start)
     safe_page_table_idx = safe_page_table_idx.clamp(min=0, max=cache_loc.numel() - 1)
     page_ids = cache_loc[safe_page_table_idx].to(torch.long)
-    return [page_ids, page_offsets]
+    outs = [page_ids, page_offsets]
+    if overlap_max_compressed_len > 0:
+        # Ratio-4 (overlap+indexer) compressed-row and full-range page maps. Every
+        # ratio-4 layer resolves these identical (seq_idx, positions) addresses, so
+        # hoisting them here drops the per-layer ``_decode_page_ids_and_offsets``
+        # chain from both ``_batched_compressed_rows_from_paged_state`` (overlap
+        # previous/current) and ``_batched_overlap_compressed_rows_fullrange``.
+        # ``_page_ids_and_offsets_from_tpb`` is the shared translation, so the
+        # produced addresses are bit-identical to the per-layer computation.
+        ratio = _COMPRESS_RATIO_OVERLAP_INDEXER
+        m = int(overlap_max_compressed_len)
+        device = positions_long.device
+        # Overlap band ``[anchor - ratio, anchor + ratio)``: the first ``ratio``
+        # columns are the previous block, the last ``ratio`` the current block.
+        row_idx = (positions_long // ratio).clamp(min=0, max=m - 1)
+        anchor = row_idx * ratio
+        band_offsets = torch.arange(2 * ratio, dtype=torch.long, device=device) - ratio
+        ovl_positions = anchor.unsqueeze(1) + band_offsets.view(1, -1)
+        ovl_page_ids, ovl_page_offsets, ovl_valid = _page_ids_and_offsets_from_tpb(
+            tokens_per_block, seq_idx_long, ovl_positions, cu_num_pages, cache_loc
+        )
+        # Full candidate range ``[0, m * ratio)`` for the lightning-indexer path.
+        full_positions = torch.arange(m * ratio, dtype=torch.long, device=device)
+        full_positions = full_positions.view(1, -1).expand(num_seq, -1)
+        full_page_ids, full_page_offsets, full_valid = _page_ids_and_offsets_from_tpb(
+            tokens_per_block, seq_idx_long, full_positions, cu_num_pages, cache_loc
+        )
+        outs += [
+            ovl_page_ids,
+            ovl_page_offsets,
+            ovl_valid,
+            full_page_ids,
+            full_page_offsets,
+            full_valid,
+        ]
+    return outs
 
 
 @deepseek_v4_sparse_prepare_decode_page_addr.register_fake
@@ -2856,12 +2981,26 @@ def deepseek_v4_sparse_prepare_decode_page_addr_fake(
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
     tokens_per_block: int,
+    overlap_max_compressed_len: int = 0,
 ) -> List[torch.Tensor]:
     num_seq = cu_num_pages.shape[0] - 1
-    return [
-        torch.empty(num_seq, dtype=torch.long, device=input_pos.device),
-        torch.empty(num_seq, dtype=torch.long, device=input_pos.device),
+    device = input_pos.device
+    outs = [
+        torch.empty(num_seq, dtype=torch.long, device=device),
+        torch.empty(num_seq, dtype=torch.long, device=device),
     ]
+    if overlap_max_compressed_len > 0:
+        ratio = _COMPRESS_RATIO_OVERLAP_INDEXER
+        m = int(overlap_max_compressed_len)
+        outs += [
+            torch.empty(num_seq, 2 * ratio, dtype=torch.long, device=device),
+            torch.empty(num_seq, 2 * ratio, dtype=torch.long, device=device),
+            torch.empty(num_seq, 2 * ratio, dtype=torch.bool, device=device),
+            torch.empty(num_seq, m * ratio, dtype=torch.long, device=device),
+            torch.empty(num_seq, m * ratio, dtype=torch.long, device=device),
+            torch.empty(num_seq, m * ratio, dtype=torch.bool, device=device),
+        ]
+    return outs
 
 
 @torch.library.custom_op(
@@ -2903,6 +3042,12 @@ def torch_deepseek_v4_sparse_attention_with_cache(
     last_page_len: torch.Tensor,
     cur_page_ids: torch.Tensor,
     cur_page_offsets: torch.Tensor,
+    ovl_page_ids: torch.Tensor,
+    ovl_page_offsets: torch.Tensor,
+    ovl_valid: torch.Tensor,
+    full_page_ids: torch.Tensor,
+    full_page_offsets: torch.Tensor,
+    full_valid: torch.Tensor,
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -2979,6 +3124,12 @@ def torch_deepseek_v4_sparse_attention_with_cache(
             cache_loc,
             cur_page_ids,
             cur_page_offsets,
+            ovl_page_ids,
+            ovl_page_offsets,
+            ovl_valid,
+            full_page_ids,
+            full_page_offsets,
+            full_valid,
             swa_cache,
             mhc_cache,
             compressor_kv_cache,
@@ -3211,6 +3362,12 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
     last_page_len: torch.Tensor,
     cur_page_ids: torch.Tensor,
     cur_page_offsets: torch.Tensor,
+    ovl_page_ids: torch.Tensor,
+    ovl_page_offsets: torch.Tensor,
+    ovl_valid: torch.Tensor,
+    full_page_ids: torch.Tensor,
+    full_page_offsets: torch.Tensor,
+    full_valid: torch.Tensor,
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -3278,6 +3435,12 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
         last_page_len,
         cur_page_ids,
         cur_page_offsets,
+        ovl_page_ids,
+        ovl_page_offsets,
+        ovl_valid,
+        full_page_ids,
+        full_page_offsets,
+        full_valid,
         swa_cache,
         mhc_cache,
         compressor_kv_cache,
@@ -3353,10 +3516,28 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
                 "forward it to get_prepare_extra_metadata_info."
             )
         tokens_per_block = int(sequence_info.tokens_per_block)
+        # Discover the ratio-4 (overlap+indexer) max_compressed_len shared by every
+        # ratio-4 layer so the prepare op can also hoist their compressed-row /
+        # full-range page maps. This method only receives one source node, so scan
+        # the shared graph for all sparse-attn nodes.
+        overlap_m = 0
+        source_op = cls.get_source_attention_op()
+        for n in any_source_attn_node.graph.nodes:
+            if not is_op(n, source_op):
+                continue
+            cr, mcl = extract_op_args(n, "compress_ratio", "max_compressed_len")
+            if cr == _COMPRESS_RATIO_OVERLAP_INDEXER and isinstance(mcl, int) and mcl > 0:
+                overlap_m = max(overlap_m, mcl)
+        # Fixed 8-output contract: 2 current-token addresses + 6 ratio-4 map tensors
+        # (overlap page_ids/page_offsets/valid + full-range page_ids/page_offsets/valid).
+        # Keep ``overlap_m >= 1`` so the map shapes stay valid and the per-layer
+        # argument alignment is invariant even when no ratio-4 layer is present (the
+        # dummy maps are then never consumed).
+        overlap_m = max(overlap_m, 1)
         return (
             torch.ops.auto_deploy.deepseek_v4_sparse_prepare_decode_page_addr.default,
-            2,
-            [tokens_per_block],
+            8,
+            [tokens_per_block, overlap_m],
         )
 
     @classmethod
