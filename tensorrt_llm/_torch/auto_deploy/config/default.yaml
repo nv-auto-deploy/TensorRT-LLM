@@ -211,6 +211,14 @@ transforms:
   fuse_fp8_act_quant_cse:
     stage: post_load_fusion
     run_shape_prop: true
+  # Merge shared-expert gate (w1) + up (w3) sibling block-FP8 matmuls into one
+  # concatenated projection + slice (the SwiGLU matcher can't span DeepSeek-V4's
+  # clamp/FP32-cast nodes). Runs AFTER fuse_fp8_act_quant_cse so it collapses the two
+  # shared-quant prequant matmuls into one; a no-op once linears route to trtllm/deepgemm.
+  # run_shape_prop populates meta on the merged matmul + slice nodes.
+  fuse_finegrained_fp8_gate_up:
+    stage: post_load_fusion
+    run_shape_prop: true
   fuse_mxfp4_moe:
     stage: post_load_fusion
     expect_mem_change: true  # adds padding for trtllm-gen kernel alignment during weight repack

@@ -843,3 +843,160 @@ class FuseFP8ActQuantCSE(BaseTransform):
             has_valid_shapes=(num_groups == 0),
         )
         return gm, info
+
+
+# ============================================================================
+# FineGrained FP8 gate/up projection concatenation
+# ============================================================================
+
+
+@TransformRegistry.register("fuse_finegrained_fp8_gate_up")
+class FuseFineGrainedFP8GateUp(BaseTransform):
+    """Merge sibling gate/up block-FP8 matmuls into one concatenated projection.
+
+    Runs in post_load_fusion AFTER ``fuse_fp8_act_quant_cse``. That transform hoists a
+    shared activation quant, leaving the SwiGLU gate (``w1``) and up (``w3``) projections
+    as two ``torch_fake_quant_finegrained_fp8_linear_prequant`` nodes that consume the
+    *same* ``(qfp8, qscale)`` pair and have identical ``[N, K]`` weight shapes (both are
+    ``moe_intermediate_size x hidden_size``). The default SwiGLU matcher
+    (``match_finegrained_fp8_swiglu_pattern``) cannot span the ``clamp`` + FP32-cast
+    nodes DeepSeek-V4 inserts between these linears and the ``silu * mul``
+    (``swiglu_limit=10``), so the pair is never fused and launches two separate,
+    CTA-starved block-FP8 GEMVs on every layer at batch=1.
+
+    This transform concatenates each such sibling pair's weight (and per-block weight
+    scale) along dim 0 into one ``[2N, K]`` projection, runs a single prequant matmul,
+    and slices the ``[..., 2N]`` result back into the two original ``[..., N]`` views --
+    leaving the clamp / SiLU / mul / down chain that consumes gate and up byte-for-byte
+    unchanged (only the two matmuls collapse to one). The block-FP8 matmul computes each
+    output row independently and ``N`` is required to be a multiple of the weight scale's
+    ``block_n``, so the seam lands on a block boundary and the concatenated result equals
+    the two separate results element-for-element (reference-exact on the deterministic
+    base kernel; the split-K decode path differs only by its own atomic-reduction
+    rounding, which is orthogonal to the N-concatenation).
+
+    Scope: only bias-free sibling groups with >= 2 members of identical weight+scale
+    shape are merged. In DeepSeek-V4 this uniquely selects shared-expert ``w1``+``w3``
+    (the MLA siblings ``wq_a``+``wkv`` and ``wq_b``+``indexer.wq_b`` differ in ``N``).
+    Concatenation is applied to the already-sharded local weights, so it is per-rank
+    correct regardless of TP layout.
+    """
+
+    config: TransformConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return TransformConfig
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        prequant_packet = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_prequant
+        prequant_op = prequant_packet.default
+        slice_op = torch.ops.aten.slice.Tensor
+
+        # Group matmul-only prequant nodes by their shared (qfp8, qscale) activation
+        # (args[0], args[1]). Sibling linears on one input share these two nodes after
+        # fuse_fp8_act_quant_cse. Visit in topological order so members[0] is the
+        # earliest node -- a valid insertion point that dominates every use.
+        groups: "dict[Tuple[Node, Node], list[Node]]" = defaultdict(list)
+        for node in gm.graph.nodes:
+            if not is_op(node, prequant_packet):
+                continue
+            qinput, input_scale, bias = extract_op_args(node, "qinput", "input_scale", "bias")
+            if not isinstance(qinput, Node) or not isinstance(input_scale, Node):
+                continue
+            if bias is not None:
+                # Concatenating biased projections is out of scope; gate/up are bias-free.
+                continue
+            groups[(qinput, input_scale)].append(node)
+
+        num_groups = 0
+        num_matmuls_removed = 0
+        fused_idx = 0
+        for (qinput, input_scale), members in groups.items():
+            if len(members) < 2:
+                continue
+
+            # Bucket shared-activation siblings by identical (weight_shape, scale_shape).
+            # gate/up share moe_intermediate_size x hidden_size; MLA siblings differ.
+            by_shape: "dict[Tuple[tuple, tuple], list[Tuple[Node, object, Node]]]" = defaultdict(
+                list
+            )
+            for m in members:
+                weight, weight_scale = extract_op_args(m, "weight_quantized", "weight_scale")
+                s_node = (
+                    weight_scale[0]
+                    if isinstance(weight_scale, (list, tuple)) and weight_scale
+                    else None
+                )
+                w = _resolve_attr_tensor(gm, weight)
+                s = _resolve_attr_tensor(gm, s_node) if isinstance(s_node, Node) else None
+                if w is None or s is None or w.dim() != 2 or s.dim() != 2:
+                    continue
+                N = w.shape[0]
+                block_n = triton.cdiv(N, s.shape[0])
+                # The seam between concatenated weights must land on a block-scale
+                # boundary, otherwise the merged scale would be misapplied at the join.
+                if block_n == 0 or N % block_n != 0:
+                    continue
+                by_shape[(tuple(w.shape), tuple(s.shape))].append((m, weight, s_node))
+
+            for shape_members in by_shape.values():
+                if len(shape_members) < 2:
+                    continue
+
+                nodes = [sm[0] for sm in shape_members]
+                weight_tensors = [_resolve_attr_tensor(gm, sm[1]) for sm in shape_members]
+                scale_tensors = [_resolve_attr_tensor(gm, sm[2]) for sm in shape_members]
+                sizes = [w.shape[0] for w in weight_tensors]
+
+                cat_w = torch.cat(weight_tensors, dim=0)  # [sum_N, K] float8_e4m3fn
+                cat_s = torch.cat(scale_tensors, dim=0)  # [sum_N/block_n, K/block_k] float32
+                w_name = f"fused_fp8_gate_up_weight_{fused_idx}"
+                s_name = f"fused_fp8_gate_up_weight_scale_{fused_idx}"
+                fused_idx += 1
+                gm.register_buffer(w_name, cat_w.detach())
+                gm.register_buffer(s_name, cat_s.detach())
+
+                first = nodes[0]
+                with gm.graph.inserting_before(first):
+                    w_attr = gm.graph.get_attr(w_name)
+                    s_attr = gm.graph.get_attr(s_name)
+                    merged = gm.graph.call_function(
+                        prequant_op, args=(qinput, input_scale, w_attr, None, [s_attr])
+                    )
+                    offset = 0
+                    slices = []
+                    for size in sizes:
+                        slices.append(
+                            gm.graph.call_function(
+                                slice_op, args=(merged, -1, offset, offset + size)
+                            )
+                        )
+                        offset += size
+
+                for node, sl in zip(nodes, slices):
+                    node.replace_all_uses_with(sl)
+                    gm.graph.erase_node(node)
+
+                num_groups += 1
+                num_matmuls_removed += len(nodes) - 1
+
+        if num_groups:
+            ad_logger.info(
+                f"fuse_finegrained_fp8_gate_up: merged {num_groups} gate/up sibling group(s), "
+                f"removed {num_matmuls_removed} block-FP8 matmul launch(es) per forward"
+            )
+
+        info = TransformInfo(
+            skipped=(num_groups == 0),
+            num_matches=num_groups,
+            is_clean=(num_groups == 0),
+            has_valid_shapes=(num_groups == 0),
+        )
+        return gm, info
