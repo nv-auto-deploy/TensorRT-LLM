@@ -592,31 +592,42 @@ def _gather_paged_rows_from_positions(
     dtype: torch.dtype,
     width: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    positions_host = positions.detach().cpu().to(torch.long).flatten()
-    rows = []
-    valid_rows = []
+    # Vectorized gather (prefill path). Mirrors ``_host_page_id_and_offset`` /
+    # ``_host_position_is_valid`` for every position at once, with no per-position
+    # host sync (``.cpu()``/``.item()``) or Python loop. ``page_start``/``page_end``
+    # are the only host reads -- two O(1) scalar loads for this sequence.
     row_width = cache.shape[-1] if width is None else width
-    zero = cache.new_zeros(row_width)
-    for logical_pos_tensor in positions_host:
-        logical_pos = int(logical_pos_tensor.item())
-        is_valid = _host_position_is_valid(cache, seq_idx, logical_pos, cu_num_pages_host)
-        valid_rows.append(is_valid)
-        if is_valid:
-            page_id, page_offset = _host_page_id_and_offset(
-                cache, seq_idx, logical_pos, cu_num_pages_host, cache_loc_host
-            )
-            row = cache[page_id, page_offset]
-            if width is not None:
-                row = row[..., :width]
-            rows.append(row.to(dtype))
-        else:
-            rows.append(zero.to(dtype))
+    tokens_per_block = int(cache.shape[1])
+    page_start = int(cu_num_pages_host[seq_idx].item())
+    page_end = int(cu_num_pages_host[seq_idx + 1].item())
 
-    if rows:
-        gathered = torch.stack(rows, dim=0)
-    else:
+    positions_flat = positions.detach().to(device=cache.device, dtype=torch.long).flatten()
+    if positions_flat.numel() == 0:
         gathered = cache.new_empty(0, row_width, dtype=dtype)
-    valid = torch.tensor(valid_rows, dtype=torch.bool, device=positions.device)
+        valid = torch.empty(0, dtype=torch.bool, device=cache.device)
+        return gathered.view(*positions.shape, row_width), valid.view(positions.shape)
+
+    safe_positions = positions_flat.clamp(min=0)
+    page_ordinal = safe_positions // tokens_per_block
+    page_offset = safe_positions % tokens_per_block
+    page_table_idx = page_start + page_ordinal
+    valid = (positions_flat >= 0) & (page_table_idx < page_end)
+
+    # Mask invalid page-table indices to a safe in-range slot before the physical
+    # page lookup, then zero the corresponding rows out below.
+    safe_page_table_idx = torch.where(
+        valid, page_table_idx, page_table_idx.new_full((), page_start)
+    )
+    safe_page_table_idx = safe_page_table_idx.clamp(min=0, max=cache_loc_host.numel() - 1)
+    phys_page = cache_loc_host.to(device=cache.device, dtype=torch.long)[safe_page_table_idx]
+
+    gathered = cache[phys_page, page_offset]
+    if width is not None:
+        gathered = gathered[..., :width]
+    gathered = gathered.to(dtype)
+    gathered = torch.where(valid.unsqueeze(-1), gathered, gathered.new_zeros(()))
+
+    valid = valid.to(device=positions.device)
     return gathered.view(*positions.shape, row_width), valid.view(positions.shape)
 
 
@@ -928,32 +939,38 @@ def _select_ratio4_indexer_rows(
         return torch.full((index_topk,), -1, dtype=torch.int64, device=q_index.device)
 
     index_head_dim = int(q_index.shape[-1])
-    state_dim = int(indexer_compressor_kv_cache.shape[-1])
-    index_k = torch.stack(
-        [
-            _compressed_row_from_paged_state(
-                indexer_compressor_kv_cache,
-                indexer_compressor_gate_cache,
-                seq_idx,
-                row_idx,
-                query_position_id - (query_pos - row_idx * 4),
-                cu_num_pages_host,
-                cache_loc_host,
-                indexer_compressor_ape,
-                indexer_compressor_norm_weight,
-                cos_table,
-                sin_table,
-                rms_norm_eps,
-                rope_dim,
-                4,
-                index_head_dim,
-                state_dim,
-                q_index.dtype,
-                rotate=True,
-            )
-            for row_idx in range(visible_len)
-        ],
-        dim=0,
+    # Vectorized replacement for the per-row ``_compressed_row_from_paged_state``
+    # stack: one call to the batched decode helper over ``row_idx = arange(visible_len)``.
+    # ``seq_idx`` is broadcast to every row and ``row_position_id`` reproduces the loop's
+    # scalar ``query_position_id - (query_pos - row_idx * 4)`` as a tensor. The batched
+    # helper returns rows in the same ``[visible_len, index_head_dim]`` order/shape the
+    # stack produced (validated bit-exact in the op unit tests).
+    row_idx = torch.arange(visible_len, dtype=torch.long, device=q_index.device)
+    seq_idx_rows = torch.full((visible_len,), seq_idx, dtype=torch.long, device=q_index.device)
+    row_position_id_rows = query_position_id - (query_pos - row_idx * 4)
+    # The batched decode helper indexes ``cu_num_pages``/``cache_loc`` with device-side
+    # tensors (row_idx/seq_idx live on ``q_index.device``), so move the host page tables
+    # onto that device first -- the naive loop used the ``_host_*`` scalar path instead.
+    cu_num_pages_dev = cu_num_pages_host.to(q_index.device)
+    cache_loc_dev = cache_loc_host.to(q_index.device)
+    index_k = _batched_compressed_rows_from_paged_state(
+        indexer_compressor_kv_cache,
+        indexer_compressor_gate_cache,
+        seq_idx_rows,
+        row_idx,
+        row_position_id_rows,
+        cu_num_pages_dev,
+        cache_loc_dev,
+        indexer_compressor_ape,
+        indexer_compressor_norm_weight,
+        cos_table,
+        sin_table,
+        rms_norm_eps,
+        rope_dim,
+        4,
+        index_head_dim,
+        q_index.dtype,
+        rotate=True,
     )
     index_score = torch.matmul(q_index, index_k.transpose(-1, -2)).float()
     index_score = (index_score.relu() * indexer_weights.float().unsqueeze(-1)).sum(dim=0)
