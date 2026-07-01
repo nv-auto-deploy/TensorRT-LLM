@@ -219,6 +219,15 @@ transforms:
   fuse_finegrained_fp8_gate_up:
     stage: post_load_fusion
     run_shape_prop: true
+  # Merge sibling replicated (tp_mode="none") bf16 linear projections that read the same
+  # activation into one multi-output projection + narrow slices (e.g. DeepSeek-V4 sparse
+  # layers: attn/indexer compressor wkv+wgate and indexer weights_proj all read the layer
+  # hidden_states). Collapses several CTA-starved M=1 decode GEMVs (and their split-K
+  # reduces) into one. Scoped to small replicated weights to avoid the model-wide
+  # fuse_gemms OOM. run_shape_prop populates meta on the merged matmul + narrow nodes.
+  fuse_replicated_bf16_linear:
+    stage: post_load_fusion
+    run_shape_prop: true
   fuse_mxfp4_moe:
     stage: post_load_fusion
     expect_mem_change: true  # adds padding for trtllm-gen kernel alignment during weight repack

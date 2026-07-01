@@ -29,6 +29,7 @@ from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     WeightBiasInfoCache,
+    extract_op_args,
     extract_weight_name,
     is_fake_quantized_linear_op,
     is_linear_op,
@@ -691,3 +692,105 @@ class FuseFineGrainedFP8Gemms(QuantizationFusionMixin, BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         return self._apply_fusion_pass(gm, cm, factory, shared_config)
+
+
+@TransformRegistry.register("fuse_replicated_bf16_linear")
+class FuseReplicatedBf16Linear(BaseTransform):
+    """Merge sibling *replicated* bf16 linear projections that read the same activation.
+
+    Some MLA models (DeepSeek-V4, etc.) launch several small, un-sharded bf16 GEMVs on
+    the *same* activation tensor within one decoder layer. On a DeepSeek-V4 ratio-4
+    (sparse-attention) layer the layer input ``hidden_states`` feeds five independent
+    ``tp_mode="none"`` (replicated) bf16 ``torch_linear_simple`` projections:
+
+      * ``attn.compressor.wkv`` + ``attn.compressor.wgate``      ([2*head_dim, hidden])
+      * ``attn.indexer.weights_proj``                            ([index_n_heads, hidden])
+      * ``attn.indexer.compressor.wkv`` + ``.wgate``             ([2*index_head_dim, hidden])
+
+    (ratio-128 layers carry only the ``attn.compressor`` pair; the FP8 ``wq_a/wkv`` and
+    the replicated index-score ``indexer.wq_b`` are separate quantized ops and are never
+    grouped here.) At batch=1 decode each is an ``M=1`` GEMV so CTA-starved that cuBLASLt
+    falls back to a split-K + reduce pair to fill the GPU; the layer therefore pays five
+    launches (and their split-K reduces) for what is one shared read of ``hidden_states``.
+
+    This transform groups replicated (``tp_mode="none"``), bias-free bf16
+    ``torch_linear_simple`` nodes by their shared input node and, for every group with
+    >= 2 members, concatenates the weights along dim 0 into one ``[sum_N, K]`` projection,
+    issues a single GEMV, and splits the result back with zero-copy ``torch.narrow`` views
+    (:func:`_insert_fused_gemm` with ``allow_not_contigous=True``). Concatenating output
+    rows is reference-exact: every output row's ``K``-reduction is unchanged, and each
+    consumer immediately casts its slice to fp32 (``.float()``), materializing the strided
+    view before further use.
+
+    Scope is deliberately narrow to avoid the model-wide OOM that disables ``fuse_gemms``
+    (issue #4674): only ``tp_mode="none"`` (never-sharded, small) replicated weights are
+    touched, so the fused weight is per-rank identical and adds negligible memory. Runs in
+    post_load_fusion, after sharding, so a group's members share a final per-rank layout.
+    """
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        lin_op = torch.ops.auto_deploy.torch_linear_simple
+
+        # Group replicated, bias-free, bf16 linear nodes by their shared input node.
+        # Visiting in topological order keeps each group's members[] ordered so the
+        # concat / narrow offsets line up with graph position.
+        groups: Dict[Node, List[Node]] = defaultdict(list)
+        for node in gm.graph.nodes:
+            if not is_op(node, lin_op):
+                continue
+            inp, weight, bias, tp_mode = extract_op_args(node, "input", "weight", "bias", "tp_mode")
+            if not isinstance(inp, Node):
+                continue
+            if bias is not None:
+                continue
+            # Only fuse replicated projections. tp_mode="colwise"/"rowwise" siblings are
+            # sharded and carry per-rank output_sizes semantics we must not disturb.
+            if tp_mode not in (None, "none"):
+                continue
+            # Require a resolvable 2D bf16 weight parameter (mirrors _insert_fused_gemm's
+            # get_parameter path; keeps the giant sharded FP8 weights out of scope).
+            w_name = extract_weight_name(node)
+            if not isinstance(w_name, str):
+                continue
+            try:
+                w = gm.get_parameter(w_name)
+            except (AttributeError, KeyError):
+                continue
+            if w.dim() != 2 or w.dtype != torch.bfloat16:
+                continue
+            groups[inp].append(node)
+
+        idx = -1
+        num_matches = 0
+        num_removed = 0
+        with cuda_memory_tracker():
+            for parent_node, lin_children in groups.items():
+                if len(lin_children) < 2:
+                    continue
+                if _insert_fused_gemm(
+                    gm, idx := idx + 1, parent_node, lin_children, allow_not_contigous=True
+                ):
+                    num_matches += 1
+                    num_removed += len(lin_children) - 1
+
+        torch.cuda.empty_cache()
+
+        if num_matches:
+            ad_logger.info(
+                f"fuse_replicated_bf16_linear: merged {num_matches} replicated bf16 linear "
+                f"group(s), removed {num_removed} GEMV launch(es) per forward"
+            )
+
+        info = TransformInfo(
+            skipped=(num_matches == 0),
+            num_matches=num_matches,
+            is_clean=(num_matches == 0),
+            has_valid_shapes=(num_matches == 0),
+        )
+        return gm, info
