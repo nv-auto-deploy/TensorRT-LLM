@@ -742,7 +742,10 @@ class Step3p7MoE(nn.Module):
         self.hidden_size = config.hidden_size
         self.routed_scaling_factor = getattr(config, "moe_router_scaling_factor", 1.0)
 
-        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+        # fp32 by construction so the bf16 checkpoint weight is upcast ONCE at load
+        # (load_state_dict copy semantics) instead of re-materialized per forward call by a
+        # ``weight.float()`` cast; the router GEMM must stay fp32 (config.need_fp32_gate).
+        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False, dtype=torch.float32)
         self.register_buffer(
             "router_bias", torch.zeros(self.num_experts, dtype=torch.float32), persistent=True
         )
@@ -754,12 +757,29 @@ class Step3p7MoE(nn.Module):
             ]
         )
 
+    def _apply(self, fn, recurse=True):
+        """Pin the router gate weight to fp32 across blanket dtype casts.
+
+        The HF fp8 quant reader post-processes the freshly built model with ``model.to(bf16)``
+        (``HFQuantConfigReader.post_process_model``), which would silently downcast the
+        fp32-by-construction gate and re-introduce the per-call weight upcast in the exported
+        graph. Re-pinning here is lossless: real values only arrive later, when the checkpoint
+        weight is copy-cast into the (fp32) parameter by ``load_state_dict``.
+        """
+        ret = super()._apply(fn, recurse)
+        weight = self.gate.weight
+        if weight is not None and weight.is_floating_point() and weight.dtype != torch.float32:
+            self.gate.weight = nn.Parameter(
+                weight.data.to(torch.float32), requires_grad=weight.requires_grad
+            )
+        return ret
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_dim)
 
-        # fp32 router GEMM (config.need_fp32_gate)
-        router_logits = F.linear(hidden_flat.float(), self.gate.weight.float())
+        # fp32 router GEMM (config.need_fp32_gate); gate weight is fp32 by construction
+        router_logits = F.linear(hidden_flat.float(), self.gate.weight)
 
         # Fused sigmoid + per-expert-bias top-k routing in one optimized Triton launch
         # (replaces the 7 separate torch ops; numerics-faithful, see custom op above).
