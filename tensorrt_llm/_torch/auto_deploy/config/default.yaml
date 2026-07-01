@@ -170,9 +170,19 @@ transforms:
     # weight directly (FP8 GEMM with in-kernel per-block scales), so pre-baking the weight to
     # BF16 would only force a wider 2-byte/elem weight read on the memory-bound decode GEMV.
     enabled: false
+  # Fuse sibling quantized projections that read the same activation into one
+  # concatenated GEMM + narrow views. Scoped to fake-quantized groups (fp8_only)
+  # with a bounded fused output width to avoid the unrestricted fuse_gemms OOM
+  # (issue #4674). On DeepSeek-V4 this merges the FineGrained-FP8 attn wq_a+wkv,
+  # wq_b+indexer.wq_b, and shared-expert w1+w3 matmuls (each also drops one
+  # activation-quant), collapsing CTA-starved B=1 decode GEMVs. Runs before
+  # fuse_fp8_act_quant_cse / fuse_finegrained_fp8_gate_up, which then no-op on the
+  # already-merged groups. Replicated bf16 GEMVs stay with fuse_replicated_bf16_linear.
   fuse_gemms_mixed_children:
     stage: post_load_fusion
-    enabled: false
+    enabled: true
+    fp8_only: true
+    max_fused_out_features: 65536
   fuse_gemms:
     stage: post_load_fusion
     enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
