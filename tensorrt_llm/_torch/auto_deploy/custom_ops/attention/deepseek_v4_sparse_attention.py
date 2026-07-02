@@ -1577,6 +1577,44 @@ def _batched_overlap_compressed_rows_fullrange(
         full_map = _decode_page_ids_and_offsets(
             compressor_kv_cache, seq_idx, full_positions, cu_num_pages, cache_loc
         )
+
+    # Fused single-kernel path (idea_0075): collapse the gather / row-shift /
+    # concat / where / pool / rmsnorm swarm into one launch that emits the
+    # pooled+normed candidate rows directly from the paged caches and the hoisted
+    # page maps.  Requires the ratio-4 overlap layout (>= 2*head_dim state
+    # channels) and a per-channel rms weight; falls back to the eager chain below
+    # otherwise.  Only the pool/norm result is produced here -- the rope/quantize
+    # tail is shared with the eager path.
+    if (
+        _HAS_TRITON
+        and compressor_kv_cache.is_cuda
+        and compress_ratio == 4
+        and full_map[2] is not None
+        and compressor_norm_weight.dim() == 1
+        and compressor_norm_weight.numel() == head_dim
+        and int(compressor_kv_cache.shape[-1]) >= 2 * head_dim
+        and compressor_ape.dim() == 2
+        and int(compressor_ape.shape[1]) >= 2 * head_dim
+    ):
+        pooled = _fused_fullrange_candidate_rows(
+            compressor_kv_cache,
+            compressor_gate_cache,
+            full_map[0],
+            full_map[1],
+            full_map[2],
+            compressor_ape,
+            compressor_norm_weight,
+            rms_norm_eps,
+            compress_ratio,
+            head_dim,
+            m,
+            dtype,
+        )
+        row_position_id = row_position_id.to(torch.long).clamp(min=0, max=cos_table.shape[0] - 1)
+        cos = cos_table[row_position_id]
+        sin = sin_table[row_position_id]
+        return _apply_compressed_rope_and_quantize(pooled, cos, sin, rope_dim, rotate=rotate)
+
     current_kv_state, current_page_valid = _decode_cache_rows_from_positions(
         compressor_kv_cache, seq_idx, full_positions, cu_num_pages, cache_loc, dtype, full_map
     )
@@ -2489,6 +2527,112 @@ if _HAS_TRITON:
         tl.store(page_offsets_ptr + offs, page_offset, mask=mask)
         tl.store(valid_ptr + offs, valid, mask=mask)
 
+    @triton.jit
+    def _dsv4_fullrange_candidate_rows_kernel(
+        kv_cache_ptr,  # [P, T, S] fp32 paged compressor kv cache
+        gate_cache_ptr,  # [P, T, S] fp32 paged compressor gate cache
+        page_ids_ptr,  # [B, M*R] int64 (hoisted full-range page map)
+        page_offsets_ptr,  # [B, M*R] int64
+        valid_ptr,  # [B, M*R] bool
+        ape_ptr,  # [R, 2*head_dim] fp32
+        norm_weight_ptr,  # [head_dim]
+        out_ptr,  # [B, M, head_dim] (dtype = q_index.dtype)
+        M,  # max_compressed_len
+        RATIO,  # compress_ratio (4)
+        HEAD_DIM,
+        T,  # tokens_per_block (paged cache dim-1 stride)
+        S,  # state_dim (paged cache dim-2 stride)
+        APE_STRIDE,  # ape.shape[1] (== 2 * head_dim)
+        PAGEMAP_STRIDE,  # M * R (row stride of the [B, M*R] page maps)
+        eps,
+        TWO_R: tl.constexpr,  # 2 * compress_ratio (8)
+        BLOCK_D: tl.constexpr,  # next_pow2(head_dim)
+    ):
+        """Fused ratio-4 full-range candidate-row reconstruction (idea_0075).
+
+        One program per (batch ``b``, candidate row ``r``).  It gathers the ``2*R``
+        paged compressor kv/gate slots for the overlap window (the previous block
+        of row ``r`` == the current block of row ``r-1``, so the full-range slot
+        index is uniformly ``(r-1)*R + s`` for ``s`` in ``[0, 2R)``), adds the ape
+        bias, applies the previous-block validity mask, softmax-pools over the
+        ``2*R`` axis and RMS-norms over ``head_dim`` -- collapsing the
+        gather / row-shift / concat / where / pool / rmsnorm swarm of
+        ``_batched_overlap_compressed_rows_fullrange`` into a single launch.  It
+        emits the post-pool, post-rmsnorm candidate rows (pre-rope); the caller
+        keeps the rope / quantize tail unchanged.  All reductions are fp32-internal
+        with bf16 rounding at the same points as the eager reference
+        (gather ``.to(dtype)``, the ape add, the ``compress_pool`` output, the
+        ``_rms_norm_ref`` output), so the result matches bit-for-bit up to the
+        ``rsqrt`` primitive (validated in the op unit test).
+        """
+        ROUND = out_ptr.dtype.element_ty
+        NEG = -1.0e20  # masked previous-gate floor (matches new_full(-1e20))
+
+        prog = tl.program_id(0)
+        b = prog // M
+        r = prog % M
+
+        s = tl.arange(0, TWO_R)
+        is_prev = s < RATIO
+        # previous block of row r == current block of row r-1, so the full-range
+        # index is uniformly (r-1)*R + s: the first R slots are the previous block,
+        # the last R the current block.  Row 0 has no previous block (masked below).
+        idx = (r - 1) * RATIO + s
+        idx_safe = tl.maximum(idx, 0)
+        pm_base = b * PAGEMAP_STRIDE
+        pid = tl.load(page_ids_ptr + pm_base + idx_safe).to(tl.int64)
+        poff = tl.load(page_offsets_ptr + pm_base + idx_safe).to(tl.int64)
+        pvalid = tl.load(valid_ptr + pm_base + idx_safe).to(tl.int1)
+
+        ratio_slot = tl.where(is_prev, s, s - RATIO)  # ape row per slot
+        channel_offset = tl.where(is_prev, 0, HEAD_DIM)  # previous / current channels
+
+        d = tl.arange(0, BLOCK_D)
+        dmask = d < HEAD_DIM
+        cmask = dmask[None, :]
+
+        base = pid * (T * S) + poff * S + channel_offset  # [TWO_R]
+        offs = base[:, None] + d[None, :]  # [TWO_R, BLOCK_D]
+        raw_kv = tl.load(kv_cache_ptr + offs, mask=cmask, other=0.0)
+        raw_gate = tl.load(gate_cache_ptr + offs, mask=cmask, other=0.0)
+        # Round the fp32 cache reads to the activation dtype (== gather ``.to(dtype)``).
+        kv_b = raw_kv.to(ROUND)
+        gate_b = raw_gate.to(ROUND)
+
+        ape_off = ratio_slot[:, None] * APE_STRIDE + channel_offset[:, None] + d[None, :]
+        ape_b = tl.load(ape_ptr + ape_off, mask=cmask, other=0.0).to(ROUND)
+        # bf16 add: round(bf16(gate) + bf16(ape)) -- the eager path adds in the
+        # activation dtype before masking, so keep the intermediate rounding.
+        gate_sum = (gate_b.to(tl.float32) + ape_b.to(tl.float32)).to(ROUND)
+
+        # Only the previous block is validity-masked; the current block is read
+        # as-is (the reference never masks it).  Row 0 has no previous block.
+        keep_prev = (r >= 1) & pvalid  # [TWO_R]
+        mask_prev_invalid = is_prev & (keep_prev == 0)  # true only for masked prev slots
+
+        g = gate_sum.to(tl.float32)
+        k = kv_b.to(tl.float32)
+        g = tl.where(mask_prev_invalid[:, None], NEG, g)  # exp(-1e20 - m) -> 0
+        k = tl.where(mask_prev_invalid[:, None], 0.0, k)
+
+        # Softmax-weighted pool over the 2R axis (matches deepseek_v4_compress_pool:
+        # max -> exp -> normalize per channel -> weighted sum).
+        m_max = tl.max(g, axis=0)  # [BLOCK_D]
+        e = tl.exp(g - m_max[None, :])
+        ssum = tl.sum(e, axis=0)  # [BLOCK_D]
+        w = e / ssum[None, :]
+        pooled = tl.sum(k * w, axis=0)  # [BLOCK_D] fp32
+        pooled_b = pooled.to(ROUND)  # compress_pool returns the activation dtype
+
+        # RMSNorm over head_dim (matches _rms_norm_ref: fp32 internal + fp32 weight).
+        c = pooled_b.to(tl.float32)
+        sq = tl.where(dmask, c * c, 0.0)
+        ms = tl.sum(sq, axis=0) / HEAD_DIM
+        rinv = tl.rsqrt(ms + eps)
+        wgt = tl.load(norm_weight_ptr + d, mask=dmask, other=0.0).to(tl.float32)
+        o = c * rinv * wgt
+        tl.store(out_ptr + prog.to(tl.int64) * HEAD_DIM + d, o.to(ROUND), mask=dmask)
+
 
 def _fused_local_window_pagemap(
     input_pos: torch.Tensor,  # [N]
@@ -2534,6 +2678,59 @@ def _fused_local_window_pagemap(
         num_warps=4,
     )
     return page_ids, page_offsets, valid
+
+
+def _fused_fullrange_candidate_rows(
+    kv_cache: torch.Tensor,  # [P, T, S] paged compressor kv cache
+    gate_cache: torch.Tensor,  # [P, T, S] paged compressor gate cache
+    page_ids: torch.Tensor,  # [B, M*R] int64 (hoisted full-range page map)
+    page_offsets: torch.Tensor,  # [B, M*R] int64
+    valid: torch.Tensor,  # [B, M*R] bool
+    ape: torch.Tensor,  # [R, 2*head_dim]
+    norm_weight: torch.Tensor,  # [head_dim]
+    rms_norm_eps: float,
+    compress_ratio: int,
+    head_dim: int,
+    max_compressed_len: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """One-launch ratio-4 full-range candidate-row reconstruction (idea_0075).
+
+    Replaces the gather / row-shift / concat / where / pool / rmsnorm swarm of
+    ``_batched_overlap_compressed_rows_fullrange`` with a single kernel that emits
+    the post-pool, post-rmsnorm candidate rows ``[B, max_compressed_len, head_dim]``
+    (pre-rope) directly from the paged caches and the hoisted page maps.  The
+    caller keeps the rope / quantize tail.
+    """
+    num_rows = int(page_ids.shape[0])
+    m = int(max_compressed_len)
+    out = torch.empty(num_rows, m, head_dim, device=kv_cache.device, dtype=dtype)
+    if num_rows == 0 or m == 0 or head_dim == 0:
+        return out
+    two_r = 2 * compress_ratio
+    grid = (num_rows * m,)
+    _dsv4_fullrange_candidate_rows_kernel[grid](
+        kv_cache,
+        gate_cache,
+        page_ids.contiguous(),
+        page_offsets.contiguous(),
+        valid.contiguous(),
+        ape.contiguous(),
+        norm_weight.contiguous(),
+        out,
+        m,
+        compress_ratio,
+        head_dim,
+        int(kv_cache.shape[1]),
+        int(kv_cache.shape[2]),
+        int(ape.shape[1]),
+        m * compress_ratio,
+        float(rms_norm_eps),
+        TWO_R=two_r,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=4,
+    )
+    return out
 
 
 def _can_use_fused_sparse_attention(
