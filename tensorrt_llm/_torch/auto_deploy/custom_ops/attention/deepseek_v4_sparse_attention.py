@@ -2765,6 +2765,44 @@ def _deepseek_v4_sparse_attention(
     return output
 
 
+def _build_placeholder_topk_idxs(
+    window_size: int,
+    compress_ratio: int,
+    batch_size: int,
+    seq_len: int,
+    compressed_width: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Rebuild the DeepSeek-V4 compressed sparse-attention selection placeholder.
+
+    Mirrors the model-side ``_window_topk_idxs`` + ``_compress_topk_idxs`` chain in
+    ``modeling_deepseek_v4.py`` (kept in sync; the modeling test carries independent
+    ``_ref_window_topk_idxs`` / ``_ref_compress_topk_idxs`` copies). The value-reading
+    initial-prefill gather consumes these indices, but the cached decode path reads only
+    their static width (``index_topk = topk_idxs.shape[-1] - window_size``). The model
+    therefore emits a cheap width-only allocation and passes ``topk_is_placeholder=True``
+    so the op rebuilds the real window+compressed selection on the eager prefill path,
+    which keeps the per-layer arange/where/expand/cat/cast index chain out of the decode
+    graph while leaving prefill/decode outputs bit-identical.
+    """
+    query_positions = torch.arange(seq_len, device=device).unsqueeze(1)
+    key_positions = query_positions - window_size + 1 + torch.arange(window_size, device=device)
+    key_positions = torch.where(
+        (key_positions < 0) | (key_positions > query_positions),
+        -1,
+        key_positions,
+    )
+    window_idxs = key_positions.unsqueeze(0).expand(batch_size, -1, -1)
+
+    compressed_positions = torch.arange(compressed_width, device=device)
+    valid_lengths = torch.arange(1, seq_len + 1, device=device).unsqueeze(1) // compress_ratio
+    compressed_idxs = compressed_positions.unsqueeze(0).expand(seq_len, -1)
+    compressed_idxs = torch.where(compressed_idxs < valid_lengths, compressed_idxs + seq_len, -1)
+    compressed_idxs = compressed_idxs.unsqueeze(0).expand(batch_size, -1, -1)
+
+    return torch.cat((window_idxs, compressed_idxs), dim=-1).to(torch.int64)
+
+
 @torch.library.custom_op("auto_deploy::torch_deepseek_v4_sparse_attention", mutates_args=())
 def torch_deepseek_v4_sparse_attention(
     q: torch.Tensor,
@@ -2794,8 +2832,17 @@ def torch_deepseek_v4_sparse_attention(
     head_dim: Optional[int] = None,
     rope_dim: Optional[int] = None,
     rms_norm_eps: float = 1e-6,
+    topk_is_placeholder: bool = False,
 ) -> torch.Tensor:
-    """DeepSeek V4 sparse source op with explicit compressor projections."""
+    """DeepSeek V4 sparse source op with explicit compressor projections.
+
+    ``topk_is_placeholder`` signals that ``topk_idxs`` is a width-only allocation (the
+    model emits one for compressed layers, whose values the cached decode path never
+    reads). When set for a compressed layer, the real window+compressed selection is
+    rebuilt here from ``window_size``/``compress_ratio`` and ``topk_idxs``' width so the
+    value-reading prefill gather stays bit-identical while the per-layer index chain is
+    kept out of the model graph.
+    """
     del (
         indexer_q,
         indexer_weights,
@@ -2806,7 +2853,6 @@ def torch_deepseek_v4_sparse_attention(
         enable_sharding,
         layer_type,
         layer_idx,
-        window_size,
         head_dim,
     )
     _validate_deepseek_v4_sparse_attention_inputs(q, kv, attn_sink, topk_idxs)
@@ -2816,6 +2862,15 @@ def torch_deepseek_v4_sparse_attention(
             raise ValueError("max_compressed_len is required for compressed attention.")
         if rope_dim is None:
             raise ValueError("rope_dim is required for compressed attention.")
+        if topk_is_placeholder:
+            if window_size is None:
+                raise ValueError(
+                    "window_size is required to rebuild the compressed topk placeholder."
+                )
+            compressed_width = int(topk_idxs.shape[-1]) - int(window_size)
+            topk_idxs = _build_placeholder_topk_idxs(
+                window_size, compress_ratio, q.shape[0], q.shape[1], compressed_width, q.device
+            )
         compressed_kv = _build_full_compressed_kv(
             compressor_kv,
             compressor_gate,
@@ -2862,6 +2917,7 @@ def torch_deepseek_v4_sparse_attention_fake(
     head_dim: Optional[int] = None,
     rope_dim: Optional[int] = None,
     rms_norm_eps: float = 1e-6,
+    topk_is_placeholder: bool = False,
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
     del (
@@ -2875,6 +2931,7 @@ def torch_deepseek_v4_sparse_attention_fake(
         head_dim,
         rope_dim,
         rms_norm_eps,
+        topk_is_placeholder,
     )
     _validate_rank("q", q, 4)
     _validate_rank("kv", kv, 3)
@@ -3060,6 +3117,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
     max_compressed_len: Optional[int] = None,
     rms_norm_eps: float = 1e-6,
     rope_dim: Optional[int] = None,
+    topk_is_placeholder: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Reference paged cached DeepSeek V4 sparse attention with compressor state."""
@@ -3144,6 +3202,19 @@ def torch_deepseek_v4_sparse_attention_with_cache(
             rms_norm_eps,
             rope_dim,
             out,
+        )
+
+    if compress_ratio and topk_is_placeholder:
+        # The model emits a width-only placeholder for ``topk_idxs`` on compressed
+        # layers; rebuild the real window+compressed selection here (once per prefill,
+        # eager) for the value-reading initial-prefill gather. The pure-decode path
+        # above returns before this and reads only the placeholder width, so it never
+        # needs the rebuilt indices.
+        if window_size is None:
+            raise ValueError("window_size is required to rebuild the compressed topk placeholder.")
+        compressed_width = int(topk_idxs.shape[-1]) - int(window_size)
+        topk_idxs = _build_placeholder_topk_idxs(
+            window_size, compress_ratio, q.shape[0], q.shape[1], compressed_width, q.device
         )
 
     seq_len_host = _to_host_long("seq_len", seq_len, num_seq)
@@ -3380,10 +3451,12 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
     max_compressed_len: Optional[int] = None,
     rms_norm_eps: float = 1e-6,
     rope_dim: Optional[int] = None,
+    topk_is_placeholder: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if out is not None:
         return out.new_empty(0)
+    del topk_is_placeholder
     _validate_compress_ratio(compress_ratio)
     _validate_rank("q", q, 4)
     _validate_rank("kv", kv, 3)
@@ -3585,16 +3658,23 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> list[Constant]:
-        softmax_scale, window_size, compress_ratio, max_compressed_len, rms_norm_eps, rope_dim = (
-            extract_op_args(
-                source_attn_node,
-                "softmax_scale",
-                "window_size",
-                "compress_ratio",
-                "max_compressed_len",
-                "rms_norm_eps",
-                "rope_dim",
-            )
+        (
+            softmax_scale,
+            window_size,
+            compress_ratio,
+            max_compressed_len,
+            rms_norm_eps,
+            rope_dim,
+            topk_is_placeholder,
+        ) = extract_op_args(
+            source_attn_node,
+            "softmax_scale",
+            "window_size",
+            "compress_ratio",
+            "max_compressed_len",
+            "rms_norm_eps",
+            "rope_dim",
+            "topk_is_placeholder",
         )
         if not isinstance(softmax_scale, float):
             raise RuntimeError(
@@ -3633,6 +3713,11 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
                 "DeepSeek V4 sparse attention source node must carry a literal "
                 f"int rope_dim or None, got {rope_dim!r}."
             )
+        if not isinstance(topk_is_placeholder, bool):
+            raise RuntimeError(
+                "DeepSeek V4 sparse attention source node must carry a literal "
+                f"bool topk_is_placeholder, got {topk_is_placeholder!r}."
+            )
         return [
             softmax_scale,
             window_size,
@@ -3640,4 +3725,5 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
             max_compressed_len,
             rms_norm_eps,
             rope_dim,
+            topk_is_placeholder,
         ]

@@ -628,21 +628,6 @@ def _window_topk_idxs(
     return key_positions.unsqueeze(0).expand(batch_size, -1, -1)
 
 
-def _compress_topk_idxs(
-    ratio: int,
-    batch_size: int,
-    seq_len: int,
-    offset: int,
-    max_compressed_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    compressed_positions = torch.arange(max_compressed_len, device=device)
-    valid_lengths = torch.arange(1, seq_len + 1, device=device).unsqueeze(1) // ratio
-    topk_idxs = compressed_positions.unsqueeze(0).expand(seq_len, -1)
-    topk_idxs = torch.where(topk_idxs < valid_lengths, topk_idxs + offset, -1)
-    return topk_idxs.unsqueeze(0).expand(batch_size, -1, -1)
-
-
 def _overlap_transform(tensor: torch.Tensor, head_dim: int, value: float) -> torch.Tensor:
     batch_size, compressed_len, ratio, _ = tensor.shape
     previous = tensor[:, :, :, :head_dim]
@@ -677,6 +662,7 @@ def _sparse_attention(
     max_compressed_len: Optional[int],
     rope_dim: Optional[int],
     rms_norm_eps: float,
+    topk_is_placeholder: bool = False,
 ) -> torch.Tensor:
     return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
         q,
@@ -706,6 +692,7 @@ def _sparse_attention(
         head_dim=kv.shape[-1],
         rope_dim=rope_dim,
         rms_norm_eps=rms_norm_eps,
+        topk_is_placeholder=topk_is_placeholder,
     )
 
 
@@ -1367,9 +1354,6 @@ class DeepseekV4Attention(nn.Module):
         empty_indexer_q = q.new_empty(batch_size, seq_len, 0, 0)
         empty_indexer_weights = q.new_empty(batch_size, seq_len, 0)
         if self.compress_ratio:
-            window_idxs = _window_topk_idxs(
-                self.window_size, batch_size, seq_len, hidden_states.device
-            )
             compressor_kv, compressor_gate = self.compressor.project(hidden_states)
             if self.indexer is not None:
                 (
@@ -1383,27 +1367,7 @@ class DeepseekV4Attention(nn.Module):
                     cos_compress,
                     sin_compress,
                 )
-                # The model-side indexer compression (`compress_projected`) and
-                # top-k scoring (`select_topk`) are dead work under the cached
-                # sparse-attention op: both the cached prefill path
-                # (`_cached_compressed_attention`) and the decode path
-                # (`_decode_compressed_cache_attention`) recompute the index-score
-                # selection from the indexer compressor caches and consume the
-                # model-produced top-k tensor only for its static width
-                # (`index_topk = topk_idxs.shape[-1] - window_size`). Emit a
-                # width-correct placeholder (same `[batch, seq_len, index_topk]`
-                # shape `select_topk` produces) instead, skipping the duplicate
-                # compress-pool + index-score matmul + top-k block per ratio-4
-                # layer. The placeholder values are never read by the cached op,
-                # so the cached prefill/decode outputs are bit-identical.
-                compressed_idxs = _compress_topk_idxs(
-                    self.compress_ratio,
-                    batch_size,
-                    seq_len,
-                    seq_len,
-                    self.indexer.index_topk,
-                    hidden_states.device,
-                )
+                compressed_width = self.indexer.index_topk
                 indexer_compressor_ape = self.indexer.compressor.ape
                 indexer_compressor_norm_weight = self.indexer.compressor.norm.weight
             else:
@@ -1413,15 +1377,22 @@ class DeepseekV4Attention(nn.Module):
                 indexer_compressor_gate = empty_compressor_state
                 indexer_compressor_ape = empty_compressor_ape
                 indexer_compressor_norm_weight = empty_compressor_norm_weight
-                compressed_idxs = _compress_topk_idxs(
-                    self.compress_ratio,
-                    batch_size,
-                    seq_len,
-                    seq_len,
-                    self.compressor.max_compressed_len,
-                    hidden_states.device,
-                )
-            topk_idxs = torch.cat((window_idxs, compressed_idxs), dim=-1).to(torch.int64)
+                compressed_width = self.compressor.max_compressed_len
+            # The model-side indexer compression (`compress_projected`) and top-k
+            # scoring (`select_topk`) are dead work under the cached sparse-attention
+            # op: both the cached prefill path (`_cached_compressed_attention`) and the
+            # decode path (`_decode_compressed_cache_attention`) recompute the
+            # index-score selection from the indexer compressor caches and consume the
+            # top-k tensor only for its static width
+            # (`index_topk = topk_idxs.shape[-1] - window_size`). Only the value-reading
+            # initial-prefill gather needs the real window+compressed indices, so emit a
+            # cheap width-only placeholder here and let the sparse-attention op rebuild
+            # them on the eager prefill path (`topk_is_placeholder=True`). This removes
+            # the per-layer arange/where/expand/cat/cast index chain from the decode
+            # graph while leaving prefill/decode outputs bit-identical.
+            topk_idxs = hidden_states.new_empty(
+                batch_size, seq_len, self.window_size + compressed_width, dtype=torch.int64
+            )
             attn_output = _sparse_attention(
                 q,
                 kv,
@@ -1447,6 +1418,7 @@ class DeepseekV4Attention(nn.Module):
                 self.compressor.max_compressed_len,
                 self.rope_head_dim,
                 self.rms_eps,
+                topk_is_placeholder=True,
             )
         else:
             topk_idxs = _window_topk_idxs(
