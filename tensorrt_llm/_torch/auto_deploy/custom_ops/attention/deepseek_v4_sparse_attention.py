@@ -1750,30 +1750,47 @@ def _update_decode_compressed_caches(
     mhc_page_ids, mhc_page_offsets, _ = _decode_page_ids_and_offsets(
         mhc_cache, seq_idx, row_logical_pos, cu_num_pages, cache_loc
     )
-    previous_rows, _ = _decode_cache_rows_from_positions(
-        mhc_cache,
-        seq_idx,
-        row_logical_pos,
-        cu_num_pages,
-        cache_loc,
-        mhc_cache.dtype,
-        (mhc_page_ids, mhc_page_offsets, None),
-    )
-    rows_to_write = torch.where(
-        row_valid.unsqueeze(-1),
-        compressed_rows.to(mhc_cache.dtype),
-        previous_rows,
-    )
-    _write_decode_cache_rows(
-        mhc_cache,
-        rows_to_write,
-        seq_idx,
-        row_logical_pos,
-        cu_num_pages,
-        cache_loc,
-        mhc_page_ids,
-        mhc_page_offsets,
-    )
+    if _HAS_TRITON and mhc_cache.is_cuda:
+        # Validity-masked paged store. ``row_valid`` is true only on the ~1-in-4 decode
+        # steps that complete a compressed row (and is identical across every layer within
+        # a step, since it depends only on ``input_pos``). The prior code unconditionally
+        # gathered the previous mhc row and ``torch.where``-selected it back for the other
+        # ~3-in-4 steps -- a per-layer read + where + write-back that runs every captured
+        # cudagraph step regardless of ``row_valid``. Fold the conditional into the store:
+        # valid rows write ``compressed_rows`` exactly as the prior index_put; invalid rows
+        # store nothing, leaving the slot byte-identical to reading and writing it back.
+        _masked_write_decode_cache_rows(
+            mhc_cache,
+            compressed_rows.to(mhc_cache.dtype),
+            row_valid,
+            mhc_page_ids,
+            mhc_page_offsets,
+        )
+    else:
+        previous_rows, _ = _decode_cache_rows_from_positions(
+            mhc_cache,
+            seq_idx,
+            row_logical_pos,
+            cu_num_pages,
+            cache_loc,
+            mhc_cache.dtype,
+            (mhc_page_ids, mhc_page_offsets, None),
+        )
+        rows_to_write = torch.where(
+            row_valid.unsqueeze(-1),
+            compressed_rows.to(mhc_cache.dtype),
+            previous_rows,
+        )
+        _write_decode_cache_rows(
+            mhc_cache,
+            rows_to_write,
+            seq_idx,
+            row_logical_pos,
+            cu_num_pages,
+            cache_loc,
+            mhc_page_ids,
+            mhc_page_offsets,
+        )
 
 
 def _select_decode_ratio4_indexer_rows(
@@ -2528,6 +2545,42 @@ if _HAS_TRITON:
         tl.store(valid_ptr + offs, valid, mask=mask)
 
     @triton.jit
+    def _masked_paged_store_kernel(
+        src_ptr,  # [N, S] contiguous, already cache dtype -- rows to conditionally store
+        row_valid_ptr,  # [N] bool -- store row r iff row_valid[r]
+        page_ids_ptr,  # [N] int64 -- physical page id per row
+        page_offsets_ptr,  # [N] int64 -- in-page offset per row
+        cache_ptr,  # [P, T, S] paged cache (mutated in place)
+        stride_p,  # cache.stride(0)
+        stride_t,  # cache.stride(1)
+        stride_s,  # cache.stride(2)
+        S,  # state_dim (row width)
+        BLOCK_S: tl.constexpr,
+    ):
+        """Read-free validity-masked paged store.
+
+        Replaces the decode ``mhc_cache`` compressed-row update's previous-row gather +
+        ``torch.where`` + unconditional index_put write-back with a single masked store.
+        For each row ``r`` the freshly compressed ``src[r]`` is written to
+        ``cache[page_ids[r], page_offsets[r], :]`` only when ``row_valid[r]`` is true;
+        invalid rows (the ~3-in-4 decode steps that do not complete a compressed row, and
+        which are identical across every layer within a step) store nothing, leaving the
+        slot byte-identical to reading the old row and writing it back. ``src`` is already
+        cast to the cache dtype by the caller, so the store is a pure copy -- byte-identical
+        to the prior ``cache[page_ids, page_offsets] = compressed_rows.to(cache.dtype)``.
+        """
+        row = tl.program_id(0)
+        sblk = tl.program_id(1)
+        valid = tl.load(row_valid_ptr + row).to(tl.int1)
+        pid = tl.load(page_ids_ptr + row).to(tl.int64)
+        poff = tl.load(page_offsets_ptr + row).to(tl.int64)
+        col = sblk * BLOCK_S + tl.arange(0, BLOCK_S)
+        smask = col < S
+        vals = tl.load(src_ptr + row * S + col, mask=smask, other=0)
+        dst = cache_ptr + pid * stride_p + poff * stride_t + col * stride_s
+        tl.store(dst, vals.to(cache_ptr.dtype.element_ty), mask=smask & valid)
+
+    @triton.jit
     def _dsv4_fullrange_candidate_rows_kernel(
         kv_cache_ptr,  # [P, T, S] fp32 paged compressor kv cache
         gate_cache_ptr,  # [P, T, S] fp32 paged compressor gate cache
@@ -2632,6 +2685,45 @@ if _HAS_TRITON:
         wgt = tl.load(norm_weight_ptr + d, mask=dmask, other=0.0).to(tl.float32)
         o = c * rinv * wgt
         tl.store(out_ptr + prog.to(tl.int64) * HEAD_DIM + d, o.to(ROUND), mask=dmask)
+
+
+def _masked_write_decode_cache_rows(
+    cache: torch.Tensor,  # [P, T, S] paged cache (mutated in place)
+    values: torch.Tensor,  # [N, S] rows to conditionally store (already cache dtype)
+    row_valid: torch.Tensor,  # [N] bool
+    page_ids: torch.Tensor,  # [N] int64 write page id per row
+    page_offsets: torch.Tensor,  # [N] int64 in-page offset per row
+) -> None:
+    """Store ``values[r]`` into ``cache[page_ids[r], page_offsets[r]]`` iff ``row_valid[r]``.
+
+    Triton wrapper for the read-free validity-masked paged store. ``page_ids``/
+    ``page_offsets`` are the precomputed write address (the same map fed to the removed
+    read + write-back). ``values`` must already be cast to ``cache.dtype`` so the store is
+    a pure copy -- byte-identical to the prior
+    ``cache[page_ids, page_offsets] = compressed_rows.to(cache.dtype)`` for valid rows,
+    and a no-op (slot untouched) for invalid rows, which is byte-identical to gathering the
+    previous row and writing it back unchanged.
+    """
+    n_rows = int(values.shape[0])
+    if n_rows == 0:
+        return
+    state_dim = int(values.shape[-1])
+    values = values.contiguous()
+    BLOCK_S = min(triton.next_power_of_2(state_dim), 1024)
+    grid = (n_rows, triton.cdiv(state_dim, BLOCK_S))
+    _masked_paged_store_kernel[grid](
+        values,
+        row_valid,
+        page_ids,
+        page_offsets,
+        cache,
+        cache.stride(0),
+        cache.stride(1),
+        cache.stride(2),
+        state_dim,
+        BLOCK_S=BLOCK_S,
+        num_warps=4,
+    )
 
 
 def _fused_local_window_pagemap(
