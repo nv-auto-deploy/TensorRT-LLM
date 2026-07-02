@@ -1253,6 +1253,31 @@ def _decode_cache_rows_from_positions(
     return cache[page_ids, page_offsets].to(dtype), valid
 
 
+def _decode_attention_from_selected(
+    q_decode: torch.Tensor,
+    selected_kv: torch.Tensor,
+    rel_topk: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Attend ``q_decode`` over ``selected_kv`` given precomputed relative row indices.
+
+    ``rel_topk`` has shape ``[N, kv_rows]``: the slot's own id for a kept row and
+    ``-1`` for a masked slot. Shared by ``_decode_attention_from_rows`` (which
+    derives ``rel_topk`` from a boolean ``valid_rows`` mask via arange + where) and
+    the fused paged-assemble path, which emits ``rel_topk`` directly so the
+    arange/where pair is dropped from the decode graph.
+    """
+    output = _deepseek_v4_sparse_attention(
+        q_decode.unsqueeze(1),
+        selected_kv,
+        attn_sink,
+        rel_topk.unsqueeze(1),
+        softmax_scale,
+    )
+    return output.squeeze(1)
+
+
 def _decode_attention_from_rows(
     q_decode: torch.Tensor,
     selected_kv: torch.Tensor,
@@ -1263,14 +1288,9 @@ def _decode_attention_from_rows(
     rel_topk = torch.arange(selected_kv.shape[1], dtype=torch.int64, device=q_decode.device)
     rel_topk = rel_topk.view(1, -1).expand(q_decode.shape[0], -1)
     rel_topk = torch.where(valid_rows, rel_topk, torch.full_like(rel_topk, -1))
-    output = _deepseek_v4_sparse_attention(
-        q_decode.unsqueeze(1),
-        selected_kv,
-        attn_sink,
-        rel_topk.unsqueeze(1),
-        softmax_scale,
+    return _decode_attention_from_selected(
+        q_decode, selected_kv, rel_topk, attn_sink, softmax_scale
     )
-    return output.squeeze(1)
 
 
 def _decode_local_cache_rows(
@@ -1897,15 +1917,9 @@ def _decode_compressed_cache_attention(
     rope_dim: int,
     full_page_map: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
-    local_kv, local_valid = _decode_local_cache_rows(
-        swa_cache,
-        seq_idx,
-        input_pos,
-        cu_num_pages,
-        cache_loc,
-        window_size,
-        q_decode.dtype,
-    )
+    # Select the compressed candidate rows (and their pre-page validity) without
+    # touching the paged caches yet: the indexer top-k for ratio-4, the full
+    # ``arange`` range for the ratio-128 dense case.
     mode = _compression_mode(compress_ratio)
     if mode.uses_indexer:
         index_topk = max(int(topk_decode.shape[-1]) - int(window_size), 0)
@@ -1929,16 +1943,6 @@ def _decode_compressed_cache_attention(
             max_compressed_len,
             full_page_map=full_page_map,
         )
-        compressed_positions = selected_rows.clamp(min=0) * compress_ratio
-        compressed_kv, page_valid = _decode_cache_rows_from_positions(
-            mhc_cache,
-            seq_idx,
-            compressed_positions,
-            cu_num_pages,
-            cache_loc,
-            q_decode.dtype,
-        )
-        compressed_valid = compressed_valid & page_valid & (selected_rows >= 0)
     else:
         candidate_rows = torch.arange(
             max_compressed_len,
@@ -1948,17 +1952,52 @@ def _decode_compressed_cache_attention(
         selected_rows = candidate_rows.view(1, -1).expand(q_decode.shape[0], -1)
         compressed_len = ((input_pos + 1) // compress_ratio).clamp(max=max_compressed_len)
         compressed_valid = selected_rows < compressed_len.unsqueeze(1)
-        compressed_positions = selected_rows * compress_ratio
-        compressed_kv, page_valid = _decode_cache_rows_from_positions(
+
+    if _HAS_TRITON and swa_cache.is_cuda and mhc_cache.is_cuda:
+        # Fold the local/compressed page-map translation, the two paged row gathers,
+        # the selected_kv / valid_rows concatenation and the attend arange/where into
+        # one paged assemble kernel, then attend directly on the emitted rel_topk.
+        selected_kv, rel_topk = _fused_assemble_selected_kv(
+            swa_cache,
             mhc_cache,
+            selected_rows,
+            compressed_valid,
+            input_pos,
             seq_idx,
-            compressed_positions,
             cu_num_pages,
             cache_loc,
+            window_size,
+            compress_ratio,
             q_decode.dtype,
         )
-        compressed_valid = compressed_valid & page_valid
+        return _decode_attention_from_selected(
+            q_decode,
+            selected_kv,
+            rel_topk,
+            attn_sink,
+            softmax_scale,
+        )
 
+    # Eager fallback (CPU / no-Triton): materialize selected_kv via row gathers + cat.
+    local_kv, local_valid = _decode_local_cache_rows(
+        swa_cache,
+        seq_idx,
+        input_pos,
+        cu_num_pages,
+        cache_loc,
+        window_size,
+        q_decode.dtype,
+    )
+    compressed_positions = selected_rows.clamp(min=0) * compress_ratio
+    compressed_kv, page_valid = _decode_cache_rows_from_positions(
+        mhc_cache,
+        seq_idx,
+        compressed_positions,
+        cu_num_pages,
+        cache_loc,
+        q_decode.dtype,
+    )
+    compressed_valid = compressed_valid & page_valid & (selected_rows >= 0)
     selected_kv = torch.cat((local_kv, compressed_kv), dim=1)
     valid_rows = torch.cat((local_valid, compressed_valid), dim=1)
     return _decode_attention_from_rows(
@@ -2686,6 +2725,101 @@ if _HAS_TRITON:
         o = c * rinv * wgt
         tl.store(out_ptr + prog.to(tl.int64) * HEAD_DIM + d, o.to(ROUND), mask=dmask)
 
+    @triton.jit
+    def _dsv4_assemble_selected_kv_kernel(
+        swa_cache_ptr,  # [P, T, D] paged local (sliding-window) kv cache
+        mhc_cache_ptr,  # [P, T, D] paged compressed kv cache (same P/T/D/dtype as swa)
+        selected_rows_ptr,  # [B, TOPK] int64 selected compressed row ids (-1 = pad)
+        comp_valid_ptr,  # [B, TOPK] bool indexer/candidate row validity
+        input_pos_ptr,  # [B] int current decode position per sequence
+        seq_idx_ptr,  # [B] int sequence row per decode token
+        cu_num_pages_ptr,  # [num_seq + 1] prefix-sum page-table offsets
+        cache_loc_ptr,  # [total_pages] physical page id per page-table slot
+        out_kv_ptr,  # [B, KV_ROWS, D] out (activation dtype)
+        out_relidx_ptr,  # [B, KV_ROWS] int64 out (slot id if kept else -1)
+        B,
+        KV_ROWS,  # W + TOPK (row stride of the [B, KV_ROWS, ...] outputs)
+        W,  # window_size (local slots occupy [0, W))
+        TOPK,  # number of compressed slots (compressed slots occupy [W, KV_ROWS))
+        RATIO,  # compress_ratio
+        T,  # tokens_per_block (paged cache dim-1)
+        D,  # head_dim (paged cache dim-2)
+        CACHE_LOC_MAX,  # cache_loc.numel() - 1
+        BLOCK_D: tl.constexpr,  # next_pow2(head_dim)
+    ):
+        """Fold the decode selected-KV assembly into one paged gather (idea_0001).
+
+        One program per (decode row ``b``, output slot ``slot``).  It replaces the
+        per-ratio-4/128-layer tail of ``_decode_compressed_cache_attention`` -- the
+        local-window page-map + ``swa_cache`` gather, the dynamic compressed page-map
+        translation + ``mhc_cache`` gather, the two ``torch.cat``s (selected_kv /
+        valid_rows) and the ``arange``/``where`` that builds the attend's relative
+        indices -- by reading the paged local/compressed cache rows directly and
+        emitting the contiguous ``selected_kv`` block plus the attend's ``rel_topk``.
+
+        Local slots (``slot < W``) mirror ``_decode_local_cache_rows``' position
+        generation; compressed slots (``slot >= W``) read the caller-selected
+        ``selected_rows`` (``clamp(min=0) * RATIO`` -> paged position).  The page
+        translation mirrors ``_page_ids_and_offsets_from_tpb`` exactly (all
+        divisions/remainders act on non-negative, identically-clamped operands), so
+        the gathered rows, the per-slot validity, and ``rel_topk`` are byte-identical
+        to the eager gather/cat/where chain -- including the clamped rows of masked
+        slots, which the attend ignores (``rel_topk == -1``).
+        """
+        prog = tl.program_id(0)
+        b = prog // KV_ROWS
+        slot = prog % KV_ROWS
+        is_local = slot < W
+        is_comp = slot >= W
+
+        input_pos = tl.load(input_pos_ptr + b).to(tl.int64)
+        seq_idx = tl.load(seq_idx_ptr + b).to(tl.int64)
+
+        # Local-window position (mirror _decode_local_cache_rows):
+        # pos = input_pos - W + 1 + slot.
+        lpos = input_pos - W + 1 + slot
+        lvalid_pos = (lpos >= 0) & (lpos <= input_pos)
+
+        # Compressed position: selected_rows.clamp(min=0) * RATIO.  Guard the load so
+        # TOPK == 0 (no compressed slots) never dereferences the empty selection.
+        c = slot - W
+        c_safe = tl.minimum(tl.maximum(c, 0), TOPK - 1)
+        csel = tl.load(selected_rows_ptr + b * TOPK + c_safe, mask=is_comp, other=0).to(tl.int64)
+        cvalid_in = tl.load(comp_valid_ptr + b * TOPK + c_safe, mask=is_comp, other=0).to(tl.int1)
+        cpos = tl.maximum(csel, 0) * RATIO
+
+        pos = tl.where(is_local, lpos, cpos)
+
+        # Page-address translation (mirror _page_ids_and_offsets_from_tpb).
+        safe_pos = tl.maximum(pos, 0)
+        page_ordinal = safe_pos // T
+        page_offset = safe_pos % T
+        page_start = tl.load(cu_num_pages_ptr + seq_idx).to(tl.int64)
+        page_end = tl.load(cu_num_pages_ptr + seq_idx + 1).to(tl.int64)
+        page_table_idx = page_start + page_ordinal
+        page_valid = (pos >= 0) & (page_table_idx < page_end)
+        safe_idx = tl.where(page_valid, page_table_idx, page_start)
+        safe_idx = tl.minimum(tl.maximum(safe_idx, 0), CACHE_LOC_MAX)
+        pid = tl.load(cache_loc_ptr + safe_idx).to(tl.int64)
+
+        local_valid = lvalid_pos & page_valid
+        # ratio-4 masks pad rows via (selected_rows >= 0); ratio-128 uses arange (>=0
+        # always), so the (csel >= 0) term is uniform and byte-identical to both.
+        comp_valid = cvalid_in & page_valid & (csel >= 0)
+        valid = tl.where(is_local, local_valid, comp_valid)
+
+        d = tl.arange(0, BLOCK_D)
+        dmask = d < D
+        row_off = (pid * T + page_offset) * D + d
+        swa_row = tl.load(swa_cache_ptr + row_off, mask=is_local & dmask, other=0.0)
+        mhc_row = tl.load(mhc_cache_ptr + row_off, mask=is_comp & dmask, other=0.0)
+        row = tl.where(is_local, swa_row, mhc_row)
+
+        out_base = (b * KV_ROWS + slot).to(tl.int64) * D + d
+        tl.store(out_kv_ptr + out_base, row.to(out_kv_ptr.dtype.element_ty), mask=dmask)
+        relidx = tl.where(valid, slot, -1).to(tl.int64)
+        tl.store(out_relidx_ptr + b * KV_ROWS + slot, relidx)
+
 
 def _masked_write_decode_cache_rows(
     cache: torch.Tensor,  # [P, T, S] paged cache (mutated in place)
@@ -2770,6 +2904,68 @@ def _fused_local_window_pagemap(
         num_warps=4,
     )
     return page_ids, page_offsets, valid
+
+
+def _fused_assemble_selected_kv(
+    swa_cache: torch.Tensor,  # [P, T, D] paged local kv cache
+    mhc_cache: torch.Tensor,  # [P, T, D] paged compressed kv cache (same P/T/D/dtype)
+    selected_rows: torch.Tensor,  # [B, TOPK] int64 selected compressed row ids (-1 = pad)
+    compressed_valid: torch.Tensor,  # [B, TOPK] bool indexer/candidate validity
+    input_pos: torch.Tensor,  # [B] int
+    seq_idx: torch.Tensor,  # [B] int
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One-launch paged assembly of the decode ``selected_kv`` block + ``rel_topk``.
+
+    Reads the local-window rows from ``swa_cache`` and the caller-selected
+    compressed rows from ``mhc_cache`` directly (folding the two page-map
+    translations, the two row gathers, the selected_kv/valid_rows ``torch.cat``s and
+    the attend's arange/where), returning the contiguous ``[B, window+TOPK, D]``
+    selected-KV tensor and the ``[B, window+TOPK]`` relative row indices consumed by
+    ``_decode_attention_from_selected``.  Byte-identical to the eager
+    gather/cat/where chain it replaces (see ``_dsv4_assemble_selected_kv_kernel``).
+    """
+    if cache_loc.numel() == 0:
+        raise ValueError("cache_loc must contain at least one page id")
+    num_decode = int(input_pos.shape[0])
+    topk = int(selected_rows.shape[1])
+    kv_rows = int(window_size) + topk
+    head_dim = int(swa_cache.shape[-1])
+    tokens_per_block = int(swa_cache.shape[1])
+    out_kv = torch.empty(num_decode, kv_rows, head_dim, dtype=dtype, device=swa_cache.device)
+    out_relidx = torch.empty(num_decode, kv_rows, dtype=torch.int64, device=swa_cache.device)
+    n_programs = num_decode * kv_rows
+    if n_programs == 0:
+        return out_kv, out_relidx
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    grid = (n_programs,)
+    _dsv4_assemble_selected_kv_kernel[grid](
+        swa_cache,
+        mhc_cache,
+        selected_rows.contiguous(),
+        compressed_valid.contiguous(),
+        input_pos.contiguous(),
+        seq_idx.contiguous(),
+        cu_num_pages,
+        cache_loc,
+        out_kv,
+        out_relidx,
+        num_decode,
+        kv_rows,
+        int(window_size),
+        topk,
+        int(compress_ratio),
+        tokens_per_block,
+        head_dim,
+        cache_loc.numel() - 1,
+        BLOCK_D=BLOCK_D,
+        num_warps=4,
+    )
+    return out_kv, out_relidx
 
 
 def _fused_fullrange_candidate_rows(
