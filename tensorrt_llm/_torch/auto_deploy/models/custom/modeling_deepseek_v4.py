@@ -1333,7 +1333,9 @@ class DeepseekV4Attention(nn.Module):
             tp_scaled_dim=2,
             layer_type="mla",
         )
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_eps).to(q.dtype)
+        # The per-head weightless Q RMS norm (q *= rsqrt(mean(q^2)+eps)) is folded
+        # into the fused RoPE/concat call below via ``rms_eps`` — see the raw split
+        # views passed there — so it no longer runs as a separate reduction chain.
 
         kv = _linear_module(hidden_states, self.wkv, layer_type="mla")
         kv = self.kv_norm(kv)
@@ -1343,8 +1345,12 @@ class DeepseekV4Attention(nn.Module):
         kv_nope = _fake_fp8_act_quant(kv_nope, block_size=64)
         # Fused interleaved-RoPE + concat: rotates the pe slice and writes
         # ``cat((nope, rope(pe)))`` in one kernel — removes the rope elementwise
-        # swarm, the rope ``stack`` and the explicit ``cat`` per call.
-        q = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(q_nope, q_pe, cos, sin, False)
+        # swarm, the rope ``stack`` and the explicit ``cat`` per call. The main-Q
+        # call also folds the pre-split per-head weightless RMS norm (rms_eps>0),
+        # collapsing its reduction/elementwise/cast chain into this same kernel.
+        q = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(
+            q_nope, q_pe, cos, sin, False, self.rms_eps
+        )
         kv = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(kv_nope, kv_pe, cos, sin, False)
 
         empty_compressor_state = kv.new_empty(batch_size, seq_len, 0)

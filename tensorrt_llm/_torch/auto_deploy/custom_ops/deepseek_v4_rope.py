@@ -31,6 +31,14 @@ reference's bf16*fp32 type promotion).
 
 The kernel name contains ``rope`` on purpose so the collapsed work classifies
 under the ``rope`` op-type and leaves the ``elementwise`` / ``copy_cast`` buckets.
+
+The main-Q path additionally normalizes each head with a weightless RMS norm
+(``q *= rsqrt(mean(q^2) + eps).to(q.dtype)``) immediately before the split/rope.
+Passing ``rms_eps > 0`` folds that reduction/elementwise chain into this same
+kernel: the sum-of-squares is gathered over the full ``nope || pe`` head, the
+rsqrt factor is rounded to the output dtype (matching the reference
+``.to(q.dtype)``), and each normalized value is materialized in the output dtype
+before RoPE — bit-faithful to running the norm as a separate pre-split step.
 """
 
 import torch
@@ -54,7 +62,9 @@ def _fused_interleaved_rope_concat_kernel(
     pe_row_stride,
     cossin_row_stride,
     out_row_stride,
+    rms_eps,  # per-head weightless RMS-norm epsilon (only read when HAS_NORM)
     INVERSE: tl.constexpr,
+    HAS_NORM: tl.constexpr,  # fold q * rsqrt(mean(q^2)+eps) over the full head first
     BLOCK_DN: tl.constexpr,  # next_pow2(Dn)
     BLOCK_DH: tl.constexpr,  # next_pow2(Dh)
 ):
@@ -64,18 +74,41 @@ def _fused_interleaved_rope_concat_kernel(
     pos = row // H
     out_base = out_ptr + row * out_row_stride
 
-    # --- copy the nope slice through, unchanged ---
+    # --- load the nope slice and the pe even/odd lanes ---
     dn = tl.arange(0, BLOCK_DN)
     mn = dn < Dn
     nope = tl.load(nope_ptr + row * nope_row_stride + dn, mask=mn, other=0.0)
-    tl.store(out_base + dn, nope.to(out_ptr.dtype.element_ty), mask=mn)
 
-    # --- interleaved RoPE on the pe slice (fp32 math) ---
     k = tl.arange(0, BLOCK_DH)
     mh = k < Dh
     pe_base = pe_ptr + row * pe_row_stride
     even = tl.load(pe_base + 2 * k, mask=mh, other=0.0).to(tl.float32)
     odd = tl.load(pe_base + 2 * k + 1, mask=mh, other=0.0).to(tl.float32)
+
+    # --- optional per-head weightless RMS norm over the full (nope || pe) head ---
+    # Reproduces ``q * rsqrt(mean(q^2) + eps).to(q.dtype)`` applied to the *full*
+    # head BEFORE the nope/pe split: sum-of-squares is order-independent so it is
+    # gathered from the nope block and the pe even/odd lanes. The rsqrt factor is
+    # rounded to the output dtype (matching the reference ``.to(q.dtype)`` on the
+    # rsqrt) and every normalized value is materialized in the output dtype before
+    # RoPE reads it back, so the fused result is bit-faithful to the split reference.
+    if HAS_NORM:
+        out_ty0 = out_ptr.dtype.element_ty
+        nope_f = nope.to(tl.float32)
+        ss = (
+            tl.sum(nope_f * nope_f, axis=0)
+            + tl.sum(even * even, axis=0)
+            + tl.sum(odd * odd, axis=0)
+        )
+        factor = tl.rsqrt(ss / (Dn + D) + rms_eps).to(out_ty0).to(tl.float32)
+        nope = (nope_f * factor).to(out_ty0)
+        even = (even * factor).to(out_ty0).to(tl.float32)
+        odd = (odd * factor).to(out_ty0).to(tl.float32)
+
+    # --- copy the (optionally normalized) nope slice through ---
+    tl.store(out_base + dn, nope.to(out_ptr.dtype.element_ty), mask=mn)
+
+    # --- interleaved RoPE on the pe slice (fp32 math) ---
     cos = tl.load(cos_ptr + pos * cossin_row_stride + k, mask=mh, other=0.0).to(tl.float32)
     sin = tl.load(sin_ptr + pos * cossin_row_stride + k, mask=mh, other=0.0).to(tl.float32)
     if INVERSE:
@@ -97,6 +130,7 @@ def deepseek_v4_fused_rope_concat(
     cos: torch.Tensor,
     sin: torch.Tensor,
     inverse: bool = False,
+    rms_eps: float = 0.0,
 ) -> torch.Tensor:
     """Fused replacement for ``cat((nope, _apply_interleaved_rope(pe, cos, sin)))``.
 
@@ -111,9 +145,17 @@ def deepseek_v4_fused_rope_concat(
             heads exactly like ``cos.unsqueeze(head_dim)`` did in the reference.
         sin:  same shape as ``cos``.
         inverse: if True, negate ``sin`` (the attention-output inverse rotation).
+        rms_eps: if ``> 0``, additionally fold a *weightless* per-head RMS
+            normalization over the full ``[..., Dn + D]`` head — i.e.
+            ``q *= rsqrt(mean(q^2, dim=-1) + rms_eps).to(q.dtype)`` — that would
+            otherwise run as a separate reduction/elementwise chain immediately
+            before this op (the main-Q path). ``nope``/``pe`` must be the *raw*
+            (un-normalized) split views. Defaults to ``0.0`` (no norm) so every
+            other call site is unchanged.
 
     Returns:
-        ``[..., Dn + D]`` contiguous tensor == ``cat((nope, rope(pe)), dim=-1)``.
+        ``[..., Dn + D]`` contiguous tensor == ``cat((nope, rope(pe)), dim=-1)``,
+        optionally with the per-head RMS norm applied first.
     """
     assert pe.shape[-1] % 2 == 0, "rope dim must be even"
     assert pe.stride(-1) == 1 and nope.stride(-1) == 1 and cos.stride(-1) == 1, (
@@ -151,7 +193,9 @@ def deepseek_v4_fused_rope_concat(
         pe_row_stride,
         cossin_row_stride,
         Dn + D,
+        rms_eps,
         INVERSE=inverse,
+        HAS_NORM=rms_eps > 0.0,
         BLOCK_DN=triton.next_power_of_2(Dn),
         BLOCK_DH=triton.next_power_of_2(Dh),
         num_warps=4,
@@ -166,5 +210,6 @@ def _deepseek_v4_fused_rope_concat_fake(
     cos: torch.Tensor,
     sin: torch.Tensor,
     inverse: bool = False,
+    rms_eps: float = 0.0,
 ) -> torch.Tensor:
     return pe.new_empty((*pe.shape[:-1], nope.shape[-1] + pe.shape[-1]))

@@ -161,5 +161,109 @@ def test_bf16_cos_is_close():
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
+# --------------------------------------------------------------------------- #
+# Folded per-head weightless RMS norm (rms_eps > 0)                            #
+# --------------------------------------------------------------------------- #
+
+
+def _ref_norm(nope, pe, cos, sin, eps, head_broadcast, inverse=False):
+    """Reference: weightless per-head RMS norm over the FULL (nope||pe) head,
+    applied BEFORE the split, then the plain rope/concat. Mirrors modeling line
+    ``q = q * rsqrt(q.float().square().mean(-1)+eps).to(q.dtype)`` then split +
+    ``deepseek_v4_fused_rope_concat``."""
+    x = torch.cat((nope, pe), dim=-1)
+    x = x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps).to(x.dtype)
+    nope_n, pe_n = torch.split(x, [nope.shape[-1], pe.shape[-1]], dim=-1)
+    return _ref(nope_n, pe_n, cos, sin, head_broadcast, inverse=inverse)
+
+
+def _fused_norm(nope, pe, cos, sin, eps, inverse=False):
+    return torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(nope, pe, cos, sin, inverse, eps)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("inverse", [False, True])
+@pytest.mark.parametrize(
+    "B,S,H,Dn,D",
+    [
+        (1, 1, 8, 448, 64),  # main q decode, per-rank H=8 (real DSV4-Flash shape)
+        (1, 1, 1, 448, 64),  # single head
+        (2, 5, 8, 448, 64),  # batched / multi-position
+        (1, 1, 8, 120, 8),  # small odd-ish head to stress masked reduction lanes
+    ],
+)
+def test_norm_fold_fp32(B, S, H, Dn, D, inverse):
+    """fp32: the rsqrt factor is not bf16-rounded, so the only deviation from the
+    split reference is fp32 reduction order (~1e-6). A tight tolerance therefore
+    proves the norm math itself — reduction over the full head, /head_dim, factor
+    applied to both nope and pe — is exactly right."""
+    torch.manual_seed(5)
+    eps = 1e-6
+    nope = torch.randn(B, S, H, Dn, device=DEV, dtype=torch.float32)
+    pe = torch.randn(B, S, H, D, device=DEV, dtype=torch.float32)
+    cos = torch.randn(B, S, D // 2, device=DEV, dtype=torch.float32)
+    sin = torch.randn(B, S, D // 2, device=DEV, dtype=torch.float32)
+    ref = _ref_norm(nope, pe, cos, sin, eps, head_broadcast=True, inverse=inverse)
+    out = _fused_norm(nope, pe, cos, sin, eps, inverse=inverse)
+    assert out.shape == ref.shape and out.dtype == ref.dtype
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("inverse", [False, True])
+@pytest.mark.parametrize(
+    "B,S,H,Dn,D",
+    [
+        (1, 1, 8, 448, 64),  # main q decode
+        (2, 5, 8, 448, 64),  # batched / multi-position
+    ],
+)
+def test_norm_fold_bf16(B, S, H, Dn, D, inverse):
+    """bf16: the folded op rounds the rsqrt factor to bf16 (matching `.to(q.dtype)`)
+    and materializes each normalized value in bf16 before RoPE, so it is bit-faithful
+    to the split reference up to the rope FMA (~1 ULP) and fp32 reduction order."""
+    torch.manual_seed(6)
+    eps = 1e-6
+    nope = torch.randn(B, S, H, Dn, device=DEV, dtype=torch.bfloat16)
+    pe = torch.randn(B, S, H, D, device=DEV, dtype=torch.bfloat16)
+    cos = torch.randn(B, S, D // 2, device=DEV, dtype=torch.float32)
+    sin = torch.randn(B, S, D // 2, device=DEV, dtype=torch.float32)
+    ref = _ref_norm(nope, pe, cos, sin, eps, head_broadcast=True, inverse=inverse)
+    out = _fused_norm(nope, pe, cos, sin, eps, inverse=inverse)
+    assert out.shape == ref.shape and out.dtype == ref.dtype
+    _assert_match(out, ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_norm_fold_strided_split_views():
+    """The real call passes raw split views of one head (row stride = full head_dim)."""
+    torch.manual_seed(7)
+    B, S, H, Dn, D = 1, 1, 8, 448, 64
+    eps = 1e-6
+    x = torch.randn(B, S, H, Dn + D, device=DEV, dtype=torch.bfloat16)
+    nope, pe = torch.split(x, [Dn, D], dim=-1)
+    assert nope.stride(-2) == Dn + D and pe.stride(-2) == Dn + D
+    cos = torch.randn(B, S, D // 2, device=DEV, dtype=torch.float32)
+    sin = torch.randn(B, S, D // 2, device=DEV, dtype=torch.float32)
+    ref = _ref_norm(nope, pe, cos, sin, eps, head_broadcast=True)
+    out = _fused_norm(nope, pe, cos, sin, eps)
+    _assert_match(out, ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_rms_eps_zero_is_plain_rope():
+    """rms_eps defaulting to 0 must leave every non-Q call site (kv/indexer/...)
+    byte-identical to the plain rope/concat."""
+    torch.manual_seed(8)
+    B, S, H, Dn, D = 1, 1, 8, 448, 64
+    nope = torch.randn(B, S, H, Dn, device=DEV, dtype=torch.bfloat16)
+    pe = torch.randn(B, S, H, D, device=DEV, dtype=torch.bfloat16)
+    cos = torch.randn(B, S, D // 2, device=DEV, dtype=torch.float32)
+    sin = torch.randn(B, S, D // 2, device=DEV, dtype=torch.float32)
+    plain = _fused(nope, pe, cos, sin)
+    explicit0 = _fused_norm(nope, pe, cos, sin, 0.0)
+    assert torch.equal(plain, explicit0)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-x", "-q"]))
