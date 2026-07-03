@@ -1704,8 +1704,6 @@ def _update_decode_compressed_caches(
     rope_dim: int,
     compress_ratio: int,
     max_compressed_len: int,
-    cur_page_ids: Optional[torch.Tensor] = None,
-    cur_page_offsets: Optional[torch.Tensor] = None,
     overlap_page_map: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> None:
     mode = _compression_mode(compress_ratio)
@@ -1714,30 +1712,13 @@ def _update_decode_compressed_caches(
 
     state_dim = int(compressor_kv_decode.shape[-1])
     head_dim = state_dim // mode.channels
-    # The compressor kv/gate caches store the *current* token at ``input_pos``,
-    # so they reuse the hoisted current-token write address. The mhc_cache
-    # write below targets a compressed row (``row_logical_pos``), a different
-    # logical position, and keeps its own per-layer translation.
-    _write_decode_cache_rows(
-        compressor_kv_cache,
-        compressor_kv_decode,
-        seq_idx,
-        input_pos,
-        cu_num_pages,
-        cache_loc,
-        cur_page_ids,
-        cur_page_offsets,
-    )
-    _write_decode_cache_rows(
-        compressor_gate_cache,
-        compressor_gate_decode,
-        seq_idx,
-        input_pos,
-        cu_num_pages,
-        cache_loc,
-        cur_page_ids,
-        cur_page_offsets,
-    )
+    # The compressor kv/gate current-token rows are written by the caller's fused
+    # ``_fused_current_token_store`` (idea_0006) -- together with the SWA and
+    # indexer-compressor rows -- before this helper runs, so they are already in
+    # ``compressor_kv_cache`` / ``compressor_gate_cache`` when the compressed-row
+    # reconstruction below reads them. The mhc_cache write further down targets a
+    # compressed row (``row_logical_pos``), a different logical position, and keeps
+    # its own per-layer translation + validity-masked store.
 
     old_completed = input_pos // compress_ratio
     new_completed = (input_pos + 1) // compress_ratio
@@ -2104,9 +2085,41 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             full_valid[:num_decode],
         )
 
-    _write_decode_cache_rows(
-        swa_cache,
-        kv_decode,
+    # Current-token cache writes (idea_0006). Every DeepSeek-V4 cache listed below
+    # stores the freshly produced current decode-token row at logical position
+    # ``input_pos`` and shares the hoisted ``(cur_page_ids, cur_page_offsets)`` write
+    # address, so a single fused paged store replaces the per-cache ``index_put``
+    # scatters (SWA kv, main-compressor kv/gate, and the ratio-4 indexer-compressor
+    # kv/gate). The stored rows are byte-identical to the prior per-cache writes.
+    store_caches = [swa_cache]
+    store_values = [kv_decode]
+    compressor_kv_decode = None
+    compressor_gate_decode = None
+    mode = _compression_mode(compress_ratio) if compress_ratio else None
+    if compress_ratio:
+        assert window_size is not None
+        assert max_compressed_len is not None
+        assert rope_dim is not None
+        compressor_kv_decode = _flatten_decode_tokens(compressor_kv, num_decode)
+        compressor_gate_decode = _flatten_decode_tokens(compressor_gate, num_decode)
+        # ``_update_decode_compressed_caches`` gates the whole compressed-row update
+        # (both kv/gate current-token writes included) on ``compressor_kv_decode``, so
+        # add the pair to the fused store under the identical condition -- keeping the
+        # gate write tied to the kv presence, not filtered independently.
+        if compressor_kv_decode.numel() > 0:
+            store_caches += [compressor_kv_cache, compressor_gate_cache]
+            store_values += [compressor_kv_decode, compressor_gate_decode]
+        if mode.uses_indexer:
+            indexer_compressor_kv_decode = _flatten_decode_tokens(indexer_compressor_kv, num_decode)
+            indexer_compressor_gate_decode = _flatten_decode_tokens(
+                indexer_compressor_gate, num_decode
+            )
+            store_caches += [indexer_compressor_kv_cache, indexer_compressor_gate_cache]
+            store_values += [indexer_compressor_kv_decode, indexer_compressor_gate_decode]
+
+    _fused_current_token_store(
+        store_caches,
+        store_values,
         seq_idx_decode,
         input_pos_decode,
         cu_num_pages,
@@ -2114,12 +2127,8 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
         cur_page_ids,
         cur_page_offsets,
     )
+
     if compress_ratio:
-        assert window_size is not None
-        assert max_compressed_len is not None
-        assert rope_dim is not None
-        compressor_kv_decode = _flatten_decode_tokens(compressor_kv, num_decode)
-        compressor_gate_decode = _flatten_decode_tokens(compressor_gate, num_decode)
         _update_decode_compressed_caches(
             compressor_kv_decode,
             compressor_gate_decode,
@@ -2139,36 +2148,8 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             rope_dim,
             compress_ratio,
             max_compressed_len,
-            cur_page_ids,
-            cur_page_offsets,
             overlap_page_map,
         )
-        mode = _compression_mode(compress_ratio)
-        if mode.uses_indexer:
-            indexer_compressor_kv_decode = _flatten_decode_tokens(indexer_compressor_kv, num_decode)
-            indexer_compressor_gate_decode = _flatten_decode_tokens(
-                indexer_compressor_gate, num_decode
-            )
-            _write_decode_cache_rows(
-                indexer_compressor_kv_cache,
-                indexer_compressor_kv_decode,
-                seq_idx_decode,
-                input_pos_decode,
-                cu_num_pages,
-                cache_loc,
-                cur_page_ids,
-                cur_page_offsets,
-            )
-            _write_decode_cache_rows(
-                indexer_compressor_gate_cache,
-                indexer_compressor_gate_decode,
-                seq_idx_decode,
-                input_pos_decode,
-                cu_num_pages,
-                cache_loc,
-                cur_page_ids,
-                cur_page_offsets,
-            )
         indexer_q_decode = _flatten_decode_tokens(indexer_q, num_decode)
         indexer_weights_decode = _flatten_decode_tokens(indexer_weights, num_decode)
         decode_output = _decode_compressed_cache_attention(
@@ -2635,6 +2616,84 @@ if _HAS_TRITON:
         tl.store(dst, vals.to(cache_ptr.dtype.element_ty), mask=smask & valid)
 
     @triton.jit
+    def _store_current_token_row(
+        row,
+        sblk,
+        pid,  # int64 physical page id (shared across caches)
+        poff,  # int64 in-page offset (shared across caches)
+        src_ptr,  # [N, S] contiguous, already cache dtype
+        cache_ptr,  # [P, T, S] contiguous paged cache (mutated in place)
+        S,  # this cache's row width (state_dim)
+        T,  # tokens_per_block (shared cache.shape[1])
+        BLOCK_S: tl.constexpr,
+    ):
+        """Copy ``src[row]`` into ``cache[pid, poff, :]`` for one paged cache.
+
+        Every current-token cache shares the ``(pid, poff)`` write address, so the
+        multi-cache kernel below computes it once and dispatches to this helper per
+        cache. The store is a pure copy (``src`` pre-cast to the cache dtype), so it
+        is byte-identical to ``cache[page_ids, page_offsets] = values.to(dtype)``.
+        """
+        col = sblk * BLOCK_S + tl.arange(0, BLOCK_S)
+        smask = col < S
+        vals = tl.load(src_ptr + row * S + col, mask=smask, other=0)
+        dst = cache_ptr + pid * (T * S) + poff * S + col
+        tl.store(dst, vals.to(cache_ptr.dtype.element_ty), mask=smask)
+
+    @triton.jit
+    def _multi_current_token_store_kernel(
+        page_ids_ptr,  # [N] int64 -- shared current-token page id per decode row
+        page_offsets_ptr,  # [N] int64 -- shared current-token in-page offset per row
+        src0,
+        cache0,
+        S0,
+        src1,
+        cache1,
+        S1,
+        src2,
+        cache2,
+        S2,
+        src3,
+        cache3,
+        S3,
+        src4,
+        cache4,
+        S4,
+        T,  # tokens_per_block, shared by every cache (cache.shape[1])
+        N_CACHES: tl.constexpr,  # number of active caches (2..5)
+        BLOCK_S: tl.constexpr,  # >= next_pow2(min(max_S, 1024))
+    ):
+        """Write the current decode token into up to 5 heterogeneous paged caches.
+
+        Every DeepSeek-V4 current-token cache write (SWA kv, main-compressor
+        kv/gate, and the ratio-4 indexer-compressor kv/gate) stores the fresh row
+        at logical position ``input_pos`` of a cache that shares one page table and
+        one ``tokens_per_block``, so they all resolve to the identical hoisted
+        ``(page_ids, page_offsets)`` address.  This kernel folds those per-cache
+        ``index_put`` scatters into one launch: grid ``(N, N_CACHES, cdiv(max_S,
+        BLOCK_S))``, program ``(row, c, sblk)`` copies one row-block of cache ``c``.
+        The caches differ in dtype (SWA is the activation dtype, the compressor
+        caches are fp32) and row width, so each is dispatched to its own pointer;
+        unused slots (``c >= N_CACHES``) are never launched.  Byte-identical to the
+        prior per-cache ``cache[page_ids, page_offsets] = values.to(cache.dtype)``.
+        """
+        row = tl.program_id(0)
+        c = tl.program_id(1)
+        sblk = tl.program_id(2)
+        pid = tl.load(page_ids_ptr + row).to(tl.int64)
+        poff = tl.load(page_offsets_ptr + row).to(tl.int64)
+        if c == 0:
+            _store_current_token_row(row, sblk, pid, poff, src0, cache0, S0, T, BLOCK_S)
+        elif c == 1:
+            _store_current_token_row(row, sblk, pid, poff, src1, cache1, S1, T, BLOCK_S)
+        elif c == 2:
+            _store_current_token_row(row, sblk, pid, poff, src2, cache2, S2, T, BLOCK_S)
+        elif c == 3:
+            _store_current_token_row(row, sblk, pid, poff, src3, cache3, S3, T, BLOCK_S)
+        else:
+            _store_current_token_row(row, sblk, pid, poff, src4, cache4, S4, T, BLOCK_S)
+
+    @triton.jit
     def _dsv4_fullrange_candidate_rows_kernel(
         kv_cache_ptr,  # [P, T, S] fp32 paged compressor kv cache
         gate_cache_ptr,  # [P, T, S] fp32 paged compressor gate cache
@@ -2928,6 +2987,109 @@ def _masked_write_decode_cache_rows(
         cache.stride(1),
         cache.stride(2),
         state_dim,
+        BLOCK_S=BLOCK_S,
+        num_warps=4,
+    )
+
+
+def _fused_current_token_store(
+    caches: List[torch.Tensor],
+    values: List[torch.Tensor],
+    seq_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    page_ids: Optional[torch.Tensor],
+    page_offsets: Optional[torch.Tensor],
+) -> None:
+    """Write the current decode token into every listed cache in one launch.
+
+    Each ``(cache, value)`` pair stores the freshly produced current-token row at
+    logical position ``input_pos``. Every DeepSeek-V4 current-token cache -- SWA kv,
+    main-compressor kv/gate, and the ratio-4 indexer-compressor kv/gate -- shares one
+    page table and one ``tokens_per_block``, so they all resolve to the identical
+    hoisted ``(page_ids, page_offsets)`` write address (see
+    ``deepseek_v4_sparse_prepare_decode_page_addr``). Folding the per-cache
+    ``index_put`` scatters into a single ``_multi_current_token_store_kernel`` launch
+    removes ~4 (ratio-4) / ~2 (ratio-128) gather/scatter kernels per layer per decode
+    step. Values are pre-cast to the cache dtype in torch -- exactly the cast the prior
+    per-cache index_put performed -- so the kernel is a pure copy, byte-identical to the
+    prior ``cache[page_ids, page_offsets] = values.to(cache.dtype)`` for each cache.
+
+    Falls back to the per-cache ``_write_decode_cache_rows`` (identical semantics) when
+    Triton/CUDA is unavailable, the hoisted address is missing, a cache is not a
+    contiguous 3-D paged tensor, or fewer than two caches would be written.
+    """
+    # Skip empty value tensors -- matches the per-cache ``_write_decode_cache_rows``
+    # ``numel() == 0`` guard so a degenerate (state_dim 0) cache is never written.
+    pairs = [(c, v) for c, v in zip(caches, values) if v.numel() > 0]
+    if not pairs:
+        return
+    caches = [c for c, _ in pairs]
+    values = [v for _, v in pairs]
+
+    use_fused = (
+        _HAS_TRITON
+        and page_ids is not None
+        and page_offsets is not None
+        and len(caches) >= 2
+        and all(c.is_cuda and c.dim() == 3 and c.is_contiguous() for c in caches)
+    )
+    if not use_fused:
+        # Byte-identical per-cache path (the original write, one index_put each).
+        for cache, value in zip(caches, values):
+            _write_decode_cache_rows(
+                cache,
+                value,
+                seq_idx,
+                input_pos,
+                cu_num_pages,
+                cache_loc,
+                page_ids,
+                page_offsets,
+            )
+        return
+
+    n_cache = len(caches)
+    n_rows = int(page_ids.shape[0])
+    # Pre-cast each value to its cache dtype (no-op when already matching) and make it
+    # row-contiguous ``[N, S]``. This is exactly the cast the per-cache index_put did
+    # (e.g. the compressor kv/gate bf16 -> fp32 cast), so no extra copy_cast kernel is
+    # introduced; ``.contiguous()`` is a no-op on the already-contiguous decode rows.
+    srcs = [v.to(c.dtype).contiguous() for c, v in zip(caches, values)]
+    dims = [int(c.shape[-1]) for c in caches]
+    tokens_per_block = int(caches[0].shape[1])
+    max_dim = max(dims)
+    BLOCK_S = min(triton.next_power_of_2(max_dim), 1024)
+
+    # The kernel has 5 fixed pointer slots; unused ones reuse the last real cache and
+    # are never launched (grid dim 1 == ``n_cache``).
+    while len(srcs) < 5:
+        srcs.append(srcs[-1])
+        caches.append(caches[-1])
+        dims.append(dims[-1])
+
+    grid = (n_rows, n_cache, triton.cdiv(max_dim, BLOCK_S))
+    _multi_current_token_store_kernel[grid](
+        page_ids,
+        page_offsets,
+        srcs[0],
+        caches[0],
+        dims[0],
+        srcs[1],
+        caches[1],
+        dims[1],
+        srcs[2],
+        caches[2],
+        dims[2],
+        srcs[3],
+        caches[3],
+        dims[3],
+        srcs[4],
+        caches[4],
+        dims[4],
+        tokens_per_block,
+        N_CACHES=n_cache,
         BLOCK_S=BLOCK_S,
         num_warps=4,
     )
