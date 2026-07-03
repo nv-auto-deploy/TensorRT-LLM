@@ -1868,15 +1868,30 @@ def _select_decode_ratio4_indexer_rows(
         rotate=True,
         full_page_map=full_page_map,
     )
-    index_score = torch.matmul(q_index, index_k.transpose(-1, -2)).float()
-    index_score = (index_score.relu() * indexer_weights.float().unsqueeze(-1)).sum(dim=1)
     # ``q_index``/``indexer_weights`` are replicated across TP ranks (the indexer
     # index-score projection is no longer head-sharded; see DeepseekV4Indexer),
-    # so ``index_score`` already sums over all index heads -- no all_reduce needed.
-
+    # so the head reduction already sums over all index heads -- no all_reduce needed.
     visible_len = ((input_pos + 1) // 4).clamp(max=max_compressed_len)
-    visible = candidate_rows < visible_len.unsqueeze(1)
-    index_score = index_score.masked_fill(~visible, float("-inf"))
+    if (
+        _HAS_TRITON
+        and q_index.is_cuda
+        and q_index.dtype in (torch.float16, torch.bfloat16)
+        and index_k.dtype == q_index.dtype
+        and index_head_dim >= 16
+    ):
+        # Fused matmul + relu + weighted head reduction + visibility mask (idea_0004):
+        # the [N, H, C] head-by-candidate score and the separate masked [N, C] tensor
+        # are never materialized -- one kernel emits the masked score row fed straight
+        # into the top-k below. Scores match the eager chain to within one ULP so the
+        # selected rows / sort order are preserved.
+        index_score = _fused_index_score(
+            q_index, index_k, indexer_weights, visible_len, max_compressed_len
+        )
+    else:
+        index_score = torch.matmul(q_index, index_k.transpose(-1, -2)).float()
+        index_score = (index_score.relu() * indexer_weights.float().unsqueeze(-1)).sum(dim=1)
+        visible = candidate_rows < visible_len.unsqueeze(1)
+        index_score = index_score.masked_fill(~visible, float("-inf"))
     topk_count = min(index_topk, max_compressed_len)
     topk_values, topk_rows = index_score.topk(topk_count, dim=-1)
     topk_valid = torch.isfinite(topk_values)
@@ -2726,6 +2741,64 @@ if _HAS_TRITON:
         tl.store(out_ptr + prog.to(tl.int64) * HEAD_DIM + d, o.to(ROUND), mask=dmask)
 
     @triton.jit
+    def _dsv4_index_score_kernel(
+        q_ptr,  # [N, H, D] index queries (fp16/bf16)
+        k_ptr,  # [N, C, D] compressed candidate index keys (same dtype as q)
+        w_ptr,  # [N, H] per-head indexer weights (fp32)
+        vis_ptr,  # [N] int visible candidate count per decode row
+        out_ptr,  # [N, C] fp32 masked index score
+        H,
+        C,
+        D: tl.constexpr,  # index_head_dim
+        D_BLOCK: tl.constexpr,  # next_pow2(D)
+        H_BLOCK: tl.constexpr,  # next_pow2(H)
+        BLOCK_C: tl.constexpr,
+    ):
+        """Fused ratio-4 lightning-indexer score for one (decode row, candidate block).
+
+        Collapses ``(matmul(q, k^T).float().relu() * w.float()).sum(dim=1)`` followed by
+        ``masked_fill(~visible, -inf)`` into a single launch, so the ``[N, H, C]``
+        head-by-candidate score and the separate masked ``[N, C]`` tensor are never
+        materialized -- only the fused masked score row consumed by the decode top-k is
+        written. The bf16/fp16 matmul output is rounded to the input dtype (matching the
+        reference ``matmul(...).float()``) and the relu / per-head weighting / head
+        reduction run in fp32, so the score values (and therefore the top-k sort order)
+        stay within one ULP of the reference and the selected rows are preserved.
+        """
+        n = tl.program_id(0)
+        cb = tl.program_id(1)
+        offs_c = cb * BLOCK_C + tl.arange(0, BLOCK_C)
+        offs_d = tl.arange(0, D_BLOCK)
+        offs_h = tl.arange(0, H_BLOCK)
+        c_mask = offs_c < C
+        d_mask = offs_d < D
+        h_mask = offs_h < H
+
+        # k tile [BLOCK_C, D_BLOCK]; padded candidate/dim lanes load 0 (add nothing).
+        k = tl.load(
+            k_ptr + n.to(tl.int64) * C * D + offs_c[:, None] * D + offs_d[None, :],
+            mask=c_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        # q tile [H_BLOCK, D_BLOCK]; padded head/dim lanes load 0.
+        q = tl.load(
+            q_ptr + n.to(tl.int64) * H * D + offs_h[:, None] * D + offs_d[None, :],
+            mask=h_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        # scores[BLOCK_C, H_BLOCK] = k @ q^T ; padded heads/candidates contribute 0.
+        sc = tl.dot(k, tl.trans(q), out_dtype=tl.float32)
+        # Match the reference bf16/fp16 matmul output rounding before ``.float()``.
+        sc = sc.to(k.dtype).to(tl.float32)
+        sc = tl.maximum(sc, 0.0)  # relu
+        w = tl.load(w_ptr + n.to(tl.int64) * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+        sc = sc * w[None, :]
+        score = tl.sum(sc, axis=1)  # [BLOCK_C] fp32 weighted head reduction
+        vlen = tl.load(vis_ptr + n)
+        score = tl.where(offs_c < vlen, score, float("-inf"))  # visibility mask
+        tl.store(out_ptr + n.to(tl.int64) * C + offs_c, score, mask=c_mask)
+
+    @triton.jit
     def _dsv4_assemble_selected_kv_kernel(
         swa_cache_ptr,  # [P, T, D] paged local (sliding-window) kv cache
         mhc_cache_ptr,  # [P, T, D] paged compressed kv cache (same P/T/D/dtype as swa)
@@ -3016,6 +3089,49 @@ def _fused_fullrange_candidate_rows(
         float(rms_norm_eps),
         TWO_R=two_r,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=4,
+    )
+    return out
+
+
+def _fused_index_score(
+    q_index: torch.Tensor,  # [N, H, D] index queries (fp16/bf16)
+    index_k: torch.Tensor,  # [N, C, D] compressed candidate keys (same dtype as q)
+    indexer_weights: torch.Tensor,  # [N, H] per-head indexer weights
+    visible_len: torch.Tensor,  # [N] int visible candidate count per decode row
+    max_compressed_len: int,
+) -> torch.Tensor:
+    """One-launch fused ratio-4 lightning-indexer score (idea_0004).
+
+    Replaces ``(matmul(q_index, index_k^T).float().relu() * indexer_weights.float()
+    .unsqueeze(-1)).sum(dim=1)`` + ``masked_fill(~visible, -inf)`` with a single kernel
+    that emits the ``[N, max_compressed_len]`` masked score consumed by the decode
+    top-k, without ever materializing the ``[N, H, C]`` head-by-candidate score or the
+    separate masked ``[N, C]`` tensor. The matmul is rounded to the input dtype and the
+    head reduction runs in fp32, so scores match the reference to within one ULP and the
+    top-k selection/order is preserved (validated in the op unit tests).
+    """
+    num_rows = int(q_index.shape[0])
+    h = int(q_index.shape[1])
+    d = int(q_index.shape[2])
+    c = int(max_compressed_len)
+    out = torch.empty(num_rows, c, device=q_index.device, dtype=torch.float32)
+    if num_rows == 0 or c == 0:
+        return out
+    block_c = 128 if c >= 128 else triton.next_power_of_2(c)
+    grid = (num_rows, triton.cdiv(c, block_c))
+    _dsv4_index_score_kernel[grid](
+        q_index.contiguous(),
+        index_k.contiguous(),
+        indexer_weights.contiguous().to(torch.float32),
+        visible_len.contiguous(),
+        out,
+        h,
+        c,
+        D=d,
+        D_BLOCK=triton.next_power_of_2(d),
+        H_BLOCK=triton.next_power_of_2(h),
+        BLOCK_C=block_c,
         num_warps=4,
     )
     return out
