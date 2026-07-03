@@ -213,3 +213,223 @@ def _deepseek_v4_fused_rope_concat_fake(
     rms_eps: float = 0.0,
 ) -> torch.Tensor:
     return pe.new_empty((*pe.shape[:-1], nope.shape[-1] + pe.shape[-1]))
+
+
+# --------------------------------------------------------------------------- #
+# KV front-end: weighted RMS norm + no-PE fake-FP8 quant + interleaved RoPE    #
+# --------------------------------------------------------------------------- #
+#
+# The main-KV path in ``modeling_deepseek_v4.py`` runs, back to back:
+#   ``kv = kv_norm(kv)``            (weighted RMS norm over the full head, an
+#                                    ``auto_deploy::torch_rmsnorm`` custom op that
+#                                    decomposes into a reduction + several
+#                                    elementwise + copy_cast kernels at runtime),
+#   ``kv_nope, kv_pe = split(kv)``  (nope/pe split of the normed head),
+#   ``kv_nope = fake_fp8_act_quant(kv_nope, 64)``  (a fused ``other``-bucket kernel),
+#   ``deepseek_v4_fused_rope_concat(kv_nope, kv_pe, cos, sin)``  (the proven op).
+#
+# ``deepseek_v4_kv_norm_rope_concat`` collapses all four into a single kernel: it
+# takes the *raw* (pre-norm) split views + the norm weight, normalizes the full
+# ``nope || pe`` head, fake-FP8-quantizes the nope slice per block, interleaved-
+# rotates the pe slice, and writes ``cat((fp8(nope), rope(pe)))`` — no separate
+# normed-kv tensor, no fp8 buffer, one launch. Every rounding point is reproduced
+# bit-for-bit (see below and ``test_deepseek_v4_kv_norm_rope_concat.py``):
+#   * RMS norm — ``torch_rmsnorm`` semantics: ``variance = mean(x^2)`` in fp32, an
+#     *unrounded* fp32 ``rsqrt`` factor, then ``round(normed_bf16) -> * weight(fp32)
+#     -> round_bf16`` (two rounding points, matching
+#     ``out.copy_(weight * input.to(out.dtype))``).
+#   * fake-FP8 — per ``block_size`` group of the *normed* nope:
+#     ``scale = 2**ceil(log2(clamp_min(amax, 1e-4) / 448))`` then
+#     ``(clamp(x/scale, -448, 448) -> bf16 -> fp32) * scale -> bf16`` — identical to
+#     ``deepseek_v4_fake_fp8_act_quant``.
+# The name contains ``rope`` so the collapsed work stays in the ``rope`` op-type
+# bucket (net-flat rope count) while the norm/fp8 kernels leave the reduction /
+# elementwise / copy_cast / other buckets.
+
+
+@triton.jit
+def _kv_norm_rope_concat_kernel(
+    nope_ptr,  # [R, Dn] raw (strided) — normed, fp8-quantized, then copied through
+    pe_ptr,  # [R, D]  raw (strided) — normed, then interleaved-rotated
+    weight_ptr,  # [Dn + D] RMS-norm weight (loaded in its native dtype -> fp32)
+    cos_ptr,  # [N_pos, Dh]
+    sin_ptr,  # [N_pos, Dh]
+    out_ptr,  # [R, Dn + D] contiguous
+    R,  # total rows = N_pos * H
+    H,  # heads per position (cos/sin broadcast over heads; H=1 for the KV latent)
+    Dn,  # nope width
+    D,  # rope width (even)
+    Dh,  # D // 2
+    nope_row_stride,
+    pe_row_stride,
+    cossin_row_stride,
+    out_row_stride,
+    rms_eps,
+    INVERSE: tl.constexpr,
+    NB: tl.constexpr,  # BLOCK_DN // FP8_BLOCK (fp8 reshape block count)
+    FP8_BLOCK: tl.constexpr,  # fp8 quant group width (block_size)
+    FP8_MAX: tl.constexpr,  # 448.0 (e4m3 absmax)
+    FP8_MIN: tl.constexpr,  # 1e-4 (amax floor)
+    BLOCK_DN: tl.constexpr,  # next_pow2(Dn) == NB * FP8_BLOCK
+    BLOCK_DH: tl.constexpr,  # next_pow2(Dh)
+):
+    row = tl.program_id(0)
+    if row >= R:
+        return
+    pos = row // H
+    out_base = out_ptr + row * out_row_stride
+    out_ty = out_ptr.dtype.element_ty
+
+    # --- load the raw nope slice and the raw pe even/odd lanes (fp32 math) ---
+    dn = tl.arange(0, BLOCK_DN)
+    mn = dn < Dn
+    nope = tl.load(nope_ptr + row * nope_row_stride + dn, mask=mn, other=0.0).to(tl.float32)
+
+    k = tl.arange(0, BLOCK_DH)
+    mh = k < Dh
+    pe_base = pe_ptr + row * pe_row_stride
+    even = tl.load(pe_base + 2 * k, mask=mh, other=0.0).to(tl.float32)
+    odd = tl.load(pe_base + 2 * k + 1, mask=mh, other=0.0).to(tl.float32)
+
+    # --- weighted RMS norm over the FULL (nope || pe) head (torch_rmsnorm) ---
+    # sum-of-squares is order-independent, so it is gathered from the (zero-padded)
+    # nope block and the pe even/odd lanes. The rsqrt factor stays fp32 (unrounded);
+    # the normed value is rounded to the output dtype, multiplied by the fp32 weight,
+    # and rounded again — the two rounding points of ``out.copy_(weight * x.to(dt))``.
+    ss = tl.sum(nope * nope) + tl.sum(even * even) + tl.sum(odd * odd)
+    factor = tl.rsqrt(ss / (Dn + D) + rms_eps)
+
+    w_nope = tl.load(weight_ptr + dn, mask=mn, other=0.0).to(tl.float32)
+    w_even = tl.load(weight_ptr + Dn + 2 * k, mask=mh, other=0.0).to(tl.float32)
+    w_odd = tl.load(weight_ptr + Dn + 2 * k + 1, mask=mh, other=0.0).to(tl.float32)
+
+    kv_nope = (w_nope * (nope * factor).to(out_ty).to(tl.float32)).to(out_ty)
+    kv_even = (w_even * (even * factor).to(out_ty).to(tl.float32)).to(out_ty)
+    kv_odd = (w_odd * (odd * factor).to(out_ty).to(tl.float32)).to(out_ty)
+
+    # --- fake-FP8 block quant on the normed nope (reshape into FP8_BLOCK groups) ---
+    # Padding lanes (dn >= Dn) are 0 and live in their own trailing block(s), so they
+    # never contaminate a real block's amax and are dropped by the masked store.
+    xb = tl.reshape(kv_nope.to(tl.float32), (NB, FP8_BLOCK))
+    amax = tl.max(tl.abs(xb), axis=1, keep_dims=True)  # [NB, 1]
+    scale = tl.exp2(tl.ceil(tl.log2(tl.maximum(amax, FP8_MIN) / FP8_MAX)))
+    q = tl.minimum(tl.maximum(xb / scale, -FP8_MAX), FP8_MAX)
+    q = q.to(out_ty).to(tl.float32)  # bf16 round-trip (emulates the FP8 mantissa)
+    nope_q = tl.reshape((q * scale).to(out_ty), (BLOCK_DN,))
+    tl.store(out_base + dn, nope_q, mask=mn)
+
+    # --- interleaved RoPE on the normed pe (fp32 math) ---
+    ev = kv_even.to(tl.float32)
+    od = kv_odd.to(tl.float32)
+    cos = tl.load(cos_ptr + pos * cossin_row_stride + k, mask=mh, other=0.0).to(tl.float32)
+    sin = tl.load(sin_ptr + pos * cossin_row_stride + k, mask=mh, other=0.0).to(tl.float32)
+    if INVERSE:
+        sin = -sin
+    out_even = ev * cos - od * sin
+    out_odd = ev * sin + od * cos
+    pe_out_base = out_base + Dn
+    tl.store(pe_out_base + 2 * k, out_even.to(out_ty), mask=mh)
+    tl.store(pe_out_base + 2 * k + 1, out_odd.to(out_ty), mask=mh)
+
+
+@torch.library.custom_op("auto_deploy::deepseek_v4_kv_norm_rope_concat", mutates_args=())
+def deepseek_v4_kv_norm_rope_concat(
+    nope: torch.Tensor,
+    pe: torch.Tensor,
+    weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rms_eps: float,
+    fp8_block_size: int = 64,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Fused KV front-end == ``fake_fp8(rmsnorm(cat(nope,pe))[:Dn]) || rope(rmsnorm(...)[Dn:])``.
+
+    Replaces the ``kv_norm -> split -> fake_fp8_act_quant(nope) ->
+    deepseek_v4_fused_rope_concat`` chain of the main-KV path with one kernel.
+
+    Args:
+        nope: ``[..., Dn]`` *raw* (pre-norm) nope slice — a last-dim view of the raw
+            KV head. Weighted-RMS-normalized then fake-FP8 block-quantized in-kernel.
+        pe:   ``[..., D]`` *raw* (pre-norm) pe slice (``D`` even). Weighted-RMS-
+            normalized then interleaved-rotated in-kernel.
+        weight: ``[Dn + D]`` RMS-norm weight for the full head (``torch_rmsnorm``
+            weight). Kept in its native dtype and applied in fp32.
+        cos/sin: ``[..M.., Dh]`` (``Dh == D // 2``), broadcasting over heads exactly
+            like the reference ``cos.unsqueeze(head_dim)``.
+        rms_eps: RMS-norm epsilon.
+        fp8_block_size: block width for the fake-FP8 quant of the nope slice
+            (``Dn % fp8_block_size == 0`` required).
+        inverse: if True, negate ``sin`` (unused by the KV path; kept for symmetry).
+
+    Returns:
+        ``[..., Dn + D]`` contiguous tensor, bit-faithful to the split reference.
+    """
+    assert pe.shape[-1] % 2 == 0, "rope dim must be even"
+    assert pe.stride(-1) == 1 and nope.stride(-1) == 1 and cos.stride(-1) == 1, (
+        "last dim of nope/pe/cos must be contiguous"
+    )
+    assert weight.stride(-1) == 1, "weight must be last-dim contiguous"
+    D = pe.shape[-1]
+    Dn = nope.shape[-1]
+    Dh = D // 2
+    assert weight.numel() == Dn + D, "weight must cover the full (nope || pe) head"
+    assert Dn % fp8_block_size == 0, "Dn must be a multiple of fp8_block_size"
+
+    out = torch.empty((*pe.shape[:-1], Dn + D), device=pe.device, dtype=pe.dtype)
+    R = pe.numel() // D
+    if R == 0:
+        return out
+    n_pos = cos.numel() // Dh
+    H = R // n_pos
+
+    BLOCK_DN = triton.next_power_of_2(Dn)
+    assert BLOCK_DN % fp8_block_size == 0, "next_pow2(Dn) must be a multiple of block size"
+    NB = BLOCK_DN // fp8_block_size
+
+    nope_row_stride = nope.stride(-2) if nope.dim() >= 2 else Dn
+    pe_row_stride = pe.stride(-2) if pe.dim() >= 2 else D
+    cossin_row_stride = cos.stride(-2) if cos.dim() >= 2 else Dh
+
+    grid = (R,)
+    _kv_norm_rope_concat_kernel[grid](
+        nope,
+        pe,
+        weight,
+        cos,
+        sin,
+        out,
+        R,
+        H,
+        Dn,
+        D,
+        Dh,
+        nope_row_stride,
+        pe_row_stride,
+        cossin_row_stride,
+        Dn + D,
+        rms_eps,
+        INVERSE=inverse,
+        NB=NB,
+        FP8_BLOCK=fp8_block_size,
+        FP8_MAX=448.0,
+        FP8_MIN=1.0e-4,
+        BLOCK_DN=BLOCK_DN,
+        BLOCK_DH=triton.next_power_of_2(Dh),
+        num_warps=4,
+    )
+    return out
+
+
+@deepseek_v4_kv_norm_rope_concat.register_fake
+def _deepseek_v4_kv_norm_rope_concat_fake(
+    nope: torch.Tensor,
+    pe: torch.Tensor,
+    weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rms_eps: float,
+    fp8_block_size: int = 64,
+    inverse: bool = False,
+) -> torch.Tensor:
+    return pe.new_empty((*pe.shape[:-1], nope.shape[-1] + pe.shape[-1]))

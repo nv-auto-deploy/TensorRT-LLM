@@ -1338,11 +1338,13 @@ class DeepseekV4Attention(nn.Module):
         # views passed there — so it no longer runs as a separate reduction chain.
 
         kv = _linear_module(hidden_states, self.wkv, layer_type="mla")
-        kv = self.kv_norm(kv)
+        # The KV RMS norm (``kv_norm``), the no-PE fake-FP8 block quant, and the
+        # interleaved RoPE/concat are folded into the single
+        # ``deepseek_v4_kv_norm_rope_concat`` kernel below — so ``kv`` stays *raw*
+        # here and the split feeds the kernel the raw (pre-norm) views.
 
         q_nope, q_pe = torch.split(q, [self.nope_head_dim, self.rope_head_dim], dim=-1)
         kv_nope, kv_pe = torch.split(kv, [self.nope_head_dim, self.rope_head_dim], dim=-1)
-        kv_nope = _fake_fp8_act_quant(kv_nope, block_size=64)
         # Fused interleaved-RoPE + concat: rotates the pe slice and writes
         # ``cat((nope, rope(pe)))`` in one kernel — removes the rope elementwise
         # swarm, the rope ``stack`` and the explicit ``cat`` per call. The main-Q
@@ -1351,7 +1353,14 @@ class DeepseekV4Attention(nn.Module):
         q = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(
             q_nope, q_pe, cos, sin, False, self.rms_eps
         )
-        kv = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(kv_nope, kv_pe, cos, sin, False)
+        # KV front-end fused into one kernel: weighted RMS norm over the full head,
+        # fake-FP8 block quant of the nope slice, then interleaved RoPE on the pe
+        # slice — collapsing the kv_norm reduction/elementwise/cast chain and the
+        # separate fp8 launch into this single call. ``kv_nope``/``kv_pe`` are the
+        # RAW (pre-norm) split views; the kernel reproduces every rounding point.
+        kv = torch.ops.auto_deploy.deepseek_v4_kv_norm_rope_concat(
+            kv_nope, kv_pe, self.kv_norm.weight, cos, sin, self.kv_norm.eps, 64
+        )
 
         empty_compressor_state = kv.new_empty(batch_size, seq_len, 0)
         empty_compressor_ape = kv.new_empty(0, 0)
