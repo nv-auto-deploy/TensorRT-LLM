@@ -41,8 +41,9 @@ Key text-architecture features:
 Differences from the HF reference (modeling_step3p7.py):
 * Vision tower, multimodal merging, KV cache, training paths, dropout, and the MTP/spec
   ``mtp_block`` layers (45-47) are all removed — prefill text decode only.
-* Uses AD canonical ops: torch_rmsnorm, torch_attention, torch_rope_with_explicit_cos_sin,
-  torch_moe. No repeat_kv (torch_attention handles GQA natively).
+* Uses AD canonical ops: torch_rmsnorm, torch_attention, torch_moe, plus the fused
+  ``step3p7_partial_rope`` (one FlashInfer launch per layer over full head_dim, prefused
+  fp32 cos/sin cache). No repeat_kv (torch_attention handles GQA natively).
 * Stacked checkpoint MoE expert weights are split into per-expert Linear modules via a
   load-state-dict pre-hook for torch_moe dispatch.
 * The SwiGLU activation clamp (``swiglu_limits``) present on routed experts of the last two
@@ -80,7 +81,7 @@ from transformers.utils import ModelOutput
 from ... import custom_ops  # noqa: F401 -- register all sharding-aware ops
 from ..._compat import ActivationType
 from ..hf import AutoModelForCausalLMFactory
-from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
+from .rotary_utils import RotaryEmbeddingBase
 
 # ---------------------------------------------------------------------------
 # Bundled config
@@ -297,12 +298,28 @@ def _compute_step3p7_inv_freq(
     return inv_freq_llama
 
 
-class Step3p7RotaryEmbedding(RotaryEmbeddingBase):
-    """RoPE table builder for one attention type (partial rotation, optional llama3 scaling).
+def _build_step3p7_fused_cos_sin_cache(
+    inv_freq: torch.Tensor, max_position_embeddings: int
+) -> torch.Tensor:
+    """FlashInfer-layout fused RoPE cache ``[cos | sin]``, shape [max_pos, rotary_dim], fp32.
 
-    Keeps only the small ``inv_freq`` buffer; the cos/sin tables are graph-computed in forward
-    (so AD's ``optimize_rope`` can materialize a fused cache). For llama3 the attention scaling
-    factor is 1.0, so cos/sin are not rescaled.
+    Same math (and thus bit-identical values) as the cache ``optimize_rope`` used to
+    materialize from the graph-computed cos/sin tables: fp32 ``outer(arange, inv_freq)``
+    angles, scale 1.0 (llama3 scaling is folded into ``inv_freq`` itself, and the llama3
+    attention-scaling factor is 1.0 for this model).
+    """
+    positions = torch.arange(max_position_embeddings, dtype=inv_freq.dtype, device=inv_freq.device)
+    freqs = torch.outer(positions, inv_freq)
+    return torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(torch.float32)
+
+
+class Step3p7RotaryEmbedding(RotaryEmbeddingBase):
+    """RoPE cache holder for one attention type (partial rotation, optional llama3 scaling).
+
+    Registers the small ``inv_freq`` buffer plus the prefused fp32 ``cos_sin_cache`` consumed
+    directly by ``step3p7_partial_rope`` (FlashInfer layout, rotary_dim wide). The cache is
+    built once at construction instead of graph-computed per forward, so no per-step table
+    build and no ``optimize_rope`` rewrite are needed.
     """
 
     def __init__(
@@ -317,36 +334,72 @@ class Step3p7RotaryEmbedding(RotaryEmbeddingBase):
         self.max_position_embeddings = max_position_embeddings
         inv_freq = _compute_step3p7_inv_freq(head_dim, partial_rotary_factor, base, rope_scaling)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer(
+            "cos_sin_cache",
+            _build_step3p7_fused_cos_sin_cache(inv_freq, max_position_embeddings),
+            persistent=False,
+        )
 
-    def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        cos, sin = build_rope_cos_sin_cache(self.inv_freq, self.max_position_embeddings, x)
-        return cos[position_ids], sin[position_ids]
+    def _apply(self, fn):
+        """Keep ``cos_sin_cache`` fp32 across blanket dtype casts.
+
+        ``HFQuantConfigReader.post_process_model`` runs ``model.to(bf16)`` on the freshly
+        built model, which would downcast the cache (FlashInfer requires fp32). Rebuild from
+        ``inv_freq`` — which the base class just re-pinned to fp32 — rather than re-floating
+        the downcast values, so the cache keeps full fp32 precision.
+        """
+        super()._apply(fn)
+        cache = getattr(self, "cos_sin_cache", None)
+        if isinstance(cache, torch.Tensor) and cache.dtype != torch.float32:
+            self.cos_sin_cache = _build_step3p7_fused_cos_sin_cache(
+                self.inv_freq, self.max_position_embeddings
+            )
+        return self
 
 
-def _apply_partial_rope(
+@torch.library.custom_op("auto_deploy::step3p7_partial_rope", mutates_args=())
+def step3p7_partial_rope(
     q: torch.Tensor,
     k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    position_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply RoPE to the first ``rotary_dim`` dims (bsnd layout), passing the rest through.
+    """Partial-rotary RoPE over full [B, S, N, head_dim] q/k in one FlashInfer launch.
 
-    ``rotary_dim = cos.shape[-1]`` may be < head_dim (full-attention layers) or == head_dim
-    (sliding-attention layers, in which case there is nothing to pass through).
+    ``rotary_dim = cos_sin_cache.shape[-1]`` may be < head_dim (full-attention layers) or
+    == head_dim (sliding-attention layers). The kernel rotates ``[..., :rotary_dim]`` with
+    neox pairing (== the ``rotate_half`` reference) in fp32 and copies the pass-through
+    remainder into the output, replacing the previous slice → rope-op → 2×``torch.cat``
+    chain (three device kernels per layer plus an extra HBM round trip of both halves)
+    with a single kernel. N may be TP-sharded; the op is shape-agnostic per head.
+
+    - position_ids: [B, S] (or flat [B*S]) integer positions indexing ``cos_sin_cache`` rows
+    - cos_sin_cache: [max_pos, rotary_dim] fp32 in fused ``[cos | sin]`` layout
     """
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-    q_rot, k_rot = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
-        q_rot,
-        k_rot,
-        cos,
-        sin,
-        2,  # unsqueeze_dim=2 for bsnd
+    import flashinfer
+
+    q_3d = q.flatten(0, -3)
+    k_3d = k.flatten(0, -3)
+    q_rope = torch.empty_like(q_3d)
+    k_rope = torch.empty_like(k_3d)
+    pos = position_ids.reshape(-1)
+    if pos.dtype != torch.int32:
+        pos = pos.to(torch.int32)
+    flashinfer.rope._apply_rope_pos_ids_cos_sin_cache(
+        q=q_3d,
+        k=k_3d,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        cos_sin_cache=cos_sin_cache,
+        pos_ids=pos,
+        interleave=False,  # neox pairing, matches the rotate_half reference
     )
-    return torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1)
+    return q_rope.view(q.shape), k_rope.view(k.shape)
+
+
+@step3p7_partial_rope.register_fake
+def _step3p7_partial_rope_fake(q, k, position_ids, cos_sin_cache):
+    return torch.empty_like(q), torch.empty_like(k)
 
 
 # ---------------------------------------------------------------------------
@@ -888,8 +941,10 @@ class Step3p7Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        cos, sin = position_embeddings
-        q, k = _apply_partial_rope(q, k, cos, sin)
+        # Fused partial-rotary RoPE: one FlashInfer kernel rotates [..., :rotary_dim] and
+        # copies the pass-through remainder (no slice + torch.cat per projection).
+        position_ids, cos_sin_cache = position_embeddings
+        q, k = torch.ops.auto_deploy.step3p7_partial_rope(q, k, position_ids, cos_sin_cache)
 
         attn_output = torch.ops.auto_deploy.torch_attention(
             q,
@@ -1070,8 +1125,11 @@ class Step3p7TextModel(Step3p7PreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
         inputs_embeds = inputs_embeds.to(self.norm.weight.dtype)
 
-        full_pe = self.full_rotary_emb(inputs_embeds, position_ids)
-        sliding_pe = self.sliding_rotary_emb(inputs_embeds, position_ids)
+        # One flattened int32 position tensor + the per-type prefused fp32 caches feed the
+        # fused partial-rope op in every layer (no per-layer cos/sin gather or table build).
+        pos_flat = position_ids.reshape(-1).to(torch.int32)
+        full_pe = (pos_flat, self.full_rotary_emb.cos_sin_cache)
+        sliding_pe = (pos_flat, self.sliding_rotary_emb.cos_sin_cache)
 
         hidden_states = inputs_embeds
         for decoder_layer in self.layers:
