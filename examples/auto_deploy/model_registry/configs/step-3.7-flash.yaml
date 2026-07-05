@@ -86,3 +86,17 @@ transforms:
     stage: post_load_fusion
     enabled: true
     run_shape_prop: true
+  # Swap the batch=1 decode bf16 projection GEMMs (fused qkvg, o_proj, dense-MLP
+  # gate_up/down; 96 nodes/rank) from cuBLAS split-K (+splitKreduce launch) to a
+  # single-pass fp32-accumulate Triton GEMV with runtime M==1 dispatch (prefill /
+  # multi-token batches fall back to aten.linear, bit-identical to the pre-swap
+  # graph). Measured on H100 (cudagraph replay, HBM-streamed weights, per-rank TP8
+  # shapes): qkvg 1.50x/1.39x, o_proj 1.21x/1.14x, dense gate_up 1.35x / down 1.14x
+  # vs cuBLAS; ~200us/step aggregate. Shape-gated: tiny projections (MoE shared
+  # expert, on the multi_stream_moe aux stream) and the vocab-sharded lm_head
+  # (cuBLAS already optimal at N=16112) stay on cuBLAS. Declared here (not in
+  # default.yaml) so it sorts after fuse_gemms_mixed_children within
+  # post_load_fusion and rewrites the FUSED qkvg/gate_up nodes.
+  swap_linear_gemv:
+    stage: post_load_fusion
+    enabled: true
