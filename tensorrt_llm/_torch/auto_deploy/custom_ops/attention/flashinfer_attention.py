@@ -425,7 +425,11 @@ def flashinfer_mha_with_cache(
     if out is not None:
         y = out.view(-1, n_heads, head_dim)
     else:
-        y = torch.zeros((bs, n_heads, head_dim), dtype=q.dtype, device=q.device)
+        # The prefill/decode kernels below fully overwrite y[:num_total_tokens], so only
+        # the padding tail needs zeroing (matches the pre-allocated `out` path below).
+        y = torch.empty((bs, n_heads, head_dim), dtype=q.dtype, device=q.device)
+        if num_total_tokens < bs:
+            y[num_total_tokens:].zero_()
 
     if num_prefill > 0:
         q_prefill = q[:num_prefill_tokens]
