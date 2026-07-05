@@ -60,7 +60,8 @@ Tensor-parallel sharding (sharding-IR hints):
 * MoE: routed experts via ``torch_moe(layer_type="moe")`` (EP/TP handled by the sharder); the
   shared expert is a colwise/rowwise MLP with no internal all_reduce — a single all_reduce at
   the ``routed + shared`` merge point covers both. Dense MLP layers reduce internally.
-* The fp32 router gate is TP-replicated (kept as plain ``F.linear``).
+* The router gate is TP-replicated (opaque ``step3p7_router_gemv`` custom op: bf16 weight
+  read + fp32 accumulate at batch=1 decode, reference fp32 GEMM elsewhere).
 """
 
 import math
@@ -685,6 +686,101 @@ def _step3p7_fused_router_topk_fake(
 
 
 # ---------------------------------------------------------------------------
+# Router gate GEMV (bf16 weight read, fp32 accumulate, fp32 logits)
+# ---------------------------------------------------------------------------
+#
+# The router gate weight ships as bf16 in the checkpoint; ``need_fp32_gate`` requires fp32
+# GEMM *accumulation*, not fp32 *operands*: every bf16 x bf16 product is exactly
+# representable in fp32 (8-bit x 8-bit mantissas), so reading bf16 operands and accumulating
+# in fp32 yields the same products as an fp32-materialized GEMM and differs only in
+# summation order (~1e-7 relative on the logits). At TP8/batch=1 decode the fp32 gate GEMV
+# was a ``[1, 4096] x [288, 4096]^T`` cuBLAS gemvx behind a per-call ``hidden.float()`` cast,
+# x42 MoE layers per step; it re-read a 4.7MB fp32 weight every call. The Triton GEMV below
+# instead keeps the gate weight bf16 (half the read bytes, half the weight memory), consumes
+# the bf16 hidden state directly (dropping the cast kernel), and stores fp32 logits for the
+# fused router top-k. One program per expert row, mask-free (K must divide by BLOCK_K).
+# Off the decode hot path (prefill, multi-token decode, offline harnesses) the op upcasts
+# both operands and runs the reference fp32 GEMM: ``weight.float()`` reproduces the
+# fp32-materialized master bit-exactly, so those paths match the pre-optimization graph.
+
+
+_STEP3P7_ROUTER_GEMV_BLOCK_K = 4096
+
+
+@triton.jit
+def _step3p7_router_gemv_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """``out[n] = dot(x, w[n, :])`` in fp32; one program per BLOCK_N expert rows."""
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        x = tl.load(x_ptr + offs_k).to(tl.float32)
+        w = tl.load(w_ptr + offs_n[:, None] * K + offs_k[None, :]).to(tl.float32)
+        acc += tl.sum(w * x[None, :], axis=1)
+    tl.store(out_ptr + offs_n, acc)
+
+
+def _step3p7_router_gemv_production_contract(hidden: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Return whether the batch=1 decode Triton GEMV can handle this call."""
+    return (
+        hidden.is_cuda
+        and weight.is_cuda
+        and hidden.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and hidden.ndim == 2
+        and weight.ndim == 2
+        and hidden.shape[0] == 1
+        and hidden.shape[1] == weight.shape[1]
+        and weight.shape[1] % _STEP3P7_ROUTER_GEMV_BLOCK_K == 0
+    )
+
+
+@torch.library.custom_op("auto_deploy::step3p7_router_gemv", mutates_args=())
+def step3p7_router_gemv(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """fp32 router logits ``hidden @ weight^T`` with a bf16 weight read at batch=1 decode.
+
+    Args:
+        hidden: ``[T, hidden]`` flattened token activations (bf16 in production).
+        weight: ``[E, hidden]`` router gate weight (bf16 in production).
+
+    ``T == 1`` (the cudagraph decode hot path) runs the Triton GEMV: bf16 loads, fp32
+    accumulate, fp32 store — matching the fp32 reference GEMM up to summation order (see
+    section comment). Any other shape/dtype/device (prefill, multi-token decode batches,
+    offline harnesses) upcasts both operands and computes the reference fp32 GEMM,
+    bit-identical to the pre-optimization fp32-materialized graph.
+    """
+    if _step3p7_router_gemv_production_contract(hidden, weight):
+        hidden = hidden.contiguous()
+        weight = weight.contiguous()
+        num_experts, k = weight.shape
+        out = torch.empty((1, num_experts), dtype=torch.float32, device=hidden.device)
+        _step3p7_router_gemv_kernel[(num_experts,)](
+            hidden,
+            weight,
+            out,
+            K=k,
+            BLOCK_N=1,
+            BLOCK_K=_STEP3P7_ROUTER_GEMV_BLOCK_K,
+            num_warps=4,
+        )
+        return out
+    return F.linear(hidden.float(), weight.float())
+
+
+@step3p7_router_gemv.register_fake
+def _step3p7_router_gemv_fake(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return hidden.new_empty((hidden.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+# ---------------------------------------------------------------------------
 # Fused head-wise attention gate (sigmoid + per-head broadcast multiply)
 # ---------------------------------------------------------------------------
 #
@@ -795,10 +891,12 @@ class Step3p7MoE(nn.Module):
         self.hidden_size = config.hidden_size
         self.routed_scaling_factor = getattr(config, "moe_router_scaling_factor", 1.0)
 
-        # fp32 by construction so the bf16 checkpoint weight is upcast ONCE at load
-        # (load_state_dict copy semantics) instead of re-materialized per forward call by a
-        # ``weight.float()`` cast; the router GEMM must stay fp32 (config.need_fp32_gate).
-        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False, dtype=torch.float32)
+        # bf16 by construction, matching the checkpoint storage: the batch=1 decode GEMV
+        # (``step3p7_router_gemv``) reads the weight as bf16 with fp32 accumulation, which
+        # matches the fp32-materialized GEMM up to summation order while halving the
+        # per-call weight read; fp32 GEMM *accumulation* is what config.need_fp32_gate
+        # requires. Off-hot-path shapes upcast per call inside the op.
+        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False, dtype=torch.bfloat16)
         self.register_buffer(
             "router_bias", torch.zeros(self.num_experts, dtype=torch.float32), persistent=True
         )
@@ -811,19 +909,20 @@ class Step3p7MoE(nn.Module):
         )
 
     def _apply(self, fn, recurse=True):
-        """Pin the router gate weight to fp32 across blanket dtype casts.
+        """Pin the router gate weight to bf16 across blanket dtype casts.
 
-        The HF fp8 quant reader post-processes the freshly built model with ``model.to(bf16)``
-        (``HFQuantConfigReader.post_process_model``), which would silently downcast the
-        fp32-by-construction gate and re-introduce the per-call weight upcast in the exported
-        graph. Re-pinning here is lossless: real values only arrive later, when the checkpoint
-        weight is copy-cast into the (fp32) parameter by ``load_state_dict``.
+        Blanket post-processing casts (e.g. the HF fp8 quant reader's ``model.to(bf16)``,
+        ``HFQuantConfigReader.post_process_model``) must not change the gate dtype: the
+        exported graph relies on a bf16 gate weight for the batch=1 decode Triton GEMV
+        (``step3p7_router_gemv``). Re-pinning here is lossless: real values only arrive
+        later, when the bf16 checkpoint weight is copied into the parameter by
+        ``load_state_dict``.
         """
         ret = super()._apply(fn, recurse)
         weight = self.gate.weight
-        if weight is not None and weight.is_floating_point() and weight.dtype != torch.float32:
+        if weight is not None and weight.is_floating_point() and weight.dtype != torch.bfloat16:
             self.gate.weight = nn.Parameter(
-                weight.data.to(torch.float32), requires_grad=weight.requires_grad
+                weight.data.to(torch.bfloat16), requires_grad=weight.requires_grad
             )
         return ret
 
@@ -831,8 +930,10 @@ class Step3p7MoE(nn.Module):
         bsz, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_dim)
 
-        # fp32 router GEMM (config.need_fp32_gate); gate weight is fp32 by construction
-        router_logits = F.linear(hidden_flat.float(), self.gate.weight)
+        # fp32 router logits (config.need_fp32_gate): batch=1 decode reads the bf16 gate
+        # weight via a Triton GEMV (fp32 accumulate/output, drops the hidden cast); all
+        # other shapes upcast and run the reference fp32 GEMM (see step3p7_router_gemv).
+        router_logits = torch.ops.auto_deploy.step3p7_router_gemv(hidden_flat, self.gate.weight)
 
         # Fused sigmoid + per-expert-bias top-k routing in one optimized Triton launch
         # (replaces the 7 separate torch ops; numerics-faithful, see custom op above).
