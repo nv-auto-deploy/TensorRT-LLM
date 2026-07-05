@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1692,6 +1692,174 @@ INSTANTIATE_EXPAND_INPUT_ROWS(half, half);
 INSTANTIATE_EXPAND_INPUT_ROWS(__nv_bfloat16, __nv_bfloat16);
 #endif
 
+// ---- Fused expand + DeepSeek FP8 1x128 block-scale activation quantization (SM90) ----
+
+namespace
+{
+//! Host-side context bridging the DeepSeek FP8 fused expand+quantize path from runMoe (which launches the fused
+//! expand kernel) to BlockScaleFC1 (which runs the grouped gemm on the pre-quantized activations). Set per runMoe
+//! invocation on the calling thread and consumed within the same invocation, so no state leaks across calls.
+struct DeepSeekFusedExpandContext
+{
+    char* deepseek_fc_workspace = nullptr;
+    bool active = false;
+};
+
+thread_local DeepSeekFusedExpandContext g_deepseek_fused_expand_ctx;
+} // namespace
+
+// Replica of deep_gemm::compute_padded_offset (cpp/include/tensorrt_llm/deep_gemm/scheduler.cuh). Must stay in sync
+// so the fused expand kernel writes scales exactly where the GroupedWithOffset deep_gemm kernels read them.
+__host__ __device__ __forceinline__ int64_t computeDeepSeekPaddedOffset(int64_t offset, int64_t problem_idx)
+{
+    constexpr int64_t alignment = 32;
+    return (offset + problem_idx * (alignment - 1)) / alignment * alignment;
+}
+
+struct DeepSeekFusedExpandLayout
+{
+    __nv_fp8_e4m3* fp8_act;
+    float* act_scales;
+    int64_t scale_leading_dim;
+};
+
+// Mirrors the activation slices CutlassFp8BlockScaleGemmRunner::moeGemm carves from its workspace for the internal
+// quantization path (fp8 data first, then the per-token per-128-channel scales) and the scale layout
+// scale_1x128_kernel writes: fp8 rows at unpadded row positions, fp32 dequant scales in column-major order
+// [k/128, padded_m] with per-problem 32-row alignment padding. Pure function of the current call arguments, so the
+// producer (fused expand kernel launch) and consumer (BlockScaleFC1) always agree byte-for-byte.
+inline DeepSeekFusedExpandLayout computeDeepSeekFusedExpandLayout(
+    char* workspace, int64_t expanded_num_rows, int64_t hidden_size, int64_t num_experts_per_node)
+{
+    int64_t const m_4_align = (expanded_num_rows + 3) / 4 * 4;
+    DeepSeekFusedExpandLayout layout;
+    layout.fp8_act = reinterpret_cast<__nv_fp8_e4m3*>(workspace);
+    layout.act_scales = reinterpret_cast<float*>(workspace + m_4_align * hidden_size * sizeof(__nv_fp8_e4m3));
+    layout.scale_leading_dim = computeDeepSeekPaddedOffset(expanded_num_rows, num_experts_per_node);
+    return layout;
+}
+
+// Butterfly all-reduce max, replicating kernel_utils::warpReduceSum<float> from fp8_blockscale_gemm_kernel.cuh
+// (which is a max reduction despite its name) so quantization stays bit-identical with scale_1x128_kernel.
+__device__ __forceinline__ float deepSeekWarpMaxAllReduce(float val)
+{
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+    {
+        val = max(val, __shfl_xor_sync(0xffffffffu, val, mask, 32));
+    }
+    return val;
+}
+
+constexpr static int DEEPSEEK_EXPAND_THREADS_PER_BLOCK = 256;
+
+// Fused variant of expandInputRowsKernel for the DeepSeek FP8 block-scale path: expands/permutes the input rows and
+// quantizes them to FP8 with 1x128 block scales in one pass, so BlockScaleFC1 does not need the standalone
+// scale_1x128_kernel launch nor the extra bf16 round trip through permuted_data_. The quantization math replicates
+// scale_1x128_kernel (fp8_blockscale_gemm_kernel.cuh) operation-for-operation: fp32 per-lane |max| over 4 elements
+// strided by 32 lanes, fp32 warp butterfly max rounded to bf16, clamp at 1e-10, quant scale 448/amax, fp32 dequant
+// scale store, saturated e4m3 conversion.
+__global__ void expandInputRowsDeepSeekFp8Kernel(__nv_bfloat16 const* unpermuted_input,
+    __nv_fp8_e4m3* permuted_fp8_output, float* permuted_act_scales, int64_t const scale_leading_dim,
+    float const* unpermuted_scales, float* permuted_scales, int const* permuted_row_to_unpermuted_row,
+    int64_t const num_tokens, int64_t const hidden_size, int64_t const k, int64_t const* expert_first_token_offset,
+    int64_t const num_experts_per_node)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+
+    constexpr int NUM_WARPS = DEEPSEEK_EXPAND_THREADS_PER_BLOCK / 32;
+    int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
+    int64_t const num_k_blocks = hidden_size / 128;
+    int const warp_idx = threadIdx.x / 32;
+    int const lane_id = threadIdx.x % 32;
+
+    for (int64_t permuted_row = blockIdx.x; permuted_row < num_valid_tokens; permuted_row += gridDim.x)
+    {
+        int64_t const unpermuted_row = permuted_row_to_unpermuted_row[permuted_row];
+        int64_t const source_k_rank = unpermuted_row / num_tokens;
+        int64_t const source_row = unpermuted_row % num_tokens;
+
+        int64_t const expert
+            = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, (int64_t) permuted_row + 1)
+            - 1;
+        int64_t const expert_start = expert_first_token_offset[expert];
+        int64_t const scale_row = permuted_row + computeDeepSeekPaddedOffset(expert_start, expert) - expert_start;
+
+        __nv_bfloat16 const* source_row_ptr = unpermuted_input + source_row * hidden_size;
+        __nv_fp8_e4m3* dest_row_ptr = permuted_fp8_output + permuted_row * hidden_size;
+
+        for (int64_t k_block = warp_idx; k_block < num_k_blocks; k_block += NUM_WARPS)
+        {
+            __nv_bfloat16 const* input_line = source_row_ptr + k_block * 128;
+            __nv_fp8_e4m3* output_line = dest_row_ptr + k_block * 128;
+
+            __nv_bfloat16 input_frag[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                input_frag[i] = input_line[i * 32 + lane_id];
+            }
+
+            __nv_bfloat16 amax
+                = deepSeekWarpMaxAllReduce(max(max(fabs(float(input_frag[0])), fabs(float(input_frag[1]))),
+                    max(fabs(float(input_frag[2])), fabs(float(input_frag[3])))));
+            // Same clamp and select as tensorrt_llm::common::cuda_max used by scale_1x128_kernel
+            __nv_bfloat16 const eps = __nv_bfloat16(1e-10f);
+            amax = (amax > eps) ? amax : eps;
+            float const quant_scale = 448.f / float(amax);
+
+            if (lane_id == 0)
+            {
+                permuted_act_scales[k_block * scale_leading_dim + scale_row] = 1.f / quant_scale;
+            }
+
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                output_line[i * 32 + lane_id] = __nv_fp8_e4m3(float(input_frag[i]) * quant_scale);
+            }
+        }
+
+        if (permuted_scales && threadIdx.x == 0)
+        {
+            int64_t const source_k_idx = source_row * k + source_k_rank;
+            permuted_scales[permuted_row] = unpermuted_scales ? unpermuted_scales[source_k_idx] : 1.0f;
+        }
+    }
+
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+void expandInputRowsDeepSeekFp8KernelLauncher(__nv_bfloat16 const* unpermuted_input, __nv_fp8_e4m3* permuted_fp8_output,
+    float* permuted_act_scales, int64_t const scale_leading_dim, float const* unpermuted_scales, float* permuted_scales,
+    int const* permuted_row_to_unpermuted_row, int64_t const num_rows, int64_t const hidden_size, int const k,
+    int const num_experts_per_node, int64_t const* expert_first_token_offset, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(hidden_size % 128 == 0, "DeepSeek FP8 fused expand requires hidden_size %% 128 == 0");
+    auto* func = &expandInputRowsDeepSeekFp8Kernel;
+    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const maxBlocksPerSM
+        = tensorrt_llm::common::getMaxActiveBlocksPerSM(func, DEEPSEEK_EXPAND_THREADS_PER_BLOCK, 0);
+    int32_t const blocks = std::min(smCount * maxBlocksPerSM, static_cast<int32_t>(num_rows * k));
+    int32_t const threads = DEEPSEEK_EXPAND_THREADS_PER_BLOCK;
+
+    cudaLaunchConfig_t config;
+    config.gridDim = blocks;
+    config.blockDim = threads;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_fp8_output, permuted_act_scales, scale_leading_dim,
+        unpermuted_scales, permuted_scales, permuted_row_to_unpermuted_row, num_rows, hidden_size,
+        static_cast<int64_t>(k), expert_first_token_offset, static_cast<int64_t>(num_experts_per_node));
+}
+
 enum class ScaleMode : int
 {
     NO_SCALE = 0,
@@ -3208,11 +3376,15 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         TLLM_CHECK(lora_fc2_result_ != nullptr);
     }
 
+    g_deepseek_fused_expand_ctx.deepseek_fc_workspace = nullptr;
+    g_deepseek_fused_expand_ctx.active = false;
     if (use_deepseek_fp8_block_scale)
     {
         auto* blockscale_gemm_runner = getDeepSeekBlockScaleGemmRunner();
         TLLM_CHECK(blockscale_gemm_runner != nullptr);
-        blockscale_gemm_runner->configureWorkspace(getWsPtr(char{}, "deepseek_fc_workspace"));
+        auto* deepseek_fc_workspace = getWsPtr(char{}, "deepseek_fc_workspace");
+        blockscale_gemm_runner->configureWorkspace(deepseek_fc_workspace);
+        g_deepseek_fused_expand_ctx.deepseek_fc_workspace = deepseek_fc_workspace;
     }
 
     if (use_awq)
@@ -3246,9 +3418,38 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     int shape_n = is_gated_activation ? inter_size * 2 : inter_size;
     int shape_k = hidden_size;
 
-    // NOTE: we assume gemm_runner.configureWorkspace has already been called.
-    gemm_runner.moeGemm(gemm_output, input, fc1_expert_weights, expert_first_token_offset, num_experts_per_node,
-        expected_tokens_per_expert, shape_n, shape_k, stream, nullptr, quant_params.fp8_block_scaling.fc1_scales_ptrs);
+    bool const use_fused_expand_quant = g_deepseek_fused_expand_ctx.active;
+    g_deepseek_fused_expand_ctx.active = false;
+    bool ran_fused_expand_quant = false;
+    if constexpr (std::is_same_v<T, __nv_bfloat16>)
+    {
+        if (use_fused_expand_quant)
+        {
+            // The activations were already expanded and quantized to FP8 + 1x128 block scales by
+            // expandInputRowsDeepSeekFp8Kernel (input points at the blockscale gemm workspace), so run the grouped
+            // gemm through a pre-quantized-activation runner instantiation that skips the internal scale_1x128 pass.
+            auto const layout = computeDeepSeekFusedExpandLayout(
+                reinterpret_cast<char*>(const_cast<T*>(input)), expanded_num_rows, hidden_size, num_experts_per_node);
+            static thread_local kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3,
+                __nv_fp8_e4m3, __nv_bfloat16>
+                prequant_gemm_runner;
+            // Refresh the runner's padded-m state so the scale leading dimension it passes to the grouped gemm
+            // matches the layout the fused expand kernel wrote.
+            prequant_gemm_runner.getWorkspaceSizeBase(expanded_num_rows, shape_n, shape_k, num_experts_per_node);
+            prequant_gemm_runner.moeGemm(gemm_output, layout.fp8_act, fc1_expert_weights, expert_first_token_offset,
+                num_experts_per_node, expected_tokens_per_expert, shape_n, shape_k, stream, layout.act_scales,
+                quant_params.fp8_block_scaling.fc1_scales_ptrs);
+            ran_fused_expand_quant = true;
+        }
+    }
+
+    if (!ran_fused_expand_quant)
+    {
+        // NOTE: we assume gemm_runner.configureWorkspace has already been called.
+        gemm_runner.moeGemm(gemm_output, input, fc1_expert_weights, expert_first_token_offset, num_experts_per_node,
+            expected_tokens_per_expert, shape_n, shape_k, stream, nullptr,
+            quant_params.fp8_block_scaling.fc1_scales_ptrs);
+    }
 
     sync_check_cuda_error(stream);
     constexpr bool bias_is_broadcast = true;
@@ -4103,12 +4304,42 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         // Only NVFP4xNVFP4 supports FC1 per-expert act scale
         bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc1.use_per_expert_act_scale : false;
         T* gemm1_input_expand = use_w4afp8 ? reinterpret_cast<T*>(smoothed_act_) : reinterpret_cast<T*>(permuted_data_);
-        // Expand input and maybe apply prequant scale for AWQ
-        expandInputRowsKernelLauncher(input_activations, gemm1_input_expand, token_topk_unpermuted_scales,
-            permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows, hidden_size, experts_per_token,
-            num_experts_per_node, quant_params, use_per_expert_act_scale, expert_first_token_offset_,
-            fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
-            (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr, stream);
+
+        // On Hopper, fuse the FC1 1x128 activation quantization into the expand kernel for the DeepSeek FP8
+        // block-scale path: expanded rows are written directly as FP8 with block scales into the blockscale gemm
+        // workspace, replacing the bf16 permuted_data_ write plus the standalone scale_1x128_kernel pass that
+        // BlockScaleFC1's gemm runner would otherwise launch.
+        bool use_deepseek_fused_expand_quant = false;
+        if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<InputType, __nv_bfloat16>)
+        {
+            use_deepseek_fused_expand_quant = use_deepseek_fp8_block_scale && !use_lora && !use_awq && !min_latency_mode
+                && (hidden_size % 128 == 0) && g_deepseek_fused_expand_ctx.deepseek_fc_workspace != nullptr
+                && tensorrt_llm::common::getSMVersion() == 90;
+        }
+
+        if (use_deepseek_fused_expand_quant)
+        {
+            if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<InputType, __nv_bfloat16>)
+            {
+                auto const layout = computeDeepSeekFusedExpandLayout(g_deepseek_fused_expand_ctx.deepseek_fc_workspace,
+                    expanded_num_rows, hidden_size, num_experts_per_node);
+                expandInputRowsDeepSeekFp8KernelLauncher(reinterpret_cast<__nv_bfloat16 const*>(input_activations),
+                    layout.fp8_act, layout.act_scales, layout.scale_leading_dim, token_topk_unpermuted_scales,
+                    permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows, hidden_size,
+                    experts_per_token, num_experts_per_node, expert_first_token_offset_, stream);
+                g_deepseek_fused_expand_ctx.active = true;
+                gemm1_input_expand = reinterpret_cast<T*>(g_deepseek_fused_expand_ctx.deepseek_fc_workspace);
+            }
+        }
+        else
+        {
+            // Expand input and maybe apply prequant scale for AWQ
+            expandInputRowsKernelLauncher(input_activations, gemm1_input_expand, token_topk_unpermuted_scales,
+                permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows, hidden_size, experts_per_token,
+                num_experts_per_node, quant_params, use_per_expert_act_scale, expert_first_token_offset_,
+                fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
+                (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr, stream);
+        }
         auto const* gemm1_input = gemm1_input_expand;
 
         sync_check_cuda_error(stream);
@@ -4139,8 +4370,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
         if constexpr (!use_w4afp8)
         {
-            gemm1_input = applyPrequantScale(smoothed_act_, permuted_data_, quant_params.groupwise.fc1.act_scales,
-                num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream, quant_params);
+            if (!use_deepseek_fused_expand_quant)
+            {
+                gemm1_input = applyPrequantScale(smoothed_act_, permuted_data_, quant_params.groupwise.fc1.act_scales,
+                    num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream, quant_params);
+            }
         }
         sync_check_cuda_error(stream);
 
