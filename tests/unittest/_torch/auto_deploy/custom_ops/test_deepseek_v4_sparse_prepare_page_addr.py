@@ -161,6 +161,70 @@ def test_prepare_decode_page_addr_overlap_fake_shape():
     assert outs[7].shape == (num_seq, m * ratio) and outs[7].dtype == torch.bool
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for the Triton path")
+@pytest.mark.parametrize("dtypes", ["production", "int64"])
+@pytest.mark.parametrize("tokens_per_block", [32, 64])
+@pytest.mark.parametrize("num_seq", [1, 3, 8])
+@pytest.mark.parametrize("m,dense_m", [(512, 16), (37, 1)])
+def test_prepare_decode_page_addr_triton_matches_torch_reference(
+    dtypes, tokens_per_block, num_seq, m, dense_m
+):
+    """The single-launch Triton path (idea_0049) must be bit-identical to the torch
+    reference body across page boundaries, out-of-range rows, compressed-row
+    completion boundaries, negative (padded) positions, and multi-sequence inputs
+    with per-sequence page counts. The CPU invocation takes the torch path, the CUDA
+    invocation the Triton path; all 18 outputs must be ``torch.equal``.
+    """
+    torch.manual_seed(num_seq * 1009 + tokens_per_block + m)
+    max_pages = 2048 // tokens_per_block
+    pages_per_seq = torch.randint(1, max_pages + 1, (num_seq,), dtype=torch.long)
+    cu_num_pages = torch.cat([torch.zeros(1, dtype=torch.long), pages_per_seq.cumsum(0)])
+    total_pages = int(cu_num_pages[-1].item())
+    cache_loc = torch.randperm(total_pages, dtype=torch.long)
+
+    # Edge-case positions cycled across rows: zero, page-boundary ends, ratio-4 /
+    # ratio-128 row-completion boundaries, last allocated token, out-of-range rows,
+    # negative (padded) rows, and beyond-max compressed rows (old_completed >= m).
+    positions = torch.empty(num_seq, dtype=torch.long)
+    for i in range(num_seq):
+        limit = int(pages_per_seq[i].item()) * tokens_per_block
+        kinds = [
+            0,
+            tokens_per_block - 1,
+            127,
+            limit - 1,
+            limit + 5,
+            -1,
+            4 * m,
+            int(torch.randint(0, limit, (1,)).item()),
+        ]
+        positions[i] = kinds[i % len(kinds)]
+    input_pos = torch.cat([positions, torch.zeros(4, dtype=torch.long)])
+    position_ids = input_pos + 3  # distinct from input_pos to catch swapped operands
+
+    if dtypes == "production":
+        idx_dtype = torch.int32
+    else:
+        idx_dtype = torch.long
+    args_cpu = (
+        input_pos.to(idx_dtype),
+        position_ids.to(torch.long),
+        cu_num_pages.to(idx_dtype),
+        cache_loc.to(idx_dtype),
+    )
+    args_gpu = tuple(t.cuda() for t in args_cpu)
+
+    prep = torch.ops.auto_deploy.deepseek_v4_sparse_prepare_decode_page_addr
+    ref = prep(*args_cpu, tokens_per_block, m, dense_m)
+    outs = prep(*args_gpu, tokens_per_block, m, dense_m)
+    assert len(ref) == 18 and len(outs) == 18
+    for i, (o, r) in enumerate(zip(outs, ref)):
+        assert o.is_cuda, f"output {i} expected on CUDA"
+        assert o.dtype == r.dtype, f"output {i} dtype {o.dtype} != {r.dtype}"
+        assert o.shape == r.shape, f"output {i} shape {o.shape} != {r.shape}"
+        assert torch.equal(o.cpu(), r), f"output {i} diverges from torch reference"
+
+
 def test_prepare_decode_page_addr_fake_shape():
     """Fake (meta) path returns ``[num_seq]`` int64 tensors for export/cudagraph."""
     tokens_per_block = 32

@@ -4917,6 +4917,253 @@ def torch_deepseek_v4_sparse_attention_fake(
     return q.new_empty(q.shape).contiguous()
 
 
+if _HAS_TRITON:
+
+    @triton.jit
+    def _prepare_meta_floordiv(x, d):
+        # Python-floor division for a positive divisor, independent of whether
+        # ``//`` lowers to trunc- or floor-division for signed ints. Matches the
+        # torch reference (`torch.div` floor semantics) for negative numerators.
+        q = x // d
+        r = x - q * d
+        return q - (r < 0).to(tl.int64)
+
+    @triton.jit
+    def _dsv4_prepare_decode_meta_kernel(
+        input_pos_ptr,  # [>= num_seq] int
+        position_ids_ptr,  # [>= num_seq] int
+        cu_num_pages_ptr,  # [num_seq + 1] int
+        cache_loc_ptr,  # [num_pages] int
+        cur_pid_ptr,  # [num_seq] i64
+        cur_poff_ptr,  # [num_seq] i64
+        ovl_pid_ptr,  # [num_seq, 2*R4] i64
+        ovl_poff_ptr,  # [num_seq, 2*R4] i64
+        ovl_valid_ptr,  # [num_seq, 2*R4] bool
+        full_pid_ptr,  # [num_seq, full_len] i64
+        full_poff_ptr,  # [num_seq, full_len] i64
+        full_valid_ptr,  # [num_seq, full_len] bool
+        r4_valid_ptr,  # [num_seq] bool
+        r4_pos_ptr,  # [num_seq] i64
+        r4_mhc_pid_ptr,  # [num_seq] i64
+        r4_mhc_poff_ptr,  # [num_seq] i64
+        r128_valid_ptr,  # [num_seq] bool
+        r128_pos_ptr,  # [num_seq] i64
+        r128_mhc_pid_ptr,  # [num_seq] i64
+        r128_mhc_poff_ptr,  # [num_seq] i64
+        r128_pos_pid_ptr,  # [num_seq, R128] i64
+        r128_pos_poff_ptr,  # [num_seq, R128] i64
+        full_len,  # overlap_m * R4
+        overlap_m,  # ratio-4 max_compressed_len
+        dense_m,  # ratio-128 max_compressed_len (>= 1)
+        cache_loc_max,  # cache_loc.numel() - 1
+        TPB: tl.constexpr,
+        R4: tl.constexpr,
+        R128: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Single-launch emitter of the full 18-tensor decode prepare contract.
+
+        Grid: ``(num_seq, cdiv(full_len, BLOCK_N))``.  Every program translates one
+        ``BLOCK_N`` chunk of the ratio-4 full candidate range (the bulk of the map);
+        the ``pid_c == 0`` program of each row additionally emits the row's small
+        outputs: current-token write address, ratio-4 overlap band, and the ratio-4 /
+        ratio-128 compressed-cache update metadata (incl. the ``[R128]`` read map).
+        Each translation mirrors ``_page_ids_and_offsets_from_tpb`` exactly (clamped
+        ordinal, ``page_start`` fallback for invalid rows, clamped page-table index)
+        so all values are bit-identical to the torch reference path.
+        """
+        pid_n = tl.program_id(0)
+        pid_c = tl.program_id(1)
+
+        pos = tl.load(input_pos_ptr + pid_n).to(tl.int64)
+        page_start = tl.load(cu_num_pages_ptr + pid_n).to(tl.int64)
+        page_end = tl.load(cu_num_pages_ptr + pid_n + 1).to(tl.int64)
+
+        # Full candidate range [0, full_len): positions are non-negative by
+        # construction, so validity reduces to the page-table bound check.
+        cols = (pid_c * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+        cmask = cols < full_len
+        f_off = cols % TPB
+        f_pti = page_start + cols // TPB
+        f_valid = f_pti < page_end
+        f_safe = tl.where(f_valid, f_pti, page_start)
+        f_safe = tl.minimum(tl.maximum(f_safe, 0), cache_loc_max)
+        f_pid = tl.load(cache_loc_ptr + f_safe, mask=cmask, other=0).to(tl.int64)
+        frow = pid_n.to(tl.int64) * full_len
+        tl.store(full_pid_ptr + frow + cols, f_pid, mask=cmask)
+        tl.store(full_poff_ptr + frow + cols, f_off, mask=cmask)
+        tl.store(full_valid_ptr + frow + cols, f_valid, mask=cmask)
+
+        if pid_c == 0:
+            # Current-token write address (positions may be negative for padded rows).
+            safe_pos = tl.maximum(pos, 0)
+            c_off = safe_pos % TPB
+            c_pti = page_start + safe_pos // TPB
+            c_valid = (pos >= 0) & (c_pti < page_end)
+            c_safe = tl.where(c_valid, c_pti, page_start)
+            c_safe = tl.minimum(tl.maximum(c_safe, 0), cache_loc_max)
+            c_pid = tl.load(cache_loc_ptr + c_safe).to(tl.int64)
+            tl.store(cur_pid_ptr + pid_n, c_pid)
+            tl.store(cur_poff_ptr + pid_n, c_off)
+
+            # Ratio-4 overlap band [anchor - R4, anchor + R4).
+            row_idx4 = tl.minimum(tl.maximum(_prepare_meta_floordiv(pos, R4), 0), overlap_m - 1)
+            bcols = tl.arange(0, 2 * R4).to(tl.int64)
+            o_pos = row_idx4 * R4 + bcols - R4
+            o_safe_pos = tl.maximum(o_pos, 0)
+            o_off = o_safe_pos % TPB
+            o_pti = page_start + o_safe_pos // TPB
+            o_valid = (o_pos >= 0) & (o_pti < page_end)
+            o_safe = tl.where(o_valid, o_pti, page_start)
+            o_safe = tl.minimum(tl.maximum(o_safe, 0), cache_loc_max)
+            o_pid = tl.load(cache_loc_ptr + o_safe).to(tl.int64)
+            orow = pid_n.to(tl.int64) * (2 * R4)
+            tl.store(ovl_pid_ptr + orow + bcols, o_pid)
+            tl.store(ovl_poff_ptr + orow + bcols, o_off)
+            tl.store(ovl_valid_ptr + orow + bcols, o_valid)
+
+            posid = tl.load(position_ids_ptr + pid_n).to(tl.int64)
+
+            # Ratio-4 compressed-cache update metadata.
+            old4 = _prepare_meta_floordiv(pos, R4)
+            new4 = _prepare_meta_floordiv(pos + 1, R4)
+            r4v = (new4 > old4) & (old4 < overlap_m)
+            r4_logical = tl.minimum(tl.maximum(old4, 0), overlap_m - 1) * R4
+            m4_off = r4_logical % TPB
+            m4_pti = page_start + r4_logical // TPB
+            m4_safe = tl.where(m4_pti < page_end, m4_pti, page_start)
+            m4_safe = tl.minimum(tl.maximum(m4_safe, 0), cache_loc_max)
+            m4_pid = tl.load(cache_loc_ptr + m4_safe).to(tl.int64)
+            tl.store(r4_valid_ptr + pid_n, r4v)
+            tl.store(r4_pos_ptr + pid_n, posid - (pos - r4_logical))
+            tl.store(r4_mhc_pid_ptr + pid_n, m4_pid)
+            tl.store(r4_mhc_poff_ptr + pid_n, m4_off)
+
+            # Ratio-128 update metadata + [R128] compressor read page map.
+            old128 = _prepare_meta_floordiv(pos, R128)
+            new128 = _prepare_meta_floordiv(pos + 1, R128)
+            r128v = (new128 > old128) & (old128 < dense_m)
+            r128_logical = tl.minimum(tl.maximum(old128, 0), dense_m - 1) * R128
+            m128_off = r128_logical % TPB
+            m128_pti = page_start + r128_logical // TPB
+            m128_safe = tl.where(m128_pti < page_end, m128_pti, page_start)
+            m128_safe = tl.minimum(tl.maximum(m128_safe, 0), cache_loc_max)
+            m128_pid = tl.load(cache_loc_ptr + m128_safe).to(tl.int64)
+            tl.store(r128_valid_ptr + pid_n, r128v)
+            tl.store(r128_pos_ptr + pid_n, posid - (pos - r128_logical))
+            tl.store(r128_mhc_pid_ptr + pid_n, m128_pid)
+            tl.store(r128_mhc_poff_ptr + pid_n, m128_off)
+
+            pcols = tl.arange(0, R128).to(tl.int64)
+            p_pos = r128_logical + pcols
+            p_off = p_pos % TPB
+            p_pti = page_start + p_pos // TPB
+            p_valid = p_pti < page_end
+            p_safe = tl.where(p_valid, p_pti, page_start)
+            p_safe = tl.minimum(tl.maximum(p_safe, 0), cache_loc_max)
+            p_pid = tl.load(cache_loc_ptr + p_safe).to(tl.int64)
+            prow = pid_n.to(tl.int64) * R128
+            tl.store(r128_pos_pid_ptr + prow + pcols, p_pid)
+            tl.store(r128_pos_poff_ptr + prow + pcols, p_off)
+
+    def _prepare_decode_meta_triton(
+        input_pos: torch.Tensor,
+        position_ids: torch.Tensor,
+        cu_num_pages: torch.Tensor,
+        cache_loc: torch.Tensor,
+        tokens_per_block: int,
+        overlap_m: int,
+        dense_m: int,
+    ) -> List[torch.Tensor]:
+        """One-launch Triton path for the 18-output decode prepare contract.
+
+        The torch implementation of ``deepseek_v4_sparse_prepare_decode_page_addr``
+        spans ~130 tiny int kernels per forward (idea_0049); this emits the
+        identical 18 tensors from a single kernel. The torch body remains the
+        reference / CPU fallback.
+        """
+        if cache_loc.numel() == 0:
+            raise ValueError("cache_loc must contain at least one page id")
+        num_seq = int(cu_num_pages.shape[0]) - 1
+        device = input_pos.device
+        ratio = _COMPRESS_RATIO_OVERLAP_INDEXER
+        dense_ratio = _COMPRESS_RATIO_DENSE
+        full_len = overlap_m * ratio
+        cur_pid = torch.empty(num_seq, dtype=torch.long, device=device)
+        cur_poff = torch.empty(num_seq, dtype=torch.long, device=device)
+        ovl_pid = torch.empty(num_seq, 2 * ratio, dtype=torch.long, device=device)
+        ovl_poff = torch.empty(num_seq, 2 * ratio, dtype=torch.long, device=device)
+        ovl_valid = torch.empty(num_seq, 2 * ratio, dtype=torch.bool, device=device)
+        full_pid = torch.empty(num_seq, full_len, dtype=torch.long, device=device)
+        full_poff = torch.empty(num_seq, full_len, dtype=torch.long, device=device)
+        full_valid = torch.empty(num_seq, full_len, dtype=torch.bool, device=device)
+        r4_valid = torch.empty(num_seq, dtype=torch.bool, device=device)
+        r4_pos = torch.empty(num_seq, dtype=torch.long, device=device)
+        r4_mhc_pid = torch.empty(num_seq, dtype=torch.long, device=device)
+        r4_mhc_poff = torch.empty(num_seq, dtype=torch.long, device=device)
+        r128_valid = torch.empty(num_seq, dtype=torch.bool, device=device)
+        r128_pos = torch.empty(num_seq, dtype=torch.long, device=device)
+        r128_mhc_pid = torch.empty(num_seq, dtype=torch.long, device=device)
+        r128_mhc_poff = torch.empty(num_seq, dtype=torch.long, device=device)
+        r128_pos_pid = torch.empty(num_seq, dense_ratio, dtype=torch.long, device=device)
+        r128_pos_poff = torch.empty(num_seq, dense_ratio, dtype=torch.long, device=device)
+        BLOCK_N = 256
+        grid = (num_seq, triton.cdiv(full_len, BLOCK_N))
+        _dsv4_prepare_decode_meta_kernel[grid](
+            input_pos.reshape(-1),
+            position_ids.reshape(-1),
+            cu_num_pages,
+            cache_loc,
+            cur_pid,
+            cur_poff,
+            ovl_pid,
+            ovl_poff,
+            ovl_valid,
+            full_pid,
+            full_poff,
+            full_valid,
+            r4_valid,
+            r4_pos,
+            r4_mhc_pid,
+            r4_mhc_poff,
+            r128_valid,
+            r128_pos,
+            r128_mhc_pid,
+            r128_mhc_poff,
+            r128_pos_pid,
+            r128_pos_poff,
+            full_len,
+            overlap_m,
+            dense_m,
+            cache_loc.numel() - 1,
+            TPB=tokens_per_block,
+            R4=ratio,
+            R128=dense_ratio,
+            BLOCK_N=BLOCK_N,
+            num_warps=4,
+        )
+        return [
+            cur_pid,
+            cur_poff,
+            ovl_pid,
+            ovl_poff,
+            ovl_valid,
+            full_pid,
+            full_poff,
+            full_valid,
+            r4_valid,
+            r4_pos,
+            r4_mhc_pid,
+            r4_mhc_poff,
+            r128_valid,
+            r128_pos,
+            r128_mhc_pid,
+            r128_mhc_poff,
+            r128_pos_pid,
+            r128_pos_poff,
+        ]
+
+
 @torch.library.custom_op(
     "auto_deploy::deepseek_v4_sparse_prepare_decode_page_addr", mutates_args=()
 )
@@ -4957,6 +5204,26 @@ def deepseek_v4_sparse_prepare_decode_page_addr(
     discovered from the graph; it selects the completed dense row.
     """
     num_seq = int(cu_num_pages.shape[0]) - 1
+    # Single-launch Triton path (idea_0049): the torch graph below expands to ~130
+    # tiny int kernels per forward; on CUDA one fused kernel emits the identical
+    # 18-output contract. The torch body stays as the CPU / reference fallback.
+    if (
+        _HAS_TRITON
+        and overlap_max_compressed_len > 0
+        and num_seq > 0
+        and input_pos.is_cuda
+        and cu_num_pages.is_contiguous()
+        and cache_loc.is_contiguous()
+    ):
+        return _prepare_decode_meta_triton(
+            input_pos,
+            position_ids,
+            cu_num_pages,
+            cache_loc,
+            tokens_per_block,
+            int(overlap_max_compressed_len),
+            max(int(dense_max_compressed_len), 1),
+        )
     positions_long = input_pos.reshape(-1)[:num_seq].to(torch.long)
     seq_idx_long = torch.arange(num_seq, dtype=torch.long, device=positions_long.device)
     safe_positions = positions_long.clamp(min=0)
