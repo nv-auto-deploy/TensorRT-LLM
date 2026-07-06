@@ -24,6 +24,7 @@ from tensorrt_llm.mapping import Mapping
 from ..._compat import ActivationType, is_sm_100f
 from ...utils.dist_config import DistConfig
 from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+from .triton_fp8_blockscale_moe_gemv import can_use_fp8_blockscale_moe_gemv, fp8_blockscale_moe_gemv
 
 _f32_scale_cache: dict = {}
 
@@ -931,6 +932,37 @@ def trtllm_quant_finegrained_fp8_moe_fused(
         routing_weights = routing_weights.to(torch.float32).contiguous()
         fc1_weight_scale_f32 = _get_cached_f32_scale(fc1_weight_scale)
         fc2_weight_scale_f32 = _get_cached_f32_scale(fc2_weight_scale)
+
+        # total-tokens==1 decode: bypass the cpp grouped-GEMM pipeline (act quant +
+        # expand + deep_gemm swapAB GEMMs + finalize) with a two-kernel Triton
+        # fp8-blockscale GEMV chain that streams each selected local expert's
+        # weights once. Prefill and multi-token batches (M > 1, resolved at
+        # cudagraph capture time) stay on the cpp path bit-identically.
+        if (
+            is_gated_mlp
+            and act_fn == ActivationType.Swiglu
+            and can_use_fp8_blockscale_moe_gemv(
+                x2d,
+                selected_experts,
+                routing_weights,
+                fc1_expert_weights,
+                fc2_expert_weights,
+                fc1_weight_scale_f32,
+                fc2_weight_scale_f32,
+            )
+        ):
+            _, local_expert_offset, _ = _expert_layout(mapping, fc1_expert_weights.shape[0])
+            return fp8_blockscale_moe_gemv(
+                x2d,
+                selected_experts,
+                routing_weights,
+                fc1_expert_weights,
+                fc1_weight_scale_f32,
+                fc2_expert_weights,
+                fc2_weight_scale_f32,
+                local_expert_offset,
+            ).view(x_shape)
+
         quant_scales = (fc1_weight_scale_f32, fc2_weight_scale_f32)
 
         output = torch.ops.trtllm.fused_moe(
