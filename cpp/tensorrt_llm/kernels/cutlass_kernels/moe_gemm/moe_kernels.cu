@@ -1697,12 +1697,14 @@ INSTANTIATE_EXPAND_INPUT_ROWS(__nv_bfloat16, __nv_bfloat16);
 namespace
 {
 //! Host-side context bridging the DeepSeek FP8 fused expand+quantize path from runMoe (which launches the fused
-//! expand kernel) to BlockScaleFC1 (which runs the grouped gemm on the pre-quantized activations). Set per runMoe
-//! invocation on the calling thread and consumed within the same invocation, so no state leaks across calls.
+//! expand kernel) to BlockScaleFC1 (which runs the grouped gemm on the pre-quantized activations), and the fused
+//! activation+quantize path from BlockScaleFC1 (which launches the fused activation kernel) to BlockScaleFC2. Set per
+//! runMoe invocation on the calling thread and consumed within the same invocation, so no state leaks across calls.
 struct DeepSeekFusedExpandContext
 {
     char* deepseek_fc_workspace = nullptr;
     bool active = false;
+    bool fc2_prequant_active = false;
 };
 
 thread_local DeepSeekFusedExpandContext g_deepseek_fused_expand_ctx;
@@ -1858,6 +1860,119 @@ void expandInputRowsDeepSeekFp8KernelLauncher(__nv_bfloat16 const* unpermuted_in
     cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_fp8_output, permuted_act_scales, scale_leading_dim,
         unpermuted_scales, permuted_scales, permuted_row_to_unpermuted_row, num_rows, hidden_size,
         static_cast<int64_t>(k), expert_first_token_offset, static_cast<int64_t>(num_experts_per_node));
+}
+
+constexpr static int DEEPSEEK_ACTIVATION_THREADS_PER_BLOCK = 256;
+
+// Fused variant of doActivationKernel for the DeepSeek FP8 block-scale path (SM90): applies the gated activation to
+// the FC1 gemm output and quantizes the result to FP8 with 1x128 block scales in one pass, writing directly into the
+// blockscale-gemm workspace so BlockScaleFC2 does not need the standalone scale_1x128_kernel launch nor the bf16
+// fc1_result_ write+read round trip. The activation math replicates doActivationKernel (same cutlass functor in fp32,
+// same bf16 rounding of the stored value) and the quantization math replicates scale_1x128_kernel
+// (fp8_blockscale_gemm_kernel.cuh) operation-for-operation, so the FC2 grouped gemm consumes bit-identical fp8 data
+// and scales to the unfused activation -> scale_1x128 sequence.
+template <class ActFn>
+__global__ void doActivationDeepSeekFp8Kernel(__nv_bfloat16 const* gemm_result, __nv_fp8_e4m3* fp8_output,
+    float* act_scales, int64_t const scale_leading_dim, int64_t const* expert_first_token_offset,
+    int64_t const num_experts_per_node, int64_t const inter_size)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+
+    constexpr int NUM_WARPS = DEEPSEEK_ACTIVATION_THREADS_PER_BLOCK / 32;
+    int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
+    int64_t const num_k_blocks = inter_size / 128;
+    int const warp_idx = threadIdx.x / 32;
+    int const lane_id = threadIdx.x % 32;
+
+    for (int64_t token = blockIdx.x; token < num_valid_tokens; token += gridDim.x)
+    {
+        int64_t const expert
+            = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, token + 1) - 1;
+        int64_t const expert_start = expert_first_token_offset[expert];
+        int64_t const scale_row = token + computeDeepSeekPaddedOffset(expert_start, expert) - expert_start;
+
+        __nv_bfloat16 const* gemm_row_ptr = gemm_result + token * inter_size * 2;
+        __nv_fp8_e4m3* dest_row_ptr = fp8_output + token * inter_size;
+
+        for (int64_t k_block = warp_idx; k_block < num_k_blocks; k_block += NUM_WARPS)
+        {
+            // The gate operand lives in the second half of the gated gemm output row and the linear operand in the
+            // first half, matching doActivationKernel's gated_off addressing.
+            __nv_bfloat16 const* gate_line = gemm_row_ptr + inter_size + k_block * 128;
+            __nv_bfloat16 const* linear_line = gemm_row_ptr + k_block * 128;
+            __nv_fp8_e4m3* output_line = dest_row_ptr + k_block * 128;
+
+            using ComputeElem = cutlass::Array<float, 4>;
+            ComputeElem gate_value, linear_value;
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                gate_value[i] = float(gate_line[i * 32 + lane_id]);
+                linear_value[i] = float(linear_line[i * 32 + lane_id]);
+            }
+
+            ActFn fn{};
+            ComputeElem const post_act = fn(gate_value, linear_value);
+
+            // Round to bf16 exactly like doActivationKernel's store, then quantize the rounded values, so the fp8
+            // data and scales match what scale_1x128_kernel would produce from the stored bf16 activations.
+            __nv_bfloat16 act_frag[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                act_frag[i] = __nv_bfloat16(post_act[i]);
+            }
+
+            __nv_bfloat16 amax = deepSeekWarpMaxAllReduce(max(max(fabs(float(act_frag[0])), fabs(float(act_frag[1]))),
+                max(fabs(float(act_frag[2])), fabs(float(act_frag[3])))));
+            // Same clamp and select as tensorrt_llm::common::cuda_max used by scale_1x128_kernel
+            __nv_bfloat16 const eps = __nv_bfloat16(1e-10f);
+            amax = (amax > eps) ? amax : eps;
+            float const quant_scale = 448.f / float(amax);
+
+            if (lane_id == 0)
+            {
+                act_scales[k_block * scale_leading_dim + scale_row] = 1.f / quant_scale;
+            }
+
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                output_line[i * 32 + lane_id] = __nv_fp8_e4m3(float(act_frag[i]) * quant_scale);
+            }
+        }
+    }
+
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <class ActFn>
+void doActivationDeepSeekFp8KernelLauncher(__nv_bfloat16 const* gemm_result, __nv_fp8_e4m3* fp8_output,
+    float* act_scales, int64_t const scale_leading_dim, int64_t const* expert_first_token_offset,
+    int const num_experts_per_node, int64_t const inter_size, int64_t const expanded_num_rows, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(inter_size % 128 == 0, "DeepSeek FP8 fused activation requires inter_size %% 128 == 0");
+    auto* func = &doActivationDeepSeekFp8Kernel<ActFn>;
+    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const maxBlocksPerSM
+        = tensorrt_llm::common::getMaxActiveBlocksPerSM(func, DEEPSEEK_ACTIVATION_THREADS_PER_BLOCK, 0);
+    int32_t const blocks = std::min(smCount * maxBlocksPerSM, static_cast<int32_t>(expanded_num_rows));
+    int32_t const threads = DEEPSEEK_ACTIVATION_THREADS_PER_BLOCK;
+
+    cudaLaunchConfig_t config;
+    config.gridDim = blocks;
+    config.blockDim = threads;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, func, gemm_result, fp8_output, act_scales, scale_leading_dim, expert_first_token_offset,
+        static_cast<int64_t>(num_experts_per_node), inter_size);
 }
 
 enum class ScaleMode : int
@@ -3378,6 +3493,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
     g_deepseek_fused_expand_ctx.deepseek_fc_workspace = nullptr;
     g_deepseek_fused_expand_ctx.active = false;
+    g_deepseek_fused_expand_ctx.fc2_prequant_active = false;
     if (use_deepseek_fp8_block_scale)
     {
         auto* blockscale_gemm_runner = getDeepSeekBlockScaleGemmRunner();
@@ -3454,9 +3570,39 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     sync_check_cuda_error(stream);
     constexpr bool bias_is_broadcast = true;
     constexpr bool use_per_expert_act_scale = false;
-    doActivation<T, UnfusedGemmOutputType>(output, static_cast<UnfusedGemmOutputType const*>(gemm_output),
-        fc2_fp8_quant, fc1_expert_biases, bias_is_broadcast, expert_first_token_offset, num_experts_per_node,
-        inter_size, expanded_num_rows, fc1_activation_type, quant_params, use_per_expert_act_scale, nullptr, stream);
+
+    // On Hopper, fuse the FC2 1x128 activation quantization into the activation kernel: the gated activation of the
+    // FC1 gemm output is written directly as FP8 with block scales into the blockscale gemm workspace, replacing the
+    // bf16 fc1_result_ write plus the standalone scale_1x128_kernel pass that BlockScaleFC2's gemm runner would
+    // otherwise launch.
+    bool ran_fused_act_quant = false;
+    if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<UnfusedGemmOutputType, __nv_bfloat16>)
+    {
+        bool const is_plain_swiglu = fc1_activation_type.activation_type == ActivationType::Swiglu
+            && fc1_activation_type.swiglu_alpha == nullptr && fc1_activation_type.swiglu_beta == nullptr
+            && fc1_activation_type.swiglu_limit == nullptr;
+        if (is_plain_swiglu && fc1_expert_biases == nullptr && fc2_fp8_quant == nullptr && (inter_size % 128 == 0)
+            && g_deepseek_fused_expand_ctx.deepseek_fc_workspace != nullptr
+            && tensorrt_llm::common::getSMVersion() == 90)
+        {
+            auto const layout = computeDeepSeekFusedExpandLayout(
+                g_deepseek_fused_expand_ctx.deepseek_fc_workspace, expanded_num_rows, inter_size, num_experts_per_node);
+            doActivationDeepSeekFp8KernelLauncher<GLUAdaptor<cutlass::epilogue::thread::SiLu>>(
+                static_cast<__nv_bfloat16 const*>(gemm_output), layout.fp8_act, layout.act_scales,
+                layout.scale_leading_dim, expert_first_token_offset, num_experts_per_node, inter_size,
+                expanded_num_rows, stream);
+            g_deepseek_fused_expand_ctx.fc2_prequant_active = true;
+            ran_fused_act_quant = true;
+        }
+    }
+
+    if (!ran_fused_act_quant)
+    {
+        doActivation<T, UnfusedGemmOutputType>(output, static_cast<UnfusedGemmOutputType const*>(gemm_output),
+            fc2_fp8_quant, fc1_expert_biases, bias_is_broadcast, expert_first_token_offset, num_experts_per_node,
+            inter_size, expanded_num_rows, fc1_activation_type, quant_params, use_per_expert_act_scale, nullptr,
+            stream);
+    }
 
     sync_check_cuda_error(stream);
 }
@@ -3476,9 +3622,38 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     int shape_n = hidden_size;
     int shape_k = inter_size;
 
-    // NOTE: we assume gemm_runner.configureWorkspace has already been called.
-    gemm_runner.moeGemm(gemm_output, input, fc2_expert_weights, expert_first_token_offset, num_experts_per_node,
-        expected_tokens_per_expert, shape_n, shape_k, stream, nullptr, quant_params.fp8_block_scaling.fc2_scales_ptrs);
+    bool const use_fused_act_quant = g_deepseek_fused_expand_ctx.fc2_prequant_active;
+    g_deepseek_fused_expand_ctx.fc2_prequant_active = false;
+    bool ran_fused_act_quant = false;
+    if constexpr (std::is_same_v<T, __nv_bfloat16>)
+    {
+        if (use_fused_act_quant)
+        {
+            // The activations were already quantized to FP8 + 1x128 block scales by doActivationDeepSeekFp8Kernel
+            // (into the blockscale gemm workspace), so run the grouped gemm through a pre-quantized-activation
+            // runner instantiation that skips the internal scale_1x128 pass.
+            auto const layout = computeDeepSeekFusedExpandLayout(
+                g_deepseek_fused_expand_ctx.deepseek_fc_workspace, expanded_num_rows, inter_size, num_experts_per_node);
+            static thread_local kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3,
+                __nv_fp8_e4m3, __nv_bfloat16>
+                prequant_gemm_runner;
+            // Refresh the runner's padded-m state so the scale leading dimension it passes to the grouped gemm
+            // matches the layout the fused activation kernel wrote.
+            prequant_gemm_runner.getWorkspaceSizeBase(expanded_num_rows, shape_n, shape_k, num_experts_per_node);
+            prequant_gemm_runner.moeGemm(gemm_output, layout.fp8_act, fc2_expert_weights, expert_first_token_offset,
+                num_experts_per_node, expected_tokens_per_expert, shape_n, shape_k, stream, layout.act_scales,
+                quant_params.fp8_block_scaling.fc2_scales_ptrs);
+            ran_fused_act_quant = true;
+        }
+    }
+
+    if (!ran_fused_act_quant)
+    {
+        // NOTE: we assume gemm_runner.configureWorkspace has already been called.
+        gemm_runner.moeGemm(gemm_output, input, fc2_expert_weights, expert_first_token_offset, num_experts_per_node,
+            expected_tokens_per_expert, shape_n, shape_k, stream, nullptr,
+            quant_params.fp8_block_scaling.fc2_scales_ptrs);
+    }
 
     sync_check_cuda_error(stream);
 
