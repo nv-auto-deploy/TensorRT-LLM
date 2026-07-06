@@ -30,6 +30,13 @@ behind the default-config fusion passes. Eligibility is shape-gated via config
 so that only weights where the Triton GEMV measurably beats cuBLAS are swapped
 (per-rank fused qkvg / o_proj / dense-MLP projections), leaving tiny
 projections and the lm_head on cuBLAS.
+
+A second pass fuses the head-wise attention gate into the swapped o_proj GEMV:
+``triton_bf16_gemv_linear(reshape(step3p7_head_gate(attn, gate)), w)`` becomes
+``triton_bf16_gemv_head_gate_linear(attn, gate, w)``, applying the sigmoid gate
+as an in-kernel prologue while the GEMV streams its activation input. This
+drops one launch-bound elementwise kernel and one ``[1, K]`` bf16 round trip
+per attention layer at batch=1 decode, bit-identical to the unfused chain.
 """
 
 from typing import Optional, Tuple, Type
@@ -97,6 +104,61 @@ class SwapLinearGemv(BaseTransform):
             return weight
         return None
 
+    def _fuse_head_gate_prologue(self, gm: GraphModule) -> int:
+        """Fuse ``step3p7_head_gate`` into the swapped GEMV as an in-kernel prologue.
+
+        Matches ``triton_bf16_gemv_linear(reshape(step3p7_head_gate(attn, gate)), w)``
+        where the reshape is a flatten of the trailing ``[H, D]`` head dims (the
+        sharding-lowered ``auto_deploy.view`` between the gate and o_proj) and both
+        intermediates are single-use, then retargets the GEMV to
+        ``triton_bf16_gemv_head_gate_linear(attn, gate, w)``. The fused op takes the
+        pre-gate attention output directly, so the head_gate and reshape nodes die.
+        """
+        num_fused = 0
+        for node in list(gm.graph.nodes):
+            if not is_op(node, torch.ops.auto_deploy.triton_bf16_gemv_linear):
+                continue
+            reshape_node, weight_node = node.args[0], node.args[1]
+            if not is_op(reshape_node, torch.ops.aten.reshape) or len(reshape_node.users) != 1:
+                continue
+            hg_node = reshape_node.args[0]
+            if not is_op(hg_node, torch.ops.auto_deploy.step3p7_head_gate):
+                continue
+            if len(hg_node.users) != 1 or len(hg_node.args) < 2:
+                continue
+            attn_node, gate_node = hg_node.args[0], hg_node.args[1]
+            weight = self._eligible_weight(gm, weight_node)
+            if weight is None:
+                continue
+            hg_val = hg_node.meta.get("val")
+            rs_val = reshape_node.meta.get("val")
+            if hg_val is None or rs_val is None or hg_val.dim() != rs_val.dim() + 1:
+                continue
+            num_heads, head_dim = int(hg_val.shape[-2]), int(hg_val.shape[-1])
+            # The fused kernel indexes gates as k // head_dim; require pow2 head_dim and
+            # an exact flatten of the head dims into the GEMV reduction dim (leading
+            # dims unchanged, compared symbolically so no shape guards are introduced).
+            if head_dim & (head_dim - 1) != 0 or num_heads * head_dim != weight.shape[1]:
+                continue
+            if [str(s) for s in hg_val.shape[:-2]] != [str(s) for s in rs_val.shape[:-1]]:
+                continue
+            with gm.graph.inserting_before(node):
+                fused_node = gm.graph.call_function(
+                    torch.ops.auto_deploy.triton_bf16_gemv_head_gate_linear.default,
+                    args=(attn_node, gate_node, weight_node),
+                )
+            fused_node.meta.update(node.meta)
+            node.replace_all_uses_with(fused_node)
+            gm.graph.erase_node(node)
+            gm.graph.erase_node(reshape_node)
+            gm.graph.erase_node(hg_node)
+            self._log_info(
+                f"Fused head-gate prologue into GEMV '{fused_node.name}' "
+                f"(weight {tuple(weight.shape)}, {num_heads} heads x {head_dim})"
+            )
+            num_fused += 1
+        return num_fused
+
     def _apply(
         self,
         gm: GraphModule,
@@ -129,6 +191,8 @@ class SwapLinearGemv(BaseTransform):
                 f"Swapped linear '{new_node.name}' (weight {tuple(weight.shape)}) to Triton GEMV"
             )
             num_matches += 1
+
+        num_matches += self._fuse_head_gate_prologue(gm)
 
         info = TransformInfo(
             skipped=num_matches == 0,

@@ -216,6 +216,210 @@ def _run_bf16_gemv(x2d: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@triton.jit
+def _bf16_gemv_head_gate_kernel(
+    x_ptr,
+    g_ptr,
+    w_ptr,
+    y_ptr,
+    N,
+    K: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """``y[n] = dot(x * sigmoid(g) per head, w[n, :])``: gated-prologue GEMV.
+
+    ``x`` is a flattened ``[K = H * D]`` attention output (H heads of size D) and
+    ``g`` holds one gate logit per head. The prologue reproduces the standalone
+    ``_step3p7_head_gate_kernel`` numerics bit-exactly (fp32 sigmoid rounded to
+    bf16, fp32 multiply rounded to bf16) so the fused kernel matches the unfused
+    ``head_gate -> gemv`` chain bitwise; the epilogue is ``_bf16_gemv_kernel``
+    unchanged. Requires ``BLOCK_K % D == 0`` and power-of-two ``D``.
+    """
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    HB: tl.constexpr = BLOCK_K // D
+    offs_h = tl.arange(0, HB)
+    offs_d = tl.arange(0, D)
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        logit = tl.load(g_ptr + k0 // D + offs_h).to(tl.float32)
+        g = 1.0 / (1.0 + tl.exp(-logit))
+        g = g.to(tl.bfloat16).to(tl.float32)
+        a = tl.load(x_ptr + k0 + offs_h[:, None] * D + offs_d[None, :]).to(tl.float32)
+        xg = tl.reshape((a * g[:, None]).to(tl.bfloat16).to(tl.float32), (BLOCK_K,))
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        w = tl.load(
+            w_ptr + offs_n[:, None] * K + offs_k[None, :],
+            mask=mask_n[:, None],
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        acc += tl.sum(w * xg[None, :], axis=1)
+    tl.store(y_ptr + offs_n, acc.to(tl.bfloat16), mask=mask_n)
+
+
+@triton.jit
+def _bf16_gemv_head_gate_peel2_kernel(
+    x_ptr,
+    g_ptr,
+    w_ptr,
+    y_ptr,
+    N,
+    K: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BK0: tl.constexpr,
+    BK1: tl.constexpr,
+):
+    """Gated-prologue variant of ``_bf16_gemv_peel2_kernel`` (non-pow2 K, two slabs).
+
+    Same head-gate prologue contract as ``_bf16_gemv_head_gate_kernel``; requires
+    ``BK0 % D == 0`` and ``BK1 % D == 0`` and power-of-two ``D``.
+    """
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    row_ptr = w_ptr + offs_n[:, None] * K
+    offs_d = tl.arange(0, D)
+
+    HB0: tl.constexpr = BK0 // D
+    offs_h0 = tl.arange(0, HB0)
+    logit0 = tl.load(g_ptr + offs_h0).to(tl.float32)
+    g0 = 1.0 / (1.0 + tl.exp(-logit0))
+    g0 = g0.to(tl.bfloat16).to(tl.float32)
+    a0 = tl.load(x_ptr + offs_h0[:, None] * D + offs_d[None, :]).to(tl.float32)
+    xg0 = tl.reshape((a0 * g0[:, None]).to(tl.bfloat16).to(tl.float32), (BK0,))
+    w0 = tl.load(
+        row_ptr + tl.arange(0, BK0)[None, :],
+        mask=mask_n[:, None],
+        other=0.0,
+        eviction_policy="evict_first",
+    ).to(tl.float32)
+    acc = tl.sum(w0 * xg0[None, :], axis=1)
+
+    HB1: tl.constexpr = BK1 // D
+    offs_h1 = tl.arange(0, HB1)
+    logit1 = tl.load(g_ptr + HB0 + offs_h1).to(tl.float32)
+    g1 = 1.0 / (1.0 + tl.exp(-logit1))
+    g1 = g1.to(tl.bfloat16).to(tl.float32)
+    a1 = tl.load(x_ptr + BK0 + offs_h1[:, None] * D + offs_d[None, :]).to(tl.float32)
+    xg1 = tl.reshape((a1 * g1[:, None]).to(tl.bfloat16).to(tl.float32), (BK1,))
+    w1 = tl.load(
+        row_ptr + (BK0 + tl.arange(0, BK1))[None, :],
+        mask=mask_n[:, None],
+        other=0.0,
+        eviction_policy="evict_first",
+    ).to(tl.float32)
+    acc += tl.sum(w1 * xg1[None, :], axis=1)
+
+    tl.store(y_ptr + offs_n, acc.to(tl.bfloat16), mask=mask_n)
+
+
+def _head_gate_gemv_supported(
+    x2d: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, d: int
+) -> bool:
+    """Whether the fused head-gate GEMV can serve this call (else compose unfused)."""
+    if not _production_contract(x2d, weight):
+        return False
+    n, k = weight.shape
+    if d <= 0 or (d & (d - 1)) != 0 or k % d != 0:
+        return False
+    if not (gate.is_cuda and gate.dtype == torch.bfloat16 and gate.numel() == k // d):
+        return False
+    peel_cfg = _PEEL2_CONFIG_TABLE.get((n, k))
+    if peel_cfg is not None:
+        _, bk0, bk1, _ = peel_cfg
+        return bk0 % d == 0 and bk1 % d == 0
+    _, block_k, _, _ = _pick_config(n, k)
+    return block_k % d == 0
+
+
+def _run_bf16_gemv_head_gate(
+    x2d: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, d: int
+) -> torch.Tensor:
+    n, k = weight.shape
+    out = torch.empty((1, n), dtype=torch.bfloat16, device=x2d.device)
+    peel_cfg = _PEEL2_CONFIG_TABLE.get((n, k))
+    if peel_cfg is not None:
+        block_n, bk0, bk1, num_warps = peel_cfg
+        grid = (triton.cdiv(n, block_n),)
+        _bf16_gemv_head_gate_peel2_kernel[grid](
+            x2d,
+            gate,
+            weight,
+            out,
+            n,
+            K=k,
+            D=d,
+            BLOCK_N=block_n,
+            BK0=bk0,
+            BK1=bk1,
+            num_warps=num_warps,
+        )
+        return out
+    block_n, block_k, num_warps, num_stages = _pick_config(n, k)
+    grid = (triton.cdiv(n, block_n),)
+    _bf16_gemv_head_gate_kernel[grid](
+        x2d,
+        gate,
+        weight,
+        out,
+        n,
+        K=k,
+        D=d,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out
+
+
+@torch.library.custom_op("auto_deploy::triton_bf16_gemv_head_gate_linear", mutates_args=())
+def triton_bf16_gemv_head_gate_linear(
+    attn_output: torch.Tensor, gate_logits: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Head-gated projection: ``(attn_output * sigmoid(gate_logits)[..., None]) @ weight^T``.
+
+    Fuses the per-head attention gate (``auto_deploy::step3p7_head_gate``) into the
+    M==1 decode Triton GEMV as an activation prologue: the gate applies while the
+    GEMV streams its activation input, eliminating one launch-bound elementwise
+    kernel and one ``[1, K]`` bf16 round trip per attention layer. The fused path
+    is bit-identical to the unfused ``head_gate -> reshape -> gemv`` chain.
+
+    Args:
+        attn_output: ``[..., H, D]`` attention output (one row of size ``D`` per head).
+        gate_logits: ``[..., H]`` per-head gate pre-activation.
+        weight: ``(out_features, H * D)`` bf16 weight; bias is not supported.
+
+    Returns ``[..., out_features]`` with the head dims flattened away. Any call
+    outside the production contract (M > 1 prefill/multi-token batches, non-bf16
+    dtypes, incompatible D) composes the unfused ops instead, bit-identical to the
+    pre-fusion graph.
+    """
+    assert attn_output.dim() >= 2, "attn_output must be at least 2-D [..., H, D]"
+    d = attn_output.shape[-1]
+    k = attn_output.shape[-2] * d
+    x2d = attn_output.reshape(-1, k)
+    if _head_gate_gemv_supported(x2d, gate_logits, weight, d):
+        out = _run_bf16_gemv_head_gate(
+            x2d.contiguous(), gate_logits.reshape(-1).contiguous(), weight, d
+        )
+        return out.reshape(*attn_output.shape[:-2], weight.shape[0])
+    gated = torch.ops.auto_deploy.step3p7_head_gate(attn_output, gate_logits)
+    return torch.ops.aten.linear.default(gated.reshape(*gated.shape[:-2], k), weight, None)
+
+
+@triton_bf16_gemv_head_gate_linear.register_fake
+def _triton_bf16_gemv_head_gate_linear_fake(
+    attn_output: torch.Tensor, gate_logits: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return attn_output.new_empty((*attn_output.shape[:-2], weight.shape[0]))
+
+
 @torch.library.custom_op("auto_deploy::triton_bf16_gemv_linear", mutates_args=())
 def triton_bf16_gemv_linear(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``input @ weight^T`` with a single-pass Triton GEMV on the M==1 decode path.
