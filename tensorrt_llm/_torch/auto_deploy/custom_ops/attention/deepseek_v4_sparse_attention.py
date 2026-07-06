@@ -2082,6 +2082,13 @@ def _select_decode_ratio4_indexer_rows(
         visible = candidate_rows < visible_len.unsqueeze(1)
         index_score = index_score.masked_fill(~visible, float("-inf"))
     topk_count = min(index_topk, max_compressed_len)
+    if _HAS_TRITON and index_score.is_cuda and index_score.dtype == torch.float32:
+        # One-launch exact top-k select (idea_0046): replaces the fat
+        # gatherTopK / radixSortKVInPlace pair, the decomposed isfinite/where
+        # fixups and the short-history pad path with a single kernel emitting the
+        # padded rows/validity directly.  Byte-identical to the eager tail below,
+        # tie order included (see _dsv4_topk_select_kernel + the op unit test).
+        return _fused_topk_select(index_score, index_topk, topk_count)
     topk_values, topk_rows = index_score.topk(topk_count, dim=-1)
     topk_valid = torch.isfinite(topk_values)
     topk_rows = torch.where(topk_valid, topk_rows.to(torch.int64), torch.full_like(topk_rows, -1))
@@ -3103,6 +3110,72 @@ if _HAS_TRITON:
         tl.store(out_ptr + n.to(tl.int64) * C + offs_c, score, mask=c_mask)
 
     @triton.jit
+    def _dsv4_topk_select_kernel(
+        score_ptr,  # [N, C] fp32 masked index score
+        rows_ptr,  # [N, K_OUT] int64 out: selected candidate row per slot (-1 = invalid)
+        valid_ptr,  # [N, K_OUT] uint8 out: 1 iff the slot's score is finite
+        C,  # candidate count (score row width)
+        K_OUT,  # index_topk (output row width)
+        TOPK_COUNT,  # min(index_topk, C): slots filled from the sort
+        BLOCK_C: tl.constexpr,  # next_pow2(C)
+        BLOCK_K: tl.constexpr,  # next_pow2(K_OUT)
+    ):
+        """Exact decode top-k row selection for the ratio-4 indexer (idea_0046).
+
+        One program per decode row.  It replaces ``index_score.topk(topk_count)``
+        (the fat ``gatherTopK`` + ``radixSortKVInPlace`` pair), the decomposed
+        ``isfinite`` chain, the ``where``-to-``-1`` fixup and the short-history
+        -1/False pad path with a single launch that emits the padded
+        ``topk_rows`` / ``topk_valid`` directly.
+
+        The score row is packed into one sortable int64 key per candidate:
+        ``inv_u`` is the IEEE-754 float-flip (ascending ``inv_u`` == descending
+        float total order, the transform CUDA's radix top-k uses) in the high
+        bits, the candidate index in the low 31 bits.  ``-0.0`` is canonicalized
+        to ``+0.0`` first because torch's top-k compares them equal (ties break
+        by ascending index, which the low bits reproduce).  A bitonic
+        ``tl.sort`` of the keys therefore yields exactly torch's value order,
+        tie order included; non-finite scores (the ``-inf`` visibility mask)
+        decode to ``valid == 0`` / ``row == -1`` just like the eager
+        ``isfinite``/``where`` tail.  NaN scores sort first (torch's "NaN is
+        largest") and also emit ``-1``; only the relative order *among* multiple
+        differently-signed NaNs may differ, where every affected slot is ``-1``
+        either way.
+        """
+        n = tl.program_id(0)
+        c = tl.arange(0, BLOCK_C)
+        cmask = c < C
+        s = tl.load(score_ptr + n.to(tl.int64) * C + c, mask=cmask, other=float("-inf"))
+        # torch's top-k orders +-0.0 as equal keys; distinct bit patterns would
+        # rank +0.0 above -0.0, so fold both onto the +0.0 pattern.
+        s = tl.where(s == 0.0, 0.0, s)
+        u = s.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+        # Float-flip: negative floats (sign bit set) already ascend toward -inf as
+        # raw bits; positive floats are mirrored below them.
+        inv_u = tl.where(u >= 0x80000000, u, 0x7FFFFFFF - u)
+        # Padding lanes sort after every real candidate (-inf included).  A real
+        # 0xFFFFFFFF (negative-NaN payload) key ties with padding and wins the tie
+        # via its smaller low-bits index, so it is never displaced out of the row.
+        inv_u = tl.where(cmask, inv_u, 0xFFFFFFFF)
+        key = (inv_u << 31) | c.to(tl.int64)
+        key = tl.sort(key)
+        idx_s = key & 0x7FFFFFFF
+        inv_s = key >> 31
+        # Strictly-finite window == torch.isfinite: -inf flips to 0xFF800000, +inf
+        # to 0x007FFFFF, NaN payloads fall outside on either side.
+        valid = (inv_s > 0x007FFFFF) & (inv_s < 0xFF800000)
+        rows = tl.where(valid, idx_s, tl.full((BLOCK_C,), -1, tl.int64))
+        out_base = n.to(tl.int64) * K_OUT
+        smask = c < TOPK_COUNT
+        tl.store(rows_ptr + out_base + c, rows, mask=smask)
+        tl.store(valid_ptr + out_base + c, valid.to(tl.uint8), mask=smask)
+        # Short-history pad tail (topk_count < index_topk): -1 rows, False validity.
+        p = tl.arange(0, BLOCK_K)
+        pmask = (p >= TOPK_COUNT) & (p < K_OUT)
+        tl.store(rows_ptr + out_base + p, tl.full((BLOCK_K,), -1, tl.int64), mask=pmask)
+        tl.store(valid_ptr + out_base + p, tl.zeros((BLOCK_K,), tl.uint8), mask=pmask)
+
+    @triton.jit
     def _dsv4_assemble_selected_kv_kernel(
         swa_cache_ptr,  # [P, T, D] paged local (sliding-window) kv cache
         mhc_cache_ptr,  # [P, T, D] paged compressed kv cache (same P/T/D/dtype as swa)
@@ -4065,6 +4138,43 @@ def _fused_index_score(
         num_warps=4,
     )
     return out
+
+
+def _fused_topk_select(
+    index_score: torch.Tensor,  # [N, C] fp32 masked index score
+    index_topk: int,
+    topk_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One-launch exact decode top-k row selection (idea_0046).
+
+    Replaces the ``index_score.topk(topk_count)`` + ``isfinite`` + ``where`` +
+    pad tail of ``_select_decode_ratio4_indexer_rows`` with a single kernel that
+    emits the padded ``[N, index_topk]`` rows / validity directly.  Byte-identical
+    to the eager chain for finite and ``-inf`` scores, tie order included
+    (validated in the op unit test); see ``_dsv4_topk_select_kernel``.
+    """
+    num_rows, c = int(index_score.shape[0]), int(index_score.shape[1])
+    device = index_score.device
+    rows = torch.empty(num_rows, index_topk, dtype=torch.int64, device=device)
+    valid = torch.empty(num_rows, index_topk, dtype=torch.uint8, device=device)
+    if num_rows == 0 or index_topk == 0:
+        return rows, valid.view(torch.bool)
+    if c == 0 or topk_count <= 0:
+        rows.fill_(-1)
+        valid.zero_()
+        return rows, valid.view(torch.bool)
+    _dsv4_topk_select_kernel[(num_rows,)](
+        index_score.contiguous(),
+        rows,
+        valid,
+        c,
+        index_topk,
+        min(topk_count, c),
+        BLOCK_C=triton.next_power_of_2(c),
+        BLOCK_K=triton.next_power_of_2(index_topk),
+        num_warps=4,
+    )
+    return rows, valid.view(torch.bool)
 
 
 def _can_use_fused_sparse_attention(
