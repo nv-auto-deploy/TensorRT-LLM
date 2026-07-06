@@ -130,6 +130,11 @@ def _bf16_gemv_peel2_kernel(
 # from a CUDA-graph replay sweep on H100 over the Step-3.7-Flash per-rank TP8
 # decode shapes with one distinct weight per call (L2-busted, HBM-streamed like
 # the real 45-layer decode step). Measured speedup vs cuBLAS in parentheses.
+# The o_proj entries are shared with the gated head-gate variants (their only
+# production consumer after the head-gate fusion); sharing each entry keeps the
+# fused path bit-identical to the unfused chain. A gated re-sweep confirmed the
+# (4096, 1024) entry optimal for the gated kernel as well (pairwise A/B on 3
+# GPUs; all alternatives within +-1% or worse).
 _KERNEL_CONFIG_TABLE = {
     (1288, 4096): (1, 4096, 8, 3),  # fused qkvg, full attn (1.50x)
     (1804, 4096): (1, 4096, 8, 3),  # fused qkvg, sliding attn (1.39x)
@@ -143,7 +148,10 @@ _KERNEL_CONFIG_TABLE = {
 # (N, K) -> (BLOCK_N, BK0, BK1, num_warps), with BK0 + BK1 == K. Only wins where
 # non-pow2 K forces the loop kernel into narrow slabs; measured on H100.
 _PEEL2_CONFIG_TABLE = {
-    (4096, 1536): (2, 1024, 512, 4),  # o_proj, sliding attn (-2.9% vs looped best)
+    # o_proj, sliding attn: narrow-then-wide slabs at one warp per CTA, re-swept
+    # for the gated head-gate variant (-3.5% vs the prior (2, 1024, 512, 4)
+    # entry, pairwise CUDA-graph A/B reproduced on 3 H100s).
+    (4096, 1536): (2, 512, 1024, 1),
 }
 
 
