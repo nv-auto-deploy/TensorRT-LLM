@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -144,6 +144,32 @@ bool is_tma_multicast_legal(int n, int block_n, int num_tma_multicast, int num_s
 GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_groups,
     int num_device_sms, bool is_grouped_contiguous = false, bool swap_ab = false)
 {
+    // SwapAB decode specialization: callers pass the (tiny) token count as shape_n, so
+    // shape_n <= 16 means a single BLOCK_N tile covers all tokens and the only CTA
+    // parallelism left is div_up(shape_m, block_m) per active group. The generic wave
+    // model below assumes every group is dense, which for grouped MoE decode (only a
+    // handful of experts receive tokens) tie-breaks to BLOCK_M=128 and leaves far fewer
+    // CTAs than num_device_sms streaming the expert weights. BLOCK_M=64 doubles the CTA
+    // count over the weight rows, which is what bounds achieved memory bandwidth here.
+    if (swap_ab && shape_n <= 16)
+    {
+        constexpr int block_m = 64;
+        constexpr int block_n = 16;
+        constexpr int sm90_capacity = 232448;
+        int num_stages = 0;
+        int smem_size = 0;
+        for (int stages : {8, 7, 6, 5, 4})
+        {
+            smem_size = get_smem_size(stages, shape_k, block_m, block_n, 128, true);
+            if (smem_size <= sm90_capacity)
+            {
+                num_stages = stages;
+                break;
+            }
+        }
+        return std::make_tuple(block_m, block_n, num_stages, 1, smem_size);
+    }
+
     // Choose candidate block sizes
     std::vector<int> block_ms;
     block_ms.push_back((!is_grouped_contiguous && shape_m <= 64) ? 64 : 128);
