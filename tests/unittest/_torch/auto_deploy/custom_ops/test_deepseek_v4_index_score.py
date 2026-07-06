@@ -73,7 +73,8 @@ def test_fused_index_score_selection_matches_eager(num_rows, index_head_dim, vis
     visible_len = torch.full((num_rows,), vlen, device=device, dtype=torch.int64)
 
     assert M._HAS_TRITON, "test requires triton"
-    fused = M._fused_index_score(q_index, index_k, weights, visible_len, c)
+    # input_pos with (input_pos + 1) // 4 == visible_len (the in-kernel visibility form).
+    fused = M._fused_index_score(q_index, index_k, weights, visible_len * 4 - 1, c, 4)
     eager = _eager_index_score(q_index, index_k, weights, visible_len, c)
 
     assert fused.shape == (num_rows, c)
@@ -104,7 +105,8 @@ def test_fused_index_score_partial_topk_matches_eager(index_topk):
     weights = torch.randn(num_rows, h, device=device, dtype=torch.float32) * (d**-0.5)
     visible_len = torch.tensor([c, 300], device=device, dtype=torch.int64)
 
-    fused = M._fused_index_score(q_index, index_k, weights, visible_len, c)
+    # input_pos with (input_pos + 1) // 4 == visible_len (the in-kernel visibility form).
+    fused = M._fused_index_score(q_index, index_k, weights, visible_len * 4 - 1, c, 4)
     eager = _eager_index_score(q_index, index_k, weights, visible_len, c)
     rows_f, valid_f = _topk_tail(fused, index_topk, c)
     rows_e, valid_e = _topk_tail(eager, index_topk, c)
@@ -132,7 +134,8 @@ def test_fused_index_score_ties_and_validity():
     weights = torch.randn(num_rows, h, device=device, dtype=torch.float32) * (d**-0.5)
     visible_len = torch.tensor([200], device=device, dtype=torch.int64)
 
-    fused = M._fused_index_score(q_index, index_k, weights, visible_len, c)
+    # input_pos with (input_pos + 1) // 4 == visible_len (the in-kernel visibility form).
+    fused = M._fused_index_score(q_index, index_k, weights, visible_len * 4 - 1, c, 4)
     eager = _eager_index_score(q_index, index_k, weights, visible_len, c)
 
     assert torch.equal(torch.isfinite(fused), torch.isfinite(eager))
@@ -153,6 +156,6 @@ def test_fused_index_score_empty_rows():
     q_index = torch.empty(0, 64, 128, device=device, dtype=dtype)
     index_k = torch.empty(0, 512, 128, device=device, dtype=dtype)
     weights = torch.empty(0, 64, device=device, dtype=torch.float32)
-    visible_len = torch.empty(0, device=device, dtype=torch.int64)
-    out = M._fused_index_score(q_index, index_k, weights, visible_len, 512)
+    input_pos = torch.empty(0, device=device, dtype=torch.int64)
+    out = M._fused_index_score(q_index, index_k, weights, input_pos, 512, 4)
     assert out.shape == (0, 512)
