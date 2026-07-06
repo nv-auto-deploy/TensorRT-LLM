@@ -80,7 +80,7 @@ def _build_inputs(compress_ratio, num_rows, seed):
     overlap_page_map = None
     if compress_ratio == 4:
         outs = M.deepseek_v4_sparse_prepare_decode_page_addr(
-            input_pos, cu_num_pages, cache_loc, tokens_per_block, max_compressed_len
+            input_pos, position_ids, cu_num_pages, cache_loc, tokens_per_block, max_compressed_len
         )
         overlap_page_map = (outs[2][:num_rows], outs[3][:num_rows], outs[4][:num_rows])
 

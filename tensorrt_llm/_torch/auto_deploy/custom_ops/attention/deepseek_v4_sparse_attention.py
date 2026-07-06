@@ -1685,6 +1685,71 @@ def _batched_overlap_compressed_rows_fullrange(
     return _apply_compressed_rope_and_quantize(pooled, cos, sin, rope_dim, rotate=rotate)
 
 
+def _compressed_row_update_metadata(
+    input_pos: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_idx: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    tokens_per_block: int,
+    compress_ratio: int,
+    max_compressed_len: int,
+    want_pos_map: bool,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    """Per-decode-row compressed-cache update metadata for one compression ratio.
+
+    Returns ``(row_valid, row_position_id, mhc_page_ids, mhc_page_offsets,
+    pos_page_ids, pos_page_offsets)``.  The first four -- whether this decode step
+    completes a compressed row, the query-relative RoPE position of that row, and
+    the ``(page_id, page_offset)`` write address of the completed row in ``mhc_cache``
+    -- are identical for every layer of the given ``compress_ratio`` because they
+    depend only on ``input_pos`` / ``position_ids`` and the shared page table.  The
+    dense (ratio-128, non-overlap) update additionally reads the ``[num_seq, ratio]``
+    compressor-token page map (``want_pos_map=True``); the overlap (ratio-4) update
+    reads through its separately hoisted overlap band map instead, so it requests
+    ``want_pos_map=False`` and the pos map is ``None``.
+
+    This is the single source of truth shared by the per-layer
+    ``_update_decode_compressed_caches`` (when the metadata is not hoisted) and the
+    once-per-forward ``deepseek_v4_sparse_prepare_decode_page_addr`` hoist, so the
+    hoisted values are bit-identical to the per-layer computation they replace.
+    """
+    input_pos = input_pos.to(torch.long)
+    position_ids = position_ids.to(torch.long)
+    old_completed = input_pos // compress_ratio
+    new_completed = (input_pos + 1) // compress_ratio
+    row_valid = (new_completed > old_completed) & (old_completed < max_compressed_len)
+    row_idx = old_completed.clamp(min=0, max=max_compressed_len - 1)
+    row_position_id = position_ids - (input_pos - row_idx * compress_ratio)
+    row_logical_pos = row_idx * compress_ratio
+    mhc_page_ids, mhc_page_offsets, _ = _page_ids_and_offsets_from_tpb(
+        tokens_per_block, seq_idx, row_logical_pos, cu_num_pages, cache_loc
+    )
+    pos_page_ids = None
+    pos_page_offsets = None
+    if want_pos_map:
+        offsets = torch.arange(compress_ratio, dtype=torch.long, device=input_pos.device)
+        positions = row_logical_pos.unsqueeze(1) + offsets.view(1, -1)  # [num_seq, ratio]
+        pos_page_ids, pos_page_offsets, _ = _page_ids_and_offsets_from_tpb(
+            tokens_per_block, seq_idx, positions, cu_num_pages, cache_loc
+        )
+    return (
+        row_valid,
+        row_position_id,
+        mhc_page_ids,
+        mhc_page_offsets,
+        pos_page_ids,
+        pos_page_offsets,
+    )
+
+
 def _update_decode_compressed_caches(
     compressor_kv_decode: torch.Tensor,
     compressor_gate_decode: torch.Tensor,
@@ -1705,6 +1770,16 @@ def _update_decode_compressed_caches(
     compress_ratio: int,
     max_compressed_len: int,
     overlap_page_map: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    update_meta: Optional[
+        Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ]
+    ] = None,
 ) -> None:
     mode = _compression_mode(compress_ratio)
     if not mode.enabled or compressor_kv_decode.numel() == 0:
@@ -1720,18 +1795,39 @@ def _update_decode_compressed_caches(
     # compressed row (``row_logical_pos``), a different logical position, and keeps
     # its own per-layer translation + validity-masked store.
 
-    old_completed = input_pos // compress_ratio
-    new_completed = (input_pos + 1) // compress_ratio
-    row_valid = (new_completed > old_completed) & (old_completed < max_compressed_len)
-    row_idx = old_completed.clamp(min=0, max=max_compressed_len - 1)
-    row_position_id = position_ids_decode.to(torch.long) - (input_pos - row_idx * compress_ratio)
-    row_logical_pos = row_idx * compress_ratio
-    # The mhc read (previous_rows, eager fallback only) and the write below both target
-    # ``row_logical_pos`` of mhc_cache, so they resolve to one page map. Compute it once
-    # and feed both the read and the write -- the second translation chain is removed.
-    mhc_page_ids, mhc_page_offsets, _ = _decode_page_ids_and_offsets(
-        mhc_cache, seq_idx, row_logical_pos, cu_num_pages, cache_loc
-    )
+    # Per-row update metadata (row_valid / query-relative rope position / mhc write
+    # address; and, for the dense ratio-128 layers, the [num_seq, ratio] compressor
+    # read page map). Every layer of this compression ratio resolves identical values,
+    # so ``deepseek_v4_sparse_prepare_decode_page_addr`` hoists them once per forward
+    # and threads them in via ``update_meta`` (idea_0044); when absent (eager/CPU, or no
+    # prepare op) they are computed here. ``row_idx`` / ``row_logical_pos`` are cheap and
+    # consumed only by the eager fallback below, so they stay local to that branch.
+    if update_meta is not None:
+        (
+            row_valid,
+            row_position_id,
+            mhc_page_ids,
+            mhc_page_offsets,
+            hoisted_pos_page_ids,
+            hoisted_pos_page_offsets,
+        ) = update_meta
+    else:
+        old_completed = input_pos // compress_ratio
+        new_completed = (input_pos + 1) // compress_ratio
+        row_valid = (new_completed > old_completed) & (old_completed < max_compressed_len)
+        row_idx = old_completed.clamp(min=0, max=max_compressed_len - 1)
+        row_position_id = position_ids_decode.to(torch.long) - (
+            input_pos - row_idx * compress_ratio
+        )
+        row_logical_pos = row_idx * compress_ratio
+        # The mhc read (previous_rows, eager fallback only) and the write below both target
+        # ``row_logical_pos`` of mhc_cache, so they resolve to one page map. Compute it once
+        # and feed both the read and the write -- the second translation chain is removed.
+        mhc_page_ids, mhc_page_offsets, _ = _decode_page_ids_and_offsets(
+            mhc_cache, seq_idx, row_logical_pos, cu_num_pages, cache_loc
+        )
+        hoisted_pos_page_ids = None
+        hoisted_pos_page_offsets = None
 
     # Fused ratio-4 path (idea_0007): the overlap reconstruction (gather / slice /
     # ape-add / where / cat / pool / rmsnorm), the rope/fp8-quant tail
@@ -1797,14 +1893,21 @@ def _update_decode_compressed_caches(
         and nope_dim > 0
         and nope_dim % 64 == 0
     ):
-        offsets = torch.arange(compress_ratio, dtype=torch.long, device=row_idx.device)
-        anchor = row_idx.to(torch.long) * compress_ratio
-        positions = anchor.unsqueeze(1) + offsets.view(1, -1)  # [N, ratio]
-        # kv and gate caches share one page table + tokens_per_block, so the reads at these
-        # positions resolve to one page map -- bit-identical to the fallback's translation.
-        pos_page_ids, pos_page_offsets, _ = _decode_page_ids_and_offsets(
-            compressor_kv_cache, seq_idx, positions, cu_num_pages, cache_loc
-        )
+        if hoisted_pos_page_ids is not None:
+            # Hoisted once per forward by the prepare op and shared by every ratio-128
+            # layer (they all read the identical [num_seq, ratio] compressor positions).
+            pos_page_ids = hoisted_pos_page_ids
+            pos_page_offsets = hoisted_pos_page_offsets
+        else:
+            offsets = torch.arange(compress_ratio, dtype=torch.long, device=row_idx.device)
+            anchor = row_idx.to(torch.long) * compress_ratio
+            positions = anchor.unsqueeze(1) + offsets.view(1, -1)  # [N, ratio]
+            # kv and gate caches share one page table + tokens_per_block, so the reads at
+            # these positions resolve to one page map -- bit-identical to the fallback's
+            # translation.
+            pos_page_ids, pos_page_offsets, _ = _decode_page_ids_and_offsets(
+                compressor_kv_cache, seq_idx, positions, cu_num_pages, cache_loc
+            )
         row_position_id_clamped = row_position_id.to(torch.long).clamp(
             min=0, max=cos_table.shape[0] - 1
         )
@@ -1830,6 +1933,13 @@ def _update_decode_compressed_caches(
         )
         return
 
+    # Eager fallback (CPU / non-Triton / unsupported shapes). The hoisted metadata does
+    # not carry ``row_idx`` / ``row_logical_pos`` (only this path consumes them and they
+    # are cheap), so recompute them locally when the metadata was hoisted.
+    if update_meta is not None:
+        old_completed = input_pos // compress_ratio
+        row_idx = old_completed.clamp(min=0, max=max_compressed_len - 1)
+        row_logical_pos = row_idx * compress_ratio
     compressed_rows = _batched_compressed_rows_from_paged_state(
         compressor_kv_cache,
         compressor_gate_cache,
@@ -2133,6 +2243,16 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
     full_page_ids: Optional[torch.Tensor],
     full_page_offsets: Optional[torch.Tensor],
     full_valid: Optional[torch.Tensor],
+    r4_row_valid: Optional[torch.Tensor],
+    r4_row_position_id: Optional[torch.Tensor],
+    r4_mhc_page_ids: Optional[torch.Tensor],
+    r4_mhc_page_offsets: Optional[torch.Tensor],
+    r128_row_valid: Optional[torch.Tensor],
+    r128_row_position_id: Optional[torch.Tensor],
+    r128_mhc_page_ids: Optional[torch.Tensor],
+    r128_mhc_page_offsets: Optional[torch.Tensor],
+    r128_pos_page_ids: Optional[torch.Tensor],
+    r128_pos_page_offsets: Optional[torch.Tensor],
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -2181,6 +2301,32 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             full_page_ids[:num_decode],
             full_page_offsets[:num_decode],
             full_valid[:num_decode],
+        )
+
+    # Compressed-cache UPDATE metadata (idea_0044), hoisted once per forward by
+    # ``deepseek_v4_sparse_prepare_decode_page_addr`` and shared by every layer of this
+    # ratio class. Select the bundle matching this layer's ratio and slice to the active
+    # decode sequences; ``None`` falls back to per-layer computation inside
+    # ``_update_decode_compressed_caches`` (the R4 bundle carries no compressor read
+    # page map -- that path reads through ``overlap_page_map`` instead).
+    update_meta = None
+    if compress_ratio == _COMPRESS_RATIO_OVERLAP_INDEXER and r4_row_valid is not None:
+        update_meta = (
+            r4_row_valid[:num_decode],
+            r4_row_position_id[:num_decode],
+            r4_mhc_page_ids[:num_decode],
+            r4_mhc_page_offsets[:num_decode],
+            None,
+            None,
+        )
+    elif compress_ratio == _COMPRESS_RATIO_DENSE and r128_row_valid is not None:
+        update_meta = (
+            r128_row_valid[:num_decode],
+            r128_row_position_id[:num_decode],
+            r128_mhc_page_ids[:num_decode],
+            r128_mhc_page_offsets[:num_decode],
+            r128_pos_page_ids[:num_decode],
+            r128_pos_page_offsets[:num_decode],
         )
 
     # Current-token cache writes (idea_0006). Every DeepSeek-V4 cache listed below
@@ -2247,6 +2393,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             compress_ratio,
             max_compressed_len,
             overlap_page_map,
+            update_meta,
         )
         indexer_q_decode = _flatten_decode_tokens(indexer_q, num_decode)
         indexer_weights_decode = _flatten_decode_tokens(indexer_weights, num_decode)
@@ -4342,10 +4489,12 @@ def torch_deepseek_v4_sparse_attention_fake(
 )
 def deepseek_v4_sparse_prepare_decode_page_addr(
     input_pos: torch.Tensor,
+    position_ids: torch.Tensor,
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
     tokens_per_block: int,
     overlap_max_compressed_len: int = 0,
+    dense_max_compressed_len: int = 0,
 ) -> List[torch.Tensor]:
     """Precompute the current-token paged write address once per forward.
 
@@ -4364,6 +4513,15 @@ def deepseek_v4_sparse_prepare_decode_page_addr(
     decode op slices ``[:num_decode]``.  Mirrors ``_decode_page_ids_and_offsets``
     for ``seq_idx = arange(num_seq)`` and ``positions = input_pos`` so the
     produced addresses are bit-identical to the per-layer computation.
+
+    When ``overlap_max_compressed_len > 0`` (the production contract) it also
+    emits the ratio-4 overlap band / full-range page maps (6 tensors) and the
+    compressed-cache UPDATE metadata for the ratio-4 and ratio-128 layers
+    (idea_0044): ``row_valid`` / query-relative rope position / ``mhc_cache``
+    write address for each ratio (4 + 4 tensors), plus the ratio-128
+    ``[num_seq, ratio]`` compressor read page map (2 tensors) -- 18 outputs
+    total.  ``dense_max_compressed_len`` is the ratio-128 ``max_compressed_len``
+    discovered from the graph; it selects the completed dense row.
     """
     num_seq = int(cu_num_pages.shape[0]) - 1
     positions_long = input_pos.reshape(-1)[:num_seq].to(torch.long)
@@ -4413,16 +4571,70 @@ def deepseek_v4_sparse_prepare_decode_page_addr(
             full_page_offsets,
             full_valid,
         ]
+        # Compressed-cache UPDATE metadata (idea_0044). Every layer of a given
+        # compression ratio resolves the identical row_valid / query-relative rope
+        # position / mhc write address (they depend only on input_pos / position_ids
+        # and the shared page table); the dense ratio-128 layers additionally read the
+        # identical [num_seq, ratio] compressor page map. Compute each ratio's bundle
+        # once here via the shared metadata helper so it is bit-identical to the
+        # per-layer ``_update_decode_compressed_caches`` computation, and thread it into
+        # every matching layer. Fixed contract: the ratio-4 bundle (4 tensors) then the
+        # ratio-128 bundle (6 tensors) -> 18 outputs total.
+        position_ids_long = position_ids.reshape(-1)[:num_seq].to(torch.long)
+        r4_valid, r4_pos, r4_mhc_pid, r4_mhc_poff, _, _ = _compressed_row_update_metadata(
+            positions_long,
+            position_ids_long,
+            seq_idx_long,
+            cu_num_pages,
+            cache_loc,
+            tokens_per_block,
+            _COMPRESS_RATIO_OVERLAP_INDEXER,
+            m,
+            want_pos_map=False,
+        )
+        dense_m = max(int(dense_max_compressed_len), 1)
+        (
+            r128_valid,
+            r128_pos,
+            r128_mhc_pid,
+            r128_mhc_poff,
+            r128_pos_pid,
+            r128_pos_poff,
+        ) = _compressed_row_update_metadata(
+            positions_long,
+            position_ids_long,
+            seq_idx_long,
+            cu_num_pages,
+            cache_loc,
+            tokens_per_block,
+            _COMPRESS_RATIO_DENSE,
+            dense_m,
+            want_pos_map=True,
+        )
+        outs += [
+            r4_valid,
+            r4_pos,
+            r4_mhc_pid,
+            r4_mhc_poff,
+            r128_valid,
+            r128_pos,
+            r128_mhc_pid,
+            r128_mhc_poff,
+            r128_pos_pid,
+            r128_pos_poff,
+        ]
     return outs
 
 
 @deepseek_v4_sparse_prepare_decode_page_addr.register_fake
 def deepseek_v4_sparse_prepare_decode_page_addr_fake(
     input_pos: torch.Tensor,
+    position_ids: torch.Tensor,
     cu_num_pages: torch.Tensor,
     cache_loc: torch.Tensor,
     tokens_per_block: int,
     overlap_max_compressed_len: int = 0,
+    dense_max_compressed_len: int = 0,
 ) -> List[torch.Tensor]:
     num_seq = cu_num_pages.shape[0] - 1
     device = input_pos.device
@@ -4433,6 +4645,7 @@ def deepseek_v4_sparse_prepare_decode_page_addr_fake(
     if overlap_max_compressed_len > 0:
         ratio = _COMPRESS_RATIO_OVERLAP_INDEXER
         m = int(overlap_max_compressed_len)
+        dense_ratio = _COMPRESS_RATIO_DENSE
         outs += [
             torch.empty(num_seq, 2 * ratio, dtype=torch.long, device=device),
             torch.empty(num_seq, 2 * ratio, dtype=torch.long, device=device),
@@ -4440,6 +4653,21 @@ def deepseek_v4_sparse_prepare_decode_page_addr_fake(
             torch.empty(num_seq, m * ratio, dtype=torch.long, device=device),
             torch.empty(num_seq, m * ratio, dtype=torch.long, device=device),
             torch.empty(num_seq, m * ratio, dtype=torch.bool, device=device),
+            # Compressed-cache UPDATE metadata (idea_0044): ratio-4 bundle (4) then
+            # ratio-128 bundle (6). The [num_seq, dense_ratio] pos map shape is fixed
+            # by the dense compression ratio (independent of dense_max_compressed_len).
+            torch.empty(num_seq, dtype=torch.bool, device=device),  # r4_row_valid
+            torch.empty(num_seq, dtype=torch.long, device=device),  # r4_row_position_id
+            torch.empty(num_seq, dtype=torch.long, device=device),  # r4_mhc_page_ids
+            torch.empty(num_seq, dtype=torch.long, device=device),  # r4_mhc_page_offsets
+            torch.empty(num_seq, dtype=torch.bool, device=device),  # r128_row_valid
+            torch.empty(num_seq, dtype=torch.long, device=device),  # r128_row_position_id
+            torch.empty(num_seq, dtype=torch.long, device=device),  # r128_mhc_page_ids
+            torch.empty(num_seq, dtype=torch.long, device=device),  # r128_mhc_page_offsets
+            torch.empty(num_seq, dense_ratio, dtype=torch.long, device=device),  # r128_pos_page_ids
+            torch.empty(
+                num_seq, dense_ratio, dtype=torch.long, device=device
+            ),  # r128_pos_page_offsets
         ]
     return outs
 
@@ -4489,6 +4717,16 @@ def torch_deepseek_v4_sparse_attention_with_cache(
     full_page_ids: torch.Tensor,
     full_page_offsets: torch.Tensor,
     full_valid: torch.Tensor,
+    r4_row_valid: torch.Tensor,
+    r4_row_position_id: torch.Tensor,
+    r4_mhc_page_ids: torch.Tensor,
+    r4_mhc_page_offsets: torch.Tensor,
+    r128_row_valid: torch.Tensor,
+    r128_row_position_id: torch.Tensor,
+    r128_mhc_page_ids: torch.Tensor,
+    r128_mhc_page_offsets: torch.Tensor,
+    r128_pos_page_ids: torch.Tensor,
+    r128_pos_page_offsets: torch.Tensor,
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -4572,6 +4810,16 @@ def torch_deepseek_v4_sparse_attention_with_cache(
             full_page_ids,
             full_page_offsets,
             full_valid,
+            r4_row_valid,
+            r4_row_position_id,
+            r4_mhc_page_ids,
+            r4_mhc_page_offsets,
+            r128_row_valid,
+            r128_row_position_id,
+            r128_mhc_page_ids,
+            r128_mhc_page_offsets,
+            r128_pos_page_ids,
+            r128_pos_page_offsets,
             swa_cache,
             mhc_cache,
             compressor_kv_cache,
@@ -4823,6 +5071,16 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
     full_page_ids: torch.Tensor,
     full_page_offsets: torch.Tensor,
     full_valid: torch.Tensor,
+    r4_row_valid: torch.Tensor,
+    r4_row_position_id: torch.Tensor,
+    r4_mhc_page_ids: torch.Tensor,
+    r4_mhc_page_offsets: torch.Tensor,
+    r128_row_valid: torch.Tensor,
+    r128_row_position_id: torch.Tensor,
+    r128_mhc_page_ids: torch.Tensor,
+    r128_mhc_page_offsets: torch.Tensor,
+    r128_pos_page_ids: torch.Tensor,
+    r128_pos_page_offsets: torch.Tensor,
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -4973,28 +5231,39 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
                 "forward it to get_prepare_extra_metadata_info."
             )
         tokens_per_block = int(sequence_info.tokens_per_block)
-        # Discover the ratio-4 (overlap+indexer) max_compressed_len shared by every
-        # ratio-4 layer so the prepare op can also hoist their compressed-row /
-        # full-range page maps. This method only receives one source node, so scan
-        # the shared graph for all sparse-attn nodes.
+        # Discover the ratio-4 (overlap+indexer) and ratio-128 (dense) max_compressed_len
+        # shared by every layer of the respective ratio so the prepare op can hoist their
+        # compressed-row / full-range page maps and their compressed-cache update metadata
+        # (idea_0044). Every layer of a given ratio shares one max_compressed_len (it is
+        # derived only from compress_ratio and a global config), so the per-ratio max is
+        # that uniform value. This method only receives one source node, so scan the shared
+        # graph for all sparse-attn nodes.
         overlap_m = 0
+        dense_m = 0
         source_op = cls.get_source_attention_op()
         for n in any_source_attn_node.graph.nodes:
             if not is_op(n, source_op):
                 continue
             cr, mcl = extract_op_args(n, "compress_ratio", "max_compressed_len")
-            if cr == _COMPRESS_RATIO_OVERLAP_INDEXER and isinstance(mcl, int) and mcl > 0:
+            if not isinstance(mcl, int) or mcl <= 0:
+                continue
+            if cr == _COMPRESS_RATIO_OVERLAP_INDEXER:
                 overlap_m = max(overlap_m, mcl)
-        # Fixed 8-output contract: 2 current-token addresses + 6 ratio-4 map tensors
-        # (overlap page_ids/page_offsets/valid + full-range page_ids/page_offsets/valid).
-        # Keep ``overlap_m >= 1`` so the map shapes stay valid and the per-layer
-        # argument alignment is invariant even when no ratio-4 layer is present (the
-        # dummy maps are then never consumed).
+            elif cr == _COMPRESS_RATIO_DENSE:
+                dense_m = max(dense_m, mcl)
+        # Fixed 18-output contract: 2 current-token addresses + 6 ratio-4 map tensors
+        # (overlap page_ids/page_offsets/valid + full-range page_ids/page_offsets/valid)
+        # + 10 update-metadata tensors (ratio-4 row_valid/row_position_id/mhc page_ids/
+        # page_offsets, then the same 4 for ratio-128, then the ratio-128 [N, ratio]
+        # compressor read page_ids/page_offsets). Keep ``overlap_m`` / ``dense_m`` >= 1 so
+        # the map shapes stay valid and the per-layer argument alignment is invariant even
+        # when a ratio class is absent (the dummy maps are then never consumed).
         overlap_m = max(overlap_m, 1)
+        dense_m = max(dense_m, 1)
         return (
             torch.ops.auto_deploy.deepseek_v4_sparse_prepare_decode_page_addr.default,
-            8,
-            [tokens_per_block, overlap_m],
+            18,
+            [tokens_per_block, overlap_m, dense_m],
         )
 
     @classmethod

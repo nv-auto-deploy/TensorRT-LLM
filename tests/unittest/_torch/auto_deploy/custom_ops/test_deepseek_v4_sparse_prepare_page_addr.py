@@ -44,9 +44,12 @@ def test_prepare_decode_page_addr_matches_reference(tokens_per_block, num_seq):
     # Current-token positions for each sequence; buffer padded beyond num_seq.
     positions = torch.randint(0, 2048, (num_seq,), dtype=torch.long)
     input_pos = torch.cat([positions, torch.zeros(4, dtype=torch.long)])
+    position_ids = input_pos.clone()
 
     prep = torch.ops.auto_deploy.deepseek_v4_sparse_prepare_decode_page_addr
-    page_ids, page_offsets = prep(input_pos, cu_num_pages, cache_loc, tokens_per_block)
+    page_ids, page_offsets = prep(
+        input_pos, position_ids, cu_num_pages, cache_loc, tokens_per_block
+    )
 
     # Reference: the per-layer translation each current-token write performs.
     cache = torch.zeros(total_pages, tokens_per_block, 4)
@@ -85,10 +88,13 @@ def test_prepare_decode_page_addr_overlap_and_full_maps_match_reference(tokens_p
 
     positions = torch.randint(0, 2048, (num_seq,), dtype=torch.long)
     input_pos = torch.cat([positions, torch.zeros(4, dtype=torch.long)])
+    position_ids = input_pos.clone()
 
     prep = torch.ops.auto_deploy.deepseek_v4_sparse_prepare_decode_page_addr
-    outs = prep(input_pos, cu_num_pages, cache_loc, tokens_per_block, m)
-    assert len(outs) == 8, "overlap request must return 2 current-token + 6 map tensors"
+    outs = prep(input_pos, position_ids, cu_num_pages, cache_loc, tokens_per_block, m)
+    assert len(outs) == 18, (
+        "overlap request must return 2 current-token + 6 map + 10 update tensors"
+    )
     (
         cur_pid,
         cur_poff,
@@ -98,7 +104,7 @@ def test_prepare_decode_page_addr_overlap_and_full_maps_match_reference(tokens_p
         full_pid,
         full_poff,
         full_valid,
-    ) = outs
+    ) = outs[:8]
 
     seq_idx = torch.arange(num_seq, dtype=torch.long)
     pos_seq = input_pos.reshape(-1)[:num_seq]
@@ -144,10 +150,11 @@ def test_prepare_decode_page_addr_overlap_fake_shape():
     prep = torch.ops.auto_deploy.deepseek_v4_sparse_prepare_decode_page_addr
     with torch._subclasses.FakeTensorMode():
         fake_pos = torch.empty(num_seq, dtype=torch.long)
+        fake_pids = torch.empty(num_seq, dtype=torch.long)
         fake_cu = torch.empty(num_seq + 1, dtype=torch.long)
         fake_loc = torch.empty(128, dtype=torch.long)
-        outs = prep(fake_pos, fake_cu, fake_loc, tokens_per_block, m)
-    assert len(outs) == 8
+        outs = prep(fake_pos, fake_pids, fake_cu, fake_loc, tokens_per_block, m)
+    assert len(outs) == 18
     assert outs[2].shape == (num_seq, 2 * ratio) and outs[2].dtype == torch.long
     assert outs[4].shape == (num_seq, 2 * ratio) and outs[4].dtype == torch.bool
     assert outs[5].shape == (num_seq, m * ratio) and outs[5].dtype == torch.long
@@ -162,9 +169,10 @@ def test_prepare_decode_page_addr_fake_shape():
     prep = torch.ops.auto_deploy.deepseek_v4_sparse_prepare_decode_page_addr
     with torch._subclasses.FakeTensorMode():
         fake_pos = torch.empty(num_seq, dtype=torch.long)
+        fake_pids = torch.empty(num_seq, dtype=torch.long)
         fake_cu = torch.empty(num_seq + 1, dtype=torch.long)
         fake_loc = torch.empty(128, dtype=torch.long)
-        page_ids, page_offsets = prep(fake_pos, fake_cu, fake_loc, tokens_per_block)
+        page_ids, page_offsets = prep(fake_pos, fake_pids, fake_cu, fake_loc, tokens_per_block)
     assert page_ids.dtype == torch.long and page_offsets.dtype == torch.long
     assert page_ids.shape[0] == num_seq and page_offsets.shape[0] == num_seq
 
