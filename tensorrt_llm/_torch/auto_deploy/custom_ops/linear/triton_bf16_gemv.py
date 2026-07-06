@@ -68,10 +68,61 @@ def _bf16_gemv_kernel(
     for k0 in range(0, K, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         x = tl.load(x_ptr + offs_k).to(tl.float32)
+        # Each weight row is read exactly once per decode step; evict_first keeps the
+        # streamed weights out of the L2 working set (measured -1.7..-4.1% per shape
+        # on H100 vs the default policy, HBM-streamed CUDA-graph replay).
         w = tl.load(
-            w_ptr + offs_n[:, None] * K + offs_k[None, :], mask=mask_n[:, None], other=0.0
+            w_ptr + offs_n[:, None] * K + offs_k[None, :],
+            mask=mask_n[:, None],
+            other=0.0,
+            eviction_policy="evict_first",
         ).to(tl.float32)
         acc += tl.sum(w * x[None, :], axis=1)
+    tl.store(y_ptr + offs_n, acc.to(tl.bfloat16), mask=mask_n)
+
+
+@triton.jit
+def _bf16_gemv_peel2_kernel(
+    x_ptr,
+    w_ptr,
+    y_ptr,
+    N,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BK0: tl.constexpr,
+    BK1: tl.constexpr,
+):
+    """Straight-line two-slab variant of ``_bf16_gemv_kernel`` for non-pow2 K.
+
+    ``tl.arange`` slabs must be powers of two, so K values like 1536 cannot use a
+    single full-width slab and the K-loop falls back to narrow slabs (3x512). Two
+    peeled mixed-width slabs (``BK0 + BK1 == K``, e.g. 1024 + 512) issue fewer,
+    wider loads with no loop; measured -2.9% vs the looped best on the o_proj
+    sliding shape (4096, 1536) under HBM-streamed CUDA-graph replay on H100.
+    Same contract as the loop kernel: bf16 loads, fp32 accumulate, bf16 store.
+    """
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    row_ptr = w_ptr + offs_n[:, None] * K
+    offs_k0 = tl.arange(0, BK0)
+    x0 = tl.load(x_ptr + offs_k0).to(tl.float32)
+    w0 = tl.load(
+        row_ptr + offs_k0[None, :],
+        mask=mask_n[:, None],
+        other=0.0,
+        eviction_policy="evict_first",
+    ).to(tl.float32)
+    acc = tl.sum(w0 * x0[None, :], axis=1)
+    offs_k1 = BK0 + tl.arange(0, BK1)
+    x1 = tl.load(x_ptr + offs_k1).to(tl.float32)
+    w1 = tl.load(
+        row_ptr + offs_k1[None, :],
+        mask=mask_n[:, None],
+        other=0.0,
+        eviction_policy="evict_first",
+    ).to(tl.float32)
+    acc += tl.sum(w1 * x1[None, :], axis=1)
     tl.store(y_ptr + offs_n, acc.to(tl.bfloat16), mask=mask_n)
 
 
@@ -86,6 +137,13 @@ _KERNEL_CONFIG_TABLE = {
     (4096, 1536): (2, 512, 4, 3),  # o_proj, sliding attn (1.14x)
     (2816, 4096): (1, 4096, 8, 3),  # dense MLP fused gate_up (1.35x)
     (4096, 1408): (8, 128, 8, 3),  # dense MLP down (1.14x)
+}
+
+# Shapes routed to the peeled two-slab kernel instead of the K-loop kernel:
+# (N, K) -> (BLOCK_N, BK0, BK1, num_warps), with BK0 + BK1 == K. Only wins where
+# non-pow2 K forces the loop kernel into narrow slabs; measured on H100.
+_PEEL2_CONFIG_TABLE = {
+    (4096, 1536): (2, 1024, 512, 4),  # o_proj, sliding attn (-2.9% vs looped best)
 }
 
 
@@ -126,6 +184,22 @@ def _production_contract(x2d: torch.Tensor, weight: torch.Tensor) -> bool:
 def _run_bf16_gemv(x2d: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     n, k = weight.shape
     out = torch.empty((1, n), dtype=torch.bfloat16, device=x2d.device)
+    peel_cfg = _PEEL2_CONFIG_TABLE.get((n, k))
+    if peel_cfg is not None:
+        block_n, bk0, bk1, num_warps = peel_cfg
+        grid = (triton.cdiv(n, block_n),)
+        _bf16_gemv_peel2_kernel[grid](
+            x2d,
+            weight,
+            out,
+            n,
+            K=k,
+            BLOCK_N=block_n,
+            BK0=bk0,
+            BK1=bk1,
+            num_warps=num_warps,
+        )
+        return out
     block_n, block_k, num_warps, num_stages = _pick_config(n, k)
     grid = (triton.cdiv(n, block_n),)
     _bf16_gemv_kernel[grid](
