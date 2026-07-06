@@ -518,8 +518,10 @@ def _prepare_trtllm_gen_mxfp4_cached(
         down_scales,
         down_bias,
     )
+    # Prepared layout is shared by both trtllm-gen act dtypes (W4A16 bf16 / W4A8 mxfp8):
+    # only activation handling differs at forward time, so the key is act-dtype-agnostic.
     key: WeightCacheKey = (
-        "trtllm_gen_w4a16",
+        "trtllm_gen_mxfp4",
         hidden_size,
         intermediate_size,
         float(alpha),
@@ -578,8 +580,17 @@ def _run_trtllm_gen_mxfp4_from_routing(
     expert_start: int,
     alpha: float = 1.0,
     limit: float = float("inf"),
+    act_dtype: str = "mxfp8",
 ) -> torch.Tensor:
-    """Run the routed MXFP4 MLP via the trtllm-gen W4A16 bf16-act runner.
+    """Run the routed MXFP4 MLP via the trtllm-gen runner (W4A8 mxfp8-act by default).
+
+    ``act_dtype`` selects the activation precision / cubin family (same switch as
+    ``trtllm_quant_mxfp4_trtllm_gen_moe_fused`` in ``trtllm_moe.py``):
+      * ``"mxfp8"`` (W4A8, default) — activations pre-quantized to MXFP8 (E4M3 + UE8M0
+        per-32-elem block scales via ``trtllm.mxfp8_quantize``) and fed to
+        ``mxe4m3_mxe2m1_block_scale_moe_runner``. Weights, routing localization, and
+        top-k ordering are identical to the bf16 path; only activation precision changes.
+      * ``"bf16"`` (W4A16) — bf16 activations fed to ``bf16_mxe2m1_block_scale_moe_runner``.
 
     Produces this rank's *local* partial output (tokens routed to off-rank experts contribute
     zero, exactly like the torch reference's ``valid_route`` masking); the sharding transform's
@@ -631,34 +642,80 @@ def _run_trtllm_gen_mxfp4_from_routing(
         x2d = torch.nn.functional.pad(x2d, (0, expected_hidden - hidden_size))
 
     intermediate_size_padded = int(prepared.fc1_weights_mxfp4.shape[1] // 2)
-    result = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
-        None,  # routing_logits (precomputed routing -> None)
-        None,  # routing_bias
-        x2d,
-        prepared.fc1_weights_mxfp4,
-        prepared.fc1_weights_scale_ue8m0,
-        prepared.fc1_bias_f32,
-        sg_alpha,
-        sg_beta,
-        sg_limit,
-        prepared.fc2_weights_mxfp4,
-        prepared.fc2_weights_scale_ue8m0,
-        prepared.fc2_bias_f32,
-        local_experts,  # num_experts (local routing space; topk_ids in [0, local_experts))
-        int(top_k),
-        None,  # n_group
-        None,  # topk_group
-        intermediate_size_padded,
-        prepared.valid_hidden_size,
-        prepared.valid_intermediate_size,
-        0,  # local_expert_offset (local expert coords)
-        local_experts,  # local_num_experts
-        None,  # routed_scaling_factor (already folded into routing_weights upstream)
-        1,  # routing_method_type = Renormalize (no-op: topk precomputed)
-        0,  # act_type = SwiGlu
-        topk_weights=weights,
-        topk_ids=local_idx,
-    )
+    if act_dtype == "mxfp8":
+        # W4A8: pre-quantize the (already padded) bf16 activations to MXFP8 (E4M3 elem +
+        # UE8M0 per-32-elem block scale). alignment=512 matches PT's
+        # ``W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.input_hidden_alignment`` (a no-op here —
+        # ``expected_hidden`` is already 512-aligned). ``x_scale`` stays 1D: the C++ runner
+        # asserts ``hidden_states_scale must be 1D``.
+        x_mxfp8, x_scale = torch.ops.trtllm.mxfp8_quantize(
+            x2d,
+            False,  # is_sf_swizzled_layout
+            alignment=512,
+        )
+        result = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+            None,  # routing_logits (precomputed routing -> None)
+            None,  # routing_bias
+            x_mxfp8,  # hidden_states (E4M3-packed)
+            x_scale,  # hidden_states_scale (UE8M0 per-32-elem block scale)
+            prepared.fc1_weights_mxfp4,
+            prepared.fc1_weights_scale_ue8m0,
+            prepared.fc1_bias_f32,
+            sg_alpha,
+            sg_beta,
+            sg_limit,
+            prepared.fc2_weights_mxfp4,
+            prepared.fc2_weights_scale_ue8m0,
+            prepared.fc2_bias_f32,
+            local_experts,  # num_experts (local routing space; topk_ids in [0, local_experts))
+            int(top_k),
+            None,  # n_group
+            None,  # topk_group
+            intermediate_size_padded,
+            prepared.valid_hidden_size,
+            prepared.valid_intermediate_size,
+            0,  # local_expert_offset (local expert coords)
+            local_experts,  # local_num_experts
+            None,  # routed_scaling_factor (already folded into routing_weights upstream)
+            1,  # routing_method_type = Renormalize (no-op: topk precomputed)
+            0,  # act_type = SwiGlu
+            topk_weights=weights,
+            topk_ids=local_idx,
+        )
+    elif act_dtype == "bf16":
+        result = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
+            None,  # routing_logits (precomputed routing -> None)
+            None,  # routing_bias
+            x2d,
+            prepared.fc1_weights_mxfp4,
+            prepared.fc1_weights_scale_ue8m0,
+            prepared.fc1_bias_f32,
+            sg_alpha,
+            sg_beta,
+            sg_limit,
+            prepared.fc2_weights_mxfp4,
+            prepared.fc2_weights_scale_ue8m0,
+            prepared.fc2_bias_f32,
+            local_experts,  # num_experts (local routing space; topk_ids in [0, local_experts))
+            int(top_k),
+            None,  # n_group
+            None,  # topk_group
+            intermediate_size_padded,
+            prepared.valid_hidden_size,
+            prepared.valid_intermediate_size,
+            0,  # local_expert_offset (local expert coords)
+            local_experts,  # local_num_experts
+            None,  # routed_scaling_factor (already folded into routing_weights upstream)
+            1,  # routing_method_type = Renormalize (no-op: topk precomputed)
+            0,  # act_type = SwiGlu
+            topk_weights=weights,
+            topk_ids=local_idx,
+        )
+    else:
+        raise ValueError(
+            f"_run_trtllm_gen_mxfp4_from_routing: act_dtype must be 'mxfp8' or 'bf16', "
+            f"got {act_dtype!r}."
+        )
 
     valid_h = prepared.valid_hidden_size
     if result.shape[-1] > valid_h:
@@ -683,8 +740,9 @@ def _run_torch_mxfp4_from_routing_core(
     swiglu_mode: str = "deepseek",
 ) -> torch.Tensor:
     # Blackwell fast path: the DSV4 (up_gate / deepseek-SwiGLU) routed MXFP4 MLP runs on the
-    # trtllm-gen W4A16 bf16-act runner instead of the fp32 dequant+bmm reference. gpt-oss
-    # (interleaved / gpt_oss-SwiGLU) and non-SM100 keep the torch reference below.
+    # trtllm-gen W4A8 mxfp8-act runner (activations quantized to MXFP8; MXFP4 weights, routing
+    # localization and top-k ordering unchanged) instead of the fp32 dequant+bmm reference.
+    # gpt-oss (interleaved / gpt_oss-SwiGLU) and non-SM100 keep the torch reference below.
     if is_sm_100f() and gate_up_order == "up_gate" and swiglu_mode == "deepseek":
         return _run_trtllm_gen_mxfp4_from_routing(
             hidden_states,
