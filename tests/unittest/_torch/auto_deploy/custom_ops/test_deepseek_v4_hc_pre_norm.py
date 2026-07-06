@@ -63,6 +63,32 @@ def test_hc_combine_rmsnorm_matches_reference(shape, hc_mult, H):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("shape", [(1, 1), (1, 1000), (2, 3), (4, 17)])
+@pytest.mark.parametrize("hc_mult", [4, 3])
+@pytest.mark.parametrize("H", [4096, 512, 127])
+def test_hc_combine_rmsnorm_bf16_input_bit_exact(shape, hc_mult, H):
+    """bf16 ``flat`` must produce byte-identical output to pre-cast fp32 ``flat``.
+
+    The kernel's in-register bf16 -> fp32 conversion is exact, so skipping the
+    HBM fp32 materialization cannot change a single bit.
+    """
+    torch.manual_seed(5)
+    eps = 1e-6
+    dev = "cuda"
+    pre = torch.rand(*shape, hc_mult, device=dev, dtype=torch.float32) + 0.1
+    x = torch.randn(*shape, hc_mult * H, device=dev, dtype=torch.bfloat16)
+    weight = torch.randn(H, device=dev, dtype=torch.float32) * 0.1 + 1.0
+
+    out_fp32 = torch.ops.auto_deploy.deepseek_v4_hc_combine_rmsnorm(
+        pre, x.float(), weight, eps, hc_mult, torch.bfloat16
+    )
+    out_bf16 = torch.ops.auto_deploy.deepseek_v4_hc_combine_rmsnorm(
+        pre, x, weight, eps, hc_mult, torch.bfloat16
+    )
+    assert torch.equal(out_bf16, out_fp32)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_hc_combine_rmsnorm_zero_weight_identity():
     """weight == 0 -> output all zeros (sanity on the weight broadcast)."""
     torch.manual_seed(1)

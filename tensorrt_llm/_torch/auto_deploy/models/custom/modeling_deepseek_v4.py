@@ -1538,21 +1538,27 @@ class DeepseekV4Block(nn.Module):
         hc_base: torch.Tensor,
         norm: "DeepseekV4RMSNorm",
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        flat = x.flatten(2).float()
-        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = _linear(flat, hc_fn) * rsqrt
-        pre, post, comb = torch.ops.auto_deploy.hc_split_sinkhorn(
-            mixes,
+        # Fused HC-pre front: bf16 input -> fp32 RMS statistic + the MIX_HC-output
+        # hc_fn GEMV + ordered rsqrt scaling + sigmoid/softmax/sinkhorn, in two
+        # launches. Replaces the eager cast/square/mean/rsqrt/GEMV/mul swarm and
+        # never materializes the [N, hc_mult*H] fp32 ``flat`` intermediate; see
+        # hc_composition.py.
+        flat = x.flatten(2)
+        pre, post, comb = torch.ops.auto_deploy.deepseek_v4_hc_pre_mix(
+            flat,
+            hc_fn,
             hc_scale,
             hc_base,
             self.hc_mult,
             self.hc_sinkhorn_iters,
             self.hc_eps,
+            self.norm_eps,
         )
         # Fused weighted-combine over the hc_mult axis folded with the immediately
         # following block RMSNorm: y = norm(sum_m pre[m] * flat[m*H:]). Replaces a
         # broadcast-mul + sum-reduce + bf16 cast + the RMSNorm kernel swarm with a
-        # single launch and skips the [N, hc_mult, H] fp32 intermediate.
+        # single launch and skips the [N, hc_mult, H] fp32 intermediate. ``flat``
+        # stays bf16; the kernel converts in-register (exact).
         y = torch.ops.auto_deploy.deepseek_v4_hc_combine_rmsnorm(
             pre, flat, norm.weight, norm.eps, self.hc_mult, x.dtype
         )

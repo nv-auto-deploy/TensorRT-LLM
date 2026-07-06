@@ -96,7 +96,7 @@ def _hc_launch_config(n: int, block_h: int):
 @triton.jit
 def _hc_weighted_combine_kernel(
     pre_ptr,  # [N, HM] fp32
-    flat_ptr,  # [N, HM * H] fp32
+    flat_ptr,  # [N, HM * H] fp32 or bf16/fp16 (converted to fp32 in-register)
     weight_ptr,  # [H] fp32 (RMSNorm weight)
     out_ptr,  # [N, H] out_dtype
     N,
@@ -119,7 +119,10 @@ def _hc_weighted_combine_kernel(
     acc = tl.zeros([BLOCK_H], dtype=tl.float32)
     for m in tl.static_range(HM):
         p = tl.load(pre_ptr + row * HM + m)  # scalar fp32
-        f = tl.load(flat_row + m * H + h, mask=hmask, other=0.0)
+        # Native-dtype load + in-register fp32 convert: exact for bf16/fp16
+        # inputs (widening conversions are lossless), identical for fp32, and
+        # skips the HBM materialization of an fp32 ``flat``.
+        f = tl.load(flat_row + m * H + h, mask=hmask, other=0.0).to(tl.float32)
         acc += p * f
 
     # --- replicate the bf16 round-trip y takes (return .to(x.dtype) then
@@ -154,8 +157,9 @@ def deepseek_v4_hc_combine_rmsnorm(
 
     Args:
         pre:      ``[..., hc_mult]`` fp32 combine weights (from the sinkhorn op).
-        flat:     ``[..., hc_mult * H]`` fp32 flattened hidden states
-                  (``x.flatten(2).float()``); element ``[..., m*H + h]``.
+        flat:     ``[..., hc_mult * H]`` flattened hidden states
+                  (``x.flatten(2)``; fp32, bf16, or fp16 — non-fp32 inputs are
+                  converted to fp32 in-register, which is exact).
         weight:   ``[H]`` fp32 RMSNorm weight (attn_norm / ffn_norm).
         eps:      RMSNorm epsilon.
         hc_mult:  number of hyper-connection streams folded over.
@@ -172,7 +176,7 @@ def deepseek_v4_hc_combine_rmsnorm(
     assert flat.shape[-1] == hc_mult * H, "flat last dim must equal hc_mult * H"
 
     pre_f = pre.reshape(n, hc_mult).contiguous().float()
-    flat_f = flat.reshape(n, hc_mult * H).contiguous().float()
+    flat_f = flat.reshape(n, hc_mult * H).contiguous()
     weight_f = weight.contiguous().float()
 
     out = torch.empty((n, H), device=pre.device, dtype=out_dtype)
