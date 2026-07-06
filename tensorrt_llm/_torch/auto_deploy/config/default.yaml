@@ -365,6 +365,15 @@ transforms:
   multi_stream_moe:
     stage: compile
     enabled: false
+  # DSV4-scoped default enablement of the shared/routed MoE overlap: the op
+  # allowlist restricts the rewrite to the from-routing MXFP4 ops that only the
+  # DeepSeek-V4 modeling code emits, so other models keep single-stream MoE.
+  multi_stream_moe_from_routing:
+    stage: compile
+    enabled: true
+    op_allowlist:
+      - torch_mxfp4_moe_from_routing
+      - torch_mxfp4_moe_from_routing_ep
   multi_stream_mla_attn:
     stage: compile
     enabled: false

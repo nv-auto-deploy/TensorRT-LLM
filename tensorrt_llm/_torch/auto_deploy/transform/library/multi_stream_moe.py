@@ -15,9 +15,10 @@
 
 """Transform for multi-stream execution of MoE layers that have shared experts and routed experts."""
 
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple, Type
 
 import torch
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
@@ -30,7 +31,13 @@ from ...utils.multi_stream_utils import (
     wait_aux_stream_passthrough,
 )
 from ...utils.node_utils import all_reduce_ops, has_shape, is_op
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 
 def _find_merge_node(moe_node: Node) -> Optional[Node]:
@@ -84,6 +91,17 @@ def _get_ancestors(node: Node) -> Set[Node]:
     return ancestors
 
 
+# FX ``call_function`` targets inserted by this transform. Their presence around a
+# merge node means the MoE was already rewritten (e.g. two multi-stream transform
+# entries whose op lists overlap); applying the rewrite twice would nest begin/end
+# pairs and corrupt the saved caller-stream state.
+_PASSTHROUGH_TARGETS = (
+    begin_aux_stream_passthrough,
+    end_aux_stream_passthrough,
+    wait_aux_stream_passthrough,
+)
+
+
 def _execute_shared_expert_in_aux_stream(
     gm: GraphModule, moe_ops: List[Callable]
 ) -> Tuple[GraphModule, int]:
@@ -126,6 +144,10 @@ def _execute_shared_expert_in_aux_stream(
                 f"No merge node found downstream of MoE node {moe_node.name}; "
                 "skipping multi-stream transform for this node."
             )
+            continue
+
+        # Idempotency: skip MoE nodes whose merge is already stream-rewritten.
+        if any(inp.target in _PASSTHROUGH_TARGETS for inp in merge_node.all_input_nodes):
             continue
 
         # ---- Step 2: Classify merge node inputs. ----
@@ -190,6 +212,12 @@ def _execute_shared_expert_in_aux_stream(
                 f"Could not identify shared-expert subgraph for MoE node "
                 f"{moe_node.name}; skipping multi-stream transform for this node."
             )
+            continue
+
+        # Idempotency (collective variant): the begin/end/wait triplet sits inside
+        # the shared branch when the trailing collective was split off on a prior
+        # application, so the merge-input check above does not see it.
+        if any(n.target in _PASSTHROUGH_TARGETS for n in shared_nodes):
             continue
 
         # Order shared nodes by their position in the graph.
@@ -314,9 +342,30 @@ def _execute_shared_expert_in_aux_stream(
     return gm, num_replaced
 
 
+class MultiStreamMOEConfig(TransformConfig):
+    """Configuration for the multi-stream MoE transform."""
+
+    op_allowlist: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Names of ``torch.ops.auto_deploy`` fused-MoE ops eligible for the "
+            "shared/routed multi-stream rewrite; ``None`` means every supported op. "
+            "The default config enables this transform scoped to the DeepSeek-V4 "
+            "from-routing MXFP4 ops only, so models emitting other MoE ops keep "
+            "their single-stream behavior unless explicitly opted in."
+        ),
+    )
+
+
 @TransformRegistry.register("multi_stream_moe")
 class MultiStreamMOE(BaseTransform):
     """Multi-stream execution of MoE layers that have shared experts and routed experts."""
+
+    config: MultiStreamMOEConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[MultiStreamMOEConfig]:
+        return MultiStreamMOEConfig
 
     def _apply(
         self,
@@ -325,18 +374,51 @@ class MultiStreamMOE(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        base_ops = [
-            torch.ops.auto_deploy.trtllm_moe_fused,
-            torch.ops.auto_deploy.triton_moe_fused,
-            torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
-            torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused,
-            torch.ops.auto_deploy.trtllm_nvfp4_trtllm_gen_moe_fused,
-            torch.ops.auto_deploy.trtllm_quant_finegrained_fp8_moe_fused,
-        ]
+        supported_ops = {
+            "trtllm_moe_fused": torch.ops.auto_deploy.trtllm_moe_fused,
+            "triton_moe_fused": torch.ops.auto_deploy.triton_moe_fused,
+            "trtllm_quant_fp8_moe_fused": torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
+            "trtllm_quant_nvfp4_moe_fused": torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused,
+            "trtllm_nvfp4_trtllm_gen_moe_fused": (
+                torch.ops.auto_deploy.trtllm_nvfp4_trtllm_gen_moe_fused
+            ),
+            "trtllm_quant_finegrained_fp8_moe_fused": (
+                torch.ops.auto_deploy.trtllm_quant_finegrained_fp8_moe_fused
+            ),
+            # MXFP4 MoE emitted directly from precomputed routing (DeepSeek V4).
+            # The modeling code dispatches the shared-expert MLP *before* this op
+            # so that ``begin_aux_stream_passthrough`` (inserted before the first
+            # shared-expert op) records the main stream before the routed-expert
+            # kernels are enqueued — a prerequisite for actual overlap.
+            "torch_mxfp4_moe_from_routing": torch.ops.auto_deploy.torch_mxfp4_moe_from_routing,
+            "torch_mxfp4_moe_from_routing_ep": (
+                torch.ops.auto_deploy.torch_mxfp4_moe_from_routing_ep
+            ),
+        }
 
-        # Ensure that aux stream and events for the current device are added to the CudaStreamManager.
-        cuda_stream_manager.add_device(torch.cuda.current_device())
-        gm, num_matches = _execute_shared_expert_in_aux_stream(gm, base_ops)
+        allowlist = self.config.op_allowlist
+        if allowlist is None:
+            moe_ops = list(supported_ops.values())
+        else:
+            unknown = [name for name in allowlist if name not in supported_ops]
+            if unknown:
+                ad_logger.warning(
+                    f"multi_stream_moe: ignoring unsupported op_allowlist entries {unknown}"
+                )
+            moe_ops = [supported_ops[name] for name in allowlist if name in supported_ops]
+
+        if not moe_ops:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # Ensure that aux stream and events for the current device are added to the
+        # CudaStreamManager (the singleton already registers the import-time device;
+        # the guard avoids a re-add warning on every graph module).
+        device = torch.cuda.current_device()
+        if device not in cuda_stream_manager.devices:
+            cuda_stream_manager.add_device(device)
+        gm, num_matches = _execute_shared_expert_in_aux_stream(gm, moe_ops)
         info = TransformInfo(
             skipped=False,
             num_matches=num_matches,
@@ -344,3 +426,17 @@ class MultiStreamMOE(BaseTransform):
             has_valid_shapes=num_matches == 0,
         )
         return gm, info
+
+
+@TransformRegistry.register("multi_stream_moe_from_routing")
+class MultiStreamMOEFromRouting(MultiStreamMOE):
+    """Multi-stream shared/routed overlap for MoE ops that take precomputed routing.
+
+    Registered as a separate transform key so the DeepSeek-V4 shared-expert
+    overlap can ship enabled by default — ``default.yaml`` scopes this entry via
+    ``op_allowlist`` to ``torch_mxfp4_moe_from_routing[_ep]``, which only the
+    DSV4 modeling code emits — while the generic ``multi_stream_moe`` entry (and
+    any explicit user-config setting for it) keeps its default-disabled
+    behavior. Both entries share the rewrite implementation, which skips
+    already-rewritten MoE nodes, so enabling both cannot double-apply.
+    """
