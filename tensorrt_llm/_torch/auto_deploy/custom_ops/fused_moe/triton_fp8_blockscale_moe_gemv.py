@@ -187,13 +187,14 @@ def _fp8_bs_down_reduce_kernel(
 
 # (BLOCK_N, NKB, num_warps, num_stages) for the gate_up kernel, keyed by (I, H).
 # Measured on H100 under CUDA-graph replay with L2-busted weights (Step-3.7-Flash
-# per-rank EP8 routed expert shape); generic fallback below.
+# per-rank EP8 routed expert shape), scored across 1-3 local slots weighted by the
+# max-over-ranks distribution of top-8/EP8 routing; generic fallback below.
 _GATE_UP_CONFIG_TABLE = {
-    (1280, 4096): (4, 16, 8, 3),
+    (1280, 4096): (1, 8, 1, 1),
 }
 # (BLOCK_N, NKB, num_warps, num_stages) for the down+reduce kernel, keyed by (H, I).
 _DOWN_CONFIG_TABLE = {
-    (4096, 1280): (16, 16, 8, 3),
+    (4096, 1280): (2, 16, 1, 1),
 }
 
 
