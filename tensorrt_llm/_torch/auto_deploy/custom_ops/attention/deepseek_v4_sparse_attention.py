@@ -1776,6 +1776,60 @@ def _update_decode_compressed_caches(
         )
         return
 
+    # Fused ratio-128 (dense, non-overlap) path (idea_0039): the ratio-4 kernel fuses its
+    # whole reconstruction in one program per row, but the dense ``[ratio, head_dim]`` pool
+    # tile is too large for that, so the pool is D-tiled (``_paged_compress_pool``), RMSNorm
+    # is a separate ``head_dim`` reduction (``_compressor_rms_norm``) and the rope/fp8/store
+    # tail is the shared ``_launch_compressed_rope_fp8_store``.  Requires the fp8 nope slice
+    # to be block_size=64 aligned, a non-empty even rope dim, and contiguous paged compressor
+    # caches (the kernel indexes them with the contiguous ``T*S`` / ``S`` strides); otherwise
+    # fall back to the op-by-op path below.  The dense reconstruction never validity-masks the
+    # gate (the reference discards ``page_valid``), so the pooled row matches
+    # ``gather + ape + deepseek_v4_compress_pool`` to <=1 ULP (fp32 ratio-axis reduction order).
+    if (
+        not mode.overlap
+        and _HAS_TRITON
+        and mhc_cache.is_cuda
+        and compressor_kv_cache.is_contiguous()
+        and compressor_gate_cache.is_contiguous()
+        and rope_dim > 0
+        and rope_dim % 2 == 0
+        and nope_dim > 0
+        and nope_dim % 64 == 0
+    ):
+        offsets = torch.arange(compress_ratio, dtype=torch.long, device=row_idx.device)
+        anchor = row_idx.to(torch.long) * compress_ratio
+        positions = anchor.unsqueeze(1) + offsets.view(1, -1)  # [N, ratio]
+        # kv and gate caches share one page table + tokens_per_block, so the reads at these
+        # positions resolve to one page map -- bit-identical to the fallback's translation.
+        pos_page_ids, pos_page_offsets, _ = _decode_page_ids_and_offsets(
+            compressor_kv_cache, seq_idx, positions, cu_num_pages, cache_loc
+        )
+        row_position_id_clamped = row_position_id.to(torch.long).clamp(
+            min=0, max=cos_table.shape[0] - 1
+        )
+        _fused_compressed_row_update_r128(
+            compressor_kv_cache,
+            compressor_gate_cache,
+            pos_page_ids,
+            pos_page_offsets,
+            compressor_ape,
+            compressor_norm_weight,
+            cos_table,
+            sin_table,
+            row_position_id_clamped,
+            row_valid,
+            mhc_page_ids,
+            mhc_page_offsets,
+            mhc_cache,
+            rms_norm_eps,
+            compress_ratio,
+            head_dim,
+            rope_dim,
+            compressor_kv_decode.dtype,
+        )
+        return
+
     compressed_rows = _batched_compressed_rows_from_paged_state(
         compressor_kv_cache,
         compressor_gate_cache,
@@ -3185,6 +3239,92 @@ if _HAS_TRITON:
         tl.store(pe_out_base + (2 * k) * stride_s, out_even.to(RD).to(CT), mask=kmask & valid)
         tl.store(pe_out_base + (2 * k + 1) * stride_s, out_odd.to(RD).to(CT), mask=kmask & valid)
 
+    @triton.jit
+    def _dsv4_paged_compress_pool_kernel(
+        kv_cache_ptr,  # [P, T, S] fp32 paged compressor kv cache
+        gate_cache_ptr,  # [P, T, S] fp32 paged compressor gate cache
+        page_ids_ptr,  # [N, R] int64 (per-row page id of each ratio slot)
+        page_offsets_ptr,  # [N, R] int64 (per-row in-page offset of each ratio slot)
+        ape_ptr,  # [R, APE_STRIDE] fp32; column d in [0, HEAD_DIM) used
+        out_ptr,  # [N, HEAD_DIM] pooled row (activation dtype)
+        N,
+        R,  # compress_ratio (128)
+        HEAD_DIM,
+        T,  # tokens_per_block (paged cache dim-1)
+        S,  # compressor state_dim (paged cache dim-2 stride, == HEAD_DIM here)
+        APE_STRIDE,  # ape.shape[1]
+        PAGEMAP_STRIDE,  # R (row stride of the [N, R] page maps)
+        BLOCK_R: tl.constexpr,  # next_pow2(R)
+        BLOCK_D: tl.constexpr,
+    ):
+        """Fused ratio-128 (dense) main-compressor pool front (idea_0039, stage 1).
+
+        D-tiled companion of ``_dsv4_compressed_row_r4_front_kernel``: one program per
+        ``(decode row, HEAD_DIM block)``.  The ratio-128 pool tile ``[R, HEAD_DIM]`` is
+        too large for the ratio-4 kernel's single-program strategy, so the HEAD_DIM axis
+        is fanned across ``cdiv(HEAD_DIM, BLOCK_D)`` programs (recovering occupancy at the
+        small decode ``N``).  Reads the ``R`` paged compressor kv/gate slots of the
+        just-completed block via the precomputed ``[N, R]`` page map, adds the ape bias
+        and softmax-pools over the ratio axis -- collapsing the two paged gathers, the two
+        ``.to(dtype)`` casts, the ape add and the ``deepseek_v4_compress_pool`` launch into
+        one kernel emitting the pooled (pre-rmsnorm) row.  The non-overlap branch performs
+        NO validity masking (the reference discards ``page_valid`` and never masks the
+        gate for the dense path), so every slot participates.  RMSNorm
+        (``_compressor_rms_norm``) and the rope/fp8/masked-store tail
+        (``_dsv4_rope_fp8_masked_store_kernel``) run as the subsequent stages.  All
+        reductions are fp32-internal with bf16 rounding at the same points as the eager
+        reference (gather ``.to(dtype)``, the ape add, the ``compress_pool`` output), so the
+        pooled row matches ``gather + ape + _dsv4_compress_pool_kernel`` to <=1 ULP -- the
+        only deviation is the fp32 reduction order over the ratio axis (this kernel fixes
+        ``num_warps=4`` while ``deepseek_v4_compress_pool`` autotunes it), which flips at
+        most a handful of near-zero channels by one bf16 ULP.
+        """
+        ROUND = out_ptr.dtype.element_ty
+
+        n = tl.program_id(0)
+        if n >= N:
+            return
+        d0 = tl.program_id(1) * BLOCK_D
+        d = d0 + tl.arange(0, BLOCK_D)
+        dmask = d < HEAD_DIM
+
+        r = tl.arange(0, BLOCK_R)
+        rmask = r < R
+        pm_base = n * PAGEMAP_STRIDE
+        pid = tl.load(page_ids_ptr + pm_base + r, mask=rmask, other=0).to(tl.int64)
+        poff = tl.load(page_offsets_ptr + pm_base + r, mask=rmask, other=0).to(tl.int64)
+
+        base = pid * (T * S) + poff * S  # [BLOCK_R]; channel offset 0 (non-overlap)
+        offs = base[:, None] + d[None, :]  # [BLOCK_R, BLOCK_D]
+        cmask = rmask[:, None] & dmask[None, :]
+        raw_kv = tl.load(kv_cache_ptr + offs, mask=cmask, other=0.0)
+        raw_gate = tl.load(gate_cache_ptr + offs, mask=cmask, other=0.0)
+        # Round the fp32 cache reads to the activation dtype (== gather ``.to(dtype)``).
+        kv_b = raw_kv.to(ROUND)
+        gate_b = raw_gate.to(ROUND)
+
+        ape_off = r[:, None] * APE_STRIDE + d[None, :]
+        ape_b = tl.load(ape_ptr + ape_off, mask=cmask, other=0.0).to(ROUND)
+        # bf16 add: round(bf16(gate) + bf16(ape)) -- the eager path adds ``gate + ape`` in
+        # the activation dtype, so keep the intermediate rounding.
+        gate_sum = (gate_b.to(tl.float32) + ape_b.to(tl.float32)).to(ROUND)
+
+        g = gate_sum.to(tl.float32)
+        k = kv_b.to(tl.float32)
+        # Padded ratio rows (r >= R) never contribute: -inf gate -> zero softmax weight
+        # (R == BLOCK_R for ratio-128, so this is a no-op safety net).
+        g = tl.where(rmask[:, None], g, float("-inf"))
+        k = tl.where(rmask[:, None], k, 0.0)
+
+        # Per-channel softmax over the ratio axis, then weighted sum -- same op order as
+        # ``(kv * gate.softmax(dim=-2)).sum(dim=-2)`` / ``_dsv4_compress_pool_kernel``.
+        m = tl.max(g, axis=0)  # [BLOCK_D]
+        e = tl.exp(g - m[None, :])
+        ssum = tl.sum(e, axis=0)  # [BLOCK_D]
+        w = e / ssum[None, :]
+        pooled = tl.sum(k * w, axis=0)  # [BLOCK_D] fp32
+        tl.store(out_ptr + n.to(tl.int64) * HEAD_DIM + d, pooled.to(ROUND), mask=dmask)
+
 
 def _masked_write_decode_cache_rows(
     cache: torch.Tensor,  # [P, T, S] paged cache (mutated in place)
@@ -3523,8 +3663,6 @@ def _fused_compressed_row_update_r4(
     if n == 0 or head_dim == 0:
         return
     two_r = 2 * compress_ratio
-    nope_dim = head_dim - rope_dim
-    dh = rope_dim // 2
     block_d = triton.next_power_of_2(head_dim)
 
     # Stage 1: gather + ape + mask + softmax-pool + rmsnorm -> post-rmsnorm rows.
@@ -3552,7 +3690,49 @@ def _fused_compressed_row_update_r4(
         num_warps=4,
     )
 
-    # Stage 2: fp8(nope) + rope(pe) + validity-masked store into mhc_cache.
+    # Stage 2: fp8(nope) + rope(pe) + validity-masked store into mhc_cache (shared tail).
+    _launch_compressed_rope_fp8_store(
+        normed,
+        cos_table,
+        sin_table,
+        row_position_id,
+        row_valid,
+        mhc_page_ids,
+        mhc_page_offsets,
+        mhc_cache,
+        head_dim,
+        rope_dim,
+    )
+
+
+def _launch_compressed_rope_fp8_store(
+    normed: torch.Tensor,  # [N, head_dim] post-rmsnorm rows (activation dtype)
+    cos_table: torch.Tensor,  # [n_pos, rope_dim//2]
+    sin_table: torch.Tensor,  # [n_pos, rope_dim//2]
+    row_position_id: torch.Tensor,  # [N] int64, already clamped into [0, n_pos)
+    row_valid: torch.Tensor,  # [N] bool -- store the row iff valid
+    mhc_page_ids: torch.Tensor,  # [N] int64 write page id per row
+    mhc_page_offsets: torch.Tensor,  # [N] int64 in-page offset per row
+    mhc_cache: torch.Tensor,  # [P, T, head_dim] paged mhc cache (mutated in place)
+    head_dim: int,
+    rope_dim: int,
+) -> None:
+    """Shared stage-2 tail: fp8(nope) + interleaved RoPE(pe) + validity-masked store.
+
+    Launches ``_dsv4_rope_fp8_masked_store_kernel`` (idea_0007) over the ``[N, head_dim]``
+    post-rmsnorm rows.  Ratio-agnostic: the same tail serves both the ratio-4 (overlap,
+    idea_0007) and ratio-128 (dense, idea_0039) main-compressor compressed-row updates,
+    since both produce an identical ``[N, head_dim]`` normed row and write the same
+    ``head_dim``-wide mhc row.  Invalid rows write nothing (byte-identical to the prior
+    read-old + write-back no-op).
+    """
+    n = int(normed.shape[0])
+    if n == 0 or head_dim == 0:
+        return
+    nope_dim = head_dim - rope_dim
+    dh = rope_dim // 2
+    block_d = triton.next_power_of_2(head_dim)
+    grid = (n,)
     _dsv4_rope_fp8_masked_store_kernel[grid](
         normed,
         cos_table,
@@ -3577,6 +3757,123 @@ def _fused_compressed_row_update_r4(
         MAX_VAL=448.0,
         MIN_VAL=1.0e-4,
         num_warps=4,
+    )
+
+
+def _paged_compress_pool(
+    kv_cache: torch.Tensor,  # [P, T, S] fp32 paged compressor kv cache
+    gate_cache: torch.Tensor,  # [P, T, S] fp32 paged compressor gate cache
+    page_ids: torch.Tensor,  # [N, ratio] int64 page id per ratio slot
+    page_offsets: torch.Tensor,  # [N, ratio] int64 in-page offset per ratio slot
+    ape: torch.Tensor,  # [ratio, S] fp32 (column d in [0, head_dim) used)
+    ratio: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Paged softmax-weighted pool for the dense (ratio-128) compressed-row front.
+
+    Fuses the two paged compressor kv/gate gathers, the ``.to(dtype)`` casts, the ape add
+    and the ``deepseek_v4_compress_pool`` launch into one D-tiled kernel that reads the
+    ``[N, ratio]`` page map directly.  Mirrors ``deepseek_v4_compress_pool``'s BLOCK_D
+    occupancy heuristic (start at the maximal D-block and halve while the grid is below the
+    ~512-CTA machine-fill target, floor 16) so the small decode ``N`` is not
+    occupancy-starved.  Returns the pooled ``[N, head_dim]`` row in ``dtype``.
+    """
+    n = int(page_ids.shape[0])
+    pooled = torch.empty(n, head_dim, device=kv_cache.device, dtype=dtype)
+    if n == 0 or head_dim == 0:
+        return pooled
+    cap = min(128, triton.next_power_of_2(head_dim))
+    block_d = cap
+    while block_d > 16 and n * triton.cdiv(head_dim, block_d) < 512:
+        block_d //= 2
+    grid = (n, triton.cdiv(head_dim, block_d))
+    _dsv4_paged_compress_pool_kernel[grid](
+        kv_cache,
+        gate_cache,
+        page_ids.contiguous(),
+        page_offsets.contiguous(),
+        ape.contiguous(),
+        pooled,
+        n,
+        ratio,
+        head_dim,
+        int(kv_cache.shape[1]),
+        int(kv_cache.shape[2]),
+        int(ape.shape[1]),
+        ratio,
+        BLOCK_R=triton.next_power_of_2(ratio),
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+    return pooled
+
+
+def _fused_compressed_row_update_r128(
+    kv_cache: torch.Tensor,  # [P, T, S=head_dim] fp32 paged compressor kv cache
+    gate_cache: torch.Tensor,  # [P, T, S] fp32 paged compressor gate cache
+    positions_page_ids: torch.Tensor,  # [N, ratio] int64 page id per ratio slot
+    positions_page_offsets: torch.Tensor,  # [N, ratio] int64 in-page offset per ratio slot
+    ape: torch.Tensor,  # [ratio, head_dim]
+    norm_weight: torch.Tensor,  # [head_dim]
+    cos_table: torch.Tensor,  # [n_pos, rope_dim//2]
+    sin_table: torch.Tensor,  # [n_pos, rope_dim//2]
+    row_position_id: torch.Tensor,  # [N] int64, already clamped into [0, n_pos)
+    row_valid: torch.Tensor,  # [N] bool -- store the row iff valid
+    mhc_page_ids: torch.Tensor,  # [N] int64 write page id per row
+    mhc_page_offsets: torch.Tensor,  # [N] int64 in-page offset per row
+    mhc_cache: torch.Tensor,  # [P, T, head_dim] paged mhc cache (mutated in place)
+    rms_norm_eps: float,
+    compress_ratio: int,
+    head_dim: int,
+    rope_dim: int,
+    dtype: torch.dtype,
+) -> None:
+    """Three-launch ratio-128 (dense) main-compressor compressed-row update (idea_0039).
+
+    The dense-path analogue of ``_fused_compressed_row_update_r4``.  Ratio-4 fused its
+    reconstruction in a single one-program-per-row front kernel because its ``[2*ratio,
+    head_dim]`` pool tile fits one program; the ratio-128 ``[ratio, head_dim]`` tile does
+    not, so the pool is D-tiled instead (``_paged_compress_pool``) and RMSNorm is a
+    separate reduction over ``head_dim`` (``_compressor_rms_norm``, the shipped fused
+    ``triton_rms_norm``).  The rope/fp8/validity-masked-store tail is the shared
+    ``_launch_compressed_rope_fp8_store``.  This replaces the dense-branch
+    ``_batched_compressed_rows_from_paged_state`` reconstruction (2 paged gathers, 2 casts,
+    the ape add, the pool), the ``_apply_compressed_rope_and_quantize`` rope/fp8 tail, the
+    ``cos``/``sin`` gathers and the ``_masked_write_decode_cache_rows`` store.  The pooled
+    row matches ``gather + ape + deepseek_v4_compress_pool`` to <=1 ULP (same rounding
+    points; only the fp32 ratio-axis reduction order differs) and the stored row matches the
+    eager path up to the rsqrt (bf16-absorbed) and the rope FMA (<=1 ULP).  Invalid rows
+    write nothing.
+    """
+    n = int(positions_page_ids.shape[0])
+    if n == 0 or head_dim == 0:
+        return
+    # Stage 1: paged gather(kv/gate) + ape-add + softmax-pool -> pooled [N, head_dim].
+    pooled = _paged_compress_pool(
+        kv_cache,
+        gate_cache,
+        positions_page_ids,
+        positions_page_offsets,
+        ape,
+        compress_ratio,
+        head_dim,
+        dtype,
+    )
+    # Stage 1b: RMSNorm over head_dim (reuse the shipped fused triton_rms_norm).
+    normed = _compressor_rms_norm(pooled, norm_weight, rms_norm_eps)
+    # Stage 2: fp8(nope) + rope(pe) + validity-masked store (shared tail).
+    _launch_compressed_rope_fp8_store(
+        normed,
+        cos_table,
+        sin_table,
+        row_position_id,
+        row_valid,
+        mhc_page_ids,
+        mhc_page_offsets,
+        mhc_cache,
+        head_dim,
+        rope_dim,
     )
 
 

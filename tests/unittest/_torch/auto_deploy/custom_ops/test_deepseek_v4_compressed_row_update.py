@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit test for the fused ratio-4 compressed-row cache update (idea_0007).
+"""Unit test for the fused compressed-row cache update (idea_0007 ratio-4, idea_0039 ratio-128).
 
 ``_update_decode_compressed_caches`` reconstructs the just-completed main-compressor
 compressed row at decode time and stores it into ``mhc_cache`` on the ~1-in-ratio steps
@@ -10,14 +10,21 @@ that complete a row.  idea_0007 collapses the ratio-4 (overlap) reconstruction s
 the validity-masked store into two Triton kernels
 (``_dsv4_compressed_row_r4_front_kernel`` + ``_dsv4_rope_fp8_masked_store_kernel``).
 
+idea_0039 extends the same collapse to the ratio-128 (dense, non-overlap) layers, whose
+``[ratio, head_dim]`` pool tile is too large for the ratio-4 one-program-per-row strategy:
+the pool is D-tiled (``_dsv4_paged_compress_pool_kernel``), RMSNorm is the shipped fused
+``triton_rms_norm`` (``_compressor_rms_norm``), and the rope/fp8/validity-masked-store tail
+is the same shared ``_dsv4_rope_fp8_masked_store_kernel`` idea_0007 introduced.
+
 The fused path replicates the eager numerics -- fp32-internal softmax pool and RMSNorm
 with bf16 rounding at the same points as the reference, a byte-identical block fake-fp8
 on the nope slice and an interleaved RoPE on the pe slice -- so the stored ``mhc_cache``
 must match the eager op-by-op path up to the ``rsqrt`` primitive (bf16-absorbed) and the
-rope FMA folding (<=1 ULP).  These tests pin that equivalence separately for the ratio-4
-(fused) and ratio-128 (untouched fallback) modes so a regression in one cannot hide in the
-other, and they exercise both row-completing (valid) and non-completing (invalid, no-write)
-decode steps.
+rope FMA folding (<=1 ULP).  The ratio-128 paged pool is even byte-identical to
+``gather + ape + deepseek_v4_compress_pool`` (same rounding points; pinned separately).
+These tests pin that equivalence for the ratio-4 and ratio-128 modes so a regression in one
+cannot hide in the other, and they exercise both row-completing (valid) and non-completing
+(invalid, no-write) decode steps across multi-page position spans.
 """
 
 import pytest
@@ -231,21 +238,91 @@ def test_rope_fp8_store_kernel_byte_exact(num_rows):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
 @pytest.mark.parametrize("num_rows", [1, 2])
-def test_ratio128_unchanged(monkeypatch, num_rows):
-    """Ratio-128 (non-overlap) never takes the fused path -> flag on/off must be identical."""
+def test_ratio128_fused_matches_eager(monkeypatch, num_rows):
+    """Ratio-128 (dense) fused three-launch path == eager op-by-op reconstruction+store.
+
+    idea_0039: the fused path (D-tiled paged pool -> rmsnorm -> rope/fp8/masked-store) must
+    match the eager ``_batched_compressed_rows_from_paged_state`` (non-overlap) + eager
+    where/write-back store.  The paged pool is bit-identical to ``gather + ape + pool`` and
+    RMSNorm is unchanged, so end-to-end the only deviation is the tail rope FMA (<=1 ULP);
+    the nope slice is byte-exact.  ``_build_inputs`` mixes a row-completing (valid) row with
+    a non-completing (invalid, no-write) row, and the 128-token position span crosses many
+    ``tokens_per_block=8`` page boundaries.
+    """
     assert M._HAS_TRITON, "test requires triton"
     inp = _build_inputs(compress_ratio=128, num_rows=num_rows, seed=200 + num_rows)
 
-    mhc_on = inp["mhc_cache"].clone()
-    _run(inp, mhc_on)
+    mhc_fused = inp["mhc_cache"].clone()
+    _run(inp, mhc_fused)  # real _HAS_TRITON -> fused ratio-128 path
 
     monkeypatch.setattr(M, "_HAS_TRITON", False)
-    mhc_off = inp["mhc_cache"].clone()
-    _run(inp, mhc_off)
+    mhc_eager = inp["mhc_cache"].clone()
+    _run(inp, mhc_eager)  # forced fallback -> eager reconstruction + where/write-back store
 
-    # The masked store differs (triton vs eager where/write-back) but both must produce
-    # the identical cache contents; ratio-128 reconstruction is byte-for-byte untouched.
-    torch.testing.assert_close(mhc_on.float(), mhc_off.float(), rtol=1e-3, atol=1e-3)
+    exact = (mhc_fused == mhc_eager).float().mean().item()
+    max_abs = (mhc_fused.float() - mhc_eager.float()).abs().max().item()
+    assert exact >= 0.95, f"exact bf16 match ratio {exact} too low (max_abs={max_abs})"
+    torch.testing.assert_close(mhc_fused.float(), mhc_eager.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
+@pytest.mark.parametrize("num_rows", [1, 3])
+def test_ratio128_paged_pool_matches_gather_pool(num_rows):
+    """Isolate the ratio-128 paged pool front kernel from the rsqrt/rope tail.
+
+    ``_paged_compress_pool`` (paged gather + ape add + softmax pool) reproduces the eager
+    ``gather + ape + deepseek_v4_compress_pool`` it collapses to <=1 ULP: it rounds the fp32
+    cache reads to the activation dtype (== the gather ``.to(dtype)``), adds the ape in the
+    activation dtype, and runs the same fp32-internal per-channel softmax pool.  The only
+    deviation is the fp32 reduction order over the 128-slot ratio axis (this kernel fixes
+    ``num_warps=4`` while ``deepseek_v4_compress_pool`` autotunes it), which flips at most a
+    handful of near-zero channels by one bf16 ULP.  The 128-token span crosses many
+    ``tokens_per_block`` page boundaries.
+    """
+    assert M._HAS_TRITON, "test requires triton"
+    torch.manual_seed(300 + num_rows)
+    head_dim, ratio, tokens_per_block = 512, 128, 8
+    state_dim = head_dim  # channels == 1 for the dense (non-overlap) compressor
+    dtype = torch.bfloat16
+
+    max_pos = ratio + tokens_per_block
+    pages_per_seq = (max_pos + tokens_per_block - 1) // tokens_per_block
+    cu_num_pages = torch.tensor(
+        [0, *torch.tensor([pages_per_seq] * num_rows).cumsum(0).tolist()],
+        dtype=torch.long,
+        device=DEV,
+    )
+    total_pages = int(cu_num_pages[-1].item())
+    cache_loc = torch.arange(total_pages, dtype=torch.long, device=DEV)
+    kv_cache = torch.randn(total_pages, tokens_per_block, state_dim, device=DEV)
+    gate_cache = torch.randn(total_pages, tokens_per_block, state_dim, device=DEV)
+    ape = torch.randn(ratio, state_dim, device=DEV)
+
+    seq_idx = torch.arange(num_rows, dtype=torch.long, device=DEV)
+    # Each row reconstructs positions [0, ratio) -> spans ratio/tokens_per_block pages.
+    positions = torch.arange(ratio, dtype=torch.long, device=DEV).view(1, -1).expand(num_rows, -1)
+    page_ids, page_offsets, _ = M._decode_page_ids_and_offsets(
+        kv_cache, seq_idx, positions, cu_num_pages, cache_loc
+    )
+
+    pooled_fused = M._paged_compress_pool(
+        kv_cache, gate_cache, page_ids, page_offsets, ape, ratio, head_dim, dtype
+    )
+
+    # Eager reference: gather -> cast -> ape add -> shipped compress_pool op.
+    kv_state = kv_cache[page_ids, page_offsets].to(dtype)
+    gate_state = gate_cache[page_ids, page_offsets].to(dtype)
+    kv = kv_state[..., :head_dim]
+    gate = gate_state[..., :head_dim] + ape[:, :head_dim].to(dtype)
+    pooled_ref = torch.ops.auto_deploy.deepseek_v4_compress_pool(kv, gate)
+
+    exact = (pooled_fused == pooled_ref).float().mean().item()
+    max_abs = (pooled_fused.float() - pooled_ref.float()).abs().max().item()
+    assert exact >= 0.99, (
+        f"paged pool vs gather + ape + compress_pool: only {exact:.5f} bf16-exact "
+        f"(max_abs={max_abs:.2e})"
+    )
+    torch.testing.assert_close(pooled_fused.float(), pooled_ref.float(), rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
