@@ -68,6 +68,7 @@ from .sharding import (
     _get_dist_ops,
     _load_hook,
     _shard_fp4_weight_scale,
+    resolve_plain_allreduce_strategy,
     shard_weight_tensor,
     validate_allreduce_strategy,
 )
@@ -798,9 +799,12 @@ class AllReduceShardableNode(ShardableNode):
 
         _, all_reduce_op = _get_dist_ops(dc.dist_backend)
         [x] = extract_op_args(self.node, "x")
+        strategy = resolve_plain_allreduce_strategy(dc, self.node, all_reduce_op)
         self.node.target = all_reduce_op
-        self.node.args = (x, dc.allreduce_strategy)
-        ad_logger.debug(f"  inserted real all_reduce ({all_reduce_op.__name__})")
+        self.node.args = (x, strategy)
+        ad_logger.debug(
+            f"  inserted real all_reduce ({all_reduce_op.__name__}, strategy={strategy})"
+        )
         return 1
 
 
@@ -1545,10 +1549,11 @@ class StackedMoEShardableNode(ShardableNode):
         )
 
         _, all_reduce_op = _get_dist_ops(dc.dist_backend)
+        strategy = resolve_plain_allreduce_strategy(dc, self.node, all_reduce_op)
         with gm.graph.inserting_after(self.node):
             red = gm.graph.call_function(
                 all_reduce_op,
-                args=(self.node, dc.allreduce_strategy),
+                args=(self.node, strategy),
             )
             self.node.replace_all_uses_with(red)
             red.replace_input_with(red, self.node)

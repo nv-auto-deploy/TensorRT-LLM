@@ -976,12 +976,9 @@ class QuantizeMXFP4MOE(BaseTransform):
         moe_tp_rank = int(getattr(dc, "moe_tp_rank", 0)) if dc is not None else 0
         moe_ep_size = int(getattr(dc, "moe_ep_size", 1)) if dc is not None else 1
         moe_ep_rank = int(getattr(dc, "moe_ep_rank", 0)) if dc is not None else 0
-        # Cover MoE-EP as well: any distributed case (tp_size>1) needs the
-        # configured strategy. ``moe_tp_size > 1`` alone would miss EP-only.
-        _tp_size = int(getattr(dc, "tp_size", 1)) if dc is not None else 1
-        allreduce_strategy = (
-            str(dc.allreduce_strategy) if dc is not None and _tp_size > 1 else "NCCL"
-        )
+        # The allreduce strategy is resolved per node at the AR insertion site
+        # below (covers MoE-EP as well: any distributed case with tp_size > 1
+        # gets an AR with the configured — or small-message-qualified — strategy).
 
         # Single op handles both activation precisions via the ``act_dtype`` arg:
         # ``"bf16"`` → W4A16 (bf16 MoE runner), ``"mxfp8"`` → W4A8 (mxfp8_quantize +
@@ -1225,9 +1222,15 @@ class QuantizeMXFP4MOE(BaseTransform):
             # 88.02%).
             tp_size = int(getattr(dc, "tp_size", 1)) if dc is not None else 1
             if tp_size > 1:
-                from .sharding import _get_dist_ops
+                from .sharding import _get_dist_ops, qualify_small_oneshot_allreduce
 
                 _, all_reduce_op = _get_dist_ops("auto")
+                # Qualify the small-message ONESHOT upgrade from the fused op's
+                # static contract (bf16 activations, full hidden size) — the
+                # anchor may be a freshly created node without meta.
+                strategy = qualify_small_oneshot_allreduce(
+                    dc, all_reduce_op, torch.bfloat16, int(valid_hidden_size)
+                )
                 view_node = next(
                     (
                         u
@@ -1240,7 +1243,7 @@ class QuantizeMXFP4MOE(BaseTransform):
                 with gm.graph.inserting_after(anchor):
                     red = gm.graph.call_function(
                         all_reduce_op,
-                        args=(anchor, allreduce_strategy),
+                        args=(anchor, strategy),
                     )
                     anchor.replace_all_uses_with(red)
                     red.replace_input_with(red, anchor)

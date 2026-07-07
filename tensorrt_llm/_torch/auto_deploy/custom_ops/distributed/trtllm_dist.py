@@ -36,6 +36,25 @@ from ...distributed.common import ReduceOp, get_rank_world_size, get_world_size,
 # warmup causes hangs due to workspace allocation with CPU synchronization
 _allreduce_cache = {}
 
+# Strategy token emitted by the sharding transforms for qualified small plain-SUM
+# reductions (see transform.library.sharding.qualify_small_oneshot_allreduce).
+# Not a TRT-LLM ``AllReduceStrategy``: ``trtllm_dist_all_reduce`` resolves it per
+# call to ONESHOT for messages of at most ``_ONESHOT_SMALL_MAX_NUMEL`` elements
+# (the one-token decode shape) and to NCCL for everything larger, so prefill and
+# multi-token batches on the same graph node keep NCCL.
+ONESHOT_SMALL_STRATEGY = "ONESHOT_SMALL"
+
+# One decode token at hidden_size 4096 (8 KiB bf16): TRT-LLM ONESHOT measured
+# ~5.5x faster than NCCL on a matched single-node TP4 grid, while >= 6144
+# elements measured at NCCL parity — so larger calls keep NCCL.
+_ONESHOT_SMALL_MAX_NUMEL = 4096
+
+
+def resolve_oneshot_small_strategy(numel: int) -> str:
+    """Per-call strategy the ``ONESHOT_SMALL`` token resolves to for *numel*."""
+    return "ONESHOT" if numel <= _ONESHOT_SMALL_MAX_NUMEL else "NCCL"
+
+
 # SymmetricMemoryAllGather instances keyed on (rank, world_size, workspace_id).
 # workspace_id == 0 uses the default TP process group. Higher workspace_ids
 # allocate fresh process groups (via dist.new_group), each with its own
@@ -82,8 +101,20 @@ def trtllm_symm_mem_allgather_impl(tensor, dim, sizes, workspace_id):
     return trtllm_allgather(tensor, dim=dim, sizes=sizes)
 
 
-def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
+def _get_cached_allreduce(dtype: torch.dtype, strategy_enum: AllReduceStrategy) -> AllReduce:
+    """Get or create the cached AllReduce module for (rank, world_size, dtype, strategy)."""
     rank, world_size = get_rank_world_size()
+    # Cache key includes rank, world_size, dtype, and strategy to handle different configurations
+    cache_key = (rank, world_size, dtype, strategy_enum)
+    if cache_key not in _allreduce_cache:
+        p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+        _allreduce_cache[cache_key] = AllReduce(
+            mapping=p_config, strategy=strategy_enum, dtype=dtype
+        )
+    return _allreduce_cache[cache_key]
+
+
+def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
     assert op == ReduceOp.SUM, "TRT-LLM all reduce only supports SUM op."
 
     # Convert string strategy to enum
@@ -96,15 +127,7 @@ def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
             f"LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC"
         )
 
-    # Cache key includes rank, world_size, dtype, and strategy to handle different configurations
-    cache_key = (rank, world_size, tensor.dtype, strategy_enum)
-    if cache_key not in _allreduce_cache:
-        p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
-        _allreduce_cache[cache_key] = AllReduce(
-            mapping=p_config, strategy=strategy_enum, dtype=tensor.dtype
-        )
-
-    torch_op = _allreduce_cache[cache_key]
+    torch_op = _get_cached_allreduce(tensor.dtype, strategy_enum)
     return torch_op(tensor, all_reduce_params=all_reduce_params)
 
 
@@ -154,7 +177,22 @@ def trtllm_dist_all_reduce(t: torch.Tensor, strategy: str) -> torch.Tensor:
     """All_reduce using TRT-LLM optimized backend. Reduction op is SUM.
 
     This op always uses TRT-LLM's optimized allreduce and is used in MPI mode.
+
+    ``strategy`` is a TRT-LLM ``AllReduceStrategy`` name (e.g. "NCCL") applied
+    as-is, or the ``ONESHOT_SMALL`` token the sharding transforms emit on
+    qualified nodes: calls with at most ``_ONESHOT_SMALL_MAX_NUMEL`` elements
+    (one-token decode hidden states) run the ONESHOT kernel while larger calls
+    (prefill, multi-token batches) run NCCL. Explicit strategy names are never
+    reinterpreted here.
     """
+    if strategy == ONESHOT_SMALL_STRATEGY:
+        # Build both module variants up front: the first call of this op is an
+        # eager warmup call, so the ONESHOT IPC-workspace allocation (a
+        # CPU-synchronizing collective) can never land inside CUDA-graph
+        # capture regardless of which message size shows up first.
+        _get_cached_allreduce(t.dtype, AllReduceStrategy.ONESHOT)
+        _get_cached_allreduce(t.dtype, AllReduceStrategy.NCCL)
+        strategy = resolve_oneshot_small_strategy(t.numel())
     return trtllm_allreduce(t, op=ReduceOp.SUM, strategy=strategy)
 
 
