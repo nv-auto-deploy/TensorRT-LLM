@@ -270,6 +270,14 @@ transforms:
   fuse_collinear_allreduce:
     stage: post_load_fusion
     requires_shape_prop: true
+  # Fold the merge add feeding a distributed all_reduce into the producing
+  # bias-free block-FP8 linear's epilogue (one kernel writes the collective's
+  # input buffer directly, bit-exact). Runs AFTER fuse_collinear_allreduce,
+  # which creates the canonical match: DeepSeek-V4's per-MoE-layer
+  # ``AR(routed_moe_out + shared_down_proj_out)`` seam.
+  fuse_fp8_linear_allreduce_add:
+    stage: post_load_fusion
+    requires_shape_prop: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
     requires_shape_prop: true

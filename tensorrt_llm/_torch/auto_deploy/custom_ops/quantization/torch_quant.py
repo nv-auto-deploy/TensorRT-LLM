@@ -673,6 +673,7 @@ def _w8a8_block_fp8_matmul_kernel(
     C,
     As,
     Bs,
+    R,
     M,
     N,
     K,
@@ -688,10 +689,13 @@ def _w8a8_block_fp8_matmul_kernel(
     stride_As_k,
     stride_Bs_k,
     stride_Bs_n,
+    stride_rm,
+    stride_rn,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -738,6 +742,15 @@ def _w8a8_block_fp8_matmul_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    if HAS_RESIDUAL:
+        # Fused merge add (e.g. routed-MoE output + this shared-expert down
+        # projection feeding one all_reduce). ``c`` was already rounded to the
+        # output dtype above, so widening both addends to fp32 and rounding once
+        # reproduces the eager two-kernel sequence ``add(matmul_out, residual)``
+        # bit-for-bit (aten elementwise add computes in fp32 opmath).
+        r_ptrs = R + stride_rm * offs_cm[:, None] + stride_rn * offs_cn[None, :]
+        r = tl.load(r_ptrs, mask=c_mask, other=0.0)
+        c = (c.to(tl.float32) + r.to(tl.float32)).to(C.dtype.element_ty)
     tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -748,6 +761,7 @@ def _w8a8_block_fp8_matmul_triton(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float32,
+    residual: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if block_size is None:
         block_n, block_k = 128, 128
@@ -777,8 +791,19 @@ def _w8a8_block_fp8_matmul_triton(
     # across ``SPLIT_K`` CTAs (grid axis 1) and reduces the fp32 partials, raising
     # occupancy ~SPLIT_K x. Restricted to small M + large K where the base grid is
     # CTA-starved; everything else keeps the autotuned full-K kernel.
+    if residual is not None:
+        assert residual.shape == C_shape, "residual must match the matmul output shape"
+        assert residual.dtype == output_dtype, "residual must match the matmul output dtype"
+        assert residual.dim() >= 2 and residual.is_contiguous()
+
     if _use_splitk_decode(M, N, K):
-        return _w8a8_block_fp8_matmul_splitk(A, B, As, Bs, block_n, block_k, output_dtype, M, N, K)
+        C = _w8a8_block_fp8_matmul_splitk(A, B, As, Bs, block_n, block_k, output_dtype, M, N, K)
+        if residual is not None:
+            # The split-K path materializes its output via an fp32 atomic
+            # accumulator + cast; keep the merge add as a separate elementwise op
+            # there (identical rounding to the unfused sequence).
+            C = C + residual
+        return C
 
     C = A.new_empty(C_shape, dtype=output_dtype)
 
@@ -794,6 +819,7 @@ def _w8a8_block_fp8_matmul_triton(
         C,
         As,
         Bs,
+        C if residual is None else residual,
         M,
         N,
         K,
@@ -809,7 +835,10 @@ def _w8a8_block_fp8_matmul_triton(
         As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
+        0 if residual is None else residual.stride(-2),
+        0 if residual is None else residual.stride(-1),
         BLOCK_SIZE_K=block_k,
+        HAS_RESIDUAL=residual is not None,
     )
     return C
 
@@ -1293,6 +1322,79 @@ def _torch_fake_quant_finegrained_fp8_linear_prequant_fake(
     return torch.empty(
         (*qinput.shape[:-1], out_features), dtype=input_scale.dtype, device=qinput.device
     )
+
+
+@torch.library.custom_op(
+    "auto_deploy::torch_fake_quant_finegrained_fp8_linear_residual_add", mutates_args=()
+)
+def torch_fake_quant_finegrained_fp8_linear_residual_add(
+    input: torch.Tensor,  # [..., K]
+    weight_quantized: torch.Tensor,  # [N, K] float8_e4m3fn
+    bias: Optional[torch.Tensor],  # must be None (the fusion only matches bias-free linears)
+    input_scale: List[torch.Tensor],  # unused for FineGrained FP8 (input quantized on the fly)
+    weight_scale: List[torch.Tensor],  # [weight_scale_inv]
+    input_zp: List[torch.Tensor],  # unused
+    weight_zp: List[torch.Tensor],  # unused
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
+    input_scale_fmt: str = "",
+    residual: Optional[torch.Tensor] = None,  # [..., N] added to the matmul output
+) -> torch.Tensor:
+    """``torch_fake_quant_finegrained_fp8_linear`` with a fused trailing merge add.
+
+    Computes ``torch_fake_quant_finegrained_fp8_linear(input, ...) + residual`` with
+    the add folded into the W8A8 block-FP8 matmul epilogue (one kernel instead of
+    matmul + standalone elementwise add). The matmul accumulator is rounded to the
+    output dtype *before* the add, so the result is bit-for-bit identical to the
+    unfused sequence. Emitted by the ``fuse_fp8_linear_allreduce_add`` transform for
+    the MoE routed+shared merge add feeding a distributed all_reduce (the summed
+    tensor is the collective's input buffer).
+    """
+    assert bias is None, "fused residual-add linear only supports bias-free linears"
+    assert residual is not None, "residual tensor is required"
+    weight_scale_inv = weight_scale[0]
+
+    N, K = weight_quantized.shape
+    scale_n, scale_k = weight_scale_inv.shape
+    block_n = triton.cdiv(N, scale_n)
+    block_k = triton.cdiv(K, scale_k)
+    block_size = [block_n, block_k]
+
+    qinput, scale = _safe_act_quant(input, block_size[1], input_scale_fmt)
+    output = _w8a8_block_fp8_matmul_triton(
+        qinput,
+        weight_quantized,
+        scale,
+        weight_scale_inv,
+        block_size,
+        output_dtype=input.dtype,
+        residual=residual.contiguous(),
+    )
+
+    return output.to(dtype=input.dtype)
+
+
+@torch_fake_quant_finegrained_fp8_linear_residual_add.register_fake
+def _torch_fake_quant_finegrained_fp8_linear_residual_add_fake(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    input_scale: List[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    input_zp: List[torch.Tensor],
+    weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
+    input_scale_fmt: str = "",
+    residual: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fake implementation for torch.export tracing."""
+    out_features = weight_quantized.shape[0]
+    return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
 
 
 @torch.library.custom_op(

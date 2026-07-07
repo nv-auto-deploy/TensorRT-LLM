@@ -346,3 +346,146 @@ class FuseCollinearAllreduce(BaseTransform):
             has_valid_shapes=cnt == 0,
         )
         return gm, info
+
+
+# ============================================================================
+# Merge-add fusion: all_reduce(other + fp8_linear(x)) folds the add into the
+# linear's epilogue so the projection writes the collective's input directly.
+# ============================================================================
+
+# Positional argument order + keyword defaults of
+# ``auto_deploy::torch_fake_quant_finegrained_fp8_linear`` (used to normalize a
+# matched graph node's args/kwargs into the full positional tuple for the fused
+# residual-add variant, whose signature is the same list + trailing ``residual``).
+_FINEGRAINED_FP8_LINEAR_ARG_NAMES = (
+    "input",
+    "weight_quantized",
+    "bias",
+    "input_scale",
+    "weight_scale",
+    "input_zp",
+    "weight_zp",
+    "tp_mode",
+    "output_sizes",
+    "tp_min_local_shape",
+    "layer_type",
+    "input_scale_fmt",
+)
+_FINEGRAINED_FP8_LINEAR_ARG_DEFAULTS = {
+    "tp_mode": "none",
+    "output_sizes": None,
+    "tp_min_local_shape": 1,
+    "layer_type": "unknown",
+    "input_scale_fmt": "",
+}
+
+
+@TransformRegistry.register("fuse_fp8_linear_allreduce_add")
+class FuseFp8LinearAllreduceAdd(BaseTransform):
+    """Fold an all_reduce input's merge add into the producing block-FP8 linear.
+
+    Matches ``all_reduce(add(other, linear(x)))`` (either operand order) where the
+    linear is a bias-free ``torch_fake_quant_finegrained_fp8_linear`` whose sole
+    consumer is the add, and the add's sole consumer is a distributed all_reduce.
+    The add is replaced by ``torch_fake_quant_finegrained_fp8_linear_residual_add``,
+    which folds the elementwise add into the W8A8 matmul epilogue so the projection
+    writes the summed tensor -- the collective's input buffer -- directly (bit-exact:
+    the accumulator is rounded to the output dtype before the fp32-opmath add).
+
+    Canonical case: DeepSeek-V4's MoE seam after ``fuse_collinear_allreduce``,
+    ``AR(routed_moe_out + shared_down_proj_out)`` -- one standalone bf16 add per MoE
+    layer collapses into the shared-expert down projection. The rewrite keeps the
+    merge-node data dependencies intact (the routed output becomes the fused node's
+    ``residual`` arg, passed positionally), so the multi-stream MoE transform still
+    classifies the fused node as the shared/routed merge point and inserts its
+    aux-stream sync around it.
+    """
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        if not self.config.enabled:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        linear_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
+        fused_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add
+
+        graph = gm.graph
+        cnt = 0
+        for node in list(graph.nodes):
+            if not is_op(node, torch.ops.aten.add.Tensor) or len(node.args) < 2:
+                continue
+            # The add must feed exactly one distributed all_reduce, so the fused
+            # projection output is precisely the collective's input buffer.
+            if len(node.users) != 1:
+                continue
+            (consumer,) = node.users
+            if not is_op(consumer, _DIST_ALLREDUCE_OPS):
+                continue
+            lhs, rhs = node.args[0], node.args[1]
+            if not (isinstance(lhs, Node) and isinstance(rhs, Node)):
+                continue
+            for linear, other in ((lhs, rhs), (rhs, lhs)):
+                if not is_op(linear, linear_op):
+                    continue
+                # Sole consumer => the original linear node is dead after the
+                # rewrite (net -1 kernel, not a duplicated matmul).
+                if len(linear.users) != 1:
+                    continue
+                vals = dict(zip(_FINEGRAINED_FP8_LINEAR_ARG_NAMES, linear.args))
+                vals.update(linear.kwargs)
+                for name, default in _FINEGRAINED_FP8_LINEAR_ARG_DEFAULTS.items():
+                    vals.setdefault(name, default)
+                # The fused epilogue reproduces add(matmul_out, residual); a bias
+                # would introduce a second, differently-ordered rounding point.
+                if vals.get("bias") is not None:
+                    continue
+                lin_val = linear.meta.get("val")
+                other_val = other.meta.get("val")
+                if lin_val is None or other_val is None:
+                    continue
+                # Matching shape + dtype => the epilogue add is elementwise with no
+                # broadcast and reproduces the original add exactly.
+                if (
+                    tuple(lin_val.shape) != tuple(other_val.shape)
+                    or lin_val.dtype != other_val.dtype
+                ):
+                    continue
+
+                # Insert at the add's position: both the linear's inputs and
+                # ``other`` are already defined there regardless of which branch
+                # was emitted first. ``residual`` is passed positionally so
+                # downstream arg-rewriting passes (e.g. the multi-stream wait
+                # insertion) see it in ``node.args``.
+                with graph.inserting_before(node):
+                    fused = graph.call_function(
+                        fused_op,
+                        args=tuple(vals[n] for n in _FINEGRAINED_FP8_LINEAR_ARG_NAMES) + (other,),
+                    )
+                ref_val = node.meta.get("val")
+                if ref_val is not None:
+                    fused.meta["val"] = torch.empty(
+                        ref_val.shape, dtype=ref_val.dtype, device="meta"
+                    )
+                node.replace_all_uses_with(fused)
+                cnt += 1
+                break
+
+        if cnt > 0:
+            graph.eliminate_dead_code()
+            gm.recompile()
+            ad_logger.info(f"fused {cnt} allreduce-input merge add(s) into block-FP8 linear(s)")
+
+        info = TransformInfo(
+            skipped=False,
+            num_matches=cnt,
+            is_clean=cnt == 0,
+            has_valid_shapes=cnt == 0,
+        )
+        return gm, info
