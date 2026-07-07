@@ -1545,6 +1545,7 @@ class DeepseekV4Block(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
         norm: "DeepseekV4RMSNorm",
+        hc_partials: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Fully fused HC-pre: bf16 input -> fp32 RMS statistic + the MIX_HC-output
         # hc_fn GEMV + ordered rsqrt scaling + sigmoid/softmax/sinkhorn + the
@@ -1555,8 +1556,30 @@ class DeepseekV4Block(nn.Module):
         # the combine's ``flat`` load latency. Bit-identical to the previous
         # deepseek_v4_hc_pre_mix + deepseek_v4_hc_combine_rmsnorm sequence on
         # every path; see hc_composition.py.
+        #
+        # When ``hc_partials`` is given (every site except layer 0's attn), the
+        # preceding fused ``_hc_post`` seam op already produced this site's
+        # split-D partials while storing the residual stream, so the decode path
+        # skips even the partials launch — one composition/combine kernel per
+        # site (the seam partials match the standalone launch to ~1-2 fp32 ULP;
+        # see deepseek_v4_hc_post.py).
         flat = x.flatten(2)
-        return torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine(
+        if hc_partials is None:
+            return torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine(
+                flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm.weight,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+                self.norm_eps,
+                norm.eps,
+                x.dtype,
+            )
+        return torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine_partials(
+            hc_partials,
             flat,
             hc_fn,
             hc_scale,
@@ -1576,13 +1599,19 @@ class DeepseekV4Block(nn.Module):
         residual: torch.Tensor,
         post: torch.Tensor,
         comb: torch.Tensor,
-    ) -> torch.Tensor:
+        next_hc_fn: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Fused residual-stream composition collapsing the two broadcast-muls +
         # M-axis sum + add + bf16 cast into one Triton launch, and skipping the
         # [N, hc_mult, hc_mult, H] fp32 intermediate. Bit-faithful (fp32
         # accumulate, single bf16 store); see deepseek_v4_hc_post.py.
         #   y[n, o, :] = post[n, o] * x[n, :] + sum_m comb[n, m, o] * residual[n, m, :]
-        return torch.ops.auto_deploy.deepseek_v4_hc_post(x, residual, post, comb)
+        # The seam-fused op additionally emits the NEXT HC site's split-D
+        # partials (against ``next_hc_fn``) from the composed stream while it is
+        # still in registers, replacing that site's partials launch + HBM re-read.
+        return torch.ops.auto_deploy.deepseek_v4_hc_post_next_partials(
+            x, residual, post, comb, next_hc_fn
+        )
 
     def forward(
         self,
@@ -1595,7 +1624,9 @@ class DeepseekV4Block(nn.Module):
         ],
         position_ids: torch.Tensor,
         input_ids: torch.Tensor,
-    ) -> torch.Tensor:
+        next_hc_fn: torch.Tensor,
+        hc_partials: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         # _hc_pre now returns the post-combine hidden states already normalized by
         # attn_norm (fused), so the explicit norm call is dropped here.
@@ -1605,9 +1636,12 @@ class DeepseekV4Block(nn.Module):
             self.hc_attn_scale,
             self.hc_attn_base,
             self.attn_norm,
+            hc_partials,
         )
         hidden_states = self.attn(hidden_states, position_embeddings, position_ids)
-        hidden_states = self._hc_post(hidden_states, residual, post, comb)
+        hidden_states, hc_partials = self._hc_post(
+            hidden_states, residual, post, comb, self.hc_ffn_fn
+        )
 
         residual = hidden_states
         hidden_states, post, comb = self._hc_pre(
@@ -1616,9 +1650,12 @@ class DeepseekV4Block(nn.Module):
             self.hc_ffn_scale,
             self.hc_ffn_base,
             self.ffn_norm,
+            hc_partials,
         )
         hidden_states = self.ffn(hidden_states, input_ids)
-        return self._hc_post(hidden_states, residual, post, comb)
+        # ``next_hc_fn`` belongs to the next consumer of the residual stream:
+        # the next layer's ``hc_attn_fn``, or ``hc_head_fn`` after the last layer.
+        return self._hc_post(hidden_states, residual, post, comb, next_hc_fn)
 
 
 class DeepseekV4PreTrainedModel(PreTrainedModel):
@@ -1718,15 +1755,26 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self
 
-    def _hc_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        original_dtype = hidden_states.dtype
-        original_shape = hidden_states.shape
-        flat = hidden_states.flatten(2).float()
-        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
-        mixes = _linear(flat, self.hc_head_fn) * rsqrt
-        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.config.hc_eps
-        hidden_states = torch.sum(pre.unsqueeze(-1) * flat.view(original_shape), dim=2)
-        return hidden_states.to(original_dtype)
+    def _hc_head_norm(self, hidden_states: torch.Tensor, hc_partials: torch.Tensor) -> torch.Tensor:
+        # Fused model-tail HC seam: the eager _hc_head chain (fp32 boundary cast,
+        # RMS statistic, hc_head_fn GEMV, sigmoid gate, weighted combine) + the
+        # final ``norm`` RMSNorm + the ``.float()`` cast feeding the fp32 lm-head
+        # GEMV, collapsed into ONE kernel at decode. ``hc_partials`` comes from
+        # the last layer's fused ``_hc_post`` seam op (produced against
+        # ``hc_head_fn``); every bf16 rounding point of the eager chain is
+        # preserved and the fp32 widen happens at the store. See hc_composition.py.
+        flat = hidden_states.flatten(2)
+        return torch.ops.auto_deploy.deepseek_v4_hc_head_norm(
+            hc_partials,
+            flat,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+            self.norm.weight,
+            self.config.hc_eps,
+            self.config.rms_norm_eps,
+            self.norm.eps,
+        )
 
     def forward(
         self,
@@ -1739,10 +1787,26 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         hidden_states = self.embed(input_ids)
         position_embeddings = self.rotary_emb()
         hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, self.hc_mult, -1)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, position_embeddings, position_ids, input_ids)
-        hidden_states = self._hc_head(hidden_states)
-        hidden_states = self.norm(hidden_states)
+        # Each layer's final fused ``_hc_post`` emits the split-D partials for
+        # the NEXT consumer of the residual stream (the next layer's attn HC-pre,
+        # or the HC head after the last layer), threading them across the layer
+        # boundary so every HC site but the first skips its partials launch.
+        num_layers = len(self.layers)
+        hc_partials: Optional[torch.Tensor] = None
+        for layer_idx, layer in enumerate(self.layers):
+            next_hc_fn = (
+                self.layers[layer_idx + 1].hc_attn_fn
+                if layer_idx + 1 < num_layers
+                else self.hc_head_fn
+            )
+            hidden_states, hc_partials = layer(
+                hidden_states,
+                position_embeddings,
+                position_ids,
+                input_ids,
+                next_hc_fn,
+                hc_partials,
+            )
         # ``layer_type="lm_head"`` tags this vocab projection so
         # ``apply_sharding_hints`` column-splits ``head.weight`` (vocab dim) +
         # all_gathers the logits under TP, instead of replicating it. Replicated,
@@ -1750,10 +1814,11 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         # step; sharded, both the bf16->fp32 weight cast and the fp32 logits GEMM
         # shrink by tp_size. Mathematically exact (output columns are independent).
         # ``self.head.weight`` is already fp32 (cast once at load), so no per-step
-        # bf16->fp32 weight recast is emitted into the decode graph here.
-        logits = _linear(
-            hidden_states.float(), self.head.weight, None, layer_type="lm_head"
-        ).float()
+        # bf16->fp32 weight recast is emitted into the decode graph here; the
+        # fused HC head op returns fp32 (bf16-rounded values widened), so no
+        # per-step activation cast is emitted either.
+        hidden_states = self._hc_head_norm(hidden_states, hc_partials)
+        logits = _linear(hidden_states, self.head.weight, None, layer_type="lm_head").float()
         return DeepseekV4CausalLMOutput(logits=logits)
 
 

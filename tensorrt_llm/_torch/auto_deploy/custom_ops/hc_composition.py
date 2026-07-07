@@ -242,6 +242,20 @@ def _hc_split_sinkhorn_fake(
 _HC_PRE_MIX_FUSED_N_MAX = 64
 
 
+def hc_partials_layout(dim: int) -> Tuple[int, int]:
+    """Split-D partial layout ``(CHUNK, SPLIT)`` shared by every partials producer/consumer.
+
+    ~128 chunks for the model shape (D = 16384 -> CHUNK = 128); small D used in
+    tests degrades gracefully to fewer/masked chunks. Producers
+    (``_hc_fn_partials_kernel`` and the fused hc_post seam kernel) and consumers
+    (the composition kernels) must derive the identical layout from ``dim`` so a
+    ``[N, MIX_HC + 1, SPLIT]`` partials tensor can cross the op boundary.
+    """
+    chunk = max(64, triton.next_power_of_2((dim + 127) // 128))
+    split = (dim + chunk - 1) // chunk
+    return chunk, split
+
+
 @triton.jit
 def _hc_fn_partials_kernel(
     x_ptr,  # [N, D] input (any float dtype; converted to fp32 in-register)
@@ -460,10 +474,7 @@ def deepseek_v4_hc_pre_mix(
             comb.reshape(*lead, hc_mult, hc_mult),
         )
 
-    # ~128 chunks for the model shape (D = 16384 -> CHUNK = 128); small D used
-    # in tests degrades gracefully to fewer/masked chunks.
-    chunk = max(64, triton.next_power_of_2((dim + 127) // 128))
-    split = (dim + chunk - 1) // chunk
+    chunk, split = hc_partials_layout(dim)
 
     partials = torch.empty(n, mix_hc + 1, split, device=flat.device, dtype=torch.float32)
     _hc_fn_partials_kernel[(n, split)](
@@ -781,8 +792,7 @@ def deepseek_v4_hc_pre_mix_combine(
         )
 
     # Same split-D layout as deepseek_v4_hc_pre_mix (~128 chunks at D = 16384).
-    chunk = max(64, triton.next_power_of_2((dim + 127) // 128))
-    split = (dim + chunk - 1) // chunk
+    chunk, split = hc_partials_layout(dim)
 
     partials = torch.empty(n, mix_hc + 1, split, device=flat.device, dtype=torch.float32)
     _hc_fn_partials_kernel[(n, split)](
@@ -852,3 +862,382 @@ def _deepseek_v4_hc_pre_mix_combine_fake(
     post = flat.new_empty((*lead, hc_mult), dtype=torch.float32)
     comb = flat.new_empty((*lead, hc_mult, hc_mult), dtype=torch.float32)
     return y, post, comb
+
+
+# ---------------------------------------------------------------------------
+# Layer-boundary HC seam: consume partials produced by the fused hc_post
+# ---------------------------------------------------------------------------
+#
+# ``deepseek_v4_hc_pre_mix_combine`` still launches ``_hc_fn_partials_kernel``
+# to re-read the ``[N, HM * H]`` hidden states it was just handed — but at every
+# HC site except the very first (layer 0, attn), those hidden states are the
+# output of the *previous* site's ``_hc_post``, which had the freshly composed
+# residual stream in registers moments earlier. The fused seam op
+# ``auto_deploy::deepseek_v4_hc_post_next_partials`` (deepseek_v4_hc_post.py)
+# therefore emits the next site's split-D partials while storing the residual,
+# and this op consumes them: the decode path skips the partials launch and goes
+# straight to the (unchanged) ``_hc_pre_composition_combine_kernel`` — this op
+# adds no arithmetic of its own (the seam producer's partials carry ~1-2 fp32
+# ULP of FMA-association drift; see deepseek_v4_hc_post.py). The prefill path ignores
+# ``partials`` (the producer leaves them unfilled at prefill) and runs the
+# identical eager cublas front as ``deepseek_v4_hc_pre_mix_combine``.
+
+
+@torch.library.custom_op("auto_deploy::deepseek_v4_hc_pre_mix_combine_partials", mutates_args=())
+def deepseek_v4_hc_pre_mix_combine_partials(
+    partials: torch.Tensor,
+    flat: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+    norm_eps: float,
+    rms_eps: float,
+    out_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``deepseek_v4_hc_pre_mix_combine`` with precomputed split-D partials.
+
+    Args:
+        partials: [N, MIX_HC + 1, SPLIT] fp32 from the fused hc_post seam op
+                  (``hc_partials_layout``'s layout over ``flat``'s last dim);
+                  read only on the decode (n <= _HC_PRE_MIX_FUSED_N_MAX) path.
+        (remaining args identical to ``deepseek_v4_hc_pre_mix_combine``)
+
+    Returns:
+        y:    [..., H]                  out_dtype == rmsnorm(sum_m pre*flat)
+        post: [..., hc_mult]            fp32
+        comb: [..., hc_mult, hc_mult]   fp32
+    """
+    lead = list(flat.shape[:-1])
+    dim = flat.shape[-1]
+    n = 1
+    for sz in lead:
+        n *= sz
+    mix_hc = hc_fn.shape[0]
+    hidden = norm_weight.shape[0]
+    assert hc_fn.shape[-1] == dim, "hc_fn last dim must match flat last dim"
+    assert dim == hc_mult * hidden, "flat last dim must equal hc_mult * H"
+
+    if n > _HC_PRE_MIX_FUSED_N_MAX:
+        # Prefill-sized token counts: identical to deepseek_v4_hc_pre_mix_combine
+        # (the producer left ``partials`` unfilled on this path — never read it).
+        flat_f = flat.reshape(n, dim).float()
+        rsqrt = torch.rsqrt(flat_f.square().mean(-1, keepdim=True) + norm_eps)
+        mixes = torch.nn.functional.linear(flat_f, hc_fn) * rsqrt
+        pre, post, comb = torch.ops.auto_deploy.hc_split_sinkhorn(
+            mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
+        )
+        y = torch.ops.auto_deploy.deepseek_v4_hc_combine_rmsnorm(
+            pre, flat.reshape(n, dim), norm_weight, rms_eps, hc_mult, out_dtype
+        )
+        return (
+            y.reshape(*lead, hidden),
+            post.reshape(*lead, hc_mult),
+            comb.reshape(*lead, hc_mult, hc_mult),
+        )
+
+    _, split = hc_partials_layout(dim)
+    assert partials.shape[-2:] == (mix_hc + 1, split), (
+        f"partials layout mismatch: {tuple(partials.shape)} vs (*, {mix_hc + 1}, {split})"
+    )
+
+    flat_c = flat.reshape(n, dim).contiguous()
+    part_c = partials.reshape(n, mix_hc + 1, split).contiguous()
+    scale_f = hc_scale.contiguous().float()
+    base_f = hc_base.contiguous().float()
+    weight_f = norm_weight.contiguous().float()
+
+    y = torch.empty(n, hidden, device=flat.device, dtype=out_dtype)
+    post = torch.empty(n, hc_mult, device=flat.device, dtype=torch.float32)
+    comb = torch.empty(n, hc_mult * hc_mult, device=flat.device, dtype=torch.float32)
+    if n == 0:
+        return (
+            y.reshape(*lead, hidden),
+            post.reshape(*lead, hc_mult),
+            comb.reshape(*lead, hc_mult, hc_mult),
+        )
+
+    _hc_pre_composition_combine_kernel[(n,)](
+        part_c,
+        scale_f,
+        base_f,
+        flat_c,
+        weight_f,
+        y,
+        post,
+        comb,
+        n,
+        dim,
+        split,
+        hidden,
+        norm_eps,
+        eps,
+        rms_eps,
+        MIX_HC=mix_hc,
+        HM=hc_mult,
+        BM=triton.next_power_of_2(hc_mult),
+        SBLOCK=triton.next_power_of_2(split),
+        BLOCK_H=triton.next_power_of_2(hidden),
+        SINKHORN_ITERS=sinkhorn_iters,
+        num_warps=_HC_PRE_MIX_COMBINE_NUM_WARPS,
+        num_stages=2,
+        maxnreg=_HC_PRE_MIX_COMBINE_MAXNREG,
+    )
+
+    return (
+        y.reshape(*lead, hidden),
+        post.reshape(*lead, hc_mult),
+        comb.reshape(*lead, hc_mult, hc_mult),
+    )
+
+
+@deepseek_v4_hc_pre_mix_combine_partials.register_fake
+def _deepseek_v4_hc_pre_mix_combine_partials_fake(
+    partials: torch.Tensor,
+    flat: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+    norm_eps: float,
+    rms_eps: float,
+    out_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    lead = list(flat.shape[:-1])
+    hidden = norm_weight.shape[0]
+    y = flat.new_empty((*lead, hidden), dtype=out_dtype)
+    post = flat.new_empty((*lead, hc_mult), dtype=torch.float32)
+    comb = flat.new_empty((*lead, hc_mult, hc_mult), dtype=torch.float32)
+    return y, post, comb
+
+
+# ---------------------------------------------------------------------------
+# Fused HC head: partial-reduce + sigmoid gate + weighted-combine + RMSNorm
+# ---------------------------------------------------------------------------
+#
+# ``_hc_head`` in ``modeling_deepseek_v4.py`` is the model-tail HC seam: it
+# collapses the ``hc_mult`` residual streams into one hidden state right before
+# the final ``norm`` and the fp32 lm-head GEMV. In eager form it emits ~25 tiny
+# kernels per decode step (measured ~51 us GPU on the 10-layer proxy): a
+# ``[N, HM * H]`` bf16->fp32 boundary cast, square/mean/rsqrt, a cublas GEMV
+# (2 kernels), the sigmoid gate chain, a broadcast mul + M-axis reduce, the
+# bf16 cast back, the decomposed ``torch_rmsnorm`` swarm (~9 kernels), and the
+# ``.float()`` boundary cast feeding the lm-head.
+#
+# On the decode path this op consumes the split-D partials the last layer's
+# fused ``_hc_post`` seam kernel already produced against ``hc_head_fn`` and
+# runs ONE single-CTA kernel: partial reduce -> ``rstd`` -> sigmoid gate ->
+# weighted combine (streaming ``flat`` bf16 in-register, fp32 accumulate) ->
+# RMSNorm — preserving every bf16 rounding point of the eager chain
+# (``y -> bf16``, ``normed -> bf16``, ``weight * normed -> bf16``). The final
+# store WIDENS the bf16-rounded result to fp32, absorbing the ``.float()``
+# boundary cast: the stored values are exactly ``eager_bf16.float()``. Like
+# ``deepseek_v4_hc_pre_mix``, the partial-reduced ``mixes`` match the eager
+# cublas GEMV to ~1 ULP (fp32 association differs), not bit-exactly; every
+# op downstream of ``mixes`` mirrors the eager rounding chain.
+#
+# The prefill path (n > _HC_PRE_MIX_FUSED_N_MAX) ignores ``partials`` and runs
+# the identical eager chain (cublas GEMM front + ``torch_rmsnorm`` + widen).
+
+
+@triton.jit
+def _hc_head_combine_kernel(
+    part_ptr,  # [N, HM + 1, SPLIT] fp32 (HM head-fn dots + square-sum)
+    scale_ptr,  # [1] fp32
+    base_ptr,  # [HM] fp32
+    flat_ptr,  # [N, HM * H] input (any float dtype; converted in-register)
+    weight_ptr,  # [H] fp32 (final RMSNorm weight)
+    y_ptr,  # [N, H] fp32 (out; bf16-rounded values widened to fp32)
+    N,
+    D,
+    SPLIT,
+    H,
+    norm_eps,
+    hc_eps,
+    rms_eps,
+    HM: tl.constexpr,  # hc_mult == hc_head_fn rows
+    BM: tl.constexpr,  # next_power_of_2(hc_mult)
+    SBLOCK: tl.constexpr,  # next_power_of_2(SPLIT)
+    BLOCK_H: tl.constexpr,  # next_power_of_2(H)
+):
+    """One program per token row: partials -> pre gate -> combine -> RMSNorm."""
+    row = tl.program_id(0)
+    if row >= N:
+        return
+    pbase = part_ptr + row * ((HM + 1) * SPLIT)
+
+    s = tl.arange(0, SBLOCK)
+    smask = s < SPLIT
+
+    # rstd = rsqrt(mean(x^2) + norm_eps), fixed-order tree reduce over SPLIT.
+    sq = tl.load(pbase + HM * SPLIT + s, mask=smask, other=0.0)
+    rstd = tl.rsqrt(tl.sum(sq, axis=0) / D + norm_eps)
+
+    sc = tl.load(scale_ptr)  # scalar fp32 (hc_head_scale is [1])
+
+    d = tl.arange(0, BM)
+    dmask = d < HM
+
+    # pre = sigmoid((mix * rstd) * scale + base) + hc_eps — kept in registers.
+    pre_part = tl.load(
+        pbase + d[:, None] * SPLIT + s[None, :],
+        mask=dmask[:, None] & smask[None, :],
+        other=0.0,
+    )
+    pre_logits = (tl.sum(pre_part, axis=1) * rstd) * sc + tl.load(
+        base_ptr + d, mask=dmask, other=0.0
+    )
+    pre = tl.sigmoid(pre_logits) + hc_eps
+
+    # --- weighted combine + RMSNorm (mirrors _hc_weighted_combine_kernel) ---
+    h = tl.arange(0, BLOCK_H)
+    hmask = h < H
+    flat_row = flat_ptr + row * (HM * H)
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for m in tl.static_range(HM):
+        # Exact scalar extraction of pre[m] from the register tile.
+        p = tl.sum(tl.where(d == m, pre, 0.0), axis=0)
+        f = tl.load(flat_row + m * H + h, mask=hmask, other=0.0).to(tl.float32)
+        acc += p * f
+    y = acc.to(tl.bfloat16).to(tl.float32)
+    var = tl.sum(y * y, axis=0) / H
+    y_rstd = tl.rsqrt(var + rms_eps)
+    normed = (y * y_rstd).to(tl.bfloat16).to(tl.float32)
+    w = tl.load(weight_ptr + h, mask=hmask, other=0.0)
+    # bf16 round (torch_rmsnorm's out dtype) then widen: absorbs the .float().
+    out = (w * normed).to(tl.bfloat16).to(tl.float32)
+    tl.store(y_ptr + row * H + h, out, mask=hmask)
+
+
+@torch.library.custom_op("auto_deploy::deepseek_v4_hc_head_norm", mutates_args=())
+def deepseek_v4_hc_head_norm(
+    partials: torch.Tensor,
+    flat: torch.Tensor,
+    hc_head_fn: torch.Tensor,
+    hc_head_scale: torch.Tensor,
+    hc_head_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    hc_eps: float,
+    norm_eps: float,
+    rms_eps: float,
+) -> torch.Tensor:
+    """Fused ``_hc_head`` + final RMSNorm + fp32 widen. Drop-in for the eager tail.
+
+    Computes, per leading (token) index::
+
+        f     = flat.float()                                   # exact for bf16
+        rstd  = rsqrt(mean(f ^ 2) + norm_eps)
+        mixes = (f @ hc_head_fn.T) * rstd
+        pre   = sigmoid(mixes * hc_head_scale + hc_head_base) + hc_eps
+        y     = (sum_m pre[m] * f[m*H : (m+1)*H]).to(flat.dtype)
+        out   = torch_rmsnorm(y, norm_weight, rms_eps).float()
+
+    Args:
+        partials:      [N, HM + 1, SPLIT] fp32 split-D partials of ``flat``
+                       against ``hc_head_fn`` (from the fused hc_post seam op);
+                       read only on the decode (n <= _HC_PRE_MIX_FUSED_N_MAX) path.
+        flat:          [..., D] hidden states (bf16/fp16/fp32), D == HM * H
+        hc_head_fn:    [HM, D] fp32
+        hc_head_scale: [1] fp32
+        hc_head_base:  [HM] fp32
+        norm_weight:   [H] fp32 final RMSNorm weight
+        hc_eps:        sigmoid gate epsilon
+        norm_eps:      RMS statistic epsilon (mix scaling)
+        rms_eps:       final RMSNorm epsilon
+
+    Returns:
+        [..., H] fp32 — bf16-rounded normalized hidden states widened to fp32
+        (exactly ``eager_bf16.float()``), ready for the fp32 lm-head GEMV.
+    """
+    lead = list(flat.shape[:-1])
+    dim = flat.shape[-1]
+    n = 1
+    for sz in lead:
+        n *= sz
+    hm = hc_head_fn.shape[0]
+    hidden = norm_weight.shape[0]
+    assert hc_head_fn.shape[-1] == dim, "hc_head_fn last dim must match flat last dim"
+    assert dim == hm * hidden, "flat last dim must equal hc_mult * H"
+
+    if n > _HC_PRE_MIX_FUSED_N_MAX:
+        # Prefill-sized token counts: the eager chain, bit-identical to the
+        # previous modeling-side _hc_head + norm + .float() sequence.
+        flat_f = flat.reshape(n, dim).float()
+        rsqrt = torch.rsqrt(flat_f.square().mean(-1, keepdim=True) + norm_eps)
+        mixes = torch.nn.functional.linear(flat_f, hc_head_fn) * rsqrt
+        pre = torch.sigmoid(mixes * hc_head_scale + hc_head_base) + hc_eps
+        y = torch.sum(pre.unsqueeze(-1) * flat_f.view(n, hm, hidden), dim=-2)
+        y = y.to(flat.dtype)
+        y = torch.ops.auto_deploy.torch_rmsnorm(y, norm_weight, rms_eps)
+        return y.float().reshape(*lead, hidden)
+
+    _, split = hc_partials_layout(dim)
+    assert partials.shape[-2:] == (hm + 1, split), (
+        f"partials layout mismatch: {tuple(partials.shape)} vs (*, {hm + 1}, {split})"
+    )
+
+    flat_c = flat.reshape(n, dim).contiguous()
+    part_c = partials.reshape(n, hm + 1, split).contiguous()
+    scale_f = hc_head_scale.contiguous().float()
+    base_f = hc_head_base.contiguous().float()
+    weight_f = norm_weight.contiguous().float()
+
+    y = torch.empty(n, hidden, device=flat.device, dtype=torch.float32)
+    if n == 0:
+        return y.reshape(*lead, hidden)
+
+    block_h = triton.next_power_of_2(hidden)
+    # Same shape-dependent launch config as the sibling combine+RMSNorm kernel
+    # (wide CTA hides the HM*H load latency at decode; see _hc_launch_config).
+    num_warps, num_stages, maxnreg = _hc_pre_norm._hc_launch_config(n, block_h)
+    launch_kwargs = dict(
+        HM=hm,
+        BM=triton.next_power_of_2(hm),
+        SBLOCK=triton.next_power_of_2(split),
+        BLOCK_H=block_h,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    if maxnreg is not None:
+        launch_kwargs["maxnreg"] = maxnreg
+
+    _hc_head_combine_kernel[(n,)](
+        part_c,
+        scale_f,
+        base_f,
+        flat_c,
+        weight_f,
+        y,
+        n,
+        dim,
+        split,
+        hidden,
+        norm_eps,
+        hc_eps,
+        rms_eps,
+        **launch_kwargs,
+    )
+    return y.reshape(*lead, hidden)
+
+
+@deepseek_v4_hc_head_norm.register_fake
+def _deepseek_v4_hc_head_norm_fake(
+    partials: torch.Tensor,
+    flat: torch.Tensor,
+    hc_head_fn: torch.Tensor,
+    hc_head_scale: torch.Tensor,
+    hc_head_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    hc_eps: float,
+    norm_eps: float,
+    rms_eps: float,
+) -> torch.Tensor:
+    lead = list(flat.shape[:-1])
+    hidden = norm_weight.shape[0]
+    return flat.new_empty((*lead, hidden), dtype=torch.float32)
