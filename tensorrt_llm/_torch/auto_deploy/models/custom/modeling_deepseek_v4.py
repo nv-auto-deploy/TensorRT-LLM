@@ -822,18 +822,22 @@ class DeepseekV4MoEGate(nn.Module):
         if self.score_func != "sqrtsoftplus":
             raise ValueError(f"Unsupported DeepSeek V4 scoring_func: {self.score_func}")
 
-        router_logits = _linear(hidden_states_flat.to(self.weight.dtype), self.weight).float()
-
         if self.hash_routing:
-            scores = F.softplus(router_logits).sqrt()
-            selected_experts = self.tid2eid[input_ids_flat.to(torch.long)].to(torch.int64)
-            routing_weights = scores.gather(1, selected_experts)
-            if self.norm_topk_prob:
-                routing_weights = routing_weights / (
-                    routing_weights.sum(dim=-1, keepdim=True) + 1e-20
-                )
-            routing_weights = routing_weights * self.routed_scaling_factor
-            return selected_experts, routing_weights
+            # Hash layers: the selected experts come from the tid2eid token map, so
+            # only those top_k rows of the (E, H) fp32 router GEMV are needed. The
+            # fused op gathers just those rows and runs the whole
+            # gemv + sqrtsoftplus + gather + renorm + scale chain as one Triton
+            # program per token at decode (prefill keeps the dense reference chain).
+            return torch.ops.auto_deploy.deepseek_v4_hash_routing(
+                hidden_states_flat,
+                self.weight,
+                self.tid2eid,
+                input_ids_flat,
+                self.routed_scaling_factor,
+                self.norm_topk_prob,
+            )
+
+        router_logits = _linear(hidden_states_flat.to(self.weight.dtype), self.weight).float()
 
         # Non-hash layers: fuse the sqrtsoftplus scoring + bias-add + top-k + gather +
         # renorm + scale chain into one Triton kernel (collapses the tiny per-token
