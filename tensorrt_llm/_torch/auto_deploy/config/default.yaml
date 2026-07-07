@@ -229,6 +229,14 @@ transforms:
   fuse_finegrained_fp8_gate_up:
     stage: post_load_fusion
     run_shape_prop: true
+  # DeepSeek-V4-only optimization. The matcher proves the complete fused wq_a+wkv
+  # projection shape and Q1024/KV(448+64) fanout, then replaces only the Q-LoRA BF16
+  # torch_rmsnorm decomposition with one fixed-BF16 kernel. Projection and KV behavior
+  # are unchanged. The exact DSV4 op provenance makes this a no-op for other models,
+  # so no model- or campaign-specific flag is needed.
+  fuse_deepseek_v4_q_rmsnorm:
+    stage: post_load_fusion
+    run_shape_prop: true
   # Merge sibling replicated (tp_mode="none") bf16 linear projections that read the same
   # activation into one multi-output projection + narrow slices (e.g. DeepSeek-V4 sparse
   # layers: attn/indexer compressor wkv+wgate and indexer weights_proj all read the layer

@@ -907,6 +907,45 @@ def _splitk_block_k(N: int, block_k: int) -> int:
     return block_k
 
 
+def _validate_splitk_c_out(
+    C_out: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype,
+    M: int,
+    N: int,
+    K: int,
+) -> None:
+    """Validate a caller-owned split-K accumulator without reading device data."""
+    expected_shape = (M, N)
+    if A.dim() != 2 or tuple(A.shape) != (M, K):
+        raise ValueError(f"A must have shape {(M, K)} when C_out is used, got {tuple(A.shape)}")
+    if C_out.dtype != torch.float32:
+        raise TypeError(f"C_out must have dtype float32, got {C_out.dtype}")
+    if output_dtype != torch.float32:
+        raise ValueError("C_out requires output_dtype=torch.float32")
+    if C_out.layout != torch.strided:
+        raise ValueError(f"C_out must use strided layout, got {C_out.layout}")
+    for name, tensor in (("A", A), ("B", B), ("As", As), ("Bs", Bs)):
+        if C_out.device != tensor.device:
+            raise ValueError(
+                f"C_out and {name} must be on the same device, "
+                f"got {C_out.device} and {tensor.device}"
+            )
+    if C_out.dim() != 2 or tuple(C_out.shape) != expected_shape:
+        raise ValueError(f"C_out must have shape {expected_shape}, got {tuple(C_out.shape)}")
+    if C_out.stride(1) != 1 or C_out.stride(0) < N:
+        raise ValueError(
+            "C_out must have unit column stride and row stride >= N; "
+            f"got stride {tuple(C_out.stride())} for N={N}"
+        )
+    for name, tensor in (("A", A), ("B", B), ("As", As), ("Bs", Bs)):
+        if torch._C._overlaps(C_out, tensor):
+            raise ValueError(f"C_out must not overlap {name}")
+
+
 def _w8a8_block_fp8_matmul_splitk(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -924,6 +963,7 @@ def _w8a8_block_fp8_matmul_splitk(
     BLOCK_SIZE_K: Optional[int] = None,
     num_warps: int = _SPLITK_NUM_WARPS,
     num_stages: int = _SPLITK_NUM_STAGES,
+    C_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Split-K block-FP8 GEMM for the decode GEMV (see kernel docstring above).
 
@@ -938,6 +978,14 @@ def _w8a8_block_fp8_matmul_splitk(
     never straddles a scale-block boundary (the kernel loads one scale per tile,
     indexed ``(k * BLOCK_SIZE_K) // group_k``); a smaller tile keeps the same atomic
     count as ``SPLIT_K`` but raises the K-loop iteration count (deeper pipelining).
+
+    ``C_out``, when given, is a caller-provided, pre-zeroed FP32 accumulator. It must
+    be a non-overlapping ``[M, N]`` view with unit column stride, must not alias any
+    input, and is returned directly (``output_dtype`` must be FP32). This lets
+    grouped GEMVs use disjoint column slices of one allocation and one later finish
+    cast. Split-K uses FP32 atomics, so launch-to-launch accumulation order is not
+    deterministic; a later BF16 cast normally absorbs the variation but values on a
+    BF16 rounding boundary can differ by one ULP.
     """
     if SPLIT_K is None:
         SPLIT_K = _splitk_split_k(N)
@@ -949,9 +997,13 @@ def _w8a8_block_fp8_matmul_splitk(
     assert block_k % BLOCK_SIZE_K == 0, (
         f"BLOCK_SIZE_K={BLOCK_SIZE_K} must divide quant block_k={block_k}"
     )
-    C_shape = A.shape[:-1] + (N,)
-    # fp32 accumulator, pre-zeroed for the atomic reduction across SPLIT_K CTAs.
-    C_acc = A.new_zeros(C_shape, dtype=torch.float32)
+    if C_out is not None:
+        _validate_splitk_c_out(C_out, A, B, As, Bs, output_dtype, M, N, K)
+        C_acc = C_out
+    else:
+        C_shape = A.shape[:-1] + (N,)
+        # fp32 accumulator, pre-zeroed for the atomic reduction across SPLIT_K CTAs.
+        C_acc = A.new_zeros(C_shape, dtype=torch.float32)
 
     grid = (
         triton.cdiv(M, _SPLITK_BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
@@ -1229,6 +1281,40 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
                 output_dtype=input.dtype,
             )
             output = out2d.reshape(*lead_shape, out_rows)
+        elif _use_splitk_decode(m_tokens, rank, in_features):
+            # Decode GEMV epilogue collapse (idea_0003): every per-rank group takes the
+            # split-K path here, and the old per-group dispatch paid a (zero-fill +
+            # fp32->bf16 finish cast) pair per group plus a ``torch.stack`` copy to
+            # re-concatenate the group outputs. Instead, atomically accumulate all
+            # groups into ONE pre-zeroed fp32 buffer laid out exactly like the stacked
+            # result ([M, G*rank], group-major columns) — the split-K kernel writes
+            # each group's disjoint column slice through explicit strides — then run
+            # ONE finish cast over the whole buffer. This preserves the kernel, launch
+            # configuration, and mathematical FP32 reduction for each group while
+            # removing redundant fills/casts and the stack copy. Split-K atomic arrival
+            # order remains nondeterministic; values exactly on a BF16 rounding boundary
+            # can vary by one ULP just as they can on the original per-group path. The
+            # strided ``qin`` / ``sin`` slices need no ``.contiguous()`` because the
+            # kernel consumes explicit row strides.
+            weight_grouped = weight_quantized.view(num_groups, rank, in_features)
+            scale_rows = scale_n // num_groups
+            scale_grouped = weight_scale_inv.view(num_groups, scale_rows, scale_k)
+            acc = qinput.new_zeros((m_tokens, out_rows), dtype=torch.float32)
+            for g in range(num_groups):
+                _w8a8_block_fp8_matmul_splitk(
+                    qin[:, g, :],
+                    weight_grouped[g],
+                    sin[:, g, :],
+                    scale_grouped[g],
+                    block_n,
+                    block_k,
+                    torch.float32,
+                    m_tokens,
+                    rank,
+                    in_features,
+                    C_out=acc[:, g * rank : (g + 1) * rank],
+                )
+            output = acc.to(input.dtype).reshape(*lead_shape, out_rows)
         else:
             weight_grouped = weight_quantized.view(num_groups, rank, in_features)
             scale_rows = scale_n // num_groups
