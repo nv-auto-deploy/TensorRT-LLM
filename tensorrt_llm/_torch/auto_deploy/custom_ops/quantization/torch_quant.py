@@ -1143,353 +1143,6 @@ def _w8a8_block_fp8_matmul_splitk(
     return C_acc.to(output_dtype)
 
 
-# ===== Fused act-quant + block-FP8 matmul (decode prologue fusion, idea_0043) =====
-#
-# ``torch_fake_quant_finegrained_fp8_linear`` (and the grouped variant) launch a
-# standalone ``_act_quant_kernel`` before every W8A8 block-FP8 matmul. At decode
-# (M<=4) that quant is a launch-floor-bound ~1.3us kernel whose fp8 output and
-# per-block scale are materialized to HBM only to be re-read by the very next
-# kernel. The two kernels below are line-for-line copies of
-# ``_w8a8_block_fp8_matmul_kernel`` / ``_w8a8_block_fp8_matmul_splitk_kernel`` that
-# instead load the raw model-dtype activation tile and quantize it in the prologue,
-# removing the standalone launch and the fp8/scale round trip. CSE-hoisted
-# ``torch_fp8_finegrained_act_quant`` producers (one quant shared by >=2 consumer
-# linears) are NOT rewritten -- fusing those would re-run the quant once per
-# consumer and change the shared-activation contract.
-#
-# Byte-identity contract vs. quant-then-matmul (both ops keep the standalone path
-# for every other case, so the fused path must be bit-equal, not just close):
-#   * ``_fp8_act_quant_tile`` repeats ``_act_quant_kernel``'s per-group math on the
-#     same 128-wide scale group: fp32 amax (max is order-independent, so any lane
-#     layout gives the same bits), the same fp32 scale formula in both ROUND_SCALE
-#     branches, the same fp32 division by the *unrounded* fp32 scale, and the same
-#     RNE fp32->fp8 cast. The ue8m0 branch's ``tl.log2/ceil/exp2`` compile to the
-#     same instructions in both kernels, so even its transcendentals match.
-#   * The per-block scale is then rounded through the model dtype exactly like the
-#     standalone kernel's store into the model-dtype scale tensor, and enters the
-#     unchanged ``tl.dot(a, b) * a_s * b_s`` accumulation expression.
-#   * ``BLOCK_SIZE_K`` stays pinned to the quantization group (one scale per
-#     K-tile) and the K loop / dot tiling / autotune config tables are unchanged,
-#     so the fp32 accumulation sequence is unchanged. (Split-K keeps the
-#     pre-existing fp32-atomic arrival-order caveat of the standalone path.)
-# The only behavioral difference is reading 2-byte model-dtype activations instead
-# of 1-byte fp8 (negligible next to the N*K weight traffic dominating these decode
-# GEMVs) and recomputing the ALU-trivial quant once per consuming CTA.
-
-
-@triton.jit
-def _fp8_act_quant_tile(a_f32, ROUND_SCALE: tl.constexpr):
-    """Per-row block-FP8 quant of one fp32 ``(BLOCK_M, group_k)`` activation tile.
-
-    Bit-for-bit the per-group math of ``_act_quant_kernel`` -- keep the two in
-    sync. Returns the fp8 tile and the raw fp32 per-row scale (the caller rounds
-    the scale through the model dtype, mirroring the standalone kernel's store).
-    """
-    amax = tl.max(tl.abs(a_f32), axis=1)
-    if ROUND_SCALE:
-        amax = tl.maximum(amax, 1e-4)
-        e = tl.ceil(tl.log2(amax / 448.0))
-        s = tl.exp2(e)
-        # s is an exact power of two (exp2 of an integer), so multiplying by
-        # exp2(-e) is bit-identical to dividing by s -- fp32 scaling by a power of
-        # two is a pure exponent shift, and at the subnormal/inf edges both ops
-        # round the same exact value. This replaces BLOCK_M*group_k dependent fp32
-        # divides with pipelined multiplies; the divides otherwise dominate the
-        # exposed prologue latency on the CTA-starved decode GEMVs.
-        a_fp8 = (a_f32 * tl.exp2(-e)[:, None]).to(tl.float8e4nv)
-    else:
-        s = amax / 448.0
-        # Clamp scale so that all-zero blocks produce 0/eps = 0 instead of 0/0 = NaN.
-        s = tl.maximum(s, 1e-12)
-        a_fp8 = (a_f32 / s[:, None]).to(tl.float8e4nv)
-    return a_fp8, s
-
-
-@triton.autotune(
-    configs=_W8A8_BLOCK_FP8_MATMUL_CONFIGS,
-    key=["M", "N", "K"],
-    prune_configs_by={"early_config_prune": _w8a8_prune_tp4_decode_configs},
-)
-@triton.jit
-def _w8a8_block_fp8_matmul_fused_act_quant_kernel(
-    A,  # raw model-dtype activation, quantized per K-tile in the prologue
-    B,
-    C,
-    Bs,
-    M,
-    N,
-    K,
-    group_n,
-    group_k,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    stride_Bs_k,
-    stride_Bs_n,
-    ROUND_SCALE: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-
-    offs_bsn = offs_bn // group_n
-    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a_raw = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-
-        a, a_s_f32 = _fp8_act_quant_tile(a_raw.to(tl.float32), ROUND_SCALE)
-        # Round the scale through the model dtype: the standalone path stores it in
-        # a model-dtype tensor and the matmul consumes that rounded value.
-        a_s = a_s_f32.to(A.dtype.element_ty)
-
-        k_start = k * BLOCK_SIZE_K
-        offs_ks = k_start // group_k
-        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
-
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-
-    if C.dtype.element_ty == tl.bfloat16:
-        c = accumulator.to(tl.bfloat16)
-    elif C.dtype.element_ty == tl.float16:
-        c = accumulator.to(tl.float16)
-    else:
-        c = accumulator.to(tl.float32)
-
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
-
-
-@triton.jit
-def _w8a8_block_fp8_matmul_splitk_fused_act_quant_kernel(
-    A,  # raw model-dtype activation, quantized per K-tile in the prologue
-    B,
-    C,
-    Bs,
-    M,
-    N,
-    K,
-    group_n,
-    group_k,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    stride_Bs_k,
-    stride_Bs_n,
-    ROUND_SCALE: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    SPLIT_K: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    pid_sk = tl.program_id(axis=1)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    pid_m = pid // num_pid_n
-    pid_n = pid % num_pid_n
-
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    # Start each split at its own K-block; stride by SPLIT_K K-blocks per loop step.
-    a_ptrs = A + (
-        offs_am[:, None] * stride_am + (pid_sk * BLOCK_SIZE_K + offs_k)[None, :] * stride_ak
-    )
-    b_ptrs = B + (
-        (pid_sk * BLOCK_SIZE_K + offs_k)[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-    )
-
-    offs_bsn = offs_bn // group_n
-    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    num_k = tl.cdiv(K, BLOCK_SIZE_K)
-    for k in range(pid_sk, num_k, SPLIT_K):
-        k_remaining = K - k * BLOCK_SIZE_K
-        a_raw = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
-
-        a, a_s_f32 = _fp8_act_quant_tile(a_raw.to(tl.float32), ROUND_SCALE)
-        # Round the scale through the model dtype: the standalone path stores it in
-        # a model-dtype tensor and the matmul consumes that rounded value.
-        a_s = a_s_f32.to(A.dtype.element_ty)
-
-        offs_ks = (k * BLOCK_SIZE_K) // group_k
-        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
-
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
-        a_ptrs += SPLIT_K * BLOCK_SIZE_K * stride_ak
-        b_ptrs += SPLIT_K * BLOCK_SIZE_K * stride_bk
-
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
-
-
-def _use_fused_act_quant_matmul(x: torch.Tensor, N: int, K: int, block_k: int) -> bool:
-    """Whether the fused act-quant+matmul decode path applies (else standalone quant).
-
-    Decode-only (``M <= _SPLITK_MAX_M``): at larger M the fused kernel re-reads the
-    2-byte model-dtype activation and recomputes the quant once per N-tile, which
-    can lose to the standalone one-pass quant at prefill; the M<=4 GEMV is
-    weight-traffic-bound so both effects are noise there. Contiguity and
-    ``K % block_k`` mirror ``_safe_act_quant``'s own requirements. The split-K
-    fused prologue additionally needs the MMA K-tile pinned to the scale group
-    (one scale per tile), so fall back if ``_splitk_block_k`` is ever re-tuned.
-    """
-    M = x.numel() // K
-    if M == 0 or M > _SPLITK_MAX_M:
-        return False
-    if K % block_k != 0 or not x.is_contiguous():
-        return False
-    if _use_splitk_decode(M, N, K) and _splitk_block_k(N, block_k) != block_k:
-        return False
-    return True
-
-
-def _w8a8_block_fp8_matmul_fused_act_quant(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    block_size: List[int],
-    output_dtype: torch.dtype,
-    input_scale_fmt: str = "",
-    *,
-    SPLIT_K: Optional[int] = None,
-    BLOCK_SIZE_N: Optional[int] = None,
-    num_warps: Optional[int] = None,
-    num_stages: Optional[int] = None,
-) -> torch.Tensor:
-    """Block-FP8 W8A8 matmul on a raw model-dtype activation (quant in the prologue).
-
-    Byte-identical to ``_safe_act_quant`` + ``_w8a8_block_fp8_matmul_triton`` at the
-    same shape (see the section comment above) and dispatches split-K / full-K
-    exactly like that standalone path. The explicit keyword overrides mirror
-    ``_w8a8_block_fp8_matmul_splitk`` for microbench/config sweeps.
-    """
-    assert len(block_size) == 2
-    block_n, block_k = block_size[0], block_size[1]
-    assert A.is_floating_point() and A.dtype != torch.float8_e4m3fn
-    assert A.is_contiguous()
-    assert A.shape[-1] == B.shape[-1] and A.shape[-1] % block_k == 0
-
-    M = A.numel() // A.shape[-1]
-    N, K = B.shape
-    assert B.ndim == 2 and B.is_contiguous()
-    assert Bs.ndim == 2
-    assert triton.cdiv(N, block_n) == Bs.shape[0]
-    assert triton.cdiv(K, block_k) == Bs.shape[1]
-
-    round_scale = input_scale_fmt.lower() == "ue8m0"
-    C_shape = A.shape[:-1] + (N,)
-
-    if _use_splitk_decode(M, N, K):
-        if SPLIT_K is None:
-            SPLIT_K = _splitk_split_k(N, K, M)
-        if BLOCK_SIZE_N is None:
-            BLOCK_SIZE_N = _splitk_block_n(N, K, M)
-        if num_warps is None:
-            num_warps = _splitk_num_warps(N, K, M)
-        if num_stages is None:
-            num_stages = _SPLITK_NUM_STAGES
-        # One scale per K-tile: the fused prologue requires tile == quant group
-        # (the op-level gate falls back to the standalone path if this changes).
-        assert _splitk_block_k(N, block_k) == block_k
-        C_acc = A.new_zeros(C_shape, dtype=torch.float32)
-        grid = (
-            triton.cdiv(M, _SPLITK_BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
-            SPLIT_K,
-        )
-        _w8a8_block_fp8_matmul_splitk_fused_act_quant_kernel[grid](
-            A,
-            B,
-            C_acc,
-            Bs,
-            M,
-            N,
-            K,
-            block_n,
-            block_k,
-            A.stride(-2),
-            A.stride(-1),
-            B.stride(1),
-            B.stride(0),
-            C_acc.stride(-2),
-            C_acc.stride(-1),
-            Bs.stride(1),
-            Bs.stride(0),
-            ROUND_SCALE=round_scale,
-            BLOCK_SIZE_M=_SPLITK_BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=block_k,
-            SPLIT_K=SPLIT_K,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        if output_dtype == torch.float32:
-            return C_acc
-        return C_acc.to(output_dtype)
-
-    C = A.new_empty(C_shape, dtype=output_dtype)
-
-    def grid(META):
-        return (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
-
-    _w8a8_block_fp8_matmul_fused_act_quant_kernel[grid](
-        A,
-        B,
-        C,
-        Bs,
-        M,
-        N,
-        K,
-        block_n,
-        block_k,
-        A.stride(-2),
-        A.stride(-1),
-        B.stride(1),
-        B.stride(0),
-        C.stride(-2),
-        C.stride(-1),
-        Bs.stride(1),
-        Bs.stride(0),
-        ROUND_SCALE=round_scale,
-        BLOCK_SIZE_K=block_k,
-    )
-    return C
-
-
 @torch.library.custom_op("auto_deploy::torch_fake_quant_finegrained_fp8_linear", mutates_args=())
 def torch_fake_quant_finegrained_fp8_linear(
     input: torch.Tensor,  # [..., K]
@@ -1520,28 +1173,15 @@ def torch_fake_quant_finegrained_fp8_linear(
     block_k = triton.cdiv(K, scale_k)
     block_size = [block_n, block_k]
 
-    if _use_fused_act_quant_matmul(input, N, K, block_size[1]):
-        # Decode fast path (idea_0043): quantize the activation inside the matmul
-        # prologue -- byte-identical to the two-launch path below, minus the
-        # standalone _act_quant_kernel launch and its fp8/scale materialization.
-        output = _w8a8_block_fp8_matmul_fused_act_quant(
-            input,
-            weight_quantized,
-            weight_scale_inv,
-            block_size,
-            output_dtype=input.dtype,
-            input_scale_fmt=input_scale_fmt,
-        )
-    else:
-        qinput, scale = _safe_act_quant(input, block_size[1], input_scale_fmt)
-        output = _w8a8_block_fp8_matmul_triton(
-            qinput,
-            weight_quantized,
-            scale,
-            weight_scale_inv,
-            block_size,
-            output_dtype=input.dtype,
-        )
+    qinput, scale = _safe_act_quant(input, block_size[1], input_scale_fmt)
+    output = _w8a8_block_fp8_matmul_triton(
+        qinput,
+        weight_quantized,
+        scale,
+        weight_scale_inv,
+        block_size,
+        output_dtype=input.dtype,
+    )
 
     if bias is not None:
         output = output + bias
@@ -1728,86 +1368,70 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
         # contraction is exact). Under tensor parallelism the DeepSeek-V4 MLA ``wo_a`` per-rank
         # group count is 1, so this is a single 2D block-FP8 GEMM (K=4096 -> the split-K decode
         # path); ``num_groups > 1`` falls back to a per-group launch of the same proven kernel.
-        m_tokens = input_contiguous.numel() // (num_groups * in_features)
-        if num_groups == 1 and _use_fused_act_quant_matmul(
-            input_contiguous, out_rows, in_features, block_k
-        ):
-            # Decode fast path (idea_0043): quantize the activation inside the matmul
-            # prologue -- byte-identical to the two-launch path below, minus the
-            # standalone _act_quant_kernel launch and its fp8/scale materialization.
-            out2d = _w8a8_block_fp8_matmul_fused_act_quant(
-                input_contiguous.reshape(m_tokens, in_features),
+        qinput, input_scales = _safe_act_quant(input_contiguous, block_k, input_scale_fmt)
+        m_tokens = qinput.numel() // (num_groups * in_features)
+        qin = qinput.reshape(m_tokens, num_groups, in_features)
+        sin = input_scales.reshape(m_tokens, num_groups, input_scales.shape[-1])
+        if num_groups == 1:
+            out2d = _w8a8_block_fp8_matmul_triton(
+                qin[:, 0, :],
                 weight_quantized,
+                sin[:, 0, :],
                 weight_scale_inv,
                 [block_n, block_k],
                 output_dtype=input.dtype,
-                input_scale_fmt=input_scale_fmt,
             )
             output = out2d.reshape(*lead_shape, out_rows)
+        elif _use_splitk_decode(m_tokens, rank, in_features):
+            # Decode GEMV epilogue collapse (idea_0003): every per-rank group takes the
+            # split-K path here, and the old per-group dispatch paid a (zero-fill +
+            # fp32->bf16 finish cast) pair per group plus a ``torch.stack`` copy to
+            # re-concatenate the group outputs. Instead, atomically accumulate all
+            # groups into ONE pre-zeroed fp32 buffer laid out exactly like the stacked
+            # result ([M, G*rank], group-major columns) — the split-K kernel writes
+            # each group's disjoint column slice through explicit strides — then run
+            # ONE finish cast over the whole buffer. This preserves the kernel, launch
+            # configuration, and mathematical FP32 reduction for each group while
+            # removing redundant fills/casts and the stack copy. Split-K atomic arrival
+            # order remains nondeterministic; values exactly on a BF16 rounding boundary
+            # can vary by one ULP just as they can on the original per-group path. The
+            # strided ``qin`` / ``sin`` slices need no ``.contiguous()`` because the
+            # kernel consumes explicit row strides.
+            weight_grouped = weight_quantized.view(num_groups, rank, in_features)
+            scale_rows = scale_n // num_groups
+            scale_grouped = weight_scale_inv.view(num_groups, scale_rows, scale_k)
+            acc = qinput.new_zeros((m_tokens, out_rows), dtype=torch.float32)
+            for g in range(num_groups):
+                _w8a8_block_fp8_matmul_splitk(
+                    qin[:, g, :],
+                    weight_grouped[g],
+                    sin[:, g, :],
+                    scale_grouped[g],
+                    block_n,
+                    block_k,
+                    torch.float32,
+                    m_tokens,
+                    rank,
+                    in_features,
+                    C_out=acc[:, g * rank : (g + 1) * rank],
+                )
+            output = acc.to(input.dtype).reshape(*lead_shape, out_rows)
         else:
-            qinput, input_scales = _safe_act_quant(input_contiguous, block_k, input_scale_fmt)
-            qin = qinput.reshape(m_tokens, num_groups, in_features)
-            sin = input_scales.reshape(m_tokens, num_groups, input_scales.shape[-1])
-            if num_groups == 1:
-                out2d = _w8a8_block_fp8_matmul_triton(
-                    qin[:, 0, :],
-                    weight_quantized,
-                    sin[:, 0, :],
-                    weight_scale_inv,
+            weight_grouped = weight_quantized.view(num_groups, rank, in_features)
+            scale_rows = scale_n // num_groups
+            scale_grouped = weight_scale_inv.view(num_groups, scale_rows, scale_k)
+            parts = [
+                _w8a8_block_fp8_matmul_triton(
+                    qin[:, g, :].contiguous(),
+                    weight_grouped[g].contiguous(),
+                    sin[:, g, :].contiguous(),
+                    scale_grouped[g].contiguous(),
                     [block_n, block_k],
                     output_dtype=input.dtype,
                 )
-                output = out2d.reshape(*lead_shape, out_rows)
-            elif _use_splitk_decode(m_tokens, rank, in_features):
-                # Decode GEMV epilogue collapse (idea_0003): every per-rank group takes the
-                # split-K path here, and the old per-group dispatch paid a (zero-fill +
-                # fp32->bf16 finish cast) pair per group plus a ``torch.stack`` copy to
-                # re-concatenate the group outputs. Instead, atomically accumulate all
-                # groups into ONE pre-zeroed fp32 buffer laid out exactly like the stacked
-                # result ([M, G*rank], group-major columns) — the split-K kernel writes
-                # each group's disjoint column slice through explicit strides — then run
-                # ONE finish cast over the whole buffer. This preserves the kernel, launch
-                # configuration, and mathematical FP32 reduction for each group while
-                # removing redundant fills/casts and the stack copy. Split-K atomic arrival
-                # order remains nondeterministic; values exactly on a BF16 rounding boundary
-                # can vary by one ULP just as they can on the original per-group path. The
-                # strided ``qin`` / ``sin`` slices need no ``.contiguous()`` because the
-                # kernel consumes explicit row strides.
-                weight_grouped = weight_quantized.view(num_groups, rank, in_features)
-                scale_rows = scale_n // num_groups
-                scale_grouped = weight_scale_inv.view(num_groups, scale_rows, scale_k)
-                acc = qinput.new_zeros((m_tokens, out_rows), dtype=torch.float32)
-                for g in range(num_groups):
-                    _w8a8_block_fp8_matmul_splitk(
-                        qin[:, g, :],
-                        weight_grouped[g],
-                        sin[:, g, :],
-                        scale_grouped[g],
-                        block_n,
-                        block_k,
-                        torch.float32,
-                        m_tokens,
-                        rank,
-                        in_features,
-                        C_out=acc[:, g * rank : (g + 1) * rank],
-                    )
-                output = acc.to(input.dtype).reshape(*lead_shape, out_rows)
-            else:
-                weight_grouped = weight_quantized.view(num_groups, rank, in_features)
-                scale_rows = scale_n // num_groups
-                scale_grouped = weight_scale_inv.view(num_groups, scale_rows, scale_k)
-                parts = [
-                    _w8a8_block_fp8_matmul_triton(
-                        qin[:, g, :].contiguous(),
-                        weight_grouped[g].contiguous(),
-                        sin[:, g, :].contiguous(),
-                        scale_grouped[g].contiguous(),
-                        [block_n, block_k],
-                        output_dtype=input.dtype,
-                    )
-                    for g in range(num_groups)
-                ]
-                output = torch.stack(parts, dim=1).reshape(*lead_shape, out_rows)
+                for g in range(num_groups)
+            ]
+            output = torch.stack(parts, dim=1).reshape(*lead_shape, out_rows)
     else:
         # Weight already holds its dequantized floating-point runtime value (baked at load time by
         # the ``bake_grouped_finegrained_fp8_weight`` transform). Fall back to the dynamic input
