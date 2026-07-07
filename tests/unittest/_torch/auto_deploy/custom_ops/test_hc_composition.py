@@ -229,6 +229,102 @@ def test_hc_pre_chain_end_to_end_vs_current(shape):
     torch.testing.assert_close(y, y_r)  # bf16 default tolerances
 
 
+def _two_op_reference(x, hc_fn, hc_scale, hc_base, weight, hc_mult, iters, eps, norm_eps, rms_eps):
+    """The landed two-op HC-pre path the fused op must reproduce bit-for-bit."""
+    from tensorrt_llm._torch.auto_deploy.custom_ops import deepseek_v4_hc_pre_norm  # noqa: F401
+
+    pre, post, comb = torch.ops.auto_deploy.deepseek_v4_hc_pre_mix(
+        x, hc_fn, hc_scale, hc_base, hc_mult, iters, eps, norm_eps
+    )
+    y = torch.ops.auto_deploy.deepseek_v4_hc_combine_rmsnorm(
+        pre, x, weight, rms_eps, hc_mult, x.dtype
+    )
+    return y, post, comb
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+# (1, 1) / (2, 1) are the captured decode shapes; (4, 16) sits on the fused-path
+# boundary (n == 64); (1, 200) / (4, 17) take the n > 64 eager fallback.
+@pytest.mark.parametrize("shape", [(1, 1), (2, 1), (1, 3), (4, 16), (1, 200), (4, 17)])
+@pytest.mark.parametrize("hc_mult,H", [(4, 4096), (4, 512), (2, 384), (3, 100)])
+def test_hc_pre_mix_combine_bit_exact_vs_two_op_path(shape, hc_mult, H):
+    """Fused composition+combine op vs the landed two-op sequence: torch.equal.
+
+    ``rms_eps`` is deliberately distinct from ``norm_eps`` so an argument swap
+    between the mix-statistic epsilon and the RMSNorm epsilon cannot pass.
+    """
+    torch.manual_seed(0)
+    eps, norm_eps, rms_eps, iters = 1e-6, 1e-6, 3e-5, 20
+    mix_hc = (2 + hc_mult) * hc_mult
+    dev = "cuda"
+    x = torch.randn(*shape, hc_mult * H, device=dev, dtype=torch.bfloat16)
+    hc_fn = (torch.randn(mix_hc, hc_mult * H, device=dev, dtype=torch.float32) * 0.02).contiguous()
+    hc_scale = torch.rand(3, device=dev, dtype=torch.float32) + 0.5
+    hc_base = torch.randn(mix_hc, device=dev, dtype=torch.float32) * 0.1
+    weight = torch.randn(H, device=dev, dtype=torch.float32) * 0.1 + 1.0
+
+    y_r, post_r, comb_r = _two_op_reference(
+        x, hc_fn, hc_scale, hc_base, weight, hc_mult, iters, eps, norm_eps, rms_eps
+    )
+    y, post, comb = torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine(
+        x, hc_fn, hc_scale, hc_base, weight, hc_mult, iters, eps, norm_eps, rms_eps, x.dtype
+    )
+
+    assert y.shape == y_r.shape and y.dtype == x.dtype
+    assert post.shape == post_r.shape and comb.shape == comb_r.shape
+    assert post.dtype == torch.float32 and comb.dtype == torch.float32
+    assert torch.equal(y, y_r)
+    assert torch.equal(post, post_r)
+    assert torch.equal(comb, comb_r)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_hc_pre_mix_combine_bit_exact_non_bf16(dtype):
+    """Non-bf16 residual dtypes route through the same bit-exact kernels."""
+    torch.manual_seed(2)
+    hc_mult, H, iters, eps, norm_eps, rms_eps = 4, 512, 20, 1e-6, 1e-6, 1e-6
+    mix_hc = (2 + hc_mult) * hc_mult
+    dev = "cuda"
+    x = torch.randn(2, 1, hc_mult * H, device=dev, dtype=dtype)
+    hc_fn = torch.randn(mix_hc, hc_mult * H, device=dev, dtype=torch.float32) * 0.02
+    hc_scale = torch.rand(3, device=dev, dtype=torch.float32) + 0.5
+    hc_base = torch.randn(mix_hc, device=dev, dtype=torch.float32) * 0.1
+    weight = torch.randn(H, device=dev, dtype=torch.float32) * 0.1 + 1.0
+
+    y_r, post_r, comb_r = _two_op_reference(
+        x, hc_fn, hc_scale, hc_base, weight, hc_mult, iters, eps, norm_eps, rms_eps
+    )
+    y, post, comb = torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine(
+        x, hc_fn, hc_scale, hc_base, weight, hc_mult, iters, eps, norm_eps, rms_eps, x.dtype
+    )
+    assert torch.equal(y, y_r)
+    assert torch.equal(post, post_r)
+    assert torch.equal(comb, comb_r)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_hc_pre_mix_combine_deterministic():
+    """No atomics: repeated fused-path calls must be bit-identical."""
+    torch.manual_seed(3)
+    hc_mult, H, iters, eps, norm_eps, rms_eps = 4, 4096, 20, 1e-6, 1e-6, 1e-6
+    mix_hc = (2 + hc_mult) * hc_mult
+    x = torch.randn(2, 1, hc_mult * H, device="cuda", dtype=torch.bfloat16)
+    hc_fn = torch.randn(mix_hc, hc_mult * H, device="cuda", dtype=torch.float32) * 0.02
+    hc_scale = torch.ones(3, device="cuda", dtype=torch.float32)
+    hc_base = torch.zeros(mix_hc, device="cuda", dtype=torch.float32)
+    weight = torch.ones(H, device="cuda", dtype=torch.float32)
+
+    outs = [
+        torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine(
+            x, hc_fn, hc_scale, hc_base, weight, hc_mult, iters, eps, norm_eps, rms_eps, x.dtype
+        )
+        for _ in range(2)
+    ]
+    for a, b in zip(outs[0], outs[1]):
+        assert torch.equal(a, b)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_hc_split_sinkhorn_doubly_stochastic():
     """After enough sinkhorn iters, comb is ~doubly stochastic (sanity)."""

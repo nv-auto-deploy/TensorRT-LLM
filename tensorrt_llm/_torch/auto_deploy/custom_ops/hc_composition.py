@@ -40,6 +40,12 @@ import torch
 import triton
 import triton.language as tl
 
+# Registers auto_deploy::deepseek_v4_hc_combine_rmsnorm for the prefill fallback
+# of ``deepseek_v4_hc_pre_mix_combine`` when this module is imported standalone
+# (the package ``__init__`` auto-imports every sibling anyway). One-way import:
+# ``deepseek_v4_hc_pre_norm`` does not import this module.
+from . import deepseek_v4_hc_pre_norm as _hc_pre_norm  # noqa: F401
+
 
 @triton.jit
 def _hc_composition_kernel(
@@ -516,3 +522,333 @@ def _deepseek_v4_hc_pre_mix_fake(
     post = flat.new_empty((*lead, hc_mult), dtype=torch.float32)
     comb = flat.new_empty((*lead, hc_mult, hc_mult), dtype=torch.float32)
     return pre, post, comb
+
+
+# ---------------------------------------------------------------------------
+# Fully fused HC-pre: composition + weighted-combine + block RMSNorm
+# ---------------------------------------------------------------------------
+#
+# ``deepseek_v4_hc_pre_mix`` still hands ``pre`` back through HBM so the
+# separate ``deepseek_v4_hc_combine_rmsnorm`` launch can consume it — three
+# kernels per HC call at decode. But ``pre`` is only ever fed to that combine,
+# and it is ready *before* the serial sinkhorn loop (it needs the partial
+# reduction and ``rstd`` only). ``deepseek_v4_hc_pre_mix_combine`` therefore
+# merges the composition and the combine into ONE kernel per row (two launches
+# per HC call total):
+#
+#   * ``_hc_fn_partials_kernel`` — unchanged split-D front (a single CTA cannot
+#     stream the [MIX_HC, D] fp32 ``hc_fn`` weight competitively).
+#   * ``_hc_pre_composition_combine_kernel`` — reduces the partials, computes
+#     ``pre``/``post`` and the comb logits, runs the weighted combine +
+#     RMSNorm, then the sinkhorn loop. ``pre`` never leaves registers.
+#
+# The block ORDER inside the fused kernel is deliberate: all small partial
+# loads and logit reductions run first, then the wide ``flat`` loads + combine,
+# and the register-only sinkhorn loop last. With the comb logits already in
+# registers the sinkhorn chain has no memory dependency, so ptxas overlaps its
+# ~40-step serial ALU chain with the outstanding ``flat`` load latency
+# (measured on B200: 6.56us fused vs 7.74us for the landed two-kernel
+# sequence at the decode shape, amortized in a CUDA graph).
+#
+# Bit-exactness (torch.equal vs the landed two-kernel path) requires
+# ``num_warps=2``: the composition reductions change bits with warp count
+# (their tile-reduce tree is layout-dependent), while the combine part is
+# warp-count-invariant, so the fused kernel adopts the composition kernel's
+# ``num_warps=2`` and reproduces both kernels' bits. ``maxnreg=240`` only
+# relaxes ptxas scheduling (measured fastest 192..255 cap sweep); it does not
+# change results.
+
+_HC_PRE_MIX_COMBINE_NUM_WARPS = 2
+_HC_PRE_MIX_COMBINE_MAXNREG = 240
+
+
+@triton.jit
+def _hc_pre_composition_combine_kernel(
+    part_ptr,  # [N, MIX_HC + 1, SPLIT] fp32
+    scale_ptr,  # [3] fp32
+    base_ptr,  # [MIX_HC] fp32
+    flat_ptr,  # [N, HM * H] input (any float dtype; converted in-register)
+    weight_ptr,  # [H] fp32 (RMSNorm weight)
+    y_ptr,  # [N, H] out_dtype (out)
+    post_ptr,  # [N, HM] fp32 (out)
+    comb_ptr,  # [N, HM*HM] fp32 (out)
+    N,
+    D,
+    SPLIT,
+    H,
+    norm_eps,
+    eps,
+    rms_eps,
+    MIX_HC: tl.constexpr,
+    HM: tl.constexpr,  # hc_mult
+    BM: tl.constexpr,  # next_power_of_2(hc_mult)
+    SBLOCK: tl.constexpr,  # next_power_of_2(SPLIT)
+    BLOCK_H: tl.constexpr,  # next_power_of_2(H)
+    SINKHORN_ITERS: tl.constexpr,
+):
+    """One program per token row: partials -> pre/post/comb logits -> y -> comb.
+
+    The composition math mirrors ``_hc_partials_composition_kernel`` and the
+    combine + RMSNorm math mirrors ``_hc_weighted_combine_kernel`` exactly
+    (same tile shapes and op order, so at ``num_warps=2`` the outputs are
+    bit-identical to the two-kernel sequence). ``pre`` is consumed from
+    registers via an exact one-hot extraction instead of an HBM round-trip.
+    """
+    row = tl.program_id(0)
+    if row >= N:
+        return
+    pbase = part_ptr + row * ((MIX_HC + 1) * SPLIT)
+
+    s = tl.arange(0, SBLOCK)
+    smask = s < SPLIT
+
+    # rstd = rsqrt(mean(x^2) + norm_eps), fixed-order tree reduce over SPLIT.
+    sq = tl.load(pbase + MIX_HC * SPLIT + s, mask=smask, other=0.0)
+    rstd = tl.rsqrt(tl.sum(sq, axis=0) / D + norm_eps)
+
+    s0 = tl.load(scale_ptr + 0)
+    s1 = tl.load(scale_ptr + 1)
+    s2 = tl.load(scale_ptr + 2)
+
+    d = tl.arange(0, BM)
+    dmask = d < HM
+
+    # pre = sigmoid((mix * rstd) * scale[0] + base) + eps — kept in registers.
+    pre_part = tl.load(
+        pbase + d[:, None] * SPLIT + s[None, :],
+        mask=dmask[:, None] & smask[None, :],
+        other=0.0,
+    )
+    pre_logits = (tl.sum(pre_part, axis=1) * rstd) * s0 + tl.load(
+        base_ptr + d, mask=dmask, other=0.0
+    )
+    pre = tl.sigmoid(pre_logits) + eps
+
+    # post = 2 * sigmoid((mix * rstd) * scale[1] + base)
+    post_part = tl.load(
+        pbase + (HM + d)[:, None] * SPLIT + s[None, :],
+        mask=dmask[:, None] & smask[None, :],
+        other=0.0,
+    )
+    post_logits = (tl.sum(post_part, axis=1) * rstd) * s1 + tl.load(
+        base_ptr + HM + d, mask=dmask, other=0.0
+    )
+    post = 2.0 * tl.sigmoid(post_logits)
+    tl.store(post_ptr + row * HM + d, post, mask=dmask)
+
+    # comb logits, laid out as [i (dim=-2), j (dim=-1)] — computed BEFORE the
+    # combine so the sinkhorn loop below is register-only and can overlap the
+    # flat load latency.
+    i = tl.arange(0, BM)[:, None]
+    j = tl.arange(0, BM)[None, :]
+    m2 = (i < HM) & (j < HM)
+    cflat = i * HM + j
+    comb_part = tl.load(
+        pbase + (2 * HM + cflat)[:, :, None] * SPLIT + s[None, None, :],
+        mask=m2[:, :, None] & smask[None, None, :],
+        other=0.0,
+    )
+    comb_logits = (tl.sum(comb_part, axis=2) * rstd) * s2 + tl.load(
+        base_ptr + 2 * HM + cflat, mask=m2, other=0.0
+    )
+
+    # --- weighted combine + RMSNorm (mirrors _hc_weighted_combine_kernel) ---
+    h = tl.arange(0, BLOCK_H)
+    hmask = h < H
+    flat_row = flat_ptr + row * (HM * H)
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for m in tl.static_range(HM):
+        # Exact scalar extraction of pre[m] from the register tile (sum of a
+        # one-hot selection reproduces the element bit-for-bit).
+        p = tl.sum(tl.where(d == m, pre, 0.0), axis=0)
+        f = tl.load(flat_row + m * H + h, mask=hmask, other=0.0).to(tl.float32)
+        acc += p * f
+    y = acc.to(tl.bfloat16).to(tl.float32)
+    var = tl.sum(y * y, axis=0) / H
+    y_rstd = tl.rsqrt(var + rms_eps)
+    normed = (y * y_rstd).to(tl.bfloat16).to(tl.float32)
+    w = tl.load(weight_ptr + h, mask=hmask, other=0.0)
+    out = w * normed
+    tl.store(y_ptr + row * H + h, out.to(y_ptr.dtype.element_ty), mask=hmask)
+
+    # --- sinkhorn (register-only; mirrors _hc_partials_composition_kernel) ---
+    neg_inf = float("-inf")
+    logits_sm = tl.where(m2, comb_logits, neg_inf)
+    mx = tl.max(logits_sm, axis=1)[:, None]
+    e = tl.exp(logits_sm - mx)
+    sden = tl.sum(e, axis=1)[:, None]
+    comb = tl.where(m2, e / sden + eps, 0.0)
+
+    cs = tl.sum(comb, axis=0)[None, :]
+    comb = tl.where(m2, comb / (cs + eps), 0.0)
+
+    for _ in range(SINKHORN_ITERS - 1):
+        rs = tl.sum(comb, axis=1)[:, None]
+        comb = tl.where(m2, comb / (rs + eps), 0.0)
+        cs = tl.sum(comb, axis=0)[None, :]
+        comb = tl.where(m2, comb / (cs + eps), 0.0)
+
+    tl.store(comb_ptr + row * (HM * HM) + cflat, comb, mask=m2)
+
+
+@torch.library.custom_op("auto_deploy::deepseek_v4_hc_pre_mix_combine", mutates_args=())
+def deepseek_v4_hc_pre_mix_combine(
+    flat: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+    norm_eps: float,
+    rms_eps: float,
+    out_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused HC-pre. Drop-in for ``deepseek_v4_hc_pre_mix`` + the combine op.
+
+    Computes, per leading (token) index::
+
+        pre, post, comb = deepseek_v4_hc_pre_mix(flat, hc_fn, ...)
+        y = deepseek_v4_hc_combine_rmsnorm(pre, flat, norm_weight, rms_eps, ...)
+
+    but on the decode path the composition and the combine run inside one
+    kernel and ``pre`` never touches HBM. Outputs are bit-identical to the
+    two-op sequence on every path.
+
+    Args:
+        flat:           [..., D] input hidden states (bf16/fp16/fp32),
+                        D == hc_mult * H
+        hc_fn:          [MIX_HC, D] fp32, MIX_HC == (2 + hc_mult) * hc_mult
+        hc_scale:       [3] fp32
+        hc_base:        [MIX_HC] fp32
+        norm_weight:    [H] fp32 RMSNorm weight (attn_norm / ffn_norm)
+        hc_mult:        comb matrix side (4 for DeepSeek-V4-Flash)
+        sinkhorn_iters: number of sinkhorn normalization rounds
+        eps:            sinkhorn stabilization epsilon
+        norm_eps:       RMS statistic epsilon (mix scaling)
+        rms_eps:        RMSNorm epsilon (y normalization)
+        out_dtype:      dtype of the returned ``y`` (the residual dtype)
+
+    Returns:
+        y:    [..., H]                  out_dtype == rmsnorm(sum_m pre*flat)
+        post: [..., hc_mult]            fp32
+        comb: [..., hc_mult, hc_mult]   fp32
+    """
+    lead = list(flat.shape[:-1])
+    dim = flat.shape[-1]
+    n = 1
+    for sz in lead:
+        n *= sz
+    mix_hc = hc_fn.shape[0]
+    hidden = norm_weight.shape[0]
+    assert hc_fn.shape[-1] == dim, "hc_fn last dim must match flat last dim"
+    assert dim == hc_mult * hidden, "flat last dim must equal hc_mult * H"
+
+    if n > _HC_PRE_MIX_FUSED_N_MAX:
+        # Prefill-sized token counts: identical to the landed two-op path
+        # (eager cublas front + composition kernel + combine kernel), so this
+        # branch is bit-exact vs current behavior by construction.
+        flat_f = flat.reshape(n, dim).float()
+        rsqrt = torch.rsqrt(flat_f.square().mean(-1, keepdim=True) + norm_eps)
+        mixes = torch.nn.functional.linear(flat_f, hc_fn) * rsqrt
+        pre, post, comb = torch.ops.auto_deploy.hc_split_sinkhorn(
+            mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
+        )
+        y = torch.ops.auto_deploy.deepseek_v4_hc_combine_rmsnorm(
+            pre, flat.reshape(n, dim), norm_weight, rms_eps, hc_mult, out_dtype
+        )
+        return (
+            y.reshape(*lead, hidden),
+            post.reshape(*lead, hc_mult),
+            comb.reshape(*lead, hc_mult, hc_mult),
+        )
+
+    flat_c = flat.reshape(n, dim).contiguous()
+    fn_f = hc_fn.contiguous().float()
+    scale_f = hc_scale.contiguous().float()
+    base_f = hc_base.contiguous().float()
+    weight_f = norm_weight.contiguous().float()
+
+    y = torch.empty(n, hidden, device=flat.device, dtype=out_dtype)
+    post = torch.empty(n, hc_mult, device=flat.device, dtype=torch.float32)
+    comb = torch.empty(n, hc_mult * hc_mult, device=flat.device, dtype=torch.float32)
+    if n == 0:
+        return (
+            y.reshape(*lead, hidden),
+            post.reshape(*lead, hc_mult),
+            comb.reshape(*lead, hc_mult, hc_mult),
+        )
+
+    # Same split-D layout as deepseek_v4_hc_pre_mix (~128 chunks at D = 16384).
+    chunk = max(64, triton.next_power_of_2((dim + 127) // 128))
+    split = (dim + chunk - 1) // chunk
+
+    partials = torch.empty(n, mix_hc + 1, split, device=flat.device, dtype=torch.float32)
+    _hc_fn_partials_kernel[(n, split)](
+        flat_c,
+        fn_f,
+        partials,
+        n,
+        dim,
+        split,
+        MIX_HC=mix_hc,
+        KBLOCK=triton.next_power_of_2(mix_hc),
+        CHUNK=chunk,
+        num_warps=4,
+    )
+
+    _hc_pre_composition_combine_kernel[(n,)](
+        partials,
+        scale_f,
+        base_f,
+        flat_c,
+        weight_f,
+        y,
+        post,
+        comb,
+        n,
+        dim,
+        split,
+        hidden,
+        norm_eps,
+        eps,
+        rms_eps,
+        MIX_HC=mix_hc,
+        HM=hc_mult,
+        BM=triton.next_power_of_2(hc_mult),
+        SBLOCK=triton.next_power_of_2(split),
+        BLOCK_H=triton.next_power_of_2(hidden),
+        SINKHORN_ITERS=sinkhorn_iters,
+        num_warps=_HC_PRE_MIX_COMBINE_NUM_WARPS,
+        num_stages=2,
+        maxnreg=_HC_PRE_MIX_COMBINE_MAXNREG,
+    )
+
+    return (
+        y.reshape(*lead, hidden),
+        post.reshape(*lead, hc_mult),
+        comb.reshape(*lead, hc_mult, hc_mult),
+    )
+
+
+@deepseek_v4_hc_pre_mix_combine.register_fake
+def _deepseek_v4_hc_pre_mix_combine_fake(
+    flat: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+    norm_eps: float,
+    rms_eps: float,
+    out_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    lead = list(flat.shape[:-1])
+    hidden = norm_weight.shape[0]
+    y = flat.new_empty((*lead, hidden), dtype=out_dtype)
+    post = flat.new_empty((*lead, hc_mult), dtype=torch.float32)
+    comb = flat.new_empty((*lead, hc_mult, hc_mult), dtype=torch.float32)
+    return y, post, comb
