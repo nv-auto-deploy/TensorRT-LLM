@@ -199,6 +199,18 @@ class CapturedGraph(nn.Module):
         self._in_spec = None
         self._out_spec = None
 
+        # Replay-time host fast paths. Decode replays this module once per token, so
+        # per-call host overhead (pytree recursion, per-input narrow/copy_ dispatch)
+        # directly gates inter-token latency on host-bound TP ranks.
+        # _fast_kwargs_order: capture-validated key order such that
+        # [kwargs[k] for k in order] reproduces tree_flatten_spec exactly (leaf-only
+        # kwargs, empty args). None disables the fast path.
+        self._fast_kwargs_order: Optional[Tuple[str, ...]] = None
+        self._fast_kwargs_keyset: Optional[frozenset] = None
+        # Pre-narrowed input-buffer views per captured combined_shape so replay does a
+        # single _foreach_copy_ instead of num_batched_inputs narrow+copy_ dispatches.
+        self._input_views_cache: Dict[Tuple[int, ...], List[torch.Tensor]] = {}
+
     def _get_hash(self, flat_args: List[Any]) -> Tuple[int, ...]:
         static_hash = []
         for arg in flat_args:
@@ -221,6 +233,35 @@ class CapturedGraph(nn.Module):
 
     def _normalize_args_kwargs(self, args: Tuple, kwargs: Dict[str, Any]) -> Tuple[Tuple, Dict]:
         return args, _order_kwargs_runtime_then_resources(kwargs, self.resource_input_names)
+
+    def _set_fast_flatten_order(
+        self, args: Tuple, kwargs: Dict[str, Any], all_args_flat: List[Any]
+    ) -> None:
+        """Validate and record a key-lookup shortcut for the pytree flatten at replay.
+
+        The fast path is enabled only when the capture-time flatten is exactly
+        ``[kwargs[k] for k in <in_spec kwargs key order>]`` (no positional args, every
+        kwarg a leaf). Validation compares object identity against the real
+        ``tree_flatten`` result, so any nesting or ordering subtlety disables it.
+        """
+        self._fast_kwargs_order = None
+        self._fast_kwargs_keyset = None
+        if args:
+            return
+        try:
+            child = getattr(self._in_spec, "child", None)
+            kw_spec = child(1) if child is not None else self._in_spec.children_specs[1]
+            order = tuple(kw_spec.context or ())
+        except (AttributeError, IndexError, TypeError):
+            return
+        if len(order) != len(kwargs) or set(order) != set(kwargs):
+            return
+        candidate = [kwargs[k] for k in order]
+        if len(candidate) == len(all_args_flat) and all(
+            c is f for c, f in zip(candidate, all_args_flat)
+        ):
+            self._fast_kwargs_order = order
+            self._fast_kwargs_keyset = frozenset(order)
 
     def _resolve_num_batched_inputs(self, args: Tuple, kwargs: Dict[str, Any]) -> int:
         if self.num_batched_inputs is not None:
@@ -304,6 +345,10 @@ class CapturedGraph(nn.Module):
         # flatten args, kwargs for the first time and record in_spec
         all_args_flat, self._in_spec = _args_kwargs_flatten(*args, **kwargs)
 
+        # record the key-lookup flatten shortcut for replay (validated vs the real
+        # flatten above; disabled automatically for nested/positional inputs)
+        self._set_fast_flatten_order(args, kwargs, all_args_flat)
+
         # extract the batched input tensors
         args_batched = all_args_flat[:num_batched_inputs]
         args_static = all_args_flat[num_batched_inputs:]
@@ -329,6 +374,8 @@ class CapturedGraph(nn.Module):
 
         # store the input buffers for the largest batch size
         self._input_buffers = [a.clone() for a in args_batched]
+        # input views from a previous capture generation would alias stale buffers
+        self._input_views_cache.clear()
 
         # create new args, kwargs with the input buffers and static args
         args, kwargs = self._in_spec.unflatten(self._input_buffers + args_static)
@@ -403,11 +450,20 @@ class CapturedGraph(nn.Module):
         if cuda_graph_state.in_bypass():
             return self.model(*args, **kwargs)
 
-        args, kwargs = self._normalize_args_kwargs(args, kwargs)
         assert self.num_batched_inputs is not None, "Graphs must be captured before replay."
 
-        # flatten args, kwargs
-        all_args_flat = _args_kwargs_flatten_spec(self._in_spec, *args, **kwargs)
+        # flatten args, kwargs. The key-lookup fast path (validated at capture) avoids
+        # the pytree recursion + kwargs re-sort on the per-token decode path; any key
+        # mismatch falls back to the generic spec flatten.
+        if (
+            self._fast_kwargs_order is not None
+            and not args
+            and kwargs.keys() == self._fast_kwargs_keyset
+        ):
+            all_args_flat = [kwargs[name] for name in self._fast_kwargs_order]
+        else:
+            args, kwargs = self._normalize_args_kwargs(args, kwargs)
+            all_args_flat = _args_kwargs_flatten_spec(self._in_spec, *args, **kwargs)
 
         # extract the batched input tensors
         args_batched = all_args_flat[: self.num_batched_inputs]
@@ -445,11 +501,18 @@ class CapturedGraph(nn.Module):
         ):
             return self.model(*args, **kwargs)
 
-        # copy inputs to input buffers along their respective dynamic dims
-        for i, input_tensor in enumerate(args_batched):
-            dim_i = self.dynamic_dims[i]
-            size_i = input_tensor.shape[dim_i]
-            self._input_buffers[i].narrow(dim_i, 0, size_i).copy_(input_tensor, non_blocking=True)
+        # copy inputs to input buffers along their respective dynamic dims. The
+        # narrowed destination views are cached per captured combined_shape and the
+        # copies are batched through one _foreach_copy_ dispatch — per-token host
+        # cost, not GPU math.
+        input_views = self._input_views_cache.get(combined_shape)
+        if input_views is None:
+            input_views = [
+                buf.narrow(self.dynamic_dims[i], 0, args_batched[i].shape[self.dynamic_dims[i]])
+                for i, buf in enumerate(self._input_buffers)
+            ]
+            self._input_views_cache[combined_shape] = input_views
+        torch._foreach_copy_(input_views, args_batched, non_blocking=True)
 
         # run forward pass via graph
         self.cudagraphs[combined_shape].replay()

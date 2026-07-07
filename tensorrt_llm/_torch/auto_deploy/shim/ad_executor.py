@@ -549,6 +549,7 @@ class ADEngine(ModelEngine):
                         cudagraphs.clear()
                     module._cuda_graph_mem_pool = None
                     module._input_buffers = []
+                    module._input_views_cache = {}
                     module._out_buffer_flat = None
 
                 if module.__class__.__name__ == "PiecewiseCapturedGraph":
