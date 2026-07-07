@@ -424,10 +424,14 @@ def test_fuse_deepseek_v4_q_rmsnorm_rejects_non_dsv4_graph(
     assert any(target.endswith("torch_rmsnorm.default") for target in targets)
 
 
-def test_grouped_decode_cuda_graph_replays_reset_shared_accumulator() -> None:
-    """Each replay zeros the captured shared accumulator before split-K atomics."""
+@pytest.mark.parametrize("rank", [256, 1024])
+def test_grouped_decode_cuda_graph_replays_reset_shared_accumulator(rank: int) -> None:
+    """Each replay zeros both legacy and TP4-tuned grouped accumulators.
+
+    ``rank=1024`` is the exact DeepSeek-V4-Flash TP4 per-group shape and engages
+    the M=1, K=4096, SPLIT_K=32, BLOCK_SIZE_N=64, two-warp schedule.
+    """
     num_groups = 2
-    rank = 256
     tokens = 1
     weight_fp8, weight_scale = _fp8_weight(num_groups * rank, DSV4_FLASH_HIDDEN, 91)
     static_input = _rand_acc((1, tokens, num_groups, DSV4_FLASH_HIDDEN), 92, scale=1.0).to(

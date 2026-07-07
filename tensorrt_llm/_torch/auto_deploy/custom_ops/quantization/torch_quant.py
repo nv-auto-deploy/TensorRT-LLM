@@ -568,6 +568,33 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str
 #     verified deterministic at the worst shape AND ~2.8x faster than the old
 #     BLOCK_SIZE_M=128/num_warps=4 launch. The autotuner selects on latency only,
 #     so the racy num_warps=4 large-tile configs are deliberately excluded.
+
+# DeepSeek-V4-Flash TP4 per-rank decode additions (idea_0040). Each exact M=1
+# full-K key is pinned to its measured winner so independent ranks cannot choose
+# different near-tie configs during Triton autotuning.
+_W8A8_TP4_QIDX_CONFIG = triton.Config(
+    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "GROUP_SIZE_M": 1},
+    num_warps=8,
+    num_stages=4,
+)
+_W8A8_TP4_Q_CONFIG = triton.Config(
+    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1},
+    num_warps=8,
+    num_stages=4,
+)
+_W8A8_TP4_WO_B_CONFIG = triton.Config(
+    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "GROUP_SIZE_M": 1},
+    num_warps=8,
+    num_stages=5,
+)
+_W8A8_TP4_DECODE_CONFIG_BY_KEY = {
+    (1, 16384, 1024): _W8A8_TP4_QIDX_CONFIG,  # fused wq_b + indexer.wq_b
+    (1, 8192, 1024): _W8A8_TP4_Q_CONFIG,  # wq_b
+    (1, 4096, 2048): _W8A8_TP4_WO_B_CONFIG,  # wo_b
+}
+_W8A8_TP4_DECODE_CONFIGS = tuple(_W8A8_TP4_DECODE_CONFIG_BY_KEY.values())
+_W8A8_TP4_DECODE_KEYS = frozenset(_W8A8_TP4_DECODE_CONFIG_BY_KEY)
+
 _W8A8_BLOCK_FP8_MATMUL_CONFIGS = [
     # Decode / small-M (BLOCK_SIZE_M=16), num_warps=4. The M=1 GEMV is dominated by
     # the K=7168 projections; the right BLOCK_SIZE_N depends on N:
@@ -591,6 +618,17 @@ _W8A8_BLOCK_FP8_MATMUL_CONFIGS = [
     triton.Config(
         {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=3
     ),
+    # The exact TP4 full-K GEMVs are much wider / shorter-K than the K=7168 shapes
+    # the configs above were tuned on. With 8-16 K-blocks, round-robin CUDA-graph
+    # microbenchmarks (drift controlled, L2-cold and L2-hot weight regimes) show:
+    #   * N=16384 K=1024: BLOCK_SIZE_N=128/num_warps=8/num_stages=4 (~128 CTAs
+    #     ~= 1 wave) -21% cold / -30% hot vs the BLOCK_SIZE_N=64/num_warps=4 pick.
+    #   * N=8192 K=1024: BLOCK_SIZE_N=64/num_warps=8/num_stages=4, ~-10%.
+    #   * N=4096 K=2048: BLOCK_SIZE_N=32/num_warps=8/num_stages=5, ~4% in the
+    #     cold-weight measurements.
+    # Each key is pinned to the matching winner above. Every other key, including
+    # M=2, prefill, and N=4096/K=512 shared w2, sees the pre-idea config set.
+    *_W8A8_TP4_DECODE_CONFIGS,
     # Prefill / large-M (BLOCK_SIZE_M>=64): num_warps=8, BLOCK_SIZE_N=128 only.
     # IMPORTANT: the stock kernel is run-to-run NON-deterministic on sm100 at large
     # M (>=256) with large K (>=2048) for several (BLOCK_SIZE_*, num_warps) combos
@@ -609,7 +647,25 @@ _W8A8_BLOCK_FP8_MATMUL_CONFIGS = [
 ]
 
 
-@triton.autotune(configs=_W8A8_BLOCK_FP8_MATMUL_CONFIGS, key=["M", "N", "K"])
+def _w8a8_prune_tp4_decode_configs(configs, nargs, **kwargs):
+    """Pin exact measured TP4 keys and preserve the old list everywhere else.
+
+    Pinning prevents per-rank autotuner noise from selecting a slower near-tie.
+    Other models, shared w2, chunked prefill, and larger-batch selection behavior
+    remain identical to the pre-idea config set.
+    """
+    key = (nargs["M"], nargs["N"], nargs["K"])
+    pinned_config = _W8A8_TP4_DECODE_CONFIG_BY_KEY.get(key)
+    if pinned_config is not None:
+        return [pinned_config]
+    return [config for config in configs if config not in _W8A8_TP4_DECODE_CONFIGS]
+
+
+@triton.autotune(
+    configs=_W8A8_BLOCK_FP8_MATMUL_CONFIGS,
+    key=["M", "N", "K"],
+    prune_configs_by={"early_config_prune": _w8a8_prune_tp4_decode_configs},
+)
 @triton.jit
 def _w8a8_block_fp8_matmul_kernel(
     A,
@@ -843,8 +899,11 @@ def _w8a8_block_fp8_matmul_splitk_kernel(
     tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
 
 
-# Split-K launch config for the decode GEMV. Tuned (kernel_layout axis) on B200 over
-# the DeepSeek-V4 MLA/dense K=7168 decode projection shapes (N in {256,576,1536,2304}).
+# Split-K launch config for the decode GEMV. Two tuned bands (see the per-knob
+# heuristics below): the legacy schedule tuned on B200 over K=7168 decode
+# projection shapes (N in {256,576,1536,2304}; kernel_layout axis), and exact M=1,
+# K=4096 DeepSeek-V4-Flash TP4 per-rank shapes (N in {1024,1536}; idea_0040,
+# kernel_autotune axis).
 _SPLITK_BLOCK_SIZE_M = 16
 # Mid-N default / fallback SPLIT_K (see ``_splitk_split_k`` for the per-N schedule).
 _SPLITK_SPLIT_K = 24
@@ -859,13 +918,27 @@ def _use_splitk_decode(M: int, N: int, K: int) -> bool:
     return M <= _SPLITK_MAX_M and K >= _SPLITK_MIN_K
 
 
-def _splitk_block_n(N: int) -> int:
-    """BLOCK_SIZE_N for the split-K decode GEMV, scaled with N.
+def _use_dsv4_tp4_m1_splitk_schedule(M: Optional[int], N: int, K: Optional[int]) -> bool:
+    """Return whether the exact measured DeepSeek-V4-Flash TP4 schedule applies."""
+    return M == 1 and K == 4096 and N in (1024, 1536)
+
+
+def _splitk_block_n(N: int, K: Optional[int] = None, M: Optional[int] = None) -> int:
+    """BLOCK_SIZE_N for the split-K decode GEMV, scaled with N and measured shape.
 
     Small N is CTA-starved so a narrow N-tile spreads work over more CTAs; large N
     has enough output tiles that a wide N-tile (better MMA / fewer atomic stores)
-    wins. Measured B200 optima: N=256->32, N=576->64, N>=1024 (1536/2304)->128.
+    wins. Measured B200 optima at K=7168: N=256->32, N=576->64, N>=1024
+    (1536/2304)->128.
+
+    Exact M=1, K=4096 shapes (idea_0040, DeepSeek-V4-Flash TP4 per-rank decode: fused
+    wq_a+wkv N=1536, shared w1+w3 / grouped wo_a N=1024, all K=4096): with only 32
+    K-blocks the wide 128-N tile leaves too few CTAs in flight; BLOCK_SIZE_N=64
+    wins in the measured L2-cold and L2-hot regimes. All other shapes preserve
+    the legacy K=7168-tuned schedule.
     """
+    if _use_dsv4_tp4_m1_splitk_schedule(M, N, K):
+        return 64
     if N <= 512:
         return 32
     if N >= 1024:
@@ -873,10 +946,10 @@ def _splitk_block_n(N: int) -> int:
     return 64
 
 
-def _splitk_split_k(N: int) -> int:
-    """SPLIT_K (K-reduction CTA fan-out) for the split-K decode GEMV, scaled with N.
+def _splitk_split_k(N: int, K: Optional[int] = None, M: Optional[int] = None) -> int:
+    """SPLIT_K (K-reduction CTA fan-out) for the split-K decode GEMV.
 
-    The K=7168 reduction is partitioned across ``SPLIT_K`` CTAs per output tile, so
+    The K reduction is partitioned across ``SPLIT_K`` CTAs per output tile, so
     the launch grid is ``cdiv(N, BLOCK_SIZE_N) * SPLIT_K`` and the atomic-reduction
     count scales with ``SPLIT_K``. The best grid is ~2-3 waves on the B200 SM array:
     narrow-N tiles (``N < 1024`` -> BLOCK_SIZE_N 32/64) yield few n-tiles and are
@@ -886,12 +959,34 @@ def _splitk_split_k(N: int) -> int:
     N=256->48, N=576->48, N=1536->24, N=2304->16 (each ~-3.5..-4.0% vs the old
     fixed SPLIT_K=24; idea_0063, kernel_tile). idea_0025's fixed 24 was tuned over
     SPLIT_K<=32 and missed the deeper split the narrow-N shapes want.
+
+    Exact M=1, K=4096 shapes (idea_0040): K=4096 has exactly 32 K-blocks, so the
+    SPLIT_K=24 is ragged -- 8 CTAs per tile do 2 K-blocks while 16 do 1, and the
+    2-block stragglers set the kernel tail. SPLIT_K=32 (1 K-block per CTA,
+    balanced) + BLOCK_SIZE_N=64 + num_warps=2 wins the measured N=1024 single and
+    grouped sites. N=1536 instead keeps SPLIT_K=24, whose drift-controlled cold
+    result was slightly faster than 32. All other shapes preserve the legacy
+    schedule.
     """
+    if _use_dsv4_tp4_m1_splitk_schedule(M, N, K):
+        return 32 if N == 1024 else _SPLITK_SPLIT_K
     if N < 1024:
         return 48
     if N <= 1792:
         return _SPLITK_SPLIT_K  # 24
     return 16
+
+
+def _splitk_num_warps(N: int, K: Optional[int] = None, M: Optional[int] = None) -> int:
+    """num_warps for the split-K decode GEMV.
+
+    The exact idea_0040 M=1/K=4096/N={1024,1536} shapes use 2 warps; their short
+    per-CTA K reduction does not benefit from the legacy 4-warps schedule. Every
+    other shape keeps the tuned 4-warps default.
+    """
+    if _use_dsv4_tp4_m1_splitk_schedule(M, N, K):
+        return 2
+    return _SPLITK_NUM_WARPS
 
 
 def _splitk_block_k(N: int, block_k: int) -> int:
@@ -961,17 +1056,19 @@ def _w8a8_block_fp8_matmul_splitk(
     SPLIT_K: Optional[int] = None,
     BLOCK_SIZE_N: Optional[int] = None,
     BLOCK_SIZE_K: Optional[int] = None,
-    num_warps: int = _SPLITK_NUM_WARPS,
-    num_stages: int = _SPLITK_NUM_STAGES,
+    num_warps: Optional[int] = None,
+    num_stages: Optional[int] = None,
     C_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Split-K block-FP8 GEMM for the decode GEMV (see kernel docstring above).
 
     Accumulates fp32 partials from ``SPLIT_K`` contraction-slices via atomics into a
     pre-zeroed fp32 buffer, then casts to ``output_dtype``. ``SPLIT_K`` /
-    ``BLOCK_SIZE_N`` / ``BLOCK_SIZE_K`` default (``None``) to the tuned heuristic
-    (``_splitk_split_k`` / ``_splitk_block_n`` / ``_splitk_block_k``); the microbench
-    passes them explicitly to sweep the config.
+    ``BLOCK_SIZE_N`` / ``BLOCK_SIZE_K`` / ``num_warps`` / ``num_stages`` default
+    (``None``) to the tuned heuristics (``_splitk_split_k`` / ``_splitk_block_n`` /
+    ``_splitk_block_k`` / ``_splitk_num_warps`` / ``_SPLITK_NUM_STAGES``), which
+    select per (N, K) band; the microbench passes them explicitly to sweep the
+    config.
 
     ``BLOCK_SIZE_K`` is the MMA contraction-tile depth and is *decoupled* from the
     quantization ``block_k`` (the scale group). It must divide ``block_k`` so a tile
@@ -988,11 +1085,15 @@ def _w8a8_block_fp8_matmul_splitk(
     BF16 rounding boundary can differ by one ULP.
     """
     if SPLIT_K is None:
-        SPLIT_K = _splitk_split_k(N)
+        SPLIT_K = _splitk_split_k(N, K, M)
     if BLOCK_SIZE_N is None:
-        BLOCK_SIZE_N = _splitk_block_n(N)
+        BLOCK_SIZE_N = _splitk_block_n(N, K, M)
     if BLOCK_SIZE_K is None:
         BLOCK_SIZE_K = _splitk_block_k(N, block_k)
+    if num_warps is None:
+        num_warps = _splitk_num_warps(N, K, M)
+    if num_stages is None:
+        num_stages = _SPLITK_NUM_STAGES
     # The MMA tile must fit inside a single scale block (one scale loaded per tile).
     assert block_k % BLOCK_SIZE_K == 0, (
         f"BLOCK_SIZE_K={BLOCK_SIZE_K} must divide quant block_k={block_k}"

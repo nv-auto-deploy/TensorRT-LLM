@@ -47,6 +47,18 @@ SHAPES = [
     (256, 7168),  # shared-expert gate/up-like
 ]
 
+# DeepSeek-V4-Flash TP4 per-rank decode shapes (idea_0040). Full-K keys carry the
+# BLOCK_SIZE_N in {128,64,32} / num_warps=8 autotune additions; the K=4096 shapes
+# dispatch to the split-K path and exercise the exact M=1, K=4096 schedule through
+# ``_w8a8_block_fp8_matmul_triton``.
+TP4_SHAPES = [
+    (16384, 1024),  # fused wq_b + indexer.wq_b
+    (8192, 1024),  # wq_b alone (ratio-128/0 layers)
+    (4096, 2048),  # wo_b (rowwise K=8192/4)
+    (1536, 4096),  # fused wq_a + wkv -> split-K path
+    (1024, 4096),  # shared w1+w3 / grouped wo_a rank -> split-K path
+]
+
 
 def _quant_weight_block_fp8(w: torch.Tensor, block_n: int = 128, block_k: int = 128):
     """Per-(block_n x block_k)-block FP8 weight quantization.
@@ -128,6 +140,79 @@ def test_prefill_rmse(M, N, K):
     scale = ref.abs().amax().clamp(min=1e-6)
     rmse_rel = ((out.float() - ref).pow(2).mean().sqrt() / scale).item()
     assert rmse_rel < 2.5e-2, f"M={M} N={N} K={K}: RMSE/amax={rmse_rel:.4e}"
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
+@pytest.mark.parametrize("M", [1, 2])
+@pytest.mark.parametrize("N,K", TP4_SHAPES)
+def test_tp4_decode_strict(M, N, K):
+    """Check TP4 per-rank decode shapes through the real dispatcher."""
+    out, ref = _run(M, N, K)
+    assert out.shape == (M, N) and out.dtype == torch.bfloat16
+    scale = ref.abs().amax().clamp(min=1e-6)
+    max_rel = ((out.float() - ref).abs().amax() / scale).item()
+    assert max_rel < 1.5e-2, f"M={M} N={N} K={K}: max_abs_err/amax={max_rel:.4e}"
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
+@pytest.mark.parametrize("M", [16, 48, 512])
+@pytest.mark.parametrize("N,K", TP4_SHAPES)
+def test_tp4_prefill_rmse(M, N, K):
+    """Check TP4 shapes at chunked-prefill Ms with the pre-existing config set."""
+    out, ref = _run(M, N, K)
+    assert out.shape == (M, N)
+    scale = ref.abs().amax().clamp(min=1e-6)
+    rmse_rel = ((out.float() - ref).pow(2).mean().sqrt() / scale).item()
+    assert rmse_rel < 2.5e-2, f"M={M} N={N} K={K}: RMSE/amax={rmse_rel:.4e}"
+
+
+def test_tp4_decode_config_prune_pins_exact_fullk_keys():
+    """Each measured key is pinned; all other keys retain the old list."""
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
+        _W8A8_BLOCK_FP8_MATMUL_CONFIGS,
+        _W8A8_TP4_DECODE_CONFIG_BY_KEY,
+        _W8A8_TP4_DECODE_CONFIGS,
+        _W8A8_TP4_DECODE_KEYS,
+        _w8a8_prune_tp4_decode_configs,
+    )
+
+    base_configs = [
+        config
+        for config in _W8A8_BLOCK_FP8_MATMUL_CONFIGS
+        if config not in _W8A8_TP4_DECODE_CONFIGS
+    ]
+    expected_signatures = {
+        (1, 16384, 1024): (16, 128, 1, 8, 4),
+        (1, 8192, 1024): (16, 64, 1, 8, 4),
+        (1, 4096, 2048): (16, 32, 1, 8, 5),
+    }
+    assert _W8A8_TP4_DECODE_KEYS == frozenset(expected_signatures)
+    for key, pinned_config in _W8A8_TP4_DECODE_CONFIG_BY_KEY.items():
+        M, N, K = key
+        selected = _w8a8_prune_tp4_decode_configs(
+            _W8A8_BLOCK_FP8_MATMUL_CONFIGS, {"M": M, "N": N, "K": K}
+        )
+        assert selected == [pinned_config]
+        signature = (
+            pinned_config.kwargs["BLOCK_SIZE_M"],
+            pinned_config.kwargs["BLOCK_SIZE_N"],
+            pinned_config.kwargs["GROUP_SIZE_M"],
+            pinned_config.num_warps,
+            pinned_config.num_stages,
+        )
+        assert signature == expected_signatures[key]
+
+    # Shared w2 has no measured win; non-target M/N/K keys keep the old list.
+    for M, N, K in [
+        (1, 4096, 512),
+        (1, 4096, 1024),
+        (2, 16384, 1024),
+        (16, 8192, 1024),
+    ]:
+        selected = _w8a8_prune_tp4_decode_configs(
+            _W8A8_BLOCK_FP8_MATMUL_CONFIGS, {"M": M, "N": N, "K": K}
+        )
+        assert selected == base_configs
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
@@ -216,6 +301,52 @@ def test_splitk_block_size_k(N, K, split_k, block_size_k):
     scale = ref.abs().amax().clamp(min=1e-6)
     max_rel = ((out.float() - ref).abs().amax() / scale).item()
     assert max_rel < 1.5e-2, f"N={N} K={K} SPLIT_K={split_k} BK={block_size_k}: {max_rel:.4e}"
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
+@pytest.mark.parametrize("num_warps", [2, 4])
+@pytest.mark.parametrize("split_k", [8, 16, 24, 32])
+@pytest.mark.parametrize("M", [1, 2])
+@pytest.mark.parametrize("N,K", [(1024, 4096), (1536, 4096)])
+def test_splitk_tp4_band(M, N, K, split_k, num_warps):
+    """K=4096 (32 K-blocks) TP4 band: SPLIT_K up to 32 (1 K-block per CTA) and the
+    new num_warps=2 launch must reconstruct the fp64 ground truth (incl. the ragged
+    SPLIT_K=24 case where 8 CTAs per tile take 2 K-blocks)."""
+    out, ref = _run_splitk(M, N, K, split_k, num_warps=num_warps)
+    assert out.shape == (M, N) and out.dtype == torch.bfloat16
+    scale = ref.abs().amax().clamp(min=1e-6)
+    max_rel = ((out.float() - ref).abs().amax() / scale).item()
+    assert max_rel < 1.5e-2, f"M={M} N={N} K={K} SK={split_k} nw={num_warps}: {max_rel:.4e}"
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
+def test_splitk_tp4_heuristic_defaults():
+    """Check the exact M=1 TP4 schedule and unchanged legacy fallbacks."""
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
+        _splitk_block_n,
+        _splitk_num_warps,
+        _splitk_split_k,
+    )
+
+    assert _splitk_split_k(1024, 4096, 1) == 32
+    assert _splitk_split_k(1536, 4096, 1) == 24
+    assert _splitk_block_n(1024, 4096, 1) == 64
+    assert _splitk_block_n(1536, 4096, 1) == 64
+    assert _splitk_num_warps(1024, 4096, 1) == 2
+    assert _splitk_num_warps(1536, 4096, 1) == 2
+    # M=2 and K=7168 keep the legacy schedules.
+    assert _splitk_split_k(1024, 4096, 2) == 24
+    assert _splitk_block_n(1024, 4096, 2) == 128
+    assert _splitk_num_warps(1024, 4096, 2) == 4
+    assert _splitk_split_k(1536, 7168) == 24 and _splitk_split_k(1536) == 24
+    assert _splitk_block_n(1536, 7168) == 128 and _splitk_block_n(1536) == 128
+    assert _splitk_num_warps(1536, 7168) == 4 and _splitk_num_warps(1536) == 4
+
+    for N in (1024, 1536):
+        out, ref = _run_splitk(1, N, 4096, None, block_size_n=None, num_warps=None)
+        scale = ref.abs().amax().clamp(min=1e-6)
+        max_rel = ((out.float() - ref).abs().amax() / scale).item()
+        assert max_rel < 1.5e-2, f"heuristic N={N} K=4096: {max_rel:.4e}"
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
