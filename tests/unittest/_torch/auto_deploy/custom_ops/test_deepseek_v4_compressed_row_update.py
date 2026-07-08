@@ -16,6 +16,14 @@ the pool is D-tiled (``_dsv4_paged_compress_pool_kernel``), RMSNorm is the shipp
 ``triton_rms_norm`` (``_compressor_rms_norm``), and the rope/fp8/validity-masked-store tail
 is the same shared ``_dsv4_rope_fp8_masked_store_kernel`` idea_0007 introduced.
 
+idea_0088 folds that rope/fp8/masked-store tail into the producing kernels as a
+register-fed final stage (``_dsv4_rope_fp8_store_tail``): the ratio-4 front kernel now
+stores the mhc row directly, and the ratio-128 rmsnorm + tail collapse into
+``_dsv4_norm_rope_fp8_masked_store_kernel`` -- removing one launch per compressed layer
+per decode step plus the ``[N, head_dim]`` normed-row round-trip.  The original
+stage-2 kernel (and ``_launch_compressed_rope_fp8_store``) is retained byte-for-byte as
+the reference the fold is pinned against (``torch.equal``, whole cache) below.
+
 The fused path replicates the eager numerics -- fp32-internal softmax pool and RMSNorm
 with bf16 rounding at the same points as the reference, a byte-identical block fake-fp8
 on the nope slice and an interleaved RoPE on the pe slice -- so the stored ``mhc_cache``
@@ -233,6 +241,100 @@ def test_rope_fp8_store_kernel_byte_exact(num_rows):
     )
     torch.testing.assert_close(
         mhc_fused[..., nope_dim:].float(), mhc_ref[..., nope_dim:].float(), rtol=1e-2, atol=1e-2
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
+@pytest.mark.parametrize("num_rows", [1, 3])
+@pytest.mark.parametrize("head_dim,rope_dim", [(512, 64), (256, 64)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_norm_rope_store_fused_kernel_matches_two_stage(num_rows, head_dim, rope_dim, dtype):
+    """idea_0088 byte-pin: the fused rmsnorm+rope+fp8+masked-store kernel == the old chain.
+
+    Feeds an identical pooled row to the retained two-stage reference
+    (``_compressor_rms_norm`` -> ``_launch_compressed_rope_fp8_store``, i.e. the
+    ``rms_norm_kernel`` launch plus the byte-for-byte-retained
+    ``_dsv4_rope_fp8_masked_store_kernel``) and to the new single kernel, then compares
+    the ENTIRE mhc cache with ``torch.equal``.  This pins bit-identity of (a) the
+    in-kernel RMSNorm replication of ``rms_norm_kernel`` (same ``sum(x*x) * (1/N)``
+    mean, ``x / sqrt(var + eps)`` and left-weight multiply, same BLOCK/num_warps
+    reduction shape) and (b) the shared register-fed
+    ``_dsv4_rope_fp8_store_tail`` epilogue -- the reshape/split pe deinterleave, the
+    rope FMA expressions, the fake-fp8 block quant and the validity-masked store --
+    which the folded ratio-4 front kernel reuses verbatim.  Untouched cache slots and
+    invalid (no-write) rows are covered by the whole-cache compare.
+    """
+    assert M._HAS_TRITON, "test requires triton"
+    import triton
+
+    torch.manual_seed(11 + num_rows + head_dim)
+    tokens_per_block = 8
+    nope_dim, dh = head_dim - rope_dim, rope_dim // 2
+    eps = 1e-6
+    total_pages = num_rows + 2
+
+    pooled = torch.randn(num_rows, head_dim, device=DEV, dtype=dtype)
+    norm_weight = torch.randn(head_dim, device=DEV, dtype=dtype)
+    n_pos = 32
+    cos_table = torch.randn(n_pos, dh, device=DEV)
+    sin_table = torch.randn(n_pos, dh, device=DEV)
+    row_position_id = torch.randint(0, n_pos, (num_rows,), dtype=torch.long, device=DEV)
+    row_valid = torch.tensor([bool((i + 1) % 2) for i in range(num_rows)], device=DEV)
+    mhc_page_ids = torch.arange(num_rows, dtype=torch.long, device=DEV)
+    mhc_page_offsets = torch.randint(0, tokens_per_block, (num_rows,), dtype=torch.long, device=DEV)
+    mhc_cache = torch.randn(total_pages, tokens_per_block, head_dim, device=DEV, dtype=dtype)
+
+    # Reference: the removed two-stage chain (rms_norm_kernel launch + stage-2 kernel).
+    mhc_ref = mhc_cache.clone()
+    normed_ref = M._compressor_rms_norm(pooled, norm_weight, eps)
+    M._launch_compressed_rope_fp8_store(
+        normed_ref,
+        cos_table,
+        sin_table,
+        row_position_id,
+        row_valid,
+        mhc_page_ids,
+        mhc_page_offsets,
+        mhc_ref,
+        head_dim,
+        rope_dim,
+    )
+
+    # Fused single kernel (idea_0088).
+    mhc_fused = mhc_cache.clone()
+    grid = (num_rows,)
+    M._dsv4_norm_rope_fp8_masked_store_kernel[grid](
+        pooled,
+        norm_weight.contiguous(),
+        cos_table,
+        sin_table,
+        row_position_id,
+        row_valid,
+        mhc_page_ids,
+        mhc_page_offsets,
+        mhc_fused,
+        mhc_fused.stride(0),
+        mhc_fused.stride(1),
+        mhc_fused.stride(2),
+        int(cos_table.stride(0)),
+        num_rows,
+        head_dim,
+        nope_dim,
+        dh,
+        float(eps),
+        float(1.0 / head_dim),
+        FP8_BLOCK=64,
+        NUM_FP8_BLOCKS=nope_dim // 64,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        MAX_VAL=448.0,
+        MIN_VAL=1.0e-4,
+        num_warps=4,
+    )
+
+    assert torch.equal(mhc_fused, mhc_ref), (
+        f"fused rmsnorm+rope+fp8+store differs from the two-stage reference "
+        f"(exact={(mhc_fused == mhc_ref).float().mean().item():.6f}, "
+        f"max_abs={(mhc_fused.float() - mhc_ref.float()).abs().max().item():.3e})"
     )
 
 
