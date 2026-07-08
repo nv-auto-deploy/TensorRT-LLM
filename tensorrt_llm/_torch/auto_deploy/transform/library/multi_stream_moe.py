@@ -258,32 +258,6 @@ def _execute_shared_expert_in_aux_stream(
             )
             continue
 
-        # ---- Step 3.5: Compact the aux region into a contiguous block. ----
-        # ``begin_aux`` / ``end_aux`` switch the thread-local current stream, so
-        # they bracket a *positional* window: every node between them in graph
-        # order executes on the aux stream, member of the shared branch or not.
-        # Upstream fusion passes can strand rewritten shared-expert nodes after
-        # the routed MoE op (e.g. ``fuse_fp8_swiglu_act_quant`` used to emit the
-        # fused down-input chain at the down-projection site, which follows the
-        # MoE op once the merge add is folded into it as a residual).  With the
-        # routed subtree inside the window, both branches serialize on the aux
-        # stream and the overlap is lost.  Hoist stragglers so the aux region
-        # sits contiguously at its first node, ahead of the routed subtree.
-        # Moving a shared node earlier is topologically safe: its tensor inputs
-        # are other shared nodes (kept in relative order) or MoE-path ancestors
-        # (all ordered at or before ``fork_point``); only ``get_attr`` inputs
-        # may trail the window start and are hoisted along with their consumer.
-        anchor = first_shared
-        for n in aux_region[1:]:
-            if anchor.next is not n:
-                for inp in n.all_input_nodes:
-                    if inp.op == "get_attr" and node_order.get(inp, 0) > node_order.get(
-                        first_shared, 0
-                    ):
-                        first_shared.prepend(inp)
-                anchor.append(n)
-            anchor = n
-
         # ---- Step 4: Insert begin_aux before the first shared-expert op. ----
         # NOTE: do NOT bake ``torch.cuda.current_device()`` into the graph —
         # that would hard-code device 0 and break on other ranks in a
