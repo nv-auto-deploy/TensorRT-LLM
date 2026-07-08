@@ -345,9 +345,7 @@ def _rope_cos_sin(
     return phase.cos(), phase.sin()
 
 
-def _position_embeddings(
-    config: DeepseekV4Config, position_ids: torch.Tensor
-) -> tuple[torch.Tensor, ...]:
+def _rope_tables(config: DeepseekV4Config, position_ids: torch.Tensor) -> tuple[torch.Tensor, ...]:
     rotary_cls = getattr(dsv4, "DeepseekV4RotaryEmbedding", None)
     if rotary_cls is not None:
         try:
@@ -361,6 +359,25 @@ def _position_embeddings(
         table_positions, config.qk_rope_head_dim, config.compress_rope_theta
     )
     return cos, sin, cos_comp, sin_comp
+
+
+def _position_embeddings(
+    config: DeepseekV4Config, position_ids: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    # Mirror the model-root contract: the four per-token cos/sin rows gathered
+    # once from the tables, plus the compressed tables for the sparse-attention
+    # op (see ``DeepseekV4ForCausalLM.forward``).
+    cos_base_table, sin_base_table, cos_compress_table, sin_compress_table = (
+        table.to(position_ids.device) for table in _rope_tables(config, position_ids)
+    )
+    return (
+        cos_base_table[position_ids],
+        sin_base_table[position_ids],
+        cos_compress_table[position_ids],
+        sin_compress_table[position_ids],
+        cos_compress_table,
+        sin_compress_table,
+    )
 
 
 def _ref_compressor(
@@ -924,6 +941,91 @@ def test_rotary_embedding_returns_full_cached_tables() -> None:
     assert cos_compress.shape == cos_base.shape
     assert sin_compress.shape == cos_base.shape
     assert cos_base[position_ids].shape == (2, 5, config.qk_rope_head_dim // 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_attention_consumes_only_hoisted_rows_for_its_variant() -> None:
+    """Each layer must read only its variant's hoisted rows (plus compress tables).
+
+    NaN-poisons the row pair (and, for dense layers, the tables) the layer must
+    not touch; the output has to stay byte-identical to the all-real run.
+    """
+    # Real-model-shaped head dims: the fused rope/fp8 CUDA kernels require the
+    # nope slice (head_dim - qk_rope_head_dim) to be a multiple of 64.
+    config = _small_config(head_dim=128, qk_rope_head_dim=64, index_head_dim=128)
+    position_ids = _position_ids(2, 5, "cuda")
+    embeddings = _position_embeddings(config, position_ids)
+    (
+        cos_base,
+        sin_base,
+        cos_compress,
+        sin_compress,
+        cos_compress_table,
+        sin_compress_table,
+    ) = embeddings
+    nan_rows = torch.full_like(cos_base, float("nan"))
+    nan_table = torch.full_like(cos_compress_table, float("nan"))
+
+    poisoned_by_layer = {
+        0: (cos_base, sin_base, nan_rows, nan_rows, nan_table, nan_table),
+        1: (nan_rows, nan_rows, cos_compress, sin_compress, cos_compress_table, sin_compress_table),
+        2: (nan_rows, nan_rows, cos_compress, sin_compress, cos_compress_table, sin_compress_table),
+    }
+    for layer_idx, poisoned in poisoned_by_layer.items():
+        attn = DeepseekV4Attention(config, layer_idx=layer_idx).eval().to("cuda")
+        hidden_states = torch.randn(2, 5, config.hidden_size, device="cuda")
+        with torch.no_grad():
+            reference = attn(hidden_states, embeddings, position_ids)
+            actual = attn(hidden_states, poisoned, position_ids)
+        assert torch.isfinite(reference).all(), f"layer {layer_idx}: non-finite reference"
+        assert torch.equal(actual, reference), f"layer {layer_idx}: poisoned rows leaked"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_export_hoists_rope_row_gathers_to_model_root() -> None:
+    """The exported graph must carry exactly four RoPE table-row gathers.
+
+    One per table at the model root; the pre-hoist graph carried two live
+    gathers per decoder layer (six for this three-layer mixed-ratio config).
+    """
+    # Real-model-shaped head dims: the fused rope/fp8 CUDA kernels require the
+    # nope slice (head_dim - qk_rope_head_dim) to be a multiple of 64.
+    config = _small_config(head_dim=128, qk_rope_head_dim=64, index_head_dim=128)
+    model = DeepseekV4ForCausalLM(config).eval().to("cuda")
+    input_ids = torch.randint(0, config.vocab_size, (2, 6), device="cuda")
+    position_ids = _position_ids(2, 6, input_ids.device)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(input_ids,),
+        kwargs={"position_ids": position_ids},
+        dynamic_shapes={
+            "input_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+            "position_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        },
+        num_moe_experts_for_export=2,
+    )
+
+    table_shape = (config.ad_rope_cache_len, config.qk_rope_head_dim // 2)
+
+    def _reads_rope_table(node: torch.fx.Node) -> bool:
+        src = node.args[0]
+        if not isinstance(src, torch.fx.Node):
+            return False
+        val = src.meta.get("val")
+        return val is not None and tuple(val.shape) == table_shape
+
+    row_gathers = [
+        node
+        for node in gm.graph.nodes
+        if node.op == "call_function"
+        and node.target == torch.ops.aten.index.Tensor
+        and _reads_rope_table(node)
+    ]
+    assert len(row_gathers) == 4, (
+        f"expected 4 model-root RoPE row gathers, found {len(row_gathers)}: "
+        f"{[node.name for node in row_gathers]}"
+    )
 
 
 def test_rmsnorm_matches_reference() -> None:

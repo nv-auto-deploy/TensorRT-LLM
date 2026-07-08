@@ -1318,15 +1318,26 @@ class DeepseekV4Attention(nn.Module):
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
         ],
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        cos_base_table, sin_base_table, cos_compress_table, sin_compress_table = position_embeddings
-        cos_base = cos_base_table[position_ids]
-        sin_base = sin_base_table[position_ids]
-        cos_compress = cos_compress_table[position_ids]
-        sin_compress = sin_compress_table[position_ids]
+        # ``position_embeddings`` carries the per-token cos/sin rows gathered
+        # ONCE at the model root (see ``DeepseekV4ForCausalLM.forward``) plus the
+        # compressed-RoPE tables, which the sparse-attention op still needs to
+        # rope compressed rows at their own (non-token) positions. Base vs
+        # compressed is a per-layer Python constant, so no per-layer table
+        # gather kernel is issued here.
+        (
+            cos_base,
+            sin_base,
+            cos_compress,
+            sin_compress,
+            cos_compress_table,
+            sin_compress_table,
+        ) = position_embeddings
         cos = cos_compress if self.compress_ratio else cos_base
         sin = sin_compress if self.compress_ratio else sin_base
 
@@ -1625,6 +1636,8 @@ class DeepseekV4Block(nn.Module):
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
         ],
         position_ids: torch.Tensor,
         input_ids: torch.Tensor,
@@ -1789,7 +1802,27 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         assert position_ids is not None, "position_ids is required"
 
         hidden_states = self.embed(input_ids)
-        position_embeddings = self.rotary_emb()
+        # Hoisted RoPE row lookup: gather the base and compressed cos/sin rows
+        # for the dynamic ``position_ids`` ONCE here instead of re-issuing the
+        # same table gathers inside every decoder layer (two live index kernels
+        # per layer per step). Layers receive the four gathered rows plus the
+        # compressed tables (still consumed by the sparse-attention op for
+        # compressed-row positions) and select base vs compressed via a
+        # per-layer Python constant.
+        (
+            cos_base_table,
+            sin_base_table,
+            cos_compress_table,
+            sin_compress_table,
+        ) = self.rotary_emb()
+        position_embeddings = (
+            cos_base_table[position_ids],
+            sin_base_table[position_ids],
+            cos_compress_table[position_ids],
+            sin_compress_table[position_ids],
+            cos_compress_table,
+            sin_compress_table,
+        )
         hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, self.hc_mult, -1)
         # Each layer's final fused ``_hc_post`` emits the split-D partials for
         # the NEXT consumer of the residual stream (the next layer's attn HC-pre,
