@@ -2656,6 +2656,16 @@ _SPARSE_ATTN_DECODE_SMALL_H_HEAD_BLOCK = 4
 _SPARSE_ATTN_DECODE_SMALL_H_NUM_WARPS = 4  # split-K partial warps for the small M-tile
 _SPARSE_ATTN_DECODE_SMALL_H_REDUCE_NUM_WARPS = 16
 
+# Banded decode top-k select (idea_0087).  The exact top-k of C candidates only
+# needs each TOPK_BLOCK-wide band sorted before the bitonic top-k merge tail, so
+# bands sort on parallel CTAs instead of one CTA serializing a BLOCK_C-wide sort
+# (the ~2.2x win at the traced [1, 2048] -> 512 decode shape).  Swept: 8 warps
+# beat 4 for 512-wide bands; thinner bands (TOPK_BLOCK < 512) and the single-CTA
+# full-sort fallback prefer 4.
+_SPARSE_TOPK_BAND_NUM_WARPS = 8
+_SPARSE_TOPK_SORT_NUM_WARPS = 4
+_SPARSE_TOPK_WIDE_BAND_MIN_BLOCK = 512
+
 
 if _HAS_TRITON:
     # Shared Walsh-Hadamard butterfly stage + fake-FP4 quant constants: the fused
@@ -3644,41 +3654,15 @@ if _HAS_TRITON:
         tl.store(out_ptr + prog.to(tl.int64), score)
 
     @triton.jit
-    def _dsv4_topk_select_kernel(
-        score_ptr,  # [N, C] fp32 masked index score
-        rows_ptr,  # [N, K_OUT] int64 out: selected candidate row per slot (-1 = invalid)
-        valid_ptr,  # [N, K_OUT] uint8 out: 1 iff the slot's score is finite
-        C,  # candidate count (score row width)
-        K_OUT,  # index_topk (output row width)
-        TOPK_COUNT,  # min(index_topk, C): slots filled from the sort
-        BLOCK_C: tl.constexpr,  # next_pow2(C)
-        BLOCK_K: tl.constexpr,  # next_pow2(K_OUT)
-    ):
-        """Exact decode top-k row selection for the ratio-4 indexer (idea_0046).
+    def _dsv4_topk_pack_keys(score_ptr, n, c, cmask, C):
+        """Pack score lanes into the sortable (float-flip, index) int64 keys.
 
-        One program per decode row.  It replaces ``index_score.topk(topk_count)``
-        (the fat ``gatherTopK`` + ``radixSortKVInPlace`` pair), the decomposed
-        ``isfinite`` chain, the ``where``-to-``-1`` fixup and the short-history
-        -1/False pad path with a single launch that emits the padded
-        ``topk_rows`` / ``topk_valid`` directly.
-
-        The score row is packed into one sortable int64 key per candidate:
         ``inv_u`` is the IEEE-754 float-flip (ascending ``inv_u`` == descending
         float total order, the transform CUDA's radix top-k uses) in the high
         bits, the candidate index in the low 31 bits.  ``-0.0`` is canonicalized
         to ``+0.0`` first because torch's top-k compares them equal (ties break
-        by ascending index, which the low bits reproduce).  A bitonic
-        ``tl.sort`` of the keys therefore yields exactly torch's value order,
-        tie order included; non-finite scores (the ``-inf`` visibility mask)
-        decode to ``valid == 0`` / ``row == -1`` just like the eager
-        ``isfinite``/``where`` tail.  NaN scores sort first (torch's "NaN is
-        largest") and also emit ``-1``; only the relative order *among* multiple
-        differently-signed NaNs may differ, where every affected slot is ``-1``
-        either way.
+        by ascending index, which the low bits reproduce).
         """
-        n = tl.program_id(0)
-        c = tl.arange(0, BLOCK_C)
-        cmask = c < C
         s = tl.load(score_ptr + n.to(tl.int64) * C + c, mask=cmask, other=float("-inf"))
         # torch's top-k orders +-0.0 as equal keys; distinct bit patterns would
         # rank +0.0 above -0.0, so fold both onto the +0.0 pattern.
@@ -3691,23 +3675,165 @@ if _HAS_TRITON:
         # 0xFFFFFFFF (negative-NaN payload) key ties with padding and wins the tie
         # via its smaller low-bits index, so it is never displaced out of the row.
         inv_u = tl.where(cmask, inv_u, 0xFFFFFFFF)
-        key = (inv_u << 31) | c.to(tl.int64)
-        key = tl.sort(key)
+        return (inv_u << 31) | c.to(tl.int64)
+
+    @triton.jit
+    def _dsv4_topk_emit(
+        key,
+        rows_ptr,
+        valid_ptr,
+        n,
+        K_OUT,
+        TOPK_COUNT,
+        TOPK_BLOCK: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Decode the leading TOPK_COUNT ascending keys into rows/valid (+ pad tail)."""
+        t = tl.arange(0, TOPK_BLOCK)
         idx_s = key & 0x7FFFFFFF
         inv_s = key >> 31
         # Strictly-finite window == torch.isfinite: -inf flips to 0xFF800000, +inf
         # to 0x007FFFFF, NaN payloads fall outside on either side.
         valid = (inv_s > 0x007FFFFF) & (inv_s < 0xFF800000)
-        rows = tl.where(valid, idx_s, tl.full((BLOCK_C,), -1, tl.int64))
+        rows = tl.where(valid, idx_s, tl.full((TOPK_BLOCK,), -1, tl.int64))
         out_base = n.to(tl.int64) * K_OUT
-        smask = c < TOPK_COUNT
-        tl.store(rows_ptr + out_base + c, rows, mask=smask)
-        tl.store(valid_ptr + out_base + c, valid.to(tl.uint8), mask=smask)
+        smask = t < TOPK_COUNT
+        tl.store(rows_ptr + out_base + t, rows, mask=smask)
+        tl.store(valid_ptr + out_base + t, valid.to(tl.uint8), mask=smask)
         # Short-history pad tail (topk_count < index_topk): -1 rows, False validity.
         p = tl.arange(0, BLOCK_K)
         pmask = (p >= TOPK_COUNT) & (p < K_OUT)
         tl.store(rows_ptr + out_base + p, tl.full((BLOCK_K,), -1, tl.int64), mask=pmask)
         tl.store(valid_ptr + out_base + p, tl.zeros((BLOCK_K,), tl.uint8), mask=pmask)
+
+    @triton.jit
+    def _dsv4_topk_compare_swap(x, flip, i: tl.constexpr, n_dims: tl.constexpr):
+        """Bitonic compare-and-swap on the ith innermost hypercube dim.
+
+        ``triton.language.standard._compare_and_swap`` minus the float bitcasts
+        (the keys are already int64), so the merge tail below leans only on
+        public ``tl`` ops.
+        """
+        y = x ^ tl.xor_sum(x, n_dims - 1 - i, True)
+        is_right = tl.reshape(tl.arange(0, 2), [1] * (n_dims - i - 1) + [2] + [1] * i)
+        return tl.where((x > y) != (flip ^ is_right), y, x)
+
+    @triton.jit
+    def _dsv4_topk_merge_flip(x, flip, LOG_TOPK: tl.constexpr):
+        """Sort the bitonic TOPK_BLOCK-wide sequence ``x`` (bitonic-merge network).
+
+        ``flip`` is a *runtime* uniform scalar: 0 sorts ascending, 1 descending
+        (the compare-and-swap XORs it into the direction indicator), so one
+        compiled body serves every tree node.
+        """
+        h = tl.reshape(x, [2] * LOG_TOPK)
+        for i in tl.static_range(LOG_TOPK):
+            h = _dsv4_topk_compare_swap(h, flip, LOG_TOPK - 1 - i, LOG_TOPK)
+        return tl.reshape(h, [x.numel])
+
+    @triton.jit
+    def _dsv4_topk_select_kernel(
+        score_ptr,  # [N, C] fp32 masked index score
+        rows_ptr,  # [N, K_OUT] int64 out: selected candidate row per slot (-1 = invalid)
+        valid_ptr,  # [N, K_OUT] uint8 out: 1 iff the slot's score is finite
+        heap_ptr,  # [N, (2*NBANDS-1)*TOPK_BLOCK] int64 scratch (unused if NBANDS == 1)
+        ticket_ptr,  # [N, NBANDS-1] int64 monotonic node tickets (unused if NBANDS == 1)
+        C,  # candidate count (score row width)
+        K_OUT,  # index_topk (output row width)
+        TOPK_COUNT,  # min(index_topk, C): slots filled from the sort
+        BLOCK_C: tl.constexpr,  # next_pow2(C) == NBANDS * TOPK_BLOCK
+        BLOCK_K: tl.constexpr,  # next_pow2(K_OUT)
+        TOPK_BLOCK: tl.constexpr,  # min(BLOCK_C, next_pow2(TOPK_COUNT)): sorted band width
+        NBANDS: tl.constexpr,  # band CTAs per decode row
+        LOG_NBANDS: tl.constexpr,  # log2(NBANDS): merge-tree depth
+        LOG_TOPK: tl.constexpr,  # log2(TOPK_BLOCK)
+    ):
+        """Exact decode top-k row selection for the ratio-4 indexer (idea_0046).
+
+        It replaces ``index_score.topk(topk_count)`` (the fat ``gatherTopK`` +
+        ``radixSortKVInPlace`` pair), the decomposed ``isfinite`` chain, the
+        ``where``-to-``-1`` fixup and the short-history -1/False pad path with a
+        single launch that emits the padded ``topk_rows`` / ``topk_valid``
+        directly.
+
+        The score row is packed into one sortable int64 key per candidate (see
+        ``_dsv4_topk_pack_keys``); ascending key order is exactly torch's top-k
+        value order, tie order included.  (One documented fold: ``-0.0`` ties
+        with ``+0.0`` by ascending index.  torch's small-C sort path agrees;
+        its large-C ``gatherTopK`` radix path instead ranks ``+0.0`` strictly
+        above ``-0.0`` -- the fused kernel keeps the folded semantics idea_0046
+        landed with, at every C.)  Non-finite scores (the ``-inf`` visibility
+        mask) decode to ``valid == 0`` / ``row == -1`` just like the eager
+        ``isfinite``/``where`` tail.  NaN scores sort first (torch's "NaN
+        is largest") and also emit ``-1``; only the relative order *among*
+        multiple differently-signed NaNs may differ, where every affected slot
+        is ``-1`` either way.
+
+        Banded tree layout (idea_0087): a lone CTA serializing a BLOCK_C-wide
+        bitonic ``tl.sort`` is the latency bottleneck at the decode shape
+        (batch-one [1, 2048] -> 512), so the grid is (N, NBANDS) and each band
+        CTA sorts only its TOPK_BLOCK-wide key slice.  The bands then reduce
+        up a binary heap (node 0 = root; children of ``i`` are ``2i+1`` /
+        ``2i+2``): left children hold ascending sequences, right children
+        descending (via the order-reversing bitwise NOT), so each sibling pair
+        concatenates into a bitonic sequence whose elementwise ``minimum`` is
+        exactly the TOPK_BLOCK smallest keys of the pair -- itself bitonic --
+        which one TOPK_BLOCK-wide bitonic merge re-sorts (the truncation step
+        of ``triton.language.standard.sort_impl``; distinct keys make the
+        result bit-identical to the full sort).  Every CTA publishes its node
+        to ``heap_ptr`` and bumps the parent's monotonic ticket; the
+        first-arriving child exits and the second (whose acq_rel ticket pairs
+        with the sibling's release, making the sibling's store visible)
+        performs the parent merge, ascending at the root, which emits.
+        Tickets are never reset (each node sees exactly two arrivals per
+        launch, so parity identifies the merger), which keeps replays of a
+        captured CUDA graph correct without a zeroing launch.
+        """
+        n = tl.program_id(0)
+        if NBANDS == 1:
+            # Single-CTA fallback: TOPK_BLOCK == BLOCK_C, plain full-width sort.
+            c = tl.arange(0, BLOCK_C)
+            key = tl.sort(_dsv4_topk_pack_keys(score_ptr, n, c, c < C, C))
+            _dsv4_topk_emit(key, rows_ptr, valid_ptr, n, K_OUT, TOPK_COUNT, TOPK_BLOCK, BLOCK_K)
+        else:
+            b = tl.program_id(1)
+            c = b * TOPK_BLOCK + tl.arange(0, TOPK_BLOCK)
+            key = _dsv4_topk_pack_keys(score_ptr, n, c, c < C, C)
+            node = NBANDS - 1 + b
+            # Right children (even heap ids) hold descending sequences: bitwise
+            # NOT is an order-reversing bijection on int64, so sort the flipped
+            # keys ascending and flip back.
+            m = (0 - tl.where(node % 2 == 0, 1, 0)).to(tl.int64)
+            key = tl.sort(key ^ m) ^ m
+            hbase = n.to(tl.int64) * (2 * NBANDS - 1) * TOPK_BLOCK
+            t = tl.arange(0, TOPK_BLOCK)
+            tl.store(heap_ptr + hbase + node * TOPK_BLOCK + t, key)
+            # debug_barrier orders each store block-wide before the (cumulative)
+            # release the arrival ticket publishes.
+            tl.debug_barrier()
+            live = node > 0
+            for _lvl in tl.static_range(LOG_NBANDS):
+                if live:
+                    parent = (node - 1) >> 1
+                    ticket = tl.atomic_add(
+                        ticket_ptr + n.to(tl.int64) * (NBANDS - 1) + parent, 1, sem="acq_rel"
+                    )
+                    if ticket % 2 == 0:
+                        live = False  # first arrival: the sibling's CTA merges
+                    else:
+                        sib = ((node - 1) ^ 1) + 1
+                        sk = tl.load(heap_ptr + hbase + sib * TOPK_BLOCK + t, cache_modifier=".cg")
+                        # Bitonic halver: the TOPK_BLOCK smallest of the pair.
+                        key = tl.minimum(key, sk)
+                        # Re-sort toward the parent's direction (root ascending).
+                        flip = tl.where((parent > 0) & (parent % 2 == 0), 1, 0)
+                        key = _dsv4_topk_merge_flip(key, flip, LOG_TOPK)
+                        node = parent
+                        if node > 0:
+                            tl.store(heap_ptr + hbase + node * TOPK_BLOCK + t, key)
+                            tl.debug_barrier()
+            if live & (node == 0):
+                _dsv4_topk_emit(key, rows_ptr, valid_ptr, n, K_OUT, TOPK_COUNT, TOPK_BLOCK, BLOCK_K)
 
     @triton.jit
     def _dsv4_assemble_selected_kv_kernel(
@@ -4831,6 +4957,17 @@ def _fused_index_score(
     return out
 
 
+# Monotonic per-node arrival tickets for the banded top-k select kernel, keyed
+# by (device, num_rows, num_bands) so every launch sharing a buffer bumps each
+# merge-tree node by exactly two arrivals (the kernel's parity arithmetic
+# needs aligned tickets).  Allocated once outside any CUDA-graph capture -- a
+# stable address whose value survives replays (the kernel never resets it).
+# The decode selection calls run sequentially on one stream per device;
+# concurrent same-shape launches from multiple streams must not share a
+# ticket buffer.
+_TOPK_SELECT_TICKETS: dict = {}
+
+
 def _fused_topk_select(
     index_score: torch.Tensor,  # [N, C] fp32 masked index score
     index_topk: int,
@@ -4842,7 +4979,10 @@ def _fused_topk_select(
     pad tail of ``_select_decode_ratio4_indexer_rows`` with a single kernel that
     emits the padded ``[N, index_topk]`` rows / validity directly.  Byte-identical
     to the eager chain for finite and ``-inf`` scores, tie order included
-    (validated in the op unit test); see ``_dsv4_topk_select_kernel``.
+    (validated in the op unit test); see ``_dsv4_topk_select_kernel``.  When the
+    candidate row is wider than the selection, the kernel spreads the bitonic
+    sort across one CTA per TOPK_BLOCK-wide band (idea_0087); the tickets the
+    band CTAs synchronize on live in ``_TOPK_SELECT_TICKETS``.
     """
     num_rows, c = int(index_score.shape[0]), int(index_score.shape[1])
     device = index_score.device
@@ -4854,16 +4994,53 @@ def _fused_topk_select(
         rows.fill_(-1)
         valid.zero_()
         return rows, valid.view(torch.bool)
-    _dsv4_topk_select_kernel[(num_rows,)](
+    block_c = triton.next_power_of_2(c)
+    block_k = triton.next_power_of_2(index_topk)
+    capped_topk = min(topk_count, c)
+    topk_block = min(block_c, triton.next_power_of_2(capped_topk))
+    nbands = block_c // topk_block
+    if nbands > 1:
+        ticket_key = (device, num_rows, nbands)
+        tickets = _TOPK_SELECT_TICKETS.get(ticket_key)
+        if tickets is None and torch.cuda.is_current_stream_capturing():
+            # A ticket buffer allocated during capture would live in the graph
+            # pool (its bytes can be reused between replays); fall back to the
+            # single-CTA sort rather than risk a scribbled ticket.  Real decode
+            # warmup always runs this shape eagerly before capture.
+            nbands, topk_block = 1, block_c
+        elif tickets is None:
+            tickets = torch.zeros(num_rows, nbands - 1, dtype=torch.int64, device=device)
+            _TOPK_SELECT_TICKETS[ticket_key] = tickets
+    if nbands > 1:
+        heap_scratch = torch.empty(
+            num_rows, (2 * nbands - 1) * topk_block, dtype=torch.int64, device=device
+        )
+        num_warps = (
+            _SPARSE_TOPK_BAND_NUM_WARPS
+            if topk_block >= _SPARSE_TOPK_WIDE_BAND_MIN_BLOCK
+            else _SPARSE_TOPK_SORT_NUM_WARPS
+        )
+    else:
+        # Dead pointers: the NBANDS == 1 specialization never touches them.
+        heap_scratch = rows
+        tickets = rows
+        num_warps = _SPARSE_TOPK_SORT_NUM_WARPS
+    _dsv4_topk_select_kernel[(num_rows, nbands)](
         index_score.contiguous(),
         rows,
         valid,
+        heap_scratch,
+        tickets,
         c,
         index_topk,
-        min(topk_count, c),
-        BLOCK_C=triton.next_power_of_2(c),
-        BLOCK_K=triton.next_power_of_2(index_topk),
-        num_warps=4,
+        capped_topk,
+        BLOCK_C=block_c,
+        BLOCK_K=block_k,
+        TOPK_BLOCK=topk_block,
+        NBANDS=nbands,
+        LOG_NBANDS=nbands.bit_length() - 1,
+        LOG_TOPK=topk_block.bit_length() - 1,
+        num_warps=num_warps,
     )
     return rows, valid.view(torch.bool)
 
