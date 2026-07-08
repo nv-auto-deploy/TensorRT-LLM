@@ -50,8 +50,8 @@ import triton.language as tl
 def _deepseek_v4_routing_kernel(
     logits_ptr,  # (T, E) fp32 router logits
     bias_ptr,  # (E,) fp32 routing bias
-    weights_ptr,  # (T, K) fp32 output routing weights
-    indices_ptr,  # (T, K) int64 output selected experts
+    weights_ptr,  # (T, K) fp32 (LOCALIZED=0) or bf16 (LOCALIZED=1) output routing weights
+    indices_ptr,  # (T, K) int64 (LOCALIZED=0) or int32 (LOCALIZED=1) output selected experts
     num_tokens,
     num_experts,
     stride_lt,
@@ -61,8 +61,11 @@ def _deepseek_v4_routing_kernel(
     stride_it,
     stride_ik,
     routed_scaling_factor,
+    expert_start,  # EP shard offset (only read when LOCALIZED=1)
+    local_experts,  # local expert count / invalid sentinel (only read when LOCALIZED=1)
     SOFTPLUS_THRESHOLD: tl.constexpr,
     NORM_TOPK: tl.constexpr,
+    LOCALIZED: tl.constexpr,
     BLOCK_E: tl.constexpr,  # >= num_experts, power of 2
     TOP_K: tl.constexpr,
     BLOCK_K: tl.constexpr,  # >= TOP_K, power of 2
@@ -130,16 +133,28 @@ def _deepseek_v4_routing_kernel(
     topk_w = topk_w * routed_scaling_factor
 
     mask_k = offs_k < TOP_K
-    tl.store(
-        weights_ptr + token_id * stride_wt + offs_k * stride_wk,
-        topk_w,
-        mask=mask_k,
-    )
-    tl.store(
-        indices_ptr + token_id * stride_it + offs_k * stride_ik,
-        topk_idxs.to(tl.int64),
-        mask=mask_k,
-    )
+    if LOCALIZED:
+        # Fused EP global->local localization (mirrors ``_localize_routing_kernel``
+        # bit for bit): off-rank / out-of-range routes get the invalid sentinel
+        # ``local_experts`` and a zero weight; valid weights are the single-rounded
+        # bf16 of the exact fp32 value the non-localized op would have stored.
+        local = topk_idxs.to(tl.int64) - expert_start
+        valid = (local >= 0) & (local < local_experts)
+        out_idx = tl.where(valid, local, local_experts).to(tl.int32)
+        out_w = tl.where(valid, topk_w, 0.0).to(tl.bfloat16)
+        tl.store(weights_ptr + token_id * stride_wt + offs_k * stride_wk, out_w, mask=mask_k)
+        tl.store(indices_ptr + token_id * stride_it + offs_k * stride_ik, out_idx, mask=mask_k)
+    else:
+        tl.store(
+            weights_ptr + token_id * stride_wt + offs_k * stride_wk,
+            topk_w,
+            mask=mask_k,
+        )
+        tl.store(
+            indices_ptr + token_id * stride_it + offs_k * stride_ik,
+            topk_idxs.to(tl.int64),
+            mask=mask_k,
+        )
 
 
 def _next_power_of_2(n: int) -> int:
@@ -152,6 +167,8 @@ def deepseek_v4_routing_fn(
     top_k: int,
     routed_scaling_factor: float,
     norm_topk_prob: bool,
+    expert_start: int = 0,
+    local_experts: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused DeepSeek V4 sqrtsoftplus top-k routing.
 
@@ -161,16 +178,27 @@ def deepseek_v4_routing_fn(
         top_k: number of experts to select per token.
         routed_scaling_factor: scalar multiplier applied to the routing weights.
         norm_topk_prob: if True, renormalize the selected weights to sum to 1.
+        expert_start: EP shard offset (localized mode only).
+        local_experts: when > 0, emit EP-LOCALIZED outputs for the trtllm-gen MoE
+            runner instead of the global pair: int32 local expert ids (off-rank
+            routes carry the invalid sentinel ``local_experts``) and bf16 masked
+            routing weights, exactly as ``deepseek_v4_localize_routing`` would
+            produce from the global outputs.
 
     Returns:
-        selected_experts: (T, top_k) int64 expert indices (descending score order).
-        routing_weights: (T, top_k) fp32 routing weights.
+        selected_experts: (T, top_k) int64 expert indices (descending score order),
+            or int32 local ids in localized mode.
+        routing_weights: (T, top_k) fp32 routing weights, or bf16 masked weights in
+            localized mode.
     """
     assert router_logits.ndim == 2, "router_logits must be 2-D (T, E)"
     num_tokens, num_experts = router_logits.shape
+    localized = local_experts > 0
 
-    weights = torch.empty((num_tokens, top_k), dtype=torch.float32, device=router_logits.device)
-    indices = torch.empty((num_tokens, top_k), dtype=torch.int64, device=router_logits.device)
+    idx_dtype = torch.int32 if localized else torch.int64
+    w_dtype = torch.bfloat16 if localized else torch.float32
+    weights = torch.empty((num_tokens, top_k), dtype=w_dtype, device=router_logits.device)
+    indices = torch.empty((num_tokens, top_k), dtype=idx_dtype, device=router_logits.device)
 
     BLOCK_E = _next_power_of_2(num_experts)
     BLOCK_K = _next_power_of_2(top_k)
@@ -195,8 +223,11 @@ def deepseek_v4_routing_fn(
         indices.stride(0),
         indices.stride(1),
         routed_scaling_factor,
+        int(expert_start),
+        int(local_experts),
         SOFTPLUS_THRESHOLD=20.0,
         NORM_TOPK=norm_topk_prob,
+        LOCALIZED=localized,
         BLOCK_E=BLOCK_E,
         TOP_K=top_k,
         BLOCK_K=BLOCK_K,
@@ -243,6 +274,53 @@ def _deepseek_v4_routing_fake(
     return indices, weights
 
 
+@torch.library.custom_op("auto_deploy::deepseek_v4_routing_localized", mutates_args=())
+def deepseek_v4_routing_localized(
+    router_logits: torch.Tensor,
+    bias: torch.Tensor,
+    top_k: int,
+    routed_scaling_factor: float,
+    norm_topk_prob: bool,
+    expert_start: int,
+    local_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused DeepSeek V4 router head emitting EP-LOCALIZED routing for the MoE runner.
+
+    Same scoring/top-k/renorm chain as :func:`deepseek_v4_routing`, with the EP
+    global->local localization (``deepseek_v4_localize_routing``) folded into the
+    kernel tail. Returns ``(local_idx int32, weights bf16)``: off-rank routes carry
+    the invalid sentinel ``local_experts`` and weight ``0``; valid slots are
+    bit-identical to running the two ops back to back.
+    """
+    if local_experts <= 0:
+        raise ValueError(f"local_experts should be positive, got {local_experts}.")
+    return deepseek_v4_routing_fn(
+        router_logits,
+        bias,
+        top_k,
+        routed_scaling_factor,
+        norm_topk_prob,
+        expert_start=expert_start,
+        local_experts=local_experts,
+    )
+
+
+@deepseek_v4_routing_localized.register_fake
+def _deepseek_v4_routing_localized_fake(
+    router_logits: torch.Tensor,
+    bias: torch.Tensor,
+    top_k: int,
+    routed_scaling_factor: float,
+    norm_topk_prob: bool,
+    expert_start: int,
+    local_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = router_logits.shape[0]
+    indices = router_logits.new_empty((num_tokens, top_k), dtype=torch.int32)
+    weights = router_logits.new_empty((num_tokens, top_k), dtype=torch.bfloat16)
+    return indices, weights
+
+
 # ---------------------------------------------------------------------------
 # Hash-router gate (layer_idx < num_hash_layers)
 # ---------------------------------------------------------------------------
@@ -285,8 +363,8 @@ def _deepseek_v4_hash_routing_kernel(
     weight_ptr,  # (E, H) fp32 router weight
     tid2eid_ptr,  # (V, K) int64 token->expert map
     input_ids_ptr,  # (T,) integer token ids
-    weights_ptr,  # (T, K) fp32 output routing weights
-    indices_ptr,  # (T, K) int64 output selected experts
+    weights_ptr,  # (T, K) fp32 (LOCALIZED=0) or bf16 (LOCALIZED=1) output routing weights
+    indices_ptr,  # (T, K) int64 (LOCALIZED=0) or int32 (LOCALIZED=1) output selected experts
     num_tokens,
     hidden_size,
     stride_xt,
@@ -300,9 +378,12 @@ def _deepseek_v4_hash_routing_kernel(
     stride_it,
     stride_ik,
     routed_scaling_factor,
+    expert_start,  # EP shard offset (only read when LOCALIZED=1)
+    local_experts,  # local expert count / invalid sentinel (only read when LOCALIZED=1)
     SOFTPLUS_THRESHOLD: tl.constexpr,
     NORM_TOPK: tl.constexpr,
     TF32_TRUNC: tl.constexpr,
+    LOCALIZED: tl.constexpr,
     TOP_K: tl.constexpr,
     BLOCK_K: tl.constexpr,  # >= TOP_K, power of 2
     BLOCK_H: tl.constexpr,  # hidden-dim chunk
@@ -363,8 +444,19 @@ def _deepseek_v4_hash_routing_kernel(
         w_k = w_k / denom
     w_k = w_k * routed_scaling_factor
 
-    tl.store(weights_ptr + token_id * stride_wt + offs_k * stride_wk, w_k, mask=mask_k)
-    tl.store(indices_ptr + token_id * stride_it + offs_k * stride_ik, eids, mask=mask_k)
+    if LOCALIZED:
+        # Fused EP global->local localization (mirrors ``_localize_routing_kernel``
+        # bit for bit): off-rank routes -> invalid sentinel ``local_experts`` + zero
+        # weight; valid weights are the single-rounded bf16 of the exact fp32 value.
+        local = eids - expert_start
+        valid = (local >= 0) & (local < local_experts)
+        out_idx = tl.where(valid, local, local_experts).to(tl.int32)
+        out_w = tl.where(valid, w_k, 0.0).to(tl.bfloat16)
+        tl.store(weights_ptr + token_id * stride_wt + offs_k * stride_wk, out_w, mask=mask_k)
+        tl.store(indices_ptr + token_id * stride_it + offs_k * stride_ik, out_idx, mask=mask_k)
+    else:
+        tl.store(weights_ptr + token_id * stride_wt + offs_k * stride_wk, w_k, mask=mask_k)
+        tl.store(indices_ptr + token_id * stride_it + offs_k * stride_ik, eids, mask=mask_k)
 
 
 # Above this token count the dense reference chain (bit-identical to the
@@ -377,6 +469,22 @@ def _deepseek_v4_hash_routing_kernel(
 _HASH_ROUTING_DECODE_MAX_TOKENS = 8
 
 
+def _localize_routing_eager(
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    expert_start: int,
+    local_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Eager mirror of ``deepseek_v4_localize_routing`` (prefill fallback paths)."""
+    local = selected_experts.to(torch.int64) - int(expert_start)
+    valid = (local >= 0) & (local < local_experts)
+    local_idx = torch.where(valid, local, torch.full_like(local, local_experts)).to(torch.int32)
+    weights = torch.where(
+        valid, routing_weights.to(torch.float32), torch.zeros((), device=routing_weights.device)
+    ).to(torch.bfloat16)
+    return local_idx, weights
+
+
 def deepseek_v4_hash_routing_fn(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -384,6 +492,8 @@ def deepseek_v4_hash_routing_fn(
     input_ids: torch.Tensor,
     routed_scaling_factor: float,
     norm_topk_prob: bool,
+    expert_start: int = 0,
+    local_experts: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused DeepSeek V4 hash-router gate.
 
@@ -394,14 +504,21 @@ def deepseek_v4_hash_routing_fn(
         input_ids: (T,) integer token ids.
         routed_scaling_factor: scalar multiplier applied to the routing weights.
         norm_topk_prob: if True, renormalize the selected weights to sum to 1.
+        expert_start: EP shard offset (localized mode only).
+        local_experts: when > 0, emit EP-LOCALIZED outputs (int32 local ids with the
+            invalid sentinel ``local_experts`` for off-rank routes, bf16 masked
+            weights), exactly as ``deepseek_v4_localize_routing`` would produce.
 
     Returns:
-        selected_experts: (T, top_k) int64 expert indices (= tid2eid[input_ids]).
-        routing_weights: (T, top_k) fp32 routing weights.
+        selected_experts: (T, top_k) int64 expert indices (= tid2eid[input_ids]),
+            or int32 local ids in localized mode.
+        routing_weights: (T, top_k) fp32 routing weights, or bf16 masked weights in
+            localized mode.
     """
     assert hidden_states.ndim == 2, "hidden_states must be 2-D (T, H)"
     num_tokens, hidden_size = hidden_states.shape
     top_k = tid2eid.shape[1]
+    localized = local_experts > 0
 
     if num_tokens > _HASH_ROUTING_DECODE_MAX_TOKENS:
         # Prefill: keep the reference chain bit-identical (dense GEMM is the
@@ -413,10 +530,16 @@ def deepseek_v4_hash_routing_fn(
         if norm_topk_prob:
             routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-20)
         routing_weights = routing_weights * routed_scaling_factor
+        if localized:
+            return _localize_routing_eager(
+                selected_experts, routing_weights, expert_start, local_experts
+            )
         return selected_experts, routing_weights
 
-    weights = torch.empty((num_tokens, top_k), dtype=torch.float32, device=hidden_states.device)
-    indices = torch.empty((num_tokens, top_k), dtype=torch.int64, device=hidden_states.device)
+    idx_dtype = torch.int32 if localized else torch.int64
+    w_dtype = torch.bfloat16 if localized else torch.float32
+    weights = torch.empty((num_tokens, top_k), dtype=w_dtype, device=hidden_states.device)
+    indices = torch.empty((num_tokens, top_k), dtype=idx_dtype, device=hidden_states.device)
 
     # Mirror the ambient cuBLAS dispatch this kernel replaces: M=1 runs a
     # CUDA-core fp32 gemv (TF32 never applies), M>=2 runs a TF32 tensor-core
@@ -445,9 +568,12 @@ def deepseek_v4_hash_routing_fn(
         indices.stride(0),
         indices.stride(1),
         routed_scaling_factor,
+        int(expert_start),
+        int(local_experts),
         SOFTPLUS_THRESHOLD=20.0,
         NORM_TOPK=norm_topk_prob,
         TF32_TRUNC=tf32_trunc,
+        LOCALIZED=localized,
         TOP_K=top_k,
         BLOCK_K=BLOCK_K,
         BLOCK_H=512,
@@ -498,4 +624,56 @@ def _deepseek_v4_hash_routing_fake(
     top_k = tid2eid.shape[1]
     indices = hidden_states.new_empty((num_tokens, top_k), dtype=torch.int64)
     weights = hidden_states.new_empty((num_tokens, top_k), dtype=torch.float32)
+    return indices, weights
+
+
+@torch.library.custom_op("auto_deploy::deepseek_v4_hash_routing_localized", mutates_args=())
+def deepseek_v4_hash_routing_localized(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    tid2eid: torch.Tensor,
+    input_ids: torch.Tensor,
+    routed_scaling_factor: float,
+    norm_topk_prob: bool,
+    expert_start: int,
+    local_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused DeepSeek V4 hash-router gate emitting EP-LOCALIZED routing.
+
+    Same gemv + sqrtsoftplus + renorm/scale chain as
+    :func:`deepseek_v4_hash_routing`, with the EP global->local localization
+    (``deepseek_v4_localize_routing``) folded into the kernel tail (eager mirror on
+    the prefill reference branch). Returns ``(local_idx int32, weights bf16)``:
+    off-rank routes carry the invalid sentinel ``local_experts`` and weight ``0``;
+    valid slots are bit-identical to running the two ops back to back.
+    """
+    if local_experts <= 0:
+        raise ValueError(f"local_experts should be positive, got {local_experts}.")
+    return deepseek_v4_hash_routing_fn(
+        hidden_states,
+        weight,
+        tid2eid,
+        input_ids,
+        routed_scaling_factor,
+        norm_topk_prob,
+        expert_start=expert_start,
+        local_experts=local_experts,
+    )
+
+
+@deepseek_v4_hash_routing_localized.register_fake
+def _deepseek_v4_hash_routing_localized_fake(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    tid2eid: torch.Tensor,
+    input_ids: torch.Tensor,
+    routed_scaling_factor: float,
+    norm_topk_prob: bool,
+    expert_start: int,
+    local_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = hidden_states.shape[0]
+    top_k = tid2eid.shape[1]
+    indices = hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32)
+    weights = hidden_states.new_empty((num_tokens, top_k), dtype=torch.bfloat16)
     return indices, weights

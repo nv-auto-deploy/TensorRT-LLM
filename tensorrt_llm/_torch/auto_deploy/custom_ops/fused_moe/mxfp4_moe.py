@@ -581,6 +581,7 @@ def _run_trtllm_gen_mxfp4_from_routing(
     alpha: float = 1.0,
     limit: float = float("inf"),
     act_dtype: str = "mxfp8",
+    routing_localized: bool = False,
 ) -> torch.Tensor:
     """Run the routed MXFP4 MLP via the trtllm-gen runner (W4A8 mxfp8-act by default).
 
@@ -625,16 +626,29 @@ def _run_trtllm_gen_mxfp4_from_routing(
     # routing histogram and drops real routes (capacity overflow), under-computing the output.
     sel = selected_experts.reshape(num_tokens, -1)
     top_k = sel.shape[-1]
-    # Fuse the global->local subtraction, range mask, invalid-sentinel select, int32 cast,
-    # and routing-weight mask/bf16-cast (plus the upstream model-side bf16 cast) into one
-    # Triton program. Off-rank / out-of-range routes get the sentinel ``local_experts`` so
-    # the runner SKIPS them; valid weights are bit-identical bf16, invalid ones are bf16(0).
-    local_idx, weights = torch.ops.auto_deploy.deepseek_v4_localize_routing(
-        sel,
-        routing_weights.reshape(num_tokens, top_k),
-        int(expert_start),
-        int(local_experts),
-    )
+    if routing_localized:
+        # The router already emitted the runner's contract (int32 local ids with the
+        # invalid sentinel ``local_experts`` for off-rank routes + masked bf16
+        # weights) via the ``*_routing_localized`` gate ops — nothing to localize.
+        if sel.dtype != torch.int32 or routing_weights.dtype != torch.bfloat16:
+            raise TypeError(
+                "routing_localized=True expects int32 local expert ids and bf16 "
+                f"routing weights, got {sel.dtype} / {routing_weights.dtype}."
+            )
+        local_idx = sel
+        weights = routing_weights.reshape(num_tokens, top_k)
+    else:
+        # Fuse the global->local subtraction, range mask, invalid-sentinel select, int32
+        # cast, and routing-weight mask/bf16-cast (plus the upstream model-side bf16 cast)
+        # into one Triton program. Off-rank / out-of-range routes get the sentinel
+        # ``local_experts`` so the runner SKIPS them; valid weights are bit-identical bf16,
+        # invalid ones are bf16(0).
+        local_idx, weights = torch.ops.auto_deploy.deepseek_v4_localize_routing(
+            sel,
+            routing_weights.reshape(num_tokens, top_k),
+            int(expert_start),
+            int(local_experts),
+        )
 
     # Pad activations to the kernel's expected (padded) hidden dim (multiple of 512).
     expected_hidden = int(prepared.fc1_weights_mxfp4.shape[-1] * 2)
@@ -738,6 +752,7 @@ def _run_torch_mxfp4_from_routing_core(
     expert_start: int = 0,
     gate_up_order: str = "up_gate",
     swiglu_mode: str = "deepseek",
+    routing_localized: bool = False,
 ) -> torch.Tensor:
     # Blackwell fast path: the DSV4 (up_gate / deepseek-SwiGLU) routed MXFP4 MLP runs on the
     # trtllm-gen W4A8 mxfp8-act runner (activations quantized to MXFP8; MXFP4 weights, routing
@@ -757,6 +772,7 @@ def _run_torch_mxfp4_from_routing_core(
             expert_start,
             alpha,
             limit,
+            routing_localized=routing_localized,
         )
 
     leading_shape = hidden_states.shape[:-1]
@@ -771,8 +787,16 @@ def _run_torch_mxfp4_from_routing_core(
     if local_experts <= 0:
         raise ValueError("MXFP4 MoE requires at least one local expert.")
 
-    local_expert_idx = selected_experts - int(expert_start)
-    valid_route = (local_expert_idx >= 0) & (local_expert_idx < local_experts)
+    if routing_localized:
+        # Inputs already carry LOCAL expert coords with the invalid sentinel
+        # ``local_experts`` and zero-masked (bf16-rounded) weights, so localization
+        # reduces to the sentinel check. Only reachable when the localization fusion
+        # transform fired on a non-trtllm-gen fallback path.
+        local_expert_idx = selected_experts
+        valid_route = local_expert_idx < local_experts
+    else:
+        local_expert_idx = selected_experts - int(expert_start)
+        valid_route = (local_expert_idx >= 0) & (local_expert_idx < local_experts)
     local_expert_idx = local_expert_idx.clamp(0, local_experts - 1)
 
     # Decode regime: when the routing references fewer expert slots than there are
@@ -1114,6 +1138,7 @@ def torch_mxfp4_moe_from_routing(
     gate_up_order: str = "up_gate",
     swiglu_mode: str = "deepseek",
     layer_type: str = "moe",
+    routing_localized: bool = False,
 ) -> torch.Tensor:
     return _run_torch_mxfp4_from_routing_core(
         hidden_states,
@@ -1129,6 +1154,7 @@ def torch_mxfp4_moe_from_routing(
         down_scales,
         gate_up_order=gate_up_order,
         swiglu_mode=swiglu_mode,
+        routing_localized=routing_localized,
     )
 
 
@@ -1148,6 +1174,7 @@ def _torch_mxfp4_mlp_from_routing_fake(
     gate_up_order: str = "up_gate",
     swiglu_mode: str = "deepseek",
     layer_type: str = "moe",
+    routing_localized: bool = False,
 ):
     return torch.empty_like(hidden_states)
 
@@ -1235,6 +1262,7 @@ def torch_mxfp4_moe_from_routing_ep(
     swiglu_mode: str = "deepseek",
     layer_type: str = "moe",
     expert_start: int = 0,
+    routing_localized: bool = False,
 ) -> torch.Tensor:
     return _run_torch_mxfp4_from_routing_core(
         hidden_states,
@@ -1251,6 +1279,7 @@ def torch_mxfp4_moe_from_routing_ep(
         expert_start=expert_start,
         gate_up_order=gate_up_order,
         swiglu_mode=swiglu_mode,
+        routing_localized=routing_localized,
     )
 
 
@@ -1271,6 +1300,7 @@ def _torch_mxfp4_mlp_from_routing_ep_fake(
     swiglu_mode: str = "deepseek",
     layer_type: str = "moe",
     expert_start: int = 0,
+    routing_localized: bool = False,
 ):
     return torch.empty_like(hidden_states)
 

@@ -138,6 +138,63 @@ def test_trtllm_gen_mxfp4_from_routing_matches_torch_ref(batch, act_dtype):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.skipif(not is_sm_100f(), reason="trtllm-gen MXFP4 runners require SM100 (Blackwell)")
 @pytest.mark.parametrize("batch", [1, 2, 8])
+def test_trtllm_gen_mxfp4_from_routing_localized_matches_global(batch):
+    """``routing_localized=True`` (pre-localized int32/bf16 gate outputs, the
+    fuse_moe_routing_localization contract) must be byte-equal to the default path:
+    the localized inputs are exactly what ``deepseek_v4_localize_routing`` produces,
+    so the runner consumes bit-identical ``(topk_ids, topk_weights)`` either way."""
+    x, sel, rw, weights, expert_start, alpha, limit, H = _make_case(batch)
+    gu_blocks, gu_bias, gu_scales, dn_blocks, dn_bias, dn_scales = weights
+    e_local = gu_blocks.shape[0]
+
+    out_global = _trtllm_gen(x, sel, rw, weights, expert_start, alpha, limit, "mxfp8")
+    local_idx, local_w = torch.ops.auto_deploy.deepseek_v4_localize_routing(
+        sel, rw, expert_start, e_local
+    )
+    out_localized = mxfp4_moe._run_trtllm_gen_mxfp4_from_routing(
+        x,
+        local_idx,
+        local_w,
+        gu_blocks,
+        gu_bias,
+        gu_scales,
+        dn_blocks,
+        dn_bias,
+        dn_scales,
+        expert_start,
+        alpha,
+        limit,
+        act_dtype="mxfp8",
+        routing_localized=True,
+    )
+    assert torch.equal(out_localized, out_global), (
+        "routing_localized path must consume the pre-localized gate outputs verbatim"
+    )
+
+    # Global (int64/fp32) inputs with routing_localized=True must be rejected loudly —
+    # silently treating global ids as local would mis-route experts.
+    with pytest.raises(TypeError, match="routing_localized"):
+        mxfp4_moe._run_trtllm_gen_mxfp4_from_routing(
+            x,
+            sel.to(torch.int64),
+            rw,
+            gu_blocks,
+            gu_bias,
+            gu_scales,
+            dn_blocks,
+            dn_bias,
+            dn_scales,
+            expert_start,
+            alpha,
+            limit,
+            act_dtype="mxfp8",
+            routing_localized=True,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not is_sm_100f(), reason="trtllm-gen MXFP4 runners require SM100 (Blackwell)")
+@pytest.mark.parametrize("batch", [1, 2, 8])
 def test_trtllm_gen_mxfp4_from_routing_w4a8_close_to_w4a16(batch):
     """Isolate the activation-quantization delta: W4A8 (mxfp8 act) vs W4A16 (bf16 act) on the
     SAME prepared weights, routing localization, and top-k ordering. The only difference is the
@@ -159,3 +216,5 @@ if __name__ == "__main__":
             print(f"batch={b} act={a}: OK")
         test_trtllm_gen_mxfp4_from_routing_w4a8_close_to_w4a16(b)
         print(f"batch={b} w4a8-vs-w4a16: OK")
+        test_trtllm_gen_mxfp4_from_routing_localized_matches_global(b)
+        print(f"batch={b} localized-vs-global: OK")
