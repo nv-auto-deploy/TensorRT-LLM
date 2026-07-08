@@ -796,6 +796,17 @@ def _w8a8_block_fp8_matmul_triton(
         assert residual.dtype == output_dtype, "residual must match the matmul output dtype"
         assert residual.dim() >= 2 and residual.is_contiguous()
 
+    # Rowwise direct-store decode GEMV (idea_0009): the exact measured M=1
+    # DeepSeek-V4-Flash TP4 per-rank shapes bypass both incumbent paths -- one
+    # flat rowwise kernel replaces full-K MMA launches and the split-K
+    # (zero-fill + atomic matmul + finish-cast) triple, with the residual merge
+    # add fused in the same epilogue as the full-K kernel. See the kernel
+    # docstring/comment block for the measured schedule and numerics.
+    if _use_rowwise_gemv(M, N, K, block_n, block_k, A, B, As, Bs):
+        return _w8a8_gemv_rowwise(
+            A, B, As, Bs, block_n, block_k, output_dtype, N, K, residual=residual
+        )
+
     if _use_splitk_decode(M, N, K):
         C = _w8a8_block_fp8_matmul_splitk(A, B, As, Bs, block_n, block_k, output_dtype, M, N, K)
         if residual is not None:
@@ -1170,6 +1181,156 @@ def _w8a8_block_fp8_matmul_splitk(
     if output_dtype == torch.float32:
         return C_acc
     return C_acc.to(output_dtype)
+
+
+# Rowwise direct-store decode GEMV backend (idea_0009, kernel_backend axis).
+#
+# At M=1 both incumbent paths carry structural overhead this memory-bound GEMV
+# does not need:
+#   * the full-K MMA kernel loads B as (BLOCK_K, BLOCK_N) tiles -- 128-byte
+#     segments per output column -- and pads the M=1 row to a 16-row MMA tile;
+#   * the split-K path adds a zero-fill kernel before and an fp32->bf16 finish
+#     cast kernel after every call (three CUDA-graph nodes per GEMV) plus an
+#     fp32 atomic reduction.
+# This kernel instead assigns each CTA a small band of B *rows* and streams them
+# along K in (BLOCK_N, GROUPS, group_k) tiles: per row the K segment read per
+# load is ``GROUPS * group_k`` bytes (up to a whole 4 KiB row) instead of 128,
+# there are no atomics, no MMA row padding, and the bf16 result (plus the
+# optional fused residual add) is stored directly -- one kernel, no fill/cast.
+#
+# Numerics: for each row the per-scale-group partial dot products are formed in
+# fp32 and accumulated in a deterministic order (sequential over GROUPS-sized
+# chunks, tree-reduced within a chunk), with the same ``(partial * a_s) * b_s``
+# scale association as the incumbent kernels. It therefore matches the full-K
+# kernel up to the intra-group summation-tree order (measured 0-1 / 16384
+# bf16-boundary flips vs an fp64 dequant ground truth, the same count the
+# incumbent MMA kernel shows) and *removes* the split-K path's atomic-order
+# run-to-run nondeterminism on the shapes it covers.
+#
+# The launch schedule was selected by a drift-controlled round-robin CUDA-graph
+# microbench on B200 (L2-cold weight rotation) over the exact DeepSeek-V4-Flash
+# TP4 per-rank M=1 decode shapes; each entry below beat the incumbent dispatch
+# (including the split-K fill+cast overhead) in 3/3 alternating repeats.
+# Persistent / work-queue variants of this kernel (grid-strided task loop,
+# one-wave grid) were also swept and LOST to the flat one-task-per-CTA launch at
+# every shape, so the backend intentionally launches a plain flat grid.
+# Non-listed shapes, M>=2, and non-128 quant blocks keep the incumbent paths.
+
+# (N, K) -> (BLOCK_N rows/CTA, GROUPS k-groups/iter, num_warps, num_stages)
+_W8A8_TP4_M1_ROWWISE_CFG = {
+    (1536, 4096): (1, 32, 2, 3),  # fused wq_a + wkv          (was split-K 24x24)
+    (1024, 4096): (1, 32, 2, 5),  # shared w1+w3 / wo_a sites (was split-K 16x32)
+    (16384, 1024): (32, 8, 4, 3),  # fused wq_b + indexer.wq_b (was full-K BN128)
+    (8192, 1024): (8, 8, 4, 3),  # wq_b                      (was full-K BN64)
+    (4096, 512): (4, 4, 2, 5),  # shared w2 (+residual)     (was full-K BN32)
+    (4096, 2048): (4, 8, 2, 5),  # wo_b                      (was full-K BN32)
+}
+
+
+def _use_rowwise_gemv(
+    M: int,
+    N: int,
+    K: int,
+    block_n: int,
+    block_k: int,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+) -> bool:
+    """Gate the rowwise decode GEMV to the exact measured M=1 TP4 shapes."""
+    if M != 1 or block_n != 128 or block_k != 128:
+        return False
+    cfg = _W8A8_TP4_M1_ROWWISE_CFG.get((N, K))
+    if cfg is None:
+        return False
+    block_rows, groups = cfg[0], cfg[1]
+    # Defensive: every table shape satisfies these exactly-divisible tilings.
+    if N % block_rows or K % (groups * block_k):
+        return False
+    # The kernel reads flat contiguous rows (A, As) and row-major B / Bs.
+    return A.stride(-1) == 1 and B.stride(1) == 1 and As.stride(-1) == 1 and Bs.stride(1) == 1
+
+
+@triton.jit
+def _w8a8_gemv_rowwise_kernel(
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    R,
+    K,
+    stride_bn,
+    stride_bsn,
+    GROUP_N: tl.constexpr,
+    GROUP_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUPS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_g = tl.arange(0, GROUPS)
+    offs_k = tl.arange(0, GROUP_K)
+    num_k_groups = K // GROUP_K
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    bs_row = offs_n // GROUP_N
+    for g0 in range(0, num_k_groups, GROUPS):
+        kk = (g0 + offs_g)[:, None] * GROUP_K + offs_k[None, :]
+        a = tl.load(A + kk).to(tl.float32)  # (GROUPS, GROUP_K)
+        b = tl.load(B + offs_n[:, None, None] * stride_bn + kk[None, :, :]).to(tl.float32)
+        part = tl.sum(b * a[None, :, :], axis=2)  # (BLOCK_N, GROUPS)
+        a_s = tl.load(As + g0 + offs_g).to(tl.float32)
+        b_s = tl.load(Bs + bs_row[:, None] * stride_bsn + (g0 + offs_g)[None, :]).to(tl.float32)
+        # Same scale association as the incumbent kernels: (partial * a_s) * b_s.
+        acc += tl.sum(part * a_s[None, :] * b_s, axis=1)
+
+    c = acc.to(C.dtype.element_ty)
+    if HAS_RESIDUAL:
+        # Mirror the full-K epilogue bit-for-bit: round the accumulator to the
+        # output dtype first, then add the residual in fp32 and round once.
+        r = tl.load(R + offs_n).to(tl.float32)
+        c = (c.to(tl.float32) + r).to(C.dtype.element_ty)
+    tl.store(C + offs_n, c)
+
+
+def _w8a8_gemv_rowwise(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    output_dtype: torch.dtype,
+    N: int,
+    K: int,
+    residual: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Launch the rowwise direct-store decode GEMV (gate via _use_rowwise_gemv)."""
+    block_rows, groups, num_warps, num_stages = _W8A8_TP4_M1_ROWWISE_CFG[(N, K)]
+    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+    grid = (N // block_rows,)
+    _w8a8_gemv_rowwise_kernel[grid](
+        A,
+        B,
+        C,
+        As,
+        Bs,
+        C if residual is None else residual,
+        K,
+        B.stride(0),
+        Bs.stride(0),
+        GROUP_N=block_n,
+        GROUP_K=block_k,
+        BLOCK_N=block_rows,
+        GROUPS=groups,
+        HAS_RESIDUAL=residual is not None,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return C
 
 
 @torch.library.custom_op("auto_deploy::torch_fake_quant_finegrained_fp8_linear", mutates_args=())
