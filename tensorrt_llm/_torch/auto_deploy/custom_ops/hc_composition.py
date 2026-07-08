@@ -549,25 +549,32 @@ def _deepseek_v4_hc_pre_mix_fake(
 #
 #   * ``_hc_fn_partials_kernel`` — unchanged split-D front (a single CTA cannot
 #     stream the [MIX_HC, D] fp32 ``hc_fn`` weight competitively).
-#   * ``_hc_pre_composition_combine_kernel`` — reduces the partials, computes
-#     ``pre``/``post`` and the comb logits, runs the weighted combine +
-#     RMSNorm, then the sinkhorn loop. ``pre`` never leaves registers.
+#   * ``_hc_pre_composition_combine_kernel`` — grid ``(n, 2)``: per token row,
+#     program 0 reduces the ``pre`` partials and runs the wide combine +
+#     RMSNorm, while program 1 *concurrently* computes ``post`` and the comb
+#     logits and runs the serial sinkhorn loop. ``pre`` never leaves registers.
 #
-# The block ORDER inside the fused kernel is deliberate: all small partial
-# loads and logit reductions run first, then the wide ``flat`` loads + combine,
-# and the register-only sinkhorn loop last. With the comb logits already in
-# registers the sinkhorn chain has no memory dependency, so ptxas overlaps its
-# ~40-step serial ALU chain with the outstanding ``flat`` load latency
-# (measured on B200: 6.56us fused vs 7.74us for the landed two-kernel
-# sequence at the decode shape, amortized in a CUDA graph).
+# The two-program split exists because the kernel's two halves want opposite
+# resources: the combine streams a ``[HM, H]`` tile (wide, latency-bound) while
+# the sinkhorn is a ~40-step *serial* dependent ALU chain on a ``[HM, HM]``
+# register tile. In the previous single-program form the wide combine was
+# serialized behind/around the chain inside one CTA — the launch measured
+# 6.64us while its SINKHORN_ITERS=1 variant measured 4.12us (B200, CUDA-graph
+# amortized, decode shape), i.e. ~2.5us of exposed chain latency. Running the
+# chain in a sibling program on another SM takes the launch to max(combine,
+# composition) = 5.15us (-22%). A two-*kernel* split is strictly worse (8.1us:
+# each grid-1 launch re-pays the ~1us+ GPU execution floor and the partial
+# re-loads), which is why the sibling program shares the launch.
 #
 # Bit-exactness (torch.equal vs the landed two-kernel path) requires
 # ``num_warps=2``: the composition reductions change bits with warp count
 # (their tile-reduce tree is layout-dependent), while the combine part is
 # warp-count-invariant, so the fused kernel adopts the composition kernel's
-# ``num_warps=2`` and reproduces both kernels' bits. ``maxnreg=240`` only
-# relaxes ptxas scheduling (measured fastest 192..255 cap sweep); it does not
-# change results.
+# ``num_warps=2`` and reproduces both kernels' bits. Both programs re-derive
+# ``rstd`` (and program 0 the ``pre`` gate) from the same partials with the
+# identical tile shapes and op order, so the duplicated math is bit-identical
+# to the single-program form. ``maxnreg=240`` only relaxes ptxas scheduling
+# (measured fastest 192..255 cap sweep); it does not change results.
 
 _HC_PRE_MIX_COMBINE_NUM_WARPS = 2
 _HC_PRE_MIX_COMBINE_MAXNREG = 240
@@ -597,15 +604,20 @@ def _hc_pre_composition_combine_kernel(
     BLOCK_H: tl.constexpr,  # next_power_of_2(H)
     SINKHORN_ITERS: tl.constexpr,
 ):
-    """One program per token row: partials -> pre/post/comb logits -> y -> comb.
+    """Two programs per token row (grid ``(N, 2)``): combine ∥ composition.
 
-    The composition math mirrors ``_hc_partials_composition_kernel`` and the
-    combine + RMSNorm math mirrors ``_hc_weighted_combine_kernel`` exactly
-    (same tile shapes and op order, so at ``num_warps=2`` the outputs are
-    bit-identical to the two-kernel sequence). ``pre`` is consumed from
+    Program ``(row, 0)`` reduces the ``pre`` partials and runs the weighted
+    combine + RMSNorm into ``y``; program ``(row, 1)`` concurrently computes
+    ``post`` and the comb logits and runs the serial sinkhorn loop into
+    ``comb``. The composition math mirrors ``_hc_partials_composition_kernel``
+    and the combine + RMSNorm math mirrors ``_hc_weighted_combine_kernel``
+    exactly (same tile shapes and op order, so at ``num_warps=2`` the outputs
+    are bit-identical to the two-kernel sequence — the sibling-program split
+    only moves which SM executes each half). ``pre`` is consumed from
     registers via an exact one-hot extraction instead of an HBM round-trip.
     """
     row = tl.program_id(0)
+    which = tl.program_id(1)
     if row >= N:
         return
     pbase = part_ptr + row * ((MIX_HC + 1) * SPLIT)
@@ -614,92 +626,96 @@ def _hc_pre_composition_combine_kernel(
     smask = s < SPLIT
 
     # rstd = rsqrt(mean(x^2) + norm_eps), fixed-order tree reduce over SPLIT.
+    # Re-derived by both programs from the same partials row (identical tile
+    # shape + op order -> identical bits); 0.5 KB of redundant loads.
     sq = tl.load(pbase + MIX_HC * SPLIT + s, mask=smask, other=0.0)
     rstd = tl.rsqrt(tl.sum(sq, axis=0) / D + norm_eps)
-
-    s0 = tl.load(scale_ptr + 0)
-    s1 = tl.load(scale_ptr + 1)
-    s2 = tl.load(scale_ptr + 2)
 
     d = tl.arange(0, BM)
     dmask = d < HM
 
-    # pre = sigmoid((mix * rstd) * scale[0] + base) + eps — kept in registers.
-    pre_part = tl.load(
-        pbase + d[:, None] * SPLIT + s[None, :],
-        mask=dmask[:, None] & smask[None, :],
-        other=0.0,
-    )
-    pre_logits = (tl.sum(pre_part, axis=1) * rstd) * s0 + tl.load(
-        base_ptr + d, mask=dmask, other=0.0
-    )
-    pre = tl.sigmoid(pre_logits) + eps
+    if which == 0:
+        # --- combine program: pre gate -> weighted combine -> RMSNorm -> y ---
+        s0 = tl.load(scale_ptr + 0)
 
-    # post = 2 * sigmoid((mix * rstd) * scale[1] + base)
-    post_part = tl.load(
-        pbase + (HM + d)[:, None] * SPLIT + s[None, :],
-        mask=dmask[:, None] & smask[None, :],
-        other=0.0,
-    )
-    post_logits = (tl.sum(post_part, axis=1) * rstd) * s1 + tl.load(
-        base_ptr + HM + d, mask=dmask, other=0.0
-    )
-    post = 2.0 * tl.sigmoid(post_logits)
-    tl.store(post_ptr + row * HM + d, post, mask=dmask)
+        # pre = sigmoid((mix * rstd) * scale[0] + base) + eps — registers only.
+        pre_part = tl.load(
+            pbase + d[:, None] * SPLIT + s[None, :],
+            mask=dmask[:, None] & smask[None, :],
+            other=0.0,
+        )
+        pre_logits = (tl.sum(pre_part, axis=1) * rstd) * s0 + tl.load(
+            base_ptr + d, mask=dmask, other=0.0
+        )
+        pre = tl.sigmoid(pre_logits) + eps
 
-    # comb logits, laid out as [i (dim=-2), j (dim=-1)] — computed BEFORE the
-    # combine so the sinkhorn loop below is register-only and can overlap the
-    # flat load latency.
-    i = tl.arange(0, BM)[:, None]
-    j = tl.arange(0, BM)[None, :]
-    m2 = (i < HM) & (j < HM)
-    cflat = i * HM + j
-    comb_part = tl.load(
-        pbase + (2 * HM + cflat)[:, :, None] * SPLIT + s[None, None, :],
-        mask=m2[:, :, None] & smask[None, None, :],
-        other=0.0,
-    )
-    comb_logits = (tl.sum(comb_part, axis=2) * rstd) * s2 + tl.load(
-        base_ptr + 2 * HM + cflat, mask=m2, other=0.0
-    )
+        # weighted combine + RMSNorm (mirrors _hc_weighted_combine_kernel)
+        h = tl.arange(0, BLOCK_H)
+        hmask = h < H
+        flat_row = flat_ptr + row * (HM * H)
+        acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+        for m in tl.static_range(HM):
+            # Exact scalar extraction of pre[m] from the register tile (sum of
+            # a one-hot selection reproduces the element bit-for-bit).
+            p = tl.sum(tl.where(d == m, pre, 0.0), axis=0)
+            f = tl.load(flat_row + m * H + h, mask=hmask, other=0.0).to(tl.float32)
+            acc += p * f
+        y = acc.to(tl.bfloat16).to(tl.float32)
+        var = tl.sum(y * y, axis=0) / H
+        y_rstd = tl.rsqrt(var + rms_eps)
+        normed = (y * y_rstd).to(tl.bfloat16).to(tl.float32)
+        w = tl.load(weight_ptr + h, mask=hmask, other=0.0)
+        out = w * normed
+        tl.store(y_ptr + row * H + h, out.to(y_ptr.dtype.element_ty), mask=hmask)
+    else:
+        # --- composition program: post gate + comb logits + sinkhorn ---
+        s1 = tl.load(scale_ptr + 1)
+        s2 = tl.load(scale_ptr + 2)
 
-    # --- weighted combine + RMSNorm (mirrors _hc_weighted_combine_kernel) ---
-    h = tl.arange(0, BLOCK_H)
-    hmask = h < H
-    flat_row = flat_ptr + row * (HM * H)
-    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
-    for m in tl.static_range(HM):
-        # Exact scalar extraction of pre[m] from the register tile (sum of a
-        # one-hot selection reproduces the element bit-for-bit).
-        p = tl.sum(tl.where(d == m, pre, 0.0), axis=0)
-        f = tl.load(flat_row + m * H + h, mask=hmask, other=0.0).to(tl.float32)
-        acc += p * f
-    y = acc.to(tl.bfloat16).to(tl.float32)
-    var = tl.sum(y * y, axis=0) / H
-    y_rstd = tl.rsqrt(var + rms_eps)
-    normed = (y * y_rstd).to(tl.bfloat16).to(tl.float32)
-    w = tl.load(weight_ptr + h, mask=hmask, other=0.0)
-    out = w * normed
-    tl.store(y_ptr + row * H + h, out.to(y_ptr.dtype.element_ty), mask=hmask)
+        # post = 2 * sigmoid((mix * rstd) * scale[1] + base)
+        post_part = tl.load(
+            pbase + (HM + d)[:, None] * SPLIT + s[None, :],
+            mask=dmask[:, None] & smask[None, :],
+            other=0.0,
+        )
+        post_logits = (tl.sum(post_part, axis=1) * rstd) * s1 + tl.load(
+            base_ptr + HM + d, mask=dmask, other=0.0
+        )
+        post = 2.0 * tl.sigmoid(post_logits)
+        tl.store(post_ptr + row * HM + d, post, mask=dmask)
 
-    # --- sinkhorn (register-only; mirrors _hc_partials_composition_kernel) ---
-    neg_inf = float("-inf")
-    logits_sm = tl.where(m2, comb_logits, neg_inf)
-    mx = tl.max(logits_sm, axis=1)[:, None]
-    e = tl.exp(logits_sm - mx)
-    sden = tl.sum(e, axis=1)[:, None]
-    comb = tl.where(m2, e / sden + eps, 0.0)
+        # comb logits, laid out as [i (dim=-2), j (dim=-1)]
+        i = tl.arange(0, BM)[:, None]
+        j = tl.arange(0, BM)[None, :]
+        m2 = (i < HM) & (j < HM)
+        cflat = i * HM + j
+        comb_part = tl.load(
+            pbase + (2 * HM + cflat)[:, :, None] * SPLIT + s[None, None, :],
+            mask=m2[:, :, None] & smask[None, None, :],
+            other=0.0,
+        )
+        comb_logits = (tl.sum(comb_part, axis=2) * rstd) * s2 + tl.load(
+            base_ptr + 2 * HM + cflat, mask=m2, other=0.0
+        )
 
-    cs = tl.sum(comb, axis=0)[None, :]
-    comb = tl.where(m2, comb / (cs + eps), 0.0)
+        # sinkhorn (register-only; mirrors _hc_partials_composition_kernel)
+        neg_inf = float("-inf")
+        logits_sm = tl.where(m2, comb_logits, neg_inf)
+        mx = tl.max(logits_sm, axis=1)[:, None]
+        e = tl.exp(logits_sm - mx)
+        sden = tl.sum(e, axis=1)[:, None]
+        comb = tl.where(m2, e / sden + eps, 0.0)
 
-    for _ in range(SINKHORN_ITERS - 1):
-        rs = tl.sum(comb, axis=1)[:, None]
-        comb = tl.where(m2, comb / (rs + eps), 0.0)
         cs = tl.sum(comb, axis=0)[None, :]
         comb = tl.where(m2, comb / (cs + eps), 0.0)
 
-    tl.store(comb_ptr + row * (HM * HM) + cflat, comb, mask=m2)
+        for _ in range(SINKHORN_ITERS - 1):
+            rs = tl.sum(comb, axis=1)[:, None]
+            comb = tl.where(m2, comb / (rs + eps), 0.0)
+            cs = tl.sum(comb, axis=0)[None, :]
+            comb = tl.where(m2, comb / (cs + eps), 0.0)
+
+        tl.store(comb_ptr + row * (HM * HM) + cflat, comb, mask=m2)
 
 
 @torch.library.custom_op("auto_deploy::deepseek_v4_hc_pre_mix_combine", mutates_args=())
@@ -808,7 +824,9 @@ def deepseek_v4_hc_pre_mix_combine(
         num_warps=4,
     )
 
-    _hc_pre_composition_combine_kernel[(n,)](
+    # grid (n, 2): per row, program 0 = combine + RMSNorm, program 1 = the
+    # post/comb composition with the serial sinkhorn chain (see kernel doc).
+    _hc_pre_composition_combine_kernel[(n, 2)](
         partials,
         scale_f,
         base_f,
@@ -960,7 +978,9 @@ def deepseek_v4_hc_pre_mix_combine_partials(
             comb.reshape(*lead, hc_mult, hc_mult),
         )
 
-    _hc_pre_composition_combine_kernel[(n,)](
+    # grid (n, 2): per row, program 0 = combine + RMSNorm, program 1 = the
+    # post/comb composition with the serial sinkhorn chain (see kernel doc).
+    _hc_pre_composition_combine_kernel[(n, 2)](
         part_c,
         scale_f,
         base_f,
