@@ -97,3 +97,72 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_deepseek_v4_routing_fp32_mirror_input_parity():
+    """Learned-router fp32-mirror contract for the HC-pre y32 output.
+
+    ``deepseek_v4_hc_pre_mix_combine_partials_y32`` emits ``y32 == y.float()``
+    bit-for-bit, so feeding the mirror to the unchanged fp32 router GEMV
+    (``torch_linear_simple``) must reproduce the exact logits, selected expert
+    ids, and routing weights of the old ``y.to(torch.float32)`` boundary-copy
+    path in the same process.
+    """
+    import triton
+
+    from tensorrt_llm._torch.auto_deploy.custom_ops import hc_composition
+    from tensorrt_llm._torch.auto_deploy.custom_ops.linear import linear  # noqa: F401
+
+    torch.manual_seed(17)
+    B, S, hc_mult, H = 2, 1, 4, 4096
+    num_experts, top_k = 256, 6
+    eps, norm_eps, rms_eps, iters = 1e-6, 1e-6, 3e-5, 20
+    mix_hc = (2 + hc_mult) * hc_mult
+    dev = "cuda"
+
+    x = torch.randn(B, S, hc_mult * H, device=dev, dtype=torch.bfloat16)
+    hc_fn = (torch.randn(mix_hc, hc_mult * H, device=dev, dtype=torch.float32) * 0.02).contiguous()
+    hc_scale = torch.rand(3, device=dev, dtype=torch.float32) + 0.5
+    hc_base = torch.randn(mix_hc, device=dev, dtype=torch.float32) * 0.1
+    norm_w = torch.randn(H, device=dev, dtype=torch.float32) * 0.1 + 1.0
+
+    n, dim = B * S, hc_mult * H
+    chunk, split = hc_composition.hc_partials_layout(dim)
+    parts = torch.empty(n, mix_hc + 1, split, device=dev, dtype=torch.float32)
+    hc_composition._hc_fn_partials_kernel[(n, split)](
+        x.reshape(n, dim).contiguous(),
+        hc_fn,
+        parts,
+        n,
+        dim,
+        split,
+        MIX_HC=mix_hc,
+        KBLOCK=triton.next_power_of_2(mix_hc),
+        CHUNK=chunk,
+        num_warps=4,
+    )
+
+    y, y32, _, _ = torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine_partials_y32(
+        parts, x, hc_fn, hc_scale, hc_base, norm_w, hc_mult, iters, eps, norm_eps, rms_eps, x.dtype
+    )
+
+    router_w = (torch.randn(num_experts, H, device=dev, dtype=torch.float32) * 0.05).contiguous()
+    bias = (torch.randn(num_experts, device=dev) * 0.5).float()
+
+    # Old gate path: bf16 -> fp32 boundary copy feeding the fp32 GEMV.
+    logits_cast = torch.ops.auto_deploy.torch_linear_simple(
+        y.reshape(-1, H).to(router_w.dtype), router_w, None
+    ).float()
+    # New gate path: the kernel-emitted fp32 mirror feeding the same GEMV.
+    logits_mirror = torch.ops.auto_deploy.torch_linear_simple(
+        y32.reshape(-1, H), router_w, None
+    ).float()
+
+    assert torch.equal(y32, y.float())
+    assert torch.equal(logits_cast, logits_mirror)
+
+    idx_c, w_c = torch.ops.auto_deploy.deepseek_v4_routing(logits_cast, bias, top_k, 1.5, True)
+    idx_m, w_m = torch.ops.auto_deploy.deepseek_v4_routing(logits_mirror, bias, top_k, 1.5, True)
+    assert torch.equal(idx_c, idx_m)
+    assert torch.equal(w_c, w_m)

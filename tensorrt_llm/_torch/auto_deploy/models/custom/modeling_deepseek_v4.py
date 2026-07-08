@@ -818,6 +818,7 @@ class DeepseekV4MoEGate(nn.Module):
         self,
         hidden_states_flat: torch.Tensor,
         input_ids_flat: torch.Tensor,
+        hidden_states_flat_fp32: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.score_func != "sqrtsoftplus":
             raise ValueError(f"Unsupported DeepSeek V4 scoring_func: {self.score_func}")
@@ -837,7 +838,16 @@ class DeepseekV4MoEGate(nn.Module):
                 self.norm_topk_prob,
             )
 
-        router_logits = _linear(hidden_states_flat.to(self.weight.dtype), self.weight).float()
+        # ``hidden_states_flat_fp32`` is the HC-pre combine kernel's fp32 mirror of
+        # ``hidden_states_flat`` (bit-equal to ``hidden_states_flat.float()``), so
+        # using it skips the per-step bf16->fp32 boundary copy while feeding the
+        # fp32 cuBLAS router GEMV exactly the values it used to consume.
+        router_in = (
+            hidden_states_flat_fp32
+            if hidden_states_flat_fp32 is not None
+            else hidden_states_flat.to(self.weight.dtype)
+        )
+        router_logits = _linear(router_in, self.weight).float()
 
         # Non-hash layers: fuse the sqrtsoftplus scoring + bias-add + top-k + gather +
         # renorm + scale chain into one Triton kernel (collapses the tiny per-token
@@ -978,7 +988,12 @@ class DeepseekV4MoE(nn.Module):
             torch.empty(loaded.shape, dtype=loaded.dtype, device=current.device),
         )
 
-    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        hidden_states_fp32: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         original_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, original_shape[-1])
         # The shared-expert MLP is dispatched BEFORE the router and the routed
@@ -989,7 +1004,14 @@ class DeepseekV4MoE(nn.Module):
         # routed-expert kernels out of that wait set, so the shared MLP (aux
         # stream) genuinely overlaps the gate + routed experts (main stream).
         shared = self.shared_experts(hidden_states_flat)
-        selected_experts, routing_weights = self.gate(hidden_states_flat, input_ids.reshape(-1))
+        router_states_flat = (
+            hidden_states_fp32.view(-1, original_shape[-1])
+            if hidden_states_fp32 is not None
+            else None
+        )
+        selected_experts, routing_weights = self.gate(
+            hidden_states_flat, input_ids.reshape(-1), router_states_flat
+        )
         routed = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
             hidden_states_flat,
             selected_experts,
@@ -1532,6 +1554,10 @@ class DeepseekV4Block(nn.Module):
         self.norm_eps = config.rms_norm_eps
         self.attn = DeepseekV4Attention(config, layer_idx)
         self.ffn = DeepseekV4MoE(config, layer_idx)
+        # Learned-router FFN sites consume the HC-pre combine kernel's fp32
+        # mirror of its output (== y.float()), replacing the per-step
+        # bf16->fp32 router-input copy; hash-router layers keep the plain op.
+        self.ffn_router_fp32 = not self.ffn.gate.hash_routing
         self.attn_norm = DeepseekV4RMSNorm(config.hidden_size, self.norm_eps)
         self.ffn_norm = DeepseekV4RMSNorm(config.hidden_size, self.norm_eps)
 
@@ -1561,7 +1587,8 @@ class DeepseekV4Block(nn.Module):
         hc_base: torch.Tensor,
         norm: "DeepseekV4RMSNorm",
         hc_partials: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        emit_fp32: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
         # Fully fused HC-pre: bf16 input -> fp32 RMS statistic + the MIX_HC-output
         # hc_fn GEMV + ordered rsqrt scaling + sigmoid/softmax/sinkhorn + the
         # weighted-combine folded with the block RMSNorm, in two launches at
@@ -1578,9 +1605,34 @@ class DeepseekV4Block(nn.Module):
         # skips even the partials launch — one composition/combine kernel per
         # site (the seam partials match the standalone launch to ~1-2 fp32 ULP;
         # see deepseek_v4_hc_post.py).
+        #
+        # With ``emit_fp32`` (learned-router FFN sites) the return is a 4-tuple
+        # ``(y, y32, post, comb)`` where ``y32 == y.float()`` bit-for-bit: the
+        # combine kernel stores the fp32 widening of the just-rounded ``y`` as a
+        # second output, absorbing the router's bf16->fp32 boundary copy.
         flat = x.flatten(2)
         if hc_partials is None:
-            return torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine(
+            y, post, comb = torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine(
+                flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm.weight,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+                self.norm_eps,
+                norm.eps,
+                x.dtype,
+            )
+            if emit_fp32:
+                # Unused for DeepSeek V4 (every FFN site has seam partials);
+                # kept exact for robustness.
+                return y, y.float(), post, comb
+            return y, post, comb
+        if emit_fp32:
+            return torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine_partials_y32(
+                hc_partials,
                 flat,
                 hc_fn,
                 hc_scale,
@@ -1661,15 +1713,30 @@ class DeepseekV4Block(nn.Module):
         )
 
         residual = hidden_states
-        hidden_states, post, comb = self._hc_pre(
-            hidden_states,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.ffn_norm,
-            hc_partials,
-        )
-        hidden_states = self.ffn(hidden_states, input_ids)
+        if self.ffn_router_fp32:
+            # Learned-router layers: the fused HC-pre also emits the fp32 mirror
+            # of its output for the router GEMV, replacing the per-step
+            # bf16->fp32 boundary copy (values are bit-identical to the copy).
+            hidden_states, router_states_fp32, post, comb = self._hc_pre(
+                hidden_states,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.ffn_norm,
+                hc_partials,
+                emit_fp32=True,
+            )
+            hidden_states = self.ffn(hidden_states, input_ids, router_states_fp32)
+        else:
+            hidden_states, post, comb = self._hc_pre(
+                hidden_states,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.ffn_norm,
+                hc_partials,
+            )
+            hidden_states = self.ffn(hidden_states, input_ids)
         # ``next_hc_fn`` belongs to the next consumer of the residual stream:
         # the next layer's ``hc_attn_fn``, or ``hc_head_fn`` after the last layer.
         return self._hc_post(hidden_states, residual, post, comb, next_hc_fn)
