@@ -314,6 +314,12 @@ def _build_full_compressed_kv(
     if seq_len == 0:
         return compressor_kv.new_empty(batch_size, max_compressed_len, head_dim)
 
+    # The pool/ape math below ran on fp32 inputs before the producer started handing
+    # over raw activation-dtype rows (idea_0092); widen here (no-op when already fp32)
+    # so this reference stays bit-identical for every caller.
+    compressor_kv = compressor_kv.float()
+    compressor_gate = compressor_gate.float()
+
     row_offsets = torch.arange(max_compressed_len, device=compressor_kv.device)
     token_offsets = torch.arange(compress_ratio, device=compressor_kv.device)
     gather_idxs = row_offsets.unsqueeze(1) * compress_ratio + token_offsets
@@ -1887,7 +1893,10 @@ def _update_decode_compressed_caches(
             compress_ratio,
             head_dim,
             rope_dim,
-            compressor_kv_decode.dtype,
+            # Reconstruction compute/rounding dtype. The rows are reconstructed from the
+            # fp32 compressor caches, so anchor on the cache dtype -- the incoming decode
+            # rows may now be raw bf16 (idea_0092) and must not narrow this math.
+            compressor_kv_cache.dtype,
         )
         return
 
@@ -1948,7 +1957,8 @@ def _update_decode_compressed_caches(
             compress_ratio,
             head_dim,
             rope_dim,
-            compressor_kv_decode.dtype,
+            # Cache-anchored compute dtype -- see the ratio-4 call above (idea_0092).
+            compressor_kv_cache.dtype,
         )
         return
 
@@ -1975,7 +1985,8 @@ def _update_decode_compressed_caches(
         rope_dim,
         compress_ratio,
         head_dim,
-        compressor_kv_decode.dtype,
+        # Cache-anchored compute dtype -- see the fused paths above (idea_0092).
+        compressor_kv_cache.dtype,
         overlap_page_map=overlap_page_map,
     )
     if _HAS_TRITON and mhc_cache.is_cuda:
@@ -3008,7 +3019,7 @@ if _HAS_TRITON:
         sblk,
         pid,  # int64 physical page id (shared across caches)
         poff,  # int64 in-page offset (shared across caches)
-        src_ptr,  # [N, S] contiguous, already cache dtype
+        src_ptr,  # [N, S] contiguous, native producer dtype (converted on store)
         cache_ptr,  # [P, T, S] contiguous paged cache (mutated in place)
         S,  # this cache's row width (state_dim)
         T,  # tokens_per_block (shared cache.shape[1])
@@ -3018,8 +3029,10 @@ if _HAS_TRITON:
 
         Every current-token cache shares the ``(pid, poff)`` write address, so the
         multi-cache kernel below computes it once and dispatches to this helper per
-        cache. The store is a pure copy (``src`` pre-cast to the cache dtype), so it
-        is byte-identical to ``cache[page_ids, page_offsets] = values.to(dtype)``.
+        cache. ``src`` stays in its producer dtype and the store converts to the
+        cache dtype (bf16 -> fp32 widening is exact; fp32 -> bf16 rounds
+        nearest-even like torch ``.to``), so the write is byte-identical to
+        ``cache[page_ids, page_offsets] = values.to(dtype)``.
         """
         col = sblk * BLOCK_S + tl.arange(0, BLOCK_S)
         smask = col < S
@@ -3061,8 +3074,11 @@ if _HAS_TRITON:
         BLOCK_S))``, program ``(row, c, sblk)`` copies one row-block of cache ``c``.
         The caches differ in dtype (SWA is the activation dtype, the compressor
         caches are fp32) and row width, so each is dispatched to its own pointer;
-        unused slots (``c >= N_CACHES``) are never launched.  Byte-identical to the
-        prior per-cache ``cache[page_ids, page_offsets] = values.to(cache.dtype)``.
+        unused slots (``c >= N_CACHES``) are never launched.  Sources arrive in
+        their native producer dtype and are converted on store (idea_0092), so the
+        launch is byte-identical to the prior per-cache
+        ``cache[page_ids, page_offsets] = values.to(cache.dtype)`` without the
+        bf16 -> fp32 pre-cast copy kernels.
         """
         row = tl.program_id(0)
         c = tl.program_id(1)
@@ -4265,13 +4281,17 @@ def _fused_current_token_store(
     ``deepseek_v4_sparse_prepare_decode_page_addr``). Folding the per-cache
     ``index_put`` scatters into a single ``_multi_current_token_store_kernel`` launch
     removes ~4 (ratio-4) / ~2 (ratio-128) gather/scatter kernels per layer per decode
-    step. Values are pre-cast to the cache dtype in torch -- exactly the cast the prior
-    per-cache index_put performed -- so the kernel is a pure copy, byte-identical to the
-    prior ``cache[page_ids, page_offsets] = values.to(cache.dtype)`` for each cache.
+    step. Values are handed to the kernel in their native producer dtype and converted
+    to the cache dtype by the store itself (idea_0092), removing the per-cache
+    bf16 -> fp32 ``.to(cache.dtype)`` copy kernels the wrapper used to launch. The
+    bf16 -> fp32 widening (the only production conversion; fp32 -> bf16 rounds
+    nearest-even in both torch and Triton) is exact, so the result stays
+    byte-identical to ``cache[page_ids, page_offsets] = values.to(cache.dtype)``.
 
     Falls back to the per-cache ``_write_decode_cache_rows`` (identical semantics) when
-    Triton/CUDA is unavailable, the hoisted address is missing, a cache is not a
-    contiguous 3-D paged tensor, or fewer than two caches would be written.
+    Triton/CUDA is unavailable, the hoisted address is missing, or a cache is not a
+    contiguous 3-D paged tensor. A single-cache write (the compression-off layers'
+    SWA kv) uses the same fused kernel with ``N_CACHES=1`` instead of ``index_put``.
     """
     # Skip empty value tensors -- matches the per-cache ``_write_decode_cache_rows``
     # ``numel() == 0`` guard so a degenerate (state_dim 0) cache is never written.
@@ -4285,7 +4305,6 @@ def _fused_current_token_store(
         _HAS_TRITON
         and page_ids is not None
         and page_offsets is not None
-        and len(caches) >= 2
         and all(c.is_cuda and c.dim() == 3 and c.is_contiguous() for c in caches)
     )
     if not use_fused:
@@ -4305,11 +4324,11 @@ def _fused_current_token_store(
 
     n_cache = len(caches)
     n_rows = int(page_ids.shape[0])
-    # Pre-cast each value to its cache dtype (no-op when already matching) and make it
-    # row-contiguous ``[N, S]``. This is exactly the cast the per-cache index_put did
-    # (e.g. the compressor kv/gate bf16 -> fp32 cast), so no extra copy_cast kernel is
-    # introduced; ``.contiguous()`` is a no-op on the already-contiguous decode rows.
-    srcs = [v.to(c.dtype).contiguous() for c, v in zip(caches, values)]
+    # Keep each value in its native producer dtype; the store kernel converts to the
+    # cache dtype on write, so no bf16 -> fp32 copy kernel runs here. ``.contiguous()``
+    # is a no-op on the already-contiguous decode rows (the kernel indexes rows at
+    # stride ``S``).
+    srcs = [v.contiguous() for v in values]
     dims = [int(c.shape[-1]) for c in caches]
     tokens_per_block = int(caches[0].shape[1])
     max_dim = max(dims)
@@ -6205,6 +6224,20 @@ def torch_deepseek_v4_sparse_attention_with_cache(
             rope_dim,
             out,
         )
+
+    if compress_ratio:
+        # Prefill / mixed path: the producer hands over raw activation-dtype compressor
+        # rows (idea_0092) -- the pure-decode path above consumes them without widening
+        # (the fused current-token store converts in-kernel), so the one-time fp32
+        # widening the modeling code used to do moves here, off the decode hot path.
+        # bf16 -> fp32 is exact, so every prefill consumer below (the paged cache
+        # writes, ``_update_compressed_paged_caches``'s reconstruction dtype, and the
+        # initial-prefill reference) sees bit-identical values; ``.float()`` is a no-op
+        # for already-fp32 callers.
+        compressor_kv = compressor_kv.float()
+        compressor_gate = compressor_gate.float()
+        indexer_compressor_kv = indexer_compressor_kv.float()
+        indexer_compressor_gate = indexer_compressor_gate.float()
 
     if topk_is_placeholder:
         # The model emits a width-only placeholder for ``topk_idxs`` on compressed AND

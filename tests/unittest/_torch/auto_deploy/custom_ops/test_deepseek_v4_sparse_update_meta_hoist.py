@@ -279,5 +279,34 @@ def test_update_with_hoisted_meta_byte_exact(compress_ratio, num_rows):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
+@pytest.mark.parametrize("compress_ratio", [_RATIO4, _RATIO128])
+def test_update_reconstruction_dtype_anchored_on_cache(compress_ratio):
+    """bf16 vs fp32 decode rows (same values) give a byte-identical mhc_cache.
+
+    The compressed-row reconstruction reads the current token from the fp32
+    compressor caches (written by the caller's fused store) and anchors its
+    compute/rounding dtype on that cache dtype (idea_0092); the incoming decode
+    rows are consulted only for gating and shape, so their dtype -- raw bf16 from
+    the producer, or the fp32 widening the modeling code used to hand over --
+    must not change a byte of the update.
+    """
+    assert M._HAS_TRITON, "test requires triton"
+    common, mhc_base, update_meta = _build_update_inputs(compress_ratio, 3, seed=920)
+
+    mhc_bf16 = mhc_base.clone()
+    _run_update(common, mhc_bf16, update_meta)  # rows are bf16 as built
+
+    common_f32 = dict(common)
+    common_f32["compressor_kv_decode"] = common["compressor_kv_decode"].float()
+    common_f32["compressor_gate_decode"] = common["compressor_gate_decode"].float()
+    mhc_f32 = mhc_base.clone()
+    _run_update(common_f32, mhc_f32, update_meta)
+
+    assert torch.equal(mhc_bf16, mhc_f32), (
+        f"decode-row dtype leaked into the compressed-row update (ratio={compress_ratio})"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

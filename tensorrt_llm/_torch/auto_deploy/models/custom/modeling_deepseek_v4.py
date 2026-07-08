@@ -1074,8 +1074,13 @@ class DeepseekV4Compressor(nn.Module):
         self.norm = DeepseekV4RMSNorm(self.head_dim, config.rms_norm_eps)
 
     def project(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        kv_all = _linear_module(hidden_states, self.wkv, layer_type="mla").float()
-        score_all = _linear_module(hidden_states, self.wgate, layer_type="mla").float()
+        # Raw activation-dtype rows (idea_0092): the sparse-attention op widens them
+        # where fp32 math needs it -- the decode current-token store converts in-kernel
+        # (bf16 -> fp32 is exact), so no per-layer ``.float()`` copy runs at decode.
+        # Consumers that need the fp32 tensors up front (``compress_projected`` on the
+        # standalone paths, the op's prefill branch) widen explicitly.
+        kv_all = _linear_module(hidden_states, self.wkv, layer_type="mla")
+        score_all = _linear_module(hidden_states, self.wgate, layer_type="mla")
         return kv_all, score_all
 
     def compress_projected(
@@ -1147,9 +1152,12 @@ class DeepseekV4Compressor(nn.Module):
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
         kv_all, score_all = self.project(hidden_states)
+        # ``compress_projected`` math (pool, ape add) ran on fp32 inputs before
+        # ``project`` started returning raw activation-dtype rows (idea_0092); widen
+        # here so this standalone path stays bit-identical.
         return self.compress_projected(
-            kv_all,
-            score_all,
+            kv_all.float(),
+            score_all.float(),
             cos_table,
             sin_table,
             position_ids,
@@ -1284,9 +1292,12 @@ class DeepseekV4Indexer(nn.Module):
         offset: int,
     ) -> torch.Tensor:
         q, weights, compressor_kv, compressor_gate = self.project(hidden_states, q_lora, cos, sin)
+        # Same widening note as ``DeepseekV4Compressor.forward``: ``project`` returns
+        # raw activation-dtype rows (idea_0092); the standalone indexer path widens
+        # before ``compress_projected`` to keep its math bit-identical.
         index_k = self.compressor.compress_projected(
-            compressor_kv,
-            compressor_gate,
+            compressor_kv.float(),
+            compressor_gate.float(),
             cos_table,
             sin_table,
             position_ids,
