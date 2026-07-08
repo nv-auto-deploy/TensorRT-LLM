@@ -1,0 +1,37 @@
+# MMLU reference accuracies (0-100 scale), keyed by HF model id.
+# Each model maps to a list of variant entries; the bare entry (no quant keys)
+# matches an unquantized/bf16 run, and quant_algo/kv_cache_quant_algo entries
+# match quantized runs. The pass threshold is derived statistically from
+# `accuracy` and the task's sigma/alpha (see accuracy_core.compute_threshold),
+# so store the *measured reference accuracy*, not a floor.
+#
+# Values sourced from upstream TensorRT-LLM
+# (tests/integration/defs/accuracy/references/mmlu.yaml). If no entry matches a
+# run's quant, the harness treats the reference as unknown and the test passes
+# trivially (no crash). gpt-oss-120b has no MMLU reference upstream.
+meta-llama/Llama-3.1-8B-Instruct:
+  - accuracy: 68.17
+# TRT-LLM key: nvidia/Nemotron-3-Nano
+nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8:
+  - accuracy: 73.85
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 74.35
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 73.684
+# TRT-LLM key: nvidia/Nemotron-Super-V3 (bare = BF16 / BF16 KV)
+nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-010726:
+  - accuracy: 85.90
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 85.70
+google/gemma-4-26B-A4B-it:
+  - accuracy: 71.296
+deepseek-ai/DeepSeek-R1-0528:
+  - accuracy: 87.33
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 87.573
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 87.33

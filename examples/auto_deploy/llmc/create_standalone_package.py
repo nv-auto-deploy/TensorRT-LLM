@@ -62,6 +62,15 @@ TRTLLM_ATTRIBUTIONS_PYTHON = os.path.join(REPO_ROOT, "ATTRIBUTIONS-Python.md")
 LLMC_README = os.path.join(SCRIPT_DIR, "README.md")
 LLMC_CONTRIBUTING = os.path.join(SCRIPT_DIR, "CONTRIBUTING.md")
 
+# Standalone accuracy suite (MMLU + GSM8K) + its JET products generator. The
+# suite ships into the package under `tests/accuracy/` (copied alongside the
+# other tests) and the generator under `scripts/generate_accuracy_products.py`.
+# Source is kept under examples/ (not tests/) so TRT-LLM's own pytest collection
+# does not pick it up; the packager copies it and rewrites auto_deploy -> llmc.
+LLMC_ACCURACY_SRC = os.path.join(SCRIPT_DIR, "accuracy")
+LLMC_GEN_PRODUCTS_SRC = os.path.join(SCRIPT_DIR, "scripts", "generate_accuracy_products.py")
+LLMC_GEN_PRODUCTS_DST_REL = os.path.join("scripts", "generate_accuracy_products.py")
+
 # Test source directories
 AD_TESTS_DIR = os.path.join(REPO_ROOT, "tests", "unittest", "auto_deploy")
 AD_UTILS_TEST_DIR = os.path.join(AD_TESTS_DIR, "_utils_test")
@@ -211,6 +220,7 @@ _IMPORT_TARGET = "llmc"
 _MANAGED_PATHS = [
     "llmc",
     "tests",
+    os.path.join("scripts", "generate_accuracy_products.py"),
     "runners",
     "pyproject.toml",
     "README.md",
@@ -375,6 +385,11 @@ def _copy_tests(output_dir: str) -> int:
                 shutil.copy2(src_path, dst_path)
                 count += 1
 
+    # Copy the standalone accuracy suite into tests/accuracy/ (MMLU + GSM8K).
+    # Its LLM import uses the canonical tensorrt_llm._torch.auto_deploy path and
+    # is rewritten to llmc by the caller's tests/ import rewrite.
+    count += _copy_tree(LLMC_ACCURACY_SRC, os.path.join(tests_dst, "accuracy"))
+
     # Create conftest.py for test discovery and imports
     _create_test_conftest(tests_dst)
 
@@ -407,18 +422,66 @@ def _create_test_conftest(tests_dir: str) -> None:
         import os
         import sys
 
-        _trtllm_spec = importlib.util.find_spec("tensorrt_llm")
-        if _trtllm_spec is not None:
-            raise RuntimeError(
-                "Standalone llmc tests must not be able to import tensorrt_llm; "
-                f"found {getattr(_trtllm_spec, 'origin', None)!r}"
-            )
-
         # Add _utils_test to the Python path so test files can import from it
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "_utils_test"))
 
         # Add the tests directory itself to the path for cross-test imports
         sys.path.insert(0, os.path.dirname(__file__))
+
+        # The accuracy INTEGRATION tests (tests/accuracy/integration) are the only
+        # ones that need the TRT-LLM runtime. Every other tree under tests/ must run
+        # without tensorrt_llm importable, to prove the standalone llmc package works
+        # on its own. The integration tests are the deliberate exception.
+        _INTEGRATION_DIR = os.path.realpath(
+            os.path.join(os.path.dirname(__file__), "accuracy", "integration")
+        )
+
+
+        def _run_confined_to_integration(config):
+            targets = [a for a in config.invocation_params.args if not a.startswith("-")]
+            if not targets:
+                return False
+            paths = [os.path.realpath(t.split("::", 1)[0]) for t in targets]
+            return all(
+                p == _INTEGRATION_DIR or p.startswith(_INTEGRATION_DIR + os.sep) for p in paths
+            )
+
+
+        def pytest_ignore_collect(collection_path, config):
+            # Keep the accuracy integration tests out of a broad `pytest tests` run
+            # (they are a separate TRT-LLM suite with their own CI). An explicit run
+            # scoped to tests/accuracy/integration still collects them. The accuracy
+            # UNIT tests are NOT ignored -- they run with the standalone suite.
+            if _run_confined_to_integration(config):
+                return None
+            p = os.path.realpath(str(collection_path))
+            if p == _INTEGRATION_DIR or p.startswith(_INTEGRATION_DIR + os.sep):
+                return True
+            return None
+
+
+        def pytest_configure(config):
+            # Standalone purity guard: every tree under tests/ EXCEPT
+            # tests/accuracy/integration must run without tensorrt_llm importable. The
+            # integration tests drive llmc.llm.LLM on the TRT-LLM runtime, so skip the
+            # guard when the run is scoped to them. In the standalone image tensorrt_llm
+            # is absent, so the guard is a no-op there and those tests simply skip via
+            # importorskip. TRTLLM_REDIRECT_AD_TO_LLMC=true is a deliberate escape hatch
+            # for redirect smoke tests that need tensorrt_llm importable.
+            if os.environ.get("TRTLLM_REDIRECT_AD_TO_LLMC") == "true":
+                return
+            spec = importlib.util.find_spec("tensorrt_llm")
+            if spec is None or _run_confined_to_integration(config):
+                return
+            import pytest
+
+            raise pytest.UsageError(
+                "Standalone llmc tests must not be able to import tensorrt_llm; "
+                f"found {getattr(spec, 'origin', None)!r}. "
+                "(tests/accuracy/integration is exempt -- scope the run to it when "
+                "trtllm is present; set TRTLLM_REDIRECT_AD_TO_LLMC=true for redirect "
+                "smoke tests.)"
+            )
     """)
     with open(os.path.join(tests_dir, "conftest.py"), "w") as f:
         f.write(content)
@@ -516,6 +579,23 @@ def _copy_runners(output_dir: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Accuracy products generator
+# ---------------------------------------------------------------------------
+def _copy_products_generator(output_dir: str) -> int:
+    """Copy the JET accuracy-products generator to scripts/.
+
+    (The accuracy test suite itself is copied into tests/accuracy/ by
+    ``_copy_tests``.) No import rewrite: it has no auto_deploy imports.
+    """
+    if not os.path.isfile(LLMC_GEN_PRODUCTS_SRC):
+        return 0
+    dst = os.path.join(output_dir, LLMC_GEN_PRODUCTS_DST_REL)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(LLMC_GEN_PRODUCTS_SRC, dst)
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # Package generation
 # ---------------------------------------------------------------------------
 def _create_pyproject_toml(output_dir: str, dependencies: list, dev_dependencies: list) -> None:
@@ -600,6 +680,12 @@ def create_standalone_package(output_dir: str) -> None:
     print(
         f"  Copied {runner_count} runner files to runners/trtllm/ ({runner_rewrites} import rewrites)"
     )
+
+    # 2c. Copy the JET accuracy-products generator to scripts/. (The accuracy
+    #     test suite itself was copied into tests/accuracy/ by _copy_tests above
+    #     and rewritten by the tests/ import rewrite.)
+    gen_count = _copy_products_generator(output_dir)
+    print(f"  Copied {gen_count} accuracy products generator to scripts/")
 
     # 3. Resolve dependencies and create pyproject.toml
     pinned = _read_pinned_versions(TRTLLM_REQUIREMENTS)

@@ -7,3 +7,5 @@ benchmark_results.json
 !nano_v3.yaml
 !nemotron_flash.yaml
 !model_registry/configs/*.yaml
+# llmc standalone accuracy suite: references + registry overlay are tracked data
+!llmc/accuracy/**/*.yaml
