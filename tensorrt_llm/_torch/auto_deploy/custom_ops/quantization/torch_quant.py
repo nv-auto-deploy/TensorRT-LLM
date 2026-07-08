@@ -1397,6 +1397,192 @@ def _torch_fake_quant_finegrained_fp8_linear_residual_add_fake(
     return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
 
 
+@triton.jit
+def _swiglu_clamp_act_quant_kernel(
+    g_ptr,
+    u_ptr,
+    y_ptr,
+    s_ptr,
+    limit,
+    g_row_stride,
+    u_row_stride,
+    GROUPS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
+    ROUND_SCALE: tl.constexpr,
+):
+    """Fused (clamped) SwiGLU + block-wise FP8 activation quantization.
+
+    One program handles one ``BLOCK_SIZE`` (=quant group) chunk of one row. It
+    reproduces the eager chain
+    ``clamp(gate, max=L); clamp(up, -L, L); silu(gate.float()) * up.float();
+    .to(model_dtype); _act_quant_kernel`` bit for bit:
+
+    * clamps use ``tl.where`` so NaN inputs propagate exactly like ``aten.clamp``
+      (a plain ``tl.minimum`` would replace NaN with the bound);
+    * comparing/selecting in fp32 after the exact bf16->fp32 widening selects the
+      same value ``aten.clamp`` picks in bf16 (the bound is bf16-representable);
+    * silu uses aten's fp32 formula ``x / (1 + expf(-x))``;
+    * the product is rounded to the model dtype in-register at the same point the
+      reference chain stores it, then re-widened, so the quantization sees the
+      identical values ``_act_quant_kernel`` loads from memory;
+    * the scale math (both fmt branches) matches ``_act_quant_kernel`` line for
+      line, including storing the fp32-divided payload with a bf16-rounded scale.
+    """
+    pid = tl.program_id(axis=0)
+    row = pid // GROUPS
+    grp = pid % GROUPS
+    cols = grp * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    gate = tl.load(g_ptr + row * g_row_stride + cols).to(tl.float32)
+    up = tl.load(u_ptr + row * u_row_stride + cols).to(tl.float32)
+    if HAS_LIMIT:
+        gate = tl.where(gate > limit, limit, gate)
+        up = tl.where(up < -limit, -limit, up)
+        up = tl.where(up > limit, limit, up)
+    hidden = (gate / (1.0 + tl.exp(-gate))) * up
+    hidden = hidden.to(g_ptr.dtype.element_ty).to(tl.float32)
+    amax = tl.max(tl.abs(hidden))
+    if ROUND_SCALE:
+        amax = tl.maximum(amax, 1e-4)
+        s = amax / 448.0
+        s = tl.exp2(tl.ceil(tl.log2(s)))
+    else:
+        s = amax / 448.0
+        # Clamp scale so that all-zero blocks produce 0/eps = 0 instead of 0/0 = NaN.
+        s = tl.maximum(s, 1e-12)
+    y = hidden / s
+    y = y.to(y_ptr.dtype.element_ty)
+    # Outputs are contiguous [M, GROUPS*BLOCK_SIZE] / [M, GROUPS], so the row-major
+    # program id addresses both directly.
+    tl.store(y_ptr + pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), y)
+    tl.store(s_ptr + pid, s)
+
+
+@torch.library.custom_op("auto_deploy::torch_fp8_swiglu_clamp_act_quant", mutates_args=())
+def torch_fp8_swiglu_clamp_act_quant(
+    gate: torch.Tensor,  # [M, I], strided views allowed (stride(-1)==1)
+    up: torch.Tensor,  # [M, I], same shape/dtype as gate
+    limit: Optional[float],  # swiglu clamp bound; None/<=0 disables the clamps
+    block_size: int,  # activation quant group (== matmul block_k)
+    input_scale_fmt: str = "",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused clamped-SwiGLU + block-FP8 activation quant feeding a *_prequant linear.
+
+    Computes, in one kernel launch, the DeepSeek-V4 shared-expert epilogue between
+    the merged gate/up projection and the down projection::
+
+        gate = clamp(gate, max=limit)
+        up = clamp(up, min=-limit, max=limit)
+        hidden = (silu(gate.float()) * up.float()).to(gate.dtype)
+        return _safe_act_quant(hidden, block_size, input_scale_fmt)
+
+    ``gate``/``up`` may be non-contiguous last-dim-unit-stride views (e.g. the two
+    ``torch.narrow`` halves of one fused gate_up GEMM output), so the sliced halves
+    are consumed in place without materializing them. Bit-for-bit identical to the
+    unfused aten chain + ``_act_quant_kernel`` (see the kernel docstring).
+    """
+    assert gate.dim() == 2 and up.dim() == 2, "expected flattened [tokens, features] inputs"
+    assert gate.shape == up.shape and gate.dtype == up.dtype
+    assert gate.stride(-1) == 1 and up.stride(-1) == 1
+    num_tokens, width = gate.shape
+    assert width % block_size == 0
+    groups = width // block_size
+    y = torch.empty((num_tokens, width), dtype=torch.float8_e4m3fn, device=gate.device)
+    # Keep scale metadata in the model dtype (matches _safe_act_quant).
+    s = torch.empty((num_tokens, groups), dtype=gate.dtype, device=gate.device)
+    has_limit = limit is not None and limit > 0
+    round_scale = input_scale_fmt.lower() == "ue8m0"
+    grid = (num_tokens * groups,)
+    # One quant group per program: a tiny single-reduction workload, one warp
+    # (same rationale as _act_quant_kernel's num_warps=1).
+    _swiglu_clamp_act_quant_kernel[grid](
+        gate,
+        up,
+        y,
+        s,
+        float(limit) if has_limit else 0.0,
+        gate.stride(0),
+        up.stride(0),
+        GROUPS=groups,
+        BLOCK_SIZE=block_size,
+        HAS_LIMIT=has_limit,
+        ROUND_SCALE=round_scale,
+        num_warps=1,
+    )
+    return y, s
+
+
+@torch_fp8_swiglu_clamp_act_quant.register_fake
+def _torch_fp8_swiglu_clamp_act_quant_fake(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    limit: Optional[float],
+    block_size: int,
+    input_scale_fmt: str = "",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    qhidden = torch.empty(gate.shape, dtype=torch.float8_e4m3fn, device=gate.device)
+    scale = torch.empty(
+        (*gate.shape[:-1], gate.shape[-1] // block_size), dtype=gate.dtype, device=gate.device
+    )
+    return qhidden, scale
+
+
+@torch.library.custom_op(
+    "auto_deploy::torch_fake_quant_finegrained_fp8_linear_residual_add_prequant",
+    mutates_args=(),
+)
+def torch_fake_quant_finegrained_fp8_linear_residual_add_prequant(
+    qinput: torch.Tensor,  # [..., K] float8_e4m3fn (pre-quantized activation)
+    input_scale: torch.Tensor,  # [..., K//block_k] per-block act scale (model dtype)
+    weight_quantized: torch.Tensor,  # [N, K] float8_e4m3fn
+    bias: Optional[torch.Tensor],  # must be None (the fusion only matches bias-free linears)
+    weight_scale: List[torch.Tensor],  # [weight_scale_inv]
+    residual: torch.Tensor,  # [..., N] added to the matmul output
+) -> torch.Tensor:
+    """Matmul half of ``torch_fake_quant_finegrained_fp8_linear_residual_add``.
+
+    Consumes a pre-quantized activation + per-block scale (e.g. produced by
+    ``torch_fp8_swiglu_clamp_act_quant``) and runs the same block-FP8 W8A8 matmul
+    with the merge add folded into the epilogue. Output dtype is recovered from
+    ``input_scale.dtype`` exactly like the prequant linear, so the result is
+    bit-for-bit identical to the internally-quantizing residual-add op.
+    """
+    assert bias is None, "fused residual-add linear only supports bias-free linears"
+    weight_scale_inv = weight_scale[0]
+    out_dtype = input_scale.dtype
+    N, K = weight_quantized.shape
+    scale_n, scale_k = weight_scale_inv.shape
+    block_n = triton.cdiv(N, scale_n)
+    block_k = triton.cdiv(K, scale_k)
+
+    output = _w8a8_block_fp8_matmul_triton(
+        qinput,
+        weight_quantized,
+        input_scale,
+        weight_scale_inv,
+        [block_n, block_k],
+        output_dtype=out_dtype,
+        residual=residual.contiguous(),
+    )
+
+    return output.to(dtype=out_dtype)
+
+
+@torch_fake_quant_finegrained_fp8_linear_residual_add_prequant.register_fake
+def _torch_fake_quant_finegrained_fp8_linear_residual_add_prequant_fake(
+    qinput: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    out_features = weight_quantized.shape[0]
+    return torch.empty(
+        (*qinput.shape[:-1], out_features), dtype=input_scale.dtype, device=qinput.device
+    )
+
+
 @torch.library.custom_op(
     "auto_deploy::torch_fake_quant_grouped_finegrained_fp8_linear",
     mutates_args=(),

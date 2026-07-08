@@ -278,6 +278,15 @@ transforms:
   fuse_fp8_linear_allreduce_add:
     stage: post_load_fusion
     requires_shape_prop: true
+  # Fuse the clamped-SwiGLU + down-input act-quant chain between a merged block-FP8
+  # gate/up projection and its down projection (DeepSeek-V4 shared experts: the
+  # generic SwiGLU matcher cannot span the clamp/FP32-cast nodes) into one Triton
+  # kernel feeding the matmul-only prequant down linear. Bit-exact. Runs AFTER
+  # fuse_fp8_linear_allreduce_add so the down projection is matched in its final
+  # (residual-add) form and that fusion's collective-input epilogue is preserved.
+  fuse_fp8_swiglu_act_quant:
+    stage: post_load_fusion
+    run_shape_prop: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
     requires_shape_prop: true
