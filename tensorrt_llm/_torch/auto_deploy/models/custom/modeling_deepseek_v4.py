@@ -1481,9 +1481,17 @@ class DeepseekV4Attention(nn.Module):
                 topk_is_placeholder=True,
             )
         else:
-            topk_idxs = _window_topk_idxs(
-                self.window_size, batch_size, seq_len, hidden_states.device
-            ).to(torch.int64)
+            # Window-only layers mirror the compressed-layer placeholder trick above:
+            # the cached decode path derives the local window from ``input_pos``
+            # directly (hoisted once per forward, idea_0086) and never reads
+            # ``topk_idxs`` values, so emit a width-only allocation and let the
+            # sparse-attention op rebuild the real window selection on the eager
+            # prefill path (``topk_is_placeholder=True``). This removes the per-layer
+            # arange/where/expand index chain from the decode graph while leaving
+            # prefill/decode outputs bit-identical.
+            topk_idxs = hidden_states.new_empty(
+                batch_size, seq_len, self.window_size, dtype=torch.int64
+            )
             attn_output = _sparse_attention(
                 q,
                 kv,
@@ -1509,6 +1517,7 @@ class DeepseekV4Attention(nn.Module):
                 None,
                 None,
                 self.rms_eps,
+                topk_is_placeholder=True,
             )
 
         out_nope, out_pe = torch.split(

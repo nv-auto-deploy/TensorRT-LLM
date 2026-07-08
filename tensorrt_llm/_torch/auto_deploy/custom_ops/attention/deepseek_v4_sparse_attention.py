@@ -1339,8 +1339,27 @@ def _decode_topk_cache_attention(
     cache_loc: torch.Tensor,
     softmax_scale: float,
     window_size: Optional[int],
+    swa_page_map: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     if window_size is not None:
+        # ``swa_page_map`` is the hoisted once-per-forward local-window
+        # ``(page_ids, page_offsets, rel_topk)`` from
+        # ``deepseek_v4_sparse_prepare_decode_page_addr``: every window-only layer
+        # resolves the identical addresses (they depend only on ``input_pos`` and the
+        # shared page table), so the per-layer fused page-map kernel and the
+        # arange/where ``rel_topk`` chain collapse into that single prepare launch,
+        # leaving only the layer-specific cache-row gather here. Addresses and mask
+        # are bit-identical to the per-layer computation below.
+        if swa_page_map is not None:
+            page_ids, page_offsets, rel_topk = swa_page_map
+            selected_kv = swa_cache[page_ids, page_offsets].to(q_decode.dtype)
+            return _decode_attention_from_selected(
+                q_decode,
+                selected_kv,
+                rel_topk,
+                attn_sink,
+                softmax_scale,
+            )
         selected_kv, valid_rows = _decode_local_cache_rows(
             swa_cache,
             seq_idx,
@@ -2343,6 +2362,9 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
     r128_mhc_page_offsets: Optional[torch.Tensor],
     r128_pos_page_ids: Optional[torch.Tensor],
     r128_pos_page_offsets: Optional[torch.Tensor],
+    swa_page_ids: Optional[torch.Tensor],
+    swa_page_offsets: Optional[torch.Tensor],
+    swa_rel_topk: Optional[torch.Tensor],
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -2515,6 +2537,21 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             full_page_map=full_page_map,
         )
     else:
+        # Hoisted once-per-forward SWA local-window page map + rel_topk (idea_0086),
+        # shared by every window-only layer. Slice to the active decode sequences;
+        # the shape guard keeps the per-layer fallback for any layer whose window
+        # width differs from the hoisted contract.
+        swa_page_map = None
+        if (
+            window_size is not None
+            and swa_page_ids is not None
+            and swa_page_ids.shape[1] == window_size
+        ):
+            swa_page_map = (
+                swa_page_ids[:num_decode],
+                swa_page_offsets[:num_decode],
+                swa_rel_topk[:num_decode],
+            )
         decode_output = _decode_topk_cache_attention(
             q_decode,
             attn_sink,
@@ -2526,6 +2563,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             cache_loc,
             softmax_scale,
             window_size,
+            swa_page_map=swa_page_map,
         )
 
     output_flat = torch.zeros_like(q_flat)
@@ -5059,6 +5097,31 @@ def _deepseek_v4_sparse_attention(
     return output
 
 
+def _build_window_topk_idxs(
+    window_size: int,
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Rebuild the model-side ``_window_topk_idxs`` local-window selection.
+
+    Mirrors the aten chain in ``modeling_deepseek_v4.py`` exactly so the rebuilt
+    indices are bit-identical to the tensor the model used to emit. Window-only
+    (``compress_ratio == 0``) layers emit a width-only placeholder instead — the
+    cached decode path never reads the values (it derives the local window from
+    ``input_pos`` directly) — so only the value-reading eager prefill paths call
+    this to reconstruct the real selection.
+    """
+    query_positions = torch.arange(seq_len, device=device).unsqueeze(1)
+    key_positions = query_positions - window_size + 1 + torch.arange(window_size, device=device)
+    key_positions = torch.where(
+        (key_positions < 0) | (key_positions > query_positions),
+        -1,
+        key_positions,
+    )
+    return key_positions.unsqueeze(0).expand(batch_size, -1, -1)
+
+
 def _build_placeholder_topk_idxs(
     window_size: int,
     compress_ratio: int,
@@ -5079,14 +5142,7 @@ def _build_placeholder_topk_idxs(
     which keeps the per-layer arange/where/expand/cat/cast index chain out of the decode
     graph while leaving prefill/decode outputs bit-identical.
     """
-    query_positions = torch.arange(seq_len, device=device).unsqueeze(1)
-    key_positions = query_positions - window_size + 1 + torch.arange(window_size, device=device)
-    key_positions = torch.where(
-        (key_positions < 0) | (key_positions > query_positions),
-        -1,
-        key_positions,
-    )
-    window_idxs = key_positions.unsqueeze(0).expand(batch_size, -1, -1)
+    window_idxs = _build_window_topk_idxs(window_size, batch_size, seq_len, device)
 
     compressed_positions = torch.arange(compressed_width, device=device)
     valid_lengths = torch.arange(1, seq_len + 1, device=device).unsqueeze(1) // compress_ratio
@@ -5151,6 +5207,15 @@ def torch_deepseek_v4_sparse_attention(
     )
     _validate_deepseek_v4_sparse_attention_inputs(q, kv, attn_sink, topk_idxs)
     _validate_compress_ratio(compress_ratio)
+    if topk_is_placeholder and not compress_ratio:
+        # Window-only layers also emit a width-only placeholder; rebuild the real
+        # local-window selection (bit-identical to the model-side chain) for the
+        # value-reading attention below.
+        if window_size is None:
+            raise ValueError("window_size is required to rebuild the window topk placeholder.")
+        topk_idxs = _build_window_topk_idxs(window_size, q.shape[0], q.shape[1], q.device).to(
+            torch.int64
+        )
     if compress_ratio:
         if max_compressed_len is None:
             raise ValueError("max_compressed_len is required for compressed attention.")
@@ -5282,6 +5347,9 @@ if _HAS_TRITON:
         r128_mhc_poff_ptr,  # [num_seq] i64
         r128_pos_pid_ptr,  # [num_seq, R128] i64
         r128_pos_poff_ptr,  # [num_seq, R128] i64
+        swa_pid_ptr,  # [num_seq, W] i64 (unused when W == 0)
+        swa_poff_ptr,  # [num_seq, W] i64 (unused when W == 0)
+        swa_rel_ptr,  # [num_seq, W] i64 (unused when W == 0)
         full_len,  # overlap_m * R4
         overlap_m,  # ratio-4 max_compressed_len
         dense_m,  # ratio-128 max_compressed_len (>= 1)
@@ -5290,14 +5358,17 @@ if _HAS_TRITON:
         R4: tl.constexpr,
         R128: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        W: tl.constexpr,  # SWA window size (0 disables the SWA bundle)
+        W_BLOCK: tl.constexpr,  # next_power_of_2(W) (1 when W == 0)
     ):
-        """Single-launch emitter of the full 18-tensor decode prepare contract.
+        """Single-launch emitter of the full 21-tensor decode prepare contract.
 
         Grid: ``(num_seq, cdiv(full_len, BLOCK_N))``.  Every program translates one
         ``BLOCK_N`` chunk of the ratio-4 full candidate range (the bulk of the map);
         the ``pid_c == 0`` program of each row additionally emits the row's small
-        outputs: current-token write address, ratio-4 overlap band, and the ratio-4 /
-        ratio-128 compressed-cache update metadata (incl. the ``[R128]`` read map).
+        outputs: current-token write address, ratio-4 overlap band, the ratio-4 /
+        ratio-128 compressed-cache update metadata (incl. the ``[R128]`` read map),
+        and (when ``W > 0``) the SWA local-window page map + ``rel_topk`` bundle.
         Each translation mirrors ``_page_ids_and_offsets_from_tpb`` exactly (clamped
         ordinal, ``page_start`` fallback for invalid rows, clamped page-table index)
         so all values are bit-identical to the torch reference path.
@@ -5396,6 +5467,30 @@ if _HAS_TRITON:
             tl.store(r128_pos_pid_ptr + prow + pcols, p_pid)
             tl.store(r128_pos_poff_ptr + prow + pcols, p_off)
 
+            if W > 0:
+                # SWA local-window bundle (idea_0086): positions
+                # ``input_pos - W + 1 .. input_pos`` with the combined
+                # (position && page) validity folded into ``rel_topk`` (slot
+                # index where valid, -1 otherwise). Mirrors
+                # ``_decode_local_window_pagemap_kernel`` +
+                # ``_decode_attention_from_rows`` exactly.
+                wcols = tl.arange(0, W_BLOCK).to(tl.int64)
+                wmask = wcols < W
+                s_pos = pos - W + 1 + wcols
+                s_valid_pos = (s_pos >= 0) & (s_pos <= pos)
+                s_safe_pos = tl.maximum(s_pos, 0)
+                s_off = s_safe_pos % TPB
+                s_pti = page_start + s_safe_pos // TPB
+                s_page_valid = (s_pos >= 0) & (s_pti < page_end)
+                s_safe = tl.where(s_page_valid, s_pti, page_start)
+                s_safe = tl.minimum(tl.maximum(s_safe, 0), cache_loc_max)
+                s_pid = tl.load(cache_loc_ptr + s_safe, mask=wmask, other=0).to(tl.int64)
+                s_rel = tl.where(s_valid_pos & s_page_valid, wcols, -1)
+                srow = pid_n.to(tl.int64) * W
+                tl.store(swa_pid_ptr + srow + wcols, s_pid, mask=wmask)
+                tl.store(swa_poff_ptr + srow + wcols, s_off, mask=wmask)
+                tl.store(swa_rel_ptr + srow + wcols, s_rel, mask=wmask)
+
     def _prepare_decode_meta_triton(
         input_pos: torch.Tensor,
         position_ids: torch.Tensor,
@@ -5404,12 +5499,14 @@ if _HAS_TRITON:
         tokens_per_block: int,
         overlap_m: int,
         dense_m: int,
+        window_size: int = 0,
     ) -> List[torch.Tensor]:
-        """One-launch Triton path for the 18-output decode prepare contract.
+        """One-launch Triton path for the 18/21-output decode prepare contract.
 
         The torch implementation of ``deepseek_v4_sparse_prepare_decode_page_addr``
         spans ~130 tiny int kernels per forward (idea_0049); this emits the
-        identical 18 tensors from a single kernel. The torch body remains the
+        identical tensors from a single kernel (plus the SWA local-window bundle
+        when ``window_size > 0``, idea_0086). The torch body remains the
         reference / CPU fallback.
         """
         if cache_loc.numel() == 0:
@@ -5437,6 +5534,19 @@ if _HAS_TRITON:
         r128_mhc_poff = torch.empty(num_seq, dtype=torch.long, device=device)
         r128_pos_pid = torch.empty(num_seq, dense_ratio, dtype=torch.long, device=device)
         r128_pos_poff = torch.empty(num_seq, dense_ratio, dtype=torch.long, device=device)
+        # SWA local-window bundle (idea_0086); 1-element dummies keep the kernel
+        # signature stable when the bundle is disabled (the W == 0 branch is
+        # compiled out, so the dummies are never touched).
+        if window_size > 0:
+            swa_pid = torch.empty(num_seq, window_size, dtype=torch.long, device=device)
+            swa_poff = torch.empty(num_seq, window_size, dtype=torch.long, device=device)
+            swa_rel = torch.empty(num_seq, window_size, dtype=torch.long, device=device)
+            w_block = triton.next_power_of_2(window_size)
+        else:
+            swa_pid = torch.empty(1, dtype=torch.long, device=device)
+            swa_poff = torch.empty(1, dtype=torch.long, device=device)
+            swa_rel = torch.empty(1, dtype=torch.long, device=device)
+            w_block = 1
         BLOCK_N = 256
         grid = (num_seq, triton.cdiv(full_len, BLOCK_N))
         _dsv4_prepare_decode_meta_kernel[grid](
@@ -5462,6 +5572,9 @@ if _HAS_TRITON:
             r128_mhc_poff,
             r128_pos_pid,
             r128_pos_poff,
+            swa_pid,
+            swa_poff,
+            swa_rel,
             full_len,
             overlap_m,
             dense_m,
@@ -5470,9 +5583,11 @@ if _HAS_TRITON:
             R4=ratio,
             R128=dense_ratio,
             BLOCK_N=BLOCK_N,
+            W=window_size,
+            W_BLOCK=w_block,
             num_warps=4,
         )
-        return [
+        outs = [
             cur_pid,
             cur_poff,
             ovl_pid,
@@ -5492,6 +5607,9 @@ if _HAS_TRITON:
             r128_pos_pid,
             r128_pos_poff,
         ]
+        if window_size > 0:
+            outs += [swa_pid, swa_poff, swa_rel]
+        return outs
 
 
 @torch.library.custom_op(
@@ -5505,6 +5623,7 @@ def deepseek_v4_sparse_prepare_decode_page_addr(
     tokens_per_block: int,
     overlap_max_compressed_len: int = 0,
     dense_max_compressed_len: int = 0,
+    window_size: int = 0,
 ) -> List[torch.Tensor]:
     """Precompute the current-token paged write address once per forward.
 
@@ -5532,6 +5651,17 @@ def deepseek_v4_sparse_prepare_decode_page_addr(
     ``[num_seq, ratio]`` compressor read page map (2 tensors) -- 18 outputs
     total.  ``dense_max_compressed_len`` is the ratio-128 ``max_compressed_len``
     discovered from the graph; it selects the completed dense row.
+
+    When additionally ``window_size > 0`` (idea_0086) it emits the SWA
+    local-window decode bundle shared by every window-only
+    (``compress_ratio == 0``) layer: the ``[num_seq, window_size]`` page map
+    (``page_ids`` / ``page_offsets``) for the window positions
+    ``input_pos - window_size + 1 .. input_pos`` plus the precombined
+    ``rel_topk`` (slot index where the position and page are valid, ``-1``
+    otherwise) -- 21 outputs total.  This collapses the per-layer fused
+    local-window page-map kernel and the ``arange``/``where`` ``rel_topk``
+    chain into this single prepare launch; only the layer-specific
+    ``swa_cache`` row gather remains per layer.
     """
     num_seq = int(cu_num_pages.shape[0]) - 1
     # Single-launch Triton path (idea_0049): the torch graph below expands to ~130
@@ -5553,6 +5683,7 @@ def deepseek_v4_sparse_prepare_decode_page_addr(
             tokens_per_block,
             int(overlap_max_compressed_len),
             max(int(dense_max_compressed_len), 1),
+            int(window_size),
         )
     positions_long = input_pos.reshape(-1)[:num_seq].to(torch.long)
     seq_idx_long = torch.arange(num_seq, dtype=torch.long, device=positions_long.device)
@@ -5653,6 +5784,23 @@ def deepseek_v4_sparse_prepare_decode_page_addr(
             r128_pos_pid,
             r128_pos_poff,
         ]
+        if window_size > 0:
+            # SWA local-window decode bundle (idea_0086). Mirrors the position
+            # generation + combined validity of ``_decode_local_cache_rows`` and the
+            # ``rel_topk`` construction of ``_decode_attention_from_rows`` exactly, so
+            # the per-layer consumption is bit-identical to the chain it replaces.
+            w = int(window_size)
+            w_offsets = torch.arange(w, dtype=torch.long, device=device)
+            w_positions = positions_long.unsqueeze(1) - w + 1 + w_offsets.view(1, -1)
+            swa_page_ids, swa_page_offsets, swa_page_valid = _page_ids_and_offsets_from_tpb(
+                tokens_per_block, seq_idx_long, w_positions, cu_num_pages, cache_loc
+            )
+            swa_valid = (
+                (w_positions >= 0) & (w_positions <= positions_long.unsqueeze(1)) & swa_page_valid
+            )
+            rel = w_offsets.view(1, -1).expand(num_seq, -1)
+            swa_rel_topk = torch.where(swa_valid, rel, torch.full_like(rel, -1))
+            outs += [swa_page_ids, swa_page_offsets, swa_rel_topk]
     return outs
 
 
@@ -5665,6 +5813,7 @@ def deepseek_v4_sparse_prepare_decode_page_addr_fake(
     tokens_per_block: int,
     overlap_max_compressed_len: int = 0,
     dense_max_compressed_len: int = 0,
+    window_size: int = 0,
 ) -> List[torch.Tensor]:
     num_seq = cu_num_pages.shape[0] - 1
     device = input_pos.device
@@ -5699,6 +5848,14 @@ def deepseek_v4_sparse_prepare_decode_page_addr_fake(
                 num_seq, dense_ratio, dtype=torch.long, device=device
             ),  # r128_pos_page_offsets
         ]
+        if window_size > 0:
+            # SWA local-window decode bundle (idea_0086).
+            w = int(window_size)
+            outs += [
+                torch.empty(num_seq, w, dtype=torch.long, device=device),  # swa_page_ids
+                torch.empty(num_seq, w, dtype=torch.long, device=device),  # swa_page_offsets
+                torch.empty(num_seq, w, dtype=torch.long, device=device),  # swa_rel_topk
+            ]
     return outs
 
 
@@ -5757,6 +5914,9 @@ def torch_deepseek_v4_sparse_attention_with_cache(
     r128_mhc_page_offsets: torch.Tensor,
     r128_pos_page_ids: torch.Tensor,
     r128_pos_page_offsets: torch.Tensor,
+    swa_page_ids: torch.Tensor,
+    swa_page_offsets: torch.Tensor,
+    swa_rel_topk: torch.Tensor,
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -5850,6 +6010,9 @@ def torch_deepseek_v4_sparse_attention_with_cache(
             r128_mhc_page_offsets,
             r128_pos_page_ids,
             r128_pos_page_offsets,
+            swa_page_ids,
+            swa_page_offsets,
+            swa_rel_topk,
             swa_cache,
             mhc_cache,
             compressor_kv_cache,
@@ -5866,18 +6029,23 @@ def torch_deepseek_v4_sparse_attention_with_cache(
             out,
         )
 
-    if compress_ratio and topk_is_placeholder:
-        # The model emits a width-only placeholder for ``topk_idxs`` on compressed
-        # layers; rebuild the real window+compressed selection here (once per prefill,
-        # eager) for the value-reading initial-prefill gather. The pure-decode path
-        # above returns before this and reads only the placeholder width, so it never
-        # needs the rebuilt indices.
+    if topk_is_placeholder:
+        # The model emits a width-only placeholder for ``topk_idxs`` on compressed AND
+        # window-only layers; rebuild the real selection here (once per prefill, eager)
+        # for the value-reading initial-prefill gather. The pure-decode path above
+        # returns before this and reads only the placeholder width, so it never needs
+        # the rebuilt indices.
         if window_size is None:
-            raise ValueError("window_size is required to rebuild the compressed topk placeholder.")
-        compressed_width = int(topk_idxs.shape[-1]) - int(window_size)
-        topk_idxs = _build_placeholder_topk_idxs(
-            window_size, compress_ratio, q.shape[0], q.shape[1], compressed_width, q.device
-        )
+            raise ValueError("window_size is required to rebuild the topk placeholder.")
+        if compress_ratio:
+            compressed_width = int(topk_idxs.shape[-1]) - int(window_size)
+            topk_idxs = _build_placeholder_topk_idxs(
+                window_size, compress_ratio, q.shape[0], q.shape[1], compressed_width, q.device
+            )
+        else:
+            topk_idxs = _build_window_topk_idxs(window_size, q.shape[0], q.shape[1], q.device).to(
+                torch.int64
+            )
 
     seq_len_host = _to_host_long("seq_len", seq_len, num_seq)
     input_pos_host = _to_host_long("input_pos", input_pos, num_seq)
@@ -6111,6 +6279,9 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
     r128_mhc_page_offsets: torch.Tensor,
     r128_pos_page_ids: torch.Tensor,
     r128_pos_page_offsets: torch.Tensor,
+    swa_page_ids: torch.Tensor,
+    swa_page_offsets: torch.Tensor,
+    swa_rel_topk: torch.Tensor,
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -6186,6 +6357,9 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
         full_page_ids,
         full_page_offsets,
         full_valid,
+        swa_page_ids,
+        swa_page_offsets,
+        swa_rel_topk,
         swa_cache,
         mhc_cache,
         compressor_kv_cache,
@@ -6270,30 +6444,37 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
         # graph for all sparse-attn nodes.
         overlap_m = 0
         dense_m = 0
+        window_size = 0
         source_op = cls.get_source_attention_op()
         for n in any_source_attn_node.graph.nodes:
             if not is_op(n, source_op):
                 continue
-            cr, mcl = extract_op_args(n, "compress_ratio", "max_compressed_len")
+            cr, mcl, ws = extract_op_args(n, "compress_ratio", "max_compressed_len", "window_size")
+            if isinstance(ws, int) and ws > 0:
+                window_size = max(window_size, ws)
             if not isinstance(mcl, int) or mcl <= 0:
                 continue
             if cr == _COMPRESS_RATIO_OVERLAP_INDEXER:
                 overlap_m = max(overlap_m, mcl)
             elif cr == _COMPRESS_RATIO_DENSE:
                 dense_m = max(dense_m, mcl)
-        # Fixed 18-output contract: 2 current-token addresses + 6 ratio-4 map tensors
+        # Fixed 21-output contract: 2 current-token addresses + 6 ratio-4 map tensors
         # (overlap page_ids/page_offsets/valid + full-range page_ids/page_offsets/valid)
         # + 10 update-metadata tensors (ratio-4 row_valid/row_position_id/mhc page_ids/
         # page_offsets, then the same 4 for ratio-128, then the ratio-128 [N, ratio]
-        # compressor read page_ids/page_offsets). Keep ``overlap_m`` / ``dense_m`` >= 1 so
-        # the map shapes stay valid and the per-layer argument alignment is invariant even
-        # when a ratio class is absent (the dummy maps are then never consumed).
+        # compressor read page_ids/page_offsets) + 3 SWA local-window tensors
+        # (page_ids/page_offsets/rel_topk shared by every window-only layer,
+        # idea_0086). Keep ``overlap_m`` / ``dense_m`` / ``window_size`` >= 1 so the
+        # map shapes stay valid and the per-layer argument alignment is invariant even
+        # when a class is absent (the dummy maps are then never consumed; the decode
+        # op additionally guards on the hoisted window width matching the layer's).
         overlap_m = max(overlap_m, 1)
         dense_m = max(dense_m, 1)
+        window_size = max(window_size, 1)
         return (
             torch.ops.auto_deploy.deepseek_v4_sparse_prepare_decode_page_addr.default,
-            18,
-            [tokens_per_block, overlap_m, dense_m],
+            21,
+            [tokens_per_block, overlap_m, dense_m, window_size],
         )
 
     @classmethod
