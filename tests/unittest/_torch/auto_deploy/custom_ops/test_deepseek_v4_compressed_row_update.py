@@ -33,6 +33,16 @@ rope FMA folding (<=1 ULP).  The ratio-128 paged pool is even byte-identical to
 These tests pin that equivalence for the ratio-4 and ratio-128 modes so a regression in one
 cannot hide in the other, and they exercise both row-completing (valid) and non-completing
 (invalid, no-write) decode steps across multi-page position spans.
+
+idea_0093 gates every program of those kernels on ``row_valid`` at entry: a compressed
+row completes only once every ``ratio`` decode steps, and invalid rows were already
+no-write, so on the other steps the programs now retire after one scalar load instead of
+paying the paged loads / pool / rmsnorm / rope / fp8 math whose result was discarded.
+The added tests pin the gate's invariants: all-invalid steps (including the boundary
+positions one before / one after a completion) leave the whole cache byte-identical,
+the gated pool is byte-identical to the ungated pool on valid rows, and the gate keeps
+working under CUDA-graph capture/replay when only the ``row_valid`` buffer content flips
+between replays -- the exact production decode pattern.
 """
 
 import pytest
@@ -425,6 +435,228 @@ def test_ratio128_paged_pool_matches_gather_pool(num_rows):
         f"(max_abs={max_abs:.2e})"
     )
     torch.testing.assert_close(pooled_fused.float(), pooled_ref.float(), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+def test_all_invalid_steps_leave_cache_untouched(compress_ratio):
+    """idea_0093: non-completing steps must write nothing, byte-for-byte.
+
+    Overrides ``input_pos`` with only non-completing positions, including both
+    validity boundaries -- one step BEFORE a row completes (``ratio-2``, e.g. 2/126)
+    and one step AFTER (``ratio``, e.g. 4/128) -- so ``row_valid`` is all-false and
+    the early-exited fused path must leave the entire mhc cache byte-identical.
+    (The completing boundary ``ratio-1`` is exercised by the mixed-validity tests
+    above and the cudagraph test below.)
+    """
+    assert M._HAS_TRITON, "test requires triton"
+    inp = _build_inputs(compress_ratio=compress_ratio, num_rows=3, seed=400 + compress_ratio)
+    # Boundary non-completing positions: ratio-2 (one before), ratio (one after), and a
+    # mid-band position of the next block.
+    input_pos = torch.tensor(
+        [compress_ratio - 2, compress_ratio, compress_ratio + compress_ratio // 2],
+        dtype=torch.long,
+        device=DEV,
+    )
+    inp["input_pos"] = input_pos
+    inp["position_ids_decode"] = input_pos.clone()
+    if compress_ratio == 4:
+        outs = M.deepseek_v4_sparse_prepare_decode_page_addr(
+            inp["input_pos"],
+            inp["position_ids_decode"],
+            inp["cu_num_pages"],
+            inp["cache_loc"],
+            int(inp["compressor_kv_cache"].shape[1]),
+            inp["max_compressed_len"],
+        )
+        inp["overlap_page_map"] = (outs[2][:3], outs[3][:3], outs[4][:3])
+
+    old = input_pos // compress_ratio
+    new = (input_pos + 1) // compress_ratio
+    assert not bool((new > old).any()), "test setup must produce only non-completing steps"
+
+    mhc = inp["mhc_cache"].clone()
+    _run(inp, mhc)  # real _HAS_TRITON -> fused, all rows early-exit
+    assert torch.equal(mhc, inp["mhc_cache"]), "all-invalid decode step mutated the mhc cache"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
+def test_ratio128_paged_pool_row_valid_gate():
+    """idea_0093: the gated pool is byte-identical to the ungated pool on valid rows.
+
+    Invalid rows of the gated output are unwritten garbage by contract (their only
+    consumer early-exits before reading them), so only valid rows are compared.
+    """
+    assert M._HAS_TRITON, "test requires triton"
+    torch.manual_seed(500)
+    head_dim, ratio, tokens_per_block = 512, 128, 8
+    dtype = torch.bfloat16
+    num_rows = 3
+
+    max_pos = ratio + tokens_per_block
+    pages_per_seq = (max_pos + tokens_per_block - 1) // tokens_per_block
+    cu_num_pages = torch.tensor(
+        [0, *torch.tensor([pages_per_seq] * num_rows).cumsum(0).tolist()],
+        dtype=torch.long,
+        device=DEV,
+    )
+    total_pages = int(cu_num_pages[-1].item())
+    cache_loc = torch.arange(total_pages, dtype=torch.long, device=DEV)
+    kv_cache = torch.randn(total_pages, tokens_per_block, head_dim, device=DEV)
+    gate_cache = torch.randn(total_pages, tokens_per_block, head_dim, device=DEV)
+    ape = torch.randn(ratio, head_dim, device=DEV)
+
+    seq_idx = torch.arange(num_rows, dtype=torch.long, device=DEV)
+    positions = torch.arange(ratio, dtype=torch.long, device=DEV).view(1, -1).expand(num_rows, -1)
+    page_ids, page_offsets, _ = M._decode_page_ids_and_offsets(
+        kv_cache, seq_idx, positions, cu_num_pages, cache_loc
+    )
+    row_valid = torch.tensor([True, False, True], device=DEV)
+
+    pooled_ungated = M._paged_compress_pool(
+        kv_cache, gate_cache, page_ids, page_offsets, ape, ratio, head_dim, dtype
+    )
+    pooled_gated = M._paged_compress_pool(
+        kv_cache,
+        gate_cache,
+        page_ids,
+        page_offsets,
+        ape,
+        ratio,
+        head_dim,
+        dtype,
+        row_valid=row_valid,
+    )
+    assert torch.equal(pooled_gated[row_valid], pooled_ungated[row_valid]), (
+        "row_valid gate changed the pooled values of valid rows"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+def test_row_valid_gate_under_cudagraph_replay(compress_ratio):
+    """idea_0093: the early exit is data-gated per replay, not baked in at capture.
+
+    Captures the fused decode update once with ``row_valid`` threaded in via the
+    hoisted ``update_meta`` (the production prepare-op contract), then replays the
+    SAME graph with different ``row_valid`` buffer contents: an all-false replay must
+    leave the cache byte-identical, and a subsequent mixed-validity replay must write
+    exactly what an uncaptured run with that validity writes -- including leaving the
+    invalid row untouched.  This is the captured-decode production pattern (the launch
+    replays every step; only the buffer content changes).
+    """
+    assert M._HAS_TRITON, "test requires triton"
+    inp = _build_inputs(compress_ratio=compress_ratio, num_rows=2, seed=600 + compress_ratio)
+    # Row 0 completes a compressed row (input_pos == ratio-1); row 1 does not.
+    input_pos = torch.tensor([compress_ratio - 1, compress_ratio], dtype=torch.long, device=DEV)
+    inp["input_pos"] = input_pos
+    inp["position_ids_decode"] = input_pos.clone()
+    tokens_per_block = int(inp["compressor_kv_cache"].shape[1])
+    if compress_ratio == 4:
+        outs = M.deepseek_v4_sparse_prepare_decode_page_addr(
+            inp["input_pos"],
+            inp["position_ids_decode"],
+            inp["cu_num_pages"],
+            inp["cache_loc"],
+            tokens_per_block,
+            inp["max_compressed_len"],
+        )
+        inp["overlap_page_map"] = (outs[2][:2], outs[3][:2], outs[4][:2])
+
+    # Hoisted update metadata, mirroring the update_meta=None branch of
+    # ``_update_decode_compressed_caches`` (and the prepare op).
+    ratio = compress_ratio
+    max_compressed_len = inp["max_compressed_len"]
+    old_completed = input_pos // ratio
+    new_completed = (input_pos + 1) // ratio
+    true_valid = (new_completed > old_completed) & (old_completed < max_compressed_len)
+    assert true_valid.tolist() == [True, False]
+    row_idx = old_completed.clamp(min=0, max=max_compressed_len - 1)
+    row_position_id = inp["position_ids_decode"].to(torch.long) - (input_pos - row_idx * ratio)
+    row_logical_pos = row_idx * ratio
+    mhc_page_ids, mhc_page_offsets, _ = M._decode_page_ids_and_offsets(
+        inp["mhc_cache"], inp["seq_idx"], row_logical_pos, inp["cu_num_pages"], inp["cache_loc"]
+    )
+    pos_page_ids = None
+    pos_page_offsets = None
+    if compress_ratio == 128:
+        offsets = torch.arange(ratio, dtype=torch.long, device=DEV)
+        positions = (row_idx.to(torch.long) * ratio).unsqueeze(1) + offsets.view(1, -1)
+        pos_page_ids, pos_page_offsets, _ = M._decode_page_ids_and_offsets(
+            inp["compressor_kv_cache"],
+            inp["seq_idx"],
+            positions,
+            inp["cu_num_pages"],
+            inp["cache_loc"],
+        )
+
+    row_valid_buf = true_valid.clone()  # mutated in place between replays
+
+    def _run_with_meta(mhc):
+        M._update_decode_compressed_caches(
+            inp["compressor_kv_decode"],
+            inp["compressor_gate_decode"],
+            inp["position_ids_decode"],
+            inp["compressor_ape"],
+            inp["compressor_norm_weight"],
+            inp["cos_table"],
+            inp["sin_table"],
+            inp["seq_idx"],
+            inp["input_pos"],
+            inp["cu_num_pages"],
+            inp["cache_loc"],
+            mhc,
+            inp["compressor_kv_cache"],
+            inp["compressor_gate_cache"],
+            inp["rms_norm_eps"],
+            inp["rope_dim"],
+            inp["compress_ratio"],
+            inp["max_compressed_len"],
+            inp["overlap_page_map"],
+            update_meta=(
+                row_valid_buf,
+                row_position_id,
+                mhc_page_ids,
+                mhc_page_offsets,
+                pos_page_ids,
+                pos_page_offsets,
+            ),
+        )
+
+    mhc_orig = inp["mhc_cache"].clone()
+
+    # Uncaptured reference with the true (mixed) validity.
+    mhc_ref = mhc_orig.clone()
+    _run_with_meta(mhc_ref)
+    assert not torch.equal(mhc_ref, mhc_orig), "valid row must have been written"
+
+    # Warm up (triton JIT compile, allocator pools) outside capture.
+    mhc_graph = mhc_orig.clone()
+    for _ in range(2):
+        _run_with_meta(mhc_graph)
+    mhc_graph.copy_(mhc_orig)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        _run_with_meta(mhc_graph)
+    # Capture records the launches without executing them; the cache is still pristine.
+    torch.cuda.synchronize()
+    assert torch.equal(mhc_graph, mhc_orig)
+
+    # Replay 1: all-invalid step -> every program early-exits, cache byte-unchanged.
+    row_valid_buf.fill_(False)
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(mhc_graph, mhc_orig), "all-invalid cudagraph replay mutated the mhc cache"
+
+    # Replay 2: restore the true validity -> identical bytes to the uncaptured run.
+    row_valid_buf.copy_(true_valid)
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(mhc_graph, mhc_ref), (
+        "valid-row cudagraph replay differs from the uncaptured reference"
+    )
 
 
 if __name__ == "__main__":

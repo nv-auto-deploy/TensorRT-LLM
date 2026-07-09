@@ -4093,12 +4093,23 @@ if _HAS_TRITON:
         ``_dsv4_fullrange_candidate_rows_kernel`` but reads the ``[N, 2*RATIO]``
         band map by slot index ``s`` directly (no ``(r-1)*R+s`` fullrange remap) and
         masks the previous block with the band ``valid`` flag.
+
+        ``row_valid`` gates the whole program (idea_0093): it is true only on the
+        ~1-in-RATIO decode steps that complete a compressed row, and the masked
+        store epilogue writes nothing for invalid rows, so their entire
+        reconstruction (band gather / ape / pool / rmsnorm / rope / fp8) is dead
+        work.  The captured cudagraph replays the launch every step; on the
+        non-completing steps the program retires after one scalar load instead
+        of the full reconstruction, leaving the cache byte-identical.
         """
         ROUND = ROUND_DTYPE
         NEG = -1.0e20  # masked previous-gate floor (matches new_full(-1e20))
 
         b = tl.program_id(0)
         if b >= N:
+            return
+        valid = tl.load(row_valid_ptr + b).to(tl.int1)
+        if valid == 0:
             return
 
         s = tl.arange(0, TWO_R)
@@ -4157,7 +4168,8 @@ if _HAS_TRITON:
 
         # In-register rope/fp8/masked-store tail (idea_0088).  ``o.to(ROUND)`` is the
         # exact activation-dtype row the removed [N, HEAD_DIM] store+reload produced.
-        valid = tl.load(row_valid_ptr + b).to(tl.int1)
+        # ``valid`` is necessarily true here (early exit above), so the tail's masked
+        # store degenerates to an unconditional store of this row.
         pid_w = tl.load(mhc_page_ids_ptr + b).to(tl.int64)
         poff_w = tl.load(mhc_page_offsets_ptr + b).to(tl.int64)
         rpid = tl.load(row_position_id_ptr + b).to(tl.int64)
@@ -4311,10 +4323,17 @@ if _HAS_TRITON:
         / sqrt(var + eps)``, fp32 ``weight * out`` with the weight on the left,
         activation-dtype rounding), so the in-register normed row is bit-identical to
         the one the removed launch stored; the rope/fp8/masked-store epilogue is the
-        shared ``_dsv4_rope_fp8_store_tail``.  Invalid rows store nothing.
+        shared ``_dsv4_rope_fp8_store_tail``.  Invalid rows store nothing -- and skip
+        the whole program (idea_0093): ``row_valid`` is true only on the ~1-in-RATIO
+        row-completing decode steps, so on the other captured cudagraph replays the
+        program retires after one scalar load instead of paying the pooled-row load,
+        RMSNorm, rope and fp8 math whose result would be discarded.
         """
         b = tl.program_id(0)
         if b >= N:
+            return
+        valid = tl.load(row_valid_ptr + b).to(tl.int1)
+        if valid == 0:
             return
 
         d = tl.arange(0, BLOCK_D)
@@ -4326,7 +4345,8 @@ if _HAS_TRITON:
         out = xf / tl.sqrt(var + eps)
         normed_round = (w.to(tl.float32) * out).to(x.dtype)
 
-        valid = tl.load(row_valid_ptr + b).to(tl.int1)
+        # ``valid`` is necessarily true here (early exit above), so the shared tail's
+        # masked store degenerates to an unconditional store of this row.
         pid_w = tl.load(mhc_page_ids_ptr + b).to(tl.int64)
         poff_w = tl.load(mhc_page_offsets_ptr + b).to(tl.int64)
         rpid = tl.load(row_position_id_ptr + b).to(tl.int64)
@@ -4355,6 +4375,7 @@ if _HAS_TRITON:
         gate_cache_ptr,  # [P, T, S] fp32 paged compressor gate cache
         page_ids_ptr,  # [N, R] int64 (per-row page id of each ratio slot)
         page_offsets_ptr,  # [N, R] int64 (per-row in-page offset of each ratio slot)
+        row_valid_ptr,  # [N] bool -- pool row iff valid (dummy when not HAS_VALID)
         ape_ptr,  # [R, APE_STRIDE] fp32; column d in [0, HEAD_DIM) used
         out_ptr,  # [N, HEAD_DIM] pooled row (activation dtype)
         N,
@@ -4364,6 +4385,7 @@ if _HAS_TRITON:
         S,  # compressor state_dim (paged cache dim-2 stride, == HEAD_DIM here)
         APE_STRIDE,  # ape.shape[1]
         PAGEMAP_STRIDE,  # R (row stride of the [N, R] page maps)
+        HAS_VALID: tl.constexpr,  # gate programs on row_valid (idea_0093)
         BLOCK_R: tl.constexpr,  # next_pow2(R)
         BLOCK_D: tl.constexpr,
     ):
@@ -4388,12 +4410,22 @@ if _HAS_TRITON:
         only deviation is the fp32 reduction order over the ratio axis (this kernel fixes
         ``num_warps=4`` while ``deepseek_v4_compress_pool`` autotunes it), which flips at
         most a handful of near-zero channels by one bf16 ULP.
+
+        When ``HAS_VALID`` is set, ``row_valid`` gates the whole program (idea_0093):
+        the downstream norm/rope/store stage discards invalid rows entirely (its own
+        early exit + masked store), so their pooled row is dead work -- skip the
+        ``[R, BLOCK_D]`` paged loads and the pool after one scalar load.  Invalid rows
+        of ``out_ptr`` are left unwritten (stale/uninitialized) and must not be read.
         """
         ROUND = out_ptr.dtype.element_ty
 
         n = tl.program_id(0)
         if n >= N:
             return
+        if HAS_VALID:
+            valid = tl.load(row_valid_ptr + n).to(tl.int1)
+            if valid == 0:
+                return
         d0 = tl.program_id(1) * BLOCK_D
         d = d0 + tl.arange(0, BLOCK_D)
         dmask = d < HEAD_DIM
@@ -5045,6 +5077,7 @@ def _paged_compress_pool(
     ratio: int,
     head_dim: int,
     dtype: torch.dtype,
+    row_valid: Optional[torch.Tensor] = None,  # [N] bool -- pool row iff valid
 ) -> torch.Tensor:
     """Paged softmax-weighted pool for the dense (ratio-128) compressed-row front.
 
@@ -5054,6 +5087,11 @@ def _paged_compress_pool(
     occupancy heuristic (start at the maximal D-block and halve while the grid is below the
     ~512-CTA machine-fill target, floor 16) so the small decode ``N`` is not
     occupancy-starved.  Returns the pooled ``[N, head_dim]`` row in ``dtype``.
+
+    When ``row_valid`` is given, invalid rows are skipped entirely (idea_0093) and
+    their slot of the returned tensor is unwritten garbage -- callers must gate every
+    consumer of those rows on the same ``row_valid`` (the fused ratio-128 update's
+    norm/rope/store stage does).  Valid rows are byte-identical to the ungated pool.
     """
     n = int(page_ids.shape[0])
     pooled = torch.empty(n, head_dim, device=kv_cache.device, dtype=dtype)
@@ -5069,6 +5107,9 @@ def _paged_compress_pool(
         gate_cache,
         page_ids.contiguous(),
         page_offsets.contiguous(),
+        # Dummy (never dereferenced) pointer when ungated -- constexpr HAS_VALID
+        # compiles the gate out of that specialization.
+        page_ids if row_valid is None else row_valid,
         ape.contiguous(),
         pooled,
         n,
@@ -5078,6 +5119,7 @@ def _paged_compress_pool(
         int(kv_cache.shape[2]),
         int(ape.shape[1]),
         ratio,
+        HAS_VALID=row_valid is not None,
         BLOCK_R=triton.next_power_of_2(ratio),
         BLOCK_D=block_d,
         num_warps=4,
@@ -5127,6 +5169,10 @@ def _fused_compressed_row_update_r128(
     if n == 0 or head_dim == 0:
         return
     # Stage 1: paged gather(kv/gate) + ape-add + softmax-pool -> pooled [N, head_dim].
+    # ``row_valid`` gates both stages (idea_0093): a ratio-128 row completes only once
+    # every 128 decode steps, so on all other captured cudagraph replays both programs
+    # retire after one scalar load. Invalid rows of ``pooled`` are unwritten garbage;
+    # stage 2 is their only consumer and early-exits before reading them.
     pooled = _paged_compress_pool(
         kv_cache,
         gate_cache,
@@ -5136,6 +5182,7 @@ def _fused_compressed_row_update_r128(
         compress_ratio,
         head_dim,
         dtype,
+        row_valid=row_valid,
     )
     # Stage 2: rmsnorm + fp8(nope) + rope(pe) + validity-masked store in one kernel.
     nope_dim = head_dim - rope_dim
