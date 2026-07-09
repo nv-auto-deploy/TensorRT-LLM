@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# DeepSeek-V4-Flash TP4/EP4 TTFT experiment. The 1004-token AIPerf prompt fits
+# in one prefill chunk, avoiding the token-serial cached-prefill fallback.
+world_size: 4
+
+attn_backend: deepseek_v4_sparse
+compile_backend: torch-cudagraph
+model_factory: DeepseekV4AutoModelForCausalLM
+max_batch_size: 2
+max_num_tokens: 1024
+max_seq_len: 2048
+enable_chunked_prefill: true
+cuda_graph_config:
+  max_batch_size: 2
+  batch_sizes: [1, 2]
+
+transforms:
+  pipeline_cache:
+    enabled: false
+  load_weights:
+    disable_preload: true
+  fuse_rmsnorm:
+    rmsnorm_backend: torch
+  detect_sharding:
+    enabled: false
+  sharding_transform_executor:
+    enabled: false
+  apply_sharding_hints:
+    enabled: true
+    allreduce_strategy: NCCL
+    dist_mapping:
+      tp: 4
+      moe_ep: 4
+      moe_tp: 1
+      moe_cluster: 1
+    enable_attention_dp: false
+    shard_layers: ["mla", "moe"]
+  fuse_finegrained_fp8_linear:
+    enabled: false
+  quantize_mxfp4_moe:
+    enabled: true
+  compile_model:
+    piecewise_enabled: false
+  multi_stream_moe:
+    enabled: false

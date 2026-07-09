@@ -22,7 +22,11 @@ import pytest
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionType
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
-from tensorrt_llm._torch.auto_deploy.shim.ad_executor import create_autodeploy_executor
+from tensorrt_llm._torch.auto_deploy.shim.ad_executor import (
+    create_autodeploy_executor,
+    maybe_pad_for_cuda_graph,
+)
+from tensorrt_llm._torch.auto_deploy.utils.cuda_graph import cuda_graph_state
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import AttentionTypeCpp
 from tensorrt_llm.llmapi import CacheTransceiverConfig
 
@@ -101,6 +105,47 @@ def make_mock_engine(
     mock_engine.cache_seq_interface.kv_cache_manager = kv_cache_manager
     mock_engine.cache_seq_interface.kv_cache_config_tuned = Mock()
     return mock_engine, kv_cache_manager
+
+
+@pytest.mark.parametrize(
+    "piecewise_enabled,attention_dp,spec_config,expected_bypass",
+    [
+        (True, False, None, False),
+        (False, False, None, True),
+        (True, True, None, True),
+        (True, False, object(), True),
+    ],
+)
+def test_piecewise_context_skips_decode_only_outer_cuda_graph_gate(
+    piecewise_enabled, attention_dp, spec_config, expected_bypass
+):
+    """Context piecewise replay must not be disabled by decode batch padding."""
+    observed_bypass = []
+
+    def forward(engine, scheduled_requests, resource_manager):
+        del engine, scheduled_requests, resource_manager
+        observed_bypass.append(cuda_graph_state.in_bypass())
+        return "forwarded"
+
+    engine = SimpleNamespace(
+        cuda_graph_used=True,
+        _piecewise_cuda_graph_used=piecewise_enabled,
+        enable_attention_dp=attention_dp,
+        spec_config=spec_config,
+        dist_config=SimpleNamespace(tp_size=1),
+        padding_dummy_request=None,
+    )
+    scheduled_requests = SimpleNamespace(
+        num_context_requests=1,
+        can_run_cuda_graph=False,
+        batch_size=1,
+    )
+
+    result = maybe_pad_for_cuda_graph(forward)(engine, scheduled_requests, Mock())
+
+    assert result == "forwarded"
+    assert observed_bypass == [expected_bypass]
+    assert not cuda_graph_state.in_bypass()
 
 
 @pytest.mark.parametrize("guided_decoding_backend", ["xgrammar", "llguidance"])

@@ -150,6 +150,23 @@ def maybe_pad_for_cuda_graph(func):
             with BypassCapturedGraphs():
                 return _call_func()
 
+        # Piecewise CUDA graphs own token-bucket selection and padding for context
+        # and mixed batches inside DualModeCapturedGraph. Sending those batches
+        # through the decode-only outer padding gate would mark them ineligible and
+        # force BypassCapturedGraphs(), so the successfully captured piecewise
+        # segments would never replay. Attention-DP still requires the cross-rank
+        # agreement path below because different ranks may have different batch
+        # compositions and runtime scalar metadata.
+        can_run_piecewise = (
+            self.cuda_graph_used
+            and getattr(self, "_piecewise_cuda_graph_used", False)
+            and scheduled_requests.num_context_requests > 0
+            and not self.enable_attention_dp
+            and self.spec_config is None
+        )
+        if can_run_piecewise:
+            return _call_func()
+
         # check conditions for current rank
         can_run_cuda_graph = self.cuda_graph_used and scheduled_requests.can_run_cuda_graph
         batch_size = scheduled_requests.batch_size
@@ -515,9 +532,14 @@ class ADEngine(ModelEngine):
         # TODO: better mechanism to retrieve this information when we refactor LlmArgs
         if ad_config is None:
             self.cuda_graph_used = False
+            self._piecewise_cuda_graph_used = False
             self.cuda_graph_batch_sizes = []
         else:
             self.cuda_graph_used = ad_config.is_cuda_graph_enabled()
+            compile_model_config = ad_config.transforms.get("compile_model", {})
+            self._piecewise_cuda_graph_used = bool(
+                self.cuda_graph_used and compile_model_config.get("piecewise_enabled", False)
+            )
             cg_config = ad_config.cuda_graph_config
             self.cuda_graph_batch_sizes = (
                 cg_config.batch_sizes if cg_config is not None and cg_config.batch_sizes else []
