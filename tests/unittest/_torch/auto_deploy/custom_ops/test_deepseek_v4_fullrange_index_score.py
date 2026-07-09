@@ -111,7 +111,7 @@ def _build_fixture(
     )
 
 
-def _two_kernel_score(fx, q_index, indexer_weights):
+def _two_kernel_score(fx, q_index, indexer_weights, w_scale: float = 1.0):
     """The production two-kernel chain the fold replaces (index-k + score)."""
     index_k = M._fused_fullrange_index_k(
         fx["kv_cache"],
@@ -131,11 +131,11 @@ def _two_kernel_score(fx, q_index, indexer_weights):
         q_index.dtype,
     )
     return M._fused_index_score(
-        q_index, index_k, indexer_weights, fx["input_pos"], fx["m"], fx["ratio"]
+        q_index, index_k, indexer_weights, fx["input_pos"], fx["m"], fx["ratio"], w_scale
     )
 
 
-def _fused_score(fx, q_index, indexer_weights):
+def _fused_score(fx, q_index, indexer_weights, w_scale: float = 1.0):
     return M._fused_fullrange_index_score(
         fx["kv_cache"],
         fx["gate_cache"],
@@ -153,6 +153,7 @@ def _fused_score(fx, q_index, indexer_weights):
         fx["head_dim"],
         fx["rope_dim"],
         fx["m"],
+        w_scale=w_scale,
     )
 
 
@@ -278,6 +279,23 @@ CASES = [
         16,
         False,
     ),
+    (
+        # The proxy/production decode grid (M=1024): one row deep in the
+        # early-exit regime (vlen 250) and one fully visible (vlen == M, no
+        # early exits), pinning the idea_0089 visible-prefix split.
+        "prod_scale_m1024_visible_split",
+        dict(
+            num_rows=2,
+            head_dim=128,
+            rope_dim=64,
+            m=1024,
+            tokens_per_block=64,
+            input_pos=[1001, 4095],
+            seed=59,
+        ),
+        16,
+        False,
+    ),
 ]
 
 
@@ -350,9 +368,54 @@ def test_fused_index_score_fp32_weights():
     not (M._HAS_TRITON and torch.cuda.is_available()),
     reason="fused index-score fold requires triton + CUDA",
 )
+@pytest.mark.parametrize("m,input_pos", [(8, [31, 9]), (512, [1001, 998])])
+def test_raw_weight_scale_fold_matches_prescaled(m, input_pos):
+    """``w_scale`` in-kernel fold == the eager ``weights.float() * scale`` pre-scale.
+
+    The kernels widen the raw model-dtype weights to fp32 and multiply by the
+    scalar before the head weighting -- the identical fp32 multiply on the
+    identical widened value -- so the scores must be bit-equal
+    (``torch.equal``) to pre-scaling on the host, in BOTH the fused fold and
+    the two-kernel chain, at toy and production candidate scales.
+    """
+    fx = _build_fixture(
+        num_rows=2,
+        head_dim=128,
+        rope_dim=64,
+        m=m,
+        tokens_per_block=8 if m == 8 else 64,
+        input_pos=input_pos,
+        seed=53,
+    )
+    torch.manual_seed(5300)
+    num_heads = 16
+    q_index = torch.randn(2, num_heads, 128, device="cuda", dtype=torch.bfloat16)
+    raw_weights = torch.randn(2, num_heads, device="cuda", dtype=torch.bfloat16)
+    # The production scale expression (DeepseekV4Indexer: softmax_scale * H**-0.5).
+    w_scale = fx["head_dim"] ** -0.5 * num_heads**-0.5
+    prescaled = raw_weights.float() * w_scale
+
+    fused_folded = _fused_score(fx, q_index, raw_weights, w_scale=w_scale)
+    fused_prescaled = _fused_score(fx, q_index, prescaled)
+    assert torch.equal(fused_folded, fused_prescaled), "fused w_scale fold diverged"
+
+    chain_folded = _two_kernel_score(fx, q_index, raw_weights, w_scale=w_scale)
+    chain_prescaled = _two_kernel_score(fx, q_index, prescaled)
+    assert torch.equal(chain_folded, chain_prescaled), "two-kernel w_scale fold diverged"
+
+
+@pytest.mark.skipif(
+    not (M._HAS_TRITON and torch.cuda.is_available()),
+    reason="fused index-score fold requires triton + CUDA",
+)
 def test_selection_path_routes_through_fold_and_matches():
     """End-to-end ``_select_decode_ratio4_indexer_rows`` (which now routes H > 8
-    through the fold) must keep the exact selection of the two-kernel chain."""
+    through the fold) must keep the exact selection of the two-kernel chain.
+
+    The selection helper consumes RAW model-dtype weights and folds the
+    indexer pre-scale (``head_dim**-0.5 * num_heads**-0.5``, idea_0089) into
+    the kernel, so the reference chain applies the identical ``w_scale``.
+    """
     fx = _build_fixture(
         num_rows=3,
         head_dim=128,
@@ -388,7 +451,8 @@ def test_selection_path_routes_through_fold_and_matches():
         fx["m"],
         full_page_map=fx["full_page_map"],
     )
-    score_ref = _two_kernel_score(fx, q_index, indexer_weights)
+    w_scale = fx["head_dim"] ** -0.5 * int(q_index.shape[1]) ** -0.5
+    score_ref = _two_kernel_score(fx, q_index, indexer_weights, w_scale=w_scale)
     rows_ref, valid_ref = M._fused_topk_select(score_ref, index_topk, min(index_topk, fx["m"]))
     assert torch.equal(rows, rows_ref)
     assert torch.equal(valid, valid_ref)

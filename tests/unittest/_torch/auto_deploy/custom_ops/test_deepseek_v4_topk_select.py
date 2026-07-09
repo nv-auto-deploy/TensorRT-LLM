@@ -129,9 +129,12 @@ def _single_cta_kernel(index_score: torch.Tensor, index_topk: int):
         valid,
         rows,
         rows,
+        rows,  # input_pos dead pointer (HAS_VLEN=False)
         c,
         index_topk,
         min(index_topk, c),
+        1,  # RATIO (unused without HAS_VLEN)
+        HAS_VLEN=False,
         BLOCK_C=block_c,
         BLOCK_K=triton.next_power_of_2(index_topk),
         TOPK_BLOCK=block_c,
@@ -298,3 +301,114 @@ def test_topk_select_banded_cudagraph_replay():
         g2.replay()
         torch.cuda.synchronize()
         assert torch.equal(rows2_g, ref2_rows) and torch.equal(valid2_g, ref2_valid)
+
+
+def _masked_scores(n: int, c: int, vlens, dev: str = "cuda", ties: bool = False):
+    """Scores masked exactly like the decode score kernels: -inf at c >= vlen."""
+    s = torch.randn(n, c, device=dev)
+    if ties:
+        s = (s * 2).round() / 2
+    input_pos = []
+    for row, v in enumerate(vlens):
+        s[row, v:] = float("-inf")
+        # vlen == min((input_pos + 1) // 4, C): input_pos = 4 * vlen - 1 hits it
+        # exactly for vlen >= 1; any input_pos in [0, 2] yields vlen == 0.
+        input_pos.append(4 * v - 1 if v > 0 else 0)
+    return s, torch.tensor(input_pos, dtype=torch.long, device=dev)
+
+
+def _check_vlen(index_score, input_pos, index_topk: int, case: str):
+    """Fast-path output must equal the no-hint kernel AND the eager tail."""
+    c = int(index_score.shape[1])
+    got_rows, got_valid = M._fused_topk_select(
+        index_score, index_topk, min(index_topk, c), input_pos, 4
+    )
+    ref_rows, ref_valid = M._fused_topk_select(index_score, index_topk, min(index_topk, c))
+    assert torch.equal(got_rows, ref_rows), f"{case}: vlen rows != no-hint rows"
+    assert torch.equal(got_valid, ref_valid), f"{case}: vlen valid != no-hint valid"
+    if not ((index_score == 0) & torch.signbit(index_score)).any():
+        eager_rows, eager_valid = _eager_topk_tail(index_score, index_topk, c)
+        assert torch.equal(got_rows, eager_rows), f"{case}: vlen rows != eager rows"
+        assert torch.equal(got_valid, eager_valid), f"{case}: vlen valid != eager valid"
+
+
+@pytest.mark.skipif(not _supported(), reason="requires CUDA + triton")
+def test_topk_select_visible_prefix_fast_path():
+    """The banded visible-prefix fast path (idea_0089) stays byte-exact.
+
+    Passing ``input_pos``/``compress_ratio`` lets band 0 emit its own sort
+    directly while the other band CTAs retire whenever
+    ``vlen = min((input_pos + 1) // 4, C) <= TOPK_BLOCK`` -- the entire
+    production decode window.  Pinned across the band-edge transitions
+    (vlen 511/512/513), empty history (vlen 0), ties, deeper band fans, mixed
+    fast/slow rows in one launch, and the vlen > TOPK_BLOCK slow path with the
+    hint still compiled in.
+    """
+    torch.manual_seed(7)
+
+    # C=1024/K=512 (2 bands, the decode shape): every band-edge transition.
+    for vlen in (0, 1, 250, 511, 512):
+        s, ip = _masked_scores(2, 1024, [vlen, vlen])
+        _check_vlen(s, ip, 512, f"fast vlen={vlen}")
+    for vlen in (513, 900, 1024):  # slow path with the hint compiled in
+        s, ip = _masked_scores(2, 1024, [vlen, vlen])
+        _check_vlen(s, ip, 512, f"slow vlen={vlen}")
+
+    # Heavy ties around the boundary (quantized scores can mint -0.0).
+    for vlen in (250, 511, 512, 513):
+        s, ip = _masked_scores(2, 1024, [vlen, vlen], ties=True)
+        _check_vlen(s, ip, 512, f"ties vlen={vlen}")
+
+    # Mixed fast/slow rows in one launch (per-row branch + ticket parity).
+    s, ip = _masked_scores(4, 1024, [250, 513, 0, 1024])
+    _check_vlen(s, ip, 512, "mixed fast/slow rows")
+
+    # Deeper band fan: C=2048 -> 4 bands, K=512.
+    for vlen in (0, 250, 512, 513, 1500, 2048):
+        s, ip = _masked_scores(1, 2048, [vlen])
+        _check_vlen(s, ip, 512, f"4-band vlen={vlen}")
+
+    # K=128 over C=2048 (TOPK_BLOCK=128, 16 bands): boundary at 128.
+    for vlen in (0, 100, 128, 129, 700):
+        s, ip = _masked_scores(1, 2048, [vlen])
+        _check_vlen(s, ip, 128, f"16-band vlen={vlen}")
+
+    # Short history + pad tail (index_topk > C).
+    s, ip = _masked_scores(2, 384, [40, 384])
+    _check_vlen(s, ip, 512, "pad k>C with vlen")
+
+
+@pytest.mark.skipif(not _supported(), reason="requires CUDA + triton")
+def test_topk_select_visible_prefix_ticket_parity_and_replay():
+    """Fast-path launches leave the arrival tickets untouched.
+
+    Interleaving fast (vlen <= TOPK_BLOCK, zero ticket arrivals) and slow
+    (full merge protocol, two arrivals per node) launches on the same ticket
+    buffer must keep the parity arithmetic aligned, eagerly and across CUDA
+    graph replays whose input_pos value changes between replays.
+    """
+    torch.manual_seed(11)
+    s_fast, ip_fast = _masked_scores(1, 1024, [250])
+    s_slow, ip_slow = _masked_scores(1, 1024, [800])
+    ref_fast = M._fused_topk_select(s_fast, 512, 512)
+    ref_slow = M._fused_topk_select(s_slow, 512, 512)
+
+    for _ in range(3):  # alternate fast/slow eagerly on one ticket buffer
+        rf = M._fused_topk_select(s_fast, 512, 512, ip_fast, 4)
+        rs = M._fused_topk_select(s_slow, 512, 512, ip_slow, 4)
+        assert torch.equal(rf[0], ref_fast[0]) and torch.equal(rf[1], ref_fast[1])
+        assert torch.equal(rs[0], ref_slow[0]) and torch.equal(rs[1], ref_slow[1])
+
+    # Captured graph whose score/input_pos buffers are rewritten per replay:
+    # the same launch must flip between fast and slow paths by data alone.
+    s_buf = s_fast.clone()
+    ip_buf = ip_fast.clone()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        rows_g, valid_g = M._fused_topk_select(s_buf, 512, 512, ip_buf, 4)
+    for src, ref in ((s_slow, ref_slow), (s_fast, ref_fast), (s_slow, ref_slow)):
+        s_buf.copy_(src)
+        ip_buf.copy_(ip_slow if ref is ref_slow else ip_fast)
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(rows_g, ref[0]) and torch.equal(valid_g, ref[1])

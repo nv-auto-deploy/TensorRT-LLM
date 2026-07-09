@@ -2163,6 +2163,19 @@ def _select_decode_ratio4_indexer_rows(
         return empty_rows, empty_valid
 
     index_head_dim = int(q_index.shape[-1])
+    index_n_heads = int(q_index.shape[1])
+    # Raw (unscaled, model-dtype) indexer weights arrive at the op boundary
+    # (idea_0089): every score path below folds the eager
+    # ``weights.float() * scale`` pre-scale into its own fp32 weight widening.
+    # The expression mirrors ``DeepseekV4Indexer`` exactly
+    # (``softmax_scale * index_n_heads**-0.5`` with ``softmax_scale ==
+    # index_head_dim**-0.5``), evaluated on the same Python ints so the fp32
+    # scalar the kernels consume is bit-identical to the removed aten multiply.
+    w_scale = (
+        index_head_dim**-0.5 * index_n_heads**-0.5
+        if index_head_dim > 0 and index_n_heads > 0
+        else 1.0
+    )
     # ``q_index``/``indexer_weights`` are replicated across TP ranks (the indexer
     # index-score projection is no longer head-sharded; see DeepseekV4Indexer),
     # so the head reduction already sums over all index heads -- no all_reduce needed.
@@ -2224,6 +2237,7 @@ def _select_decode_ratio4_indexer_rows(
                 index_head_dim,
                 rope_dim,
                 max_compressed_len,
+                w_scale=w_scale,
             )
         else:
             index_k = _fused_fullrange_index_k(
@@ -2244,7 +2258,7 @@ def _select_decode_ratio4_indexer_rows(
                 q_index.dtype,
             )
             index_score = _fused_index_score(
-                q_index, index_k, indexer_weights, input_pos, max_compressed_len, 4
+                q_index, index_k, indexer_weights, input_pos, max_compressed_len, 4, w_scale
             )
     else:
         candidate_rows = torch.arange(max_compressed_len, dtype=torch.long, device=q_index.device)
@@ -2292,11 +2306,13 @@ def _select_decode_ratio4_indexer_rows(
             # eager chain to within one ULP so the selected rows / sort order are
             # preserved.
             index_score = _fused_index_score(
-                q_index, index_k, indexer_weights, input_pos, max_compressed_len, 4
+                q_index, index_k, indexer_weights, input_pos, max_compressed_len, 4, w_scale
             )
         else:
             index_score = torch.matmul(q_index, index_k.transpose(-1, -2)).float()
-            index_score = (index_score.relu() * indexer_weights.float().unsqueeze(-1)).sum(dim=1)
+            index_score = (
+                index_score.relu() * (indexer_weights.float() * w_scale).unsqueeze(-1)
+            ).sum(dim=1)
             visible = candidate_rows < visible_len.unsqueeze(1)
             index_score = index_score.masked_fill(~visible, float("-inf"))
     topk_count = min(index_topk, max_compressed_len)
@@ -2306,7 +2322,10 @@ def _select_decode_ratio4_indexer_rows(
         # fixups and the short-history pad path with a single kernel emitting the
         # padded rows/validity directly.  Byte-identical to the eager tail below,
         # tie order included (see _dsv4_topk_select_kernel + the op unit test).
-        return _fused_topk_select(index_score, index_topk, topk_count)
+        # ``input_pos`` asserts the score rows are -inf beyond the visibility
+        # bound (every path above masks with it), enabling the banded kernel's
+        # visible-prefix fast path (idea_0089).
+        return _fused_topk_select(index_score, index_topk, topk_count, input_pos, 4)
     topk_values, topk_rows = index_score.topk(topk_count, dim=-1)
     topk_valid = torch.isfinite(topk_values)
     topk_rows = torch.where(topk_valid, topk_rows.to(torch.int64), torch.full_like(topk_rows, -1))
@@ -3717,6 +3736,7 @@ if _HAS_TRITON:
         H,
         C,
         RATIO,  # compress_ratio: visible = min((input_pos + 1) // RATIO, C)
+        W_SCALE,  # fp32 scalar folded into the weight load (1.0 = pre-scaled weights)
         D: tl.constexpr,  # index_head_dim
         D_BLOCK: tl.constexpr,  # next_pow2(D)
         H_BLOCK: tl.constexpr,  # next_pow2(H)
@@ -3732,6 +3752,8 @@ if _HAS_TRITON:
         reference ``matmul(...).float()``) and the relu / per-head weighting / head
         reduction run in fp32, so the score values (and therefore the top-k sort order)
         stay within one ULP of the reference and the selected rows are preserved.
+        ``W_SCALE`` folds the eager per-head weight pre-scale into the fp32 weight
+        load exactly like ``_dsv4_fullrange_index_score_kernel`` (idea_0089).
         """
         n = tl.program_id(0)
         cb = tl.program_id(1)
@@ -3760,6 +3782,7 @@ if _HAS_TRITON:
         sc = sc.to(k.dtype).to(tl.float32)
         sc = tl.maximum(sc, 0.0)  # relu
         w = tl.load(w_ptr + n.to(tl.int64) * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+        w = w * W_SCALE
         sc = sc * w[None, :]
         score = tl.sum(sc, axis=1)  # [BLOCK_C] fp32 weighted head reduction
         # Visibility bound computed in-kernel (== ((input_pos + 1) // RATIO)
@@ -3796,6 +3819,7 @@ if _HAS_TRITON:
         TABLE_MAX,  # cos/sin table row count - 1 (rope position clamp bound)
         H,  # number of index heads
         eps,
+        W_SCALE,  # fp32 scalar folded into the weight load (1.0 = pre-scaled weights)
         INV_SQRT_DIM: tl.constexpr,  # HEAD_DIM ** -0.5 (hadamard normalization)
         FP4_MAX: tl.constexpr,
         FP4_MIN: tl.constexpr,
@@ -3817,6 +3841,20 @@ if _HAS_TRITON:
         consume it in registers with the ``_dsv4_index_score_kernel`` tail, so the
         ``[B, M, head_dim]`` candidate index-key tensor is never materialized.
 
+        Invisible candidate rows (``r >= visible_len``) early-exit (idea_0089):
+        their score is the visibility mask's ``-inf`` regardless of the
+        reconstruction, so the program stores it and retires after one scalar
+        load.  The grid is sized for ``M = max_compressed_len`` while a decode
+        step at ``input_pos`` exposes only ``(input_pos + 1) // RATIO`` rows, so
+        the skipped paged gather / rope / hadamard / dot work dominates the
+        launch at production depths.
+
+        ``W_SCALE`` folds the eager per-head weight pre-scale into the kernel's
+        existing fp32 weight widening: ``float(w) * W_SCALE`` reproduces the
+        removed ``weights.float() * scale`` aten pair bit-exactly (same fp32
+        multiply on the same widened value), so raw model-dtype weights can be
+        handed over without the per-layer cast+mul launches.
+
         Numerics: the key is rounded to the query dtype exactly where the index-k
         kernel stored it; it then enters a ``tl.dot`` with the key in row 0 of a
         zero-padded ``C_TILE``-row tile shaped like the score kernel's
@@ -3837,6 +3875,13 @@ if _HAS_TRITON:
         prog = tl.program_id(0)
         b = prog // M
         r = prog % M
+        # Visibility bound (== _dsv4_index_score_kernel), hoisted ahead of the
+        # reconstruction: invisible rows store the mask value and retire.
+        ip = tl.load(input_pos_ptr + b).to(tl.int64)
+        vlen = tl.minimum((ip + 1) // RATIO, M)
+        if r >= vlen:
+            tl.store(out_ptr + prog.to(tl.int64), float("-inf"))
+            return
         res = _dsv4_fullrange_index_key_row(
             kv_cache_ptr,
             gate_cache_ptr,
@@ -3899,14 +3944,16 @@ if _HAS_TRITON:
         # Match the reference bf16/fp16 matmul output rounding before ``.float()``.
         sc = sc.to(ROUND).to(tl.float32)
         sc = tl.maximum(sc, 0.0)  # relu
+        # ``float(w) * W_SCALE`` == the removed eager ``weights.float() * scale``
+        # (identical fp32 multiply on the identical widened value; padded head
+        # lanes stay exact zero).
         w = tl.load(w_ptr + b.to(tl.int64) * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+        w = w * W_SCALE
         sc = sc * w[None, :]
         row_scores = tl.sum(sc, axis=1)  # [C_TILE] fp32 weighted head reduction
         score = tl.sum(tl.where(rowc == 0, row_scores, 0.0), axis=0)
-        # Visibility bound (== _dsv4_index_score_kernel).
-        ip = tl.load(input_pos_ptr + b).to(tl.int64)
-        vlen = tl.minimum((ip + 1) // RATIO, M)
-        score = tl.where(r < vlen, score, float("-inf"))
+        # r < vlen holds on this path (invisible rows exited above), so the
+        # score is stored unmasked.
         tl.store(out_ptr + prog.to(tl.int64), score)
 
     @triton.jit
@@ -3994,9 +4041,12 @@ if _HAS_TRITON:
         valid_ptr,  # [N, K_OUT] uint8 out: 1 iff the slot's score is finite
         heap_ptr,  # [N, (2*NBANDS-1)*TOPK_BLOCK] int64 scratch (unused if NBANDS == 1)
         ticket_ptr,  # [N, NBANDS-1] int64 monotonic node tickets (unused if NBANDS == 1)
+        input_pos_ptr,  # [N] int decode position (visibility bound; unused if not HAS_VLEN)
         C,  # candidate count (score row width)
         K_OUT,  # index_topk (output row width)
         TOPK_COUNT,  # min(index_topk, C): slots filled from the sort
+        RATIO,  # compress_ratio: visible = min((input_pos + 1) // RATIO, C)
+        HAS_VLEN: tl.constexpr,  # enable the visible-prefix band fast path (idea_0089)
         BLOCK_C: tl.constexpr,  # next_pow2(C) == NBANDS * TOPK_BLOCK
         BLOCK_K: tl.constexpr,  # next_pow2(K_OUT)
         TOPK_BLOCK: tl.constexpr,  # min(BLOCK_C, next_pow2(TOPK_COUNT)): sorted band width
@@ -4044,6 +4094,20 @@ if _HAS_TRITON:
         Tickets are never reset (each node sees exactly two arrivals per
         launch, so parity identifies the merger), which keeps replays of a
         captured CUDA graph correct without a zeroing launch.
+
+        Visible-prefix fast path (idea_0089, ``HAS_VLEN``): the caller
+        guarantees ``score[n, c] == -inf`` for every ``c >= visible_len`` with
+        ``visible_len = min((input_pos[n] + 1) // RATIO, C)`` (the score
+        kernels' visibility mask).  While ``visible_len <= TOPK_BLOCK`` every
+        band but the first holds only ``-inf``/pad keys, all of which decode to
+        ``(-1, False)`` and sort after band 0's keys, so the leading
+        ``TOPK_COUNT`` of the full merge equals band 0's own ascending sort:
+        band 0 emits directly and bands ``>= 1`` retire after one scalar load
+        -- no heap stores, tickets or merges.  Tickets see zero arrivals on
+        such launches (parity stays aligned for later deep-history launches of
+        the same captured graph).  Non-finite band-0 scores stay byte-exact:
+        every non-finite key decodes to ``(-1, False)`` on both paths and the
+        finite prefix (band 0 only, by the -inf guarantee) sorts identically.
         """
         n = tl.program_id(0)
         if NBANDS == 1:
@@ -4053,6 +4117,18 @@ if _HAS_TRITON:
             _dsv4_topk_emit(key, rows_ptr, valid_ptr, n, K_OUT, TOPK_COUNT, TOPK_BLOCK, BLOCK_K)
         else:
             b = tl.program_id(1)
+            if HAS_VLEN:
+                ip = tl.load(input_pos_ptr + n).to(tl.int64)
+                vlen = tl.minimum((ip + 1) // RATIO, C)
+                if vlen <= TOPK_BLOCK:
+                    if b > 0:
+                        return
+                    c0 = tl.arange(0, TOPK_BLOCK)
+                    key0 = tl.sort(_dsv4_topk_pack_keys(score_ptr, n, c0, c0 < C, C))
+                    _dsv4_topk_emit(
+                        key0, rows_ptr, valid_ptr, n, K_OUT, TOPK_COUNT, TOPK_BLOCK, BLOCK_K
+                    )
+                    return
             c = b * TOPK_BLOCK + tl.arange(0, TOPK_BLOCK)
             key = _dsv4_topk_pack_keys(score_ptr, n, c, c < C, C)
             node = NBANDS - 1 + b
@@ -5194,6 +5270,7 @@ def _fused_fullrange_index_score(
     head_dim: int,
     rope_dim: int,
     max_compressed_len: int,
+    w_scale: float = 1.0,
 ) -> torch.Tensor:
     """One-launch ratio-4 decode index score from the paged state (idea_0012).
 
@@ -5203,11 +5280,14 @@ def _fused_fullrange_index_score(
     it in registers, emitting the masked ``[B, max_compressed_len]`` fp32 score
     row fed straight into the top-k.  The ``[B, M, head_dim]`` index-key tensor,
     its HBM round trip, the separate score launch and the eager
-    ``indexer_weights`` fp32 cast all drop out of the decode graph.  Scores match
-    the two-kernel chain bit-exactly at small candidate counts and to a tiny
-    absolute tail at the M=512 production scale, preserving the top-k ids / tie
-    order / validity (see ``_dsv4_fullrange_index_score_kernel`` and the op unit
-    test).
+    ``indexer_weights`` fp32 cast all drop out of the decode graph.  Invisible
+    candidate rows early-exit before the paged reconstruction (idea_0089), and
+    ``w_scale`` folds the eager per-head weight pre-scale into the kernel's fp32
+    weight widening (``float(w) * w_scale``, bit-equal to the removed
+    ``weights.float() * scale`` pair).  Scores match the two-kernel chain
+    bit-exactly at small candidate counts and to a tiny absolute tail at the
+    M=512 production scale, preserving the top-k ids / tie order / validity
+    (see ``_dsv4_fullrange_index_score_kernel`` and the op unit test).
     """
     page_ids, page_offsets, valid = full_page_map
     num_rows = int(page_ids.shape[0])
@@ -5242,6 +5322,7 @@ def _fused_fullrange_index_score(
         int(cos_table.shape[0]) - 1,
         h,
         float(rms_norm_eps),
+        float(w_scale),
         INV_SQRT_DIM=float(head_dim**-0.5),
         FP4_MAX=_FP4_MAX,
         FP4_MIN=_FP4_MIN,
@@ -5553,6 +5634,7 @@ def _fused_index_score(
     input_pos: torch.Tensor,  # [N] int current decode position per sequence
     max_compressed_len: int,
     compress_ratio: int,
+    w_scale: float = 1.0,
 ) -> torch.Tensor:
     """One-launch fused ratio-4 lightning-indexer score (idea_0004).
 
@@ -5562,7 +5644,9 @@ def _fused_index_score(
     top-k, without ever materializing the ``[N, H, C]`` head-by-candidate score or the
     separate masked ``[N, C]`` tensor. The matmul is rounded to the input dtype and the
     head reduction runs in fp32, so scores match the reference to within one ULP and the
-    top-k selection/order is preserved (validated in the op unit tests).
+    top-k selection/order is preserved (validated in the op unit tests).  ``w_scale``
+    folds the eager per-head weight pre-scale into the kernel's fp32 weight load
+    (``float(w) * w_scale``, bit-equal to the removed ``weights.float() * scale``).
     """
     num_rows = int(q_index.shape[0])
     h = int(q_index.shape[1])
@@ -5582,6 +5666,7 @@ def _fused_index_score(
         h,
         c,
         compress_ratio,
+        float(w_scale),
         D=d,
         D_BLOCK=triton.next_power_of_2(d),
         H_BLOCK=triton.next_power_of_2(h),
@@ -5606,6 +5691,8 @@ def _fused_topk_select(
     index_score: torch.Tensor,  # [N, C] fp32 masked index score
     index_topk: int,
     topk_count: int,
+    input_pos: Optional[torch.Tensor] = None,  # [N] int decode position (visibility bound)
+    compress_ratio: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One-launch exact decode top-k row selection (idea_0046).
 
@@ -5617,6 +5704,14 @@ def _fused_topk_select(
     candidate row is wider than the selection, the kernel spreads the bitonic
     sort across one CTA per TOPK_BLOCK-wide band (idea_0087); the tickets the
     band CTAs synchronize on live in ``_TOPK_SELECT_TICKETS``.
+
+    Passing ``input_pos`` + ``compress_ratio`` asserts the caller masked
+    ``index_score[n, c] = -inf`` for every
+    ``c >= min((input_pos[n] + 1) // compress_ratio, C)`` (the score kernels'
+    visibility bound), enabling the banded kernel's visible-prefix fast path
+    (idea_0089): while the visible prefix fits the first band, band 0 emits its
+    own sort directly and the other band CTAs retire without loads, heap
+    stores, tickets or merges -- byte-identical output.
     """
     num_rows, c = int(index_score.shape[0]), int(index_score.shape[1])
     device = index_score.device
@@ -5659,15 +5754,20 @@ def _fused_topk_select(
         heap_scratch = rows
         tickets = rows
         num_warps = _SPARSE_TOPK_SORT_NUM_WARPS
+    has_vlen = input_pos is not None and compress_ratio > 0 and nbands > 1
     _dsv4_topk_select_kernel[(num_rows, nbands)](
         index_score.contiguous(),
         rows,
         valid,
         heap_scratch,
         tickets,
+        # Dead pointer when the visible-prefix fast path is off.
+        input_pos.contiguous() if has_vlen else rows,
         c,
         index_topk,
         capped_topk,
+        compress_ratio if has_vlen else 1,
+        HAS_VLEN=has_vlen,
         BLOCK_C=block_c,
         BLOCK_K=block_k,
         TOPK_BLOCK=topk_block,
@@ -6857,6 +6957,17 @@ def torch_deepseek_v4_sparse_attention_with_cache(
         compressor_gate = compressor_gate.float()
         indexer_compressor_kv = indexer_compressor_kv.float()
         indexer_compressor_gate = indexer_compressor_gate.float()
+        # Same idea for the per-head indexer weights (idea_0089): the model hands
+        # over the raw (unscaled, model-dtype) ``weights_proj`` output -- the
+        # pure-decode path above folds ``float(w) * scale`` into its score
+        # kernels -- so the one-time widening + pre-scale moves here, off the
+        # decode hot path. The expression mirrors ``DeepseekV4Indexer``
+        # (``softmax_scale * index_n_heads**-0.5``) on the same Python ints, so
+        # every prefill consumer below sees bit-identical pre-scaled fp32 values.
+        if int(indexer_q.shape[2]) > 0 and int(indexer_q.shape[3]) > 0:
+            indexer_weights = indexer_weights.float() * (
+                int(indexer_q.shape[3]) ** -0.5 * int(indexer_q.shape[2]) ** -0.5
+            )
 
     if topk_is_placeholder:
         # The model emits a width-only placeholder for ``topk_idxs`` on compressed AND

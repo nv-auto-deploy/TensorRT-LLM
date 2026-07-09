@@ -1229,7 +1229,12 @@ class DeepseekV4Indexer(nn.Module):
             tp_mode="none",
             layer_type="mla",
         )
-        weights = weights.float() * (self.softmax_scale * self.index_n_heads**-0.5)
+        # Raw (unscaled, model-dtype) weights are handed over (idea_0089): the
+        # cached sparse-attention op folds the ``float(w) * scale`` pre-scale
+        # into its decode score kernels' fp32 weight load (bit-identical fp32
+        # multiply) and pre-scales once at prefill entry, dropping the per-layer
+        # cast + scalar-mul launches from the decode graph. The uncached
+        # reference path applies the identical scale in ``select_topk``.
         compressor_kv, compressor_gate = self.compressor.project(hidden_states)
         return q, weights, compressor_kv, compressor_gate
 
@@ -1241,6 +1246,10 @@ class DeepseekV4Indexer(nn.Module):
         seq_len: int,
         offset: int,
     ) -> torch.Tensor:
+        # ``project`` hands over raw model-dtype weights (idea_0089); the
+        # widening + pre-scale moved here so this uncached reference stays
+        # bit-identical to the pre-change chain.
+        weights = weights.float() * (self.softmax_scale * self.index_n_heads**-0.5)
         index_score = torch.matmul(
             q.transpose(1, 2),
             index_k.transpose(1, 2).unsqueeze(1),
