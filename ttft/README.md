@@ -16,7 +16,8 @@ state is not modified by these files.
 - GPUs: 4, 5, 6, 7
 - Concurrency: 1
 - Actual input/output lengths: 1004 / 8 tokens
-- AutoDeploy config: `config_tp4_piecewise_1024.yaml`
+- Perf-agent entry config: `configs/deepseek-v4-flash-tp4.yaml`
+- AutoDeploy config selected by it: `configs/dsv4_flash_ad_4gpu.yaml`
 - SGLang reference: TP4 MXFP4, 135.89 ms average TTFT and 135.49 ms p50
 
 The SGLang artifact uses the same TP4/MXFP4, concurrency, and approximately
@@ -131,21 +132,30 @@ continuation followed by decode test.
 
 ## Reproduction
 
+Run or resume the optimization campaign from the perf-agent repository:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m perf_agent \
+  --config configs/deepseek-v4-flash-tp4.yaml --resume
+```
+
 Start the server:
 
 ```bash
 REPO_ROOT="${PWD}"
+PERF_AGENT_ROOT="${HOME}/dev/perf-agent"
 CUDA_VISIBLE_DEVICES=4,5,6,7 \
 PYTHONPATH="${REPO_ROOT}" \
 trtllm-serve deepseek-ai/DeepSeek-V4-Flash \
   --host 127.0.0.1 --port 8134 --trust_remote_code \
   --backend _autodeploy \
-  --config "${REPO_ROOT}/ttft/config_tp4_piecewise_1024.yaml"
+  --config "${PERF_AGENT_ROOT}/configs/dsv4_flash_ad_4gpu.yaml"
 ```
 
 Run the matched benchmark:
 
 ```bash
+PERF_AGENT_ROOT="${HOME}/dev/perf-agent"
 aiperf profile \
   --model deepseek-ai/DeepSeek-V4-Flash \
   --url 127.0.0.1:8134 --endpoint-type chat --streaming \
@@ -153,16 +163,17 @@ aiperf profile \
   --request-timeout-seconds 1800 --use-server-token-count \
   --no-server-metrics --isl 1000 --osl 8 \
   --extra-inputs '{"ignore_eos": true}' \
-  --tokenizer <path-to-dsv4-tokenizer>
+  --tokenizer "${PERF_AGENT_ROOT}/configs/dsv4_tokenizer"
 ```
 
 Run the standalone real-weight smoke test:
 
 ```bash
+PERF_AGENT_ROOT="${HOME}/dev/perf-agent"
 CUDA_VISIBLE_DEVICES=4,5,6,7 PYTHONPATH="${PWD}" \
 python examples/auto_deploy/build_and_run_ad.py \
   --model deepseek-ai/DeepSeek-V4-Flash \
-  --args.yaml-extra "${PWD}/ttft/config_tp4_piecewise_1024.yaml" \
+  --args.yaml-extra "${PERF_AGENT_ROOT}/configs/dsv4_flash_ad_4gpu.yaml" \
   --prompt.batch-size=1 \
   --prompt.queries='["What is 2 + 2? Answer with only the number."]' \
   --prompt.sp-kwargs.max-tokens=8 --prompt.sp-kwargs.temperature=0
