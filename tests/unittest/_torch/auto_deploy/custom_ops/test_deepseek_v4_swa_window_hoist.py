@@ -109,10 +109,14 @@ def test_prepare_swa_bundle_matches_per_layer_reference(tokens_per_block, window
     outs = prep(
         input_pos, position_ids, cu_num_pages, cache_loc, tokens_per_block, 37, 5, window_size
     )
-    assert len(outs) == 21, "window request must extend the contract to 21 outputs"
-    swa_pid, swa_poff, swa_rel = outs[18:]
+    assert len(outs) == 23, "window request must extend the contract to 23 outputs"
+    swa_pid, swa_poff, swa_rel = outs[18:21]
     assert swa_pid.shape == (num_seq, window_size)
     assert swa_rel.dtype == torch.long
+    # Once-per-forward long decode metadata (idea_0090): the exact arange /
+    # widened input_pos every layer's decode path used to rebuild per call.
+    assert torch.equal(outs[21], torch.arange(num_seq, dtype=torch.long))
+    assert torch.equal(outs[22], input_pos.reshape(-1)[:num_seq].to(torch.long))
 
     ref_ids, ref_offs, ref_rel, _ = _reference_swa_bundle(
         positions, cu_num_pages, cache_loc, tokens_per_block, total_pages, window_size
@@ -159,7 +163,7 @@ def test_prepare_swa_bundle_triton_matches_torch(window_size, tokens_per_block, 
     prep = torch.ops.auto_deploy.deepseek_v4_sparse_prepare_decode_page_addr
     ref = prep(*args_cpu, tokens_per_block, 37, 5, window_size)
     outs = prep(*args_gpu, tokens_per_block, 37, 5, window_size)
-    assert len(ref) == 21 and len(outs) == 21
+    assert len(ref) == 23 and len(outs) == 23
     for i, (o, r) in enumerate(zip(outs, ref)):
         assert o.is_cuda, f"output {i} expected on CUDA"
         assert o.dtype == r.dtype, f"output {i} dtype {o.dtype} != {r.dtype}"
@@ -316,7 +320,7 @@ def test_window_only_placeholder_matches_explicit(batch_size, seq_len, window_si
 
 
 def test_prepare_swa_fake_shapes():
-    """Fake (meta) path returns 21 tensors with the SWA shapes for export/cudagraph."""
+    """Fake (meta) path returns 23 tensors with the SWA shapes for export/cudagraph."""
     tokens_per_block = 32
     num_seq = 2
     w = 128
@@ -328,9 +332,12 @@ def test_prepare_swa_fake_shapes():
         fake_cu = torch.empty(num_seq + 1, dtype=torch.long)
         fake_loc = torch.empty(128, dtype=torch.long)
         outs = prep(fake_pos, fake_pids, fake_cu, fake_loc, tokens_per_block, 11, 1, w)
-    assert len(outs) == 21
+    assert len(outs) == 23
     for i in (18, 19, 20):
         assert outs[i].shape == (num_seq, w)
+        assert outs[i].dtype == torch.long
+    for i in (21, 22):
+        assert outs[i].shape == (num_seq,)
         assert outs[i].dtype == torch.long
 
 

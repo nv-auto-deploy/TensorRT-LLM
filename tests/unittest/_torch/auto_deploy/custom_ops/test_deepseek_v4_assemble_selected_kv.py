@@ -233,6 +233,112 @@ def test_fused_assemble_large_decode_position(compress_ratio):
     not (M._HAS_TRITON and torch.cuda.is_available()),
     reason="fused selected-KV assembly requires triton + CUDA",
 )
+@pytest.mark.parametrize(
+    "window_size,tokens_per_block,max_compressed_len",
+    [(128, 64, 16), (128, 64, 512), (4, 8, 40)],
+)
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float32])
+def test_fused_assemble_dense_in_kernel_matches_materialized(
+    window_size, tokens_per_block, max_compressed_len, cache_dtype
+):
+    """Dense (ratio-128) mode, idea_0090: ``selected_rows=None`` derives the row ids
+    and their visibility in-kernel; the result must be bit-identical to both the
+    materialized arange/floordiv/clamp/lt chain fed through the fused kernel and the
+    eager reference. The input_pos sweep crosses the ratio-128 row boundaries
+    (126/127/128/255/256), partial pages, short histories, and negative (padded)
+    rows where torch's floor division semantics differ from truncation."""
+    compress_ratio = 128
+    torch.manual_seed(90_000 + window_size + max_compressed_len)
+    device = "cuda"
+    dtype = torch.bfloat16
+    head_dim = 64
+
+    input_pos = torch.tensor(
+        [126, 127, 128, 129, 255, 256, 0, 2, -1, -130, 1005],
+        dtype=torch.long,
+        device=device,
+    )
+    num_seq = int(input_pos.shape[0])
+    # Enough pages per sequence to cover input_pos ~1005 plus the current token;
+    # rows past each sequence's extent must resolve page-invalid in both paths.
+    pages_per_seq = [(1006 + tokens_per_block) // tokens_per_block + 1] * num_seq
+    cu_num_pages = torch.tensor(
+        [0, *torch.cumsum(torch.tensor(pages_per_seq), 0).tolist()],
+        dtype=torch.long,
+        device=device,
+    )
+    total_slots = int(cu_num_pages[-1])
+    num_physical = total_slots + 5
+    cache_loc = torch.randperm(num_physical, device=device)[:total_slots].to(torch.long)
+    swa_cache = torch.randn(num_physical, tokens_per_block, head_dim, device=device).to(cache_dtype)
+    mhc_cache = torch.randn(num_physical, tokens_per_block, head_dim, device=device).to(cache_dtype)
+    seq_idx = torch.arange(num_seq, dtype=torch.long, device=device)
+
+    # The materialized chain the dense specialization replaces (byte-for-byte).
+    rows = torch.arange(max_compressed_len, dtype=torch.long, device=device)
+    selected_rows = rows.view(1, -1).expand(num_seq, -1)
+    compressed_len = ((input_pos + 1) // compress_ratio).clamp(max=max_compressed_len)
+    compressed_valid = selected_rows < compressed_len.unsqueeze(1)
+
+    ref_kv, ref_relidx = _reference_assemble(
+        swa_cache,
+        mhc_cache,
+        selected_rows,
+        compressed_valid,
+        input_pos,
+        seq_idx,
+        cu_num_pages,
+        cache_loc,
+        window_size,
+        compress_ratio,
+        dtype,
+    )
+    mat_kv, mat_relidx = M._fused_assemble_selected_kv(
+        swa_cache,
+        mhc_cache,
+        selected_rows,
+        compressed_valid,
+        input_pos,
+        seq_idx,
+        cu_num_pages,
+        cache_loc,
+        window_size,
+        compress_ratio,
+        dtype,
+    )
+    dense_kv, dense_relidx = M._fused_assemble_selected_kv(
+        swa_cache,
+        mhc_cache,
+        None,
+        None,
+        input_pos,
+        seq_idx,
+        cu_num_pages,
+        cache_loc,
+        window_size,
+        compress_ratio,
+        dtype,
+        dense_num_rows=max_compressed_len,
+    )
+
+    assert dense_kv.shape == ref_kv.shape
+    assert dense_relidx.shape == ref_relidx.shape
+    assert torch.equal(dense_relidx, ref_relidx), (
+        f"dense rel_topk diverged from eager: W={window_size} tpb={tokens_per_block} "
+        f"m={max_compressed_len} cache_dtype={cache_dtype}"
+    )
+    assert torch.equal(dense_kv, ref_kv), (
+        f"dense selected_kv diverged from eager: W={window_size} tpb={tokens_per_block} "
+        f"m={max_compressed_len} cache_dtype={cache_dtype}"
+    )
+    assert torch.equal(dense_relidx, mat_relidx)
+    assert torch.equal(dense_kv, mat_kv)
+
+
+@pytest.mark.skipif(
+    not (M._HAS_TRITON and torch.cuda.is_available()),
+    reason="fused selected-KV assembly requires triton + CUDA",
+)
 def test_fused_assemble_attend_output_matches_eager():
     """End-to-end: the fused assemble + attend must match the eager rows + attend."""
     torch.manual_seed(4242)

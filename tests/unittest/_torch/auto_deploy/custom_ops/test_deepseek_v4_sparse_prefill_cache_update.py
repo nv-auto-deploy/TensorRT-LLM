@@ -28,10 +28,8 @@ def test_cached_op_uses_host_prefill_metadata_within_schema_limit():
     metadata_args = M.DeepSeekV4SparseAttention.get_standard_metadata_args()
     assert metadata_args == [
         "batch_info_host",
-        "seq_len",
         "input_pos",
         "slot_idx",
-        "cu_seqlen",
         "cu_num_pages",
         "cache_loc",
         "seq_len_host",
@@ -44,6 +42,11 @@ def test_cached_op_uses_host_prefill_metadata_within_schema_limit():
     schema = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache.default._schema
     assert len(schema.arguments) == 64
     assert "last_page_len" not in {argument.name for argument in schema.arguments}
+    arg_names = {argument.name for argument in schema.arguments}
+    # Device-side seq_len / cu_seqlen were dropped (only their *_host mirrors are
+    # read); their slots carry the hoisted long decode metadata (idea_0090).
+    assert {"seq_idx_long", "input_pos_long"} <= arg_names
+    assert "seq_len" not in arg_names and "cu_seqlen" not in arg_names
 
 
 def _scalar_write_paged_cache_rows(
