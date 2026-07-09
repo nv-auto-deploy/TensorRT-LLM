@@ -456,11 +456,11 @@ def _run_torch_mxfp4_mlp_core(
 # DSV4-Flash feeds *precomputed* routing (selected_experts / routing_weights, its
 # custom sqrtsoftplus+hash routing stays upstream) to ``torch_mxfp4_moe_from_routing(_ep)``.
 # The torch reference then dequantizes the routed expert slots and runs the SwiGLU MLP in
-# fp32 bmm — the #1 decode-time op (idea_0002 routed it off the full-expert dequant; the
+# fp32 bmm — the #1 decode-time op (routed off the full-expert dequant; the
 # remaining per-slot dequant+bmm is the dominant residual). The trtllm-gen W4A16 runner
 # ``bf16_mxe2m1_block_scale_moe_runner`` does the same math in one hand-tuned cubin and is
-# 21-28x faster at DSV4 EP=8 decode shapes (idea_0008 microbench), 17x faster than matmul_ogs
-# (which regressed +34%, idea_0005). The kernel consumes mxfp4 weights + bf16 activations
+# 21-28x faster at DSV4 EP=8 decode shapes (microbench), 17x faster than matmul_ogs
+# (which regressed +34%). The kernel consumes mxfp4 weights + bf16 activations
 # directly; precomputed routing is forwarded as topk_ids/topk_weights (used verbatim — PT folds
 # routed_scaling_factor into token_final_scales the same way, routing.py:380/419).
 
@@ -481,7 +481,7 @@ def _reinterleave_up_gate(t: torch.Tensor, intermediate_size: int) -> torch.Tens
     The torch reference (``gate_up_order='up_gate'``) reads ``up = t[:, :I]`` /
     ``gate = t[:, I:]``; prepare's ``_deinterleave_gate_up`` reads ``gate = t[:, 0::2]`` /
     ``up = t[:, 1::2]``. Re-interleaving so even=gate, odd=up makes prepare see the same
-    gate/up halves the reference does — THE fix that lifts cos 0.012 -> 0.977 (idea_0008).
+    gate/up halves the reference does — THE fix that lifts cos 0.012 -> 0.977.
     Handles weights ``[E, 2I, H/32, 16]``, scales ``[E, 2I, H/32]`` and bias ``[E, 2I]``.
     """
     up = t[:, :intermediate_size]

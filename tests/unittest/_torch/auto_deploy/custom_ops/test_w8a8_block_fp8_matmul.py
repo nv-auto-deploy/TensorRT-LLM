@@ -47,7 +47,7 @@ SHAPES = [
     (256, 7168),  # shared-expert gate/up-like
 ]
 
-# DeepSeek-V4-Flash TP4 per-rank decode shapes (idea_0040). Full-K keys carry the
+# DeepSeek-V4-Flash TP4 per-rank decode shapes. Full-K keys carry the
 # BLOCK_SIZE_N in {128,64,32} / num_warps=8 autotune additions; the K=4096 shapes
 # dispatch to the split-K path and exercise the exact M=1, K=4096 schedule through
 # ``_w8a8_block_fp8_matmul_triton``.
@@ -225,7 +225,7 @@ def test_decode_gemv_multi_kblock():
 
 
 # ----------------------------------------------------------------------------------
-# Split-K decode path (idea_0025, kernel_layout). The split-K kernel partitions the
+# Split-K decode path (kernel_layout). The split-K kernel partitions the
 # K reduction across SPLIT_K CTAs and reduces fp32 partials via atomics; the result
 # must match the same fp64 dequant->matmul ground truth as the full-K kernel.
 # ----------------------------------------------------------------------------------
@@ -291,7 +291,7 @@ def test_splitk_block_n_and_ragged_n(split_k, block_size_n):
 @pytest.mark.parametrize("split_k", [12, 24, 48])
 @pytest.mark.parametrize("N,K", [(1536, 7168), (576, 7168), (2304, 7168), (256, 7168)])
 def test_splitk_block_size_k(N, K, split_k, block_size_k):
-    """BLOCK_SIZE_K (MMA tile depth) decoupled from the quant scale group (idea_0063).
+    """BLOCK_SIZE_K (MMA tile depth) decoupled from the quant scale group.
 
     A tile of BLOCK_SIZE_K in {32,64,128} stays inside one 128-wide scale block, so
     the per-tile scale index ``(k*BLOCK_SIZE_K)//group_k`` must still reconstruct the

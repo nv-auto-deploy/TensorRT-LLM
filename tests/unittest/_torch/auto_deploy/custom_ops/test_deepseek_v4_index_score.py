@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit test for the fused ratio-4 lightning-indexer score (idea_0004).
+"""Unit test for the fused ratio-4 lightning-indexer score.
 
 The decode ratio-4 selection in ``_select_decode_ratio4_indexer_rows`` computes a
 per-candidate score with
@@ -9,7 +9,7 @@ per-candidate score with
                    * indexer_weights.float().unsqueeze(-1)).sum(dim=1)
     index_score = index_score.masked_fill(~visible, -inf)
 
-then feeds ``index_score`` into ``topk`` to pick the compressed rows. idea_0004 fuses
+then feeds ``index_score`` into ``topk`` to pick the compressed rows. The fused kernel merges
 the matmul + relu + weighted head reduction + visibility mask into one Triton kernel
 (``_dsv4_index_score_kernel`` via ``_fused_index_score``) so the ``[N, H, C]``
 head-by-candidate score and the separate masked ``[N, C]`` tensor are never

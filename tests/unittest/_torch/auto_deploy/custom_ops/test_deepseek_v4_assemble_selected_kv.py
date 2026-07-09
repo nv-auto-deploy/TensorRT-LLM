@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Byte-exactness guard for the fused decode selected-KV paged assembly (idea_0001).
+"""Byte-exactness guard for the fused decode selected-KV paged assembly.
 
 ``_fused_assemble_selected_kv`` folds the per-ratio-4/128-layer decode tail of
 ``_decode_compressed_cache_attention`` -- the local-window ``swa_cache`` gather, the
@@ -241,7 +241,7 @@ def test_fused_assemble_large_decode_position(compress_ratio):
 def test_fused_assemble_dense_in_kernel_matches_materialized(
     window_size, tokens_per_block, max_compressed_len, cache_dtype
 ):
-    """Dense (ratio-128) mode, idea_0090: ``selected_rows=None`` derives the row ids
+    """Dense (ratio-128) mode: ``selected_rows=None`` derives the row ids
     and their visibility in-kernel; the result must be bit-identical to both the
     materialized arange/floordiv/clamp/lt chain fed through the fused kernel and the
     eager reference. The input_pos sweep crosses the ratio-128 row boundaries

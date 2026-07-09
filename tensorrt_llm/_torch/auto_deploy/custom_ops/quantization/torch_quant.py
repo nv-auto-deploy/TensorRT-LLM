@@ -588,7 +588,7 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str
 #     BLOCK_SIZE_M=128/num_warps=4 launch. The autotuner selects on latency only,
 #     so the racy num_warps=4 large-tile configs are deliberately excluded.
 
-# DeepSeek-V4-Flash TP4 per-rank decode additions (idea_0040). Each exact M=1
+# DeepSeek-V4-Flash TP4 per-rank decode additions. Each exact M=1
 # full-K key is pinned to its measured winner so independent ranks cannot choose
 # different near-tie configs during Triton autotuning.
 _W8A8_TP4_QIDX_CONFIG = triton.Config(
@@ -823,7 +823,7 @@ def _w8a8_block_fp8_matmul_triton(
         assert residual.dtype == output_dtype, "residual must match the matmul output dtype"
         assert residual.dim() >= 2 and residual.is_contiguous()
 
-    # Rowwise direct-store decode GEMV (idea_0009): the exact measured M=1
+    # Rowwise direct-store decode GEMV: the exact measured M=1
     # DeepSeek-V4-Flash TP4 per-rank shapes bypass both incumbent paths -- one
     # flat rowwise kernel replaces full-K MMA launches and the split-K
     # (zero-fill + atomic matmul + finish-cast) triple, with the residual merge
@@ -886,7 +886,7 @@ def _w8a8_block_fp8_matmul_triton(
     return C
 
 
-# Split-K decode GEMV reduction layout (kernel_layout axis, idea_0025).
+# Split-K decode GEMV reduction layout.
 #
 # The full-K kernel above assigns one CTA per (M,N) output tile and walks the whole
 # K dimension serially. At decode M (1/2) with K=7168 (56 K-blocks of 128) the base
@@ -985,7 +985,7 @@ def _w8a8_block_fp8_matmul_splitk_kernel(
 # Split-K launch config for the decode GEMV. Two tuned bands (see the per-knob
 # heuristics below): the legacy schedule tuned on B200 over K=7168 decode
 # projection shapes (N in {256,576,1536,2304}; kernel_layout axis), and exact M=1,
-# K=4096 DeepSeek-V4-Flash TP4 per-rank shapes (N in {1024,1536}; idea_0040,
+# K=4096 DeepSeek-V4-Flash TP4 per-rank shapes (N in {1024,1536};
 # kernel_autotune axis).
 _SPLITK_BLOCK_SIZE_M = 16
 # Mid-N default / fallback SPLIT_K (see ``_splitk_split_k`` for the per-N schedule).
@@ -1014,7 +1014,7 @@ def _splitk_block_n(N: int, K: Optional[int] = None, M: Optional[int] = None) ->
     wins. Measured B200 optima at K=7168: N=256->32, N=576->64, N>=1024
     (1536/2304)->128.
 
-    Exact M=1, K=4096 shapes (idea_0040, DeepSeek-V4-Flash TP4 per-rank decode: fused
+    Exact M=1, K=4096 shapes (DeepSeek-V4-Flash TP4 per-rank decode: fused
     wq_a+wkv N=1536, shared w1+w3 / grouped wo_a N=1024, all K=4096): with only 32
     K-blocks the wide 128-N tile leaves too few CTAs in flight; BLOCK_SIZE_N=64
     wins in the measured L2-cold and L2-hot regimes. All other shapes preserve
@@ -1040,10 +1040,10 @@ def _splitk_split_k(N: int, K: Optional[int] = None, M: Optional[int] = None) ->
     already have enough n-tiles, so a *shallower* split cuts atomic-reduction
     over-subscription. Measured B200 optima (BLOCK_SIZE_K=128, K=7168, M=1):
     N=256->48, N=576->48, N=1536->24, N=2304->16 (each ~-3.5..-4.0% vs the old
-    fixed SPLIT_K=24; idea_0063, kernel_tile). idea_0025's fixed 24 was tuned over
+    fixed SPLIT_K=24). The earlier fixed 24 was tuned over
     SPLIT_K<=32 and missed the deeper split the narrow-N shapes want.
 
-    Exact M=1, K=4096 shapes (idea_0040): K=4096 has exactly 32 K-blocks, so the
+    Exact M=1, K=4096 shapes: K=4096 has exactly 32 K-blocks, so the
     SPLIT_K=24 is ragged -- 8 CTAs per tile do 2 K-blocks while 16 do 1, and the
     2-block stragglers set the kernel tail. SPLIT_K=32 (1 K-block per CTA,
     balanced) + BLOCK_SIZE_N=64 + num_warps=2 wins the measured N=1024 single and
@@ -1063,7 +1063,7 @@ def _splitk_split_k(N: int, K: Optional[int] = None, M: Optional[int] = None) ->
 def _splitk_num_warps(N: int, K: Optional[int] = None, M: Optional[int] = None) -> int:
     """num_warps for the split-K decode GEMV.
 
-    The exact idea_0040 M=1/K=4096/N={1024,1536} shapes use 2 warps; their short
+    The exact M=1/K=4096/N={1024,1536} shapes use 2 warps; their short
     per-CTA K reduction does not benefit from the legacy 4-warps schedule. Every
     other shape keeps the tuned 4-warps default.
     """
@@ -1075,7 +1075,7 @@ def _splitk_num_warps(N: int, K: Optional[int] = None, M: Optional[int] = None) 
 def _splitk_block_k(N: int, block_k: int) -> int:
     """MMA contraction-tile depth (``BLOCK_SIZE_K``) for the split-K decode GEMV.
 
-    Decoupled from the quantization scale group ``block_k`` (idea_0063): it must
+    Decoupled from the quantization scale group ``block_k``: it must
     divide ``block_k`` so an MMA tile stays inside one scale block, but a *smaller*
     tile keeps the atomic-reduction count fixed at ``SPLIT_K`` while raising the
     K-loop trip count, which deepens the software pipeline (more in-flight B-tile
@@ -1236,7 +1236,7 @@ def _w8a8_block_fp8_matmul_splitk(
     return C_acc.to(output_dtype)
 
 
-# Rowwise direct-store decode GEMV backend (idea_0009, kernel_backend axis).
+# Rowwise direct-store decode GEMV backend (kernel_backend axis).
 #
 # At M=1 both incumbent paths carry structural overhead this memory-bound GEMV
 # does not need:
@@ -1865,12 +1865,8 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
     if weight_quantized.dim() != 2:
         raise ValueError(f"weight must have shape [G * R, K], got {weight_quantized.shape}")
     # The weight is either the raw ``float8_e4m3fn`` checkpoint tensor (consumed directly by the
-    # block-FP8 matmul below) or a tensor whose exact BF16 runtime value was pre-materialized at
-    # load time by the ``bake_grouped_finegrained_fp8_weight`` post_load_fusion transform. When
-    # the weight is FP8 we keep both operands in FP8 and run a direct grouped block-FP8 W8A8
-    # matmul (idea_0025); when it has already been baked to a floating-point dtype we fall back to
-    # the dynamic input quantize-dequantize + grouped BMM, which stays bit-for-bit identical to
-    # the prior behavior on that branch.
+    # block-FP8 matmul below) or an already-dequantized floating-point tensor, for which we
+    # fall back to the dynamic input quantize-dequantize + grouped BMM.
     weight_is_fp8 = weight_quantized.dtype == torch.float8_e4m3fn
     if not weight_is_fp8 and not weight_quantized.is_floating_point():
         raise TypeError(
@@ -1934,7 +1930,7 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
             )
             output = out2d.reshape(*lead_shape, out_rows)
         elif _use_splitk_decode(m_tokens, rank, in_features):
-            # Decode GEMV epilogue collapse (idea_0003): every per-rank group takes the
+            # Decode GEMV epilogue collapse: every per-rank group takes the
             # split-K path here, and the old per-group dispatch paid a (zero-fill +
             # fp32->bf16 finish cast) pair per group plus a ``torch.stack`` copy to
             # re-concatenate the group outputs. Instead, atomically accumulate all
@@ -1985,7 +1981,7 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
             output = torch.stack(parts, dim=1).reshape(*lead_shape, out_rows)
     else:
         # Weight already holds its dequantized floating-point runtime value (baked at load time by
-        # the ``bake_grouped_finegrained_fp8_weight`` transform). Fall back to the dynamic input
+        # an external pre-bake). Fall back to the dynamic input
         # quantize-dequantize + grouped BMM; bit-for-bit identical to the prior behavior here.
         qinput, input_scales = _safe_act_quant(input_contiguous, block_k, input_scale_fmt)
         qinput_blocks = qinput.reshape(*input_contiguous.shape[:-1], -1, block_k)

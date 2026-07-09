@@ -7,7 +7,7 @@ Covers the DSV4-Flash routed MXFP4 MLP on Blackwell (SM100). The trtllm-gen runn
 (``mxe4m3_mxe2m1_block_scale_moe_runner`` for ``act_dtype="mxfp8"`` — the default — and
 ``bf16_mxe2m1_block_scale_moe_runner`` for ``act_dtype="bf16"``) replace the fp32 dequant+bmm
 reference for the ``up_gate``/``deepseek`` signature. This validates the integration details the
-idea_0008 microbench did NOT exercise: re-interleave of the ``[up|gate]`` split-half layout,
+the original microbench did NOT exercise: re-interleave of the ``[up|gate]`` split-half layout,
 remote-route masking under EP (some routes off-rank, one token fully remote must be exactly
 zero), and NON-ZERO expert biases. Output is a reduced-precision kernel vs fp32-reference, so we
 assert high cosine similarity (not bit-exactness); the W4A8-vs-W4A16 check isolates the

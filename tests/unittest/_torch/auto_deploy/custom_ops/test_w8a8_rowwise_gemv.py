@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Correctness checks for the rowwise direct-store M=1 decode GEMV (idea_0009).
+"""Correctness checks for the rowwise direct-store M=1 decode GEMV.
 
 ``_w8a8_gemv_rowwise`` replaces both incumbent block-FP8 paths (full-K MMA and
 split-K fill + atomic-matmul + cast) for the exact measured DeepSeek-V4-Flash

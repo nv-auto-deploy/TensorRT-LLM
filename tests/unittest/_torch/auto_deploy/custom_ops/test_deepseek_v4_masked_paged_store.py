@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Byte-exactness check for the DeepSeek V4 validity-masked paged store.
 
-``_masked_write_decode_cache_rows`` (idea_0035) replaces the decode ``mhc_cache``
+``_masked_write_decode_cache_rows`` replaces the decode ``mhc_cache``
 compressed-row update's previous-row gather + ``torch.where`` + unconditional
 index_put write-back with a single read-free masked store: for each decode row it
 writes the freshly compressed row only when ``row_valid`` is true, and stores

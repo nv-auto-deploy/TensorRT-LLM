@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit test for the fused ratio-4 full-range candidate-row reconstruction (idea_0075).
+"""Unit test for the fused ratio-4 full-range candidate-row reconstruction.
 
 ``_batched_overlap_compressed_rows_fullrange`` reconstructs every lightning-indexer
-candidate compressed row at decode time.  idea_0075 collapses the gather / row-shift /
+candidate compressed row at decode time.  the fused path collapses the gather / row-shift /
 concat / where / pool / rmsnorm swarm of that helper into a single Triton kernel
 (``_dsv4_fullrange_candidate_rows_kernel``) that emits the post-pool, post-rmsnorm rows
 directly.  The kernel replicates the eager numerics -- fp32-internal softmax pool and

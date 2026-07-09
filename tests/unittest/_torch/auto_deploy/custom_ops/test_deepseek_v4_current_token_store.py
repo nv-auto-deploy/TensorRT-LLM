@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Byte-exactness check for the DeepSeek V4 fused current-token multi-cache store.
 
-``_fused_current_token_store`` (idea_0006) folds the per-cache current-token
+``_fused_current_token_store`` folds the per-cache current-token
 ``index_put`` scatters -- SWA kv, main-compressor kv/gate, and the ratio-4
 indexer-compressor kv/gate, which all write logical position ``input_pos`` and
 therefore share the hoisted ``(page_ids, page_offsets)`` address -- into one
@@ -57,7 +57,7 @@ _CONFIGS = {
         (torch.bfloat16, 64),
         (torch.float32, 576),
     ],
-    # Compression-off layers write only the SWA kv cache; since idea_0092 this
+    # Compression-off layers write only the SWA kv cache; this
     # single-cache arity also runs the fused kernel (N_CACHES=1) instead of index_put.
     "off": [
         (torch.bfloat16, 128),
@@ -174,7 +174,7 @@ def test_fused_current_token_store_single_cache_and_empty():
     cache_loc = torch.arange(num_pages, dtype=torch.long, device=device)
 
     # Single cache -> fused kernel with N_CACHES=1 (the compression-off layers' SWA
-    # write since idea_0092), still byte-identical to the index_put reference.
+    # write), still byte-identical to the index_put reference.
     torch.manual_seed(5)
     cache = torch.randn(num_pages, tokens_per_block, state_dim, device=device).to(torch.bfloat16)
     ref = cache.clone()
@@ -211,7 +211,7 @@ def test_fused_current_token_store_single_cache_and_empty():
 def test_fused_current_token_store_extreme_bf16_widening():
     """The in-kernel bf16 -> fp32 store conversion is byte-exact on extreme values.
 
-    Since idea_0092 the wrapper no longer pre-casts values with torch ``.to``;
+    The wrapper no longer pre-casts values with torch ``.to``;
     the Triton store performs the widening. bf16 -> fp32 is a pure mantissa
     zero-extension, so +/-inf, NaN (payload preserved), +/-0, the bf16
     max/min normals and subnormals must all round-trip byte-identically to the
@@ -277,7 +277,7 @@ def test_fused_current_token_store_cuda_graph_replay():
     """The fused store is CUDA-graph capturable and replays byte-identically.
 
     The decode path runs under piecewise CUDA graphs, so the launch (including the
-    native-dtype source pointers of idea_0092) must capture without host fallbacks
+    native-dtype source pointers) must capture without host fallbacks
     and produce the reference bytes on every replay with refreshed inputs.
     """
     torch.manual_seed(92)

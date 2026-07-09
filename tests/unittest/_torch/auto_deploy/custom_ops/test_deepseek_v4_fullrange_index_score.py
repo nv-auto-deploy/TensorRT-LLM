@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Bit-exactness guard for the fused paged index-score fold (idea_0012).
+"""Bit-exactness guard for the fused paged index-score fold.
 
 ``_fused_fullrange_index_score`` folds ``_fused_fullrange_index_k`` (paged
 candidate-row reconstruction + rope + hadamard/fake-fp4) and
@@ -282,7 +282,7 @@ CASES = [
     (
         # The proxy/production decode grid (M=1024): one row deep in the
         # early-exit regime (vlen 250) and one fully visible (vlen == M, no
-        # early exits), pinning the idea_0089 visible-prefix split.
+        # early exits), pinning the visible-prefix split.
         "prod_scale_m1024_visible_split",
         dict(
             num_rows=2,
@@ -413,7 +413,7 @@ def test_selection_path_routes_through_fold_and_matches():
     through the fold) must keep the exact selection of the two-kernel chain.
 
     The selection helper consumes RAW model-dtype weights and folds the
-    indexer pre-scale (``head_dim**-0.5 * num_heads**-0.5``, idea_0089) into
+    indexer pre-scale (``head_dim**-0.5 * num_heads**-0.5``) into
     the kernel, so the reference chain applies the identical ``w_scale``.
     """
     fx = _build_fixture(

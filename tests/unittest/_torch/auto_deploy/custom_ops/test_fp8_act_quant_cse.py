@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Byte-exactness for the FineGrained FP8 activation-quant CSE split (idea_0021).
+"""Byte-exactness for the FineGrained FP8 activation-quant CSE split.
 
 ``fuse_fp8_act_quant_cse`` hoists the per-block FP8 activation quant out of
 ``torch_fake_quant_finegrained_fp8_linear`` so sibling linears that consume the

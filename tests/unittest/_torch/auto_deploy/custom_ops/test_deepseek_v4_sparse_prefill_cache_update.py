@@ -44,7 +44,7 @@ def test_cached_op_uses_host_prefill_metadata_within_schema_limit():
     assert "last_page_len" not in {argument.name for argument in schema.arguments}
     arg_names = {argument.name for argument in schema.arguments}
     # Device-side seq_len / cu_seqlen were dropped (only their *_host mirrors are
-    # read); their slots carry the hoisted long decode metadata (idea_0090).
+    # read); their slots carry the hoisted long decode metadata.
     assert {"seq_idx_long", "input_pos_long"} <= arg_names
     assert "seq_len" not in arg_names and "cu_seqlen" not in arg_names
 
@@ -589,7 +589,7 @@ def test_initial_source_rows_match_paged_reconstruction_cache_layout(
         head_dim=512,
     )
     # The cached op widens raw activation-dtype compressor rows once before any
-    # prefill consumer (idea_0092). Mirror that production boundary so the direct
+    # prefill consumer. Mirror that production boundary so the direct
     # source path and paged-cache reconstruction use the same FP32 inputs.
     inp["kv_seq"] = inp["kv_seq"].float()
     inp["gate_seq"] = inp["gate_seq"].float()

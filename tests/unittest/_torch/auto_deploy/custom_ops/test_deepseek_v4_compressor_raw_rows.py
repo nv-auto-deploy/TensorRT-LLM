@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Raw bf16 compressor-row contract for the DeepSeek V4 sparse-attention ops.
 
-Since idea_0092 the model hands the compressor kv/gate projections to the
+The model hands the compressor kv/gate projections to the
 sparse-attention ops in their native activation dtype (bf16) instead of
 pre-widening them with a per-layer ``.float()``.  The decode current-token
 store converts in-kernel and the compressed-row reconstruction anchors its
@@ -122,7 +122,7 @@ def test_source_op_bf16_rows_match_fp32_widening(compress_ratio: int) -> None:
 
     out_bf16 = _run(case["compressor_kv"], case["compressor_gate"])
     # The exact fp32 widening is what the modeling-side per-layer ``.float()`` used
-    # to hand over before idea_0092.
+    # to hand over previously.
     out_f32 = _run(case["compressor_kv"].float(), case["compressor_gate"].float())
 
     assert torch.equal(out_bf16, out_f32), (

@@ -169,7 +169,7 @@ def test_prepare_decode_page_addr_overlap_fake_shape():
 def test_prepare_decode_page_addr_triton_matches_torch_reference(
     dtypes, tokens_per_block, num_seq, m, dense_m
 ):
-    """The single-launch Triton path (idea_0049) must be bit-identical to the torch
+    """The single-launch Triton path must be bit-identical to the torch
     reference body across page boundaries, out-of-range rows, compressed-row
     completion boundaries, negative (padded) positions, and multi-sequence inputs
     with per-sequence page counts. The CPU invocation takes the torch path, the CUDA

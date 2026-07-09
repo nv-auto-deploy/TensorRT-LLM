@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the decode-tail host fast paths (idea_0013).
+"""Unit tests for the decode-tail host fast paths.
 
 The TP4 decode cadence is host-bound: every rank re-runs the per-token host path
 (sampler bookkeeping -> nest_sequences staging -> CapturedGraph replay dispatch) and

@@ -114,7 +114,7 @@ def _hc_post_launch_config(n: int, hc_mult: int):
     because these sub-floor kernels defeat the autotuner's ``do_bench`` (it
     resolves the host launch cadence, not GPU time) and the model's varying
     prefill token counts would otherwise force a synchronizing re-tune each shape
-    (cf. sibling ``_hc_weighted_combine_kernel`` / idea_0054).
+    (cf. sibling ``_hc_weighted_combine_kernel``).
     """
     if n <= 16:
         return 2, 2, 512, 1

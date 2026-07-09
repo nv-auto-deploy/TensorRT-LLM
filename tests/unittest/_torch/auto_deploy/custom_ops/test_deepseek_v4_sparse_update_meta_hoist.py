@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit test for the hoisted DeepSeek-V4 compressed-cache UPDATE metadata (idea_0044).
+"""Unit test for the hoisted DeepSeek-V4 compressed-cache UPDATE metadata.
 
 ``deepseek_v4_sparse_prepare_decode_page_addr`` now also emits, once per forward, the
 per-decode-row update metadata shared by every layer of a compression ratio:
@@ -286,7 +286,7 @@ def test_update_reconstruction_dtype_anchored_on_cache(compress_ratio):
 
     The compressed-row reconstruction reads the current token from the fp32
     compressor caches (written by the caller's fused store) and anchors its
-    compute/rounding dtype on that cache dtype (idea_0092); the incoming decode
+    compute/rounding dtype on that cache dtype; the incoming decode
     rows are consulted only for gating and shape, so their dtype -- raw bf16 from
     the producer, or the fp32 widening the modeling code used to hand over --
     must not change a byte of the update.

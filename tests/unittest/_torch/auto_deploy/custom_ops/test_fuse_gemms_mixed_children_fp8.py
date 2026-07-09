@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Correctness + no-collision proof for the scoped ``fuse_gemms_mixed_children`` (idea_0022).
+"""Correctness + no-collision proof for the scoped ``fuse_gemms_mixed_children``.
 
 Enabling ``fuse_gemms_mixed_children`` (``fp8_only=True``) merges sibling
 ``torch_fake_quant_finegrained_fp8_linear`` projections that read the *same* activation

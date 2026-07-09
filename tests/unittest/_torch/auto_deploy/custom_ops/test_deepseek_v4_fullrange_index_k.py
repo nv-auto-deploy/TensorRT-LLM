@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit test for the fused ratio-4 decode index-key production (idea_0063 remainder).
+"""Unit test for the fused ratio-4 decode index-key production.
 
 ``_fused_fullrange_index_k`` collapses the decode lightning-indexer candidate front --
 paged full-range reconstruction (``_dsv4_fullrange_candidate_rows_kernel``), the

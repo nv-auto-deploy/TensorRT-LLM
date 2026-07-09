@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Equivalence proof for the replicated bf16 multi-output linear fusion (idea_0029).
+"""Equivalence proof for the replicated bf16 multi-output linear fusion.
 
 ``fuse_replicated_bf16_linear`` merges sibling replicated (``tp_mode="none"``),
 bias-free bf16 ``torch_linear_simple`` projections that read the *same* activation

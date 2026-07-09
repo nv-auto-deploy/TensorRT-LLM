@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit test for the fused exact decode top-k row selection (idea_0046).
+"""Unit test for the fused exact decode top-k row selection.
 
 The decode ratio-4 selection tail in ``_select_decode_ratio4_indexer_rows`` runs
 
@@ -10,7 +10,7 @@ The decode ratio-4 selection tail in ``_select_decode_ratio4_indexer_rows`` runs
     # + -1/False pad up to index_topk when topk_count < index_topk
 
 which costs a fat ``gatherTopK`` + ``radixSortKVInPlace`` pair plus the decomposed
-``isfinite``/``where``/pad swarm per ratio-4 layer per decode step. idea_0046 replaces
+``isfinite``/``where``/pad swarm per ratio-4 layer per decode step. The fused kernel replaces
 it with one Triton kernel (``_dsv4_topk_select_kernel`` via ``_fused_topk_select``)
 that sorts a packed (float-flip score, index) int64 key per candidate and emits the
 padded ``topk_rows`` / ``topk_valid`` directly.
@@ -114,8 +114,8 @@ def test_topk_select_matches_eager_tail():
 def _single_cta_kernel(index_score: torch.Tensor, index_topk: int):
     """Launch the select kernel on its single-CTA full-sort path (NBANDS=1).
 
-    This is idea_0046's original layout -- the semantic reference the banded
-    multi-CTA layout (idea_0087) must reproduce bit-for-bit on every input.
+    This is the original layout -- the semantic reference the banded
+    multi-CTA layout must reproduce bit-for-bit on every input.
     """
     import triton
 
@@ -151,7 +151,7 @@ def _check_banded(index_score: torch.Tensor, index_topk: int, case: str):
 
     It must also equal the eager torch tail whenever the input has no ``-0.0``:
     torch's large-C ``gatherTopK`` path ranks ``+0.0`` strictly above ``-0.0``
-    while the fused kernel keeps idea_0046's documented ascending-index fold
+    while the fused kernel keeps the documented ascending-index fold
     for +-0.0 ties, so eager equality is only defined without ``-0.0``.
     """
     got_rows, got_valid = M._fused_topk_select(
@@ -166,7 +166,7 @@ def _check_banded(index_score: torch.Tensor, index_topk: int, case: str):
 
 @pytest.mark.skipif(not _supported(), reason="requires CUDA + triton")
 def test_topk_select_banded_matches_eager_tail():
-    """The banded multi-CTA path (C > topk, idea_0087) stays byte-exact.
+    """The banded multi-CTA path (C > topk) stays byte-exact.
 
     C=2048 -> K=512 is the traced decode shape (4 band CTAs); the adversarial
     patterns pin tie-break order *across* band boundaries (constant rows,
@@ -334,7 +334,7 @@ def _check_vlen(index_score, input_pos, index_topk: int, case: str):
 
 @pytest.mark.skipif(not _supported(), reason="requires CUDA + triton")
 def test_topk_select_visible_prefix_fast_path():
-    """The banded visible-prefix fast path (idea_0089) stays byte-exact.
+    """The banded visible-prefix fast path stays byte-exact.
 
     Passing ``input_pos``/``compress_ratio`` lets band 0 emit its own sort
     directly while the other band CTAs retire whenever

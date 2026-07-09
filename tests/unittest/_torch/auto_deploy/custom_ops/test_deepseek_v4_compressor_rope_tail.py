@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the DeepSeek-V4 compressor rope/quant tail fusion (idea_0014).
+"""Unit tests for the DeepSeek-V4 compressor rope/quant tail fusion.
 
 ``_apply_compressed_rope_and_quantize`` (rotate=False, the main-compressor tail) was
 rewritten to fp8-quantize the nope slice and then route the interleaved RoPE + concat
@@ -44,7 +44,7 @@ def _old_tail(
     rope_dim: int,
     rotate: bool,
 ) -> torch.Tensor:
-    """Verbatim copy of the pre-idea_0014 eager implementation."""
+    """Verbatim copy of the original eager implementation."""
     nope_dim = compressed.shape[-1] - rope_dim
     nope, pe = torch.split(compressed, [nope_dim, rope_dim], dim=-1)
     pe = dsa._apply_interleaved_rope_ref(pe, cos, sin)

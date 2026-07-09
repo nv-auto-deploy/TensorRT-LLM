@@ -16,7 +16,7 @@
 """CUDA correctness tests for the fused DeepSeek V4 sparse-attention attend kernel.
 
 These exercise ``_deepseek_v4_sparse_attention`` on CUDA bf16 tensors (the path the
-real model takes), where idea_0001's fused Triton kernel replaces the torch
+real model takes), where the fused Triton kernel replaces the torch
 gather+matmul+softmax+matmul body.  The reference is an independent fp32
 implementation of the documented semantics (sink term, negative/out-of-range
 masking, duplicate-index independence).

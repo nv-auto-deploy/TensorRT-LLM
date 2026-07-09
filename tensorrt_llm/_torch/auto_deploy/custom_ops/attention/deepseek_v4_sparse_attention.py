@@ -196,7 +196,7 @@ def _rms_norm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
 
 
 def _compressor_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """RMSNorm for the *main-compressor* pooled states (idea_0014).
+    """RMSNorm for the *main-compressor* pooled states.
 
     Routes through the fused ``auto_deploy::triton_rms_norm`` op -- one kernel that does
     the fp32 cast, square, mean, rsqrt and weighted scale, replacing the ~6 eager kernels
@@ -239,8 +239,7 @@ def _apply_compressed_rope_and_quantize(
     nope_dim = compressed.shape[-1] - rope_dim
     nope, pe = torch.split(compressed, [nope_dim, rope_dim], dim=-1)
     if rotate:
-        # Indexer RoPE->Hadamard tail (rotate=True) -- left intact (out of scope per
-        # idea_0014: "without revisiting the discarded RoPE-to-Hadamard sites").
+        # Indexer RoPE->Hadamard tail (rotate=True) -- intentionally left intact.
         pe = _apply_interleaved_rope_ref(pe, cos, sin)
         compressed = torch.cat((nope, pe), dim=-1)
         return torch.ops.auto_deploy.deepseek_v4_hadamard_fp4(compressed, 32)
@@ -315,7 +314,7 @@ def _build_full_compressed_kv(
         return compressor_kv.new_empty(batch_size, max_compressed_len, head_dim)
 
     # The pool/ape math below ran on fp32 inputs before the producer started handing
-    # over raw activation-dtype rows (idea_0092); widen here (no-op when already fp32)
+    # over raw activation-dtype rows; widen here (no-op when already fp32)
     # so this reference stays bit-identical for every caller.
     compressor_kv = compressor_kv.float()
     compressor_gate = compressor_gate.float()
@@ -541,26 +540,6 @@ def _slice_sequence_positions(
     if position_ids.shape[0] > seq_idx and position_ids.shape[0] != 1:
         return position_ids[seq_idx : seq_idx + 1, :seq_len]
     return position_ids.reshape(1, -1)[:, flat_start : flat_start + seq_len]
-
-
-def _slice_sequence_kv_rows(
-    kv: torch.Tensor,
-    seq_idx: int,
-    flat_start: int,
-    seq_len: int,
-    num_seq: int,
-    compress_ratio: int,
-) -> torch.Tensor:
-    if compress_ratio == 0:
-        return _slice_sequence_tokens(kv, seq_idx, flat_start, seq_len)
-    if kv.shape[0] > seq_idx and kv.shape[0] != 1:
-        return kv[seq_idx]
-    if num_seq == 1:
-        return kv.reshape(-1, kv.shape[-1])
-    raise ValueError(
-        "Flattened compressed DeepSeek V4 sparse attention KV rows are not supported; "
-        f"pass batched kv for compress_ratio={compress_ratio}."
-    )
 
 
 def _cached_sparse_attention_from_positions(
@@ -1725,7 +1704,7 @@ def _batched_overlap_compressed_rows_fullrange(
             compressor_kv_cache, seq_idx, full_positions, cu_num_pages, cache_loc
         )
 
-    # Fused single-kernel path (idea_0075): collapse the gather / row-shift /
+    # Fused single-kernel path: collapse the gather / row-shift /
     # concat / where / pool / rmsnorm swarm into one launch that emits the
     # pooled+normed candidate rows directly from the paged caches and the hoisted
     # page maps.  Requires the ratio-4 overlap layout (>= 2*head_dim state
@@ -1915,7 +1894,7 @@ def _update_decode_compressed_caches(
     state_dim = int(compressor_kv_decode.shape[-1])
     head_dim = state_dim // mode.channels
     # The compressor kv/gate current-token rows are written by the caller's fused
-    # ``_fused_current_token_store`` (idea_0006) -- together with the SWA and
+    # ``_fused_current_token_store`` -- together with the SWA and
     # indexer-compressor rows -- before this helper runs, so they are already in
     # ``compressor_kv_cache`` / ``compressor_gate_cache`` when the compressed-row
     # reconstruction below reads them. The mhc_cache write further down targets a
@@ -1926,7 +1905,7 @@ def _update_decode_compressed_caches(
     # address; and, for the dense ratio-128 layers, the [num_seq, ratio] compressor
     # read page map). Every layer of this compression ratio resolves identical values,
     # so ``deepseek_v4_sparse_prepare_decode_page_addr`` hoists them once per forward
-    # and threads them in via ``update_meta`` (idea_0044); when absent (eager/CPU, or no
+    # and threads them in via ``update_meta``; when absent (eager/CPU, or no
     # prepare op) they are computed here. ``row_idx`` / ``row_logical_pos`` are cheap and
     # consumed only by the eager fallback below, so they stay local to that branch.
     if update_meta is not None:
@@ -1956,7 +1935,7 @@ def _update_decode_compressed_caches(
         hoisted_pos_page_ids = None
         hoisted_pos_page_offsets = None
 
-    # Fused ratio-4 path (idea_0007): the overlap reconstruction (gather / slice /
+    # Fused ratio-4 path: the overlap reconstruction (gather / slice /
     # ape-add / where / cat / pool / rmsnorm), the rope/fp8-quant tail
     # (``_apply_compressed_rope_and_quantize``, rotate=False), the ``cos``/``sin``
     # gathers and the validity-masked store collapse into two kernels reading the
@@ -1998,12 +1977,12 @@ def _update_decode_compressed_caches(
             rope_dim,
             # Reconstruction compute/rounding dtype. The rows are reconstructed from the
             # fp32 compressor caches, so anchor on the cache dtype -- the incoming decode
-            # rows may now be raw bf16 (idea_0092) and must not narrow this math.
+            # rows may now be raw bf16 and must not narrow this math.
             compressor_kv_cache.dtype,
         )
         return
 
-    # Fused ratio-128 (dense, non-overlap) path (idea_0039): the ratio-4 kernel fuses its
+    # Fused ratio-128 (dense, non-overlap) path: the ratio-4 kernel fuses its
     # whole reconstruction in one program per row, but the dense ``[ratio, head_dim]`` pool
     # tile is too large for that, so the pool is D-tiled (``_paged_compress_pool``), RMSNorm
     # is a separate ``head_dim`` reduction (``_compressor_rms_norm``) and the rope/fp8/store
@@ -2062,7 +2041,7 @@ def _update_decode_compressed_caches(
             compress_ratio,
             head_dim,
             rope_dim,
-            # Cache-anchored compute dtype -- see the ratio-4 call above (idea_0092).
+            # Cache-anchored compute dtype -- see the ratio-4 call above.
             compressor_kv_cache.dtype,
         )
         return
@@ -2090,7 +2069,7 @@ def _update_decode_compressed_caches(
         rope_dim,
         compress_ratio,
         head_dim,
-        # Cache-anchored compute dtype -- see the fused paths above (idea_0092).
+        # Cache-anchored compute dtype -- see the fused paths above.
         compressor_kv_cache.dtype,
         overlap_page_map=overlap_page_map,
     )
@@ -2165,7 +2144,7 @@ def _select_decode_ratio4_indexer_rows(
     index_head_dim = int(q_index.shape[-1])
     index_n_heads = int(q_index.shape[1])
     # Raw (unscaled, model-dtype) indexer weights arrive at the op boundary
-    # (idea_0089): every score path below folds the eager
+    #: every score path below folds the eager
     # ``weights.float() * scale`` pre-scale into its own fp32 weight widening.
     # The expression mirrors ``DeepseekV4Indexer`` exactly
     # (``softmax_scale * index_n_heads**-0.5`` with ``softmax_scale ==
@@ -2202,8 +2181,7 @@ def _select_decode_ratio4_indexer_rows(
         and sin_table.shape == cos_table.shape
     )
     if use_fused_index_k:
-        # Fused candidate-row -> index-key -> masked-score front (idea_0063
-        # remainder + idea_0012 fold): one kernel reconstructs every candidate row
+        # Fused candidate-row -> index-key -> masked-score front: one kernel reconstructs every candidate row
         # from the paged caches via the hoisted full-range page map, applies the
         # rope + hadamard/fake-fp4 tail in registers, and consumes the key with
         # the score kernel's dot/relu/weighted-head-reduce/visibility tail in the
@@ -2300,7 +2278,7 @@ def _select_decode_ratio4_indexer_rows(
             and index_head_dim >= 16
         ):
             # Fused matmul + relu + weighted head reduction + visibility mask
-            # (idea_0004): the [N, H, C] head-by-candidate score and the separate
+            #: the [N, H, C] head-by-candidate score and the separate
             # masked [N, C] tensor are never materialized -- one kernel emits the
             # masked score row fed straight into the top-k below. Scores match the
             # eager chain to within one ULP so the selected rows / sort order are
@@ -2317,14 +2295,14 @@ def _select_decode_ratio4_indexer_rows(
             index_score = index_score.masked_fill(~visible, float("-inf"))
     topk_count = min(index_topk, max_compressed_len)
     if _HAS_TRITON and index_score.is_cuda and index_score.dtype == torch.float32:
-        # One-launch exact top-k select (idea_0046): replaces the fat
+        # One-launch exact top-k select: replaces the fat
         # gatherTopK / radixSortKVInPlace pair, the decomposed isfinite/where
         # fixups and the short-history pad path with a single kernel emitting the
         # padded rows/validity directly.  Byte-identical to the eager tail below,
         # tie order included (see _dsv4_topk_select_kernel + the op unit test).
         # ``input_pos`` asserts the score rows are -inf beyond the visibility
         # bound (every path above masks with it), enabling the banded kernel's
-        # visible-prefix fast path (idea_0089).
+        # visible-prefix fast path.
         return _fused_topk_select(index_score, index_topk, topk_count, input_pos, 4)
     topk_values, topk_rows = index_score.topk(topk_count, dim=-1)
     topk_valid = torch.isfinite(topk_values)
@@ -2507,7 +2485,7 @@ def _decode_compressed_cache_attention(
     else:
         # Dense ratio-128: the candidate rows are the full [0, max_compressed_len)
         # range and their validity is a pure function of input_pos, so the fused
-        # assemble kernel derives both in-kernel (idea_0090) and the captured
+        # assemble kernel derives both in-kernel and the captured
         # per-layer arange/add/floordiv/clamp/compare chain disappears. Only the
         # eager fallback below materializes them.
         selected_rows = None
@@ -2652,7 +2630,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
     topk_decode = _flatten_decode_tokens(topk_idxs, num_decode)
     del slot_idx
     # Long decode metadata, hoisted once per forward by
-    # ``deepseek_v4_sparse_prepare_decode_page_addr`` (idea_0090) and shared by
+    # ``deepseek_v4_sparse_prepare_decode_page_addr`` and shared by
     # every layer in place of the per-layer arange + int32 -> int64 cast pair the
     # lines below rebuild. Slice to the active decode sequences; ``None`` keeps
     # the per-layer computation as the (byte-identical) fallback.
@@ -2690,7 +2668,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             full_valid[:num_decode],
         )
 
-    # Compressed-cache UPDATE metadata (idea_0044), hoisted once per forward by
+    # Compressed-cache UPDATE metadata, hoisted once per forward by
     # ``deepseek_v4_sparse_prepare_decode_page_addr`` and shared by every layer of this
     # ratio class. Select the bundle matching this layer's ratio and slice to the active
     # decode sequences; ``None`` falls back to per-layer computation inside
@@ -2716,7 +2694,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             r128_pos_page_offsets[:num_decode],
         )
 
-    # Current-token cache writes (idea_0006). Every DeepSeek-V4 cache listed below
+    # Current-token cache writes. Every DeepSeek-V4 cache listed below
     # stores the freshly produced current decode-token row at logical position
     # ``input_pos`` and shares the hoisted ``(cur_page_ids, cur_page_offsets)`` write
     # address, so a single fused paged store replaces the per-cache ``index_put``
@@ -2856,7 +2834,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             precomputed_selection=precomputed_selection,
         )
     else:
-        # Hoisted once-per-forward SWA local-window page map + rel_topk (idea_0086),
+        # Hoisted once-per-forward SWA local-window page map + rel_topk,
         # shared by every window-only layer. Slice to the active decode sequences;
         # the shape guard keeps the per-layer fallback for any layer whose window
         # width differs from the hoisted contract.
@@ -2892,30 +2870,6 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
         out.copy_(output)
         return out.new_empty(0)
     return output
-
-
-def _cached_decode_topk_positions(
-    topk_seq: torch.Tensor,
-    input_pos: int,
-    window_size: Optional[int],
-    compress_ratio: int,
-) -> torch.Tensor:
-    if compress_ratio == 0 or window_size is None:
-        return topk_seq
-
-    local_window_cols = min(window_size, topk_seq.shape[-1])
-    if local_window_cols == 0:
-        return topk_seq
-
-    token_offsets = torch.arange(topk_seq.shape[0], device=topk_seq.device).unsqueeze(1)
-    query_positions = input_pos + token_offsets
-    window_offsets = torch.arange(local_window_cols, device=topk_seq.device)
-    local_topk = query_positions - local_window_cols + 1 + window_offsets
-    local_topk = torch.where(local_topk < 0, -1, local_topk)
-    local_topk = local_topk.to(topk_seq.dtype)
-    if local_window_cols == topk_seq.shape[-1]:
-        return local_topk
-    return torch.cat((local_topk, topk_seq[..., local_window_cols:]), dim=-1)
 
 
 def _sparse_attention_query_chunk_size(
@@ -2966,7 +2920,7 @@ _SPARSE_ATTN_DECODE_CTA_TARGET = 80  # split-K grid CTA budget (head_groups*num_
 # HEAD_BLOCK to 1, leaving thin M=1 split-K tiles.  Halving SEQ_BLOCK (more split-K
 # parts), packing a few heads per CTA (fatter MMA M-tile), using only 4 split-K warps
 # (8 over-subscribes the small tile) and 16 reduce warps (cover the D-wide partial row
-# in one pass) cut the H=8/L=640/D=512 decode attend by ~4.5% (swept; idea_0020).
+# in one pass) cut the H=8/L=640/D=512 decode attend by ~4.5% (swept).
 # Larger H (e.g. full H=64) already has enough head-parallel CTAs and is *not* routed
 # here — it regresses under this config, so the predicate is strictly H <= MAX_HEADS.
 _SPARSE_ATTN_DECODE_SMALL_H_MAX_HEADS = 8
@@ -2975,7 +2929,7 @@ _SPARSE_ATTN_DECODE_SMALL_H_HEAD_BLOCK = 4
 _SPARSE_ATTN_DECODE_SMALL_H_NUM_WARPS = 4  # split-K partial warps for the small M-tile
 _SPARSE_ATTN_DECODE_SMALL_H_REDUCE_NUM_WARPS = 16
 
-# Banded decode top-k select (idea_0087).  The exact top-k of C candidates only
+# Banded decode top-k select.  The exact top-k of C candidates only
 # needs each TOPK_BLOCK-wide band sorted before the bitonic top-k merge tail, so
 # bands sort on parallel CTAs instead of one CTA serializing a BLOCK_C-wide sort
 # (the ~2.2x win at the traced [1, 2048] -> 512 decode shape).  Swept: 8 warps
@@ -2985,7 +2939,7 @@ _SPARSE_TOPK_BAND_NUM_WARPS = 8
 _SPARSE_TOPK_SORT_NUM_WARPS = 4
 _SPARSE_TOPK_WIDE_BAND_MIN_BLOCK = 512
 
-# Activation dtypes the fused ratio-4 compressed-row kernel can round to (idea_0088):
+# Activation dtypes the fused ratio-4 compressed-row kernel can round to:
 # its in-register store tail needs the rounding dtype as a constexpr because the
 # kernel no longer has an activation-typed output pointer to derive it from.
 _TL_ROUND_DTYPES = (
@@ -3396,7 +3350,7 @@ if _HAS_TRITON:
         The caches differ in dtype (SWA is the activation dtype, the compressor
         caches are fp32) and row width, so each is dispatched to its own pointer;
         unused slots (``c >= N_CACHES``) are never launched.  Sources arrive in
-        their native producer dtype and are converted on store (idea_0092), so the
+        their native producer dtype and are converted on store, so the
         launch is byte-identical to the prior per-cache
         ``cache[page_ids, page_offsets] = values.to(cache.dtype)`` without the
         bf16 -> fp32 pre-cast copy kernels.
@@ -3560,7 +3514,7 @@ if _HAS_TRITON:
         TWO_R: tl.constexpr,  # 2 * compress_ratio (8)
         BLOCK_D: tl.constexpr,  # next_pow2(head_dim)
     ):
-        """Fused ratio-4 full-range candidate-row reconstruction (idea_0075).
+        """Fused ratio-4 full-range candidate-row reconstruction.
 
         One program per (batch ``b``, candidate row ``r``).  It gathers the ``2*R``
         paged compressor kv/gate slots for the overlap window (the previous block
@@ -3685,7 +3639,7 @@ if _HAS_TRITON:
         The shared per-(``b``, ``r``) body of ``_dsv4_fullrange_index_k_kernel``
         (which stores the ``[B, M, head_dim]`` key tensor) and
         ``_dsv4_fullrange_index_score_kernel`` (which consumes the key in
-        registers, idea_0012).  Returns the ``[BLOCK_D]`` fp32 key ahead of the
+        registers).  Returns the ``[BLOCK_D]`` fp32 key ahead of the
         caller's ``ROUND`` store/use point; every intermediate rounding matches the
         pre-refactor ``_dsv4_fullrange_index_k_kernel`` body verbatim.
         """
@@ -3845,7 +3799,7 @@ if _HAS_TRITON:
         NB: tl.constexpr,  # HEAD_DIM // FP4_BLOCK fake-fp4 quant groups
         FP4_BLOCK: tl.constexpr,  # fp4 quant group size (32)
     ):
-        """Fused ratio-4 full-range candidate *index-key* production (idea_0063).
+        """Fused ratio-4 full-range candidate *index-key* production.
 
         Extends ``_dsv4_fullrange_candidate_rows_kernel`` (identical paged
         reconstruction / pool / rmsnorm front, one program per (batch ``b``,
@@ -3937,7 +3891,7 @@ if _HAS_TRITON:
         reduction run in fp32, so the score values (and therefore the top-k sort order)
         stay within one ULP of the reference and the selected rows are preserved.
         ``W_SCALE`` folds the eager per-head weight pre-scale into the fp32 weight
-        load exactly like ``_dsv4_fullrange_index_score_kernel`` (idea_0089).
+        load exactly like ``_dsv4_fullrange_index_score_kernel``.
         """
         n = tl.program_id(0)
         cb = tl.program_id(1)
@@ -4017,7 +3971,7 @@ if _HAS_TRITON:
         H_BLOCK: tl.constexpr,  # next_pow2(H), >= 16 (tl.dot minimum tile)
         C_TILE: tl.constexpr,  # row-0 embedding tile M (16: tl.dot minimum)
     ):
-        """Fused ratio-4 decode index score straight from the paged state (idea_0012).
+        """Fused ratio-4 decode index score straight from the paged state.
 
         One program per (batch ``b``, candidate row ``r``): reconstruct the
         post-rope post-hadamard/fake-fp4 index key via
@@ -4025,7 +3979,7 @@ if _HAS_TRITON:
         consume it in registers with the ``_dsv4_index_score_kernel`` tail, so the
         ``[B, M, head_dim]`` candidate index-key tensor is never materialized.
 
-        Invisible candidate rows (``r >= visible_len``) early-exit (idea_0089):
+        Invisible candidate rows (``r >= visible_len``) early-exit:
         their score is the visibility mask's ``-inf`` regardless of the
         reconstruction, so the program stores it and retires after one scalar
         load.  The grid is sized for ``M = max_compressed_len`` while a decode
@@ -4230,7 +4184,7 @@ if _HAS_TRITON:
         K_OUT,  # index_topk (output row width)
         TOPK_COUNT,  # min(index_topk, C): slots filled from the sort
         RATIO,  # compress_ratio: visible = min((input_pos + 1) // RATIO, C)
-        HAS_VLEN: tl.constexpr,  # enable the visible-prefix band fast path (idea_0089)
+        HAS_VLEN: tl.constexpr,  # enable the visible-prefix band fast path
         BLOCK_C: tl.constexpr,  # next_pow2(C) == NBANDS * TOPK_BLOCK
         BLOCK_K: tl.constexpr,  # next_pow2(K_OUT)
         TOPK_BLOCK: tl.constexpr,  # min(BLOCK_C, next_pow2(TOPK_COUNT)): sorted band width
@@ -4238,7 +4192,7 @@ if _HAS_TRITON:
         LOG_NBANDS: tl.constexpr,  # log2(NBANDS): merge-tree depth
         LOG_TOPK: tl.constexpr,  # log2(TOPK_BLOCK)
     ):
-        """Exact decode top-k row selection for the ratio-4 indexer (idea_0046).
+        """Exact decode top-k row selection for the ratio-4 indexer.
 
         It replaces ``index_score.topk(topk_count)`` (the fat ``gatherTopK`` +
         ``radixSortKVInPlace`` pair), the decomposed ``isfinite`` chain, the
@@ -4251,15 +4205,15 @@ if _HAS_TRITON:
         value order, tie order included.  (One documented fold: ``-0.0`` ties
         with ``+0.0`` by ascending index.  torch's small-C sort path agrees;
         its large-C ``gatherTopK`` radix path instead ranks ``+0.0`` strictly
-        above ``-0.0`` -- the fused kernel keeps the folded semantics idea_0046
-        landed with, at every C.)  Non-finite scores (the ``-inf`` visibility
+        above ``-0.0`` -- the fused kernel keeps the folded
+        semantics at every C.)  Non-finite scores (the ``-inf`` visibility
         mask) decode to ``valid == 0`` / ``row == -1`` just like the eager
         ``isfinite``/``where`` tail.  NaN scores sort first (torch's "NaN
         is largest") and also emit ``-1``; only the relative order *among*
         multiple differently-signed NaNs may differ, where every affected slot
         is ``-1`` either way.
 
-        Banded tree layout (idea_0087): a lone CTA serializing a BLOCK_C-wide
+        Banded tree layout: a lone CTA serializing a BLOCK_C-wide
         bitonic ``tl.sort`` is the latency bottleneck at the decode shape
         (batch-one [1, 2048] -> 512), so the grid is (N, NBANDS) and each band
         CTA sorts only its TOPK_BLOCK-wide key slice.  The bands then reduce
@@ -4279,7 +4233,7 @@ if _HAS_TRITON:
         launch, so parity identifies the merger), which keeps replays of a
         captured CUDA graph correct without a zeroing launch.
 
-        Visible-prefix fast path (idea_0089, ``HAS_VLEN``): the caller
+        Visible-prefix fast path (``HAS_VLEN``): the caller
         guarantees ``score[n, c] == -inf`` for every ``c >= visible_len`` with
         ``visible_len = min((input_pos[n] + 1) // RATIO, C)`` (the score
         kernels' visibility mask).  While ``visible_len <= TOPK_BLOCK`` every
@@ -4374,7 +4328,7 @@ if _HAS_TRITON:
         BLOCK_D: tl.constexpr,  # next_pow2(head_dim)
         DENSE: tl.constexpr,  # derive dense (ratio-128) rows/validity in-kernel
     ):
-        """Fold the decode selected-KV assembly into one paged gather (idea_0001).
+        """Fold the decode selected-KV assembly into one paged gather.
 
         One program per (decode row ``b``, output slot ``slot``).  It replaces the
         per-ratio-4/128-layer tail of ``_decode_compressed_cache_attention`` -- the
@@ -4393,7 +4347,7 @@ if _HAS_TRITON:
         to the eager gather/cat/where chain -- including the clamped rows of masked
         slots, which the attend ignores (``rel_topk == -1``).
 
-        ``DENSE`` (idea_0090) covers the ratio-128 layers, whose selection is not
+        ``DENSE`` covers the ratio-128 layers, whose selection is not
         data-dependent: row ids are the full ``[0, TOPK)`` range (``TOPK ==
         max_compressed_len``) and validity is ``row < min(floor((input_pos + 1) /
         RATIO), TOPK)``.  Deriving both here drops the captured per-layer
@@ -4483,7 +4437,7 @@ if _HAS_TRITON:
         MAX_VAL: tl.constexpr,  # 448.0 (e4m3 absmax)
         MIN_VAL: tl.constexpr,  # 1e-4 (amax floor)
     ):
-        """Register-fed rope/fake-fp8/masked-store epilogue (idea_0088).
+        """Register-fed rope/fake-fp8/masked-store epilogue.
 
         The exact math of ``_dsv4_rope_fp8_masked_store_kernel`` operating on an
         in-register ``[BLOCK_D]`` post-rmsnorm row instead of a materialized
@@ -4575,7 +4529,7 @@ if _HAS_TRITON:
         MAX_VAL: tl.constexpr,  # 448.0 (e4m3 absmax)
         MIN_VAL: tl.constexpr,  # 1e-4 (amax floor)
     ):
-        """Fused ratio-4 main-compressor decode-row update (idea_0007 + idea_0088).
+        """Fused ratio-4 main-compressor decode-row update.
 
         One program per decode row ``b``.  Reconstructs the single just-completed
         compressed row exactly as ``_batched_compressed_rows_from_paged_state``'s
@@ -4586,7 +4540,7 @@ if _HAS_TRITON:
         RMS-norms over ``HEAD_DIM`` -- collapsing that gather / slice / ape-add /
         where / cat / pool / rmsnorm swarm into one launch.  The rope / fp8-quant /
         validity-masked store tail then runs in-register as the final stage
-        (``_dsv4_rope_fp8_store_tail``, idea_0088), removing the separate
+        (``_dsv4_rope_fp8_store_tail``), removing the separate
         ``_dsv4_rope_fp8_masked_store_kernel`` launch and the ``[N, HEAD_DIM]``
         normed-row round-trip.  All reductions are fp32-internal with bf16 rounding
         at the same points as the eager reference (gather ``.to(dtype)``, the ape
@@ -4597,7 +4551,7 @@ if _HAS_TRITON:
         band map by slot index ``s`` directly (no ``(r-1)*R+s`` fullrange remap) and
         masks the previous block with the band ``valid`` flag.
 
-        ``row_valid`` gates the whole program (idea_0093): it is true only on the
+        ``row_valid`` gates the whole program: it is true only on the
         ~1-in-RATIO decode steps that complete a compressed row, and the masked
         store epilogue writes nothing for invalid rows, so their entire
         reconstruction (band gather / ape / pool / rmsnorm / rope / fp8) is dead
@@ -4669,7 +4623,7 @@ if _HAS_TRITON:
         wgt = tl.load(norm_weight_ptr + d, mask=dmask, other=0.0).to(tl.float32)
         o = c * rinv * wgt
 
-        # In-register rope/fp8/masked-store tail (idea_0088).  ``o.to(ROUND)`` is the
+        # In-register rope/fp8/masked-store tail.  ``o.to(ROUND)`` is the
         # exact activation-dtype row the removed [N, HEAD_DIM] store+reload produced.
         # ``valid`` is necessarily true here (early exit above), so the tail's masked
         # store degenerates to an unconditional store of this row.
@@ -4720,10 +4674,10 @@ if _HAS_TRITON:
         MAX_VAL: tl.constexpr,  # 448.0 (e4m3 absmax)
         MIN_VAL: tl.constexpr,  # 1e-4 (amax floor)
     ):
-        """Fused main-compressor rope + fake-fp8 + validity-masked store (idea_0007, stage 2).
+        """Fused main-compressor rope + fake-fp8 + validity-masked store (stage 2).
 
-        No longer launched by the production compressed-row updates -- idea_0088
-        folded this tail into the producing kernels as the register-fed
+        No longer launched by the production compressed-row updates -- the tail is
+        folded into the producing kernels as the register-fed
         ``_dsv4_rope_fp8_store_tail`` epilogue (ratio-4 front kernel /
         ``_dsv4_norm_rope_fp8_masked_store_kernel``).  Retained byte-for-byte as the
         isolated tail-math reference the compressed-row update unit tests pin the
@@ -4815,7 +4769,7 @@ if _HAS_TRITON:
         MAX_VAL: tl.constexpr,  # 448.0 (e4m3 absmax)
         MIN_VAL: tl.constexpr,  # 1e-4 (amax floor)
     ):
-        """Fused rmsnorm + rope + fake-fp8 + validity-masked store (idea_0088).
+        """Fused rmsnorm + rope + fake-fp8 + validity-masked store.
 
         One program per decode row ``b``.  Collapses the ratio-128 compressed-row
         update tail -- the ``_compressor_rms_norm`` (``rms_norm_kernel``) launch, the
@@ -4827,7 +4781,7 @@ if _HAS_TRITON:
         activation-dtype rounding), so the in-register normed row is bit-identical to
         the one the removed launch stored; the rope/fp8/masked-store epilogue is the
         shared ``_dsv4_rope_fp8_store_tail``.  Invalid rows store nothing -- and skip
-        the whole program (idea_0093): ``row_valid`` is true only on the ~1-in-RATIO
+        the whole program: ``row_valid`` is true only on the ~1-in-RATIO
         row-completing decode steps, so on the other captured cudagraph replays the
         program retires after one scalar load instead of paying the pooled-row load,
         RMSNorm, rope and fp8 math whose result would be discarded.
@@ -4888,11 +4842,11 @@ if _HAS_TRITON:
         S,  # compressor state_dim (paged cache dim-2 stride, == HEAD_DIM here)
         APE_STRIDE,  # ape.shape[1]
         PAGEMAP_STRIDE,  # R (row stride of the [N, R] page maps)
-        HAS_VALID: tl.constexpr,  # gate programs on row_valid (idea_0093)
+        HAS_VALID: tl.constexpr,  # gate programs on row_valid
         BLOCK_R: tl.constexpr,  # next_pow2(R)
         BLOCK_D: tl.constexpr,
     ):
-        """Fused ratio-128 (dense) main-compressor pool front (idea_0039, stage 1).
+        """Fused ratio-128 (dense) main-compressor pool front (stage 1).
 
         D-tiled companion of ``_dsv4_compressed_row_r4_front_kernel``: one program per
         ``(decode row, HEAD_DIM block)``.  The ratio-128 pool tile ``[R, HEAD_DIM]`` is
@@ -4914,7 +4868,7 @@ if _HAS_TRITON:
         ``num_warps=4`` while ``deepseek_v4_compress_pool`` autotunes it), which flips at
         most a handful of near-zero channels by one bf16 ULP.
 
-        When ``HAS_VALID`` is set, ``row_valid`` gates the whole program (idea_0093):
+        When ``HAS_VALID`` is set, ``row_valid`` gates the whole program:
         the downstream norm/rope/store stage discards invalid rows entirely (its own
         early exit + masked store), so their pooled row is dead work -- skip the
         ``[R, BLOCK_D]`` paged loads and the pool after one scalar load.  Invalid rows
@@ -5137,7 +5091,7 @@ def _fused_current_token_store(
     ``index_put`` scatters into a single ``_multi_current_token_store_kernel`` launch
     removes ~4 (ratio-4) / ~2 (ratio-128) gather/scatter kernels per layer per decode
     step. Values are handed to the kernel in their native producer dtype and converted
-    to the cache dtype by the store itself (idea_0092), removing the per-cache
+    to the cache dtype by the store itself, removing the per-cache
     bf16 -> fp32 ``.to(cache.dtype)`` copy kernels the wrapper used to launch. The
     bf16 -> fp32 widening (the only production conversion; fp32 -> bf16 rounds
     nearest-even in both torch and Triton) is exact, so the result stays
@@ -5292,7 +5246,7 @@ def _fused_assemble_selected_kv(
     ``_decode_attention_from_selected``.  Byte-identical to the eager
     gather/cat/where chain it replaces (see ``_dsv4_assemble_selected_kv_kernel``).
 
-    ``selected_rows is None`` selects the dense (ratio-128) mode (idea_0090):
+    ``selected_rows is None`` selects the dense (ratio-128) mode:
     ``dense_num_rows`` (== ``max_compressed_len``) sets the compressed slot count
     and the kernel derives the row ids (``arange``) and their visibility
     (``row < min(floor((input_pos + 1) / ratio), dense_num_rows)``) in-kernel
@@ -5359,7 +5313,7 @@ def _fused_fullrange_candidate_rows(
     max_compressed_len: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """One-launch ratio-4 full-range candidate-row reconstruction (idea_0075).
+    """One-launch ratio-4 full-range candidate-row reconstruction.
 
     Replaces the gather / row-shift / concat / where / pool / rmsnorm swarm of
     ``_batched_overlap_compressed_rows_fullrange`` with a single kernel that emits
@@ -5415,7 +5369,7 @@ def _fused_fullrange_index_k(
     max_compressed_len: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """One-launch ratio-4 decode index-key production (idea_0063 remainder).
+    """One-launch ratio-4 decode index-key production.
 
     Emits the post-rope, post-hadamard/fake-fp4 ``[B, max_compressed_len, head_dim]``
     index keys consumed by ``_fused_index_score`` directly from the paged
@@ -5490,7 +5444,7 @@ def _fused_fullrange_index_score(
     max_compressed_len: int,
     w_scale: float = 1.0,
 ) -> torch.Tensor:
-    """One-launch ratio-4 decode index score from the paged state (idea_0012).
+    """One-launch ratio-4 decode index score from the paged state.
 
     Folds ``_fused_fullrange_index_k`` + ``_fused_index_score`` into a single
     kernel: each program reconstructs its candidate index key from the paged
@@ -5499,7 +5453,7 @@ def _fused_fullrange_index_score(
     row fed straight into the top-k.  The ``[B, M, head_dim]`` index-key tensor,
     its HBM round trip, the separate score launch and the eager
     ``indexer_weights`` fp32 cast all drop out of the decode graph.  Invisible
-    candidate rows early-exit before the paged reconstruction (idea_0089), and
+    candidate rows early-exit before the paged reconstruction, and
     ``w_scale`` folds the eager per-head weight pre-scale into the kernel's fp32
     weight widening (``float(w) * w_scale``, bit-equal to the removed
     ``weights.float() * scale`` pair).  Scores match the two-kernel chain
@@ -5577,7 +5531,7 @@ def _fused_compressed_row_update_r4(
     rope_dim: int,
     dtype: torch.dtype,
 ) -> None:
-    """Single-launch ratio-4 main-compressor compressed-row update (idea_0007 + idea_0088).
+    """Single-launch ratio-4 main-compressor compressed-row update.
 
     Replaces the ``_batched_compressed_rows_from_paged_state`` (overlap) reconstruction
     swarm + ``_apply_compressed_rope_and_quantize`` rope/fp8 tail + ``cos``/``sin``
@@ -5585,7 +5539,7 @@ def _fused_compressed_row_update_r4(
     reconstructs the post-rmsnorm rows from the paged caches and the hoisted overlap
     band map, then fp8-quantizes the nope slice, RoPE-rotates the pe slice and
     validity-masked-stores the row into ``mhc_cache`` as its in-register final stage
-    (idea_0088 -- previously a separate ``_dsv4_rope_fp8_masked_store_kernel`` launch
+    (previously a separate ``_dsv4_rope_fp8_masked_store_kernel`` launch
     reading a materialized ``[N, head_dim]`` normed row).  Invalid rows write nothing
     (byte-identical to the prior read-old + write-back no-op).
     """
@@ -5653,9 +5607,9 @@ def _launch_compressed_rope_fp8_store(
 ) -> None:
     """Standalone stage-2 tail: fp8(nope) + interleaved RoPE(pe) + validity-masked store.
 
-    Launches ``_dsv4_rope_fp8_masked_store_kernel`` (idea_0007) over the ``[N, head_dim]``
-    post-rmsnorm rows.  No longer called by the production compressed-row updates --
-    idea_0088 folded this tail into the producing kernels as the register-fed
+    Launches ``_dsv4_rope_fp8_masked_store_kernel`` over the ``[N, head_dim]``
+    post-rmsnorm rows.  No longer called by the production compressed-row updates -- the tail is
+    folded into the producing kernels as the register-fed
     ``_dsv4_rope_fp8_store_tail`` epilogue -- but retained (with the kernel, byte-for-byte)
     as the isolated tail-math reference the compressed-row update unit tests pin the fold
     against.  Ratio-agnostic: both the ratio-4 (overlap) and ratio-128 (dense) updates
@@ -5717,7 +5671,7 @@ def _paged_compress_pool(
     ~512-CTA machine-fill target, floor 16) so the small decode ``N`` is not
     occupancy-starved.  Returns the pooled ``[N, head_dim]`` row in ``dtype``.
 
-    When ``row_valid`` is given, invalid rows are skipped entirely (idea_0093) and
+    When ``row_valid`` is given, invalid rows are skipped entirely and
     their slot of the returned tensor is unwritten garbage -- callers must gate every
     consumer of those rows on the same ``row_valid`` (the fused ratio-128 update's
     norm/rope/store stage does).  Valid rows are byte-identical to the ungated pool.
@@ -5776,14 +5730,14 @@ def _fused_compressed_row_update_r128(
     rope_dim: int,
     dtype: torch.dtype,
 ) -> None:
-    """Two-launch ratio-128 (dense) main-compressor compressed-row update (idea_0039 + idea_0088).
+    """Two-launch ratio-128 (dense) main-compressor compressed-row update.
 
     The dense-path analogue of ``_fused_compressed_row_update_r4``.  Ratio-4 fused its
     reconstruction in a single one-program-per-row front kernel because its ``[2*ratio,
     head_dim]`` pool tile fits one program; the ratio-128 ``[ratio, head_dim]`` tile does
     not, so the pool is D-tiled instead (``_paged_compress_pool``) while RMSNorm and the
     rope/fp8/validity-masked-store tail collapse into one one-program-per-row kernel
-    (``_dsv4_norm_rope_fp8_masked_store_kernel``, idea_0088 -- previously a separate
+    (``_dsv4_norm_rope_fp8_masked_store_kernel`` -- previously a separate
     ``rms_norm_kernel`` launch, a ``[N, head_dim]`` normed-row round-trip and a
     ``_dsv4_rope_fp8_masked_store_kernel`` launch).  This replaces the dense-branch
     ``_batched_compressed_rows_from_paged_state`` reconstruction (2 paged gathers, 2 casts,
@@ -5798,7 +5752,7 @@ def _fused_compressed_row_update_r128(
     if n == 0 or head_dim == 0:
         return
     # Stage 1: paged gather(kv/gate) + ape-add + softmax-pool -> pooled [N, head_dim].
-    # ``row_valid`` gates both stages (idea_0093): a ratio-128 row completes only once
+    # ``row_valid`` gates both stages: a ratio-128 row completes only once
     # every 128 decode steps, so on all other captured cudagraph replays both programs
     # retire after one scalar load. Invalid rows of ``pooled`` are unwritten garbage;
     # stage 2 is their only consumer and early-exits before reading them.
@@ -5854,7 +5808,7 @@ def _fused_index_score(
     compress_ratio: int,
     w_scale: float = 1.0,
 ) -> torch.Tensor:
-    """One-launch fused ratio-4 lightning-indexer score (idea_0004).
+    """One-launch fused ratio-4 lightning-indexer score.
 
     Replaces ``(matmul(q_index, index_k^T).float().relu() * indexer_weights.float()
     .unsqueeze(-1)).sum(dim=1)`` + ``masked_fill(~visible, -inf)`` with a single kernel
@@ -5912,24 +5866,24 @@ def _fused_topk_select(
     input_pos: Optional[torch.Tensor] = None,  # [N] int decode position (visibility bound)
     compress_ratio: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One-launch exact decode top-k row selection (idea_0046).
+    """One-launch exact decode top-k row selection.
 
-    Replaces the ``index_score.topk(topk_count)`` + ``isfinite`` + ``where`` +
-    pad tail of ``_select_decode_ratio4_indexer_rows`` with a single kernel that
-    emits the padded ``[N, index_topk]`` rows / validity directly.  Byte-identical
-    to the eager chain for finite and ``-inf`` scores, tie order included
-    (validated in the op unit test); see ``_dsv4_topk_select_kernel``.  When the
-    candidate row is wider than the selection, the kernel spreads the bitonic
-    sort across one CTA per TOPK_BLOCK-wide band (idea_0087); the tickets the
-    band CTAs synchronize on live in ``_TOPK_SELECT_TICKETS``.
+     Replaces the ``index_score.topk(topk_count)`` + ``isfinite`` + ``where`` +
+     pad tail of ``_select_decode_ratio4_indexer_rows`` with a single kernel that
+     emits the padded ``[N, index_topk]`` rows / validity directly.  Byte-identical
+     to the eager chain for finite and ``-inf`` scores, tie order included
+     (validated in the op unit test); see ``_dsv4_topk_select_kernel``.  When the
+     candidate row is wider than the selection, the kernel spreads the bitonic
+     sort across one CTA per TOPK_BLOCK-wide band; the tickets the
+     band CTAs synchronize on live in ``_TOPK_SELECT_TICKETS``.
 
-    Passing ``input_pos`` + ``compress_ratio`` asserts the caller masked
-    ``index_score[n, c] = -inf`` for every
-    ``c >= min((input_pos[n] + 1) // compress_ratio, C)`` (the score kernels'
-    visibility bound), enabling the banded kernel's visible-prefix fast path
-    (idea_0089): while the visible prefix fits the first band, band 0 emits its
-    own sort directly and the other band CTAs retire without loads, heap
-    stores, tickets or merges -- byte-identical output.
+     Passing ``input_pos`` + ``compress_ratio`` asserts the caller masked
+     ``index_score[n, c] = -inf`` for every
+     ``c >= min((input_pos[n] + 1) // compress_ratio, C)`` (the score kernels'
+     visibility bound), enabling the banded kernel's visible-prefix fast path
+    : while the visible prefix fits the first band, band 0 emits its
+     own sort directly and the other band CTAs retire without loads, heap
+     stores, tickets or merges -- byte-identical output.
     """
     num_rows, c = int(index_score.shape[0]), int(index_score.shape[1])
     device = index_score.device
@@ -6501,7 +6455,7 @@ if _HAS_TRITON:
         ratio-128 compressed-cache update metadata (incl. the ``[R128]`` read map),
         and (when ``W > 0``) the SWA local-window page map + ``rel_topk`` bundle
         plus the once-per-forward long decode metadata (``seq_idx_long`` /
-        ``input_pos_long``, idea_0090).
+        ``input_pos_long``).
         Each translation mirrors ``_page_ids_and_offsets_from_tpb`` exactly (clamped
         ordinal, ``page_start`` fallback for invalid rows, clamped page-table index)
         so all values are bit-identical to the torch reference path.
@@ -6601,7 +6555,7 @@ if _HAS_TRITON:
             tl.store(r128_pos_poff_ptr + prow + pcols, p_off)
 
             if W > 0:
-                # SWA local-window bundle (idea_0086): positions
+                # SWA local-window bundle: positions
                 # ``input_pos - W + 1 .. input_pos`` with the combined
                 # (position && page) validity folded into ``rel_topk`` (slot
                 # index where valid, -1 otherwise). Mirrors
@@ -6624,7 +6578,7 @@ if _HAS_TRITON:
                 tl.store(swa_poff_ptr + srow + wcols, s_off, mask=wmask)
                 tl.store(swa_rel_ptr + srow + wcols, s_rel, mask=wmask)
 
-                # Once-per-forward long decode metadata (idea_0090): the identical
+                # Once-per-forward long decode metadata: the identical
                 # arange / widened input_pos every layer used to rebuild per call.
                 tl.store(seq_idx_long_ptr + pid_n, pid_n.to(tl.int64))
                 tl.store(input_pos_long_ptr + pid_n, pos)
@@ -6642,10 +6596,9 @@ if _HAS_TRITON:
         """One-launch Triton path for the 18/23-output decode prepare contract.
 
         The torch implementation of ``deepseek_v4_sparse_prepare_decode_page_addr``
-        spans ~130 tiny int kernels per forward (idea_0049); this emits the
-        identical tensors from a single kernel (plus the SWA local-window bundle,
-        idea_0086, and the long decode metadata, idea_0090, when
-        ``window_size > 0``). The torch body remains the reference / CPU fallback.
+        spans ~130 tiny int kernels per forward; this emits the
+        identical tensors from a single kernel (plus the SWA local-window bundle and the long decode
+        metadata when ``window_size > 0``). The torch body remains the reference / CPU fallback.
         """
         if cache_loc.numel() == 0:
             raise ValueError("cache_loc must contain at least one page id")
@@ -6672,7 +6625,7 @@ if _HAS_TRITON:
         r128_mhc_poff = torch.empty(num_seq, dtype=torch.long, device=device)
         r128_pos_pid = torch.empty(num_seq, dense_ratio, dtype=torch.long, device=device)
         r128_pos_poff = torch.empty(num_seq, dense_ratio, dtype=torch.long, device=device)
-        # SWA local-window bundle (idea_0086); 1-element dummies keep the kernel
+        # SWA local-window bundle; 1-element dummies keep the kernel
         # signature stable when the bundle is disabled (the W == 0 branch is
         # compiled out, so the dummies are never touched).
         if window_size > 0:
@@ -6771,52 +6724,52 @@ def deepseek_v4_sparse_prepare_decode_page_addr(
 ) -> List[torch.Tensor]:
     """Precompute the current-token paged write address once per forward.
 
-    Every DeepSeek V4 sparse-attention layer writes the freshly produced
-    KV / compressor / indexer rows for the *current* decode token to the same
-    logical position ``input_pos`` of caches that share one page table
-    (``cu_num_pages`` / ``cache_loc``) and one ``tokens_per_block``.  The
-    ``(page_id, page_offset)`` translation is therefore identical across all
-    layers and across all of those caches, yet the per-layer op currently
-    recomputes it once per current-token write (5x per layer).  Hoisting it
-    into this prepare op -- a single graph node whose result feeds every layer
-    -- removes that redundant, launch-bound page-map work while leaving the
-    stored values byte-identical.
+     Every DeepSeek V4 sparse-attention layer writes the freshly produced
+     KV / compressor / indexer rows for the *current* decode token to the same
+     logical position ``input_pos`` of caches that share one page table
+     (``cu_num_pages`` / ``cache_loc``) and one ``tokens_per_block``.  The
+     ``(page_id, page_offset)`` translation is therefore identical across all
+     layers and across all of those caches, yet the per-layer op currently
+     recomputes it once per current-token write (5x per layer).  Hoisting it
+     into this prepare op -- a single graph node whose result feeds every layer
+     -- removes that redundant, launch-bound page-map work while leaving the
+     stored values byte-identical.
 
-    Returns ``[page_ids, page_offsets]`` (both int64, shape ``[num_seq]``); the
-    decode op slices ``[:num_decode]``.  Mirrors ``_decode_page_ids_and_offsets``
-    for ``seq_idx = arange(num_seq)`` and ``positions = input_pos`` so the
-    produced addresses are bit-identical to the per-layer computation.
+     Returns ``[page_ids, page_offsets]`` (both int64, shape ``[num_seq]``); the
+     decode op slices ``[:num_decode]``.  Mirrors ``_decode_page_ids_and_offsets``
+     for ``seq_idx = arange(num_seq)`` and ``positions = input_pos`` so the
+     produced addresses are bit-identical to the per-layer computation.
 
-    When ``overlap_max_compressed_len > 0`` (the production contract) it also
-    emits the ratio-4 overlap band / full-range page maps (6 tensors) and the
-    compressed-cache UPDATE metadata for the ratio-4 and ratio-128 layers
-    (idea_0044): ``row_valid`` / query-relative rope position / ``mhc_cache``
-    write address for each ratio (4 + 4 tensors), plus the ratio-128
-    ``[num_seq, ratio]`` compressor read page map (2 tensors) -- 18 outputs
-    total.  ``dense_max_compressed_len`` is the ratio-128 ``max_compressed_len``
-    discovered from the graph; it selects the completed dense row.
+     When ``overlap_max_compressed_len > 0`` (the production contract) it also
+     emits the ratio-4 overlap band / full-range page maps (6 tensors) and the
+     compressed-cache UPDATE metadata for the ratio-4 and ratio-128 layers
+    : ``row_valid`` / query-relative rope position / ``mhc_cache``
+     write address for each ratio (4 + 4 tensors), plus the ratio-128
+     ``[num_seq, ratio]`` compressor read page map (2 tensors) -- 18 outputs
+     total.  ``dense_max_compressed_len`` is the ratio-128 ``max_compressed_len``
+     discovered from the graph; it selects the completed dense row.
 
-    When additionally ``window_size > 0`` (idea_0086) it emits the SWA
-    local-window decode bundle shared by every window-only
-    (``compress_ratio == 0``) layer: the ``[num_seq, window_size]`` page map
-    (``page_ids`` / ``page_offsets``) for the window positions
-    ``input_pos - window_size + 1 .. input_pos`` plus the precombined
-    ``rel_topk`` (slot index where the position and page are valid, ``-1``
-    otherwise).  This collapses the per-layer fused local-window page-map
-    kernel and the ``arange``/``where`` ``rel_topk`` chain into this single
-    prepare launch; only the layer-specific ``swa_cache`` row gather remains
-    per layer.
+     When additionally ``window_size > 0`` it emits the SWA
+     local-window decode bundle shared by every window-only
+     (``compress_ratio == 0``) layer: the ``[num_seq, window_size]`` page map
+     (``page_ids`` / ``page_offsets``) for the window positions
+     ``input_pos - window_size + 1 .. input_pos`` plus the precombined
+     ``rel_topk`` (slot index where the position and page are valid, ``-1``
+     otherwise).  This collapses the per-layer fused local-window page-map
+     kernel and the ``arange``/``where`` ``rel_topk`` chain into this single
+     prepare launch; only the layer-specific ``swa_cache`` row gather remains
+     per layer.
 
-    The same production contract finally appends the once-per-forward long
-    decode metadata (idea_0090): ``seq_idx_long`` (``arange(num_seq)``) and
-    ``input_pos_long`` (``input_pos`` widened to int64) -- 23 outputs total.
-    Every layer sliced these identical tensors out of an ``arange`` + int32
-    -> int64 cast pair per invocation; hoisting them here removes those two
-    captured launches per layer while keeping the consumed values
-    byte-identical.
+     The same production contract finally appends the once-per-forward long
+     decode metadata: ``seq_idx_long`` (``arange(num_seq)``) and
+     ``input_pos_long`` (``input_pos`` widened to int64) -- 23 outputs total.
+     Every layer sliced these identical tensors out of an ``arange`` + int32
+     -> int64 cast pair per invocation; hoisting them here removes those two
+     captured launches per layer while keeping the consumed values
+     byte-identical.
     """
     num_seq = int(cu_num_pages.shape[0]) - 1
-    # Single-launch Triton path (idea_0049): the torch graph below expands to ~130
+    # Single-launch Triton path: the torch graph below expands to ~130
     # tiny int kernels per forward; on CUDA one fused kernel emits the identical
     # 18-output contract. The torch body stays as the CPU / reference fallback.
     if (
@@ -6884,7 +6837,7 @@ def deepseek_v4_sparse_prepare_decode_page_addr(
             full_page_offsets,
             full_valid,
         ]
-        # Compressed-cache UPDATE metadata (idea_0044). Every layer of a given
+        # Compressed-cache UPDATE metadata. Every layer of a given
         # compression ratio resolves the identical row_valid / query-relative rope
         # position / mhc write address (they depend only on input_pos / position_ids
         # and the shared page table); the dense ratio-128 layers additionally read the
@@ -6937,7 +6890,7 @@ def deepseek_v4_sparse_prepare_decode_page_addr(
             r128_pos_poff,
         ]
         if window_size > 0:
-            # SWA local-window decode bundle (idea_0086). Mirrors the position
+            # SWA local-window decode bundle. Mirrors the position
             # generation + combined validity of ``_decode_local_cache_rows`` and the
             # ``rel_topk`` construction of ``_decode_attention_from_rows`` exactly, so
             # the per-layer consumption is bit-identical to the chain it replaces.
@@ -6953,7 +6906,7 @@ def deepseek_v4_sparse_prepare_decode_page_addr(
             rel = w_offsets.view(1, -1).expand(num_seq, -1)
             swa_rel_topk = torch.where(swa_valid, rel, torch.full_like(rel, -1))
             outs += [swa_page_ids, swa_page_offsets, swa_rel_topk]
-            # Once-per-forward long decode metadata (idea_0090), shared by every
+            # Once-per-forward long decode metadata, shared by every
             # layer's decode path in place of its per-layer arange / int64 cast.
             # ``positions_long`` may alias ``input_pos`` (already-long inputs), and
             # custom-op outputs must not alias inputs -- clone the returned copy.
@@ -6989,7 +6942,7 @@ def deepseek_v4_sparse_prepare_decode_page_addr_fake(
             torch.empty(num_seq, m * ratio, dtype=torch.long, device=device),
             torch.empty(num_seq, m * ratio, dtype=torch.long, device=device),
             torch.empty(num_seq, m * ratio, dtype=torch.bool, device=device),
-            # Compressed-cache UPDATE metadata (idea_0044): ratio-4 bundle (4) then
+            # Compressed-cache UPDATE metadata: ratio-4 bundle (4) then
             # ratio-128 bundle (6). The [num_seq, dense_ratio] pos map shape is fixed
             # by the dense compression ratio (independent of dense_max_compressed_len).
             torch.empty(num_seq, dtype=torch.bool, device=device),  # r4_row_valid
@@ -7006,13 +6959,13 @@ def deepseek_v4_sparse_prepare_decode_page_addr_fake(
             ),  # r128_pos_page_offsets
         ]
         if window_size > 0:
-            # SWA local-window decode bundle (idea_0086).
+            # SWA local-window decode bundle.
             w = int(window_size)
             outs += [
                 torch.empty(num_seq, w, dtype=torch.long, device=device),  # swa_page_ids
                 torch.empty(num_seq, w, dtype=torch.long, device=device),  # swa_page_offsets
                 torch.empty(num_seq, w, dtype=torch.long, device=device),  # swa_rel_topk
-                # Once-per-forward long decode metadata (idea_0090).
+                # Once-per-forward long decode metadata.
                 torch.empty(num_seq, dtype=torch.long, device=device),  # seq_idx_long
                 torch.empty(num_seq, dtype=torch.long, device=device),  # input_pos_long
             ]
@@ -7099,7 +7052,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
     """Reference paged cached DeepSeek V4 sparse attention with compressor state.
 
     PyTorch caps custom-op schemas at 64 arguments and this op sits exactly at
-    that cap: the once-per-forward hoisted metadata (idea_0090) took the slots
+    that cap: the once-per-forward hoisted metadata took the slots
     of the formerly unused device-side ``seq_len`` / ``cu_seqlen`` mirrors
     (their ``*_host`` twins carry the prefill path).
     """
@@ -7203,7 +7156,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
 
     if compress_ratio:
         # Prefill / mixed path: the producer hands over raw activation-dtype compressor
-        # rows (idea_0092) -- the pure-decode path above consumes them without widening
+        # rows -- the pure-decode path above consumes them without widening
         # (the fused current-token store converts in-kernel), so the one-time fp32
         # widening the modeling code used to do moves here, off the decode hot path.
         # bf16 -> fp32 is exact, so every prefill consumer below (the paged cache
@@ -7214,7 +7167,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
         compressor_gate = compressor_gate.float()
         indexer_compressor_kv = indexer_compressor_kv.float()
         indexer_compressor_gate = indexer_compressor_gate.float()
-        # Same idea for the per-head indexer weights (idea_0089): the model hands
+        # Same idea for the per-head indexer weights: the model hands
         # over the raw (unscaled, model-dtype) ``weights_proj`` output -- the
         # pure-decode path above folds ``float(w) * scale`` into its score
         # kernels -- so the one-time widening + pre-scale moves here, off the
@@ -7640,7 +7593,7 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
         # No device-side ``seq_len`` / ``cu_seqlen``: the op only reads their
         # ``*_host`` mirrors, and the two freed slots keep the 64-argument op
         # schema at the PyTorch cap while carrying the hoisted long decode
-        # metadata (idea_0090).
+        # metadata.
         return [
             "batch_info_host",
             "input_pos",
@@ -7682,7 +7635,7 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
         # Discover the ratio-4 (overlap+indexer) and ratio-128 (dense) max_compressed_len
         # shared by every layer of the respective ratio so the prepare op can hoist their
         # compressed-row / full-range page maps and their compressed-cache update metadata
-        # (idea_0044). Every layer of a given ratio shares one max_compressed_len (it is
+        # . Every layer of a given ratio shares one max_compressed_len (it is
         # derived only from compress_ratio and a global config), so the per-ratio max is
         # that uniform value. This method only receives one source node, so scan the shared
         # graph for all sparse-attn nodes.
@@ -7707,9 +7660,9 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
         # + 10 update-metadata tensors (ratio-4 row_valid/row_position_id/mhc page_ids/
         # page_offsets, then the same 4 for ratio-128, then the ratio-128 [N, ratio]
         # compressor read page_ids/page_offsets) + 3 SWA local-window tensors
-        # (page_ids/page_offsets/rel_topk shared by every window-only layer,
-        # idea_0086) + 2 long decode-metadata tensors (seq_idx_long/input_pos_long
-        # shared by every layer, idea_0090). Keep ``overlap_m`` / ``dense_m`` /
+        # (page_ids/page_offsets/rel_topk shared by every window-only layer) + 2 long
+        # decode-metadata tensors (seq_idx_long/input_pos_long shared by every
+        # layer). Keep ``overlap_m`` / ``dense_m`` /
         # ``window_size`` >= 1 so the map shapes stay valid and the per-layer argument
         # alignment is invariant even when a class is absent (the dummy maps are then
         # never consumed; the decode op additionally guards on the hoisted window

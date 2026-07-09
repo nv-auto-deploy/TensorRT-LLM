@@ -1,22 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit test for the fused compressed-row cache update (idea_0007 ratio-4, idea_0039 ratio-128).
+"""Unit test for the fused compressed-row cache update.
 
 ``_update_decode_compressed_caches`` reconstructs the just-completed main-compressor
 compressed row at decode time and stores it into ``mhc_cache`` on the ~1-in-ratio steps
-that complete a row.  idea_0007 collapses the ratio-4 (overlap) reconstruction swarm
+that complete a row.  the fused path collapses the ratio-4 (overlap) reconstruction swarm
 (gather / slice / ape-add / where / cat / pool / rmsnorm), the rope/fake-fp8 tail
 (``_apply_compressed_rope_and_quantize``, rotate=False), the ``cos``/``sin`` gathers and
 the validity-masked store into two Triton kernels
 (``_dsv4_compressed_row_r4_front_kernel`` + ``_dsv4_rope_fp8_masked_store_kernel``).
 
-idea_0039 extends the same collapse to the ratio-128 (dense, non-overlap) layers, whose
+the fused path extends the same collapse to the ratio-128 (dense, non-overlap) layers, whose
 ``[ratio, head_dim]`` pool tile is too large for the ratio-4 one-program-per-row strategy:
 the pool is D-tiled (``_dsv4_paged_compress_pool_kernel``), RMSNorm is the shipped fused
 ``triton_rms_norm`` (``_compressor_rms_norm``), and the rope/fp8/validity-masked-store tail
-is the same shared ``_dsv4_rope_fp8_masked_store_kernel`` idea_0007 introduced.
+is the same shared ``_dsv4_rope_fp8_masked_store_kernel`` the fused path introduced.
 
-idea_0088 folds that rope/fp8/masked-store tail into the producing kernels as a
+The fused path folds that rope/fp8/masked-store tail into the producing kernels as a
 register-fed final stage (``_dsv4_rope_fp8_store_tail``): the ratio-4 front kernel now
 stores the mhc row directly, and the ratio-128 rmsnorm + tail collapse into
 ``_dsv4_norm_rope_fp8_masked_store_kernel`` -- removing one launch per compressed layer
@@ -34,7 +34,7 @@ These tests pin that equivalence for the ratio-4 and ratio-128 modes so a regres
 cannot hide in the other, and they exercise both row-completing (valid) and non-completing
 (invalid, no-write) decode steps across multi-page position spans.
 
-idea_0093 gates every program of those kernels on ``row_valid`` at entry: a compressed
+Row gating runs every program of those kernels behind ``row_valid`` at entry: a compressed
 row completes only once every ``ratio`` decode steps, and invalid rows were already
 no-write, so on the other steps the programs now retire after one scalar load instead of
 paying the paged loads / pool / rmsnorm / rope / fp8 math whose result was discarded.
@@ -259,7 +259,7 @@ def test_rope_fp8_store_kernel_byte_exact(num_rows):
 @pytest.mark.parametrize("head_dim,rope_dim", [(512, 64), (256, 64)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_norm_rope_store_fused_kernel_matches_two_stage(num_rows, head_dim, rope_dim, dtype):
-    """idea_0088 byte-pin: the fused rmsnorm+rope+fp8+masked-store kernel == the old chain.
+    """Byte-pin: the fused rmsnorm+rope+fp8+masked-store kernel == the old chain.
 
     Feeds an identical pooled row to the retained two-stage reference
     (``_compressor_rms_norm`` -> ``_launch_compressed_rope_fp8_store``, i.e. the
@@ -310,7 +310,7 @@ def test_norm_rope_store_fused_kernel_matches_two_stage(num_rows, head_dim, rope
         rope_dim,
     )
 
-    # Fused single kernel (idea_0088).
+    # Fused single kernel.
     mhc_fused = mhc_cache.clone()
     grid = (num_rows,)
     M._dsv4_norm_rope_fp8_masked_store_kernel[grid](
@@ -353,7 +353,7 @@ def test_norm_rope_store_fused_kernel_matches_two_stage(num_rows, head_dim, rope
 def test_ratio128_fused_matches_eager(monkeypatch, num_rows):
     """Ratio-128 (dense) fused three-launch path == eager op-by-op reconstruction+store.
 
-    idea_0039: the fused path (D-tiled paged pool -> rmsnorm -> rope/fp8/masked-store) must
+    Ratio-128: the fused path (D-tiled paged pool -> rmsnorm -> rope/fp8/masked-store) must
     match the eager ``_batched_compressed_rows_from_paged_state`` (non-overlap) + eager
     where/write-back store.  The paged pool is bit-identical to ``gather + ape + pool`` and
     RMSNorm is unchanged, so end-to-end the only deviation is the tail rope FMA (<=1 ULP);
@@ -440,7 +440,7 @@ def test_ratio128_paged_pool_matches_gather_pool(num_rows):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 def test_all_invalid_steps_leave_cache_untouched(compress_ratio):
-    """idea_0093: non-completing steps must write nothing, byte-for-byte.
+    """Row gating: non-completing steps must write nothing, byte-for-byte.
 
     Overrides ``input_pos`` with only non-completing positions, including both
     validity boundaries -- one step BEFORE a row completes (``ratio-2``, e.g. 2/126)
@@ -482,7 +482,7 @@ def test_all_invalid_steps_leave_cache_untouched(compress_ratio):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
 def test_ratio128_paged_pool_row_valid_gate():
-    """idea_0093: the gated pool is byte-identical to the ungated pool on valid rows.
+    """Row gating: the gated pool is byte-identical to the ungated pool on valid rows.
 
     Invalid rows of the gated output are unwritten garbage by contract (their only
     consumer early-exits before reading them), so only valid rows are compared.
@@ -535,7 +535,7 @@ def test_ratio128_paged_pool_row_valid_gate():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 def test_row_valid_gate_under_cudagraph_replay(compress_ratio):
-    """idea_0093: the early exit is data-gated per replay, not baked in at capture.
+    """Row gating: the early exit is data-gated per replay, not baked in at capture.
 
     Captures the fused decode update once with ``row_valid`` threaded in via the
     hoisted ``update_meta`` (the production prepare-op contract), then replays the

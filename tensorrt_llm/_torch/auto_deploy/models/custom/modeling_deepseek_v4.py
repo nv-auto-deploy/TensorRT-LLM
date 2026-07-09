@@ -1081,7 +1081,7 @@ class DeepseekV4Compressor(nn.Module):
         self.norm = DeepseekV4RMSNorm(self.head_dim, config.rms_norm_eps)
 
     def project(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Raw activation-dtype rows (idea_0092): the sparse-attention op widens them
+        # Raw activation-dtype rows: the sparse-attention op widens them
         # where fp32 math needs it -- the decode current-token store converts in-kernel
         # (bf16 -> fp32 is exact), so no per-layer ``.float()`` copy runs at decode.
         # Consumers that need the fp32 tensors up front (``compress_projected`` on the
@@ -1160,7 +1160,7 @@ class DeepseekV4Compressor(nn.Module):
     ) -> torch.Tensor:
         kv_all, score_all = self.project(hidden_states)
         # ``compress_projected`` math (pool, ape add) ran on fp32 inputs before
-        # ``project`` started returning raw activation-dtype rows (idea_0092); widen
+        # ``project`` started returning raw activation-dtype rows; widen
         # here so this standalone path stays bit-identical.
         return self.compress_projected(
             kv_all.float(),
@@ -1236,7 +1236,7 @@ class DeepseekV4Indexer(nn.Module):
             tp_mode="none",
             layer_type="mla",
         )
-        # Raw (unscaled, model-dtype) weights are handed over (idea_0089): the
+        # Raw (unscaled, model-dtype) weights are handed over: the
         # cached sparse-attention op folds the ``float(w) * scale`` pre-scale
         # into its decode score kernels' fp32 weight load (bit-identical fp32
         # multiply) and pre-scales once at prefill entry, dropping the per-layer
@@ -1253,7 +1253,7 @@ class DeepseekV4Indexer(nn.Module):
         seq_len: int,
         offset: int,
     ) -> torch.Tensor:
-        # ``project`` hands over raw model-dtype weights (idea_0089); the
+        # ``project`` hands over raw model-dtype weights; the
         # widening + pre-scale moved here so this uncached reference stays
         # bit-identical to the pre-change chain.
         weights = weights.float() * (self.softmax_scale * self.index_n_heads**-0.5)
@@ -1309,7 +1309,7 @@ class DeepseekV4Indexer(nn.Module):
     ) -> torch.Tensor:
         q, weights, compressor_kv, compressor_gate = self.project(hidden_states, q_lora, cos, sin)
         # Same widening note as ``DeepseekV4Compressor.forward``: ``project`` returns
-        # raw activation-dtype rows (idea_0092); the standalone indexer path widens
+        # raw activation-dtype rows; the standalone indexer path widens
         # before ``compress_projected`` to keep its math bit-identical.
         index_k = self.compressor.compress_projected(
             compressor_kv.float(),
@@ -1510,7 +1510,7 @@ class DeepseekV4Attention(nn.Module):
         else:
             # Window-only layers mirror the compressed-layer placeholder trick above:
             # the cached decode path derives the local window from ``input_pos``
-            # directly (hoisted once per forward, idea_0086) and never reads
+            # directly (hoisted once per forward) and never reads
             # ``topk_idxs`` values, so emit a width-only allocation and let the
             # sparse-attention op rebuild the real window selection on the eager
             # prefill path (``topk_is_placeholder=True``). This removes the per-layer

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""idea_0067: hoist the per-step LM-head bf16->fp32 weight recast.
+"""Hoist the per-step LM-head bf16->fp32 weight recast.
 
 The DeepSeek-V4 LM head used to recompute ``self.head.weight.float()`` on every
 decode step (a constant 66M-element bf16->fp32 cast that cudagraph replays).

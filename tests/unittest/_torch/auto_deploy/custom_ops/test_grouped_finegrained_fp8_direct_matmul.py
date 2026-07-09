@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Correctness of the direct grouped block-FP8 W8A8 matmul (idea_0025).
+"""Correctness of the direct grouped block-FP8 W8A8 matmul.
 
 ``torch_fake_quant_grouped_finegrained_fp8_linear`` now keeps both operands in FP8 and runs a
 direct block-FP8 GEMM (the same ``_w8a8_block_fp8_matmul_triton`` kernel the non-grouped

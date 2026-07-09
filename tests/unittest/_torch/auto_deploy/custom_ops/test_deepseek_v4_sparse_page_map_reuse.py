@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit test for the per-layer DeepSeek-V4 sparse page-map reuse (idea_0007).
+"""Unit test for the per-layer DeepSeek-V4 sparse page-map reuse.
 
 The decode op recomputes ``_decode_page_ids_and_offsets`` once per cache read /
 write. Every sparse cache is a ``PagedResourceHandler`` allocated as

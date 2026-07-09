@@ -163,13 +163,6 @@ transforms:
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
-  bake_grouped_finegrained_fp8_weight:
-    stage: post_load_fusion
-    # Superseded by the direct grouped block-FP8 W8A8 matmul in
-    # torch_fake_quant_grouped_finegrained_fp8_linear (idea_0025): the op now consumes the FP8
-    # weight directly (FP8 GEMM with in-kernel per-block scales), so pre-baking the weight to
-    # BF16 would only force a wider 2-byte/elem weight read on the memory-bound decode GEMV.
-    enabled: false
   # Fuse sibling quantized projections that read the same activation into one
   # concatenated GEMM + narrow views. Scoped to fake-quantized groups (fp8_only)
   # with a bounded fused output width to avoid the unrestricted fuse_gemms OOM

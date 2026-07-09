@@ -7,7 +7,7 @@
 
 * ``_fused_sparse_attention_splitk_kernel`` + ``_fused_sparse_attention_reduce_kernel``
   -- the **decode** path (few query tokens, key reduction split across CTAs to fill
-  idle SMs). This is idea_0020's autotune target: the B=1 TP8 per-rank shape (H=8,
+  idle SMs). This is the autotune target: the B=1 TP8 per-rank shape (H=8,
   L=640, D=512).
 * ``_fused_sparse_attention_kernel`` -- the **prefill** path (many tokens, the simple
   flash-MQA kernel saturates the GPU with token*head parallelism).

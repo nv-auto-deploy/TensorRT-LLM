@@ -16,7 +16,7 @@
 
 ``deepseek_v4_sparse_prepare_decode_page_addr`` now also emits, once per forward,
 the SWA local-window page map + precombined ``rel_topk`` shared by every
-window-only (``compress_ratio == 0``) layer (idea_0086). These tests pin that:
+window-only (``compress_ratio == 0``) layer. These tests pin that:
 
 * the hoisted ``(page_ids, page_offsets, rel_topk)`` bundle is bit-identical to
   the per-layer chain it replaces (``_fused_local_window_pagemap`` /
@@ -113,7 +113,7 @@ def test_prepare_swa_bundle_matches_per_layer_reference(tokens_per_block, window
     swa_pid, swa_poff, swa_rel = outs[18:21]
     assert swa_pid.shape == (num_seq, window_size)
     assert swa_rel.dtype == torch.long
-    # Once-per-forward long decode metadata (idea_0090): the exact arange /
+    # Once-per-forward long decode metadata: the exact arange /
     # widened input_pos every layer's decode path used to rebuild per call.
     assert torch.equal(outs[21], torch.arange(num_seq, dtype=torch.long))
     assert torch.equal(outs[22], input_pos.reshape(-1)[:num_seq].to(torch.long))

@@ -260,13 +260,13 @@ def deepseek_v4_hadamard_fp4(x: torch.Tensor, block_size: int = 32) -> torch.Ten
     x2 = x.reshape(R, dim)
     out2 = out.reshape(R, dim)
 
-    # Occupancy (idea_0046): one warp per program. Each program handles a
+    # Occupancy: one warp per program. Each program handles a
     # single DIM<=256 row (or BLOCK_R such rows below), so a single warp covers
     # it with intra-warp shuffles for the FP4 block reductions; extra warps add
     # cross-warp smem barriers. num_stages=1 is a zero-cost guard: the kernel is
     # loop-free so there is nothing to pipeline (nw*/default == nw*/s1, inert).
     if R >= _BLOCKED_ROW_THRESHOLD:
-        # Layout (idea_0049): at large R the 1-row kernel's R single-warp CTAs are
+        # Layout: at large R the 1-row kernel's R single-warp CTAs are
         # dominated by per-CTA scheduling overhead. A [BLOCK_R, DIM] tile per
         # program amortizes it -- bit-identical, but the element-to-thread mapping
         # changes. Big win on the prefill indexer-q path (R = B*S*n_heads_local).
