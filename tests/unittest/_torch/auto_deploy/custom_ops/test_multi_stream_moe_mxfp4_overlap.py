@@ -28,10 +28,19 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401  (register ops)
 from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe import mxfp4_moe  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.interface import (
+    SharedConfig,
+    Stages,
+    TransformConfig,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant import FuseFP8SwigluActQuant
 from tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_moe import (
     _execute_shared_expert_in_aux_stream,
 )
+from tensorrt_llm._torch.auto_deploy.utils._graph import run_shape_prop
 from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import (
     begin_aux_stream_passthrough,
     cuda_stream_manager,
@@ -298,3 +307,289 @@ def test_multi_stream_moe_rewrite_is_idempotent():
     out = gm(*args)
     torch.cuda.synchronize()
     assert torch.equal(out, ref_out)
+
+
+# ---------------------------------------------------------------------------
+# Post-idea_0007 graph shape: block-FP8 shared expert with the fused
+# swiglu+act-quant tail feeding the residual-add-prequant down projection
+# (residual = routed MoE output).  The overlap must survive this form.
+# ---------------------------------------------------------------------------
+
+H_FP8, I_SH = 256, 256  # block-128 FP8 quant needs multiples of 128
+QBLK = 128
+LIMIT = 7.0
+
+
+def _fp8_weight(n, k, g):
+    w = (torch.randn(n, k, generator=g, dtype=torch.float32) * 0.05).to(torch.float8_e4m3fn)
+    s = torch.rand(n // QBLK, k // QBLK, generator=g, dtype=torch.float32) * 0.01 + 0.005
+    return w, s
+
+
+class _MXFP4RoutedBuffers(nn.Module):
+    """Routed-expert MXFP4 buffers for hidden size ``H_FP8`` (gpt-oss swiglu mode
+    keeps the tiny shapes on the torch-reference path)."""
+
+    def __init__(self, g) -> None:
+        super().__init__()
+        self.register_buffer(
+            "gate_up_blocks",
+            torch.randint(
+                0, 256, (E, 2 * INTER, H_FP8 // BLOCK, PACKED), dtype=torch.uint8, generator=g
+            ),
+        )
+        self.register_buffer(
+            "gate_up_scales",
+            torch.randint(110, 130, (E, 2 * INTER, H_FP8 // BLOCK), dtype=torch.uint8, generator=g),
+        )
+        self.register_buffer(
+            "gate_up_bias", torch.randn(E, 2 * INTER, generator=g, dtype=torch.float32) * 0.1
+        )
+        self.register_buffer(
+            "down_blocks",
+            torch.randint(
+                0, 256, (E, H_FP8, INTER // BLOCK, PACKED), dtype=torch.uint8, generator=g
+            ),
+        )
+        self.register_buffer(
+            "down_scales",
+            torch.randint(110, 130, (E, H_FP8, INTER // BLOCK), dtype=torch.uint8, generator=g),
+        )
+        self.register_buffer(
+            "down_bias", torch.randn(E, H_FP8, generator=g, dtype=torch.float32) * 0.1
+        )
+
+    def routed(self, x, selected_experts, routing_weights):
+        return torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
+            x,
+            selected_experts,
+            routing_weights,
+            self.gate_up_blocks,
+            self.gate_up_bias,
+            self.gate_up_scales,
+            1.0,
+            LIMIT,
+            self.down_blocks,
+            self.down_bias,
+            self.down_scales,
+            "interleaved",
+            "gpt_oss",
+            "moe",
+        )
+
+
+class _FP8SharedRoutedMoEStrandedTail(_MXFP4RoutedBuffers):
+    """Post-idea_0007 node ORDER as ``fuse_fp8_swiglu_act_quant`` used to emit it:
+    the shared-expert head (merged gate_up FP8 GEMM + narrows) is dispatched before
+    the routed op, but the fused swiglu+act-quant tail and the residual-add-prequant
+    down projection sit AFTER the routed op in graph order (the fusion inserted them
+    at the old down-projection site, which follows the MoE op once the merge add is
+    folded into it as its residual)."""
+
+    def __init__(self, seed: int = 0) -> None:
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        super().__init__(g)
+        w13, s13 = _fp8_weight(2 * I_SH, H_FP8, g)
+        w2, s2 = _fp8_weight(H_FP8, I_SH, g)
+        self.register_buffer("w13_q", w13)
+        self.register_buffer("w13_s", s13)
+        self.register_buffer("w2_q", w2)
+        self.register_buffer("w2_s", s2)
+
+    def forward(self, x, selected_experts, routing_weights):
+        gate_up = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+            x, self.w13_q, None, [], [self.w13_s], [], [], "none", None, 1, "unknown", ""
+        )
+        gate = torch.narrow(gate_up, -1, 0, I_SH)
+        up = torch.narrow(gate_up, -1, I_SH, I_SH)
+        routed = self.routed(x, selected_experts, routing_weights)
+        # Shared-expert tail stranded after the routed op.
+        q, s = torch.ops.auto_deploy.torch_fp8_swiglu_clamp_act_quant(gate, up, LIMIT, QBLK, "")
+        return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add_prequant(
+            q, s, self.w2_q, None, [self.w2_s], routed
+        )
+
+
+class _FP8SharedRoutedMoEResidualDown(_MXFP4RoutedBuffers):
+    """Post-idea_0008 form (the input ``fuse_fp8_swiglu_act_quant`` consumes): the
+    unfused clamped-SwiGLU chain feeding the residual-add down projection whose
+    residual is the routed MoE output."""
+
+    def __init__(self, seed: int = 0) -> None:
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        super().__init__(g)
+        w13, s13 = _fp8_weight(2 * I_SH, H_FP8, g)
+        w2, s2 = _fp8_weight(H_FP8, I_SH, g)
+        self.register_buffer("w13_q", w13)
+        self.register_buffer("w13_s", s13)
+        self.register_buffer("w2_q", w2)
+        self.register_buffer("w2_s", s2)
+
+    def forward(self, x, selected_experts, routing_weights):
+        gate_up = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+            x, self.w13_q, None, [], [self.w13_s], [], [], "none", None, 1, "unknown", ""
+        )
+        gate = torch.narrow(gate_up, -1, 0, I_SH)
+        up = torch.narrow(gate_up, -1, I_SH, I_SH)
+        routed = self.routed(x, selected_experts, routing_weights)
+        gate = torch.clamp(gate, max=LIMIT)
+        up = torch.clamp(up, min=-LIMIT, max=LIMIT)
+        hidden = (F.silu(gate.float()) * up.float()).to(x.dtype)
+        return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add(
+            hidden,
+            self.w2_q,
+            None,
+            [],
+            [self.w2_s],
+            [],
+            [],
+            input_scale_fmt="",
+            residual=routed,
+        )
+
+
+def _make_fp8_inputs(num_tokens, seed, device):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    x = (torch.randn(num_tokens, H_FP8, generator=g, dtype=torch.float32) * 0.3).to(
+        dtype=torch.bfloat16, device=device
+    )
+    selected = torch.stack([torch.randperm(E, generator=g)[:TOP_K] for _ in range(num_tokens)]).to(
+        device
+    )
+    weights = torch.rand(num_tokens, TOP_K, generator=g, dtype=torch.float32).to(device)
+    return x, selected, weights
+
+
+def _fp8_supported():
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
+
+
+def _overlap_indices(gm):
+    idx = {}
+    for i, n in enumerate(gm.graph.nodes):
+        if n.target is begin_aux_stream_passthrough:
+            idx["begin"] = i
+        elif n.target is end_aux_stream_passthrough:
+            idx["end"] = i
+        elif n.target is wait_aux_stream_passthrough:
+            idx["wait"] = i
+        elif n.op == "call_function" and "torch_mxfp4_moe_from_routing" in str(n.target):
+            idx["moe"] = i
+    return idx
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
+def test_multi_stream_moe_hoists_stranded_fp8_prequant_tail():
+    """The rewrite must compact a shared-expert tail stranded after the routed op
+    back in front of it: ``begin``/``end`` bracket a positional aux-stream window,
+    so a routed op inside the window would serialize both branches on aux."""
+    device = "cuda"
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+    mod = _FP8SharedRoutedMoEStrandedTail().to(device)
+    args = _make_fp8_inputs(2, seed=123, device=device)
+
+    gm_ref = _export_gm(mod, args)
+    ref_out = gm_ref(*args)
+    torch.cuda.synchronize()
+
+    gm = copy.deepcopy(gm_ref)
+    gm, num_replaced = _execute_shared_expert_in_aux_stream(
+        gm, [torch.ops.auto_deploy.torch_mxfp4_moe_from_routing]
+    )
+    assert num_replaced == 1
+    gm.graph.lint()
+    gm.recompile()
+
+    idx = _overlap_indices(gm)
+    assert idx["begin"] < idx["end"] < idx["moe"] < idx["wait"], (
+        "stranded shared-expert tail must be hoisted ahead of the routed op so the "
+        f"aux window excludes it (begin={idx['begin']}, end={idx['end']}, "
+        f"moe={idx['moe']}, wait={idx['wait']})"
+    )
+
+    out = gm(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref_out), "hoisting rewrite must be bit-exact (eager)"
+
+    # Deployment path: monolithic CUDA-graph capture + replay.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            gm(*args)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_out = gm(*args)
+    for _ in range(2):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(static_out, ref_out), (
+        "hoisting rewrite must be bit-exact under CUDA-graph capture/replay"
+    )
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
+def test_swiglu_fusion_keeps_shared_first_dispatch_for_overlap():
+    """End-to-end at the real pipeline seam: ``fuse_fp8_swiglu_act_quant`` on the
+    residual-add down projection must emit the fused tail ahead of the routed op
+    (anchored at its gate/up sources), and the multi-stream rewrite must then
+    bracket only the shared branch."""
+    device = "cuda"
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+    mod = _FP8SharedRoutedMoEResidualDown().to(device)
+    args = _make_fp8_inputs(2, seed=321, device=device)
+
+    gm = torch_export_to_gm(mod, args=args)
+    ref_out = gm(*args)
+    ref_out = ref_out[0] if isinstance(ref_out, (tuple, list)) else ref_out
+    torch.cuda.synchronize()
+
+    gm, info = FuseFP8SwigluActQuant(TransformConfig(stage=Stages.POST_LOAD_FUSION))._apply(
+        gm, None, None, SharedConfig()
+    )
+    assert info.num_matches == 1
+    gm.recompile()
+    # The pipeline entry sets ``run_shape_prop: true``: post-transform cleanup
+    # repopulates meta on the new nodes, which downstream matchers (the
+    # multi-stream merge search) rely on. Mimic it here.
+    run_shape_prop(gm, args_static=args)
+
+    # Lever under test: the fused act-quant chain must precede the routed op in
+    # graph order (shared-first dispatch), not sit at the down-projection site.
+    order = {n: i for i, n in enumerate(gm.graph.nodes)}
+    act_nodes = [
+        n
+        for n in gm.graph.nodes
+        if n.op == "call_function" and "torch_fp8_swiglu_clamp_act_quant" in str(n.target)
+    ]
+    moe_nodes = [
+        n
+        for n in gm.graph.nodes
+        if n.op == "call_function" and "torch_mxfp4_moe_from_routing" in str(n.target)
+    ]
+    assert len(act_nodes) == 1 and len(moe_nodes) == 1
+    assert order[act_nodes[0]] < order[moe_nodes[0]], (
+        "fuse_fp8_swiglu_act_quant must anchor the fused act-quant chain at its "
+        "gate/up sources, ahead of the routed op"
+    )
+
+    gm, num_replaced = _execute_shared_expert_in_aux_stream(
+        gm, [torch.ops.auto_deploy.torch_mxfp4_moe_from_routing]
+    )
+    assert num_replaced == 1
+    gm.graph.lint()
+    gm.recompile()
+
+    idx = _overlap_indices(gm)
+    assert idx["begin"] < idx["end"] < idx["moe"] < idx["wait"], (
+        f"overlap precondition violated after the fused rewrite (begin={idx['begin']}, "
+        f"end={idx['end']}, moe={idx['moe']}, wait={idx['wait']})"
+    )
+
+    out = gm(*args)
+    out = out[0] if isinstance(out, (tuple, list)) else out
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref_out), "fusion + multi-stream rewrite must be bit-exact"

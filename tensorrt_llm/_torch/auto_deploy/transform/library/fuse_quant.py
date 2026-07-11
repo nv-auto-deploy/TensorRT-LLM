@@ -1419,6 +1419,7 @@ class FuseFP8SwigluActQuant(BaseTransform):
 
         graph = gm.graph
         cnt = 0
+        node_order = {n: i for i, n in enumerate(graph.nodes)}
         for node in list(graph.nodes):
             if is_op(node, residual_lin):
                 is_residual = True
@@ -1443,7 +1444,18 @@ class FuseFP8SwigluActQuant(BaseTransform):
                 if not isinstance(residual, Node):
                     continue
 
-            with graph.inserting_before(node):
+            # Insert the fused act-quant chain right after its gate/up sources, NOT
+            # at the down-projection site: with the residual-add form the down node
+            # sits AFTER the routed MoE op (its residual input), and parking the
+            # shared-expert tail there would pull it inside the aux-stream window
+            # that multi_stream_moe brackets around the shared branch, serializing
+            # shared and routed on one stream (see multi_stream_moe.py).
+            anchor = (
+                matched["up"]
+                if node_order.get(matched["up"], 0) >= node_order.get(matched["gate"], 0)
+                else matched["gate"]
+            )
+            with graph.inserting_after(anchor):
                 act = graph.call_function(
                     quant_op,
                     args=(
@@ -1454,8 +1466,11 @@ class FuseFP8SwigluActQuant(BaseTransform):
                         fmt or "",
                     ),
                 )
+            with graph.inserting_after(act):
                 qfp8 = graph.call_function(operator.getitem, args=(act, 0))
+            with graph.inserting_after(qfp8):
                 qscale = graph.call_function(operator.getitem, args=(act, 1))
+            with graph.inserting_before(node):
                 if is_residual:
                     new_node = graph.call_function(
                         residual_prequant_op,
