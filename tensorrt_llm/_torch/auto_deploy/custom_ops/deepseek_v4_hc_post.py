@@ -53,6 +53,7 @@ regex (no ``sum`` / ``mean`` / ``reduce`` / ``mul`` / ``add`` / ``cast`` /
 ``reduction`` / ``copy_cast`` buckets entirely.
 """
 
+import os
 from typing import Tuple
 
 import torch
@@ -63,6 +64,11 @@ import triton.language as tl
 # split-D partials layout + decode threshold with the HC-pre composition ops so
 # the fused seam op below emits partials the composition kernels can consume.
 from .hc_composition import _HC_PRE_MIX_FUSED_N_MAX, hc_partials_layout
+
+# PDL: launch the seam kernel with programmatic dependent launch so its
+# x-independent prologue overlaps the tail of the producer (TP allreduce).
+# Pairs with the early-trigger AR in distributed/trtllm_dist.py. Default off.
+_AD_HC_PDL = os.environ.get("AD_HC_PDL", "0") == "1"
 
 
 def _hc_post_launch_config(n: int, hc_mult: int):
@@ -308,6 +314,7 @@ def _hc_post_next_partials_kernel(
     MIX_HC: tl.constexpr,  # rows of the next site's hc_fn
     KBLOCK: tl.constexpr,  # next_power_of_2(MIX_HC)
     CHUNK: tl.constexpr,  # elements per split slot (power of 2)
+    LAUNCH_PDL: tl.constexpr,  # PDL: prologue overlaps the producer (AR) tail
 ):
     """One program per (token row, D-chunk): compose y, store it, emit partials.
 
@@ -330,8 +337,7 @@ def _hc_post_next_partials_kernel(
     o = offs // H  # output stream per element
     h = offs - o * H  # hidden position per element
 
-    # --- hc_post compose for this chunk ---
-    x = tl.load(x_ptr + row * H + h, mask=cmask, other=0.0).to(tl.float32)
+    # --- x-independent prologue (overlaps the producer AR under PDL) ---
     p = tl.load(post_ptr + row * HM + o, mask=cmask, other=0.0)
     m = tl.arange(0, BM)
     mmask = m < HM
@@ -345,12 +351,7 @@ def _hc_post_next_partials_kernel(
         mask=mmask[:, None] & cmask[None, :],
         other=0.0,
     )
-    acc = p * x + tl.sum(c * res, axis=0)
-    tl.store(out_ptr + row * D + offs, acc.to(out_ptr.dtype.element_ty), mask=cmask)
-
-    # --- next site's partials from the rounded y (mirrors _hc_fn_partials_kernel) ---
-    xf = acc.to(out_ptr.dtype.element_ty).to(tl.float32)
-    sq = tl.sum(xf * xf, axis=0)
+    mix = tl.sum(c * res, axis=0)
     k = tl.arange(0, KBLOCK)
     kmask = k < MIX_HC
     w = tl.load(
@@ -358,6 +359,19 @@ def _hc_post_next_partials_kernel(
         mask=kmask[:, None] & cmask[None, :],
         other=0.0,
     )
+
+    # --- hc_post compose: only x depends on the producer ---
+    if LAUNCH_PDL:
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(x_ptr + row * H + h, mask=cmask, other=0.0).to(tl.float32)
+    if LAUNCH_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    acc = p * x + mix
+    tl.store(out_ptr + row * D + offs, acc.to(out_ptr.dtype.element_ty), mask=cmask)
+
+    # --- next site's partials from the rounded y (mirrors _hc_fn_partials_kernel) ---
+    xf = acc.to(out_ptr.dtype.element_ty).to(tl.float32)
+    sq = tl.sum(xf * xf, axis=0)
     part = tl.sum(w * xf[None, :], axis=1)
 
     out_base = part_ptr + row * ((MIX_HC + 1) * SPLIT)
@@ -460,7 +474,9 @@ def deepseek_v4_hc_post_next_partials(
         MIX_HC=mix_hc,
         KBLOCK=triton.next_power_of_2(mix_hc),
         CHUNK=chunk,
+        LAUNCH_PDL=_AD_HC_PDL,
         num_warps=4,
+        launch_pdl=_AD_HC_PDL,
     )
     return out.reshape(*lead, hc_mult, H), partials
 
