@@ -201,6 +201,74 @@ def test_cuda_graph_compatibility():
     )
 
 
+class MockFusedMLABlock(nn.Module):
+    """Mirrors the post-fusion MLA fork with a fused Q/KV GEMM.
+
+    The fused GEMM's output split interposes narrow+contiguous before the norm
+    (relu stand-in), so the Q chain's next linear sits at BFS depth 4:
+        fused_qkv -> narrow -> contiguous -> relu -> q_b_proj
+    The side projection (replicated GEMV) has no downstream linear.
+    """
+
+    def __init__(self, hidden_dim: int, q_inner_dim: int, kv_dim: int, side_dim: int):
+        super().__init__()
+        self.q_inner_dim = q_inner_dim
+        self.kv_dim = kv_dim
+        self.fused_qkv = nn.Linear(hidden_dim, q_inner_dim + kv_dim, bias=False)
+        self.q_b_proj = nn.Linear(q_inner_dim, kv_dim, bias=False)
+        self.side_proj = nn.Linear(hidden_dim, side_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.fused_qkv(x)
+        q = y.narrow(-1, 0, self.q_inner_dim).contiguous()
+        q = torch.nn.functional.relu(q)
+        q = self.q_b_proj(q)
+        kv = y.narrow(-1, self.q_inner_dim, self.kv_dim)
+        side = self.side_proj(x)
+        return torch.cat([q + kv, side], dim=-1)
+
+
+def test_fused_split_needs_deeper_classification():
+    """Depth-4 classification for fused splits.
+
+    narrow+contiguous push the Q chain's next linear to depth 4: no match at
+    the default depth 3, one (fork, side GEMV) pair at depth 4.
+    """
+    hidden_dim, q_inner_dim, kv_dim, side_dim = 128, 64, 32, 16
+    model = MockFusedMLABlock(hidden_dim, q_inner_dim, kv_dim, side_dim).eval().to("cuda")
+    example_input = torch.randn(4, hidden_dim, device="cuda")
+    gm = _build_gm(model, example_input)
+
+    assert len(_find_kv_proj_linears(gm)) == 0, "depth 3 should not classify the fused Q chain"
+
+    pairs = _find_kv_proj_linears(gm, max_depth=4)
+    assert len(pairs) == 1, f"Expected 1 fork-point pair at depth 4, got {len(pairs)}"
+    kv_linear = pairs[0][1]
+    kv_out = kv_linear.meta["val"].shape[-1]
+    assert kv_out == side_dim, f"Expected side GEMV (dim {side_dim}) as KV, got dim {kv_out}"
+
+
+def test_numerical_correctness_fused_split():
+    """Aux-stream rewrite at depth 4 must preserve numerics for the fused fork."""
+    hidden_dim, q_inner_dim, kv_dim, side_dim = 128, 64, 32, 16
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+
+    model = MockFusedMLABlock(hidden_dim, q_inner_dim, kv_dim, side_dim).eval().to("cuda")
+    example_input = torch.randn(4, hidden_dim, device="cuda")
+    gm = _build_gm(model, example_input)
+
+    test_x = torch.randn(4, hidden_dim, device="cuda")
+    ref_output = model(test_x)
+
+    gm, num_replaced = _execute_kv_proj_in_aux_stream(gm, max_depth=4)
+    assert num_replaced == 1, f"Expected 1 replacement, got {num_replaced}"
+
+    y = gm(test_x)
+    assert torch.allclose(y, ref_output, atol=1e-5), (
+        f"Output mismatch: max diff = {(y - ref_output).abs().max().item()}"
+    )
+
+
 def test_no_match_on_single_linear():
     """A node with only one linear user should not be matched."""
 

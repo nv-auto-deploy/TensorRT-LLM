@@ -82,9 +82,10 @@ GPU timeline:
 """
 
 from collections import deque
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Type
 
 import torch
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
@@ -101,11 +102,18 @@ from ...utils.multi_stream_utils import (
 )
 from ...utils.node_utils import (
     all_gather_ops,
+    is_any_moe_op,
     is_fake_quantized_linear_op,
     is_finegrained_fp8_linear_op,
     is_op,
 )
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 # ===========================================================================
 # Shared helpers
@@ -115,6 +123,20 @@ _LINEAR_OPS: List[Callable] = [
     torch.ops.auto_deploy.torch_linear_simple,
     torch.ops.aten.linear,
 ]
+
+
+# Multi-stream passthroughs inserted by sibling transforms; forks that already
+# carry one are skipped to avoid conflicting rewrites.
+_MULTI_STREAM_OPS = [
+    begin_aux_stream_passthrough,
+    end_aux_stream_passthrough,
+    wait_aux_stream_passthrough,
+    record_event_passthrough,
+]
+
+
+def _is_multi_stream_node(node: Node) -> bool:
+    return node.op == "call_function" and node.target in _MULTI_STREAM_OPS
 
 
 # Distinct symm-mem workspace slot for the aux KV path. The unified
@@ -338,12 +360,12 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
 # ===========================================================================
 
 
-def _find_kv_proj_linears(gm: GraphModule) -> List[Tuple[Node, Node]]:
+def _find_kv_proj_linears(gm: GraphModule, max_depth: int = 3) -> List[Tuple[Node, Node]]:
     """Find (fork_point, kv_linear) pairs suitable for aux-stream execution.
 
     A *fork point* is a node that directly feeds two or more supported linear
     ops.  Among these linears the one that does **not** lead to another linear
-    within a small BFS depth is the KV projection candidate (the lighter
+    within *max_depth* BFS hops is the KV projection candidate (the lighter
     branch).
 
     Returns a list of ``(fork_point, kv_linear_node)`` tuples.
@@ -356,9 +378,14 @@ def _find_kv_proj_linears(gm: GraphModule) -> List[Tuple[Node, Node]]:
         if len(linear_users) < 2:
             continue
 
+        # Skip forks already rewritten by another multi-stream transform and MoE
+        # hidden forks (the router gate consumes a separate logits node, never this).
+        if any(_is_multi_stream_node(u) or is_any_moe_op(u) for u in node.users):
+            continue
+
         # Separate into "has downstream linear" (Q-like) and "does not" (KV-like).
-        kv_candidates = [ln for ln in linear_users if not _has_downstream_linear(ln)]
-        q_candidates = [ln for ln in linear_users if _has_downstream_linear(ln)]
+        kv_candidates = [ln for ln in linear_users if not _has_downstream_linear(ln, max_depth)]
+        q_candidates = [ln for ln in linear_users if _has_downstream_linear(ln, max_depth)]
 
         if not kv_candidates or not q_candidates:
             continue
@@ -380,7 +407,7 @@ def _create_aux_linear_op(base_op: Callable) -> Callable:
     )
 
 
-def _execute_kv_proj_in_aux_stream(gm: GraphModule) -> Tuple[GraphModule, int]:
+def _execute_kv_proj_in_aux_stream(gm: GraphModule, max_depth: int = 3) -> Tuple[GraphModule, int]:
     """Replace KV projection linears with aux-stream variants.
 
     For each matched ``(fork_point, kv_linear)`` the rewriter:
@@ -398,7 +425,7 @@ def _execute_kv_proj_in_aux_stream(gm: GraphModule) -> Tuple[GraphModule, int]:
     Aux-stream variants are created lazily — only for base ops that actually
     appear in the matched KV positions.
     """
-    pairs = _find_kv_proj_linears(gm)
+    pairs = _find_kv_proj_linears(gm, max_depth)
     if not pairs:
         return gm, 0
 
@@ -447,6 +474,20 @@ def _execute_kv_proj_in_aux_stream(gm: GraphModule) -> Tuple[GraphModule, int]:
 # ===========================================================================
 
 
+class MultiStreamMLAAttnConfig(TransformConfig):
+    """Configuration for the multi-stream MLA attention transform."""
+
+    downstream_linear_depth: int = Field(
+        default=3,
+        description=(
+            "Max BFS depth (user hops) used to classify a fork-point linear as "
+            "Q-like, i.e. another linear is reachable downstream. Fused-GEMM "
+            "output splits interpose narrow+contiguous nodes, which can push "
+            "the next linear one hop deeper than the unfused chain."
+        ),
+    )
+
+
 @TransformRegistry.register("multi_stream_mla_attn")
 class MultiStreamMLAAttn(BaseTransform):
     """Multi-stream Q/KV parallelism for MLA attention blocks.
@@ -457,6 +498,12 @@ class MultiStreamMLAAttn(BaseTransform):
     Pattern 0 is tried first; if it matches (unfused graph), pattern 1 is skipped.
     If pattern 0 finds nothing (fused graph), pattern 1 runs as fallback.
     """
+
+    config: MultiStreamMLAAttnConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[MultiStreamMLAAttnConfig]:
+        return MultiStreamMLAAttnConfig
 
     def _apply(
         self,
@@ -475,7 +522,7 @@ class MultiStreamMLAAttn(BaseTransform):
             total = n_unfused
         else:
             # Fallback: Pattern 1 (projection overlap)
-            gm, n_proj = _execute_kv_proj_in_aux_stream(gm)
+            gm, n_proj = _execute_kv_proj_in_aux_stream(gm, self.config.downstream_linear_depth)
             ad_logger.info(f"Multi-stream MLA pattern 1 (projection): {n_proj} matches")
             total = n_proj
 

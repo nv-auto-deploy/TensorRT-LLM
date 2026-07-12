@@ -407,6 +407,9 @@ transforms:
   multi_stream_mla_attn:
     stage: compile
     enabled: false
+    # Fused-GEMM splits interpose narrow+contiguous before the Q chain's next
+    # linear (narrow -> contiguous -> norm -> linear), so classify at depth 4.
+    downstream_linear_depth: 4
   multi_stream_gemm:
     stage: compile
     enabled: false
