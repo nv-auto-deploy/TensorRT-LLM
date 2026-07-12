@@ -32,9 +32,15 @@ import torch.nn as nn
 
 from tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_attn import (
     _execute_kv_proj_in_aux_stream,
+    _execute_kv_proj_in_aux_stream_extended,
     _find_kv_proj_linears,
 )
-from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import cuda_stream_manager
+from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import (
+    begin_aux_stream_passthrough,
+    cuda_stream_manager,
+    end_aux_stream_passthrough,
+    wait_aux_stream_passthrough,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers -- mock MLA-like module
@@ -262,6 +268,193 @@ def test_numerical_correctness_fused_split():
 
     gm, num_replaced = _execute_kv_proj_in_aux_stream(gm, max_depth=4)
     assert num_replaced == 1, f"Expected 1 replacement, got {num_replaced}"
+
+    y = gm(test_x)
+    assert torch.allclose(y, ref_output, atol=1e-5), (
+        f"Output mismatch: max diff = {(y - ref_output).abs().max().item()}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Extended aux window (multi-node window + late join)
+# ---------------------------------------------------------------------------
+
+
+class MockExtendedSparseBlock(nn.Module):
+    """Mirrors the extended pattern-1 shape around a sparse-attention-like join.
+
+    Fork ``x`` feeds a fused Q chain and a side GEMV whose outputs are read
+    only through narrows.  The last Q-chain linear forks into a heavy main
+    branch and a light kernel side-cone (rope/quant stand-in).  Everything
+    meets only at a late ``cat`` (the attention-op stand-in).
+    """
+
+    def __init__(
+        self,
+        hidden: int = 128,
+        q_inner: int = 64,
+        main_w: int = 256,
+        idx_w: int = 32,
+        side_w: int = 48,
+    ):
+        super().__init__()
+        self.q_inner = q_inner
+        self.main_w = main_w
+        self.idx_w = idx_w
+        self.side_w = side_w
+        self.fused_a = nn.Linear(hidden, q_inner, bias=False)
+        self.q_b = nn.Linear(q_inner, main_w + idx_w, bias=False)
+        self.side_proj = nn.Linear(hidden, side_w, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Q chain: fused_a -> narrow -> contiguous -> relu (norm stand-in) -> q_b
+        q = self.fused_a(x).narrow(-1, 0, self.q_inner).contiguous()
+        qb = self.q_b(torch.nn.functional.relu(q))
+        # Heavy main branch (rope stand-in) — must stay on main.
+        main = torch.nn.functional.relu(qb.narrow(-1, 0, self.main_w).contiguous())
+        # Light side cone (rope + quant stand-in) — movable to aux.
+        idx = torch.tanh(qb.narrow(-1, self.main_w, self.idx_w).contiguous()) * 2.0
+        # Side GEMV split back with narrows (fused replicated projection shape).
+        s = self.side_proj(x)
+        s1 = s.narrow(-1, 0, self.side_w // 2)
+        s2 = s.narrow(-1, self.side_w // 2, self.side_w - self.side_w // 2)
+        # Late join: the only consumer of every side output.
+        return torch.cat([main, idx, s1, s2], dim=-1)
+
+
+class MockExtendedTwoLayer(nn.Module):
+    """Two extended blocks with inter-layer distance (as in a real stack)."""
+
+    def __init__(self, hidden: int = 128):
+        super().__init__()
+        self.block1 = MockExtendedSparseBlock(hidden)
+        out_w = self.block1.main_w + self.block1.idx_w + self.block1.side_w
+        self.norm1 = nn.LayerNorm(out_w)
+        self.o_proj = nn.Linear(out_w, hidden, bias=False)
+        self.block2 = MockExtendedSparseBlock(hidden)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # relu + layernorm add BFS distance so the side GEMV of block1 does
+        # not see o_proj as a downstream linear.
+        y = self.o_proj(self.norm1(torch.nn.functional.relu(self.block1(x))))
+        return self.block2(y)
+
+
+def _count_target(gm, target) -> int:
+    return sum(1 for n in gm.graph.nodes if n.op == "call_function" and n.target is target)
+
+
+def test_extended_window_structure():
+    """Extended rewrite: two aux windows, wait immediately before the join."""
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+    model = MockExtendedSparseBlock().eval().to("cuda")
+    example_input = torch.randn(4, 128, device="cuda")
+    gm = _build_gm(model, example_input)
+
+    gm, num = _execute_kv_proj_in_aux_stream_extended(gm, max_depth=4)
+    assert num == 1, f"Expected 1 extended match, got {num}"
+
+    assert _count_target(gm, begin_aux_stream_passthrough) == 2
+    assert _count_target(gm, end_aux_stream_passthrough) == 2
+    assert _count_target(gm, wait_aux_stream_passthrough) == 1
+
+    gm.graph.lint()
+
+    # wait_aux must sit immediately before the join consumer (the cat).
+    (wait_node,) = [n for n in gm.graph.nodes if n.target is wait_aux_stream_passthrough]
+    join = wait_node.next
+    assert join.target is torch.ops.aten.cat.default, (
+        f"wait_aux not immediately before the join: next is {join.target}"
+    )
+    # The movable side cone (contiguous/tanh/mul) landed inside window 2.
+    begins = [n for n in gm.graph.nodes if n.target is begin_aux_stream_passthrough]
+    window2 = []
+    n = begins[1].next
+    while n.target is not end_aux_stream_passthrough:
+        window2.append(n)
+        n = n.next
+    window2_targets = {n.target for n in window2}
+    assert torch.ops.aten.tanh.default in window2_targets, f"window2={window2}"
+
+
+def test_extended_window_numerics():
+    """Extended rewrite must preserve numerics."""
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+    model = MockExtendedSparseBlock().eval().to("cuda")
+    example_input = torch.randn(4, 128, device="cuda")
+    gm = _build_gm(model, example_input)
+
+    test_x = torch.randn(4, 128, device="cuda")
+    ref_output = model(test_x)
+
+    gm, num = _execute_kv_proj_in_aux_stream_extended(gm, max_depth=4)
+    assert num == 1
+
+    y = gm(test_x)
+    assert torch.allclose(y, ref_output, atol=1e-5), (
+        f"Output mismatch: max diff = {(y - ref_output).abs().max().item()}"
+    )
+
+
+def test_extended_window_numerics_two_layer_cuda_graph():
+    """Two stacked windows (repeated event reuse) + CUDA graph capture/replay."""
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+    model = MockExtendedTwoLayer().eval().to("cuda")
+    example_input = torch.randn(4, 128, device="cuda")
+    gm = _build_gm(model, example_input)
+
+    test_x = torch.randn(4, 128, device="cuda")
+    ref_output = model(test_x)
+
+    gm, num = _execute_kv_proj_in_aux_stream_extended(gm, max_depth=4)
+    assert num == 2, f"Expected 2 extended matches, got {num}"
+    assert _count_target(gm, begin_aux_stream_passthrough) == 4
+    assert _count_target(gm, wait_aux_stream_passthrough) == 2
+    gm.graph.lint()
+
+    y = gm(test_x)
+    assert torch.allclose(y, ref_output, atol=1e-5), (
+        f"Output mismatch: max diff = {(y - ref_output).abs().max().item()}"
+    )
+
+    out_w = ref_output.shape[-1]
+    static_x = torch.randn(4, 128, device="cuda")
+    static_output = torch.randn(4, out_w, device="cuda")
+    for _ in range(3):
+        static_output.copy_(gm(static_x))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_output.copy_(gm(static_x))
+
+    static_x.copy_(test_x)
+    graph.replay()
+
+    assert torch.allclose(static_output, ref_output, atol=1e-5), (
+        f"CUDA graph output mismatch: max diff = {(static_output - ref_output).abs().max().item()}"
+    )
+
+
+def test_extended_window_fallback_to_single_op():
+    """Fallback coverage: no view-split join shape.
+
+    The extended path must fall back to the single-op rewrite and stay
+    numerically correct.
+    """
+    hidden_dim, q_inner_dim, kv_dim, side_dim = 128, 64, 32, 16
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+
+    model = MockFusedMLABlock(hidden_dim, q_inner_dim, kv_dim, side_dim).eval().to("cuda")
+    example_input = torch.randn(4, hidden_dim, device="cuda")
+    gm = _build_gm(model, example_input)
+
+    test_x = torch.randn(4, hidden_dim, device="cuda")
+    ref_output = model(test_x)
+
+    gm, num = _execute_kv_proj_in_aux_stream_extended(gm, max_depth=4)
+    assert num == 1, f"Expected 1 match, got {num}"
+    # Fallback path: no begin/end windows, the derived _aux op instead.
+    assert _count_target(gm, begin_aux_stream_passthrough) == 0
 
     y = gm(test_x)
     assert torch.allclose(y, ref_output, atol=1e-5), (

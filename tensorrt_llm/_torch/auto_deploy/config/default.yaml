@@ -410,6 +410,12 @@ transforms:
     # Fused-GEMM splits interpose narrow+contiguous before the Q chain's next
     # linear (narrow -> contiguous -> norm -> linear), so classify at depth 4.
     downstream_linear_depth: 4
+    # Multi-node aux window for pattern 1: the side projection's outputs are
+    # only read by the attention op, so the main-stream join moves from the
+    # projection site to right before the attention op, and the attention-only
+    # kernel side-cones off the last Q-chain linear (e.g. indexer rope + quant)
+    # overlap on the aux stream instead of running serially on main.
+    extended_aux_window: true
   multi_stream_gemm:
     stage: compile
     enabled: false
