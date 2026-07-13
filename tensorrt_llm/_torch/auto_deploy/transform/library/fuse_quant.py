@@ -734,6 +734,21 @@ def _finegrained_fp8_block_k(
     return int(triton.cdiv(K, scale_k))
 
 
+class FuseFP8ActQuantCSEConfig(TransformConfig):
+    """Configuration for the FineGrained FP8 activation-quant CSE transform."""
+
+    w8a8_quant_prologue: bool = Field(
+        default=False,
+        description=(
+            "Fuse the standalone block-FP8 activation-quant kernel into the "
+            "prologue of the consuming decode W8A8 GEMV/split-K kernels (op-"
+            "internal flag, no graph rewrite). Applies only to ue8m0-scale "
+            "linears on the torch reference path; bit-exact vs the standalone "
+            "quant. Prefill and non-decode shapes keep the standalone kernel."
+        ),
+    )
+
+
 @TransformRegistry.register("fuse_fp8_act_quant_cse")
 class FuseFP8ActQuantCSE(BaseTransform):
     """Share one block-FP8 activation quant across sibling FineGrained FP8 linears.
@@ -764,11 +779,11 @@ class FuseFP8ActQuantCSE(BaseTransform):
     the torch reference path (fuse disabled), which is what DeepSeek-V4 runs.
     """
 
-    config: TransformConfig
+    config: FuseFP8ActQuantCSEConfig
 
     @classmethod
     def get_config_class(cls) -> Type[TransformConfig]:
-        return TransformConfig
+        return FuseFP8ActQuantCSEConfig
 
     def _apply(
         self,
@@ -777,6 +792,14 @@ class FuseFP8ActQuantCSE(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        if self.config.w8a8_quant_prologue:
+            # Op-internal fused quant prologue (no graph rewrite): flip the module
+            # flag once, before warmup/capture, so eager and captured paths agree.
+            from ...custom_ops.quantization.torch_quant import set_w8a8_quant_prologue
+
+            set_w8a8_quant_prologue(True)
+            ad_logger.info("FP8 act-quant: fused W8A8 decode quant prologue enabled")
+
         lin_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
         act_op = torch.ops.auto_deploy.torch_fp8_finegrained_act_quant.default
         prequant_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_prequant.default

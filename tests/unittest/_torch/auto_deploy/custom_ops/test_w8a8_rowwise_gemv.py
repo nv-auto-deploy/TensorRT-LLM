@@ -23,6 +23,7 @@ import torch
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
     _W8A8_TP4_M1_ROWWISE_CFG,
+    _W8A8_TP4_M1_ROWWISE_PROLOGUE_CFG,
     _safe_act_quant,
     _use_rowwise_gemv,
     _w8a8_block_fp8_matmul_triton,
@@ -159,3 +160,142 @@ def test_m2_keeps_incumbent_path():
     ref = _ref_fp64(a_fp8, a_s, b_fp8, b_s)
     scale = ref.abs().amax().clamp(min=1e-6)
     assert ((out.float() - ref).abs().amax() / scale).item() < 1.5e-2
+
+
+# ---------------------------------------------------------------------------
+# Fused activation-quant prologue (QUANT_PROLOGUE=True, v6)
+# ---------------------------------------------------------------------------
+#
+# ``As=None`` routes the raw bf16 activation into the rowwise kernel, which
+# replicates ``_act_quant_kernel``'s ue8m0 quant (amax -> pow-2 scale -> RTNE
+# fp8 cast) per 128-group in its prologue. The quant math is bit-identical by
+# construction; the *consumer* reduction, however, runs under a re-tuned
+# launch config (``_W8A8_TP4_M1_ROWWISE_PROLOGUE_CFG``) whose different
+# rows/CTA / warps change the fp32 summation-tree order, so near-cancellation
+# outputs may round to the adjacent bf16 value (<= 1 ULP; measured ~5e-5 of
+# outputs). That is the same acceptance class as this kernel's own landing
+# (vs the incumbent MMA kernels) and strictly tighter than the split-K path's
+# pre-existing atomic-order wobble. Exact-arithmetic inputs (all partial
+# products and sums fp32-exact) remove the rounding sensitivity entirely and
+# therefore must be torch.equal at every shape and config.
+
+
+def _standalone_ue8m0(a, b_fp8, b_s, residual=None):
+    a_fp8, a_s = _safe_act_quant(a.contiguous(), BLOCK, "ue8m0")
+    return _w8a8_block_fp8_matmul_triton(
+        a_fp8, b_fp8, a_s, b_s, [BLOCK, BLOCK], output_dtype=torch.bfloat16, residual=residual
+    )
+
+
+def _fused_ue8m0(a, b_fp8, b_s, residual=None):
+    return _w8a8_block_fp8_matmul_triton(
+        a,
+        b_fp8,
+        None,
+        b_s,
+        [BLOCK, BLOCK],
+        output_dtype=torch.bfloat16,
+        residual=residual,
+        input_scale_fmt="ue8m0",
+    )
+
+
+def _assert_bf16_adjacent(out, ref, max_flips):
+    """Fused vs standalone may differ only by fp32 reduction order: few flips,
+    each either 1 bf16 ULP or a negligible absolute diff at near-cancellation
+    outputs (a multi-ULP step there is ULP inflation of a ~0 value)."""
+    neq = out != ref
+    flips = int(neq.sum())
+    assert flips <= max_flips, f"{flips} mismatches (allowed {max_flips})"
+    if flips:
+        steps = (out.view(torch.int16).int() - ref.view(torch.int16).int()).abs()[neq]
+        adiff = (out.float() - ref.float()).abs()[neq]
+        scale = float(ref.float().abs().mean()) + 1e-12
+        big = steps > 1
+        assert bool((adiff[big] <= 1e-4 * scale).all()), (
+            f"non-negligible mismatch beyond 1 bf16 ULP: max step {int(steps.max())}, "
+            f"max adiff {float(adiff.max()):.3e} vs tensor scale {scale:.3e}"
+        )
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
+@pytest.mark.parametrize("N,K", ROWWISE_SHAPES)
+def test_rowwise_quant_prologue_matches_standalone(N, K):
+    """Fused-prologue output vs standalone quant+GEMV on random bf16 data."""
+    torch.manual_seed(11)
+    a = torch.randn(1, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    b_fp8, b_s = _quant_weight_block_fp8(b, BLOCK, BLOCK)
+    assert _use_rowwise_gemv(1, N, K, BLOCK, BLOCK, a, b_fp8, None, b_s)
+    ref = _standalone_ue8m0(a, b_fp8, b_s)
+    out = _fused_ue8m0(a, b_fp8, b_s)
+    # Identical launch config does NOT pin FMA scheduling across the two
+    # constexpr specializations, so no bit-exact special case on random data;
+    # the exact-arithmetic test below is the hard bit-exact gate.
+    _assert_bf16_adjacent(out, ref, max_flips=max(2, N // 1024))
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
+@pytest.mark.parametrize("N,K", ROWWISE_SHAPES)
+def test_rowwise_quant_prologue_exact_arithmetic(N, K):
+    """Exact-arithmetic inputs must be torch.equal under ANY reduction order.
+
+    Activations in {0, +-1, +-2, +-4} quantize losslessly (pow-2 scales, fp8-
+    representable payloads) and every partial product/sum is fp32-exact, so any
+    reassociation/FMA contraction yields the identical result: a hard bit-exact
+    gate on the prologue's scale math and scale association.
+    """
+    torch.manual_seed(12)
+    vals = torch.tensor([0.0, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0], device="cuda")
+    a = vals[torch.randint(0, 7, (1, K), device="cuda")].to(torch.bfloat16)
+    a[0, :BLOCK] = 0.0  # all-zero group exercises the 1e-4 amax clamp
+    w = torch.randint(-2, 3, (N, K), device="cuda").float()
+    b_fp8 = w.to(torch.float8_e4m3fn)
+    b_s = torch.ones(N // BLOCK, K // BLOCK, device="cuda", dtype=torch.float32)
+    ref = _standalone_ue8m0(a, b_fp8, b_s)
+    out = _fused_ue8m0(a, b_fp8, b_s)
+    assert torch.equal(ref, out)
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
+def test_rowwise_quant_prologue_nan_propagation():
+    """NaN activations must poison both paths identically (cfg-equal shape)."""
+    N, K = 16384, 1024  # standalone and prologue configs are identical here
+    torch.manual_seed(13)
+    a = torch.randn(1, K, device="cuda", dtype=torch.bfloat16)
+    a[0, 5] = float("nan")
+    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    b_fp8, b_s = _quant_weight_block_fp8(b, BLOCK, BLOCK)
+    ref = _standalone_ue8m0(a, b_fp8, b_s)
+    out = _fused_ue8m0(a, b_fp8, b_s)
+    assert ref.isnan().all() and out.isnan().all()
+    assert torch.equal(ref.view(torch.int16), out.view(torch.int16))
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
+def test_rowwise_quant_prologue_residual_epilogue():
+    """Fused-prologue residual epilogue keeps round -> fp32 add -> round."""
+    N, K = 4096, 512  # the shared-w2 merge-add site
+    torch.manual_seed(14)
+    a = torch.randn(1, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    b_fp8, b_s = _quant_weight_block_fp8(b, BLOCK, BLOCK)
+    residual = torch.randn(1, N, device="cuda", dtype=torch.bfloat16)
+    out_res = _fused_ue8m0(a, b_fp8, b_s, residual=residual)
+    out_plain = _fused_ue8m0(a, b_fp8, b_s)
+    expected = (out_plain.float() + residual.float()).to(torch.bfloat16)
+    assert torch.equal(out_res, expected)
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
+def test_rowwise_quant_prologue_gate_and_cfg_parity():
+    """Deferred-quant gating mirrors the fp8 gate; cfg tables cover same keys."""
+    assert set(_W8A8_TP4_M1_ROWWISE_CFG) == set(_W8A8_TP4_M1_ROWWISE_PROLOGUE_CFG)
+    N, K = 1024, 4096
+    a = torch.randn(1, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+    b_fp8, b_s = _quant_weight_block_fp8(b, BLOCK, BLOCK)
+    assert _use_rowwise_gemv(1, N, K, BLOCK, BLOCK, a, b_fp8, None, b_s)
+    assert not _use_rowwise_gemv(2, N, K, BLOCK, BLOCK, a, b_fp8, None, b_s)
+    assert not _use_rowwise_gemv(1, N + BLOCK, K, BLOCK, BLOCK, a, b_fp8, None, b_s)
+    assert not _use_rowwise_gemv(1, N, K, 64, 128, a, b_fp8, None, b_s)

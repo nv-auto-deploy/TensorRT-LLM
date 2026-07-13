@@ -221,6 +221,10 @@ transforms:
   fuse_fp8_act_quant_cse:
     stage: post_load_fusion
     run_shape_prop: true
+    # Fuse the remaining standalone act-quant launches into the consuming decode
+    # W8A8 GEMV/split-K kernel prologues (op-internal flag, no graph rewrite;
+    # bit-exact, ue8m0-only). Prefill and non-decode shapes are unaffected.
+    w8a8_quant_prologue: true
   # Merge shared-expert gate (w1) + up (w3) sibling block-FP8 matmuls into one
   # concatenated projection + slice (the SwiGLU matcher can't span DeepSeek-V4's
   # clamp/FP32-cast nodes). Runs AFTER fuse_fp8_act_quant_cse so it collapses the two
