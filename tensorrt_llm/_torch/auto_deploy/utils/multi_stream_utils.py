@@ -105,6 +105,11 @@ class _Singleton(type):
 class CudaStreamManager(metaclass=_Singleton):
     AUX_STREAM_NAME = "aux"
     MAIN_STREAM_NAME = "main"
+    # Dedicated event pair for op-internal aux windows (e.g. the decode
+    # selection overlap): keeps their record/wait pairing independent of the
+    # graph-level passthrough events above.
+    SEL_AUX_EVENT_NAME = "sel_aux"
+    SEL_MAIN_EVENT_NAME = "sel_main"
     devices: List[torch.device] = []
     events: Dict[torch.device, Dict[str, Any]] = {}
     streams: Dict[torch.device, Dict[str, Any]] = {}
@@ -129,6 +134,8 @@ class CudaStreamManager(metaclass=_Singleton):
                 self.events[device] = {
                     self.AUX_STREAM_NAME: torch.cuda.Event(),
                     self.MAIN_STREAM_NAME: torch.cuda.Event(),
+                    self.SEL_AUX_EVENT_NAME: torch.cuda.Event(),
+                    self.SEL_MAIN_EVENT_NAME: torch.cuda.Event(),
                 }
                 self.streams[device] = {
                     self.AUX_STREAM_NAME: torch.cuda.Stream(),

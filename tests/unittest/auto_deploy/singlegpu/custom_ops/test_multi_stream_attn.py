@@ -503,3 +503,38 @@ def test_no_match_when_both_have_downstream_linear():
 
     pairs = _find_kv_proj_linears(gm)
     assert len(pairs) == 0, f"Expected 0 matches, got {len(pairs)}"
+
+
+def test_decode_selection_aux_config_flips_op_flag():
+    """The transform's decode_selection_aux knob sets the op-internal flag.
+
+    The knob performs no graph rewrite: the graph must be structurally
+    unchanged apart from the (independent) pattern rewrites, and the
+    sparse-attention op module flag must flip exactly when the knob is on.
+    """
+    import tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_sparse_attention as dsv4
+    from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
+    from tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_attn import (
+        MultiStreamMLAAttn,
+        MultiStreamMLAAttnConfig,
+    )
+
+    # Default off in code (yaml opts in).
+    assert MultiStreamMLAAttnConfig(stage="compile").decode_selection_aux is False
+
+    shared = SharedConfig()
+    try:
+        dsv4.set_decode_selection_aux(False)
+
+        model = MockMLABlock(128, 64, 128).eval().to("cuda")
+        gm = _build_gm(model, torch.randn(4, 128, device="cuda"))
+        transform = MultiStreamMLAAttn.from_kwargs(stage="compile", decode_selection_aux=False)
+        transform._apply(gm, None, None, shared)
+        assert dsv4._DECODE_SELECTION_AUX is False, "knob off must not flip the flag"
+
+        gm = _build_gm(model, torch.randn(4, 128, device="cuda"))
+        transform = MultiStreamMLAAttn.from_kwargs(stage="compile", decode_selection_aux=True)
+        transform._apply(gm, None, None, shared)
+        assert dsv4._DECODE_SELECTION_AUX is True, "knob on must flip the flag"
+    finally:
+        dsv4.set_decode_selection_aux(False)

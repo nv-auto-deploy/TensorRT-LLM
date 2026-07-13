@@ -800,6 +800,17 @@ class MultiStreamMLAAttnConfig(TransformConfig):
             "required graph shape is absent."
         ),
     )
+    decode_selection_aux: bool = Field(
+        default=False,
+        description=(
+            "Run the decode sparse-selection chain (current-token indexer row "
+            "store + index score + top-k) on the auxiliary CUDA stream inside "
+            "the cached sparse-attention op, overlapping it with the "
+            "main-stream cache store/update kernels; the main stream re-joins "
+            "immediately before the assemble kernel that consumes the selected "
+            "rows. No graph rewrite: this only flips an op-internal flag."
+        ),
+    )
 
 
 @TransformRegistry.register("multi_stream_mla_attn")
@@ -827,6 +838,16 @@ class MultiStreamMLAAttn(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         cuda_stream_manager.add_device(torch.cuda.current_device())
+
+        if self.config.decode_selection_aux:
+            # Op-internal aux window (no graph rewrite): flip the module flag
+            # once, before warmup/capture, so eager and captured paths agree.
+            from ...custom_ops.attention.deepseek_v4_sparse_attention import (
+                set_decode_selection_aux,
+            )
+
+            set_decode_selection_aux(True)
+            ad_logger.info("Multi-stream MLA: decode selection on aux stream enabled")
 
         # Pattern 0: full KV path on aux (unfused GEMMs)
         gm, n_unfused = _execute_kv_path_in_aux_stream(gm, shared_config.world_size)

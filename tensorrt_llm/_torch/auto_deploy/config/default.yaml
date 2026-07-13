@@ -416,6 +416,11 @@ transforms:
     # kernel side-cones off the last Q-chain linear (e.g. indexer rope + quant)
     # overlap on the aux stream instead of running serially on main.
     extended_aux_window: true
+    # Decode sparse-selection chain (indexer row store + index score + top-k)
+    # runs on the aux stream inside the cached sparse-attention op, co-running
+    # with the main-stream cache store/update; main re-joins right before the
+    # assemble kernel that consumes the selected rows.
+    decode_selection_aux: true
   multi_stream_gemm:
     stage: compile
     enabled: false
