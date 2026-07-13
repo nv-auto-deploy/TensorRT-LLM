@@ -39,11 +39,24 @@ it.
 """
 
 import math
-from typing import Tuple
+import os
+from typing import List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+
+# PDL: launch the top-k routing kernel as a programmatic dependent of the
+# router-GEMV producer so its logits-independent prologue (bias load) overlaps
+# the producer's tail. Same machinery/gating style as AD_HC_PDL. Default off.
+_AD_GATE_PDL = os.environ.get("AD_GATE_PDL", "0") == "1"
+
+# Widen the decode hash-gate tile (BLOCK_H 512->2048, 4->8 warps): a lone CTA
+# walking hidden in 512-wide chunks serializes the global-load rounds with no
+# latency hiding (~2.4x slower measured). Selection is a pure integer gather
+# (unchanged); weights move by fp32 sum order only (~3e-8). Default off keeps
+# the default path bit-identical.
+_AD_HASH_ROUTING_WIDE = os.environ.get("AD_HASH_ROUTING_WIDE", "0") == "1"
 
 
 @triton.jit
@@ -66,6 +79,7 @@ def _deepseek_v4_routing_kernel(
     SOFTPLUS_THRESHOLD: tl.constexpr,
     NORM_TOPK: tl.constexpr,
     LOCALIZED: tl.constexpr,
+    LAUNCH_PDL: tl.constexpr,
     BLOCK_E: tl.constexpr,  # >= num_experts, power of 2
     TOP_K: tl.constexpr,
     BLOCK_K: tl.constexpr,  # >= TOP_K, power of 2
@@ -78,11 +92,19 @@ def _deepseek_v4_routing_kernel(
     offs_e = tl.arange(0, BLOCK_E)
     mask_e = offs_e < num_experts
 
+    # Logits-independent prologue (overlaps the router-GEMV tail under PDL).
+    # Pure load reorder vs the pre-PDL kernel: bit-exact.
+    bias = tl.load(bias_ptr + offs_e, mask=mask_e, other=0.0).to(tl.float32)
+
+    if LAUNCH_PDL:
+        tl.extra.cuda.gdc_wait()
     logits = tl.load(
         logits_ptr + token_id * stride_lt + offs_e * stride_le,
         mask=mask_e,
         other=0.0,
     ).to(tl.float32)
+    if LAUNCH_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     # scores = sqrt(softplus(logits)); softplus(x) = x if x > thr else log1p(exp(x)).
     # Match torch.nn.functional.softplus' numerically-stable threshold form.
@@ -90,7 +112,6 @@ def _deepseek_v4_routing_kernel(
     softplus = tl.where(logits > SOFTPLUS_THRESHOLD, logits, tl.log(1.0 + exp_x))
     scores = tl.sqrt(softplus)
 
-    bias = tl.load(bias_ptr + offs_e, mask=mask_e, other=0.0).to(tl.float32)
     biased = scores + bias
     # Padding experts (offs_e >= num_experts) must never be selected.
     neg_inf = float("-inf")
@@ -228,10 +249,12 @@ def deepseek_v4_routing_fn(
         SOFTPLUS_THRESHOLD=20.0,
         NORM_TOPK=norm_topk_prob,
         LOCALIZED=localized,
+        LAUNCH_PDL=_AD_GATE_PDL,
         BLOCK_E=BLOCK_E,
         TOP_K=top_k,
         BLOCK_K=BLOCK_K,
         num_warps=1,
+        launch_pdl=_AD_GATE_PDL,
     )
     return indices, weights
 
@@ -319,6 +342,129 @@ def _deepseek_v4_routing_localized_fake(
     indices = router_logits.new_empty((num_tokens, top_k), dtype=torch.int32)
     weights = router_logits.new_empty((num_tokens, top_k), dtype=torch.bfloat16)
     return indices, weights
+
+
+# ---------------------------------------------------------------------------
+# Learned-router gate GEMV (single-token decode)
+# ---------------------------------------------------------------------------
+#
+# The router head's fp32 (E, H) x (H,) GEMV dispatches to a cuBLAS gemvx kernel
+# at M=1 that runs latency-bound (few CTAs) and leaves a launch boundary before
+# the routing kernel. The op below runs one CTA per expert row (grid=(E,)): the
+# whole H-wide dot in one tile, tree-reduced in fp32, with the x-independent
+# weight-row load hoisted into a PDL prologue and an early dependent-launch
+# trigger so the routing kernel behind it starts during the GEMV.
+#
+# Precision: fp32 multiply/accumulate like cuBLAS, but the tree-reduction sum
+# order differs (~1e-6 relative on the logits). Selection could flip only on a
+# rank-k/rank-k+1 near-tie within that band, so the graph rewrite installing
+# this op (``fuse_deepseek_v4_gate_gemv``) is gated default-off and validated
+# with selection-parity tests before enabling. Shapes other than a single
+# decode token (or any non-fp32 / biased call) keep the cuBLAS reference path.
+
+# Largest single-tile hidden size; wider gates fall back to the reference path.
+_GATE_GEMV_MAX_BLOCK_H = 8192
+
+# 8 warps split the 4096-wide row-dot across more schedulers; measured fastest
+# (graph-captured B200 sweep 2/4/8: 3.8/2.5/2.1 us) with the sum order fixed
+# per config by the constexpr tile shape.
+_GATE_GEMV_NUM_WARPS = 8
+
+
+@triton.jit
+def _deepseek_v4_gate_gemv_kernel(
+    x_ptr,  # (H,) fp32 single-token activation
+    w_ptr,  # (E, H) fp32 router weight
+    out_ptr,  # (E,) fp32 logits
+    hidden_size,
+    stride_we,
+    stride_wh,
+    stride_xh,
+    LAUNCH_PDL: tl.constexpr,
+    BLOCK_H: tl.constexpr,  # >= hidden_size, power of 2
+):
+    """One program per expert row: logits[e] = dot(x, W[e, :]) in fp32."""
+    expert_id = tl.program_id(0)
+    offs_h = tl.arange(0, BLOCK_H)
+    mask_h = offs_h < hidden_size
+
+    # x-independent prologue: the weight-row load overlaps the producer's tail
+    # under PDL (mirrors the AD_HC_PDL prologue structure).
+    w = tl.load(w_ptr + expert_id * stride_we + offs_h * stride_wh, mask=mask_h, other=0.0)
+
+    if LAUNCH_PDL:
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(x_ptr + offs_h * stride_xh, mask=mask_h, other=0.0)
+    if LAUNCH_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    logit = tl.sum(w * x, axis=0)
+    tl.store(out_ptr + expert_id, logit)
+
+
+@torch.library.custom_op("auto_deploy::deepseek_v4_gate_gemv", mutates_args=())
+def deepseek_v4_gate_gemv(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
+) -> torch.Tensor:
+    """Router-gate GEMV: Triton one-CTA-per-expert-row dot at single-token decode.
+
+    Drop-in replacement for ``auto_deploy::torch_linear_simple`` on the DSV4
+    router gate (same signature, so the graph rewrite is a pure target swap;
+    the sharding-hint args are accepted and ignored — the rewrite runs post
+    sharding). Any shape/dtype outside the single-token fp32 bias-free gate
+    contract falls back to ``F.linear`` (the cuBLAS reference), keeping
+    prefill and larger decode batches bit-identical to the pre-swap graph.
+    """
+    hidden_size = input.shape[-1]
+    num_tokens = input.numel() // hidden_size if hidden_size else 0
+    use_triton = (
+        input.is_cuda
+        and bias is None
+        and num_tokens == 1
+        and input.dtype == torch.float32
+        and weight.dtype == torch.float32
+        and weight.ndim == 2
+        and weight.shape[-1] == hidden_size
+        and hidden_size <= _GATE_GEMV_MAX_BLOCK_H
+    )
+    if not use_triton:
+        return torch.nn.functional.linear(input, weight, bias)
+
+    num_experts = weight.shape[0]
+    x_flat = input.reshape(num_tokens, hidden_size)
+    out = torch.empty((*input.shape[:-1], num_experts), dtype=torch.float32, device=input.device)
+    _deepseek_v4_gate_gemv_kernel[(num_experts,)](
+        x_flat,
+        weight,
+        out,
+        hidden_size,
+        weight.stride(0),
+        weight.stride(1),
+        x_flat.stride(1),
+        LAUNCH_PDL=_AD_GATE_PDL,
+        BLOCK_H=_next_power_of_2(hidden_size),
+        num_warps=_GATE_GEMV_NUM_WARPS,
+    )
+    return out
+
+
+@deepseek_v4_gate_gemv.register_fake
+def _deepseek_v4_gate_gemv_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
+) -> torch.Tensor:
+    return input.new_empty((*input.shape[:-1], weight.shape[0]), dtype=input.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +692,13 @@ def deepseek_v4_hash_routing_fn(
     # GEMM when torch has TF32 matmul enabled (the shipping container default).
     tf32_trunc = torch.backends.cuda.matmul.allow_tf32 and num_tokens > 1
 
+    # Decode launch width: gated wide tile (see _AD_HASH_ROUTING_WIDE above);
+    # the default keeps the original bit-identical 512/4 configuration.
+    if _AD_HASH_ROUTING_WIDE:
+        block_h, num_warps = min(2048, _next_power_of_2(hidden_size)), 8
+    else:
+        block_h, num_warps = 512, 4
+
     BLOCK_K = _next_power_of_2(top_k)
     grid = (num_tokens,)
     _deepseek_v4_hash_routing_kernel[grid](
@@ -576,8 +729,8 @@ def deepseek_v4_hash_routing_fn(
         LOCALIZED=localized,
         TOP_K=top_k,
         BLOCK_K=BLOCK_K,
-        BLOCK_H=512,
-        num_warps=4,
+        BLOCK_H=block_h,
+        num_warps=num_warps,
     )
     return indices, weights
 

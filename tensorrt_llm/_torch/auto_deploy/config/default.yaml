@@ -258,6 +258,14 @@ transforms:
   # decode step on the trtllm-gen MXFP4 path). Bit-exact; SM100f-gated.
   fuse_moe_routing_localization:
     stage: post_load_fusion
+  # Swap the DSV4 router-gate GEMV producer (cuBLAS gemvx at M=1) for the
+  # multi-CTA Triton gate GEMV feeding deepseek_v4_routing[_localized]; pure
+  # in-place target swap (no node reordering; falls back to cuBLAS off the
+  # single-token decode shape). DEFAULT OFF: fp32 sum order of the logits
+  # changes (~1e-6) — requires a selection-parity check before enabling.
+  fuse_deepseek_v4_gate_gemv:
+    stage: post_load_fusion
+    enabled: false
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
