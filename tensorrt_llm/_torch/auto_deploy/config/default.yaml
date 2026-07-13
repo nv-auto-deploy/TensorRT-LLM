@@ -307,6 +307,14 @@ transforms:
   fuse_rmsnorm_quant_nvfp4:
     stage: post_load_fusion
     enabled: true
+  # Fuse the DeepSeek-V4 HC seam producer/consumer op pair (hc_post + next-site
+  # partials -> HC-pre composition/combine) into one barrier kernel per seam.
+  # DEFAULT OFF: measured slower than the pair at decode (the in-kernel arrival
+  # barrier costs more than the launch boundary it removes; the shipped seam
+  # optimization is the PDL dependent launch inside the ops themselves).
+  fuse_hc_seam_pair:
+    stage: post_load_fusion
+    enabled: false
   fuse_gdn_gating:
     stage: post_load_fusion
   fuse_l2norm:
