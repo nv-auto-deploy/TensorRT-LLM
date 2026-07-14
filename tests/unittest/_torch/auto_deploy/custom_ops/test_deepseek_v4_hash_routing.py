@@ -235,6 +235,47 @@ def test_hash_routing_precision_vs_fp64():
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_tokens", [1, 2, 8])
+@pytest.mark.parametrize("localized", [False, True])
+def test_hash_routing_wide_launch_config_parity(num_tokens, localized):
+    """AD_HASH_ROUTING_WIDE (BLOCK_H 512->2048, 4->8 warps): selected experts
+    are a pure integer gather -> torch.equal across configs; weights move by
+    fp32 chunk-sum order only (<=1e-6)."""
+    from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe import (
+        deepseek_v4_routing as routing_mod,
+    )
+
+    hidden, weight, tid2eid, input_ids = _make_inputs(
+        num_tokens=num_tokens,
+        hidden_size=4096,
+        num_experts=256,
+        vocab_size=512,
+        top_k=6,
+        weight_std=0.02,
+        hidden_dtype=torch.bfloat16,
+        ids_dtype=torch.int64,
+        seed=num_tokens * 17 + int(localized),
+    )
+    kwargs = dict(expert_start=64, local_experts=64) if localized else {}
+
+    old = routing_mod._AD_HASH_ROUTING_WIDE
+    try:
+        routing_mod._AD_HASH_ROUTING_WIDE = False
+        idx_narrow, w_narrow = routing_mod.deepseek_v4_hash_routing_fn(
+            hidden, weight, tid2eid, input_ids, 1.5, True, **kwargs
+        )
+        routing_mod._AD_HASH_ROUTING_WIDE = True
+        idx_wide, w_wide = routing_mod.deepseek_v4_hash_routing_fn(
+            hidden, weight, tid2eid, input_ids, 1.5, True, **kwargs
+        )
+    finally:
+        routing_mod._AD_HASH_ROUTING_WIDE = old
+
+    assert torch.equal(idx_narrow, idx_wide), "hash selection must be launch-config invariant"
+    torch.testing.assert_close(w_wide.float(), w_narrow.float(), rtol=1e-5, atol=1e-6)
+
+
 if __name__ == "__main__":
     import sys
 

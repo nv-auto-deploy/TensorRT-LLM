@@ -124,6 +124,43 @@ def test_hash_routing_localized_bit_exact(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("expert_start,local_experts", [(0, 64), (64, 64), (0, 256)])
+def test_gate_gemv_localized_chain_parity(expert_start, local_experts):
+    """Triton gate GEMV feeding routing_localized vs the cuBLAS M=1 chain.
+
+    The trtllm-gen dispatch contract (int32 local ids incl. sentinel, bf16
+    masked weights): selection must match exactly across the GEMV swap; the
+    bf16 weights absorb the ~1e-6 fp32 logits deviation almost everywhere.
+    """
+    torch.manual_seed(7)
+    device = "cuda"
+    num_experts, hidden, top_k = 256, 4096, 6
+    W = (torch.randn(num_experts, hidden, device=device) * 0.05).float()
+    bias = (torch.randn(num_experts, device=device) * 0.5).float()
+
+    n_weight_flips = 0
+    for seed in range(64):
+        torch.manual_seed(seed)
+        x = torch.randn(1, hidden, device=device, dtype=torch.float32)
+        logits_ref = torch.nn.functional.linear(x, W)
+        logits_tri = torch.ops.auto_deploy.deepseek_v4_gate_gemv(x, W, None)
+        idx_ref, w_ref = torch.ops.auto_deploy.deepseek_v4_routing_localized(
+            logits_ref, bias, top_k, 1.5, True, expert_start, local_experts
+        )
+        idx_tri, w_tri = torch.ops.auto_deploy.deepseek_v4_routing_localized(
+            logits_tri, bias, top_k, 1.5, True, expert_start, local_experts
+        )
+        assert idx_tri.dtype == torch.int32 and w_tri.dtype == torch.bfloat16
+        assert torch.equal(idx_ref, idx_tri), (
+            f"localized selection flip (seed {seed}): ref={idx_ref}, tri={idx_tri}"
+        )
+        torch.testing.assert_close(w_tri.float(), w_ref.float(), rtol=2e-2, atol=1e-3)
+        n_weight_flips += int((w_tri != w_ref).sum())
+    # bf16 rounding may flip the odd last bit; it must stay rare, never systematic.
+    assert n_weight_flips <= 8, f"too many bf16 weight LSB flips: {n_weight_flips}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_routing_localized_rejects_nonpositive_local_experts():
     device = "cuda"
     router_logits = torch.randn(1, 16, device=device, dtype=torch.float32)

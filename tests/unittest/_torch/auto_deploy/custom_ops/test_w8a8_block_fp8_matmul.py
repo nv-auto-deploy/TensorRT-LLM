@@ -364,3 +364,93 @@ def test_splitk_dispatch_gate():
     assert _use_splitk_decode(2, 1536, 7168)
     assert not _use_splitk_decode(64, 1536, 7168)  # prefill M
     assert not _use_splitk_decode(1, 7168, 2048)  # short K (already CTA-rich)
+
+
+# ---------------------------------------------------------------------------
+# Fused activation-quant prologue (QUANT_PROLOGUE=True, v6)
+# ---------------------------------------------------------------------------
+#
+# ``As=None`` routes the raw bf16 activation into the split-K kernel, which
+# replicates ``_act_quant_kernel``'s ue8m0 quant per (row, 128-group) MMA tile
+# in its prologue and feeds the fp8 tile straight to ``tl.dot``. Exact-
+# arithmetic inputs (all partial products/sums fp32-exact) make the result
+# independent of both the reassociation AND the split-K atomic arrival order,
+# so torch.equal against the standalone pipeline is a hard gate; random-data
+# comparisons inherit the split-K path's pre-existing 1-ULP atomic wobble and
+# use the fp64 reference bar instead.
+
+
+def _exact_case(M, N, K, seed):
+    """Inputs whose quant is lossless and whose accumulation is fp32-exact."""
+    torch.manual_seed(seed)
+    vals = torch.tensor([0.0, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0], device="cuda")
+    a = vals[torch.randint(0, 7, (M, K), device="cuda")].to(torch.bfloat16)
+    a[:, :128] = 0.0  # all-zero group exercises the 1e-4 amax clamp
+    w = torch.randint(-2, 3, (N, K), device="cuda").float()
+    b_fp8 = w.to(torch.float8_e4m3fn)
+    b_s = torch.ones(N // 128, K // 128, device="cuda", dtype=torch.float32)
+    return a, b_fp8, b_s
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
+@pytest.mark.parametrize("M", [1, 2, 4])
+@pytest.mark.parametrize("N,K", [(1024, 4096), (1536, 4096)])
+def test_splitk_quant_prologue_exact_arithmetic(M, N, K):
+    """Fused-prologue split-K == standalone quant + split-K, bit-for-bit, on
+    exact-arithmetic inputs (any atomic order sums the same exact fp32 values).
+    M in {2,4} exercises the %M-padded rows (each padded row re-quantizes the
+    identical data row, so scales/payloads dedupe by construction)."""
+    a, b_fp8, b_s = _exact_case(M, N, K, seed=21)
+    a_fp8, a_s = _safe_act_quant(a.contiguous(), 128, "ue8m0")
+    ref = _w8a8_block_fp8_matmul_splitk(a_fp8, b_fp8, a_s, b_s, 128, 128, torch.bfloat16, M, N, K)
+    out = _w8a8_block_fp8_matmul_splitk(a, b_fp8, None, b_s, 128, 128, torch.bfloat16, M, N, K)
+    assert torch.equal(ref, out)
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
+@pytest.mark.parametrize("M", [2, 4])
+@pytest.mark.parametrize("N,K", [(1024, 4096), (1536, 4096)])
+def test_splitk_quant_prologue_random(M, N, K):
+    """Fused-prologue split-K vs fp64 ground truth of the standalone-quantized
+    operands on random data (the strict decode bar; atomic order precludes a
+    bitwise fused-vs-standalone assert here)."""
+    torch.manual_seed(22)
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    b_fp8, b_s = _quant_weight_block_fp8(b, 128, 128)
+    a_fp8, a_s = _safe_act_quant(a.contiguous(), 128, "ue8m0")
+    out = _w8a8_block_fp8_matmul_splitk(a, b_fp8, None, b_s, 128, 128, torch.bfloat16, M, N, K)
+    ref = (_dequant_act(a_fp8, a_s).double() @ _dequant_weight(b_fp8, b_s).double().t()).float()
+    scale = ref.abs().amax().clamp(min=1e-6)
+    max_rel = ((out.float() - ref).abs().amax() / scale).item()
+    assert max_rel < 1.5e-2, f"M={M} N={N} K={K}: max_rel={max_rel:.4e}"
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
+def test_splitk_quant_prologue_requires_full_group_tile():
+    """The fused prologue must reject an MMA tile narrower than the quant group
+    (its per-tile amax would only see part of the 128-group)."""
+    a, b_fp8, b_s = _exact_case(1, 1024, 4096, seed=23)
+    with pytest.raises(AssertionError, match="quant prologue requires"):
+        _w8a8_block_fp8_matmul_splitk(
+            a, b_fp8, None, b_s, 128, 128, torch.bfloat16, 1, 1024, 4096, BLOCK_SIZE_K=64
+        )
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
+def test_deferred_quant_prefill_falls_back_to_standalone():
+    """As=None with a non-decode M must quantize standalone inside the dispatch
+    and reproduce the eager quant+full-K pipeline byte-for-byte."""
+    M, N, K = 64, 1536, 4096
+    torch.manual_seed(24)
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    b_fp8, b_s = _quant_weight_block_fp8(b, 128, 128)
+    a_fp8, a_s = _safe_act_quant(a.contiguous(), 128, "ue8m0")
+    ref = _w8a8_block_fp8_matmul_triton(
+        a_fp8, b_fp8, a_s, b_s, [128, 128], output_dtype=torch.bfloat16
+    )
+    out = _w8a8_block_fp8_matmul_triton(
+        a, b_fp8, None, b_s, [128, 128], output_dtype=torch.bfloat16, input_scale_fmt="ue8m0"
+    )
+    assert torch.equal(ref, out)

@@ -19,6 +19,7 @@ This module defines atomic TRT-LLM-specific ops that use optimized kernels.
 The torch fallback variants are defined separately to enable multi-pattern matching.
 """
 
+import os
 from typing import List, Optional
 
 import torch
@@ -48,6 +49,10 @@ ONESHOT_SMALL_STRATEGY = "ONESHOT_SMALL"
 # ~5.5x faster than NCCL on a matched single-node TP4 grid, while >= 6144
 # elements measured at NCCL parity — so larger calls keep NCCL.
 _ONESHOT_SMALL_MAX_NUMEL = 4096
+
+# PDL overlap of the decode ONESHOT allreduce with the following HC seam
+# kernels (see deepseek_v4_hc_post.py). Default off.
+_AD_HC_PDL = os.environ.get("AD_HC_PDL", "0") == "1"
 
 
 def resolve_oneshot_small_strategy(numel: int) -> str:
@@ -128,6 +133,10 @@ def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
         )
 
     torch_op = _get_cached_allreduce(tensor.dtype, strategy_enum)
+    if _AD_HC_PDL and all_reduce_params is None and strategy_enum == AllReduceStrategy.ONESHOT:
+        # Fire PDL completion at AR start so PDL-attributed successors launch
+        # early; they still gdc_wait for full AR completion before reading it.
+        all_reduce_params = AllReduceParams(trigger_completion_at_end=False)
     return torch_op(tensor, all_reduce_params=all_reduce_params)
 
 

@@ -221,6 +221,10 @@ transforms:
   fuse_fp8_act_quant_cse:
     stage: post_load_fusion
     run_shape_prop: true
+    # Fuse the remaining standalone act-quant launches into the consuming decode
+    # W8A8 GEMV/split-K kernel prologues (op-internal flag, no graph rewrite;
+    # bit-exact, ue8m0-only). Prefill and non-decode shapes are unaffected.
+    w8a8_quant_prologue: true
   # Merge shared-expert gate (w1) + up (w3) sibling block-FP8 matmuls into one
   # concatenated projection + slice (the SwiGLU matcher can't span DeepSeek-V4's
   # clamp/FP32-cast nodes). Runs AFTER fuse_fp8_act_quant_cse so it collapses the two
@@ -254,6 +258,14 @@ transforms:
   # decode step on the trtllm-gen MXFP4 path). Bit-exact; SM100f-gated.
   fuse_moe_routing_localization:
     stage: post_load_fusion
+  # Swap the DSV4 router-gate GEMV producer (cuBLAS gemvx at M=1) for the
+  # multi-CTA Triton gate GEMV feeding deepseek_v4_routing[_localized]; pure
+  # in-place target swap (no node reordering; falls back to cuBLAS off the
+  # single-token decode shape). DEFAULT OFF: fp32 sum order of the logits
+  # changes (~1e-6) — requires a selection-parity check before enabling.
+  fuse_deepseek_v4_gate_gemv:
+    stage: post_load_fusion
+    enabled: false
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
@@ -303,6 +315,14 @@ transforms:
   fuse_rmsnorm_quant_nvfp4:
     stage: post_load_fusion
     enabled: true
+  # Fuse the DeepSeek-V4 HC seam producer/consumer op pair (hc_post + next-site
+  # partials -> HC-pre composition/combine) into one barrier kernel per seam.
+  # DEFAULT OFF: measured slower than the pair at decode (the in-kernel arrival
+  # barrier costs more than the launch boundary it removes; the shipped seam
+  # optimization is the PDL dependent launch inside the ops themselves).
+  fuse_hc_seam_pair:
+    stage: post_load_fusion
+    enabled: false
   fuse_gdn_gating:
     stage: post_load_fusion
   fuse_l2norm:
@@ -407,6 +427,20 @@ transforms:
   multi_stream_mla_attn:
     stage: compile
     enabled: false
+    # Fused-GEMM splits interpose narrow+contiguous before the Q chain's next
+    # linear (narrow -> contiguous -> norm -> linear), so classify at depth 4.
+    downstream_linear_depth: 4
+    # Multi-node aux window for pattern 1: the side projection's outputs are
+    # only read by the attention op, so the main-stream join moves from the
+    # projection site to right before the attention op, and the attention-only
+    # kernel side-cones off the last Q-chain linear (e.g. indexer rope + quant)
+    # overlap on the aux stream instead of running serially on main.
+    extended_aux_window: true
+    # Decode sparse-selection chain (indexer row store + index score + top-k)
+    # runs on the aux stream inside the cached sparse-attention op, co-running
+    # with the main-stream cache store/update; main re-joins right before the
+    # assemble kernel that consumes the selected rows.
+    decode_selection_aux: true
   multi_stream_gemm:
     stage: compile
     enabled: false

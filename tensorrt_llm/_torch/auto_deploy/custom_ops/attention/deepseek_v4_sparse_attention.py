@@ -2338,6 +2338,110 @@ def _select_decode_ratio4_indexer_rows(
     return topk_rows, topk_valid
 
 
+# Decode ratio-4 selection on the auxiliary CUDA stream: enabled once at
+# transform time (multi_stream_mla_attn ``decode_selection_aux``), read once
+# per op call. Default off keeps today's serial main-stream path byte-identical.
+_DECODE_SELECTION_AUX = False
+
+
+def set_decode_selection_aux(enabled: bool) -> None:
+    """Transform-time switch for the aux-stream decode selection overlap."""
+    global _DECODE_SELECTION_AUX
+    _DECODE_SELECTION_AUX = bool(enabled)
+
+
+def _launch_ratio4_selection_on_aux(
+    indexer_caches: List[torch.Tensor],
+    indexer_values: List[torch.Tensor],
+    seq_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    cur_page_ids: Optional[torch.Tensor],
+    cur_page_offsets: Optional[torch.Tensor],
+    q_index: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    position_ids_decode: torch.Tensor,
+    index_topk: int,
+    indexer_compressor_ape: torch.Tensor,
+    indexer_compressor_norm_weight: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    rms_norm_eps: float,
+    rope_dim: int,
+    max_compressed_len: int,
+    full_page_map: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]:
+    """Run the indexer-row current-token store + row selection on the aux stream.
+
+    The score kernel reads the indexer row written this step whenever
+    ``(input_pos + 1) % 4 == 0``, so the write and the selection stay on ONE
+    stream in that order. Event safety is same-aux-stream domination: the main
+    stream's wait on the FINAL aux record transitively covers all earlier work
+    queued on the same aux stream; the caller places that wait immediately
+    before the first main-stream consumer of the returned rows.
+    """
+    from ...utils.multi_stream_utils import cuda_stream_manager
+
+    device = torch.cuda.current_device()
+    # The enabling transform registers the device; keep a lazy fallback so the
+    # flag alone (e.g. unit tests) cannot dereference an unregistered device.
+    if device not in cuda_stream_manager.devices:
+        cuda_stream_manager.add_device(device)
+    main_stream = torch.cuda.current_stream(device)
+    aux_stream = cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)
+    main_event = cuda_stream_manager.get_event(device, cuda_stream_manager.SEL_MAIN_EVENT_NAME)
+    aux_event = cuda_stream_manager.get_event(device, cuda_stream_manager.SEL_AUX_EVENT_NAME)
+
+    # Record main progress at op entry so aux inherits every producer already
+    # queued on main (indexer q/weights, decode rows) without waiting for the
+    # main-stream cache stores launched after this call.
+    main_event.record(main_stream)
+    capturing = torch.cuda.is_current_stream_capturing()
+    if not capturing:
+        # Allocator cross-stream liveness for eager mode (mirrors
+        # begin_aux_stream_passthrough); capture replays keep addresses stable.
+        for value in (*indexer_values, q_index, indexer_weights):
+            value.record_stream(aux_stream)
+    with torch.cuda.stream(aux_stream):
+        aux_stream.wait_event(main_event)
+        _fused_current_token_store(
+            indexer_caches,
+            indexer_values,
+            seq_idx,
+            input_pos,
+            cu_num_pages,
+            cache_loc,
+            cur_page_ids,
+            cur_page_offsets,
+        )
+        topk_rows, topk_valid = _select_decode_ratio4_indexer_rows(
+            q_index,
+            indexer_weights,
+            indexer_caches[0],
+            indexer_caches[1],
+            seq_idx,
+            input_pos,
+            position_ids_decode,
+            index_topk,
+            cu_num_pages,
+            cache_loc,
+            indexer_compressor_ape,
+            indexer_compressor_norm_weight,
+            cos_table,
+            sin_table,
+            rms_norm_eps,
+            rope_dim,
+            max_compressed_len,
+            full_page_map=full_page_map,
+        )
+        aux_event.record(aux_stream)
+    if not capturing:
+        topk_rows.record_stream(main_stream)
+        topk_valid.record_stream(main_stream)
+    return topk_rows, topk_valid, aux_event
+
+
 def _decode_compressed_cache_attention(
     q_decode: torch.Tensor,
     attn_sink: torch.Tensor,
@@ -2364,34 +2468,42 @@ def _decode_compressed_cache_attention(
     rms_norm_eps: float,
     rope_dim: int,
     full_page_map: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    precomputed_selection: Optional[Tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]] = None,
 ) -> torch.Tensor:
     # Select the compressed candidate rows (and their pre-page validity) without
     # touching the paged caches yet: the indexer top-k for ratio-4, the full
     # ``arange`` range for the ratio-128 dense case.
     mode = _compression_mode(compress_ratio)
     dense_num_rows = None
+    selection_event = None
     if mode.uses_indexer:
-        index_topk = max(int(topk_decode.shape[-1]) - int(window_size), 0)
-        selected_rows, compressed_valid = _select_decode_ratio4_indexer_rows(
-            indexer_q_decode,
-            indexer_weights_decode,
-            indexer_compressor_kv_cache,
-            indexer_compressor_gate_cache,
-            seq_idx,
-            input_pos,
-            position_ids_decode,
-            index_topk,
-            cu_num_pages,
-            cache_loc,
-            indexer_compressor_ape,
-            indexer_compressor_norm_weight,
-            cos_table,
-            sin_table,
-            rms_norm_eps,
-            rope_dim,
-            max_compressed_len,
-            full_page_map=full_page_map,
-        )
+        if precomputed_selection is not None:
+            # Aux-stream selection (see _launch_ratio4_selection_on_aux): defer
+            # the main-stream join to just before the first consumer of the
+            # rows so the cache store/update kernels keep co-running with it.
+            selected_rows, compressed_valid, selection_event = precomputed_selection
+        else:
+            index_topk = max(int(topk_decode.shape[-1]) - int(window_size), 0)
+            selected_rows, compressed_valid = _select_decode_ratio4_indexer_rows(
+                indexer_q_decode,
+                indexer_weights_decode,
+                indexer_compressor_kv_cache,
+                indexer_compressor_gate_cache,
+                seq_idx,
+                input_pos,
+                position_ids_decode,
+                index_topk,
+                cu_num_pages,
+                cache_loc,
+                indexer_compressor_ape,
+                indexer_compressor_norm_weight,
+                cos_table,
+                sin_table,
+                rms_norm_eps,
+                rope_dim,
+                max_compressed_len,
+                full_page_map=full_page_map,
+            )
     else:
         # Dense ratio-128: the candidate rows are the full [0, max_compressed_len)
         # range and their validity is a pure function of input_pos, so the fused
@@ -2403,6 +2515,10 @@ def _decode_compressed_cache_attention(
         dense_num_rows = max_compressed_len
 
     if _HAS_TRITON and swa_cache.is_cuda and mhc_cache.is_cuda:
+        # Join point for the aux-stream selection: NOT earlier, so the cache
+        # store/update kernels above are not serialized behind the top-k.
+        if selection_event is not None:
+            torch.cuda.current_stream().wait_event(selection_event)
         # Fold the local/compressed page-map translation, the two paged row gathers,
         # the selected_kv / valid_rows concatenation and the attend arange/where into
         # one paged assemble kernel, then attend directly on the emitted rel_topk.
@@ -2429,6 +2545,8 @@ def _decode_compressed_cache_attention(
         )
 
     # Eager fallback (CPU / no-Triton): materialize selected_kv via row gathers + cat.
+    if selection_event is not None:
+        torch.cuda.current_stream().wait_event(selection_event)
     if selected_rows is None:
         candidate_rows = torch.arange(
             max_compressed_len,
@@ -2609,6 +2727,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
     compressor_kv_decode = None
     compressor_gate_decode = None
     mode = _compression_mode(compress_ratio) if compress_ratio else None
+    precomputed_selection = None
     if compress_ratio:
         assert window_size is not None
         assert max_compressed_len is not None
@@ -2627,8 +2746,50 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             indexer_compressor_gate_decode = _flatten_decode_tokens(
                 indexer_compressor_gate, num_decode
             )
-            store_caches += [indexer_compressor_kv_cache, indexer_compressor_gate_cache]
-            store_values += [indexer_compressor_kv_decode, indexer_compressor_gate_decode]
+            selection_aux = (
+                _DECODE_SELECTION_AUX
+                and _HAS_TRITON
+                and num_decode > 0
+                and cur_page_ids is not None
+                and full_page_map is not None
+                and swa_cache.is_cuda
+                and mhc_cache.is_cuda
+            )
+            if selection_aux:
+                from ...utils.multi_stream_utils import is_multi_stream_enabled
+
+                selection_aux = is_multi_stream_enabled()
+            if selection_aux:
+                # Aux-stream selection: the indexer pair leaves the main-stream
+                # fused store and is written inside the aux window instead
+                # (exactly-once per mode; the score kernel may read this row).
+                indexer_q_decode = _flatten_decode_tokens(indexer_q, num_decode)
+                indexer_weights_decode = _flatten_decode_tokens(indexer_weights, num_decode)
+                precomputed_selection = _launch_ratio4_selection_on_aux(
+                    [indexer_compressor_kv_cache, indexer_compressor_gate_cache],
+                    [indexer_compressor_kv_decode, indexer_compressor_gate_decode],
+                    seq_idx_decode,
+                    input_pos_decode,
+                    cu_num_pages,
+                    cache_loc,
+                    cur_page_ids,
+                    cur_page_offsets,
+                    indexer_q_decode,
+                    indexer_weights_decode,
+                    position_ids_decode,
+                    max(int(topk_decode.shape[-1]) - int(window_size), 0),
+                    indexer_compressor_ape,
+                    indexer_compressor_norm_weight,
+                    cos_table,
+                    sin_table,
+                    rms_norm_eps,
+                    rope_dim,
+                    max_compressed_len,
+                    full_page_map,
+                )
+            else:
+                store_caches += [indexer_compressor_kv_cache, indexer_compressor_gate_cache]
+                store_values += [indexer_compressor_kv_decode, indexer_compressor_gate_decode]
 
     _fused_current_token_store(
         store_caches,
@@ -2692,6 +2853,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             rms_norm_eps,
             rope_dim,
             full_page_map=full_page_map,
+            precomputed_selection=precomputed_selection,
         )
     else:
         # Hoisted once-per-forward SWA local-window page map + rel_topk (idea_0086),

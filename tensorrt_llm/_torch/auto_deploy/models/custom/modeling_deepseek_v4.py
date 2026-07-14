@@ -26,6 +26,7 @@ compressed-row construction plus attention over those rows and the sink term.
 import json
 import math
 import operator
+import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -55,6 +56,12 @@ from ..quant_checkpoint_layout import (
     QuantizedCheckpointLayoutError,
     load_packed_mxfp4_expert_tensors,
 )
+
+# LM-head dtype gate (read once at import, same pattern as AD_HC_PDL): default
+# off keeps the fp32 head weight/GEMM; on, the head stays bf16 and forward
+# rounds the fp32 hidden to bf16 at the head boundary, halving the vocab-GEMM
+# weight traffic. Default off.
+_AD_BF16_LM_HEAD = os.environ.get("AD_BF16_LM_HEAD", "0") == "1"
 
 
 @dataclass
@@ -1837,13 +1844,16 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             [DeepseekV4Block(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = DeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
-        # Store the LM-head weight in fp32 so the per-step bf16->fp32 recast in
-        # ``forward`` (``self.head.weight.float()``) is hoisted to a one-time
-        # load-time cast. ``_load_checkpoint`` copy-casts the bf16 checkpoint
-        # tensor into this fp32 param (no ``assign=True``), so the stored values
-        # equal ``bf16(W).float()`` and the logits GEMM is bit-identical.
+        # LM-head weight dtype. Default fp32: ``_load_checkpoint`` copy-casts the
+        # bf16 checkpoint tensor into the fp32 param once (no ``assign=True``),
+        # so values equal ``bf16(W).float()`` and the fp32 logits GEMM is
+        # bit-identical to a per-step recast. Gated bf16: the param keeps the
+        # checkpoint dtype (plain copy) and the GEMM streams half the bytes.
         self.head = nn.Linear(
-            config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            dtype=torch.bfloat16 if _AD_BF16_LM_HEAD else torch.float32,
         )
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.hc_mult = config.hc_mult
@@ -1942,15 +1952,17 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             )
         # ``layer_type="lm_head"`` tags this vocab projection so
         # ``apply_sharding_hints`` column-splits ``head.weight`` (vocab dim) +
-        # all_gathers the logits under TP, instead of replicating it. Replicated,
-        # every rank re-casts and matmuls the full [vocab, hidden] weight each
-        # step; sharded, both the bf16->fp32 weight cast and the fp32 logits GEMM
-        # shrink by tp_size. Mathematically exact (output columns are independent).
-        # ``self.head.weight`` is already fp32 (cast once at load), so no per-step
-        # bf16->fp32 weight recast is emitted into the decode graph here; the
-        # fused HC head op returns fp32 (bf16-rounded values widened), so no
-        # per-step activation cast is emitted either.
+        # all_gathers the logits under TP, instead of replicating the full
+        # [vocab, hidden] GEMM on every rank. Exact: output columns are
+        # independent, and the gather + trailing ``.float()`` are dtype-agnostic.
         hidden_states = self._hc_head_norm(hidden_states, hc_partials)
+        # The fused HC head op returns fp32 (bf16-rounded values widened), so
+        # the gated boundary cast below is lossless. Default: fp32 GEMM against
+        # the load-time-widened fp32 weight, no per-step casts. Gated bf16: the
+        # GEMM streams the bf16 weight (half the bytes) and only its bf16
+        # output rounding differs from the fp32 path; logits still widen to fp32.
+        if _AD_BF16_LM_HEAD:
+            hidden_states = hidden_states.to(torch.bfloat16)
         logits = _linear(hidden_states, self.head.weight, None, layer_type="lm_head").float()
         return DeepseekV4CausalLMOutput(logits=logits)
 
@@ -1977,6 +1989,13 @@ class DeepseekV4AutoModelForCausalLMFactory(AutoModelForCausalLMFactory):
         ):
             model_config.ad_compress_max_seq_len = model_config.ad_rope_cache_len
         return model_config, unused_kwargs
+
+    def get_pipeline_cache_model_identifier(self) -> Dict[str, Any]:
+        # The lm-head dtype gate changes the traced graph (head weight dtype +
+        # boundary cast), so gated/ungated snapshots must not share a cache entry.
+        identifier = super().get_pipeline_cache_model_identifier()
+        identifier["ad_bf16_lm_head"] = _AD_BF16_LM_HEAD
+        return identifier
 
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:
         model_config, _ = self._get_model_config()

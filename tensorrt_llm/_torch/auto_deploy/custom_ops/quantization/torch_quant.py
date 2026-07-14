@@ -490,6 +490,25 @@ def torch_fake_quant_int4_gptq_linear_fake(
     return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)
 
 
+# In-kernel activation-quant prologue for the decode W8A8 GEMV/split-K kernels:
+# enabled once at transform time (fuse_fp8_act_quant_cse ``w8a8_quant_prologue``),
+# read per op call. Default off keeps the standalone _act_quant_kernel launches.
+_W8A8_QUANT_PROLOGUE = False
+
+
+def set_w8a8_quant_prologue(enabled: bool) -> None:
+    """Transform-time switch for the fused activation-quant prologue."""
+    global _W8A8_QUANT_PROLOGUE
+    _W8A8_QUANT_PROLOGUE = bool(enabled)
+
+
+def _use_quant_prologue(input_scale_fmt: str) -> bool:
+    # Only the pow-2 (ue8m0) scale branch is replicated in-kernel: its scales are
+    # exactly representable in the model dtype, so the recomputed fp32 scale is
+    # bit-identical to the standalone kernel's stored-then-reloaded scale.
+    return _W8A8_QUANT_PROLOGUE and input_scale_fmt.lower() == "ue8m0"
+
+
 @triton.jit
 def _act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, ROUND_SCALE: tl.constexpr):
     """Block-wise FP8 activation quantization, safe for all-zero blocks.
@@ -757,11 +776,12 @@ def _w8a8_block_fp8_matmul_kernel(
 def _w8a8_block_fp8_matmul_triton(
     A: torch.Tensor,
     B: torch.Tensor,
-    As: torch.Tensor,
+    As: Optional[torch.Tensor],
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float32,
     residual: Optional[torch.Tensor] = None,
+    input_scale_fmt: str = "",
 ) -> torch.Tensor:
     if block_size is None:
         block_n, block_k = 128, 128
@@ -770,9 +790,16 @@ def _w8a8_block_fp8_matmul_triton(
         block_n, block_k = block_size[0], block_size[1]
 
     assert A.shape[-1] == B.shape[-1]
-    assert As.numel() != 1, "per-tensor scales unsupported in vendored path"
-    assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
-    assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+    if As is None:
+        # Deferred activation quant (``_use_quant_prologue``): A is the raw
+        # model-dtype activation. The decode GEMV/split-K kernels below fuse the
+        # ue8m0 quant into their prologue; any other shape quantizes standalone
+        # right before the full-K kernel (byte-identical to the eager pipeline).
+        assert A.is_contiguous() and A.shape[-1] % block_k == 0
+    else:
+        assert As.numel() != 1, "per-tensor scales unsupported in vendored path"
+        assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
 
     M = A.numel() // A.shape[-1]
     N, K = B.shape
@@ -815,6 +842,11 @@ def _w8a8_block_fp8_matmul_triton(
             # there (identical rounding to the unfused sequence).
             C = C + residual
         return C
+
+    if As is None:
+        # No fused-prologue decode path for this shape (e.g. prefill): quantize
+        # standalone and fall through to the full-K autotuned kernel.
+        A, As = _safe_act_quant(A, block_k, input_scale_fmt)
 
     C = A.new_empty(C_shape, dtype=output_dtype)
 
@@ -895,6 +927,7 @@ def _w8a8_block_fp8_matmul_splitk_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    QUANT_PROLOGUE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     pid_sk = tl.program_id(axis=1)
@@ -921,11 +954,21 @@ def _w8a8_block_fp8_matmul_splitk_kernel(
     num_k = tl.cdiv(K, BLOCK_SIZE_K)
     for k in range(pid_sk, num_k, SPLIT_K):
         k_remaining = K - k * BLOCK_SIZE_K
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
 
         offs_ks = (k * BLOCK_SIZE_K) // group_k
-        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+        if QUANT_PROLOGUE:
+            # A is the raw model-dtype activation and BLOCK_SIZE_K == group_k, so
+            # the tile is one quant group per row: replicate _act_quant_kernel's
+            # ue8m0 scale math + fp8 cast in-register (bit-identical) and feed the
+            # fp8 tile to tl.dot exactly like the memory-loaded path.
+            x = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0).to(tl.float32)
+            amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
+            a_s = tl.exp2(tl.ceil(tl.log2(amax / 448.0)))
+            a = (x / a_s[:, None]).to(tl.float8e4nv)
+        else:
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+            a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
@@ -1046,7 +1089,7 @@ def _validate_splitk_c_out(
     C_out: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
-    As: torch.Tensor,
+    As: Optional[torch.Tensor],
     Bs: torch.Tensor,
     output_dtype: torch.dtype,
     M: int,
@@ -1055,6 +1098,8 @@ def _validate_splitk_c_out(
 ) -> None:
     """Validate a caller-owned split-K accumulator without reading device data."""
     expected_shape = (M, N)
+    # As is None on the deferred-quant path (in-kernel activation-quant prologue).
+    operands = [("A", A), ("B", B), ("Bs", Bs)] + ([] if As is None else [("As", As)])
     if A.dim() != 2 or tuple(A.shape) != (M, K):
         raise ValueError(f"A must have shape {(M, K)} when C_out is used, got {tuple(A.shape)}")
     if C_out.dtype != torch.float32:
@@ -1063,7 +1108,7 @@ def _validate_splitk_c_out(
         raise ValueError("C_out requires output_dtype=torch.float32")
     if C_out.layout != torch.strided:
         raise ValueError(f"C_out must use strided layout, got {C_out.layout}")
-    for name, tensor in (("A", A), ("B", B), ("As", As), ("Bs", Bs)):
+    for name, tensor in operands:
         if C_out.device != tensor.device:
             raise ValueError(
                 f"C_out and {name} must be on the same device, "
@@ -1076,7 +1121,7 @@ def _validate_splitk_c_out(
             "C_out must have unit column stride and row stride >= N; "
             f"got stride {tuple(C_out.stride())} for N={N}"
         )
-    for name, tensor in (("A", A), ("B", B), ("As", As), ("Bs", Bs)):
+    for name, tensor in operands:
         if torch._C._overlaps(C_out, tensor):
             raise ValueError(f"C_out must not overlap {name}")
 
@@ -1084,7 +1129,7 @@ def _validate_splitk_c_out(
 def _w8a8_block_fp8_matmul_splitk(
     A: torch.Tensor,
     B: torch.Tensor,
-    As: torch.Tensor,
+    As: Optional[torch.Tensor],
     Bs: torch.Tensor,
     block_n: int,
     block_k: int,
@@ -1138,6 +1183,13 @@ def _w8a8_block_fp8_matmul_splitk(
     assert block_k % BLOCK_SIZE_K == 0, (
         f"BLOCK_SIZE_K={BLOCK_SIZE_K} must divide quant block_k={block_k}"
     )
+    if As is None:
+        # Deferred-quant path: the per-row group amax is reduced over one K tile,
+        # so the tile must cover exactly one whole quant group.
+        assert BLOCK_SIZE_K == block_k and K % block_k == 0, (
+            f"quant prologue requires BLOCK_SIZE_K == block_k ({BLOCK_SIZE_K} vs {block_k}) "
+            f"and K % block_k == 0 (K={K})"
+        )
     if C_out is not None:
         _validate_splitk_c_out(C_out, A, B, As, Bs, output_dtype, M, N, K)
         C_acc = C_out
@@ -1154,7 +1206,7 @@ def _w8a8_block_fp8_matmul_splitk(
         A,
         B,
         C_acc,
-        As,
+        A if As is None else As,
         Bs,
         M,
         N,
@@ -1167,14 +1219,15 @@ def _w8a8_block_fp8_matmul_splitk(
         B.stride(0),
         C_acc.stride(-2),
         C_acc.stride(-1),
-        As.stride(-2),
-        As.stride(-1),
+        0 if As is None else As.stride(-2),
+        0 if As is None else As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
         BLOCK_SIZE_M=_SPLITK_BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         SPLIT_K=SPLIT_K,
+        QUANT_PROLOGUE=As is None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -1226,6 +1279,20 @@ _W8A8_TP4_M1_ROWWISE_CFG = {
     (4096, 2048): (4, 8, 2, 5),  # wo_b                      (was full-K BN32)
 }
 
+# Launch schedule for the fused-quant-prologue variant (QUANT_PROLOGUE=True).
+# The in-kernel quant shifts the register/occupancy balance, so each shape was
+# re-swept with the same drift-controlled CUDA-graph microbench: every entry
+# below beat (or tied, minus one launch) the standalone quant + GEMV pair.
+# Key set must match _W8A8_TP4_M1_ROWWISE_CFG (shared _use_rowwise_gemv gate).
+_W8A8_TP4_M1_ROWWISE_PROLOGUE_CFG = {
+    (1536, 4096): (4, 32, 4, 3),  # 4.01 vs 4.08 us pair (BLOCK_N=1 regressed)
+    (1024, 4096): (2, 32, 4, 5),  # 3.53 vs 4.20 us pair
+    (16384, 1024): (32, 8, 4, 3),  # 4.88 vs 5.58 us pair (standalone cfg kept)
+    (8192, 1024): (32, 8, 4, 2),  # 3.51 vs 4.92 us pair
+    (4096, 512): (8, 4, 2, 5),  # 2.34 vs 3.56 us pair
+    (4096, 2048): (4, 16, 4, 2),  # 4.11 vs 5.42 us pair
+}
+
 
 def _use_rowwise_gemv(
     M: int,
@@ -1235,13 +1302,14 @@ def _use_rowwise_gemv(
     block_k: int,
     A: torch.Tensor,
     B: torch.Tensor,
-    As: torch.Tensor,
+    As: Optional[torch.Tensor],
     Bs: torch.Tensor,
 ) -> bool:
     """Gate the rowwise decode GEMV to the exact measured M=1 TP4 shapes."""
     if M != 1 or block_n != 128 or block_k != 128:
         return False
-    cfg = _W8A8_TP4_M1_ROWWISE_CFG.get((N, K))
+    cfg_table = _W8A8_TP4_M1_ROWWISE_CFG if As is not None else _W8A8_TP4_M1_ROWWISE_PROLOGUE_CFG
+    cfg = cfg_table.get((N, K))
     if cfg is None:
         return False
     block_rows, groups = cfg[0], cfg[1]
@@ -1249,7 +1317,10 @@ def _use_rowwise_gemv(
     if N % block_rows or K % (groups * block_k):
         return False
     # The kernel reads flat contiguous rows (A, As) and row-major B / Bs.
-    return A.stride(-1) == 1 and B.stride(1) == 1 and As.stride(-1) == 1 and Bs.stride(1) == 1
+    # As is None on the deferred-quant path (in-kernel activation-quant prologue).
+    if As is not None and As.stride(-1) != 1:
+        return False
+    return A.stride(-1) == 1 and B.stride(1) == 1 and Bs.stride(1) == 1
 
 
 @triton.jit
@@ -1268,6 +1339,7 @@ def _w8a8_gemv_rowwise_kernel(
     BLOCK_N: tl.constexpr,
     GROUPS: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
+    QUANT_PROLOGUE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -1279,10 +1351,18 @@ def _w8a8_gemv_rowwise_kernel(
     bs_row = offs_n // GROUP_N
     for g0 in range(0, num_k_groups, GROUPS):
         kk = (g0 + offs_g)[:, None] * GROUP_K + offs_k[None, :]
-        a = tl.load(A + kk).to(tl.float32)  # (GROUPS, GROUP_K)
+        if QUANT_PROLOGUE:
+            # A is the raw model-dtype activation: replicate _act_quant_kernel's
+            # ue8m0 scale math + fp8 round-trip in-register (bit-identical).
+            x = tl.load(A + kk).to(tl.float32)  # (GROUPS, GROUP_K)
+            amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
+            a_s = tl.exp2(tl.ceil(tl.log2(amax / 448.0)))
+            a = (x / a_s[:, None]).to(tl.float8e4nv).to(tl.float32)
+        else:
+            a = tl.load(A + kk).to(tl.float32)  # (GROUPS, GROUP_K)
+            a_s = tl.load(As + g0 + offs_g).to(tl.float32)
         b = tl.load(B + offs_n[:, None, None] * stride_bn + kk[None, :, :]).to(tl.float32)
         part = tl.sum(b * a[None, :, :], axis=2)  # (BLOCK_N, GROUPS)
-        a_s = tl.load(As + g0 + offs_g).to(tl.float32)
         b_s = tl.load(Bs + bs_row[:, None] * stride_bsn + (g0 + offs_g)[None, :]).to(tl.float32)
         # Same scale association as the incumbent kernels: (partial * a_s) * b_s.
         acc += tl.sum(part * a_s[None, :] * b_s, axis=1)
@@ -1299,7 +1379,7 @@ def _w8a8_gemv_rowwise_kernel(
 def _w8a8_gemv_rowwise(
     A: torch.Tensor,
     B: torch.Tensor,
-    As: torch.Tensor,
+    As: Optional[torch.Tensor],
     Bs: torch.Tensor,
     block_n: int,
     block_k: int,
@@ -1308,15 +1388,20 @@ def _w8a8_gemv_rowwise(
     K: int,
     residual: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Launch the rowwise direct-store decode GEMV (gate via _use_rowwise_gemv)."""
-    block_rows, groups, num_warps, num_stages = _W8A8_TP4_M1_ROWWISE_CFG[(N, K)]
+    """Launch the rowwise direct-store decode GEMV (gate via _use_rowwise_gemv).
+
+    ``As is None`` selects the deferred-quant path: ``A`` is the raw model-dtype
+    activation and the kernel quantizes each 128-group in its prologue.
+    """
+    cfg_table = _W8A8_TP4_M1_ROWWISE_CFG if As is not None else _W8A8_TP4_M1_ROWWISE_PROLOGUE_CFG
+    block_rows, groups, num_warps, num_stages = cfg_table[(N, K)]
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
     grid = (N // block_rows,)
     _w8a8_gemv_rowwise_kernel[grid](
         A,
         B,
         C,
-        As,
+        A if As is None else As,
         Bs,
         C if residual is None else residual,
         K,
@@ -1327,6 +1412,7 @@ def _w8a8_gemv_rowwise(
         BLOCK_N=block_rows,
         GROUPS=groups,
         HAS_RESIDUAL=residual is not None,
+        QUANT_PROLOGUE=As is None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -1363,7 +1449,12 @@ def torch_fake_quant_finegrained_fp8_linear(
     block_k = triton.cdiv(K, scale_k)
     block_size = [block_n, block_k]
 
-    qinput, scale = _safe_act_quant(input, block_size[1], input_scale_fmt)
+    if _use_quant_prologue(input_scale_fmt):
+        # Defer the activation quant into the decode kernels' prologue (or the
+        # standalone fallback inside the matmul dispatch for non-decode shapes).
+        qinput, scale = input, None
+    else:
+        qinput, scale = _safe_act_quant(input, block_size[1], input_scale_fmt)
     output = _w8a8_block_fp8_matmul_triton(
         qinput,
         weight_quantized,
@@ -1371,6 +1462,7 @@ def torch_fake_quant_finegrained_fp8_linear(
         weight_scale_inv,
         block_size,
         output_dtype=input.dtype,
+        input_scale_fmt=input_scale_fmt,
     )
 
     if bias is not None:
@@ -1817,18 +1909,28 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
         # contraction is exact). Under tensor parallelism the DeepSeek-V4 MLA ``wo_a`` per-rank
         # group count is 1, so this is a single 2D block-FP8 GEMM (K=4096 -> the split-K decode
         # path); ``num_groups > 1`` falls back to a per-group launch of the same proven kernel.
-        qinput, input_scales = _safe_act_quant(input_contiguous, block_k, input_scale_fmt)
-        m_tokens = qinput.numel() // (num_groups * in_features)
-        qin = qinput.reshape(m_tokens, num_groups, in_features)
-        sin = input_scales.reshape(m_tokens, num_groups, input_scales.shape[-1])
+        m_tokens = input_contiguous.numel() // (num_groups * in_features)
+        # Deferred activation quant: the decode split-K/GEMV kernels fuse the
+        # ue8m0 quant into their prologue; other branches quantize standalone.
+        defer_quant = _use_quant_prologue(input_scale_fmt) and (
+            num_groups == 1 or _use_splitk_decode(m_tokens, rank, in_features)
+        )
+        if defer_quant:
+            qin = input_contiguous.reshape(m_tokens, num_groups, in_features)
+            sin = None
+        else:
+            qinput, input_scales = _safe_act_quant(input_contiguous, block_k, input_scale_fmt)
+            qin = qinput.reshape(m_tokens, num_groups, in_features)
+            sin = input_scales.reshape(m_tokens, num_groups, input_scales.shape[-1])
         if num_groups == 1:
             out2d = _w8a8_block_fp8_matmul_triton(
                 qin[:, 0, :],
                 weight_quantized,
-                sin[:, 0, :],
+                None if defer_quant else sin[:, 0, :],
                 weight_scale_inv,
                 [block_n, block_k],
                 output_dtype=input.dtype,
+                input_scale_fmt=input_scale_fmt,
             )
             output = out2d.reshape(*lead_shape, out_rows)
         elif _use_splitk_decode(m_tokens, rank, in_features):
@@ -1849,12 +1951,12 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
             weight_grouped = weight_quantized.view(num_groups, rank, in_features)
             scale_rows = scale_n // num_groups
             scale_grouped = weight_scale_inv.view(num_groups, scale_rows, scale_k)
-            acc = qinput.new_zeros((m_tokens, out_rows), dtype=torch.float32)
+            acc = qin.new_zeros((m_tokens, out_rows), dtype=torch.float32)
             for g in range(num_groups):
                 _w8a8_block_fp8_matmul_splitk(
                     qin[:, g, :],
                     weight_grouped[g],
-                    sin[:, g, :],
+                    None if defer_quant else sin[:, g, :],
                     scale_grouped[g],
                     block_n,
                     block_k,

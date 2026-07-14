@@ -34,6 +34,7 @@ The kernel name deliberately avoids the ``reduction`` op-type regex (no
 leaves the ``reduction`` bucket entirely.
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -45,6 +46,12 @@ import triton.language as tl
 # (the package ``__init__`` auto-imports every sibling anyway). One-way import:
 # ``deepseek_v4_hc_pre_norm`` does not import this module.
 from . import deepseek_v4_hc_pre_norm as _hc_pre_norm  # noqa: F401
+
+# PDL: launch the seam-consumer kernels with programmatic dependent launch so
+# their ramp + weight prologue overlaps the tail of the seam producer kernel
+# (deepseek_v4_hc_post.py, which fires gdc_launch_dependents right after its x
+# load). Launch-only gate, no graph change. Default off.
+_AD_HC_PDL = os.environ.get("AD_HC_PDL", "0") == "1"
 
 
 @triton.jit
@@ -605,6 +612,7 @@ def _hc_pre_composition_combine_kernel(
     BLOCK_H: tl.constexpr,  # next_power_of_2(H)
     SINKHORN_ITERS: tl.constexpr,
     EMIT_Y32: tl.constexpr,
+    LAUNCH_PDL: tl.constexpr,  # PDL: ramp + weight prologue overlap the producer tail
 ):
     """Two programs per token row (grid ``(N, 2)``): combine ∥ composition.
 
@@ -617,12 +625,24 @@ def _hc_pre_composition_combine_kernel(
     are bit-identical to the two-kernel sequence — the sibling-program split
     only moves which SM executes each half). ``pre`` is consumed from
     registers via an exact one-hot extraction instead of an HBM round-trip.
+
+    Under ``LAUNCH_PDL`` the producer-independent RMSNorm weight stream is
+    hoisted before ``gdc_wait`` (same values, bit-identical outputs); every
+    partials / flat load stays after the wait.
     """
     row = tl.program_id(0)
     which = tl.program_id(1)
     if row >= N:
         return
     pbase = part_ptr + row * ((MIX_HC + 1) * SPLIT)
+
+    if LAUNCH_PDL:
+        # Producer-independent prologue: stream the [H] RMSNorm weight while
+        # the seam producer is still running, then wait for its outputs.
+        h_pre = tl.arange(0, BLOCK_H)
+        w_pre = tl.load(weight_ptr + h_pre, mask=h_pre < H, other=0.0)
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     s = tl.arange(0, SBLOCK)
     smask = s < SPLIT
@@ -666,7 +686,10 @@ def _hc_pre_composition_combine_kernel(
         var = tl.sum(y * y, axis=0) / H
         y_rstd = tl.rsqrt(var + rms_eps)
         normed = (y * y_rstd).to(tl.bfloat16).to(tl.float32)
-        w = tl.load(weight_ptr + h, mask=hmask, other=0.0)
+        if LAUNCH_PDL:
+            w = w_pre  # hoisted prologue load, same values
+        else:
+            w = tl.load(weight_ptr + h, mask=hmask, other=0.0)
         out = w * normed
         out_c = out.to(y_ptr.dtype.element_ty)
         tl.store(y_ptr + row * H + h, out_c, mask=hmask)
@@ -858,6 +881,9 @@ def deepseek_v4_hc_pre_mix_combine(
         BLOCK_H=triton.next_power_of_2(hidden),
         SINKHORN_ITERS=sinkhorn_iters,
         EMIT_Y32=False,
+        # Site 0 (layer-0 attn): the preceding partials kernel never fires a
+        # PDL trigger, so a dependent launch would gain nothing here.
+        LAUNCH_PDL=False,
         num_warps=_HC_PRE_MIX_COMBINE_NUM_WARPS,
         num_stages=2,
         maxnreg=_HC_PRE_MIX_COMBINE_MAXNREG,
@@ -1016,9 +1042,13 @@ def _hc_pre_mix_combine_partials_impl(
         BLOCK_H=triton.next_power_of_2(hidden),
         SINKHORN_ITERS=sinkhorn_iters,
         EMIT_Y32=emit_y32,
+        # The seam producer right before this launch fires its PDL trigger
+        # after loading x, so the dependent launch overlaps its partials tail.
+        LAUNCH_PDL=_AD_HC_PDL,
         num_warps=_HC_PRE_MIX_COMBINE_NUM_WARPS,
         num_stages=2,
         maxnreg=_HC_PRE_MIX_COMBINE_MAXNREG,
+        launch_pdl=_AD_HC_PDL,
     )
 
     return (
@@ -1222,12 +1252,21 @@ def _hc_head_combine_kernel(
     BM: tl.constexpr,  # next_power_of_2(hc_mult)
     SBLOCK: tl.constexpr,  # next_power_of_2(SPLIT)
     BLOCK_H: tl.constexpr,  # next_power_of_2(H)
+    LAUNCH_PDL: tl.constexpr,  # PDL: ramp + weight prologue overlap the producer tail
 ):
     """One program per token row: partials -> pre gate -> combine -> RMSNorm."""
     row = tl.program_id(0)
     if row >= N:
         return
     pbase = part_ptr + row * ((HM + 1) * SPLIT)
+
+    if LAUNCH_PDL:
+        # Producer-independent prologue: stream the [H] RMSNorm weight while
+        # the seam producer is still running, then wait for its outputs.
+        h_pre = tl.arange(0, BLOCK_H)
+        w_pre = tl.load(weight_ptr + h_pre, mask=h_pre < H, other=0.0)
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     s = tl.arange(0, SBLOCK)
     smask = s < SPLIT
@@ -1266,7 +1305,10 @@ def _hc_head_combine_kernel(
     var = tl.sum(y * y, axis=0) / H
     y_rstd = tl.rsqrt(var + rms_eps)
     normed = (y * y_rstd).to(tl.bfloat16).to(tl.float32)
-    w = tl.load(weight_ptr + h, mask=hmask, other=0.0)
+    if LAUNCH_PDL:
+        w = w_pre  # hoisted prologue load, same values
+    else:
+        w = tl.load(weight_ptr + h, mask=hmask, other=0.0)
     # bf16 round (torch_rmsnorm's out dtype) then widen: absorbs the .float().
     out = (w * normed).to(tl.bfloat16).to(tl.float32)
     tl.store(y_ptr + row * H + h, out, mask=hmask)
@@ -1358,8 +1400,12 @@ def deepseek_v4_hc_head_norm(
         BM=triton.next_power_of_2(hm),
         SBLOCK=triton.next_power_of_2(split),
         BLOCK_H=block_h,
+        # The last seam producer right before this launch fires its PDL
+        # trigger after loading x, so the dependent launch overlaps its tail.
+        LAUNCH_PDL=_AD_HC_PDL,
         num_warps=num_warps,
         num_stages=num_stages,
+        launch_pdl=_AD_HC_PDL,
     )
     if maxnreg is not None:
         launch_kwargs["maxnreg"] = maxnreg
