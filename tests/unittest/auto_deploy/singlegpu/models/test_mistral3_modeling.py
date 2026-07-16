@@ -628,7 +628,8 @@ def test_top_level_wrapper_inputs_embeds_path():
     torch.testing.assert_close(wrapper_logits, ref_logits, atol=1e-3, rtol=1e-3)
 
 
-def test_mistral3_wrappers_do_not_forward_none_inputs_embeds():
+@pytest.mark.parametrize("use_inputs_embeds", [False, True])
+def test_mistral3_wrappers_forward_kwargs_in_capture_order(use_inputs_embeds):
     class RecordingModule(nn.Module):
         def __init__(self):
             super().__init__()
@@ -639,19 +640,30 @@ def test_mistral3_wrappers_do_not_forward_none_inputs_embeds():
             hidden_states = torch.zeros(1, 2, 4)
             return type("Out", (), {"last_hidden_state": hidden_states, "logits": hidden_states})()
 
+    forwarded_kwargs = {
+        "position_ids": torch.arange(2).view(1, 2),
+        "metadata": torch.ones(1, dtype=torch.int32),
+        "r0_cache": torch.zeros(1),
+    }
+    expected_order = ["input_ids", "position_ids"]
+    if use_inputs_embeds:
+        forwarded_kwargs["inputs_embeds"] = torch.ones(1, 2, 4)
+        expected_order.append("inputs_embeds")
+    else:
+        forwarded_kwargs["input_ids"] = torch.ones(1, 2, dtype=torch.long)
+    expected_order.extend(["metadata", "r0_cache"])
+
     text_cfg = _small_text_config()
     causal_lm = Mistral4ForCausalLM(text_cfg)
     causal_lm.model = RecordingModule()
     causal_lm.lm_head = nn.Identity()
-    _ = causal_lm(
-        input_ids=torch.ones(1, 2, dtype=torch.long), position_ids=torch.arange(2).view(1, 2)
-    )
-    assert "inputs_embeds" not in causal_lm.model.kwargs
+    _ = causal_lm(**forwarded_kwargs)
+    assert list(causal_lm.model.kwargs) == expected_order
 
     outer = Mistral3ForConditionalGenerationAD(_small_outer_config())
     outer.language_model = RecordingModule()
-    _ = outer(input_ids=torch.ones(1, 2, dtype=torch.long), position_ids=torch.arange(2).view(1, 2))
-    assert "inputs_embeds" not in outer.language_model.kwargs
+    _ = outer(**forwarded_kwargs)
+    assert list(outer.language_model.kwargs) == expected_order
 
 
 def test_export_mistral4_text_model():

@@ -17,9 +17,8 @@ tests pin byte-exactness of the fast paths that shorten that host path:
    ``seq_len == 1``, ``position_ids == input_pos``. Mixed batches must keep the
    general repeat/cumsum result.
 
-3. ``CapturedGraph`` replay fast path: the capture-validated key-lookup flatten +
-   cached input views + ``_foreach_copy_`` must reproduce eager outputs for every
-   captured batch size, including kwargs passed in a different key order.
+3. ``CapturedGraph`` replay fast path: direct kwargs values + cached input views +
+   ``_foreach_copy_`` must reproduce eager outputs for every captured batch size.
 """
 
 import pytest
@@ -133,8 +132,7 @@ class _AddModel(torch.nn.Module):
         return (x * 2 + y,)
 
 
-@pytest.mark.parametrize("swap_kwarg_order", [False, True])
-def test_captured_graph_fast_flatten_and_foreach_copy(swap_kwarg_order):
+def test_captured_graph_direct_kwargs_and_foreach_copy():
     """Replay via the fast path must equal eager for all captured batch sizes."""
     device = "cuda"
     torch.manual_seed(0)
@@ -149,14 +147,10 @@ def test_captured_graph_fast_flatten_and_foreach_copy(swap_kwarg_order):
     with torch.inference_mode():
         cg.capture_graph(get_args_kwargs, batch_sizes=[4, 2, 1])
 
-        # the leaf-only kwargs layout must have enabled the key-lookup fast path
-        assert cg._fast_kwargs_order is not None
-
         for bs in (1, 2, 4):
             x = torch.randn(bs, 8, device=device)
             y = torch.randn(bs, 8, device=device)
-            kwargs = {"y": y, "x": x} if swap_kwarg_order else {"x": x, "y": y}
-            out = cg(**kwargs)[0]
+            out = cg(x=x, y=y)[0]
             ref = model(x, y)[0]
             torch.cuda.synchronize()
             assert torch.equal(out.cpu(), ref.cpu()), f"mismatch at bs={bs}"

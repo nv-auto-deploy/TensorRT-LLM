@@ -819,6 +819,51 @@ def test_conditional_generation_wrapper():
     assert torch.isfinite(out.logits).all()
 
 
+def test_gemma4_forwards_runtime_inputs_before_resources() -> None:
+    class RecordingLanguageModel(nn.Module):
+        def __init__(self, text_config: Gemma4TextConfig) -> None:
+            super().__init__()
+            self.embed_tokens = nn.Embedding(text_config.vocab_size, text_config.hidden_size)
+            self.forwarded_key_order: Optional[Tuple[str, ...]] = None
+
+        def get_input_embeddings(self) -> nn.Embedding:
+            return self.embed_tokens
+
+        def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(*input_ids.shape, 1, 1)
+
+        def forward(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
+            self.forwarded_key_order = tuple(kwargs)
+            return kwargs
+
+    config = Gemma4Config(
+        text_config=_small_text_config(),
+        vision_config=Gemma4VisionConfig(hidden_size=32),
+    )
+    model = Gemma4ForConditionalGeneration(config).eval()
+    language_model = RecordingLanguageModel(config.text_config)
+    model.model.language_model = language_model
+
+    model.model(
+        input_ids=torch.tensor([[1, 2]]),
+        position_ids=_position_ids(1, 2, "cpu"),
+        batch_info_host=torch.tensor([1, 0]),
+        cu_seqlen=torch.tensor([0, 2]),
+        input_pos=torch.tensor([0]),
+        r0_cache=torch.randn(1),
+    )
+
+    assert language_model.forwarded_key_order == (
+        "position_ids",
+        "inputs_embeds",
+        "batch_info_host",
+        "cu_seqlen",
+        "input_pos",
+        "per_layer_inputs",
+        "r0_cache",
+    )
+
+
 def test_shared_kv_layer_metadata_matches_config():
     model = Gemma4ForCausalLM(_shared_kv_text_config())
     layer_expectations = [

@@ -662,11 +662,13 @@ class Mistral4ForCausalLM(Mistral4PreTrainedModel, GenerationMixin):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        model_kwargs = dict(kwargs)
-        model_kwargs["input_ids"] = input_ids
-        model_kwargs["position_ids"] = position_ids
+        model_kwargs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+        }
         if inputs_embeds is not None:
             model_kwargs["inputs_embeds"] = inputs_embeds
+        model_kwargs.update(kwargs)
         outputs = self.model(**model_kwargs)
         logits = self.lm_head(outputs.last_hidden_state).float()
         return CausalLMOutputWithPast(logits=logits)
@@ -715,11 +717,13 @@ class Mistral3ForConditionalGenerationAD(PreTrainedModel, GenerationMixin):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> Mistral3ADOutput:
-        model_kwargs = dict(kwargs)
-        model_kwargs["input_ids"] = input_ids
-        model_kwargs["position_ids"] = position_ids
+        model_kwargs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+        }
         if inputs_embeds is not None:
             model_kwargs["inputs_embeds"] = inputs_embeds
+        model_kwargs.update(kwargs)
         outputs = self.language_model(**model_kwargs)
         return Mistral3ADOutput(logits=outputs.logits)
 

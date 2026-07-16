@@ -199,14 +199,6 @@ class CapturedGraph(nn.Module):
         self._in_spec = None
         self._out_spec = None
 
-        # Replay-time host fast paths. Decode replays this module once per token, so
-        # per-call host overhead (pytree recursion, per-input narrow/copy_ dispatch)
-        # directly gates inter-token latency on host-bound TP ranks.
-        # _fast_kwargs_order: capture-validated key order such that
-        # [kwargs[k] for k in order] reproduces tree_flatten_spec exactly (leaf-only
-        # kwargs, empty args). None disables the fast path.
-        self._fast_kwargs_order: Optional[Tuple[str, ...]] = None
-        self._fast_kwargs_keyset: Optional[frozenset] = None
         # Pre-narrowed input-buffer views per captured combined_shape so replay does a
         # single _foreach_copy_ instead of num_batched_inputs narrow+copy_ dispatches.
         self._input_views_cache: Dict[Tuple[int, ...], List[torch.Tensor]] = {}
@@ -233,35 +225,6 @@ class CapturedGraph(nn.Module):
 
     def _normalize_args_kwargs(self, args: Tuple, kwargs: Dict[str, Any]) -> Tuple[Tuple, Dict]:
         return args, _order_kwargs_runtime_then_resources(kwargs, self.resource_input_names)
-
-    def _set_fast_flatten_order(
-        self, args: Tuple, kwargs: Dict[str, Any], all_args_flat: List[Any]
-    ) -> None:
-        """Validate and record a key-lookup shortcut for the pytree flatten at replay.
-
-        The fast path is enabled only when the capture-time flatten is exactly
-        ``[kwargs[k] for k in <in_spec kwargs key order>]`` (no positional args, every
-        kwarg a leaf). Validation compares object identity against the real
-        ``tree_flatten`` result, so any nesting or ordering subtlety disables it.
-        """
-        self._fast_kwargs_order = None
-        self._fast_kwargs_keyset = None
-        if args:
-            return
-        try:
-            child = getattr(self._in_spec, "child", None)
-            kw_spec = child(1) if child is not None else self._in_spec.children_specs[1]
-            order = tuple(kw_spec.context or ())
-        except (AttributeError, IndexError, TypeError):
-            return
-        if len(order) != len(kwargs) or set(order) != set(kwargs):
-            return
-        candidate = [kwargs[k] for k in order]
-        if len(candidate) == len(all_args_flat) and all(
-            c is f for c, f in zip(candidate, all_args_flat)
-        ):
-            self._fast_kwargs_order = order
-            self._fast_kwargs_keyset = frozenset(order)
 
     def _resolve_num_batched_inputs(self, args: Tuple, kwargs: Dict[str, Any]) -> int:
         if self.num_batched_inputs is not None:
@@ -344,10 +307,6 @@ class CapturedGraph(nn.Module):
 
         # flatten args, kwargs for the first time and record in_spec
         all_args_flat, self._in_spec = _args_kwargs_flatten(*args, **kwargs)
-
-        # record the key-lookup flatten shortcut for replay (validated vs the real
-        # flatten above; disabled automatically for nested/positional inputs)
-        self._set_fast_flatten_order(args, kwargs, all_args_flat)
 
         # extract the batched input tensors
         args_batched = all_args_flat[:num_batched_inputs]
@@ -452,18 +411,13 @@ class CapturedGraph(nn.Module):
 
         assert self.num_batched_inputs is not None, "Graphs must be captured before replay."
 
-        # flatten args, kwargs. The key-lookup fast path (validated at capture) avoids
-        # the pytree recursion + kwargs re-sort on the per-token decode path; any key
-        # mismatch falls back to the generic spec flatten.
-        if (
-            self._fast_kwargs_order is not None
-            and not args
-            and kwargs.keys() == self._fast_kwargs_keyset
-        ):
-            all_args_flat = [kwargs[name] for name in self._fast_kwargs_order]
-        else:
+        # AutoDeploy decode passes leaf-only kwargs in capture order. Consume their
+        # values directly instead of traversing the pytree on every token.
+        if args:
             args, kwargs = self._normalize_args_kwargs(args, kwargs)
             all_args_flat = _args_kwargs_flatten_spec(self._in_spec, *args, **kwargs)
+        else:
+            all_args_flat = list(kwargs.values())
 
         # extract the batched input tensors
         args_batched = all_args_flat[: self.num_batched_inputs]
