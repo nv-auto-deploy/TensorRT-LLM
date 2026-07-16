@@ -79,47 +79,12 @@ instead of using the begin/end_aux passthroughs.
 GPU timeline:
     Main: [record_event] → [Q_a_proj] → [...] → [Q_b_proj] → [wait_aux_event]
     Aux:                   [KV_a_proj] → done
-
-**Pattern 1 extended (config ``extended_aux_window``)**:
-
-Same match as pattern 1, but the aux window is built from the begin/end/wait
-passthroughs so it can span multiple nodes and join late.  Applies when the
-side projection's outputs are consumed only through view splits that all meet
-at one common consumer (the attention op):
-
-                fork_point
-                     │
-        ┌────────────┴──────────────────┐
-        ▼                               ▼
-    main stream                     aux stream
-    ───────────                     ──────────
-        │                           begin_aux ─ side_proj ─ end_aux
-    Q_a_proj                            │ (views of side_proj output
-    ...                                 │  stay as metadata-only nodes)
-    Q_b_proj ──────────────────────► begin_aux ─ side cone ─ end_aux
-    ...                                 │ (kernel chains off the last
-    Q rope / KV rope                    │  Q-chain linear that feed only
-        │                               │  the attention op)
-        └─────────► wait_aux ◄──────────┘
-                        │
-                  attention op
-
-The second window needs a second main→aux event.  The manager's single
-event pair is reused safely because both windows run on the same aux
-stream: the AUX record at the end of window 2 may overwrite window 1's
-un-waited record, but the single ``wait_aux`` on that final record
-transitively covers all earlier same-stream aux work (stream-order
-domination).  MAIN records are each consumed inside the next
-``begin_aux`` before any re-record, and CUDA graph capture materializes
-each record/wait as its own dependency edge, so no extra event is needed.
 """
 
-import operator
 from collections import deque
-from typing import Callable, List, Optional, Tuple, Type
+from typing import Callable, List, Optional, Tuple
 
 import torch
-from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
@@ -136,19 +101,11 @@ from ...utils.multi_stream_utils import (
 )
 from ...utils.node_utils import (
     all_gather_ops,
-    all_reduce_ops,
-    is_any_moe_op,
     is_fake_quantized_linear_op,
     is_finegrained_fp8_linear_op,
     is_op,
 )
-from ..interface import (
-    BaseTransform,
-    SharedConfig,
-    TransformConfig,
-    TransformInfo,
-    TransformRegistry,
-)
+from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 # ===========================================================================
 # Shared helpers
@@ -158,20 +115,6 @@ _LINEAR_OPS: List[Callable] = [
     torch.ops.auto_deploy.torch_linear_simple,
     torch.ops.aten.linear,
 ]
-
-
-# Multi-stream passthroughs inserted by sibling transforms; forks that already
-# carry one are skipped to avoid conflicting rewrites.
-_MULTI_STREAM_OPS = [
-    begin_aux_stream_passthrough,
-    end_aux_stream_passthrough,
-    wait_aux_stream_passthrough,
-    record_event_passthrough,
-]
-
-
-def _is_multi_stream_node(node: Node) -> bool:
-    return node.op == "call_function" and node.target in _MULTI_STREAM_OPS
 
 
 # Distinct symm-mem workspace slot for the aux KV path. The unified
@@ -395,12 +338,12 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
 # ===========================================================================
 
 
-def _find_kv_proj_linears(gm: GraphModule, max_depth: int = 3) -> List[Tuple[Node, Node]]:
+def _find_kv_proj_linears(gm: GraphModule) -> List[Tuple[Node, Node]]:
     """Find (fork_point, kv_linear) pairs suitable for aux-stream execution.
 
     A *fork point* is a node that directly feeds two or more supported linear
     ops.  Among these linears the one that does **not** lead to another linear
-    within *max_depth* BFS hops is the KV projection candidate (the lighter
+    within a small BFS depth is the KV projection candidate (the lighter
     branch).
 
     Returns a list of ``(fork_point, kv_linear_node)`` tuples.
@@ -413,14 +356,9 @@ def _find_kv_proj_linears(gm: GraphModule, max_depth: int = 3) -> List[Tuple[Nod
         if len(linear_users) < 2:
             continue
 
-        # Skip forks already rewritten by another multi-stream transform and MoE
-        # hidden forks (the router gate consumes a separate logits node, never this).
-        if any(_is_multi_stream_node(u) or is_any_moe_op(u) for u in node.users):
-            continue
-
         # Separate into "has downstream linear" (Q-like) and "does not" (KV-like).
-        kv_candidates = [ln for ln in linear_users if not _has_downstream_linear(ln, max_depth)]
-        q_candidates = [ln for ln in linear_users if _has_downstream_linear(ln, max_depth)]
+        kv_candidates = [ln for ln in linear_users if not _has_downstream_linear(ln)]
+        q_candidates = [ln for ln in linear_users if _has_downstream_linear(ln)]
 
         if not kv_candidates or not q_candidates:
             continue
@@ -442,8 +380,10 @@ def _create_aux_linear_op(base_op: Callable) -> Callable:
     )
 
 
-def _rewrite_kv_proj_single_op(graph, node_order, fork_point: Node, kv_linear: Node) -> None:
-    """Single-op aux rewrite for one ``(fork_point, kv_linear)`` pair.
+def _execute_kv_proj_in_aux_stream(gm: GraphModule) -> Tuple[GraphModule, int]:
+    """Replace KV projection linears with aux-stream variants.
+
+    For each matched ``(fork_point, kv_linear)`` the rewriter:
 
     1. Inserts ``record_event_passthrough(fork_point)`` so the main-stream
        event is recorded *before* the Q-chain kernels are submitted.
@@ -454,363 +394,57 @@ def _rewrite_kv_proj_single_op(graph, node_order, fork_point: Node, kv_linear: N
     The remaining KV-chain ops (split, rms_norm, view) stay on the main
     stream — they are lightweight and run after the aux wait that is built
     into the derived op.
-    """
-    aux_op = _create_aux_linear_op(kv_linear.target)
-
-    # Find the Q-chain linear(s) so we can insert the event record
-    # *before* the earliest Q-chain op in graph order.
-    q_linears = [u for u in fork_point.users if _is_linear(u) and u is not kv_linear]
-    earliest_q = min(q_linears, key=lambda n: node_order.get(n, 0))
-
-    # Insert record_event_passthrough right before the first Q-chain
-    # linear so the event is recorded before Q kernels hit the GPU.
-    with graph.inserting_before(earliest_q):
-        rec_node = graph.call_function(
-            record_event_passthrough,
-            args=(fork_point,),
-        )
-
-    # Replace KV linear with its aux-stream variant.  The hidden-state
-    # input (args[0]) is rewired to ``rec_node`` to create a data
-    # dependency that ensures the event is recorded first.
-    new_args = tuple(rec_node if arg is fork_point else arg for arg in kv_linear.args)
-
-    with graph.inserting_after(kv_linear):
-        new_node = graph.call_function(aux_op, args=new_args, kwargs=kv_linear.kwargs)
-
-    kv_linear.replace_all_uses_with(new_node)
-    graph.erase_node(kv_linear)
-
-
-def _execute_kv_proj_in_aux_stream(gm: GraphModule, max_depth: int = 3) -> Tuple[GraphModule, int]:
-    """Replace KV projection linears with aux-stream variants.
 
     Aux-stream variants are created lazily — only for base ops that actually
     appear in the matched KV positions.
     """
-    pairs = _find_kv_proj_linears(gm, max_depth)
+    pairs = _find_kv_proj_linears(gm)
     if not pairs:
         return gm, 0
 
     graph = gm.graph
     node_order = {n: i for i, n in enumerate(graph.nodes)}
 
+    # Create aux ops lazily for whatever linear op types are found.
+    ops_in_graph = {kv_linear.target for _, kv_linear in pairs}
+    op_dict = {op: _create_aux_linear_op(op) for op in ops_in_graph}
+
     num_replaced = 0
+
     for fork_point, kv_linear in pairs:
-        _rewrite_kv_proj_single_op(graph, node_order, fork_point, kv_linear)
+        # Find the Q-chain linear(s) so we can insert the event record
+        # *before* the earliest Q-chain op in graph order.
+        q_linears = [u for u in fork_point.users if _is_linear(u) and u is not kv_linear]
+        earliest_q = min(q_linears, key=lambda n: node_order.get(n, 0))
+
+        # Insert record_event_passthrough right before the first Q-chain
+        # linear so the event is recorded before Q kernels hit the GPU.
+        with graph.inserting_before(earliest_q):
+            rec_node = graph.call_function(
+                record_event_passthrough,
+                args=(fork_point,),
+            )
+
+        # Replace KV linear with its aux-stream variant.  The hidden-state
+        # input (args[0]) is rewired to ``rec_node`` to create a data
+        # dependency that ensures the event is recorded first.
+        new_args = tuple(rec_node if arg is fork_point else arg for arg in kv_linear.args)
+
+        with graph.inserting_after(kv_linear):
+            new_node = graph.call_function(
+                op_dict[kv_linear.target], args=new_args, kwargs=kv_linear.kwargs
+            )
+
+        kv_linear.replace_all_uses_with(new_node)
+        graph.erase_node(kv_linear)
         num_replaced += 1
 
     return gm, num_replaced
 
 
 # ===========================================================================
-# Pattern 1 extended: multi-node aux windows with a late join
-# ===========================================================================
-
-# Pure view-split targets a fused side projection is split back with (fusion
-# emits torch.narrow; exported mocks may carry the aten equivalents).
-_VIEW_SPLIT_TARGETS = (
-    torch.narrow,
-    torch.ops.aten.narrow.default,
-    torch.ops.aten.slice.Tensor,
-)
-
-# call_function targets that never launch GPU work (metadata views / bare
-# allocations).  A side cone made only of these gains nothing from a stream
-# move; anything else counts as a kernel.
-_NON_KERNEL_TARGETS = (
-    torch.narrow,
-    operator.getitem,
-    torch.ops.aten.narrow.default,
-    torch.ops.aten.slice.Tensor,
-    torch.ops.aten.view.default,
-    torch.ops.aten.reshape.default,
-    torch.ops.aten.split_with_sizes.default,
-    torch.ops.aten.split.Tensor,
-    torch.ops.aten.new_empty.default,
-)
-
-
-def _replace_input(node: Node, old: Node, new: Node) -> None:
-    """Replace every use of *old* in *node*'s args/kwargs (including nested lists)."""
-    node.args = torch.fx.node.map_arg(node.args, lambda a: new if a is old else a)
-    node.kwargs = torch.fx.node.map_arg(node.kwargs, lambda a: new if a is old else a)
-
-
-def _is_view_split(node: Node) -> bool:
-    return node.op == "call_function" and node.target in _VIEW_SPLIT_TARGETS
-
-
-def _find_view_join(kv_linear: Node) -> Optional[Node]:
-    """Return the unique consumer behind *kv_linear*'s view-only outputs.
-
-    Requires every user of *kv_linear* to be a pure view-split op and every
-    view's user to be one common ``call_function`` node (the join consumer).
-    Returns ``None`` when this shape does not hold.
-    """
-    if not kv_linear.users:
-        return None
-    join: Optional[Node] = None
-    for view in kv_linear.users:
-        if not _is_view_split(view) or not view.users:
-            return None
-        for consumer in view.users:
-            if join is None:
-                join = consumer
-            elif consumer is not join:
-                return None
-    if join is None or join.op != "call_function":
-        return None
-    return join
-
-
-def _cone_blocked(node: Node) -> bool:
-    """Ops that must never migrate to the aux stream."""
-    return (
-        _is_linear(node)
-        or _is_multi_stream_node(node)
-        or is_any_moe_op(node)
-        or is_op(node, all_gather_ops())
-        or is_op(node, all_reduce_ops())
-    )
-
-
-def _collect_exclusive_cone(root: Node, join: Node, max_nodes: int = 32) -> Optional[List[Node]]:
-    """Forward closure from *root* that terminates exclusively at *join*.
-
-    Returns the cone nodes (unordered) or ``None`` if the closure escapes to
-    any consumer other than *join*, contains a blocked op, or grows beyond
-    *max_nodes*.
-    """
-    if root is join:
-        return None
-    cone: List[Node] = []
-    seen: set = set()
-    queue: List[Node] = [root]
-    while queue:
-        n = queue.pop()
-        if n in seen:
-            continue
-        seen.add(n)
-        if n.op not in ("call_function", "call_method") or _cone_blocked(n):
-            return None
-        cone.append(n)
-        if len(cone) > max_nodes:
-            return None
-        for u in n.users:
-            if u is not join:
-                queue.append(u)
-    return cone
-
-
-def _cone_inputs_available(cone: List[Node], anchor: Node, node_order) -> bool:
-    """True if every external input of *cone* is already produced at *anchor*."""
-    cone_set = set(cone)
-    anchor_pos = node_order.get(anchor, 0)
-    for n in cone:
-        for inp in n.all_input_nodes:
-            if inp in cone_set or inp is anchor:
-                continue
-            if inp.op in ("get_attr", "placeholder"):
-                continue
-            if node_order.get(inp, 1 << 62) >= anchor_pos:
-                return False
-    return True
-
-
-def _cone_weight(cone: Optional[List[Node]]) -> float:
-    """Crude cost proxy (sum of output feature dims); ``None`` cones are heaviest."""
-    if cone is None:
-        return float("inf")
-    return float(sum(_get_output_feature_dim(n) for n in cone))
-
-
-def _cone_has_kernel(cone: List[Node]) -> bool:
-    return any(not (n.op == "call_function" and n.target in _NON_KERNEL_TARGETS) for n in cone)
-
-
-def _find_q_chain_tail(q_linear: Node, join: Node, node_order, max_depth: int) -> Node:
-    """Follow the Q chain linear-to-linear; return the last linear before *join*."""
-    tail = q_linear
-    for _ in range(8):
-        nxt = _find_downstream_node(tail, _is_linear, max_depth)
-        if nxt is None or node_order.get(nxt, 1 << 62) >= node_order.get(join, 0):
-            break
-        tail = nxt
-    return tail
-
-
-def _execute_kv_proj_in_aux_stream_extended(
-    gm: GraphModule, max_depth: int = 3
-) -> Tuple[GraphModule, int]:
-    """Pattern-1 rewrite with multi-node aux windows and a late join.
-
-    Extends the single-op rewrite in three ways (falling back to it per fork
-    when the required graph shape is absent):
-
-    1. The side projection runs inside a begin/end aux window opened at the
-       fork; its view-split outputs (metadata-only) stay in place and read the
-       ``end_aux`` passthrough, so the join is no longer baked into the op.
-    2. Kernel side-cones hanging off the *last* Q-chain linear that terminate
-       exclusively in the join consumer (e.g. an indexer rope + quant chain
-       reading a slice of a fused Q projection) migrate into a second aux
-       window opened right after that linear.  The second main→aux event
-       reuses the manager's single event pair: both windows share one aux
-       stream, so the single wait on the final AUX record transitively
-       covers window-1 work (stream-order domination); MAIN records are
-       consumed inside the next ``begin_aux`` before any re-record.
-    3. ``wait_aux`` is inserted immediately before the join consumer — the
-       first point where the main stream actually reads aux-produced data.
-    """
-    pairs = _find_kv_proj_linears(gm, max_depth)
-    if not pairs:
-        return gm, 0
-
-    graph = gm.graph
-    num_matched = 0
-
-    for fork_point, kv_linear in pairs:
-        # Recompute per pair: earlier rewrites shift node positions.
-        node_order = {n: i for i, n in enumerate(graph.nodes)}
-
-        q_linears = [u for u in fork_point.users if _is_linear(u) and u is not kv_linear]
-        earliest_q = min(q_linears, key=lambda n: node_order.get(n, 0))
-        q_pos = node_order.get(earliest_q, 0)
-
-        join = _find_view_join(kv_linear)
-        # The window opens before the Q chain, so every non-attr input of the
-        # side projection must already be available there.
-        inputs_ready = all(
-            inp is fork_point or inp.op == "get_attr" or node_order.get(inp, 1 << 62) < q_pos
-            for inp in kv_linear.all_input_nodes
-        )
-        if join is None or not inputs_ready:
-            ad_logger.info(
-                f"Multi-stream MLA pattern 1: no extended-window shape at "
-                f"{kv_linear.name}; using single-op aux rewrite"
-            )
-            _rewrite_kv_proj_single_op(graph, node_order, fork_point, kv_linear)
-            num_matched += 1
-            continue
-
-        views = list(kv_linear.users)
-
-        # ---- Window 1: side projection on aux, opened at the fork ----
-        for arg in kv_linear.all_input_nodes:
-            if arg.op == "get_attr" and node_order.get(arg, -1) >= q_pos:
-                earliest_q.prepend(arg)
-        with graph.inserting_before(earliest_q):
-            begin1 = graph.call_function(begin_aux_stream_passthrough, args=(fork_point,))
-            begin1.meta["val"] = fork_point.meta.get("val")
-        _replace_input(kv_linear, fork_point, begin1)
-        begin1.append(kv_linear)
-        with graph.inserting_after(kv_linear):
-            end1 = graph.call_function(end_aux_stream_passthrough, args=(kv_linear,))
-            end1.meta["val"] = kv_linear.meta.get("val")
-        for view in views:
-            _replace_input(view, kv_linear, end1)
-
-        # ---- Window 2: movable side cones off the last Q-chain linear ----
-        tail = _find_q_chain_tail(earliest_q, join, node_order, max_depth)
-        branches = list(tail.users)
-        end2: Optional[Node] = None
-        moved_nodes: List[Node] = []
-        if len(branches) >= 2:
-            cones = {b: _collect_exclusive_cone(b, join) for b in branches}
-            # Keep the heaviest branch (the attention Q/KV path) on main;
-            # move the lighter, self-contained kernel cones.
-            kept = max(branches, key=lambda b: _cone_weight(cones[b]))
-            movable = [
-                b
-                for b in branches
-                if b is not kept
-                and cones[b] is not None
-                and _cone_has_kernel(cones[b])
-                and _cone_inputs_available(cones[b], tail, node_order)
-            ]
-            if movable:
-                with graph.inserting_after(tail):
-                    begin2 = graph.call_function(begin_aux_stream_passthrough, args=(tail,))
-                    begin2.meta["val"] = tail.meta.get("val")
-                for b in movable:
-                    _replace_input(b, tail, begin2)
-                # Hoist the cones into a contiguous block right after begin2
-                # (original relative order is topological and preserved).
-                moved_nodes = sorted(
-                    {n for b in movable for n in cones[b]},
-                    key=lambda n: node_order.get(n, 1 << 62),
-                )
-                anchor = begin2
-                for n in moved_nodes:
-                    for inp in n.all_input_nodes:
-                        if inp.op == "get_attr" and node_order.get(inp, -1) >= node_order.get(
-                            tail, 0
-                        ):
-                            begin2.prepend(inp)
-                    anchor.append(n)
-                    anchor = n
-                with graph.inserting_after(anchor):
-                    end2 = graph.call_function(end_aux_stream_passthrough, args=(anchor,))
-                    end2.meta["val"] = anchor.meta.get("val")
-                for user in [u for u in list(anchor.users) if u is not end2]:
-                    _replace_input(user, anchor, end2)
-
-        # ---- Late join: main waits for aux right before the join consumer ----
-        chain_src = end2 if end2 is not None else max(views, key=lambda n: node_order.get(n, 0))
-        with graph.inserting_before(join):
-            wait_node = graph.call_function(wait_aux_stream_passthrough, args=(chain_src,))
-            wait_node.meta["val"] = chain_src.meta.get("val")
-        _replace_input(join, chain_src, wait_node)
-
-        ad_logger.info(
-            f"Multi-stream MLA pattern 1 extended: side={kv_linear.name} "
-            f"(views={len(views)}), join={join.name}, "
-            f"second_window={[n.name for n in moved_nodes] or None}"
-        )
-        num_matched += 1
-
-    return gm, num_matched
-
-
-# ===========================================================================
 # Transform class
 # ===========================================================================
-
-
-class MultiStreamMLAAttnConfig(TransformConfig):
-    """Configuration for the multi-stream MLA attention transform."""
-
-    downstream_linear_depth: int = Field(
-        default=3,
-        description=(
-            "Max BFS depth (user hops) used to classify a fork-point linear as "
-            "Q-like, i.e. another linear is reachable downstream. Fused-GEMM "
-            "output splits interpose narrow+contiguous nodes, which can push "
-            "the next linear one hop deeper than the unfused chain."
-        ),
-    )
-    extended_aux_window: bool = Field(
-        default=False,
-        description=(
-            "Pattern-1 multi-node aux window: open the window at the fork, join "
-            "immediately before the common attention consumer instead of at the "
-            "side projection, and migrate kernel side-cones hanging off the last "
-            "Q-chain linear (e.g. an indexer rope + quant chain) onto the aux "
-            "stream. Falls back to the single-op rewrite per fork when the "
-            "required graph shape is absent."
-        ),
-    )
-    decode_selection_aux: bool = Field(
-        default=False,
-        description=(
-            "Run the decode sparse-selection chain (current-token indexer row "
-            "store + index score + top-k) on the auxiliary CUDA stream inside "
-            "the cached sparse-attention op, overlapping it with the "
-            "main-stream cache store/update kernels; the main stream re-joins "
-            "immediately before the assemble kernel that consumes the selected "
-            "rows. No graph rewrite: this only flips an op-internal flag."
-        ),
-    )
 
 
 @TransformRegistry.register("multi_stream_mla_attn")
@@ -824,12 +458,6 @@ class MultiStreamMLAAttn(BaseTransform):
     If pattern 0 finds nothing (fused graph), pattern 1 runs as fallback.
     """
 
-    config: MultiStreamMLAAttnConfig
-
-    @classmethod
-    def get_config_class(cls) -> Type[MultiStreamMLAAttnConfig]:
-        return MultiStreamMLAAttnConfig
-
     def _apply(
         self,
         gm: GraphModule,
@@ -839,16 +467,6 @@ class MultiStreamMLAAttn(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         cuda_stream_manager.add_device(torch.cuda.current_device())
 
-        if self.config.decode_selection_aux:
-            # Op-internal aux window (no graph rewrite): flip the module flag
-            # once, before warmup/capture, so eager and captured paths agree.
-            from ...custom_ops.attention.deepseek_v4_sparse_attention import (
-                set_decode_selection_aux,
-            )
-
-            set_decode_selection_aux(True)
-            ad_logger.info("Multi-stream MLA: decode selection on aux stream enabled")
-
         # Pattern 0: full KV path on aux (unfused GEMMs)
         gm, n_unfused = _execute_kv_path_in_aux_stream(gm, shared_config.world_size)
         ad_logger.info(f"Multi-stream MLA pattern 0 (unfused KV path): {n_unfused} matches")
@@ -857,12 +475,7 @@ class MultiStreamMLAAttn(BaseTransform):
             total = n_unfused
         else:
             # Fallback: Pattern 1 (projection overlap)
-            if self.config.extended_aux_window:
-                gm, n_proj = _execute_kv_proj_in_aux_stream_extended(
-                    gm, self.config.downstream_linear_depth
-                )
-            else:
-                gm, n_proj = _execute_kv_proj_in_aux_stream(gm, self.config.downstream_linear_depth)
+            gm, n_proj = _execute_kv_proj_in_aux_stream(gm)
             ad_logger.info(f"Multi-stream MLA pattern 1 (projection): {n_proj} matches")
             total = n_proj
 
