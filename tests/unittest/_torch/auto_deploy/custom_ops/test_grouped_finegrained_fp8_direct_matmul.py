@@ -25,18 +25,12 @@ These tests prove the new path is correct:
     decode kernel, and equal up to fp32 atomic-reduction reorder (~1 ULP) on the split-K decode
     kernel (K>=4096), which itself is run-to-run non-deterministic by construction.
   * ``num_groups > 1`` matches a per-group launch of the non-grouped op bit-for-bit (full-K).
-  * the direct FP8 GEMM agrees to high cosine similarity with the prior dequant->BF16-BMM path,
-    so model-level accuracy is preserved (the direct path is in fact more faithful: it avoids the
-    BF16 rounding of the dequantized operands).
 """
 
 import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
-    _dequant_block_fp8_weight,
-)
 
 _FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 
@@ -139,26 +133,6 @@ def test_multi_group_matches_per_group_nongrouped_bitwise():
 
     assert out_grouped.shape == (x.shape[0], num_groups * rank)
     assert torch.equal(out_grouped, ref)
-
-
-def test_direct_fp8_close_to_prior_dequant_bmm():
-    """The direct FP8 GEMM changes the arithmetic vs the prior dequant->BF16-BMM; confirm they
-    agree to high cosine similarity so model accuracy is preserved."""
-    rank, in_features = 1024, 4096
-    x, w_fp8, scale = _make_inputs(1, rank, in_features, seed=3)
-
-    out_fp8 = _GROUPED_OP(x, w_fp8, None, [], [scale], [], [])  # direct FP8 path
-    # The prior behavior == feeding a pre-baked BF16 weight (the op's fallback branch).
-    out_rows, _ = w_fp8.shape
-    block_n = out_rows // scale.shape[0]
-    block_k = in_features // scale.shape[1]
-    w_bf16 = _dequant_block_fp8_weight(w_fp8, scale, block_n, block_k)
-    out_bmm = _GROUPED_OP(x, w_bf16, None, [], [scale], [], [])  # baked BF16 -> dequant BMM
-
-    cos = torch.nn.functional.cosine_similarity(
-        out_fp8.float().reshape(-1), out_bmm.float().reshape(-1), dim=0
-    )
-    assert cos > 0.99, f"cosine similarity too low: {cos.item()}"
 
 
 if __name__ == "__main__":

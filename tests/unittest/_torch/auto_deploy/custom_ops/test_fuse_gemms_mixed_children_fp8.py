@@ -16,11 +16,9 @@
 
 Enabling ``fuse_gemms_mixed_children`` (``fp8_only=True``) merges sibling
 ``torch_fake_quant_finegrained_fp8_linear`` projections that read the *same* activation
-into one concatenated ``[sum_N, K]`` block-FP8 GEMM + ``torch.narrow`` views. Unlike
-``fuse_finegrained_fp8_gate_up`` (which only merges the equal-shape shared-expert w1/w3),
-this transform also merges the DIFFERENT-shaped DeepSeek-V4 attention groups
-(``wq_a``+``wkv``, ``wq_b``+``indexer.wq_b``), so these tests guard the general
-different-N concat identity.
+into one concatenated ``[sum_N, K]`` block-FP8 GEMM + ``torch.narrow`` views, including
+the DIFFERENT-shaped DeepSeek-V4 attention groups (``wq_a``+``wkv``,
+``wq_b``+``indexer.wq_b``), so these tests guard the general different-N concat identity.
 
 They also guard the fused-parameter namespace: the transform registers its fused weights
 under a ``mixed_children_fused_weight_{idx}`` prefix instead of the generic

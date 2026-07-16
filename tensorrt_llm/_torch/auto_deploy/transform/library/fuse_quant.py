@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import operator
-from collections import defaultdict
 from typing import Optional, Tuple, Type
 
 import torch
@@ -703,7 +702,7 @@ class FuseFineGrainedFP8Linear(BaseTransform):
 
 
 # ============================================================================
-# FineGrained FP8 activation-quant common-subexpression elimination
+# FineGrained FP8 activation-quant helpers + W8A8 quant-prologue control
 # ============================================================================
 
 
@@ -714,9 +713,9 @@ def _finegrained_fp8_block_k(
 
     ``torch_fake_quant_finegrained_fp8_linear`` infers ``block_k = cdiv(K, scale_k)``
     from the weight ``[N, K]`` and per-block weight scale ``[N/block_n, K/block_k]``
-    shapes and quantizes the activation in groups of that size. Two linears can share
-    one activation quant only when this block size matches, so the transform groups on
-    it. Returns ``None`` when the shapes cannot be resolved (the node is skipped).
+    shapes and quantizes the activation in groups of that size.
+    ``fuse_fp8_swiglu_act_quant`` uses it to size the fused act-quant kernel.
+    Returns ``None`` when the shapes cannot be resolved (the node is skipped).
     """
     if not isinstance(weight_node, Node):
         return None
@@ -735,7 +734,7 @@ def _finegrained_fp8_block_k(
 
 
 class FuseFP8ActQuantCSEConfig(TransformConfig):
-    """Configuration for the FineGrained FP8 activation-quant CSE transform."""
+    """Configuration for ``fuse_fp8_act_quant_cse`` (W8A8 quant-prologue control)."""
 
     w8a8_quant_prologue: bool = Field(
         default=False,
@@ -751,32 +750,19 @@ class FuseFP8ActQuantCSEConfig(TransformConfig):
 
 @TransformRegistry.register("fuse_fp8_act_quant_cse")
 class FuseFP8ActQuantCSE(BaseTransform):
-    """Share one block-FP8 activation quant across sibling FineGrained FP8 linears.
+    """Control the op-internal W8A8 fused quant-prologue flag (no graph rewrite).
 
-    Models with MLA + MoE (DeepSeek-V4, etc.) feed the *same* activation tensor into
-    several FineGrained FP8 linears, e.g.:
-      * ``attn.wq_a`` + ``attn.wkv``               (both on the attention-norm output)
-      * ``attn.wq_b`` + ``attn.indexer.wq_b``      (both on the q-lora)
-      * shared-expert ``w1`` + ``w3``              (both on the MoE/MLP input)
+    When ``w8a8_quant_prologue`` is enabled, the standalone block-FP8 activation
+    quant is fused into the prologue of the consuming decode W8A8 GEMV/split-K
+    kernels by flipping a module-level flag (``set_w8a8_quant_prologue``) once at
+    transform time, before warmup/graph capture, so eager and captured paths agree.
 
-    Each ``torch_fake_quant_finegrained_fp8_linear`` re-runs ``_safe_act_quant`` (the
-    ``_act_quant_kernel`` Triton launch) on that identical tensor with the identical
-    block size, producing a byte-identical ``(fp8, scale)`` pair every time -- pure
-    redundant work (this kernel is the largest single hit-count Triton launch in the
-    DeepSeek-V4 decode window).
-
-    This transform hoists one ``torch_fp8_finegrained_act_quant`` per
-    ``(input, block_k, input_scale_fmt)`` group with >= 2 members and rewrites every
-    member to the matmul-only ``torch_fake_quant_finegrained_fp8_linear_prequant``,
-    deleting the redundant quant launches. Singleton groups are left untouched
-    (splitting them would be neutral). Reference-exact: the quant kernel is a
-    deterministic pure function, so one shared launch equals each per-linear recompute
-    bit for bit.
-
-    Runs in post_load_fusion AFTER ``fuse_finegrained_fp8_linear``. When the TRT-LLM
-    finegrained fuse is enabled the linears are already routed to deepgemm / cuBLAS
-    (which quantize internally), so this transform matches nothing -- it only fires on
-    the torch reference path (fuse disabled), which is what DeepSeek-V4 runs.
+    Historical note: this transform used to CSE-share one activation quant across
+    sibling FineGrained FP8 linears that consume the same input (DeepSeek-V4
+    ``wq_a``+``wkv``, ``wq_b``+``indexer.wq_b``, shared-expert ``w1``+``w3``).
+    ``fuse_gemms_mixed_children`` now merges every such sibling group into a single
+    projection before this stage runs, so the rewrite matched nothing and was
+    removed. The registry key is kept so existing configs remain valid.
     """
 
     config: FuseFP8ActQuantCSEConfig
@@ -800,71 +786,7 @@ class FuseFP8ActQuantCSE(BaseTransform):
             set_w8a8_quant_prologue(True)
             ad_logger.info("FP8 act-quant: fused W8A8 decode quant prologue enabled")
 
-        lin_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
-        act_op = torch.ops.auto_deploy.torch_fp8_finegrained_act_quant.default
-        prequant_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_prequant.default
-
-        # Group linear nodes by (shared input node, block_k, input_scale_fmt). Nodes are
-        # visited in topological order, so each group's members[] is already ordered and
-        # members[0] is the earliest -- a safe insertion point for the shared quant.
-        groups: "dict[Tuple[Node, int, str], list[Node]]" = defaultdict(list)
-        for node in gm.graph.nodes:
-            if not is_op(node, lin_op):
-                continue
-            inp, weight, weight_scale, fmt = extract_op_args(
-                node, "input", "weight_quantized", "weight_scale", "input_scale_fmt"
-            )
-            if not isinstance(inp, Node):
-                continue
-            block_k = _finegrained_fp8_block_k(gm, weight, weight_scale)
-            if block_k is None:
-                continue
-            groups[(inp, block_k, fmt or "")].append(node)
-
-        num_groups = 0
-        num_linears = 0
-        num_quant_removed = 0
-        for (inp, block_k, fmt), members in groups.items():
-            if len(members) < 2:
-                continue
-            num_groups += 1
-            num_quant_removed += len(members) - 1  # N quant launches collapse to 1
-
-            # One shared activation quant, inserted right before the earliest member
-            # (which already dominates -- it consumes `inp`, so it follows `inp` and all
-            # graph placeholders). The getitems unpack the (qfp8, scale) tuple.
-            first = members[0]
-            with gm.graph.inserting_before(first):
-                act_node = gm.graph.call_function(act_op, args=(inp, int(block_k), fmt))
-                qfp8 = gm.graph.call_function(operator.getitem, args=(act_node, 0))
-                qscale = gm.graph.call_function(operator.getitem, args=(act_node, 1))
-
-            for member in members:
-                _, weight, bias, weight_scale = extract_op_args(
-                    member, "input", "weight_quantized", "bias", "weight_scale"
-                )
-                with gm.graph.inserting_before(member):
-                    new_node = gm.graph.call_function(
-                        prequant_op,
-                        args=(qfp8, qscale, weight, bias, weight_scale),
-                    )
-                member.replace_all_uses_with(new_node)
-                gm.graph.erase_node(member)
-                num_linears += 1
-
-        if num_groups:
-            ad_logger.info(
-                f"fuse_fp8_act_quant_cse: shared {num_groups} activation-quant group(s) "
-                f"across {num_linears} FineGrained FP8 linears, removed "
-                f"{num_quant_removed} redundant act-quant launch(es) per forward"
-            )
-
-        info = TransformInfo(
-            skipped=(num_groups == 0),
-            num_matches=num_groups,
-            is_clean=(num_groups == 0),
-            has_valid_shapes=(num_groups == 0),
-        )
+        info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
         return gm, info
 
 
@@ -1100,163 +1022,6 @@ class FuseDeepSeekV4QRMSNorm(BaseTransform):
             num_matches=num_matches,
             is_clean=(num_matches == 0),
             has_valid_shapes=(num_matches == 0),
-        )
-        return gm, info
-
-
-# ============================================================================
-# FineGrained FP8 gate/up projection concatenation
-# ============================================================================
-
-
-@TransformRegistry.register("fuse_finegrained_fp8_gate_up")
-class FuseFineGrainedFP8GateUp(BaseTransform):
-    """Merge sibling gate/up block-FP8 matmuls into one concatenated projection.
-
-    Runs in post_load_fusion AFTER ``fuse_fp8_act_quant_cse``. That transform hoists a
-    shared activation quant, leaving the SwiGLU gate (``w1``) and up (``w3``) projections
-    as two ``torch_fake_quant_finegrained_fp8_linear_prequant`` nodes that consume the
-    *same* ``(qfp8, qscale)`` pair and have identical ``[N, K]`` weight shapes (both are
-    ``moe_intermediate_size x hidden_size``). The default SwiGLU matcher
-    (``match_finegrained_fp8_swiglu_pattern``) cannot span the ``clamp`` + FP32-cast
-    nodes DeepSeek-V4 inserts between these linears and the ``silu * mul``
-    (``swiglu_limit=10``), so the pair is never fused and launches two separate,
-    CTA-starved block-FP8 GEMVs on every layer at batch=1.
-
-    This transform concatenates each such sibling pair's weight (and per-block weight
-    scale) along dim 0 into one ``[2N, K]`` projection, runs a single prequant matmul,
-    and slices the ``[..., 2N]`` result back into the two original ``[..., N]`` views --
-    leaving the clamp / SiLU / mul / down chain that consumes gate and up byte-for-byte
-    unchanged (only the two matmuls collapse to one). The block-FP8 matmul computes each
-    output row independently and ``N`` is required to be a multiple of the weight scale's
-    ``block_n``, so the seam lands on a block boundary and the concatenated result equals
-    the two separate results element-for-element (reference-exact on the deterministic
-    base kernel; the split-K decode path differs only by its own atomic-reduction
-    rounding, which is orthogonal to the N-concatenation).
-
-    Scope: only bias-free sibling groups with >= 2 members of identical weight+scale
-    shape are merged. In DeepSeek-V4 this uniquely selects shared-expert ``w1``+``w3``
-    (the MLA siblings ``wq_a``+``wkv`` and ``wq_b``+``indexer.wq_b`` differ in ``N``).
-    Concatenation is applied to the already-sharded local weights, so it is per-rank
-    correct regardless of TP layout.
-    """
-
-    config: TransformConfig
-
-    @classmethod
-    def get_config_class(cls) -> Type[TransformConfig]:
-        return TransformConfig
-
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm: CachedSequenceInterface,
-        factory: ModelFactory,
-        shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        prequant_packet = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_prequant
-        prequant_op = prequant_packet.default
-        slice_op = torch.ops.aten.slice.Tensor
-
-        # Group matmul-only prequant nodes by their shared (qfp8, qscale) activation
-        # (args[0], args[1]). Sibling linears on one input share these two nodes after
-        # fuse_fp8_act_quant_cse. Visit in topological order so members[0] is the
-        # earliest node -- a valid insertion point that dominates every use.
-        groups: "dict[Tuple[Node, Node], list[Node]]" = defaultdict(list)
-        for node in gm.graph.nodes:
-            if not is_op(node, prequant_packet):
-                continue
-            qinput, input_scale, bias = extract_op_args(node, "qinput", "input_scale", "bias")
-            if not isinstance(qinput, Node) or not isinstance(input_scale, Node):
-                continue
-            if bias is not None:
-                # Concatenating biased projections is out of scope; gate/up are bias-free.
-                continue
-            groups[(qinput, input_scale)].append(node)
-
-        num_groups = 0
-        num_matmuls_removed = 0
-        fused_idx = 0
-        for (qinput, input_scale), members in groups.items():
-            if len(members) < 2:
-                continue
-
-            # Bucket shared-activation siblings by identical (weight_shape, scale_shape).
-            # gate/up share moe_intermediate_size x hidden_size; MLA siblings differ.
-            by_shape: "dict[Tuple[tuple, tuple], list[Tuple[Node, object, Node]]]" = defaultdict(
-                list
-            )
-            for m in members:
-                weight, weight_scale = extract_op_args(m, "weight_quantized", "weight_scale")
-                s_node = (
-                    weight_scale[0]
-                    if isinstance(weight_scale, (list, tuple)) and weight_scale
-                    else None
-                )
-                w = _resolve_attr_tensor(gm, weight)
-                s = _resolve_attr_tensor(gm, s_node) if isinstance(s_node, Node) else None
-                if w is None or s is None or w.dim() != 2 or s.dim() != 2:
-                    continue
-                N = w.shape[0]
-                block_n = triton.cdiv(N, s.shape[0])
-                # The seam between concatenated weights must land on a block-scale
-                # boundary, otherwise the merged scale would be misapplied at the join.
-                if block_n == 0 or N % block_n != 0:
-                    continue
-                by_shape[(tuple(w.shape), tuple(s.shape))].append((m, weight, s_node))
-
-            for shape_members in by_shape.values():
-                if len(shape_members) < 2:
-                    continue
-
-                nodes = [sm[0] for sm in shape_members]
-                weight_tensors = [_resolve_attr_tensor(gm, sm[1]) for sm in shape_members]
-                scale_tensors = [_resolve_attr_tensor(gm, sm[2]) for sm in shape_members]
-                sizes = [w.shape[0] for w in weight_tensors]
-
-                cat_w = torch.cat(weight_tensors, dim=0)  # [sum_N, K] float8_e4m3fn
-                cat_s = torch.cat(scale_tensors, dim=0)  # [sum_N/block_n, K/block_k] float32
-                w_name = f"fused_fp8_gate_up_weight_{fused_idx}"
-                s_name = f"fused_fp8_gate_up_weight_scale_{fused_idx}"
-                fused_idx += 1
-                gm.register_buffer(w_name, cat_w.detach())
-                gm.register_buffer(s_name, cat_s.detach())
-
-                first = nodes[0]
-                with gm.graph.inserting_before(first):
-                    w_attr = gm.graph.get_attr(w_name)
-                    s_attr = gm.graph.get_attr(s_name)
-                    merged = gm.graph.call_function(
-                        prequant_op, args=(qinput, input_scale, w_attr, None, [s_attr])
-                    )
-                    offset = 0
-                    slices = []
-                    for size in sizes:
-                        slices.append(
-                            gm.graph.call_function(
-                                slice_op, args=(merged, -1, offset, offset + size)
-                            )
-                        )
-                        offset += size
-
-                for node, sl in zip(nodes, slices):
-                    node.replace_all_uses_with(sl)
-                    gm.graph.erase_node(node)
-
-                num_groups += 1
-                num_matmuls_removed += len(nodes) - 1
-
-        if num_groups:
-            ad_logger.info(
-                f"fuse_finegrained_fp8_gate_up: merged {num_groups} gate/up sibling group(s), "
-                f"removed {num_matmuls_removed} block-FP8 matmul launch(es) per forward"
-            )
-
-        info = TransformInfo(
-            skipped=(num_groups == 0),
-            num_matches=num_groups,
-            is_clean=(num_groups == 0),
-            has_valid_shapes=(num_groups == 0),
         )
         return gm, info
 
