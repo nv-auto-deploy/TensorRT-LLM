@@ -33,7 +33,7 @@ def _ref(kv, gate):
 @pytest.mark.parametrize(
     "shape",
     [
-        (4, 512),  # rank-2 (dim=0 site, e.g. _compressed_row_from_paged_state)
+        (4, 512),  # rank-2 (dim=0 site, single decode row)
         (2, 4, 512),  # rank-3 (dim=1 decode new-row site), main head_dim
         (2, 8, 512),  # rank-3 overlap (2*ratio), main head_dim
         (1, 128, 8, 512),  # rank-4 (dim=2 context/full-range), main head_dim

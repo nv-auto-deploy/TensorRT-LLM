@@ -38,7 +38,95 @@ import tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_sparse_a
 # ---------------------------------------------------------------------------
 # Reference (ORIGINAL loop) implementations, pasted verbatim from before the
 # vectorization. They intentionally use the pre-change per-position host loop.
+# The scalar host helpers and the one-row compatibility wrapper below were
+# moved verbatim out of the production op module (which no longer has scalar
+# per-position callers) so this test stays self-contained.
 # ---------------------------------------------------------------------------
+def _host_page_id_and_offset(
+    cache: torch.Tensor,
+    seq_idx: int,
+    logical_pos: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
+) -> tuple:
+    if logical_pos < 0:
+        raise ValueError(f"logical_pos must be non-negative, got {logical_pos}")
+    tokens_per_block = int(cache.shape[1])
+    page_ordinal = logical_pos // tokens_per_block
+    page_offset = logical_pos % tokens_per_block
+    page_start = int(cu_num_pages_host[seq_idx].item())
+    page_end = int(cu_num_pages_host[seq_idx + 1].item())
+    page_table_idx = page_start + page_ordinal
+    if page_table_idx >= page_end:
+        raise ValueError(
+            f"Sequence {seq_idx} logical position {logical_pos} needs page ordinal "
+            f"{page_ordinal}, but only {page_end - page_start} page(s) are active"
+        )
+    return int(cache_loc_host[page_table_idx].item()), page_offset
+
+
+def _host_position_is_valid(
+    cache: torch.Tensor,
+    seq_idx: int,
+    logical_pos: int,
+    cu_num_pages_host: torch.Tensor,
+) -> bool:
+    if logical_pos < 0:
+        return False
+    tokens_per_block = int(cache.shape[1])
+    page_ordinal = logical_pos // tokens_per_block
+    page_start = int(cu_num_pages_host[seq_idx].item())
+    page_end = int(cu_num_pages_host[seq_idx + 1].item())
+    return page_start + page_ordinal < page_end
+
+
+def _compressed_row_from_paged_state(
+    compressor_kv_cache: torch.Tensor,
+    compressor_gate_cache: torch.Tensor,
+    seq_idx: int,
+    row_idx: int,
+    row_position_id: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
+    compressor_ape: torch.Tensor,
+    compressor_norm_weight: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    rms_norm_eps: float,
+    rope_dim: int,
+    compress_ratio: int,
+    head_dim: int,
+    state_dim: int,
+    dtype: torch.dtype,
+    rotate: bool = False,
+) -> torch.Tensor:
+    """Compatibility wrapper reconstructing one compressed row (one-row batch)."""
+    del state_dim
+    row_idx_tensor = torch.tensor([row_idx], dtype=torch.long, device=compressor_kv_cache.device)
+    position_id_tensor = torch.tensor(
+        [row_position_id], dtype=torch.long, device=compressor_kv_cache.device
+    )
+    return M._compressed_rows_from_paged_state(
+        compressor_kv_cache,
+        compressor_gate_cache,
+        seq_idx,
+        row_idx_tensor,
+        position_id_tensor,
+        cu_num_pages_host,
+        cache_loc_host,
+        compressor_ape,
+        compressor_norm_weight,
+        cos_table,
+        sin_table,
+        rms_norm_eps,
+        rope_dim,
+        compress_ratio,
+        head_dim,
+        dtype,
+        rotate=rotate,
+    ).squeeze(0)
+
+
 def _ref_gather_paged_rows_from_positions(
     cache: torch.Tensor,
     seq_idx: int,
@@ -55,10 +143,10 @@ def _ref_gather_paged_rows_from_positions(
     zero = cache.new_zeros(row_width)
     for logical_pos_tensor in positions_host:
         logical_pos = int(logical_pos_tensor.item())
-        is_valid = M._host_position_is_valid(cache, seq_idx, logical_pos, cu_num_pages_host)
+        is_valid = _host_position_is_valid(cache, seq_idx, logical_pos, cu_num_pages_host)
         valid_rows.append(is_valid)
         if is_valid:
-            page_id, page_offset = M._host_page_id_and_offset(
+            page_id, page_offset = _host_page_id_and_offset(
                 cache, seq_idx, logical_pos, cu_num_pages_host, cache_loc_host
             )
             row = cache[page_id, page_offset]
@@ -96,12 +184,12 @@ def _ref_indexer_row_stack(
 ):
     """The ORIGINAL per-row stack from ``_select_ratio4_indexer_rows`` (loop form).
 
-    Uses the still-present (unmodified) ``_compressed_row_from_paged_state`` helper.
+    Uses the frozen ``_compressed_row_from_paged_state`` copy kept in this file.
     """
     state_dim = int(indexer_compressor_kv_cache.shape[-1])
     return torch.stack(
         [
-            M._compressed_row_from_paged_state(
+            _compressed_row_from_paged_state(
                 indexer_compressor_kv_cache,
                 indexer_compressor_gate_cache,
                 seq_idx,

@@ -49,6 +49,32 @@ def test_cached_op_uses_host_prefill_metadata_within_schema_limit():
     assert "seq_len" not in arg_names and "cu_seqlen" not in arg_names
 
 
+# Scalar host page-address helper, moved verbatim out of the production op module
+# (which no longer has scalar per-position callers) so the reference writers in
+# this test stay self-contained.
+def _host_page_id_and_offset(
+    cache: torch.Tensor,
+    seq_idx: int,
+    logical_pos: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
+) -> tuple:
+    if logical_pos < 0:
+        raise ValueError(f"logical_pos must be non-negative, got {logical_pos}")
+    tokens_per_block = int(cache.shape[1])
+    page_ordinal = logical_pos // tokens_per_block
+    page_offset = logical_pos % tokens_per_block
+    page_start = int(cu_num_pages_host[seq_idx].item())
+    page_end = int(cu_num_pages_host[seq_idx + 1].item())
+    page_table_idx = page_start + page_ordinal
+    if page_table_idx >= page_end:
+        raise ValueError(
+            f"Sequence {seq_idx} logical position {logical_pos} needs page ordinal "
+            f"{page_ordinal}, but only {page_end - page_start} page(s) are active"
+        )
+    return int(cache_loc_host[page_table_idx].item()), page_offset
+
+
 def _scalar_write_paged_cache_rows(
     values,
     cache,
@@ -62,7 +88,7 @@ def _scalar_write_paged_cache_rows(
     logical_pos = input_pos
     tokens_per_block = int(cache.shape[1])
     while cursor < values.shape[0]:
-        page_id, page_offset = M._host_page_id_and_offset(
+        page_id, page_offset = _host_page_id_and_offset(
             cache,
             seq_idx,
             logical_pos,
@@ -241,7 +267,7 @@ def _legacy_update(inp, kv_cache, gate_cache, mhc_cache):
             inp["head_dim"],
             inp["kv_seq"].dtype,
         )
-        page_id, page_offset = M._host_page_id_and_offset(
+        page_id, page_offset = _host_page_id_and_offset(
             mhc_cache,
             inp["seq_idx"],
             row_idx * ratio,

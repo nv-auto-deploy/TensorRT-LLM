@@ -381,44 +381,6 @@ def _checked_host_prefix(name: str, tensor: torch.Tensor, length: int) -> torch.
     return flat[:length]
 
 
-def _host_page_id_and_offset(
-    cache: torch.Tensor,
-    seq_idx: int,
-    logical_pos: int,
-    cu_num_pages_host: torch.Tensor,
-    cache_loc_host: torch.Tensor,
-) -> tuple[int, int]:
-    if logical_pos < 0:
-        raise ValueError(f"logical_pos must be non-negative, got {logical_pos}")
-    tokens_per_block = int(cache.shape[1])
-    page_ordinal = logical_pos // tokens_per_block
-    page_offset = logical_pos % tokens_per_block
-    page_start = int(cu_num_pages_host[seq_idx].item())
-    page_end = int(cu_num_pages_host[seq_idx + 1].item())
-    page_table_idx = page_start + page_ordinal
-    if page_table_idx >= page_end:
-        raise ValueError(
-            f"Sequence {seq_idx} logical position {logical_pos} needs page ordinal "
-            f"{page_ordinal}, but only {page_end - page_start} page(s) are active"
-        )
-    return int(cache_loc_host[page_table_idx].item()), page_offset
-
-
-def _host_position_is_valid(
-    cache: torch.Tensor,
-    seq_idx: int,
-    logical_pos: int,
-    cu_num_pages_host: torch.Tensor,
-) -> bool:
-    if logical_pos < 0:
-        return False
-    tokens_per_block = int(cache.shape[1])
-    page_ordinal = logical_pos // tokens_per_block
-    page_start = int(cu_num_pages_host[seq_idx].item())
-    page_end = int(cu_num_pages_host[seq_idx + 1].item())
-    return page_start + page_ordinal < page_end
-
-
 def _write_paged_cache_rows(
     values: torch.Tensor,
     cache: torch.Tensor,
@@ -616,10 +578,10 @@ def _gather_paged_rows_from_positions(
     dtype: torch.dtype,
     width: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Vectorized gather (prefill path). Mirrors ``_host_page_id_and_offset`` /
-    # ``_host_position_is_valid`` for every position at once, with no per-position
-    # host sync (``.cpu()``/``.item()``) or Python loop. ``page_start``/``page_end``
-    # are the only host reads -- two O(1) scalar loads for this sequence.
+    # Vectorized gather (prefill path). Resolves the per-position page id / in-page
+    # offset / validity for every position at once, with no per-position host sync
+    # (``.cpu()``/``.item()``) or Python loop. ``page_start``/``page_end`` are the
+    # only host reads -- two O(1) scalar loads for this sequence.
     row_width = cache.shape[-1] if width is None else width
     tokens_per_block = int(cache.shape[1])
     page_start = int(cu_num_pages_host[seq_idx].item())
@@ -787,53 +749,6 @@ def _compressed_rows_from_paged_state(
         rope_dim,
         rotate=rotate,
     )
-
-
-def _compressed_row_from_paged_state(
-    compressor_kv_cache: torch.Tensor,
-    compressor_gate_cache: torch.Tensor,
-    seq_idx: int,
-    row_idx: int,
-    row_position_id: int,
-    cu_num_pages_host: torch.Tensor,
-    cache_loc_host: torch.Tensor,
-    compressor_ape: torch.Tensor,
-    compressor_norm_weight: torch.Tensor,
-    cos_table: torch.Tensor,
-    sin_table: torch.Tensor,
-    rms_norm_eps: float,
-    rope_dim: int,
-    compress_ratio: int,
-    head_dim: int,
-    state_dim: int,
-    dtype: torch.dtype,
-    rotate: bool = False,
-) -> torch.Tensor:
-    """Compatibility wrapper for callers that reconstruct one compressed row."""
-    del state_dim
-    row_idx_tensor = torch.tensor([row_idx], dtype=torch.long, device=compressor_kv_cache.device)
-    position_id_tensor = torch.tensor(
-        [row_position_id], dtype=torch.long, device=compressor_kv_cache.device
-    )
-    return _compressed_rows_from_paged_state(
-        compressor_kv_cache,
-        compressor_gate_cache,
-        seq_idx,
-        row_idx_tensor,
-        position_id_tensor,
-        cu_num_pages_host,
-        cache_loc_host,
-        compressor_ape,
-        compressor_norm_weight,
-        cos_table,
-        sin_table,
-        rms_norm_eps,
-        rope_dim,
-        compress_ratio,
-        head_dim,
-        dtype,
-        rotate=rotate,
-    ).squeeze(0)
 
 
 def _update_compressed_paged_caches(
@@ -1026,8 +941,8 @@ def _select_ratio4_indexer_rows(
         return torch.full((index_topk,), -1, dtype=torch.int64, device=q_index.device)
 
     index_head_dim = int(q_index.shape[-1])
-    # Vectorized replacement for the per-row ``_compressed_row_from_paged_state``
-    # stack: one call to the batched decode helper over ``row_idx = arange(visible_len)``.
+    # Vectorized replacement for the historical per-row reconstruction loop: one call
+    # to the batched decode helper over ``row_idx = arange(visible_len)``.
     # ``seq_idx`` is broadcast to every row and ``row_position_id`` reproduces the loop's
     # scalar ``query_position_id - (query_pos - row_idx * 4)`` as a tensor. The batched
     # helper returns rows in the same ``[visible_len, index_head_dim]`` order/shape the
@@ -1389,22 +1304,9 @@ def _decode_local_cache_rows(
     window_size: int,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # The local-window position generation + page-address translation is a fixed
-    # ~20-kernel element-wise chain that runs once per layer per decode step. Fuse
-    # it into one Triton kernel (page_ids/page_offsets/valid), leaving only the
-    # final cache-row gather as a separate op. Byte-identical addresses + mask.
-    if _HAS_TRITON and swa_cache.is_cuda:
-        page_ids, page_offsets, valid = _fused_local_window_pagemap(
-            input_pos,
-            seq_idx,
-            cu_num_pages,
-            cache_loc,
-            window_size,
-            int(swa_cache.shape[1]),
-        )
-        rows = swa_cache[page_ids, page_offsets].to(dtype)
-        return rows, valid
-
+    # Torch fallback used on CPU and when the hoisted ``swa_page_map`` from
+    # ``deepseek_v4_sparse_prepare_decode_page_addr`` is absent; the prepare op
+    # resolves byte-identical addresses + mask once per forward.
     offsets = torch.arange(window_size, dtype=torch.long, device=input_pos.device)
     positions = input_pos.unsqueeze(1) - window_size + 1 + offsets.view(1, -1)
     valid = (positions >= 0) & (positions <= input_pos.unsqueeze(1))
@@ -1433,7 +1335,7 @@ def _decode_topk_cache_attention(
         # ``(page_ids, page_offsets, rel_topk)`` from
         # ``deepseek_v4_sparse_prepare_decode_page_addr``: every window-only layer
         # resolves the identical addresses (they depend only on ``input_pos`` and the
-        # shared page table), so the per-layer fused page-map kernel and the
+        # shared page table), so the per-layer page-map translation and the
         # arange/where ``rel_topk`` chain collapse into that single prepare launch,
         # leaving only the layer-specific cache-row gather here. Addresses and mask
         # are bit-identical to the per-layer computation below.
@@ -1704,43 +1606,6 @@ def _batched_overlap_compressed_rows_fullrange(
             compressor_kv_cache, seq_idx, full_positions, cu_num_pages, cache_loc
         )
 
-    # Fused single-kernel path: collapse the gather / row-shift /
-    # concat / where / pool / rmsnorm swarm into one launch that emits the
-    # pooled+normed candidate rows directly from the paged caches and the hoisted
-    # page maps.  Requires the ratio-4 overlap layout (>= 2*head_dim state
-    # channels) and a per-channel rms weight; falls back to the eager chain below
-    # otherwise.  Only the pool/norm result is produced here -- the rope/quantize
-    # tail is shared with the eager path.
-    if (
-        _HAS_TRITON
-        and compressor_kv_cache.is_cuda
-        and compress_ratio == 4
-        and full_map[2] is not None
-        and compressor_norm_weight.dim() == 1
-        and compressor_norm_weight.numel() == head_dim
-        and int(compressor_kv_cache.shape[-1]) >= 2 * head_dim
-        and compressor_ape.dim() == 2
-        and int(compressor_ape.shape[1]) >= 2 * head_dim
-    ):
-        pooled = _fused_fullrange_candidate_rows(
-            compressor_kv_cache,
-            compressor_gate_cache,
-            full_map[0],
-            full_map[1],
-            full_map[2],
-            compressor_ape,
-            compressor_norm_weight,
-            rms_norm_eps,
-            compress_ratio,
-            head_dim,
-            m,
-            dtype,
-        )
-        row_position_id = row_position_id.to(torch.long).clamp(min=0, max=cos_table.shape[0] - 1)
-        cos = cos_table[row_position_id]
-        sin = sin_table[row_position_id]
-        return _apply_compressed_rope_and_quantize(pooled, cos, sin, rope_dim, rotate=rotate)
-
     current_kv_state, current_page_valid = _decode_cache_rows_from_positions(
         compressor_kv_cache, seq_idx, full_positions, cu_num_pages, cache_loc, dtype, full_map
     )
@@ -1984,9 +1849,9 @@ def _update_decode_compressed_caches(
 
     # Fused ratio-128 (dense, non-overlap) path: the ratio-4 kernel fuses its
     # whole reconstruction in one program per row, but the dense ``[ratio, head_dim]`` pool
-    # tile is too large for that, so the pool is D-tiled (``_paged_compress_pool``), RMSNorm
-    # is a separate ``head_dim`` reduction (``_compressor_rms_norm``) and the rope/fp8/store
-    # tail is the shared ``_launch_compressed_rope_fp8_store``.  Requires the fp8 nope slice
+    # tile is too large for that, so the pool is D-tiled (``_paged_compress_pool``) and the
+    # rmsnorm + rope/fp8/store tail is one one-program-per-row kernel
+    # (``_dsv4_norm_rope_fp8_masked_store_kernel``).  Requires the fp8 nope slice
     # to be block_size=64 aligned, a non-empty even rope dim, and contiguous paged compressor
     # caches (the kernel indexes them with the contiguous ``T*S`` / ``S`` strides); otherwise
     # fall back to the op-by-op path below.  The dense reconstruction never validity-masks the
@@ -2073,47 +1938,33 @@ def _update_decode_compressed_caches(
         compressor_kv_cache.dtype,
         overlap_page_map=overlap_page_map,
     )
-    if _HAS_TRITON and mhc_cache.is_cuda:
-        # Validity-masked paged store. ``row_valid`` is true only on the ~1-in-4 decode
-        # steps that complete a compressed row (and is identical across every layer within
-        # a step, since it depends only on ``input_pos``). The prior code unconditionally
-        # gathered the previous mhc row and ``torch.where``-selected it back for the other
-        # ~3-in-4 steps -- a per-layer read + where + write-back that runs every captured
-        # cudagraph step regardless of ``row_valid``. Fold the conditional into the store:
-        # valid rows write ``compressed_rows`` exactly as the prior index_put; invalid rows
-        # store nothing, leaving the slot byte-identical to reading and writing it back.
-        _masked_write_decode_cache_rows(
-            mhc_cache,
-            compressed_rows.to(mhc_cache.dtype),
-            row_valid,
-            mhc_page_ids,
-            mhc_page_offsets,
-        )
-    else:
-        previous_rows, _ = _decode_cache_rows_from_positions(
-            mhc_cache,
-            seq_idx,
-            row_logical_pos,
-            cu_num_pages,
-            cache_loc,
-            mhc_cache.dtype,
-            (mhc_page_ids, mhc_page_offsets, None),
-        )
-        rows_to_write = torch.where(
-            row_valid.unsqueeze(-1),
-            compressed_rows.to(mhc_cache.dtype),
-            previous_rows,
-        )
-        _write_decode_cache_rows(
-            mhc_cache,
-            rows_to_write,
-            seq_idx,
-            row_logical_pos,
-            cu_num_pages,
-            cache_loc,
-            mhc_page_ids,
-            mhc_page_offsets,
-        )
+    # Validity-masked write-back: ``row_valid`` is true only on the ~1-in-ratio decode
+    # steps that complete a compressed row, so invalid rows read the previous mhc row
+    # and write it back unchanged (byte-identical to storing nothing).
+    previous_rows, _ = _decode_cache_rows_from_positions(
+        mhc_cache,
+        seq_idx,
+        row_logical_pos,
+        cu_num_pages,
+        cache_loc,
+        mhc_cache.dtype,
+        (mhc_page_ids, mhc_page_offsets, None),
+    )
+    rows_to_write = torch.where(
+        row_valid.unsqueeze(-1),
+        compressed_rows.to(mhc_cache.dtype),
+        previous_rows,
+    )
+    _write_decode_cache_rows(
+        mhc_cache,
+        rows_to_write,
+        seq_idx,
+        row_logical_pos,
+        cu_num_pages,
+        cache_loc,
+        mhc_page_ids,
+        mhc_page_offsets,
+    )
 
 
 def _select_decode_ratio4_indexer_rows(
@@ -2158,13 +2009,22 @@ def _select_decode_ratio4_indexer_rows(
     # ``q_index``/``indexer_weights`` are replicated across TP ranks (the indexer
     # index-score projection is no longer head-sharded; see DeepseekV4Indexer),
     # so the head reduction already sums over all index heads -- no all_reduce needed.
-    use_fused_index_k = (
+    #
+    # Fused-path preconditions (CUDA + Triton + shapes): the folded
+    # ``_fused_fullrange_index_score`` kernel needs the hoisted full-range page map,
+    # a power-of-two ``index_head_dim`` in [32, 256], an even non-empty rope dim
+    # matching the tables, the ratio-4 overlap cache/ape layout, and H > 8 so its
+    # H_BLOCK matches a next_pow2(H) >= 16 tl.dot tile.  The production runtime
+    # (H=64, index_head_dim=128) always satisfies this; anything else takes the
+    # eager fallback below (the CPU correctness reference).
+    use_fused_score = (
         _HAS_TRITON
         and q_index.is_cuda
         and q_index.dtype in (torch.float16, torch.bfloat16)
+        and indexer_weights.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and index_n_heads > 8
         and 32 <= index_head_dim <= 256
         and (index_head_dim & (index_head_dim - 1)) == 0
-        and index_head_dim % 32 == 0
         and full_page_map is not None
         and full_page_map[2] is not None
         and int(full_page_map[0].shape[1]) == max_compressed_len * 4
@@ -2180,64 +2040,35 @@ def _select_decode_ratio4_indexer_rows(
         and int(cos_table.shape[1]) * 2 == rope_dim
         and sin_table.shape == cos_table.shape
     )
-    if use_fused_index_k:
-        # Fused candidate-row -> index-key -> masked-score front: one kernel reconstructs every candidate row
-        # from the paged caches via the hoisted full-range page map, applies the
-        # rope + hadamard/fake-fp4 tail in registers, and consumes the key with
-        # the score kernel's dot/relu/weighted-head-reduce/visibility tail in the
-        # same launch.  The pooled candidate tensor, the [B, M, head_dim]
-        # index-key tensor, the cos/sin gathers, the eager rope swarm, the
-        # nope/pe concat, the standalone hadamard launch, the separate score
-        # launch (and its indexer-weights fp32 cast) and the candidate/
-        # row-position/visible-len integer chains all drop out of the decode
-        # graph.  The fold needs H > 8 so its H_BLOCK matches the score kernel's
-        # next_pow2(H) >= 16 tl.dot tile (score parity, selection preserved);
-        # smaller H keeps the two-kernel chain.
-        if q_index.shape[1] > 8 and indexer_weights.dtype in (
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-        ):
-            index_score = _fused_fullrange_index_score(
-                indexer_compressor_kv_cache,
-                indexer_compressor_gate_cache,
-                full_page_map,
-                indexer_compressor_ape,
-                indexer_compressor_norm_weight,
-                cos_table,
-                sin_table,
-                input_pos,
-                position_ids_decode,
-                q_index,
-                indexer_weights,
-                rms_norm_eps,
-                4,
-                index_head_dim,
-                rope_dim,
-                max_compressed_len,
-                w_scale=w_scale,
-            )
-        else:
-            index_k = _fused_fullrange_index_k(
-                indexer_compressor_kv_cache,
-                indexer_compressor_gate_cache,
-                full_page_map,
-                indexer_compressor_ape,
-                indexer_compressor_norm_weight,
-                cos_table,
-                sin_table,
-                input_pos,
-                position_ids_decode,
-                rms_norm_eps,
-                4,
-                index_head_dim,
-                rope_dim,
-                max_compressed_len,
-                q_index.dtype,
-            )
-            index_score = _fused_index_score(
-                q_index, index_k, indexer_weights, input_pos, max_compressed_len, 4, w_scale
-            )
+    if use_fused_score:
+        # Fused candidate-row -> index-key -> masked-score front: one kernel
+        # reconstructs every candidate row from the paged caches via the hoisted
+        # full-range page map, applies the rope + hadamard/fake-fp4 tail in
+        # registers, and consumes the key with the dot/relu/weighted-head-reduce/
+        # visibility tail in the same launch.  The pooled candidate tensor, the
+        # [B, M, head_dim] index-key tensor, the cos/sin gathers, the eager rope
+        # swarm, the nope/pe concat, the standalone hadamard launch, the separate
+        # score launch (and its indexer-weights fp32 cast) and the candidate/
+        # row-position/visible-len integer chains all drop out of the decode graph.
+        index_score = _fused_fullrange_index_score(
+            indexer_compressor_kv_cache,
+            indexer_compressor_gate_cache,
+            full_page_map,
+            indexer_compressor_ape,
+            indexer_compressor_norm_weight,
+            cos_table,
+            sin_table,
+            input_pos,
+            position_ids_decode,
+            q_index,
+            indexer_weights,
+            rms_norm_eps,
+            4,
+            index_head_dim,
+            rope_dim,
+            max_compressed_len,
+            w_scale=w_scale,
+        )
     else:
         candidate_rows = torch.arange(max_compressed_len, dtype=torch.long, device=q_index.device)
         candidate_rows = candidate_rows.view(1, -1).expand(q_index.shape[0], -1)
@@ -2270,29 +2101,12 @@ def _select_decode_ratio4_indexer_rows(
             full_page_map=full_page_map,
         )
         visible_len = ((input_pos + 1) // 4).clamp(max=max_compressed_len)
-        if (
-            _HAS_TRITON
-            and q_index.is_cuda
-            and q_index.dtype in (torch.float16, torch.bfloat16)
-            and index_k.dtype == q_index.dtype
-            and index_head_dim >= 16
-        ):
-            # Fused matmul + relu + weighted head reduction + visibility mask
-            #: the [N, H, C] head-by-candidate score and the separate
-            # masked [N, C] tensor are never materialized -- one kernel emits the
-            # masked score row fed straight into the top-k below. Scores match the
-            # eager chain to within one ULP so the selected rows / sort order are
-            # preserved.
-            index_score = _fused_index_score(
-                q_index, index_k, indexer_weights, input_pos, max_compressed_len, 4, w_scale
-            )
-        else:
-            index_score = torch.matmul(q_index, index_k.transpose(-1, -2)).float()
-            index_score = (
-                index_score.relu() * (indexer_weights.float() * w_scale).unsqueeze(-1)
-            ).sum(dim=1)
-            visible = candidate_rows < visible_len.unsqueeze(1)
-            index_score = index_score.masked_fill(~visible, float("-inf"))
+        index_score = torch.matmul(q_index, index_k.transpose(-1, -2)).float()
+        index_score = (index_score.relu() * (indexer_weights.float() * w_scale).unsqueeze(-1)).sum(
+            dim=1
+        )
+        visible = candidate_rows < visible_len.unsqueeze(1)
+        index_score = index_score.masked_fill(~visible, float("-inf"))
     topk_count = min(index_topk, max_compressed_len)
     if _HAS_TRITON and index_score.is_cuda and index_score.dtype == torch.float32:
         # One-launch exact top-k select: replaces the fat
@@ -2733,11 +2547,6 @@ def _sparse_attention_query_chunk_size(
 
 
 _LOG2E = 1.4426950408889634
-# Scores for masked / out-of-range / padded key slots are floored to this value
-# *before* the exp2.  A large finite negative (rather than -inf) keeps the online
-# softmax running-max arithmetic NaN-free when an entire query has no valid key
-# (the sink-only case) — see _fused_sparse_attention_kernel.
-_SPARSE_ATTN_NEG = -1.0e30
 
 # Fused-kernel launch heuristics (tuned for the decode tpot path on Blackwell).
 _SPARSE_ATTN_SM_TARGET = 132  # min SM count across supported GPUs (H100/B200)
@@ -3033,100 +2842,6 @@ if _HAS_TRITON:
         tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty), mask=d_mask)
 
     @triton.jit
-    def _decode_local_window_pagemap_kernel(
-        input_pos_ptr,  # [N] int -- current decode position per sequence
-        seq_idx_ptr,  # [N] int -- sequence row per decode token
-        cu_num_pages_ptr,  # [num_seq + 1] -- prefix-sum page-table offsets
-        cache_loc_ptr,  # [total_pages] -- physical page id per page-table slot
-        page_ids_ptr,  # [N, W] int64 out
-        page_offsets_ptr,  # [N, W] int64 out
-        valid_ptr,  # [N, W] bool out
-        n_elements,  # N * W
-        W,  # window_size (row stride of the [N, W] grid)
-        TOKENS_PER_BLOCK,
-        CACHE_LOC_MAX,  # cache_loc.numel() - 1
-        BLOCK: tl.constexpr,
-    ):
-        """One-launch local-window page map: position gen + validity + translate.
-
-        Fuses the per-decode-step local-window integer chain -- the position
-        generation of ``_decode_local_cache_rows`` (arange / sub / add / two
-        compares / boolean-and) followed by the page-address translation of
-        ``_decode_page_ids_and_offsets`` (clamp / floordiv / remainder / the two
-        ``cu_num_pages`` lookups / add / compare / boolean-and / where / clamp /
-        ``cache_loc`` lookup) -- into a single kernel.  The final
-        ``swa_cache[page_ids, page_offsets]`` row gather is left to the caller
-        unchanged.  All divisions/remainders act on non-negative operands, so the
-        produced ``(page_ids, page_offsets)`` addresses and the combined validity
-        mask are byte-identical to the reference element-wise chain.
-        """
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < n_elements
-        n = offs // W
-        w = offs % W
-        input_pos = tl.load(input_pos_ptr + n, mask=mask, other=0).to(tl.int64)
-        seq_idx = tl.load(seq_idx_ptr + n, mask=mask, other=0).to(tl.int64)
-
-        # Local-window position generation (mirror _decode_local_cache_rows):
-        # positions = input_pos - window_size + 1 + arange(window_size).
-        pos = input_pos - W + 1 + w
-        valid_pos = (pos >= 0) & (pos <= input_pos)
-
-        # Page-address translation (mirror _decode_page_ids_and_offsets).
-        safe_pos = tl.maximum(pos, 0)
-        page_ordinal = safe_pos // TOKENS_PER_BLOCK
-        page_offset = safe_pos % TOKENS_PER_BLOCK
-        page_start = tl.load(cu_num_pages_ptr + seq_idx, mask=mask, other=0).to(tl.int64)
-        page_end = tl.load(cu_num_pages_ptr + seq_idx + 1, mask=mask, other=0).to(tl.int64)
-        page_table_idx = page_start + page_ordinal
-        page_valid = (pos >= 0) & (page_table_idx < page_end)
-        safe_idx = tl.where(page_valid, page_table_idx, page_start)
-        safe_idx = tl.minimum(tl.maximum(safe_idx, 0), CACHE_LOC_MAX)
-        page_id = tl.load(cache_loc_ptr + safe_idx, mask=mask, other=0).to(tl.int64)
-
-        valid = valid_pos & page_valid
-        tl.store(page_ids_ptr + offs, page_id, mask=mask)
-        tl.store(page_offsets_ptr + offs, page_offset, mask=mask)
-        tl.store(valid_ptr + offs, valid, mask=mask)
-
-    @triton.jit
-    def _masked_paged_store_kernel(
-        src_ptr,  # [N, S] contiguous, already cache dtype -- rows to conditionally store
-        row_valid_ptr,  # [N] bool -- store row r iff row_valid[r]
-        page_ids_ptr,  # [N] int64 -- physical page id per row
-        page_offsets_ptr,  # [N] int64 -- in-page offset per row
-        cache_ptr,  # [P, T, S] paged cache (mutated in place)
-        stride_p,  # cache.stride(0)
-        stride_t,  # cache.stride(1)
-        stride_s,  # cache.stride(2)
-        S,  # state_dim (row width)
-        BLOCK_S: tl.constexpr,
-    ):
-        """Read-free validity-masked paged store.
-
-        Replaces the decode ``mhc_cache`` compressed-row update's previous-row gather +
-        ``torch.where`` + unconditional index_put write-back with a single masked store.
-        For each row ``r`` the freshly compressed ``src[r]`` is written to
-        ``cache[page_ids[r], page_offsets[r], :]`` only when ``row_valid[r]`` is true;
-        invalid rows (the ~3-in-4 decode steps that do not complete a compressed row, and
-        which are identical across every layer within a step) store nothing, leaving the
-        slot byte-identical to reading the old row and writing it back. ``src`` is already
-        cast to the cache dtype by the caller, so the store is a pure copy -- byte-identical
-        to the prior ``cache[page_ids, page_offsets] = compressed_rows.to(cache.dtype)``.
-        """
-        row = tl.program_id(0)
-        sblk = tl.program_id(1)
-        valid = tl.load(row_valid_ptr + row).to(tl.int1)
-        pid = tl.load(page_ids_ptr + row).to(tl.int64)
-        poff = tl.load(page_offsets_ptr + row).to(tl.int64)
-        col = sblk * BLOCK_S + tl.arange(0, BLOCK_S)
-        smask = col < S
-        vals = tl.load(src_ptr + row * S + col, mask=smask, other=0)
-        dst = cache_ptr + pid * stride_p + poff * stride_t + col * stride_s
-        tl.store(dst, vals.to(cache_ptr.dtype.element_ty), mask=smask & valid)
-
-    @triton.jit
     def _store_current_token_row(
         row,
         sblk,
@@ -3332,112 +3047,6 @@ if _HAS_TRITON:
             )
 
     @triton.jit
-    def _dsv4_fullrange_candidate_rows_kernel(
-        kv_cache_ptr,  # [P, T, S] fp32 paged compressor kv cache
-        gate_cache_ptr,  # [P, T, S] fp32 paged compressor gate cache
-        page_ids_ptr,  # [B, M*R] int64 (hoisted full-range page map)
-        page_offsets_ptr,  # [B, M*R] int64
-        valid_ptr,  # [B, M*R] bool
-        ape_ptr,  # [R, 2*head_dim] fp32
-        norm_weight_ptr,  # [head_dim]
-        out_ptr,  # [B, M, head_dim] (dtype = q_index.dtype)
-        M,  # max_compressed_len
-        RATIO,  # compress_ratio (4)
-        HEAD_DIM,
-        T,  # tokens_per_block (paged cache dim-1 stride)
-        S,  # state_dim (paged cache dim-2 stride)
-        APE_STRIDE,  # ape.shape[1] (== 2 * head_dim)
-        PAGEMAP_STRIDE,  # M * R (row stride of the [B, M*R] page maps)
-        eps,
-        TWO_R: tl.constexpr,  # 2 * compress_ratio (8)
-        BLOCK_D: tl.constexpr,  # next_pow2(head_dim)
-    ):
-        """Fused ratio-4 full-range candidate-row reconstruction.
-
-        One program per (batch ``b``, candidate row ``r``).  It gathers the ``2*R``
-        paged compressor kv/gate slots for the overlap window (the previous block
-        of row ``r`` == the current block of row ``r-1``, so the full-range slot
-        index is uniformly ``(r-1)*R + s`` for ``s`` in ``[0, 2R)``), adds the ape
-        bias, applies the previous-block validity mask, softmax-pools over the
-        ``2*R`` axis and RMS-norms over ``head_dim`` -- collapsing the
-        gather / row-shift / concat / where / pool / rmsnorm swarm of
-        ``_batched_overlap_compressed_rows_fullrange`` into a single launch.  It
-        emits the post-pool, post-rmsnorm candidate rows (pre-rope); the caller
-        keeps the rope / quantize tail unchanged.  All reductions are fp32-internal
-        with bf16 rounding at the same points as the eager reference
-        (gather ``.to(dtype)``, the ape add, the ``compress_pool`` output, the
-        ``_rms_norm_ref`` output), so the result matches bit-for-bit up to the
-        ``rsqrt`` primitive (validated in the op unit test).
-        """
-        ROUND = out_ptr.dtype.element_ty
-        NEG = -1.0e20  # masked previous-gate floor (matches new_full(-1e20))
-
-        prog = tl.program_id(0)
-        b = prog // M
-        r = prog % M
-
-        s = tl.arange(0, TWO_R)
-        is_prev = s < RATIO
-        # previous block of row r == current block of row r-1, so the full-range
-        # index is uniformly (r-1)*R + s: the first R slots are the previous block,
-        # the last R the current block.  Row 0 has no previous block (masked below).
-        idx = (r - 1) * RATIO + s
-        idx_safe = tl.maximum(idx, 0)
-        pm_base = b * PAGEMAP_STRIDE
-        pid = tl.load(page_ids_ptr + pm_base + idx_safe).to(tl.int64)
-        poff = tl.load(page_offsets_ptr + pm_base + idx_safe).to(tl.int64)
-        pvalid = tl.load(valid_ptr + pm_base + idx_safe).to(tl.int1)
-
-        ratio_slot = tl.where(is_prev, s, s - RATIO)  # ape row per slot
-        channel_offset = tl.where(is_prev, 0, HEAD_DIM)  # previous / current channels
-
-        d = tl.arange(0, BLOCK_D)
-        dmask = d < HEAD_DIM
-        cmask = dmask[None, :]
-
-        base = pid * (T * S) + poff * S + channel_offset  # [TWO_R]
-        offs = base[:, None] + d[None, :]  # [TWO_R, BLOCK_D]
-        raw_kv = tl.load(kv_cache_ptr + offs, mask=cmask, other=0.0)
-        raw_gate = tl.load(gate_cache_ptr + offs, mask=cmask, other=0.0)
-        # Round the fp32 cache reads to the activation dtype (== gather ``.to(dtype)``).
-        kv_b = raw_kv.to(ROUND)
-        gate_b = raw_gate.to(ROUND)
-
-        ape_off = ratio_slot[:, None] * APE_STRIDE + channel_offset[:, None] + d[None, :]
-        ape_b = tl.load(ape_ptr + ape_off, mask=cmask, other=0.0).to(ROUND)
-        # bf16 add: round(bf16(gate) + bf16(ape)) -- the eager path adds in the
-        # activation dtype before masking, so keep the intermediate rounding.
-        gate_sum = (gate_b.to(tl.float32) + ape_b.to(tl.float32)).to(ROUND)
-
-        # Only the previous block is validity-masked; the current block is read
-        # as-is (the reference never masks it).  Row 0 has no previous block.
-        keep_prev = (r >= 1) & pvalid  # [TWO_R]
-        mask_prev_invalid = is_prev & (keep_prev == 0)  # true only for masked prev slots
-
-        g = gate_sum.to(tl.float32)
-        k = kv_b.to(tl.float32)
-        g = tl.where(mask_prev_invalid[:, None], NEG, g)  # exp(-1e20 - m) -> 0
-        k = tl.where(mask_prev_invalid[:, None], 0.0, k)
-
-        # Softmax-weighted pool over the 2R axis (matches deepseek_v4_compress_pool:
-        # max -> exp -> normalize per channel -> weighted sum).
-        m_max = tl.max(g, axis=0)  # [BLOCK_D]
-        e = tl.exp(g - m_max[None, :])
-        ssum = tl.sum(e, axis=0)  # [BLOCK_D]
-        w = e / ssum[None, :]
-        pooled = tl.sum(k * w, axis=0)  # [BLOCK_D] fp32
-        pooled_b = pooled.to(ROUND)  # compress_pool returns the activation dtype
-
-        # RMSNorm over head_dim (matches _rms_norm_ref: fp32 internal + fp32 weight).
-        c = pooled_b.to(tl.float32)
-        sq = tl.where(dmask, c * c, 0.0)
-        ms = tl.sum(sq, axis=0) / HEAD_DIM
-        rinv = tl.rsqrt(ms + eps)
-        wgt = tl.load(norm_weight_ptr + d, mask=dmask, other=0.0).to(tl.float32)
-        o = c * rinv * wgt
-        tl.store(out_ptr + prog.to(tl.int64) * HEAD_DIM + d, o.to(ROUND), mask=dmask)
-
-    @triton.jit
     def _dsv4_fullrange_index_key_row(
         kv_cache_ptr,  # [P, T, S] fp32 paged indexer-compressor kv cache
         gate_cache_ptr,  # [P, T, S] fp32 paged indexer-compressor gate cache
@@ -3474,16 +3083,16 @@ if _HAS_TRITON:
     ):
         """Reconstruct one post-rope post-hadamard/fake-fp4 index-key row.
 
-        The shared per-(``b``, ``r``) body of ``_dsv4_fullrange_index_k_kernel``
-        (which stores the ``[B, M, head_dim]`` key tensor) and
-        ``_dsv4_fullrange_index_score_kernel`` (which consumes the key in
-        registers).  Returns the ``[BLOCK_D]`` fp32 key ahead of the
-        caller's ``ROUND`` store/use point; every intermediate rounding matches the
-        pre-refactor ``_dsv4_fullrange_index_k_kernel`` body verbatim.
+        The per-(``b``, ``r``) reconstruction body of
+        ``_dsv4_fullrange_index_score_kernel``, which consumes the key in
+        registers.  Returns the ``[BLOCK_D]`` fp32 key ahead of the caller's
+        ``ROUND`` store/use point; every intermediate rounding matches the eager
+        candidate-row chain (``_batched_overlap_compressed_rows_fullrange`` +
+        rope + ``deepseek_v4_hadamard_fp4``) at the same points.
         """
         NEG = -1.0e20  # masked previous-gate floor (matches new_full(-1e20))
 
-        # --- paged reconstruction / pool / rmsnorm (== _dsv4_fullrange_candidate_rows_kernel) ---
+        # --- paged reconstruction / pool / rmsnorm (== the eager overlap fullrange chain) ---
         s = tl.arange(0, TWO_R)
         is_prev = s < RATIO
         idx = (r - 1) * RATIO + s
@@ -3604,172 +3213,6 @@ if _HAS_TRITON:
         return res
 
     @triton.jit
-    def _dsv4_fullrange_index_k_kernel(
-        kv_cache_ptr,  # [P, T, S] fp32 paged indexer-compressor kv cache
-        gate_cache_ptr,  # [P, T, S] fp32 paged indexer-compressor gate cache
-        page_ids_ptr,  # [B, M*R] int64 (hoisted full-range page map)
-        page_offsets_ptr,  # [B, M*R] int64
-        valid_ptr,  # [B, M*R] bool
-        ape_ptr,  # [R, 2*head_dim] fp32
-        norm_weight_ptr,  # [head_dim]
-        cos_ptr,  # [N_pos, ROPE_DIM // 2] rope cos table
-        sin_ptr,  # [N_pos, ROPE_DIM // 2] rope sin table
-        input_pos_ptr,  # [B] int64 current decode position per sequence
-        position_ids_ptr,  # [B] int64 rope position of the decode token
-        out_ptr,  # [B, M, head_dim] post-rope post-hadamard index keys (q dtype)
-        M,  # max_compressed_len
-        RATIO,  # compress_ratio (4)
-        HEAD_DIM,  # index_head_dim (== BLOCK_D, power of two)
-        T,  # tokens_per_block (paged cache dim-1 stride)
-        S,  # state_dim (paged cache dim-2 stride)
-        APE_STRIDE,  # ape.shape[1] (== 2 * head_dim)
-        PAGEMAP_STRIDE,  # M * R (row stride of the [B, M*R] page maps)
-        TABLE_MAX,  # cos/sin table row count - 1 (rope position clamp bound)
-        eps,
-        INV_SQRT_DIM: tl.constexpr,  # HEAD_DIM ** -0.5 (hadamard normalization)
-        FP4_MAX: tl.constexpr,
-        FP4_MIN: tl.constexpr,
-        TWO_R: tl.constexpr,  # 2 * compress_ratio (8)
-        BLOCK_D: tl.constexpr,  # == HEAD_DIM (power of two, <= 256)
-        HALF_D: tl.constexpr,  # HEAD_DIM // 2 (adjacent-lane rope pairs)
-        NOPE_PAIRS: tl.constexpr,  # (HEAD_DIM - ROPE_DIM) // 2
-        HALF_ROPE: tl.constexpr,  # ROPE_DIM // 2 (cos/sin table width)
-        NB: tl.constexpr,  # HEAD_DIM // FP4_BLOCK fake-fp4 quant groups
-        FP4_BLOCK: tl.constexpr,  # fp4 quant group size (32)
-    ):
-        """Fused ratio-4 full-range candidate *index-key* production.
-
-        Extends ``_dsv4_fullrange_candidate_rows_kernel`` (identical paged
-        reconstruction / pool / rmsnorm front, one program per (batch ``b``,
-        candidate row ``r``)) with the whole decode indexer tail that used to run
-        eagerly on the materialized ``[B, M, head_dim]`` candidate tensor: the rope
-        position (``position_ids - (input_pos - r*RATIO)``, table-clamped), the
-        cos/sin table row loads, the interleaved RoPE on the pe slice, and the
-        ``deepseek_v4_hadamard_fp4`` rotate+fake-fp4 quant.  The pooled candidate
-        rows, the cos/sin gathers, the rope intermediates and the pre-hadamard
-        concat therefore never reach HBM -- one launch emits the final index keys
-        consumed by ``_dsv4_index_score_kernel``.
-
-        Numerics: the reconstruction keeps the fullrange kernel's bf16 rounding
-        recipe; the rope mirrors ``_apply_interleaved_rope_ref`` (fp32 products of
-        the bf16-rounded row, result rounded back to the activation dtype) up to
-        fused-multiply-add contraction (<= 1 ULP fp32 before the bf16 round, same
-        tolerance as ``deepseek_v4_fused_rope_concat``); the hadamard butterfly and
-        fake-fp4 ladder reuse ``_hadamard_stage`` / the constants of
-        ``deepseek_v4_hadamard_fp4`` verbatim (bit-identical given equal inputs).
-        Selection equivalence (top-k ids / order / validity) is pinned in the op
-        unit test.
-        """
-        ROUND = out_ptr.dtype.element_ty
-
-        prog = tl.program_id(0)
-        b = prog // M
-        r = prog % M
-        res = _dsv4_fullrange_index_key_row(
-            kv_cache_ptr,
-            gate_cache_ptr,
-            page_ids_ptr,
-            page_offsets_ptr,
-            valid_ptr,
-            ape_ptr,
-            norm_weight_ptr,
-            cos_ptr,
-            sin_ptr,
-            input_pos_ptr,
-            position_ids_ptr,
-            b,
-            r,
-            RATIO,
-            HEAD_DIM,
-            T,
-            S,
-            APE_STRIDE,
-            PAGEMAP_STRIDE,
-            TABLE_MAX,
-            eps,
-            ROUND,
-            INV_SQRT_DIM,
-            FP4_MAX,
-            FP4_MIN,
-            TWO_R,
-            BLOCK_D,
-            HALF_D,
-            NOPE_PAIRS,
-            HALF_ROPE,
-            NB,
-            FP4_BLOCK,
-        )
-        d = tl.arange(0, BLOCK_D)
-        tl.store(out_ptr + prog.to(tl.int64) * HEAD_DIM + d, res.to(ROUND), mask=d < HEAD_DIM)
-
-    @triton.jit
-    def _dsv4_index_score_kernel(
-        q_ptr,  # [N, H, D] index queries (fp16/bf16)
-        k_ptr,  # [N, C, D] compressed candidate index keys (same dtype as q)
-        w_ptr,  # [N, H] per-head indexer weights (fp32)
-        input_pos_ptr,  # [N] int current decode position per sequence
-        out_ptr,  # [N, C] fp32 masked index score
-        H,
-        C,
-        RATIO,  # compress_ratio: visible = min((input_pos + 1) // RATIO, C)
-        W_SCALE,  # fp32 scalar folded into the weight load (1.0 = pre-scaled weights)
-        D: tl.constexpr,  # index_head_dim
-        D_BLOCK: tl.constexpr,  # next_pow2(D)
-        H_BLOCK: tl.constexpr,  # next_pow2(H)
-        BLOCK_C: tl.constexpr,
-    ):
-        """Fused ratio-4 lightning-indexer score for one (decode row, candidate block).
-
-        Collapses ``(matmul(q, k^T).float().relu() * w.float()).sum(dim=1)`` followed by
-        ``masked_fill(~visible, -inf)`` into a single launch, so the ``[N, H, C]``
-        head-by-candidate score and the separate masked ``[N, C]`` tensor are never
-        materialized -- only the fused masked score row consumed by the decode top-k is
-        written. The bf16/fp16 matmul output is rounded to the input dtype (matching the
-        reference ``matmul(...).float()``) and the relu / per-head weighting / head
-        reduction run in fp32, so the score values (and therefore the top-k sort order)
-        stay within one ULP of the reference and the selected rows are preserved.
-        ``W_SCALE`` folds the eager per-head weight pre-scale into the fp32 weight
-        load exactly like ``_dsv4_fullrange_index_score_kernel``.
-        """
-        n = tl.program_id(0)
-        cb = tl.program_id(1)
-        offs_c = cb * BLOCK_C + tl.arange(0, BLOCK_C)
-        offs_d = tl.arange(0, D_BLOCK)
-        offs_h = tl.arange(0, H_BLOCK)
-        c_mask = offs_c < C
-        d_mask = offs_d < D
-        h_mask = offs_h < H
-
-        # k tile [BLOCK_C, D_BLOCK]; padded candidate/dim lanes load 0 (add nothing).
-        k = tl.load(
-            k_ptr + n.to(tl.int64) * C * D + offs_c[:, None] * D + offs_d[None, :],
-            mask=c_mask[:, None] & d_mask[None, :],
-            other=0.0,
-        )
-        # q tile [H_BLOCK, D_BLOCK]; padded head/dim lanes load 0.
-        q = tl.load(
-            q_ptr + n.to(tl.int64) * H * D + offs_h[:, None] * D + offs_d[None, :],
-            mask=h_mask[:, None] & d_mask[None, :],
-            other=0.0,
-        )
-        # scores[BLOCK_C, H_BLOCK] = k @ q^T ; padded heads/candidates contribute 0.
-        sc = tl.dot(k, tl.trans(q), out_dtype=tl.float32)
-        # Match the reference bf16/fp16 matmul output rounding before ``.float()``.
-        sc = sc.to(k.dtype).to(tl.float32)
-        sc = tl.maximum(sc, 0.0)  # relu
-        w = tl.load(w_ptr + n.to(tl.int64) * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
-        w = w * W_SCALE
-        sc = sc * w[None, :]
-        score = tl.sum(sc, axis=1)  # [BLOCK_C] fp32 weighted head reduction
-        # Visibility bound computed in-kernel (== ((input_pos + 1) // RATIO)
-        # .clamp(max=C), input_pos >= 0 at decode) -- drops the eager add /
-        # floordiv / clamp launches that used to build the [N] visible_len tensor.
-        ip = tl.load(input_pos_ptr + n).to(tl.int64)
-        vlen = tl.minimum((ip + 1) // RATIO, C)
-        score = tl.where(offs_c < vlen, score, float("-inf"))  # visibility mask
-        tl.store(out_ptr + n.to(tl.int64) * C + offs_c, score, mask=c_mask)
-
-    @triton.jit
     def _dsv4_fullrange_index_score_kernel(
         kv_cache_ptr,  # [P, T, S] fp32 paged indexer-compressor kv cache
         gate_cache_ptr,  # [P, T, S] fp32 paged indexer-compressor gate cache
@@ -3813,8 +3256,8 @@ if _HAS_TRITON:
 
         One program per (batch ``b``, candidate row ``r``): reconstruct the
         post-rope post-hadamard/fake-fp4 index key via
-        ``_dsv4_fullrange_index_key_row`` (verbatim the index-k kernel front) and
-        consume it in registers with the ``_dsv4_index_score_kernel`` tail, so the
+        ``_dsv4_fullrange_index_key_row`` and consume it in registers with the
+        dot/relu/weighted-head-reduce/visibility score tail, so the
         ``[B, M, head_dim]`` candidate index-key tensor is never materialized.
 
         Invisible candidate rows (``r >= visible_len``) early-exit:
@@ -3831,28 +3274,26 @@ if _HAS_TRITON:
         multiply on the same widened value), so raw model-dtype weights can be
         handed over without the per-layer cast+mul launches.
 
-        Numerics: the key is rounded to the query dtype exactly where the index-k
-        kernel stored it; it then enters a ``tl.dot`` with the key in row 0 of a
-        zero-padded ``C_TILE``-row tile shaped like the score kernel's
-        ``[BLOCK_C, D] @ [D, H_BLOCK]`` tile (zero rows contribute exact-zero
-        products elsewhere and never touch row 0), and the rounding / relu / fp32
-        per-head weighting / head reduction / visibility mask mirror
-        ``_dsv4_index_score_kernel``.  Scores are bit-equal to the two-kernel
-        chain at small candidate counts; at the M=512 production scale the
-        compiler's fp32 FMA/accumulation context around the shared
+        Numerics: the key is rounded to the query dtype exactly where the eager
+        chain materialized it; it then enters a ``tl.dot`` with the key in row 0
+        of a zero-padded ``C_TILE``-row tile shaped like a
+        ``[BLOCK_C, D] @ [D, H_BLOCK]`` score tile (zero rows contribute
+        exact-zero products elsewhere and never touch row 0), and the rounding /
+        relu / fp32 per-head weighting / head reduction / visibility mask mirror
+        the eager ``matmul().float().relu() * w`` score chain.  Scores match that
+        reference to within one ULP at small candidate counts; at the M=512
+        production scale the compiler's fp32 FMA/accumulation context around the
         reconstruction helper flips single weighted head terms by one bf16 ULP
-        on a small score tail (observed <= 4e-6 absolute -- the same tolerance
-        class the landed ``_dsv4_index_score_kernel`` documents against its
-        eager reference); the top-k ids, tie order and validity are preserved
-        (pinned in the op unit test).
+        on a small score tail (observed <= 4e-6 absolute); the top-k ids, tie
+        order and validity are preserved (pinned in the op unit test).
         """
         ROUND = q_ptr.dtype.element_ty
 
         prog = tl.program_id(0)
         b = prog // M
         r = prog % M
-        # Visibility bound (== _dsv4_index_score_kernel), hoisted ahead of the
-        # reconstruction: invisible rows store the mask value and retire.
+        # Visibility bound (== ((input_pos + 1) // RATIO).clamp(max=M)), hoisted
+        # ahead of the reconstruction: invisible rows store the mask value and retire.
         ip = tl.load(input_pos_ptr + b).to(tl.int64)
         vlen = tl.minimum((ip + 1) // RATIO, M)
         if r >= vlen:
@@ -3892,7 +3333,7 @@ if _HAS_TRITON:
             NB,
             FP4_BLOCK,
         )
-        key_b = res.to(ROUND)  # == the bytes _dsv4_fullrange_index_k_kernel stored
+        key_b = res.to(ROUND)  # == the eager chain's activation-dtype index-key bytes
 
         offs_d = tl.arange(0, BLOCK_D)
         offs_h = tl.arange(0, H_BLOCK)
@@ -4277,10 +3718,12 @@ if _HAS_TRITON:
     ):
         """Register-fed rope/fake-fp8/masked-store epilogue.
 
-        The exact math of ``_dsv4_rope_fp8_masked_store_kernel`` operating on an
-        in-register ``[BLOCK_D]`` post-rmsnorm row instead of a materialized
-        ``[N, HEAD_DIM]`` tensor, so producing kernels can run it as their final
-        stage and skip the separate stage-2 launch.  The fake-fp8 block quant on the
+        The exact math of the historical standalone stage-2 rope/fp8/masked-store
+        kernel (retained byte-for-byte as the frozen reference in
+        ``test_deepseek_v4_compressed_row_update.py``) operating on an in-register
+        ``[BLOCK_D]`` post-rmsnorm row instead of a materialized ``[N, HEAD_DIM]``
+        tensor, so producing kernels can run it as their final stage and skip the
+        separate stage-2 launch.  The fake-fp8 block quant on the
         nope slice is byte-identical (``normed_round`` is the same activation-dtype
         row the removed store+reload round-trip would have produced); the pe slice
         deinterleaves the register row via ``reshape(BLOCK_D//2, 2) + split`` --
@@ -4378,16 +3821,14 @@ if _HAS_TRITON:
         RMS-norms over ``HEAD_DIM`` -- collapsing that gather / slice / ape-add /
         where / cat / pool / rmsnorm swarm into one launch.  The rope / fp8-quant /
         validity-masked store tail then runs in-register as the final stage
-        (``_dsv4_rope_fp8_store_tail``), removing the separate
-        ``_dsv4_rope_fp8_masked_store_kernel`` launch and the ``[N, HEAD_DIM]``
-        normed-row round-trip.  All reductions are fp32-internal with bf16 rounding
-        at the same points as the eager reference (gather ``.to(dtype)``, the ape
-        add, the ``compress_pool`` output, the ``_rms_norm_ref`` output -- the tail
-        consumes exactly the rounded row the removed store+reload produced), so the
-        row matches bit-for-bit up to the ``rsqrt`` primitive.  Mirrors
-        ``_dsv4_fullrange_candidate_rows_kernel`` but reads the ``[N, 2*RATIO]``
-        band map by slot index ``s`` directly (no ``(r-1)*R+s`` fullrange remap) and
-        masks the previous block with the band ``valid`` flag.
+        (``_dsv4_rope_fp8_store_tail``), removing the separate stage-2 launch and
+        the ``[N, HEAD_DIM]`` normed-row round-trip.  All reductions are
+        fp32-internal with bf16 rounding at the same points as the eager reference
+        (gather ``.to(dtype)``, the ape add, the ``compress_pool`` output, the
+        ``_rms_norm_ref`` output -- the tail consumes exactly the rounded row the
+        removed store+reload produced), so the row matches bit-for-bit up to the
+        ``rsqrt`` primitive.  Reads the ``[N, 2*RATIO]`` band map by slot index
+        ``s`` directly and masks the previous block with the band ``valid`` flag.
 
         ``row_valid`` gates the whole program: it is true only on the
         ~1-in-RATIO decode steps that complete a compressed row, and the masked
@@ -4488,99 +3929,6 @@ if _HAS_TRITON:
         )
 
     @triton.jit
-    def _dsv4_rope_fp8_masked_store_kernel(
-        normed_ptr,  # [N, HEAD_DIM] post-rmsnorm rows (activation dtype)
-        cos_ptr,  # [n_pos, DH] fp32
-        sin_ptr,  # [n_pos, DH] fp32
-        row_position_id_ptr,  # [N] int64 (already clamped into [0, n_pos))
-        row_valid_ptr,  # [N] bool -- store row iff valid
-        mhc_page_ids_ptr,  # [N] int64 write page id per row
-        mhc_page_offsets_ptr,  # [N] int64 in-page offset per row
-        cache_ptr,  # [P, T, HEAD_DIM] paged mhc cache (mutated in place)
-        stride_p,
-        stride_t,
-        stride_s,
-        cossin_row_stride,  # cos/sin row stride (== DH)
-        N,
-        HEAD_DIM,
-        NOPE_DIM,  # HEAD_DIM - ROPE_DIM (multiple of FP8_BLOCK)
-        DH,  # ROPE_DIM // 2
-        FP8_BLOCK: tl.constexpr,  # 64 (fake-fp8 group width)
-        NUM_FP8_BLOCKS: tl.constexpr,  # NOPE_DIM // FP8_BLOCK
-        BLOCK_D: tl.constexpr,  # next_pow2(HEAD_DIM)
-        BLOCK_DH: tl.constexpr,  # next_pow2(DH)
-        MAX_VAL: tl.constexpr,  # 448.0 (e4m3 absmax)
-        MIN_VAL: tl.constexpr,  # 1e-4 (amax floor)
-    ):
-        """Fused main-compressor rope + fake-fp8 + validity-masked store (stage 2).
-
-        No longer launched by the production compressed-row updates -- the tail is
-        folded into the producing kernels as the register-fed
-        ``_dsv4_rope_fp8_store_tail`` epilogue (ratio-4 front kernel /
-        ``_dsv4_norm_rope_fp8_masked_store_kernel``).  Retained byte-for-byte as the
-        isolated tail-math reference the compressed-row update unit tests pin the
-        fold against (via ``_launch_compressed_rope_fp8_store``).
-
-        One program per decode row ``b``.  Reads a post-rmsnorm ``[N, HEAD_DIM]``
-        normed row and, only when ``row_valid[b]``, writes the
-        fully reconstructed compressed row to ``cache[page_ids[b], page_offsets[b]]``.
-        Collapses the rope-tail chain ``_apply_compressed_rope_and_quantize``
-        (rotate=False: block fake-fp8 on the nope slice + interleaved RoPE/concat on
-        the pe slice) plus the ``cos``/``sin`` gathers plus the ``_masked_paged_store``
-        into a single launch.
-
-        Byte-identical to the reference on the nope slice -- the block amax, the
-        ``scale = 2**ceil(log2(clamp_min(amax,1e-4)/448))``, the ``clamp -> bf16 ->
-        fp32`` round-trip and the ``* scale`` reproduce ``fake_fp8_act_quant`` exactly
-        -- and equal to <=1 ULP on the pe slice (FMA folding, as for
-        ``deepseek_v4_fused_rope_concat``).  Invalid rows store nothing, leaving the
-        slot byte-identical to the prior read-old + write-back no-op.
-        """
-        RD = normed_ptr.dtype.element_ty  # rounding dtype for the fp8/rope math
-        CT = cache_ptr.dtype.element_ty  # cache store dtype
-
-        b = tl.program_id(0)
-        if b >= N:
-            return
-        valid = tl.load(row_valid_ptr + b).to(tl.int1)
-        pid = tl.load(mhc_page_ids_ptr + b).to(tl.int64)
-        poff = tl.load(mhc_page_offsets_ptr + b).to(tl.int64)
-        dst_base = cache_ptr + pid * stride_p + poff * stride_t
-        nrow = normed_ptr + b.to(tl.int64) * HEAD_DIM
-
-        # --- fake-fp8 block quant on the nope slice [0, NOPE_DIM) ---
-        d = tl.arange(0, BLOCK_D)
-        nmask = d < NOPE_DIM
-        nope = tl.load(nrow + d, mask=nmask, other=0.0).to(tl.float32)  # bf16 -> fp32
-        blk = d // FP8_BLOCK
-        scale_per_d = tl.full([BLOCK_D], 1.0, tl.float32)  # 1.0 outside the nope slice
-        for j in tl.static_range(NUM_FP8_BLOCKS):
-            in_blk = nmask & (blk == j)
-            amax_j = tl.max(tl.where(in_blk, tl.abs(nope), 0.0), axis=0)
-            scale_j = tl.exp2(tl.ceil(tl.log2(tl.maximum(amax_j, MIN_VAL) / MAX_VAL)))
-            scale_per_d = tl.where(in_blk, scale_j, scale_per_d)
-        q = nope / scale_per_d
-        q = tl.minimum(tl.maximum(q, -MAX_VAL), MAX_VAL)
-        q = q.to(RD).to(tl.float32)  # round-trip through the activation dtype
-        nope_out = (q * scale_per_d).to(RD)
-        tl.store(dst_base + d * stride_s, nope_out.to(CT), mask=nmask & valid)
-
-        # --- interleaved RoPE on the pe slice [NOPE_DIM, HEAD_DIM) ---
-        k = tl.arange(0, BLOCK_DH)
-        kmask = k < DH
-        pe_base = nrow + NOPE_DIM
-        even = tl.load(pe_base + 2 * k, mask=kmask, other=0.0).to(tl.float32)
-        odd = tl.load(pe_base + 2 * k + 1, mask=kmask, other=0.0).to(tl.float32)
-        rpid = tl.load(row_position_id_ptr + b).to(tl.int64)
-        cos = tl.load(cos_ptr + rpid * cossin_row_stride + k, mask=kmask, other=0.0).to(tl.float32)
-        sin = tl.load(sin_ptr + rpid * cossin_row_stride + k, mask=kmask, other=0.0).to(tl.float32)
-        out_even = even * cos - odd * sin
-        out_odd = even * sin + odd * cos
-        pe_out_base = dst_base + NOPE_DIM * stride_s
-        tl.store(pe_out_base + (2 * k) * stride_s, out_even.to(RD).to(CT), mask=kmask & valid)
-        tl.store(pe_out_base + (2 * k + 1) * stride_s, out_odd.to(RD).to(CT), mask=kmask & valid)
-
-    @triton.jit
     def _dsv4_norm_rope_fp8_masked_store_kernel(
         pooled_ptr,  # [N, HEAD_DIM] pooled (pre-rmsnorm) rows (activation dtype)
         norm_weight_ptr,  # [HEAD_DIM]
@@ -4611,8 +3959,8 @@ if _HAS_TRITON:
 
         One program per decode row ``b``.  Collapses the ratio-128 compressed-row
         update tail -- the ``_compressor_rms_norm`` (``rms_norm_kernel``) launch, the
-        ``[N, HEAD_DIM]`` normed-row round-trip and the
-        ``_dsv4_rope_fp8_masked_store_kernel`` launch -- into a single kernel fed by
+        ``[N, HEAD_DIM]`` normed-row round-trip and the standalone stage-2
+        rope/fp8/masked-store launch -- into a single kernel fed by
         the D-tiled ``_dsv4_paged_compress_pool_kernel`` output.  The RMSNorm stage
         replicates ``rms_norm_kernel`` op-for-op (fp32 ``sum(x*x) * (1/N)`` mean, ``x
         / sqrt(var + eps)``, fp32 ``weight * out`` with the weight on the left,
@@ -4696,9 +4044,9 @@ if _HAS_TRITON:
         ``.to(dtype)`` casts, the ape add and the ``deepseek_v4_compress_pool`` launch into
         one kernel emitting the pooled (pre-rmsnorm) row.  The non-overlap branch performs
         NO validity masking (the reference discards ``page_valid`` and never masks the
-        gate for the dense path), so every slot participates.  RMSNorm
-        (``_compressor_rms_norm``) and the rope/fp8/masked-store tail
-        (``_dsv4_rope_fp8_masked_store_kernel``) run as the subsequent stages.  All
+        gate for the dense path), so every slot participates.  The fused rmsnorm +
+        rope/fp8/masked-store kernel
+        (``_dsv4_norm_rope_fp8_masked_store_kernel``) runs as the subsequent stage.  All
         reductions are fp32-internal with bf16 rounding at the same points as the eager
         reference (gather ``.to(dtype)``, the ape add, the ``compress_pool`` output), so the
         pooled row matches ``gather + ape + _dsv4_compress_pool_kernel`` to <=1 ULP -- the
@@ -4761,45 +4109,6 @@ if _HAS_TRITON:
         w = e / ssum[None, :]
         pooled = tl.sum(k * w, axis=0)  # [BLOCK_D] fp32
         tl.store(out_ptr + n.to(tl.int64) * HEAD_DIM + d, pooled.to(ROUND), mask=dmask)
-
-
-def _masked_write_decode_cache_rows(
-    cache: torch.Tensor,  # [P, T, S] paged cache (mutated in place)
-    values: torch.Tensor,  # [N, S] rows to conditionally store (already cache dtype)
-    row_valid: torch.Tensor,  # [N] bool
-    page_ids: torch.Tensor,  # [N] int64 write page id per row
-    page_offsets: torch.Tensor,  # [N] int64 in-page offset per row
-) -> None:
-    """Store ``values[r]`` into ``cache[page_ids[r], page_offsets[r]]`` iff ``row_valid[r]``.
-
-    Triton wrapper for the read-free validity-masked paged store. ``page_ids``/
-    ``page_offsets`` are the precomputed write address (the same map fed to the removed
-    read + write-back). ``values`` must already be cast to ``cache.dtype`` so the store is
-    a pure copy -- byte-identical to the prior
-    ``cache[page_ids, page_offsets] = compressed_rows.to(cache.dtype)`` for valid rows,
-    and a no-op (slot untouched) for invalid rows, which is byte-identical to gathering the
-    previous row and writing it back unchanged.
-    """
-    n_rows = int(values.shape[0])
-    if n_rows == 0:
-        return
-    state_dim = int(values.shape[-1])
-    values = values.contiguous()
-    BLOCK_S = min(triton.next_power_of_2(state_dim), 1024)
-    grid = (n_rows, triton.cdiv(state_dim, BLOCK_S))
-    _masked_paged_store_kernel[grid](
-        values,
-        row_valid,
-        page_ids,
-        page_offsets,
-        cache,
-        cache.stride(0),
-        cache.stride(1),
-        cache.stride(2),
-        state_dim,
-        BLOCK_S=BLOCK_S,
-        num_warps=4,
-    )
 
 
 def _try_fused_initial_prefill_cache_write(
@@ -5014,52 +4323,6 @@ def _fused_current_token_store(
     )
 
 
-def _fused_local_window_pagemap(
-    input_pos: torch.Tensor,  # [N]
-    seq_idx: torch.Tensor,  # [N]
-    cu_num_pages: torch.Tensor,
-    cache_loc: torch.Tensor,
-    window_size: int,
-    tokens_per_block: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Triton wrapper for the fused local-window page map.
-
-    Returns ``(page_ids, page_offsets, valid)`` -- both addresses ``int64`` of
-    shape ``[N, window_size]`` and the combined (position && page) validity mask,
-    bit-identical to ``_decode_local_cache_rows``' position gen + the
-    ``_decode_page_ids_and_offsets`` translate.  The caller does the final
-    ``swa_cache[page_ids, page_offsets]`` gather.
-    """
-    if cache_loc.numel() == 0:
-        raise ValueError("cache_loc must contain at least one page id")
-    num_decode = int(input_pos.shape[0])
-    device = input_pos.device
-    page_ids = torch.empty(num_decode, window_size, dtype=torch.long, device=device)
-    page_offsets = torch.empty(num_decode, window_size, dtype=torch.long, device=device)
-    valid = torch.empty(num_decode, window_size, dtype=torch.bool, device=device)
-    n_elements = num_decode * window_size
-    if n_elements == 0:
-        return page_ids, page_offsets, valid
-    BLOCK = 256
-    grid = (triton.cdiv(n_elements, BLOCK),)
-    _decode_local_window_pagemap_kernel[grid](
-        input_pos.contiguous(),
-        seq_idx.contiguous(),
-        cu_num_pages,
-        cache_loc,
-        page_ids,
-        page_offsets,
-        valid,
-        n_elements,
-        window_size,
-        tokens_per_block,
-        cache_loc.numel() - 1,
-        BLOCK=BLOCK,
-        num_warps=4,
-    )
-    return page_ids, page_offsets, valid
-
-
 def _fused_assemble_selected_kv(
     swa_cache: torch.Tensor,  # [P, T, D] paged local kv cache
     mhc_cache: torch.Tensor,  # [P, T, D] paged compressed kv cache (same P/T/D/dtype)
@@ -5137,132 +4400,6 @@ def _fused_assemble_selected_kv(
     return out_kv, out_relidx
 
 
-def _fused_fullrange_candidate_rows(
-    kv_cache: torch.Tensor,  # [P, T, S] paged compressor kv cache
-    gate_cache: torch.Tensor,  # [P, T, S] paged compressor gate cache
-    page_ids: torch.Tensor,  # [B, M*R] int64 (hoisted full-range page map)
-    page_offsets: torch.Tensor,  # [B, M*R] int64
-    valid: torch.Tensor,  # [B, M*R] bool
-    ape: torch.Tensor,  # [R, 2*head_dim]
-    norm_weight: torch.Tensor,  # [head_dim]
-    rms_norm_eps: float,
-    compress_ratio: int,
-    head_dim: int,
-    max_compressed_len: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """One-launch ratio-4 full-range candidate-row reconstruction.
-
-    Replaces the gather / row-shift / concat / where / pool / rmsnorm swarm of
-    ``_batched_overlap_compressed_rows_fullrange`` with a single kernel that emits
-    the post-pool, post-rmsnorm candidate rows ``[B, max_compressed_len, head_dim]``
-    (pre-rope) directly from the paged caches and the hoisted page maps.  The
-    caller keeps the rope / quantize tail.
-    """
-    num_rows = int(page_ids.shape[0])
-    m = int(max_compressed_len)
-    out = torch.empty(num_rows, m, head_dim, device=kv_cache.device, dtype=dtype)
-    if num_rows == 0 or m == 0 or head_dim == 0:
-        return out
-    two_r = 2 * compress_ratio
-    grid = (num_rows * m,)
-    _dsv4_fullrange_candidate_rows_kernel[grid](
-        kv_cache,
-        gate_cache,
-        page_ids.contiguous(),
-        page_offsets.contiguous(),
-        valid.contiguous(),
-        ape.contiguous(),
-        norm_weight.contiguous(),
-        out,
-        m,
-        compress_ratio,
-        head_dim,
-        int(kv_cache.shape[1]),
-        int(kv_cache.shape[2]),
-        int(ape.shape[1]),
-        m * compress_ratio,
-        float(rms_norm_eps),
-        TWO_R=two_r,
-        BLOCK_D=triton.next_power_of_2(head_dim),
-        num_warps=4,
-    )
-    return out
-
-
-def _fused_fullrange_index_k(
-    kv_cache: torch.Tensor,  # [P, T, S] paged indexer-compressor kv cache
-    gate_cache: torch.Tensor,  # [P, T, S] paged indexer-compressor gate cache
-    full_page_map: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],  # each [B, M*R]
-    ape: torch.Tensor,  # [R, 2*head_dim]
-    norm_weight: torch.Tensor,  # [head_dim]
-    cos_table: torch.Tensor,  # [N_pos, rope_dim // 2]
-    sin_table: torch.Tensor,  # [N_pos, rope_dim // 2]
-    input_pos: torch.Tensor,  # [B] int64
-    position_ids: torch.Tensor,  # [B] int64
-    rms_norm_eps: float,
-    compress_ratio: int,
-    head_dim: int,
-    rope_dim: int,
-    max_compressed_len: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """One-launch ratio-4 decode index-key production.
-
-    Emits the post-rope, post-hadamard/fake-fp4 ``[B, max_compressed_len, head_dim]``
-    index keys consumed by ``_fused_index_score`` directly from the paged
-    indexer-compressor caches and the hoisted full-range page map -- the pooled
-    candidate rows, the ``cos_table``/``sin_table`` gathers, the eager interleaved
-    rope intermediates, the nope/pe concat and the standalone
-    ``deepseek_v4_hadamard_fp4`` input/output round trips never reach HBM.
-    Requires ``head_dim`` a power of two in [32, 256] divisible by 32 (the fp4
-    quant group) and an even ``rope_dim`` matching the table width; callers gate
-    on those plus the usual ratio-4 overlap-layout preconditions.
-    """
-    page_ids, page_offsets, valid = full_page_map
-    num_rows = int(page_ids.shape[0])
-    m = int(max_compressed_len)
-    out = torch.empty(num_rows, m, head_dim, device=kv_cache.device, dtype=dtype)
-    if num_rows == 0 or m == 0 or head_dim == 0:
-        return out
-    grid = (num_rows * m,)
-    _dsv4_fullrange_index_k_kernel[grid](
-        kv_cache,
-        gate_cache,
-        page_ids.contiguous(),
-        page_offsets.contiguous(),
-        valid.contiguous(),
-        ape.contiguous(),
-        norm_weight.contiguous(),
-        cos_table.contiguous(),
-        sin_table.contiguous(),
-        input_pos.contiguous(),
-        position_ids.contiguous(),
-        out,
-        m,
-        compress_ratio,
-        head_dim,
-        int(kv_cache.shape[1]),
-        int(kv_cache.shape[2]),
-        int(ape.shape[1]),
-        m * compress_ratio,
-        int(cos_table.shape[0]) - 1,
-        float(rms_norm_eps),
-        INV_SQRT_DIM=float(head_dim**-0.5),
-        FP4_MAX=_FP4_MAX,
-        FP4_MIN=_FP4_MIN,
-        TWO_R=2 * compress_ratio,
-        BLOCK_D=head_dim,
-        HALF_D=head_dim // 2,
-        NOPE_PAIRS=(head_dim - rope_dim) // 2,
-        HALF_ROPE=rope_dim // 2,
-        NB=head_dim // 32,
-        FP4_BLOCK=32,
-        num_warps=4,
-    )
-    return out
-
-
 def _fused_fullrange_index_score(
     kv_cache: torch.Tensor,  # [P, T, S] paged indexer-compressor kv cache
     gate_cache: torch.Tensor,  # [P, T, S] paged indexer-compressor gate cache
@@ -5284,8 +4421,8 @@ def _fused_fullrange_index_score(
 ) -> torch.Tensor:
     """One-launch ratio-4 decode index score from the paged state.
 
-    Folds ``_fused_fullrange_index_k`` + ``_fused_index_score`` into a single
-    kernel: each program reconstructs its candidate index key from the paged
+    Folds the whole eager decode indexer front into a single kernel: each
+    program reconstructs its candidate index key from the paged
     indexer-compressor caches (via the hoisted full-range page map) and consumes
     it in registers, emitting the masked ``[B, max_compressed_len]`` fp32 score
     row fed straight into the top-k.  The ``[B, M, head_dim]`` index-key tensor,
@@ -5294,8 +4431,8 @@ def _fused_fullrange_index_score(
     candidate rows early-exit before the paged reconstruction, and
     ``w_scale`` folds the eager per-head weight pre-scale into the kernel's fp32
     weight widening (``float(w) * w_scale``, bit-equal to the removed
-    ``weights.float() * scale`` pair).  Scores match the two-kernel chain
-    bit-exactly at small candidate counts and to a tiny absolute tail at the
+    ``weights.float() * scale`` pair).  Scores match the eager chain to within
+    one ULP at small candidate counts and to a tiny absolute tail at the
     M=512 production scale, preserving the top-k ids / tie order / validity
     (see ``_dsv4_fullrange_index_score_kernel`` and the op unit test).
     """
@@ -5373,13 +4510,13 @@ def _fused_compressed_row_update_r4(
 
     Replaces the ``_batched_compressed_rows_from_paged_state`` (overlap) reconstruction
     swarm + ``_apply_compressed_rope_and_quantize`` rope/fp8 tail + ``cos``/``sin``
-    gathers + ``_masked_write_decode_cache_rows`` store with ONE kernel: it
+    gathers + validity-masked store with ONE kernel: it
     reconstructs the post-rmsnorm rows from the paged caches and the hoisted overlap
     band map, then fp8-quantizes the nope slice, RoPE-rotates the pe slice and
     validity-masked-stores the row into ``mhc_cache`` as its in-register final stage
-    (previously a separate ``_dsv4_rope_fp8_masked_store_kernel`` launch
+    (previously a separate stage-2 rope/fp8/masked-store launch
     reading a materialized ``[N, head_dim]`` normed row).  Invalid rows write nothing
-    (byte-identical to the prior read-old + write-back no-op).
+    (byte-identical to the eager read-old + write-back no-op).
     """
     ovl_page_ids, ovl_page_offsets, ovl_valid = overlap_page_map
     n = int(ovl_page_ids.shape[0])
@@ -5425,64 +4562,6 @@ def _fused_compressed_row_update_r4(
         BLOCK_D=block_d,
         FP8_BLOCK=64,
         NUM_FP8_BLOCKS=nope_dim // 64,
-        MAX_VAL=448.0,
-        MIN_VAL=1.0e-4,
-        num_warps=4,
-    )
-
-
-def _launch_compressed_rope_fp8_store(
-    normed: torch.Tensor,  # [N, head_dim] post-rmsnorm rows (activation dtype)
-    cos_table: torch.Tensor,  # [n_pos, rope_dim//2]
-    sin_table: torch.Tensor,  # [n_pos, rope_dim//2]
-    row_position_id: torch.Tensor,  # [N] int64, already clamped into [0, n_pos)
-    row_valid: torch.Tensor,  # [N] bool -- store the row iff valid
-    mhc_page_ids: torch.Tensor,  # [N] int64 write page id per row
-    mhc_page_offsets: torch.Tensor,  # [N] int64 in-page offset per row
-    mhc_cache: torch.Tensor,  # [P, T, head_dim] paged mhc cache (mutated in place)
-    head_dim: int,
-    rope_dim: int,
-) -> None:
-    """Standalone stage-2 tail: fp8(nope) + interleaved RoPE(pe) + validity-masked store.
-
-    Launches ``_dsv4_rope_fp8_masked_store_kernel`` over the ``[N, head_dim]``
-    post-rmsnorm rows.  No longer called by the production compressed-row updates -- the tail is
-    folded into the producing kernels as the register-fed
-    ``_dsv4_rope_fp8_store_tail`` epilogue -- but retained (with the kernel, byte-for-byte)
-    as the isolated tail-math reference the compressed-row update unit tests pin the fold
-    against.  Ratio-agnostic: both the ratio-4 (overlap) and ratio-128 (dense) updates
-    produce an identical ``[N, head_dim]`` normed row and write the same ``head_dim``-wide
-    mhc row.  Invalid rows write nothing (byte-identical to the prior read-old +
-    write-back no-op).
-    """
-    n = int(normed.shape[0])
-    if n == 0 or head_dim == 0:
-        return
-    nope_dim = head_dim - rope_dim
-    dh = rope_dim // 2
-    block_d = triton.next_power_of_2(head_dim)
-    grid = (n,)
-    _dsv4_rope_fp8_masked_store_kernel[grid](
-        normed,
-        cos_table,
-        sin_table,
-        row_position_id,
-        row_valid,
-        mhc_page_ids,
-        mhc_page_offsets,
-        mhc_cache,
-        mhc_cache.stride(0),
-        mhc_cache.stride(1),
-        mhc_cache.stride(2),
-        int(cos_table.stride(0)),
-        n,
-        head_dim,
-        nope_dim,
-        dh,
-        FP8_BLOCK=64,
-        NUM_FP8_BLOCKS=nope_dim // 64,
-        BLOCK_D=block_d,
-        BLOCK_DH=triton.next_power_of_2(dh),
         MAX_VAL=448.0,
         MIN_VAL=1.0e-4,
         num_warps=4,
@@ -5577,10 +4656,10 @@ def _fused_compressed_row_update_r128(
     rope/fp8/validity-masked-store tail collapse into one one-program-per-row kernel
     (``_dsv4_norm_rope_fp8_masked_store_kernel`` -- previously a separate
     ``rms_norm_kernel`` launch, a ``[N, head_dim]`` normed-row round-trip and a
-    ``_dsv4_rope_fp8_masked_store_kernel`` launch).  This replaces the dense-branch
+    standalone stage-2 rope/fp8/masked-store launch).  This replaces the dense-branch
     ``_batched_compressed_rows_from_paged_state`` reconstruction (2 paged gathers, 2 casts,
     the ape add, the pool), the RMSNorm, the ``_apply_compressed_rope_and_quantize``
-    rope/fp8 tail, the ``cos``/``sin`` gathers and the ``_masked_write_decode_cache_rows``
+    rope/fp8 tail, the ``cos``/``sin`` gathers and the validity-masked
     store.  The pooled row matches ``gather + ape + deepseek_v4_compress_pool`` to <=1 ULP
     (same rounding points; only the fp32 ratio-axis reduction order differs) and the stored
     row matches the eager path up to the rsqrt (bf16-absorbed) and the rope FMA (<=1 ULP).
@@ -5635,55 +4714,6 @@ def _fused_compressed_row_update_r128(
         MIN_VAL=1.0e-4,
         num_warps=4,
     )
-
-
-def _fused_index_score(
-    q_index: torch.Tensor,  # [N, H, D] index queries (fp16/bf16)
-    index_k: torch.Tensor,  # [N, C, D] compressed candidate keys (same dtype as q)
-    indexer_weights: torch.Tensor,  # [N, H] per-head indexer weights
-    input_pos: torch.Tensor,  # [N] int current decode position per sequence
-    max_compressed_len: int,
-    compress_ratio: int,
-    w_scale: float = 1.0,
-) -> torch.Tensor:
-    """One-launch fused ratio-4 lightning-indexer score.
-
-    Replaces ``(matmul(q_index, index_k^T).float().relu() * indexer_weights.float()
-    .unsqueeze(-1)).sum(dim=1)`` + ``masked_fill(~visible, -inf)`` with a single kernel
-    that emits the ``[N, max_compressed_len]`` masked score consumed by the decode
-    top-k, without ever materializing the ``[N, H, C]`` head-by-candidate score or the
-    separate masked ``[N, C]`` tensor. The matmul is rounded to the input dtype and the
-    head reduction runs in fp32, so scores match the reference to within one ULP and the
-    top-k selection/order is preserved (validated in the op unit tests).  ``w_scale``
-    folds the eager per-head weight pre-scale into the kernel's fp32 weight load
-    (``float(w) * w_scale``, bit-equal to the removed ``weights.float() * scale``).
-    """
-    num_rows = int(q_index.shape[0])
-    h = int(q_index.shape[1])
-    d = int(q_index.shape[2])
-    c = int(max_compressed_len)
-    out = torch.empty(num_rows, c, device=q_index.device, dtype=torch.float32)
-    if num_rows == 0 or c == 0:
-        return out
-    block_c = 128 if c >= 128 else triton.next_power_of_2(c)
-    grid = (num_rows, triton.cdiv(c, block_c))
-    _dsv4_index_score_kernel[grid](
-        q_index.contiguous(),
-        index_k.contiguous(),
-        indexer_weights.contiguous().to(torch.float32),
-        input_pos.contiguous(),
-        out,
-        h,
-        c,
-        compress_ratio,
-        float(w_scale),
-        D=d,
-        D_BLOCK=triton.next_power_of_2(d),
-        H_BLOCK=triton.next_power_of_2(h),
-        BLOCK_C=block_c,
-        num_warps=4,
-    )
-    return out
 
 
 # Monotonic per-node arrival tickets for the banded top-k select kernel, keyed
@@ -6396,9 +5426,9 @@ if _HAS_TRITON:
                 # SWA local-window bundle: positions
                 # ``input_pos - W + 1 .. input_pos`` with the combined
                 # (position && page) validity folded into ``rel_topk`` (slot
-                # index where valid, -1 otherwise). Mirrors
-                # ``_decode_local_window_pagemap_kernel`` +
-                # ``_decode_attention_from_rows`` exactly.
+                # index where valid, -1 otherwise). Mirrors the per-layer
+                # ``_decode_local_cache_rows`` position gen + page translation +
+                # ``_decode_attention_from_rows`` ``rel_topk`` chain exactly.
                 wcols = tl.arange(0, W_BLOCK).to(tl.int64)
                 wmask = wcols < W
                 s_pos = pos - W + 1 + wcols

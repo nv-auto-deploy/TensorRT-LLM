@@ -19,8 +19,8 @@ the SWA local-window page map + precombined ``rel_topk`` shared by every
 window-only (``compress_ratio == 0``) layer. These tests pin that:
 
 * the hoisted ``(page_ids, page_offsets, rel_topk)`` bundle is bit-identical to
-  the per-layer chain it replaces (``_fused_local_window_pagemap`` /
-  ``_decode_local_cache_rows`` position generation + the
+  the per-layer chain it replaces (``_decode_local_cache_rows`` position
+  generation + the ``_decode_page_ids_and_offsets`` translation + the
   ``_decode_attention_from_rows`` ``rel_topk`` construction), including page
   boundaries, window rollover at the sequence start, and out-of-range rows;
 * the Triton single-launch path matches the torch reference body for the full
@@ -170,22 +170,15 @@ def test_prepare_swa_bundle_triton_matches_torch(window_size, tokens_per_block, 
         assert o.shape == r.shape, f"output {i} shape {o.shape} != {r.shape}"
         assert torch.equal(o.cpu(), r), f"output {i} diverges from torch reference"
 
-    # The hoisted bundle must also match the per-layer fused kernel it replaces
-    # (exact window IDs at page boundaries / rollover / padded rows).
-    seq_idx = torch.arange(num_seq, dtype=torch.long, device="cuda")
-    f_pid, f_poff, f_valid = M._fused_local_window_pagemap(
-        args_gpu[0].reshape(-1)[:num_seq],
-        seq_idx,
-        args_gpu[2],
-        args_gpu[3],
-        window_size,
-        tokens_per_block,
+    # The hoisted bundle must also match the per-layer torch chain it replaces
+    # (``_decode_local_cache_rows`` position gen + page translation; exact window
+    # IDs at page boundaries / rollover / padded rows).
+    ref_ids, ref_offs, ref_rel, _ = _reference_swa_bundle(
+        positions, cu_num_pages, cache_loc, tokens_per_block, total_pages, window_size
     )
-    assert torch.equal(outs[18], f_pid)
-    assert torch.equal(outs[19], f_poff)
-    rel = torch.arange(window_size, dtype=torch.long, device="cuda")
-    rel = rel.view(1, -1).expand(num_seq, -1)
-    assert torch.equal(outs[20], torch.where(f_valid, rel, torch.full_like(rel, -1)))
+    assert torch.equal(outs[18].cpu(), ref_ids)
+    assert torch.equal(outs[19].cpu(), ref_offs)
+    assert torch.equal(outs[20].cpu(), ref_rel)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for the decode path")

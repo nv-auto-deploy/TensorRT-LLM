@@ -21,8 +21,9 @@ register-fed final stage (``_dsv4_rope_fp8_store_tail``): the ratio-4 front kern
 stores the mhc row directly, and the ratio-128 rmsnorm + tail collapse into
 ``_dsv4_norm_rope_fp8_masked_store_kernel`` -- removing one launch per compressed layer
 per decode step plus the ``[N, head_dim]`` normed-row round-trip.  The original
-stage-2 kernel (and ``_launch_compressed_rope_fp8_store``) is retained byte-for-byte as
-the reference the fold is pinned against (``torch.equal``, whole cache) below.
+stage-2 kernel (and its ``_launch_compressed_rope_fp8_store`` launcher) lives on
+byte-for-byte in THIS file (moved out of the production module) as the frozen
+pre-fold reference the fold is pinned against (``torch.equal``, whole cache) below.
 
 The fused path replicates the eager numerics -- fp32-internal softmax pool and RMSNorm
 with bf16 rounding at the same points as the reference, a byte-identical block fake-fp8
@@ -51,6 +52,167 @@ import torch
 import tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_sparse_attention as M
 
 DEV = "cuda"
+
+
+# ---------------------------------------------------------------------------
+# Frozen pre-fold stage-2 reference, moved verbatim from the production op
+# module when the rope/fp8/masked-store tail was folded into the producing
+# kernels (`_dsv4_rope_fp8_store_tail`).  Kept byte-for-byte so the bit-exact
+# pins below keep their meaning: this kernel IS the launch the fold removed.
+# ---------------------------------------------------------------------------
+if M._HAS_TRITON:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _dsv4_rope_fp8_masked_store_kernel(
+        normed_ptr,  # [N, HEAD_DIM] post-rmsnorm rows (activation dtype)
+        cos_ptr,  # [n_pos, DH] fp32
+        sin_ptr,  # [n_pos, DH] fp32
+        row_position_id_ptr,  # [N] int64 (already clamped into [0, n_pos))
+        row_valid_ptr,  # [N] bool -- store row iff valid
+        mhc_page_ids_ptr,  # [N] int64 write page id per row
+        mhc_page_offsets_ptr,  # [N] int64 in-page offset per row
+        cache_ptr,  # [P, T, HEAD_DIM] paged mhc cache (mutated in place)
+        stride_p,
+        stride_t,
+        stride_s,
+        cossin_row_stride,  # cos/sin row stride (== DH)
+        N,
+        HEAD_DIM,
+        NOPE_DIM,  # HEAD_DIM - ROPE_DIM (multiple of FP8_BLOCK)
+        DH,  # ROPE_DIM // 2
+        FP8_BLOCK: tl.constexpr,  # 64 (fake-fp8 group width)
+        NUM_FP8_BLOCKS: tl.constexpr,  # NOPE_DIM // FP8_BLOCK
+        BLOCK_D: tl.constexpr,  # next_pow2(HEAD_DIM)
+        BLOCK_DH: tl.constexpr,  # next_pow2(DH)
+        MAX_VAL: tl.constexpr,  # 448.0 (e4m3 absmax)
+        MIN_VAL: tl.constexpr,  # 1e-4 (amax floor)
+    ):
+        """Fused main-compressor rope + fake-fp8 + validity-masked store (stage 2).
+
+        No longer launched by the production compressed-row updates -- the tail is
+        folded into the producing kernels as the register-fed
+        ``_dsv4_rope_fp8_store_tail`` epilogue (ratio-4 front kernel /
+        ``_dsv4_norm_rope_fp8_masked_store_kernel``).  Retained byte-for-byte as the
+        isolated tail-math reference the compressed-row update unit tests pin the
+        fold against (via ``_launch_compressed_rope_fp8_store``).
+
+        One program per decode row ``b``.  Reads a post-rmsnorm ``[N, HEAD_DIM]``
+        normed row and, only when ``row_valid[b]``, writes the
+        fully reconstructed compressed row to ``cache[page_ids[b], page_offsets[b]]``.
+        Collapses the rope-tail chain ``_apply_compressed_rope_and_quantize``
+        (rotate=False: block fake-fp8 on the nope slice + interleaved RoPE/concat on
+        the pe slice) plus the ``cos``/``sin`` gathers plus the ``_masked_paged_store``
+        into a single launch.
+
+        Byte-identical to the reference on the nope slice -- the block amax, the
+        ``scale = 2**ceil(log2(clamp_min(amax,1e-4)/448))``, the ``clamp -> bf16 ->
+        fp32`` round-trip and the ``* scale`` reproduce ``fake_fp8_act_quant`` exactly
+        -- and equal to <=1 ULP on the pe slice (FMA folding, as for
+        ``deepseek_v4_fused_rope_concat``).  Invalid rows store nothing, leaving the
+        slot byte-identical to the prior read-old + write-back no-op.
+        """
+        RD = normed_ptr.dtype.element_ty  # rounding dtype for the fp8/rope math
+        CT = cache_ptr.dtype.element_ty  # cache store dtype
+
+        b = tl.program_id(0)
+        if b >= N:
+            return
+        valid = tl.load(row_valid_ptr + b).to(tl.int1)
+        pid = tl.load(mhc_page_ids_ptr + b).to(tl.int64)
+        poff = tl.load(mhc_page_offsets_ptr + b).to(tl.int64)
+        dst_base = cache_ptr + pid * stride_p + poff * stride_t
+        nrow = normed_ptr + b.to(tl.int64) * HEAD_DIM
+
+        # --- fake-fp8 block quant on the nope slice [0, NOPE_DIM) ---
+        d = tl.arange(0, BLOCK_D)
+        nmask = d < NOPE_DIM
+        nope = tl.load(nrow + d, mask=nmask, other=0.0).to(tl.float32)  # bf16 -> fp32
+        blk = d // FP8_BLOCK
+        scale_per_d = tl.full([BLOCK_D], 1.0, tl.float32)  # 1.0 outside the nope slice
+        for j in tl.static_range(NUM_FP8_BLOCKS):
+            in_blk = nmask & (blk == j)
+            amax_j = tl.max(tl.where(in_blk, tl.abs(nope), 0.0), axis=0)
+            scale_j = tl.exp2(tl.ceil(tl.log2(tl.maximum(amax_j, MIN_VAL) / MAX_VAL)))
+            scale_per_d = tl.where(in_blk, scale_j, scale_per_d)
+        q = nope / scale_per_d
+        q = tl.minimum(tl.maximum(q, -MAX_VAL), MAX_VAL)
+        q = q.to(RD).to(tl.float32)  # round-trip through the activation dtype
+        nope_out = (q * scale_per_d).to(RD)
+        tl.store(dst_base + d * stride_s, nope_out.to(CT), mask=nmask & valid)
+
+        # --- interleaved RoPE on the pe slice [NOPE_DIM, HEAD_DIM) ---
+        k = tl.arange(0, BLOCK_DH)
+        kmask = k < DH
+        pe_base = nrow + NOPE_DIM
+        even = tl.load(pe_base + 2 * k, mask=kmask, other=0.0).to(tl.float32)
+        odd = tl.load(pe_base + 2 * k + 1, mask=kmask, other=0.0).to(tl.float32)
+        rpid = tl.load(row_position_id_ptr + b).to(tl.int64)
+        cos = tl.load(cos_ptr + rpid * cossin_row_stride + k, mask=kmask, other=0.0).to(tl.float32)
+        sin = tl.load(sin_ptr + rpid * cossin_row_stride + k, mask=kmask, other=0.0).to(tl.float32)
+        out_even = even * cos - odd * sin
+        out_odd = even * sin + odd * cos
+        pe_out_base = dst_base + NOPE_DIM * stride_s
+        tl.store(pe_out_base + (2 * k) * stride_s, out_even.to(RD).to(CT), mask=kmask & valid)
+        tl.store(pe_out_base + (2 * k + 1) * stride_s, out_odd.to(RD).to(CT), mask=kmask & valid)
+
+    def _launch_compressed_rope_fp8_store(
+        normed: torch.Tensor,  # [N, head_dim] post-rmsnorm rows (activation dtype)
+        cos_table: torch.Tensor,  # [n_pos, rope_dim//2]
+        sin_table: torch.Tensor,  # [n_pos, rope_dim//2]
+        row_position_id: torch.Tensor,  # [N] int64, already clamped into [0, n_pos)
+        row_valid: torch.Tensor,  # [N] bool -- store the row iff valid
+        mhc_page_ids: torch.Tensor,  # [N] int64 write page id per row
+        mhc_page_offsets: torch.Tensor,  # [N] int64 in-page offset per row
+        mhc_cache: torch.Tensor,  # [P, T, head_dim] paged mhc cache (mutated in place)
+        head_dim: int,
+        rope_dim: int,
+    ) -> None:
+        """Standalone stage-2 tail: fp8(nope) + interleaved RoPE(pe) + validity-masked store.
+
+        Launches ``_dsv4_rope_fp8_masked_store_kernel`` over the ``[N, head_dim]``
+        post-rmsnorm rows.  No longer called by the production compressed-row updates -- the tail is
+        folded into the producing kernels as the register-fed
+        ``_dsv4_rope_fp8_store_tail`` epilogue -- but retained (with the kernel, byte-for-byte)
+        as the isolated tail-math reference the compressed-row update unit tests pin the fold
+        against.  Ratio-agnostic: both the ratio-4 (overlap) and ratio-128 (dense) updates
+        produce an identical ``[N, head_dim]`` normed row and write the same ``head_dim``-wide
+        mhc row.  Invalid rows write nothing (byte-identical to the prior read-old +
+        write-back no-op).
+        """
+        n = int(normed.shape[0])
+        if n == 0 or head_dim == 0:
+            return
+        nope_dim = head_dim - rope_dim
+        dh = rope_dim // 2
+        block_d = triton.next_power_of_2(head_dim)
+        grid = (n,)
+        _dsv4_rope_fp8_masked_store_kernel[grid](
+            normed,
+            cos_table,
+            sin_table,
+            row_position_id,
+            row_valid,
+            mhc_page_ids,
+            mhc_page_offsets,
+            mhc_cache,
+            mhc_cache.stride(0),
+            mhc_cache.stride(1),
+            mhc_cache.stride(2),
+            int(cos_table.stride(0)),
+            n,
+            head_dim,
+            nope_dim,
+            dh,
+            FP8_BLOCK=64,
+            NUM_FP8_BLOCKS=nope_dim // 64,
+            BLOCK_D=block_d,
+            BLOCK_DH=triton.next_power_of_2(dh),
+            MAX_VAL=448.0,
+            MIN_VAL=1.0e-4,
+            num_warps=4,
+        )
 
 
 def _build_inputs(compress_ratio, num_rows, seed):
@@ -203,7 +365,7 @@ def test_rope_fp8_store_kernel_byte_exact(num_rows):
 
     mhc_fused = mhc_cache.clone()
     grid = (num_rows,)
-    M._dsv4_rope_fp8_masked_store_kernel[grid](
+    _dsv4_rope_fp8_masked_store_kernel[grid](
         normed,
         cos_table,
         sin_table,
@@ -261,10 +423,11 @@ def test_rope_fp8_store_kernel_byte_exact(num_rows):
 def test_norm_rope_store_fused_kernel_matches_two_stage(num_rows, head_dim, rope_dim, dtype):
     """Byte-pin: the fused rmsnorm+rope+fp8+masked-store kernel == the old chain.
 
-    Feeds an identical pooled row to the retained two-stage reference
+    Feeds an identical pooled row to the two-stage reference
     (``_compressor_rms_norm`` -> ``_launch_compressed_rope_fp8_store``, i.e. the
-    ``rms_norm_kernel`` launch plus the byte-for-byte-retained
-    ``_dsv4_rope_fp8_masked_store_kernel``) and to the new single kernel, then compares
+    ``rms_norm_kernel`` launch plus the byte-for-byte frozen
+    ``_dsv4_rope_fp8_masked_store_kernel`` kept in this file) and to the new single
+    kernel, then compares
     the ENTIRE mhc cache with ``torch.equal``.  This pins bit-identity of (a) the
     in-kernel RMSNorm replication of ``rms_norm_kernel`` (same ``sum(x*x) * (1/N)``
     mean, ``x / sqrt(var + eps)`` and left-weight multiply, same BLOCK/num_warps
@@ -297,7 +460,7 @@ def test_norm_rope_store_fused_kernel_matches_two_stage(num_rows, head_dim, rope
     # Reference: the removed two-stage chain (rms_norm_kernel launch + stage-2 kernel).
     mhc_ref = mhc_cache.clone()
     normed_ref = M._compressor_rms_norm(pooled, norm_weight, eps)
-    M._launch_compressed_rope_fp8_store(
+    _launch_compressed_rope_fp8_store(
         normed_ref,
         cos_table,
         sin_table,

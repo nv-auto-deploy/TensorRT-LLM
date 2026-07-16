@@ -17,8 +17,8 @@
 
 The compressor's softmax-weighted pool ``(kv * gate.softmax(dim=R)).sum(dim=R)``
 runs for both the main compressor and the lightning-indexer compressor, in the
-context (``_build_full_compressed_kv``) and decode (``_batched_*`` /
-``_compressed_row_from_paged_state``) paths of the sparse-attention op, as well as
+context (``_build_full_compressed_kv``) and decode (``_batched_*``) paths of the
+sparse-attention op, as well as
 the eager indexer ``compress_projected`` in the model. In every site the reduction
 axis is the ratio/candidate dim ``-2`` and the channel dim ``-1`` is ``head_dim``.
 

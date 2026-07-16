@@ -2,21 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bit-exactness guard for the fused paged index-score fold.
 
-``_fused_fullrange_index_score`` folds ``_fused_fullrange_index_k`` (paged
-candidate-row reconstruction + rope + hadamard/fake-fp4) and
-``_fused_index_score`` (dot + relu + fp32 weighted head reduction + visibility
-mask) into one launch, so the ``[B, M, head_dim]`` candidate index-key tensor is
-never materialized.  The key is rounded to the query dtype at the exact point the
-index-k kernel stored it and enters the score kernel's ``tl.dot`` tile shape
-(embedded in row 0 of a zero-padded ``C_TILE``-row tile), so the emitted scores
-must be bit-identical (``torch.equal``) to the two-kernel chain across
-histories, head counts, tie-heavy caches, shifted rope positions and poisoned
-invisible tails -- except the M=512 production scale, where the compiler's fp32
-FMA/accumulation context moves a small score tail by a one-bf16-ULP flip of a
-single weighted head term (the same tolerance class the landed score kernel
-documents vs its eager reference).  The
-top-k ids, tie order and validity consuming these scores must be identical in
-every case.
+``_fused_fullrange_index_score`` folds the whole eager decode indexer front --
+paged candidate-row reconstruction + rope + hadamard/fake-fp4 index keys
+(``_batched_overlap_compressed_rows_fullrange(rotate=True)``) followed by the
+``matmul().float().relu() * w`` weighted head reduction + visibility mask --
+into one launch, so the ``[B, M, head_dim]`` candidate index-key tensor is
+never materialized.  The reference here is that retained pure-eager chain (the
+CPU/edge fallback of ``_select_decode_ratio4_indexer_rows``): the key is
+rounded to the query dtype at the same points the eager chain materializes it,
+so the emitted scores must be bit-identical (``torch.equal``) to the eager
+chain across histories, tie-heavy caches, shifted rope positions and poisoned
+invisible tails -- except the M=512+ production scales (compiler fp32
+FMA/accumulation context) and the H != 16 head counts (fp32 head-reduction
+order vs the eager ``.sum(dim=1)``), where a small score tail moves by a
+one-bf16-ULP flip of a single weighted head term (the tolerance the original
+test documented for kernel-vs-eager comparisons).  The top-k ids, tie order
+and validity consuming these scores must be identical in every case.
 """
 
 import pytest
@@ -111,28 +112,47 @@ def _build_fixture(
     )
 
 
-def _two_kernel_score(fx, q_index, indexer_weights, w_scale: float = 1.0):
-    """The production two-kernel chain the fold replaces (index-k + score)."""
-    index_k = M._fused_fullrange_index_k(
+def _eager_score(fx, q_index, indexer_weights, w_scale: float = 1.0):
+    """The retained pure-eager chain the fold replaces.
+
+    Replicates the eager fallback of ``_select_decode_ratio4_indexer_rows``:
+    index keys via ``_batched_overlap_compressed_rows_fullrange(rotate=True)``
+    (the production eager body), then the plain-torch
+    ``matmul().float().relu() * (w.float() * w_scale)`` head reduction and the
+    ``candidate < visible_len`` mask.
+    """
+    m, ratio = fx["m"], fx["ratio"]
+    num_rows = int(fx["seq_idx"].shape[0])
+    candidate_rows = torch.arange(m, dtype=torch.long, device=q_index.device)
+    candidate_rows = candidate_rows.view(1, -1).expand(num_rows, -1)
+    row_position_id = fx["position_ids"].unsqueeze(1) - (
+        fx["input_pos"].unsqueeze(1) - candidate_rows * ratio
+    )
+    index_k = M._batched_overlap_compressed_rows_fullrange(
         fx["kv_cache"],
         fx["gate_cache"],
-        fx["full_page_map"],
+        fx["seq_idx"],
+        row_position_id,
+        fx["cu_num_pages"],
+        fx["cache_loc"],
         fx["ape"],
         fx["norm_weight"],
         fx["cos_table"],
         fx["sin_table"],
-        fx["input_pos"],
-        fx["position_ids"],
         fx["eps"],
-        fx["ratio"],
-        fx["head_dim"],
         fx["rope_dim"],
-        fx["m"],
+        ratio,
+        fx["head_dim"],
+        m,
         q_index.dtype,
+        rotate=True,
+        full_page_map=fx["full_page_map"],
     )
-    return M._fused_index_score(
-        q_index, index_k, indexer_weights, fx["input_pos"], fx["m"], fx["ratio"], w_scale
-    )
+    visible_len = ((fx["input_pos"] + 1) // ratio).clamp(max=m)
+    score = torch.matmul(q_index, index_k.transpose(-1, -2)).float()
+    score = (score.relu() * (indexer_weights.float() * w_scale).unsqueeze(-1)).sum(dim=1)
+    visible = candidate_rows < visible_len.unsqueeze(1)
+    return score.masked_fill(~visible, float("-inf"))
 
 
 def _fused_score(fx, q_index, indexer_weights, w_scale: float = 1.0):
@@ -158,11 +178,15 @@ def _fused_score(fx, q_index, indexer_weights, w_scale: float = 1.0):
 
 
 CASES = [
-    # (name, fixture kwargs, num_heads, exact) -- ``exact=False`` marks the
-    # M=512 production scale, where the compiler's fp32 FMA/accumulation
-    # context around the shared reconstruction helper moves a small score
-    # tail by ~4e-6 absolute (documented on the kernel); the top-k ids, tie
-    # order and validity must be identical either way.
+    # (name, fixture kwargs, num_heads, exact) -- ``exact=False`` marks cases
+    # in the documented kernel-vs-eager tolerance class: the M=512+ production
+    # scale (compiler fp32 FMA/accumulation context) and the H != 16 head
+    # counts (the kernel's H_BLOCK-lane fp32 head reduction orders differently
+    # than the eager ``.sum(dim=1)``), each moving a small score tail by a
+    # one-bf16-ULP flip of a single weighted head term (observed <= 4e-6
+    # absolute -- the tolerance the original test documented for kernel-vs-
+    # eager comparisons); the top-k ids, tie order and validity must be
+    # identical either way.
     (
         "prod_shape_mixed_history",
         dict(
@@ -249,7 +273,7 @@ CASES = [
             seed=31,
         ),
         24,
-        True,
+        False,
     ),
     (
         "full_heads_h64",
@@ -263,7 +287,7 @@ CASES = [
             seed=37,
         ),
         64,
-        True,
+        False,
     ),
     (
         "prod_scale_m512",
@@ -312,22 +336,28 @@ def test_fused_index_score_matches_two_kernel_chain(name, kwargs, num_heads, exa
     q_index = torch.randn(num_rows, num_heads, head_dim, device="cuda", dtype=dtype)
     indexer_weights = torch.randn(num_rows, num_heads, device="cuda", dtype=dtype)
 
-    score_ref = _two_kernel_score(fx, q_index, indexer_weights)
+    score_ref = _eager_score(fx, q_index, indexer_weights)
     score_fused = _fused_score(fx, q_index, indexer_weights)
     assert score_fused.shape == score_ref.shape and score_fused.dtype == score_ref.dtype
     if exact:
         assert torch.equal(score_fused, score_ref), f"[{name}] fused index score diverged"
     else:
-        # M=512 production scale: visibility must match exactly; most scores
-        # bit-equal, with a small tail moved by a one-bf16-ULP flip of a single
-        # weighted head term (compiler fp32 FMA context; observed <= 4e-6 abs).
+        # Documented kernel-vs-eager tolerance: visibility must match exactly;
+        # most scores bit-equal, with a small tail moved by a one-bf16-ULP flip
+        # of a single weighted head term (compiler fp32 FMA / head-reduction
+        # order; observed <= 4e-6 abs).  The 0.9 exact-fraction floor is only
+        # meaningful at the production candidate scale (hundreds of finite
+        # entries); tiny visible prefixes pin the per-entry magnitude instead.
         # The selection equality below is the load-bearing invariant.
         finite = torch.isfinite(score_ref)
         assert torch.equal(torch.isfinite(score_fused), finite), f"[{name}] visibility diverged"
         f = score_fused[finite]
         r = score_ref[finite]
-        exact_frac = (f == r).float().mean().item()
-        assert exact_frac >= 0.9, f"[{name}] exact-match fraction {exact_frac} too low"
+        if f.numel() >= 64:
+            exact_frac = (f == r).float().mean().item()
+            assert exact_frac >= 0.9, f"[{name}] exact-match fraction {exact_frac} too low"
+        max_abs = (f - r).abs().max().item()
+        assert max_abs <= 4e-6, f"[{name}] score tail moved by {max_abs} > 4e-6"
         torch.testing.assert_close(f, r, rtol=1e-5, atol=1e-4)
 
     # The selection consuming these scores must be identical: ids, tie order and
@@ -346,7 +376,12 @@ def test_fused_index_score_matches_two_kernel_chain(name, kwargs, num_heads, exa
     reason="fused index-score fold requires triton + CUDA",
 )
 def test_fused_index_score_fp32_weights():
-    """fp32 indexer weights skip the old wrapper's cast; values must still match."""
+    """fp32 indexer weights skip the old wrapper's cast; values must still match.
+
+    fp32 weights shift the fp32 head-reduction rounding pattern, so the match is
+    the documented kernel-vs-eager tolerance (<= 4e-6 abs tail, selection
+    identical) rather than ``torch.equal``.
+    """
     fx = _build_fixture(
         num_rows=2,
         head_dim=128,
@@ -359,9 +394,16 @@ def test_fused_index_score_fp32_weights():
     torch.manual_seed(4300)
     q_index = torch.randn(2, 16, 128, device="cuda", dtype=torch.bfloat16)
     indexer_weights = torch.randn(2, 16, device="cuda", dtype=torch.float32)
-    score_ref = _two_kernel_score(fx, q_index, indexer_weights)
+    score_ref = _eager_score(fx, q_index, indexer_weights)
     score_fused = _fused_score(fx, q_index, indexer_weights)
-    assert torch.equal(score_fused, score_ref)
+    finite = torch.isfinite(score_ref)
+    assert torch.equal(torch.isfinite(score_fused), finite)
+    max_abs = (score_fused[finite] - score_ref[finite]).abs().max().item()
+    assert max_abs <= 4e-6, f"score tail moved by {max_abs} > 4e-6"
+    rows_ref, valid_ref = M._fused_topk_select(score_ref, fx["m"], fx["m"])
+    rows_fused, valid_fused = M._fused_topk_select(score_fused, fx["m"], fx["m"])
+    assert torch.equal(rows_fused, rows_ref)
+    assert torch.equal(valid_fused, valid_ref)
 
 
 @pytest.mark.skipif(
@@ -399,9 +441,9 @@ def test_raw_weight_scale_fold_matches_prescaled(m, input_pos):
     fused_prescaled = _fused_score(fx, q_index, prescaled)
     assert torch.equal(fused_folded, fused_prescaled), "fused w_scale fold diverged"
 
-    chain_folded = _two_kernel_score(fx, q_index, raw_weights, w_scale=w_scale)
-    chain_prescaled = _two_kernel_score(fx, q_index, prescaled)
-    assert torch.equal(chain_folded, chain_prescaled), "two-kernel w_scale fold diverged"
+    eager_folded = _eager_score(fx, q_index, raw_weights, w_scale=w_scale)
+    eager_prescaled = _eager_score(fx, q_index, prescaled)
+    assert torch.equal(eager_folded, eager_prescaled), "eager w_scale fold diverged"
 
 
 @pytest.mark.skipif(
@@ -452,7 +494,7 @@ def test_selection_path_routes_through_fold_and_matches():
         full_page_map=fx["full_page_map"],
     )
     w_scale = fx["head_dim"] ** -0.5 * int(q_index.shape[1]) ** -0.5
-    score_ref = _two_kernel_score(fx, q_index, indexer_weights, w_scale=w_scale)
+    score_ref = _eager_score(fx, q_index, indexer_weights, w_scale=w_scale)
     rows_ref, valid_ref = M._fused_topk_select(score_ref, index_topk, min(index_topk, fx["m"]))
     assert torch.equal(rows, rows_ref)
     assert torch.equal(valid, valid_ref)
