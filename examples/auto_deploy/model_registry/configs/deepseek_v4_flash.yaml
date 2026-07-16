@@ -35,8 +35,8 @@ transforms:
   apply_sharding_hints:
     enabled: true
     dist_mapping:
-      tp: 8
-      moe_ep: 8
+      tp: 4
+      moe_ep: 4
       moe_tp: 1
       moe_cluster: 1
     enable_attention_dp: false
