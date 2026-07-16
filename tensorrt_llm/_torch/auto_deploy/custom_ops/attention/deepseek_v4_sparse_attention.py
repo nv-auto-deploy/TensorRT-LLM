@@ -6047,23 +6047,22 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                 int(indexer_q.shape[3]) ** -0.5 * int(indexer_q.shape[2]) ** -0.5
             )
 
+    placeholder_compressed_width = 0
     if topk_is_placeholder:
         # The model emits a width-only placeholder for ``topk_idxs`` on compressed AND
-        # window-only layers; rebuild the real selection here (once per prefill, eager)
-        # for the value-reading initial-prefill gather. The pure-decode path above
-        # returns before this and reads only the placeholder width, so it never needs
-        # the rebuilt indices.
+        # window-only layers. The value-reading initial-prefill branches attend each
+        # sequence against PER-SEQUENCE LOCAL kv (window rows local, compressed rows
+        # appended at ``seq_len_i``), so the real selection is rebuilt per sequence
+        # inside the loop below in that local frame. A single rebuild in the global
+        # flattened (possibly padded) token frame coincides with the local frame only
+        # for one exactly-sized prefill and silently mis-selects rows for padded,
+        # multi-sequence, or mixed prefill+decode forwards. The pure-decode path above
+        # returns before this, and the chunked-continuation path reads only the
+        # placeholder width, so both keep consuming the raw placeholder.
         if window_size is None:
             raise ValueError("window_size is required to rebuild the topk placeholder.")
         if compress_ratio:
-            compressed_width = int(topk_idxs.shape[-1]) - int(window_size)
-            topk_idxs = _build_placeholder_topk_idxs(
-                window_size, compress_ratio, q.shape[0], q.shape[1], compressed_width, q.device
-            )
-        else:
-            topk_idxs = _build_window_topk_idxs(window_size, q.shape[0], q.shape[1], q.device).to(
-                torch.int64
-            )
+            placeholder_compressed_width = int(topk_idxs.shape[-1]) - int(window_size)
 
     seq_len_host = _checked_host_prefix("seq_len_host", seq_len_host, num_seq)
     input_pos_host = _checked_host_prefix("input_pos_host", input_pos_host, num_seq)
@@ -6104,6 +6103,28 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                 f"Sequence {seq_idx} topk_idxs slice has length {topk_seq.shape[0]}, "
                 f"expected {seq_len_i}"
             )
+
+        if topk_is_placeholder and input_pos_i == 0:
+            # Initial prefill reads the selection values: rebuild the placeholder in
+            # this sequence's local frame — window keys as local row offsets and
+            # compressed slots offset by ``seq_len_i`` so they land on the compressed
+            # rows appended right after this sequence's ``kv_seq``. ``seq_len_i`` is
+            # already a host int from the loop header, so no extra device sync.
+            if compress_ratio:
+                topk_seq = _build_placeholder_topk_idxs(
+                    window_size,
+                    compress_ratio,
+                    1,
+                    seq_len_i,
+                    placeholder_compressed_width,
+                    q.device,
+                ).squeeze(0)
+            else:
+                topk_seq = (
+                    _build_window_topk_idxs(window_size, 1, seq_len_i, q.device)
+                    .to(torch.int64)
+                    .squeeze(0)
+                )
 
         if not compress_ratio:
             _write_paged_cache_rows(
