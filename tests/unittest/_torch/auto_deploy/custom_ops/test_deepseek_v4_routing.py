@@ -164,57 +164,6 @@ def test_deepseek_v4_routing_near_tie_ulp_selection():
         assert out_idx[0, 5].item() == 200, "strictly-greater score must win the boundary slot"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_deepseek_v4_routing_pdl_bitexact_and_graph():
-    """AD_GATE_PDL on/off must be bit-identical (pure load reorder) and the PDL
-    launch must survive CUDA-graph capture/replay."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe import (
-        deepseek_v4_routing as routing_mod,
-    )
-
-    torch.manual_seed(3)
-    device = "cuda"
-    num_tokens, num_experts, top_k = 2, 256, 6
-    logits = (torch.randn(num_tokens, num_experts, device=device) * 8.0).float()
-    bias = (torch.randn(num_experts, device=device) * 0.5).float()
-
-    old = routing_mod._AD_GATE_PDL
-    try:
-        routing_mod._AD_GATE_PDL = False
-        idx_off, w_off = routing_mod.deepseek_v4_routing_fn(logits, bias, top_k, 1.5, True)
-        routing_mod._AD_GATE_PDL = True
-        idx_on, w_on = routing_mod.deepseek_v4_routing_fn(logits, bias, top_k, 1.5, True)
-        assert torch.equal(idx_off, idx_on)
-        assert torch.equal(w_off, w_on)
-
-        # Capture the PDL-launched GEMV+routing chain and replay with new data.
-        x = torch.randn(1, 4096, device=device, dtype=torch.float32)
-        W = (torch.randn(num_experts, 4096, device=device) * 0.05).float()
-        graph = torch.cuda.CUDAGraph()
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            for _ in range(3):  # warmup on the side stream
-                logits_g = F.linear(x, W)
-                out_g = routing_mod.deepseek_v4_routing_fn(logits_g, bias, top_k, 1.5, True)
-            stream.synchronize()
-            with torch.cuda.graph(graph):
-                logits_g = F.linear(x, W)
-                out_g = routing_mod.deepseek_v4_routing_fn(logits_g, bias, top_k, 1.5, True)
-        torch.cuda.current_stream().wait_stream(stream)
-
-        for seed in (11, 12):
-            torch.manual_seed(seed)
-            x.copy_(torch.randn_like(x))
-            graph.replay()
-            torch.cuda.synchronize()
-            logits_e = F.linear(x, W)
-            idx_e, w_e = routing_mod.deepseek_v4_routing_fn(logits_e, bias, top_k, 1.5, True)
-            assert torch.equal(out_g[0], idx_e), "graph replay selection mismatch"
-            assert torch.equal(out_g[1], w_e), "graph replay weights mismatch"
-    finally:
-        routing_mod._AD_GATE_PDL = old
-
-
 if __name__ == "__main__":
     import sys
 

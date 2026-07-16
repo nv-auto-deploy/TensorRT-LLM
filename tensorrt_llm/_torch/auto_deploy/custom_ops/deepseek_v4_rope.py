@@ -265,7 +265,6 @@ def _kv_norm_rope_concat_kernel(
     cossin_row_stride,
     out_row_stride,
     rms_eps,
-    INVERSE: tl.constexpr,
     NB: tl.constexpr,  # BLOCK_DN // FP8_BLOCK (fp8 reshape block count)
     FP8_BLOCK: tl.constexpr,  # fp8 quant group width (block_size)
     FP8_MAX: tl.constexpr,  # 448.0 (e4m3 absmax)
@@ -323,8 +322,6 @@ def _kv_norm_rope_concat_kernel(
     od = kv_odd.to(tl.float32)
     cos = tl.load(cos_ptr + pos * cossin_row_stride + k, mask=mh, other=0.0).to(tl.float32)
     sin = tl.load(sin_ptr + pos * cossin_row_stride + k, mask=mh, other=0.0).to(tl.float32)
-    if INVERSE:
-        sin = -sin
     out_even = ev * cos - od * sin
     out_odd = ev * sin + od * cos
     pe_out_base = out_base + Dn
@@ -341,7 +338,6 @@ def deepseek_v4_kv_norm_rope_concat(
     sin: torch.Tensor,
     rms_eps: float,
     fp8_block_size: int = 64,
-    inverse: bool = False,
 ) -> torch.Tensor:
     """Fused KV front-end == ``fake_fp8(rmsnorm(cat(nope,pe))[:Dn]) || rope(rmsnorm(...)[Dn:])``.
 
@@ -360,7 +356,6 @@ def deepseek_v4_kv_norm_rope_concat(
         rms_eps: RMS-norm epsilon.
         fp8_block_size: block width for the fake-FP8 quant of the nope slice
             (``Dn % fp8_block_size == 0`` required).
-        inverse: if True, negate ``sin`` (unused by the KV path; kept for symmetry).
     Returns:
         ``[..., Dn + D]`` contiguous tensor, bit-faithful to the split reference.
     """
@@ -408,7 +403,6 @@ def deepseek_v4_kv_norm_rope_concat(
         cossin_row_stride,
         Dn + D,
         rms_eps,
-        INVERSE=inverse,
         NB=NB,
         FP8_BLOCK=fp8_block_size,
         FP8_MAX=448.0,
@@ -429,7 +423,6 @@ def _deepseek_v4_kv_norm_rope_concat_fake(
     sin: torch.Tensor,
     rms_eps: float,
     fp8_block_size: int = 64,
-    inverse: bool = False,
 ) -> torch.Tensor:
     return pe.new_empty((*pe.shape[:-1], nope.shape[-1] + pe.shape[-1]))
 

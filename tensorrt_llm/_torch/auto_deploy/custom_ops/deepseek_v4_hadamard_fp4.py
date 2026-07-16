@@ -231,8 +231,8 @@ def _hadamard_fp4_kernel_blocked(
 # Row-blocking only pays off once enough rows exist to amortize the extra per-program
 # masking/index arithmetic. Below this many rows the minimal 1-warp 1-row kernel is
 # fastest (decode: indexer-q is R=8, latency-bound); at/above it the BLOCK_R=2 tile
-# wins (R=1024 -5%, R=2048 -11%, R=4096 -26%, R=8000 -35%). BLOCK_R=2 beats 4/8/16
-# (which over-subscribe registers at num_warps=1). Microbench: bench/bench_hadamard_fp4.py.
+# wins (microbenched: R=1024 -5%, R=2048 -11%, R=4096 -26%, R=8000 -35%). BLOCK_R=2
+# beats 4/8/16 (which over-subscribe registers at num_warps=1).
 _BLOCKED_ROW_THRESHOLD = 1024
 _BLOCK_R = 2
 

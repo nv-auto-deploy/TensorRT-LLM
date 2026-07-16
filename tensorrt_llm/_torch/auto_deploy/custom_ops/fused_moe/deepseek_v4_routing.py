@@ -39,24 +39,11 @@ it.
 """
 
 import math
-import os
 from typing import Tuple
 
 import torch
 import triton
 import triton.language as tl
-
-# PDL: launch the top-k routing kernel as a programmatic dependent of the
-# router-GEMV producer so its logits-independent prologue (bias load) overlaps
-# the producer's tail. Same machinery/gating style as AD_HC_PDL. Default off.
-_AD_GATE_PDL = os.environ.get("AD_GATE_PDL", "0") == "1"
-
-# Widen the decode hash-gate tile (BLOCK_H 512->2048, 4->8 warps): a lone CTA
-# walking hidden in 512-wide chunks serializes the global-load rounds with no
-# latency hiding (~2.4x slower measured). Selection is a pure integer gather
-# (unchanged); weights move by fp32 sum order only (~3e-8). Default off keeps
-# the default path bit-identical.
-_AD_HASH_ROUTING_WIDE = os.environ.get("AD_HASH_ROUTING_WIDE", "0") == "1"
 
 
 @triton.jit
@@ -79,7 +66,6 @@ def _deepseek_v4_routing_kernel(
     SOFTPLUS_THRESHOLD: tl.constexpr,
     NORM_TOPK: tl.constexpr,
     LOCALIZED: tl.constexpr,
-    LAUNCH_PDL: tl.constexpr,
     BLOCK_E: tl.constexpr,  # >= num_experts, power of 2
     TOP_K: tl.constexpr,
     BLOCK_K: tl.constexpr,  # >= TOP_K, power of 2
@@ -92,19 +78,13 @@ def _deepseek_v4_routing_kernel(
     offs_e = tl.arange(0, BLOCK_E)
     mask_e = offs_e < num_experts
 
-    # Logits-independent prologue (overlaps the router-GEMV tail under PDL).
-    # Pure load reorder vs the pre-PDL kernel: bit-exact.
     bias = tl.load(bias_ptr + offs_e, mask=mask_e, other=0.0).to(tl.float32)
 
-    if LAUNCH_PDL:
-        tl.extra.cuda.gdc_wait()
     logits = tl.load(
         logits_ptr + token_id * stride_lt + offs_e * stride_le,
         mask=mask_e,
         other=0.0,
     ).to(tl.float32)
-    if LAUNCH_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
     # scores = sqrt(softplus(logits)); softplus(x) = x if x > thr else log1p(exp(x)).
     # Match torch.nn.functional.softplus' numerically-stable threshold form.
@@ -249,12 +229,10 @@ def deepseek_v4_routing_fn(
         SOFTPLUS_THRESHOLD=20.0,
         NORM_TOPK=norm_topk_prob,
         LOCALIZED=localized,
-        LAUNCH_PDL=_AD_GATE_PDL,
         BLOCK_E=BLOCK_E,
         TOP_K=top_k,
         BLOCK_K=BLOCK_K,
         num_warps=1,
-        launch_pdl=_AD_GATE_PDL,
     )
     return indices, weights
 
@@ -569,12 +547,7 @@ def deepseek_v4_hash_routing_fn(
     # GEMM when torch has TF32 matmul enabled (the shipping container default).
     tf32_trunc = torch.backends.cuda.matmul.allow_tf32 and num_tokens > 1
 
-    # Decode launch width: gated wide tile (see _AD_HASH_ROUTING_WIDE above);
-    # the default keeps the original bit-identical 512/4 configuration.
-    if _AD_HASH_ROUTING_WIDE:
-        block_h, num_warps = min(2048, _next_power_of_2(hidden_size)), 8
-    else:
-        block_h, num_warps = 512, 4
+    block_h, num_warps = 512, 4
 
     BLOCK_K = _next_power_of_2(top_k)
     grid = (num_tokens,)
