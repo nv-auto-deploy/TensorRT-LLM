@@ -40,7 +40,7 @@ it.
 
 import math
 import os
-from typing import List, Optional, Tuple
+from typing import Tuple
 
 import torch
 import triton
@@ -155,7 +155,7 @@ def _deepseek_v4_routing_kernel(
 
     mask_k = offs_k < TOP_K
     if LOCALIZED:
-        # Fused EP global->local localization (mirrors ``_localize_routing_kernel``
+        # Fused EP global->local localization (mirrors ``_localize_routing_eager``
         # bit for bit): off-rank / out-of-range routes get the invalid sentinel
         # ``local_experts`` and a zero weight; valid weights are the single-rounded
         # bf16 of the exact fp32 value the non-localized op would have stored.
@@ -203,7 +203,7 @@ def deepseek_v4_routing_fn(
         local_experts: when > 0, emit EP-LOCALIZED outputs for the trtllm-gen MoE
             runner instead of the global pair: int32 local expert ids (off-rank
             routes carry the invalid sentinel ``local_experts``) and bf16 masked
-            routing weights, exactly as ``deepseek_v4_localize_routing`` would
+            routing weights, exactly as ``_localize_routing_eager`` would
             produce from the global outputs.
 
     Returns:
@@ -310,7 +310,7 @@ def deepseek_v4_routing_localized(
     """Fused DeepSeek V4 router head emitting EP-LOCALIZED routing for the MoE runner.
 
     Same scoring/top-k/renorm chain as :func:`deepseek_v4_routing`, with the EP
-    global->local localization (``deepseek_v4_localize_routing``) folded into the
+    global->local localization (``_localize_routing_eager``) folded into the
     kernel tail. Returns ``(local_idx int32, weights bf16)``: off-rank routes carry
     the invalid sentinel ``local_experts`` and weight ``0``; valid slots are
     bit-identical to running the two ops back to back.
@@ -342,129 +342,6 @@ def _deepseek_v4_routing_localized_fake(
     indices = router_logits.new_empty((num_tokens, top_k), dtype=torch.int32)
     weights = router_logits.new_empty((num_tokens, top_k), dtype=torch.bfloat16)
     return indices, weights
-
-
-# ---------------------------------------------------------------------------
-# Learned-router gate GEMV (single-token decode)
-# ---------------------------------------------------------------------------
-#
-# The router head's fp32 (E, H) x (H,) GEMV dispatches to a cuBLAS gemvx kernel
-# at M=1 that runs latency-bound (few CTAs) and leaves a launch boundary before
-# the routing kernel. The op below runs one CTA per expert row (grid=(E,)): the
-# whole H-wide dot in one tile, tree-reduced in fp32, with the x-independent
-# weight-row load hoisted into a PDL prologue and an early dependent-launch
-# trigger so the routing kernel behind it starts during the GEMV.
-#
-# Precision: fp32 multiply/accumulate like cuBLAS, but the tree-reduction sum
-# order differs (~1e-6 relative on the logits). Selection could flip only on a
-# rank-k/rank-k+1 near-tie within that band, so the graph rewrite installing
-# this op (``fuse_deepseek_v4_gate_gemv``) is gated default-off and validated
-# with selection-parity tests before enabling. Shapes other than a single
-# decode token (or any non-fp32 / biased call) keep the cuBLAS reference path.
-
-# Largest single-tile hidden size; wider gates fall back to the reference path.
-_GATE_GEMV_MAX_BLOCK_H = 8192
-
-# 8 warps split the 4096-wide row-dot across more schedulers; measured fastest
-# (graph-captured B200 sweep 2/4/8: 3.8/2.5/2.1 us) with the sum order fixed
-# per config by the constexpr tile shape.
-_GATE_GEMV_NUM_WARPS = 8
-
-
-@triton.jit
-def _deepseek_v4_gate_gemv_kernel(
-    x_ptr,  # (H,) fp32 single-token activation
-    w_ptr,  # (E, H) fp32 router weight
-    out_ptr,  # (E,) fp32 logits
-    hidden_size,
-    stride_we,
-    stride_wh,
-    stride_xh,
-    LAUNCH_PDL: tl.constexpr,
-    BLOCK_H: tl.constexpr,  # >= hidden_size, power of 2
-):
-    """One program per expert row: logits[e] = dot(x, W[e, :]) in fp32."""
-    expert_id = tl.program_id(0)
-    offs_h = tl.arange(0, BLOCK_H)
-    mask_h = offs_h < hidden_size
-
-    # x-independent prologue: the weight-row load overlaps the producer's tail
-    # under PDL (mirrors the AD_HC_PDL prologue structure).
-    w = tl.load(w_ptr + expert_id * stride_we + offs_h * stride_wh, mask=mask_h, other=0.0)
-
-    if LAUNCH_PDL:
-        tl.extra.cuda.gdc_wait()
-    x = tl.load(x_ptr + offs_h * stride_xh, mask=mask_h, other=0.0)
-    if LAUNCH_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
-    logit = tl.sum(w * x, axis=0)
-    tl.store(out_ptr + expert_id, logit)
-
-
-@torch.library.custom_op("auto_deploy::deepseek_v4_gate_gemv", mutates_args=())
-def deepseek_v4_gate_gemv(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    tp_mode: str = "none",
-    output_sizes: Optional[List[int]] = None,
-    tp_min_local_shape: int = 1,
-    layer_type: str = "unknown",
-) -> torch.Tensor:
-    """Router-gate GEMV: Triton one-CTA-per-expert-row dot at single-token decode.
-
-    Drop-in replacement for ``auto_deploy::torch_linear_simple`` on the DSV4
-    router gate (same signature, so the graph rewrite is a pure target swap;
-    the sharding-hint args are accepted and ignored — the rewrite runs post
-    sharding). Any shape/dtype outside the single-token fp32 bias-free gate
-    contract falls back to ``F.linear`` (the cuBLAS reference), keeping
-    prefill and larger decode batches bit-identical to the pre-swap graph.
-    """
-    hidden_size = input.shape[-1]
-    num_tokens = input.numel() // hidden_size if hidden_size else 0
-    use_triton = (
-        input.is_cuda
-        and bias is None
-        and num_tokens == 1
-        and input.dtype == torch.float32
-        and weight.dtype == torch.float32
-        and weight.ndim == 2
-        and weight.shape[-1] == hidden_size
-        and hidden_size <= _GATE_GEMV_MAX_BLOCK_H
-    )
-    if not use_triton:
-        return torch.nn.functional.linear(input, weight, bias)
-
-    num_experts = weight.shape[0]
-    x_flat = input.reshape(num_tokens, hidden_size)
-    out = torch.empty((*input.shape[:-1], num_experts), dtype=torch.float32, device=input.device)
-    _deepseek_v4_gate_gemv_kernel[(num_experts,)](
-        x_flat,
-        weight,
-        out,
-        hidden_size,
-        weight.stride(0),
-        weight.stride(1),
-        x_flat.stride(1),
-        LAUNCH_PDL=_AD_GATE_PDL,
-        BLOCK_H=_next_power_of_2(hidden_size),
-        num_warps=_GATE_GEMV_NUM_WARPS,
-    )
-    return out
-
-
-@deepseek_v4_gate_gemv.register_fake
-def _deepseek_v4_gate_gemv_fake(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    tp_mode: str = "none",
-    output_sizes: Optional[List[int]] = None,
-    tp_min_local_shape: int = 1,
-    layer_type: str = "unknown",
-) -> torch.Tensor:
-    return input.new_empty((*input.shape[:-1], weight.shape[0]), dtype=input.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +468,7 @@ def _deepseek_v4_hash_routing_kernel(
     w_k = w_k * routed_scaling_factor
 
     if LOCALIZED:
-        # Fused EP global->local localization (mirrors ``_localize_routing_kernel``
+        # Fused EP global->local localization (mirrors ``_localize_routing_eager``
         # bit for bit): off-rank routes -> invalid sentinel ``local_experts`` + zero
         # weight; valid weights are the single-rounded bf16 of the exact fp32 value.
         local = eids - expert_start
@@ -621,7 +498,7 @@ def _localize_routing_eager(
     expert_start: int,
     local_experts: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Eager mirror of ``deepseek_v4_localize_routing`` (prefill fallback paths)."""
+    """EP global->local routing localization (eager; prefill/fallback paths)."""
     local = selected_experts.to(torch.int64) - int(expert_start)
     valid = (local >= 0) & (local < local_experts)
     local_idx = torch.where(valid, local, torch.full_like(local, local_experts)).to(torch.int32)
@@ -653,7 +530,7 @@ def deepseek_v4_hash_routing_fn(
         expert_start: EP shard offset (localized mode only).
         local_experts: when > 0, emit EP-LOCALIZED outputs (int32 local ids with the
             invalid sentinel ``local_experts`` for off-rank routes, bf16 masked
-            weights), exactly as ``deepseek_v4_localize_routing`` would produce.
+            weights), exactly as ``_localize_routing_eager`` would produce.
 
     Returns:
         selected_experts: (T, top_k) int64 expert indices (= tid2eid[input_ids]),
@@ -795,7 +672,7 @@ def deepseek_v4_hash_routing_localized(
 
     Same gemv + sqrtsoftplus + renorm/scale chain as
     :func:`deepseek_v4_hash_routing`, with the EP global->local localization
-    (``deepseek_v4_localize_routing``) folded into the kernel tail (eager mirror on
+    (``_localize_routing_eager``) folded into the kernel tail (eager mirror on
     the prefill reference branch). Returns ``(local_idx int32, weights bf16)``:
     off-rank routes carry the invalid sentinel ``local_experts`` and weight ``0``;
     valid slots are bit-identical to running the two ops back to back.

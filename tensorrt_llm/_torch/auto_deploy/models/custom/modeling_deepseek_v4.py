@@ -703,29 +703,6 @@ def _sparse_attention(
     )
 
 
-def _hc_split_sinkhorn(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int,
-    sinkhorn_iters: int,
-    eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    pre_logits = mixes[..., :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
-    post_logits = mixes[..., hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
-    comb_logits = mixes[..., 2 * hc_mult :] * hc_scale[2] + hc_base[2 * hc_mult :]
-
-    pre = torch.sigmoid(pre_logits) + eps
-    post = 2.0 * torch.sigmoid(post_logits)
-    comb = comb_logits.view(*comb_logits.shape[:-1], hc_mult, hc_mult)
-    comb = comb.softmax(dim=-1) + eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(sinkhorn_iters - 1):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    return pre, post, comb
-
-
 class DeepseekV4RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -1023,7 +1000,7 @@ class DeepseekV4MoE(nn.Module):
             hidden_states_flat,
             selected_experts,
             # Pass fp32 routing weights straight through: the trtllm-gen path's fused
-            # ``deepseek_v4_localize_routing`` casts to bf16 internally (bit-identical to
+            # EP routing localization casts to bf16 internally (bit-identical to
             # the old ``.to(bf16)`` -> f32 -> bf16 round-trip), so this cast is now dead.
             routing_weights,
             self.experts.gate_up_proj_blocks,
@@ -1632,7 +1609,7 @@ class DeepseekV4Block(nn.Module):
         # gate stays in registers instead of round-tripping through HBM to a
         # third (combine) launch, and the register-only sinkhorn chain overlaps
         # the combine's ``flat`` load latency. Bit-identical to the previous
-        # deepseek_v4_hc_pre_mix + deepseek_v4_hc_combine_rmsnorm sequence on
+        # composition + deepseek_v4_hc_combine_rmsnorm two-op sequence on
         # every path; see hc_composition.py.
         #
         # When ``hc_partials`` is given (every site except layer 0's attn), the

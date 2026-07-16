@@ -10,7 +10,7 @@ mirrors the landed two-kernel sequence on the decode path (same math, same
 rounding points, one launch fewer); the head op mirrors the
 eager ``_hc_head`` + ``torch_rmsnorm`` + ``.float()`` chain with partial-sum
 ``mixes`` that match cublas to ~1 ULP (same contract as the landed
-``deepseek_v4_hc_pre_mix``).
+``deepseek_v4_hc_pre_mix_combine``).
 
 ptxas contracts the fp32 mul+add chains into FMAs differently across kernel
 bodies, so the seam op matches the two-kernel sequence to ~1-2 fp32 ULP, not
@@ -24,6 +24,7 @@ import torch
 import triton
 
 # Registers all auto_deploy HC ops (hc_composition imports deepseek_v4_hc_pre_norm).
+from tensorrt_llm._torch.auto_deploy.custom_ops import deepseek_v4_hc_post as hc_post_mod
 from tensorrt_llm._torch.auto_deploy.custom_ops import hc_composition as hc_comp_mod
 
 
@@ -74,6 +75,46 @@ def _ref_partials(flat2d: torch.Tensor, fn: torch.Tensor) -> torch.Tensor:
     return partials
 
 
+def _ref_hc_post(x, residual, post, comb):
+    """Reference: the standalone ``_hc_post_compose_kernel`` launch the seam op subsumes.
+
+    Mirrors the launch the seam op's prefill branch performs (and what the
+    decode branch fuses with the partials emission), so decode comparisons keep
+    the standing ~1-2 fp32 ULP FMA-contraction contract and prefill comparisons
+    stay bit-exact.
+    """
+    lead = list(x.shape[:-1])
+    H = x.shape[-1]
+    hc_mult = post.shape[-1]
+    n = 1
+    for s in lead:
+        n *= s
+    x_f = x.contiguous().reshape(n, H)
+    res_f = residual.contiguous().reshape(n, hc_mult, H)
+    post_f = post.contiguous().reshape(n, hc_mult).float()
+    comb_f = comb.contiguous().reshape(n, hc_mult * hc_mult).float()
+    out = torch.empty((n, hc_mult, H), device=x.device, dtype=x.dtype)
+    num_warps, num_stages, block_h_max, o_per_cta = hc_post_mod._hc_post_launch_config(n, hc_mult)
+    block_h = min(block_h_max, triton.next_power_of_2(H))
+    grid = (n, triton.cdiv(hc_mult, o_per_cta), triton.cdiv(H, block_h))
+    hc_post_mod._hc_post_compose_kernel[grid](
+        x_f,
+        res_f,
+        post_f,
+        comb_f,
+        out,
+        n,
+        H,
+        HM=hc_mult,
+        BM=triton.next_power_of_2(hc_mult),
+        O_PER_CTA=o_per_cta,
+        BLOCK_H=block_h,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out.reshape(*lead, hc_mult, H)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("BS", [(1, 1), (2, 1), (4, 3), (1, 64)])
 @pytest.mark.parametrize(
@@ -85,7 +126,7 @@ def test_post_next_partials_ulp_close_decode(BS, hm_H_mix):
     hc_mult, H, mix_hc = hm_H_mix
     x, residual, post, comb, next_fn = _make_inputs(B, S, hc_mult, H, mix_hc)
 
-    out_ref = torch.ops.auto_deploy.deepseek_v4_hc_post(x, residual, post, comb)
+    out_ref = _ref_hc_post(x, residual, post, comb)
 
     out, parts = torch.ops.auto_deploy.deepseek_v4_hc_post_next_partials(
         x, residual, post, comb, next_fn
@@ -117,7 +158,7 @@ def test_seam_end_to_end_ulp_close_decode(BS):
     hc_base = 0.02 * torch.randn(mix_hc, device="cuda", dtype=torch.float32)
     norm_w = 1.0 + 0.05 * torch.randn(H, device="cuda", dtype=torch.float32)
 
-    out_ref = torch.ops.auto_deploy.deepseek_v4_hc_post(x, residual, post, comb)
+    out_ref = _ref_hc_post(x, residual, post, comb)
     y_ref, post_ref, comb_ref = torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine(
         out_ref.flatten(2),
         next_fn,
@@ -165,7 +206,7 @@ def test_post_next_partials_prefill_matches_old(BS):
     hc_mult, H, mix_hc = 4, 4096, 24
     x, residual, post, comb, next_fn = _make_inputs(B, S, hc_mult, H, mix_hc)
 
-    out_ref = torch.ops.auto_deploy.deepseek_v4_hc_post(x, residual, post, comb)
+    out_ref = _ref_hc_post(x, residual, post, comb)
     out, parts = torch.ops.auto_deploy.deepseek_v4_hc_post_next_partials(
         x, residual, post, comb, next_fn
     )
@@ -273,12 +314,8 @@ def test_hc_head_norm_prefill_bitexact():
 
 
 # ---------------------------------------------------------------------------
-# Merged seam-pair op (deepseek_v4_hc_post_pre_combine[_y32]) + consumer PDL
+# Consumer PDL dependent launch
 # ---------------------------------------------------------------------------
-
-from tensorrt_llm._torch.auto_deploy.custom_ops import (  # noqa: E402
-    deepseek_v4_hc_post as hc_post_mod,
-)
 
 _PAIR_SCALARS = (20, 1e-4, 1e-6, 1e-6, torch.bfloat16)  # sinkhorn, eps, norm_eps, rms_eps, dtype
 
@@ -292,98 +329,9 @@ def _make_site(B, S, hc_mult, H, mix_hc, seed=0):
     return x, residual, post, comb, next_fn, hc_scale, hc_base, norm_w
 
 
-def _run_pair(args, hc_mult, y32):
-    out, parts = torch.ops.auto_deploy.deepseek_v4_hc_post_next_partials(*args[:5])
-    op = (
-        torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine_partials_y32
-        if y32
-        else torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine_partials
-    )
-    rest = op(parts, out.flatten(2), args[4], args[5], args[6], args[7], hc_mult, *_PAIR_SCALARS)
-    return (out, *rest)
-
-
-def _run_merged(args, hc_mult, y32):
-    op = (
-        torch.ops.auto_deploy.deepseek_v4_hc_post_pre_combine_y32
-        if y32
-        else torch.ops.auto_deploy.deepseek_v4_hc_post_pre_combine
-    )
-    return op(*args, hc_mult, *_PAIR_SCALARS)
-
-
 def _set_pdl(value):
     hc_post_mod._AD_HC_PDL = value
     hc_comp_mod._AD_HC_PDL = value
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("BS", [(1, 1), (2, 1), (4, 3), (1, 16), (1, 64)])
-@pytest.mark.parametrize("y32", [False, True])
-@pytest.mark.parametrize("pdl", [False, True])
-def test_seam_pair_op_decode(BS, y32, pdl):
-    """Merged pair op vs the two-op sequence on the decode (barrier kernel) path.
-
-    ``out`` must be bit-identical; y/post/comb carry the standing ~1-2 fp32 ULP
-    FMA-contraction-across-kernel-bodies contract (see deepseek_v4_hc_post.py).
-    """
-    B, S = BS
-    hc_mult, H, mix_hc = 4, 4096, 24
-    args = _make_site(B, S, hc_mult, H, mix_hc, seed=7 * B + S)
-    _set_pdl(pdl)
-    try:
-        ref = _run_pair(args, hc_mult, y32)
-        got = _run_merged(args, hc_mult, y32)
-    finally:
-        _set_pdl(False)
-
-    assert torch.equal(got[0], ref[0]), "merged out must be bit-identical to the pair"
-    _assert_ulp_close(got[1], ref[1], rtol=1.6e-2, atol=1e-5, what="pair y", max_diff_frac=2e-3)
-    if y32:
-        assert torch.equal(got[2], got[1].float()), "y32 must equal y.float() exactly"
-        _assert_ulp_close(got[2], ref[2], rtol=1.6e-2, atol=1e-5, what="pair y32")
-    _assert_ulp_close(got[-2], ref[-2], rtol=1e-4, atol=1e-6, what="pair post")
-    _assert_ulp_close(got[-1], ref[-1], rtol=1e-4, atol=1e-6, what="pair comb")
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("y32", [False, True])
-def test_seam_pair_op_prefill_bitexact(y32):
-    """Above the decode threshold both ops take their eager branches: bit-exact."""
-    args = _make_site(1, 257, 4, 4096, 24, seed=3)
-    ref = _run_pair(args, 4, y32)
-    got = _run_merged(args, 4, y32)
-    for name, g, r in zip(("out", "y", "y32", "post", "comb"), got, ref):
-        assert torch.equal(g, r), f"prefill {name} must be bit-identical"
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_seam_pair_op_cudagraph_replay():
-    """Graph capture + replays with changing inputs validate the barrier self-reset."""
-    hc_mult, H, mix_hc = 4, 4096, 24
-    args = list(_make_site(2, 1, hc_mult, H, mix_hc, seed=11))
-    # warmup allocates the barrier outside capture
-    _ = _run_merged(tuple(args), hc_mult, True)
-    torch.cuda.synchronize()
-
-    g = torch.cuda.CUDAGraph()
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        with torch.cuda.graph(g):
-            outs = _run_merged(tuple(args), hc_mult, True)
-    torch.cuda.synchronize()
-
-    for rep in range(4):
-        fresh = _make_site(2, 1, hc_mult, H, mix_hc, seed=100 + rep)
-        for buf, val in zip(args[:4], fresh[:4]):
-            buf.copy_(val)
-        g.replay()
-        torch.cuda.synchronize()
-        ref = _run_merged(tuple(args), hc_mult, True)
-        for name, a, b in zip(("out", "y", "y32", "post", "comb"), outs, ref):
-            assert torch.equal(a, b), f"replay {rep}: {name} mismatch vs eager merged"
-        barrier = hc_post_mod._hc_seam_barrier_state(args[0].device)
-        assert bool((barrier == 0).all().item()), f"replay {rep}: barrier not self-reset"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
