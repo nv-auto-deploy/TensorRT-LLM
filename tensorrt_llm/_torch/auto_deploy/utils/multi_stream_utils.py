@@ -135,7 +135,7 @@ class CudaStreamManager(metaclass=_Singleton):
                     self.MAIN_STREAM_NAME: torch.cuda.default_stream(),
                 }
         else:
-            ad_logger.debug(f"CudaStreamManager: Device {device} already added")
+            ad_logger.warning(f"CudaStreamManager: Device {device} already added")
 
     def get_stream(self, device: int, stream_name: str) -> torch.cuda.Stream:
         return self.streams[device][stream_name]

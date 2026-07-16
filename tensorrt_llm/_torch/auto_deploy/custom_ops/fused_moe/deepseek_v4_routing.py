@@ -76,7 +76,9 @@ def _deepseek_v4_routing_kernel(
     # scores = sqrt(softplus(logits)); softplus(x) = x if x > thr else log1p(exp(x)).
     # Match torch.nn.functional.softplus' numerically-stable threshold form.
     exp_x = tl.exp(logits)
-    softplus = tl.where(logits > SOFTPLUS_THRESHOLD, logits, tl.log(1.0 + exp_x))
+    u = 1.0 + exp_x
+    log1p_x = tl.where(u == 1.0, exp_x, tl.log(u) * exp_x / (u - 1.0))
+    softplus = tl.where(logits > SOFTPLUS_THRESHOLD, logits, log1p_x)
     scores = tl.sqrt(softplus)
 
     biased = scores + bias

@@ -24,13 +24,14 @@ These tests prove the new path is correct:
     proven non-grouped FineGrained FP8 op -- bit-for-bit identical on the deterministic full-K
     decode kernel, and equal up to fp32 atomic-reduction reorder (~1 ULP) on the split-K decode
     kernel (K>=4096), which itself is run-to-run non-deterministic by construction.
-  * ``num_groups > 1`` matches a per-group launch of the non-grouped op bit-for-bit (full-K).
+  * Block-aligned ``num_groups > 1`` matches a per-group launch of the non-grouped op bit-for-bit
+    (full-K); unaligned group boundaries retain the global checkpoint scale grid.
 """
 
 import pytest
 import torch
 
-import tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.quantization import torch_quant
 
 _FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 
@@ -58,6 +59,22 @@ def _make_inputs(num_groups, rank, in_features, batch=2, seed=0):
         batch, num_groups, in_features, generator=gen, device="cuda", dtype=torch.bfloat16
     )
     return x, w_fp8, scale
+
+
+def _grouped_dense_dequant_reference(x, weight_fp8, scale):
+    """Reference the flattened checkpoint's canonical global 128x128 scale grid."""
+    num_groups = x.shape[-2]
+    rank = weight_fp8.shape[0] // num_groups
+    qinput, input_scale = torch_quant._safe_act_quant(x.contiguous(), _BLOCK)
+    qinput_blocks = qinput.reshape(*x.shape[:-1], -1, _BLOCK)
+    input_dequant = (qinput_blocks.to(x.dtype) * input_scale.unsqueeze(-1)).reshape_as(x)
+
+    weight_scale = scale.repeat_interleave(_BLOCK, dim=0).repeat_interleave(_BLOCK, dim=1)
+    weight_scale = weight_scale[: weight_fp8.shape[0], : weight_fp8.shape[1]]
+    weight = (weight_fp8.to(x.dtype) * weight_scale.to(x.dtype)).view(num_groups, rank, x.shape[-1])
+    return (
+        torch.matmul(input_dequant.unsqueeze(-2), weight.transpose(-1, -2)).squeeze(-2).flatten(-2)
+    )
 
 
 @pytest.mark.parametrize("input_scale_fmt", ["", "ue8m0"])
@@ -133,6 +150,35 @@ def test_multi_group_matches_per_group_nongrouped_bitwise():
 
     assert out_grouped.shape == (x.shape[0], num_groups * rank)
     assert torch.equal(out_grouped, ref)
+
+
+def test_ragged_output_rows_keep_canonical_scale_blocks():
+    num_groups, rank, in_features = 1, 576, 256
+    x = torch.ones(1, num_groups, in_features, device="cuda", dtype=torch.bfloat16)
+    weight_fp8 = torch.ones(rank, in_features, device="cuda", dtype=torch.bfloat16).to(_FP8_DTYPE)
+    scale = torch.arange(1, 6, device="cuda", dtype=torch.float32).unsqueeze(1).repeat(1, 2)
+
+    output = _GROUPED_OP(x, weight_fp8, None, [], [scale], [], [])
+    ref = _grouped_dense_dequant_reference(x, weight_fp8, scale)
+
+    assert output.shape == (1, rank)
+    torch.testing.assert_close(output, ref, rtol=2e-2, atol=1.0)
+
+
+def test_global_scale_blocks_may_span_group_boundaries():
+    num_groups, rank, in_features = 2, 192, 128
+    x = torch.ones(1, num_groups, in_features, device="cuda", dtype=torch.bfloat16)
+    x[:, 1, :].mul_(2)
+    weight_fp8 = torch.ones(num_groups * rank, in_features, device="cuda", dtype=torch.bfloat16).to(
+        _FP8_DTYPE
+    )
+    scale = torch.tensor([[1.0], [2.0], [4.0]], device="cuda", dtype=torch.float32)
+
+    output = _GROUPED_OP(x, weight_fp8, None, [], [scale], [], [])
+    ref = _grouped_dense_dequant_reference(x, weight_fp8, scale)
+
+    assert output.shape == (1, num_groups * rank)
+    torch.testing.assert_close(output, ref, rtol=0.0, atol=0.0)
 
 
 if __name__ == "__main__":

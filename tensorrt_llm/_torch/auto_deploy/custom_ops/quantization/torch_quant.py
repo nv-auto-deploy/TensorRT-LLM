@@ -23,6 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ...utils.fp8_dequant import dequant_fp8_weight_two_dim_block_grid
 from ...utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     unpack_uint8_to_int4_weight_2d,
@@ -1359,16 +1360,26 @@ def _w8a8_gemv_rowwise(
     return C
 
 
+_FINEGRAINED_FP8_CANONICAL_BLOCK_N = 128
+
+
 def _finegrained_fp8_block_sizes(
     weight_quantized: torch.Tensor, weight_scale_inv: torch.Tensor
 ) -> Tuple[int, int]:
     """Infer (block_n, block_k) from the weight and per-block scale shapes.
 
-    weight shape: [N, K], weight_scale_inv shape: [ceil(N/block_n), ceil(K/block_k)].
+    Recognize the standard 128-row checkpoint grid before falling back to shape inference,
+    since a partial final N block makes the block size ambiguous from shape alone.
     """
     N, K = weight_quantized.shape
     scale_n, scale_k = weight_scale_inv.shape
-    return triton.cdiv(N, scale_n), triton.cdiv(K, scale_k)
+    block_n = (
+        _FINEGRAINED_FP8_CANONICAL_BLOCK_N
+        if scale_n == triton.cdiv(N, _FINEGRAINED_FP8_CANONICAL_BLOCK_N)
+        else triton.cdiv(N, scale_n)
+    )
+    block_k = triton.cdiv(K, scale_k)
+    return block_n, block_k
 
 
 def _finegrained_fp8_matmul(
@@ -1797,6 +1808,31 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
     rank = out_rows // num_groups
     lead_shape = input.shape[:-2]
 
+    if num_groups > 1 and (rank % block_n != 0 or scale_n % num_groups != 0):
+        # The checkpoint scale grid covers the flattened weight. If a scale block crosses a
+        # logical group boundary, it cannot be reshaped into independent per-group grids.
+        qinput, input_scales = _safe_act_quant(input_contiguous, block_k, input_scale_fmt)
+        qinput_blocks = qinput.reshape(*input_contiguous.shape[:-1], -1, block_k)
+        input_dequant = (qinput_blocks.to(input.dtype) * input_scales.unsqueeze(-1)).reshape_as(
+            input_contiguous
+        )
+        weight_dequant = dequant_fp8_weight_two_dim_block_grid(
+            weight_quantized,
+            weight_scale_inv,
+            block_n,
+            block_k,
+            dtype=input.dtype,
+        )
+        weight_grouped = weight_dequant.view(num_groups, rank, in_features)
+        output = torch.matmul(
+            input_dequant.unsqueeze(-2),
+            weight_grouped.transpose(-1, -2),
+        ).squeeze(-2)
+        output = output.flatten(-2)
+        if bias is not None:
+            output = output + bias.reshape(out_rows).to(output.dtype)
+        return output.to(dtype=input.dtype)
+
     # Direct grouped block-FP8 W8A8 matmul: keep both operands in FP8 and let the proven
     # block-FP8 kernel apply the per-block input/weight scales inside its FP32 accumulator.
     # This removes the per-call input quantize->dequantize round-trip and the FP8->BF16 weight
@@ -1807,7 +1843,7 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
     # operands; the per-block scale is constant within a block so factoring it out of the
     # contraction is exact). Under tensor parallelism the DeepSeek-V4 MLA ``wo_a`` per-rank
     # group count is 1, so this is a single 2D block-FP8 GEMM (K=4096 -> the split-K decode
-    # path); ``num_groups > 1`` falls back to a per-group launch of the same proven kernel.
+    # path); block-aligned ``num_groups > 1`` uses per-group launches of the same proven kernel.
     m_tokens = input_contiguous.numel() // (num_groups * in_features)
     # Deferred activation quant: the decode split-K/GEMV kernels fuse the
     # ue8m0 quant into their prologue; other branches quantize standalone.

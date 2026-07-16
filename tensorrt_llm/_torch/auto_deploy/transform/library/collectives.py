@@ -299,6 +299,9 @@ class FuseCollinearAllreduce(BaseTransform):
         for node in list(graph.nodes):
             if not is_op(node, torch.ops.aten.add.Tensor) or len(node.args) < 2:
                 continue
+            (alpha,) = extract_op_args(node, "alpha")
+            if alpha != 1:
+                continue
             lhs, rhs = node.args[0], node.args[1]
             if not (isinstance(lhs, Node) and isinstance(rhs, Node)):
                 continue
@@ -418,6 +421,9 @@ class FuseFp8LinearAllreduceAdd(BaseTransform):
         cnt = 0
         for node in list(graph.nodes):
             if not is_op(node, torch.ops.aten.add.Tensor) or len(node.args) < 2:
+                continue
+            (alpha,) = extract_op_args(node, "alpha")
+            if alpha != 1:
                 continue
             # The add must feed exactly one distributed all_reduce, so the fused
             # projection output is precisely the collective's input buffer.

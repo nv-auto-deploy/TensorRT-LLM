@@ -94,6 +94,31 @@ def test_deepseek_v4_routing_softplus_threshold():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("norm_topk_prob", [True, False])
+def test_deepseek_v4_routing_preserves_large_negative_softplus(norm_topk_prob):
+    """Bias-selected negative logits retain their positive softplus weights."""
+    device = "cuda"
+    num_experts, top_k = 256, 6
+    router_logits = torch.stack(
+        [
+            torch.full((num_experts,), -20.0, device=device),
+            torch.full((num_experts,), -30.0, device=device),
+        ]
+    )
+    bias = torch.full((num_experts,), -100.0, device=device)
+    bias[:top_k] = torch.arange(top_k, 0, -1, device=device)
+
+    ref_idx, ref_w = _reference_routing(router_logits, bias, top_k, 1.5, norm_topk_prob)
+    out_idx, out_w = torch.ops.auto_deploy.deepseek_v4_routing(
+        router_logits, bias, top_k, 1.5, norm_topk_prob
+    )
+
+    assert torch.equal(out_idx, ref_idx.to(torch.int64))
+    assert (out_w > 0).all()
+    torch.testing.assert_close(out_w, ref_w, rtol=1e-5, atol=1e-9)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_deepseek_v4_routing_exact_tie_smallest_index():
     """Exact value ties: deterministic smallest-index selection (documented contract).
 

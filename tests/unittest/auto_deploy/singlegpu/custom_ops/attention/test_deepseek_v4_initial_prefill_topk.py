@@ -223,8 +223,10 @@ def _run_cached_placeholder(
     indexer_weights: torch.Tensor | None = None,
     indexer_compressor_kv: torch.Tensor | None = None,
     indexer_compressor_gate: torch.Tensor | None = None,
+    topk_idxs: torch.Tensor | None = None,
+    topk_is_placeholder: bool = True,
 ) -> torch.Tensor:
-    """Run the cached op with ``topk_is_placeholder=True`` on prefill/mixed metadata."""
+    """Run the cached op with placeholder or explicit top-k prefill/mixed metadata."""
     batch, num_tokens = q.shape[0], q.shape[1]
     if compress_ratio:
         assert compressor is not None
@@ -268,7 +270,7 @@ def _run_cached_placeholder(
         q,
         kv,
         attn_sink,
-        _placeholder_topk(topk_width, num_tokens, q.device),
+        _placeholder_topk(topk_width, num_tokens, q.device) if topk_idxs is None else topk_idxs,
         compressor_kv,
         compressor_gate,
         compressor_ape,
@@ -290,7 +292,7 @@ def _run_cached_placeholder(
         max_compressed_len,
         rms_norm_eps,
         rope_dim,
-        topk_is_placeholder=True,
+        topk_is_placeholder=topk_is_placeholder,
     )
 
 
@@ -497,6 +499,129 @@ def test_two_sequence_initial_prefill_matches_solo_ratio4() -> None:
             f"{(out_batched[:, sl].float() - out_solo.float()).abs().max().item():.6e}"
         )
         start += n
+
+
+@_requires_cuda
+def test_long_ratio4_initial_prefill_preserves_learned_topk() -> None:
+    """The first token with more visible rows than ``index_topk`` uses the indexer."""
+    torch.manual_seed(20260720)
+    device = torch.device("cuda")
+    compress_ratio = 4
+    seq_len = 12
+    capacity = 16
+    index_topk = 2
+
+    compressor, cos_table, sin_table = _make_compressor(compress_ratio, capacity, device)
+    indexer_config = DeepseekV4Config(
+        hidden_size=_HIDDEN_SIZE,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=_HEAD_DIM,
+        q_lora_rank=8,
+        qk_rope_head_dim=_ROPE_DIM,
+        index_n_heads=1,
+        index_head_dim=32,
+        index_topk=index_topk,
+        compress_ratios=(compress_ratio,),
+        ad_compress_max_seq_len=capacity,
+        ad_rope_cache_len=capacity,
+    )
+    indexer = DeepseekV4Indexer(indexer_config, compress_ratio).eval().to(device)
+
+    hidden = torch.randn(1, seq_len, _HIDDEN_SIZE, device=device)
+    q_lora = torch.randn(1, seq_len, indexer_config.q_lora_rank, device=device)
+    position_ids = torch.arange(seq_len, device=device).unsqueeze(0).contiguous()
+    compressor_kv, compressor_gate = compressor.project(hidden)
+    cos = cos_table[position_ids]
+    sin = sin_table[position_ids]
+    indexer_q, indexer_weights, indexer_compressor_kv, indexer_compressor_gate = indexer.project(
+        hidden, q_lora, cos, sin
+    )
+    index_k = indexer.compressor.compress_projected(
+        indexer_compressor_kv.float(),
+        indexer_compressor_gate.float(),
+        cos_table,
+        sin_table,
+        position_ids,
+        hidden.dtype,
+    )
+    # Make the overflow token prefer the newly visible row deterministically.
+    # RMSNorm gives the candidate rows comparable norms, so using row 2 as the
+    # query makes its self-dot rank in the selected pair.
+    indexer_q = indexer_q.clone()
+    indexer_q[:, -1] = index_k[:, index_topk].unsqueeze(1)
+    indexer_weights = torch.ones_like(indexer_weights)
+    fixture_scores = torch.matmul(
+        indexer_q[:, -1], index_k[:, : index_topk + 1].transpose(-1, -2)
+    ).relu()
+    newest_margin = fixture_scores[0, 0, index_topk] - fixture_scores[0, 0, :index_topk].min()
+    assert newest_margin.item() > 1.0, (
+        f"newest-row score margin is too small for a stable fixture: {newest_margin.item():.6f}"
+    )
+    compressed_topk = indexer.select_topk(indexer_q, index_k, indexer_weights, seq_len, seq_len)
+    assert (compressed_topk[0, -1] == seq_len + index_topk).any(), (
+        "fixture must select the newest compressed row so the old dense-prefix rebuild fails"
+    )
+    query_positions = torch.arange(seq_len, device=device).unsqueeze(1)
+    window_positions = (
+        query_positions - _WINDOW_SIZE + 1 + torch.arange(_WINDOW_SIZE, device=device)
+    )
+    window_positions = torch.where(
+        (window_positions < 0) | (window_positions > query_positions),
+        -1,
+        window_positions,
+    ).unsqueeze(0)
+    explicit_topk = torch.cat((window_positions, compressed_topk), dim=-1).to(torch.int64)
+    compressed_positions = torch.arange(index_topk, device=device)
+    valid_lengths = torch.arange(1, seq_len + 1, device=device).unsqueeze(1) // compress_ratio
+    dense_compressed_topk = compressed_positions.unsqueeze(0).expand(seq_len, -1)
+    dense_compressed_topk = torch.where(
+        dense_compressed_topk < valid_lengths,
+        dense_compressed_topk + seq_len,
+        -1,
+    ).unsqueeze(0)
+    dense_topk = torch.cat((window_positions, dense_compressed_topk), dim=-1).to(torch.int64)
+
+    q = torch.randn(1, seq_len, _NUM_HEADS, _HEAD_DIM, device=device)
+    kv = torch.randn(1, seq_len, _HEAD_DIM, device=device)
+    attn_sink = torch.tensor([-0.25, 0.1], device=device)
+    state_dim = int(compressor_kv.shape[-1])
+    indexer_state_dim = int(indexer_compressor_kv.shape[-1])
+
+    def run(topk: torch.Tensor | None, is_placeholder: bool) -> torch.Tensor:
+        return _run_cached_placeholder(
+            q,
+            kv,
+            attn_sink,
+            _prefill_meta([seq_len]),
+            _make_caches(1, capacity, state_dim, indexer_state_dim, device),
+            _WINDOW_SIZE + index_topk,
+            compress_ratio=compress_ratio,
+            compressor=compressor,
+            compressor_kv=compressor_kv,
+            compressor_gate=compressor_gate,
+            cos_table=cos_table,
+            sin_table=sin_table,
+            position_ids=position_ids,
+            indexer=indexer,
+            indexer_q=indexer_q,
+            indexer_weights=indexer_weights,
+            indexer_compressor_kv=indexer_compressor_kv,
+            indexer_compressor_gate=indexer_compressor_gate,
+            topk_idxs=topk,
+            topk_is_placeholder=is_placeholder,
+        )
+
+    learned = run(explicit_topk, False)
+    dense = run(dense_topk, False)
+    rebuilt = run(None, True)
+    tail_start = (index_topk + 1) * compress_ratio - 1
+    assert torch.equal(rebuilt[:, :tail_start], dense[:, :tail_start])
+    assert not torch.equal(dense[:, -1], learned[:, -1]), (
+        "fixture must distinguish learned selection from the old dense-prefix output"
+    )
+    assert torch.equal(rebuilt[:, -1], learned[:, -1])
 
 
 def test_two_sequence_window_only_prefill_matches_solo_cpu() -> None:

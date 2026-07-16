@@ -27,19 +27,24 @@ import torch
 
 # Register the distributed custom ops (auto_deploy::trtllm_dist_all_reduce, ...).
 import tensorrt_llm._torch.auto_deploy.custom_ops.distributed.trtllm_dist  # noqa: F401
+
+# Register the fine-grained FP8 linear custom ops used by the residual-add fusion.
+import tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, TransformRegistry
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 _AR = torch.ops.auto_deploy.trtllm_dist_all_reduce.default
-_N, _H = 4, 16
+_LINEAR = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default
+_LINEAR_RESIDUAL_ADD = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add
+_N, _H, _K = 4, 16, 16
 
 
-def _run(gm, enabled=True):
-    """Apply only the fuse_collinear_allreduce transform."""
+def _run(gm, enabled=True, name="fuse_collinear_allreduce"):
+    """Apply one collective fusion transform."""
     shared_config = SharedConfig(local_rank=0, world_size=1)
-    config_cls = TransformRegistry.get_config_class("fuse_collinear_allreduce")
+    config_cls = TransformRegistry.get_config_class(name)
     config = config_cls(stage="post_load_fusion", enabled=enabled)
-    transform = TransformRegistry.get("fuse_collinear_allreduce")(config)
+    transform = TransformRegistry.get(name)(config)
     return transform._apply(gm, cm=None, factory=None, shared_config=shared_config)
 
 
@@ -66,15 +71,50 @@ def _count(gm, op):
     return sum(1 for n in gm.graph.nodes if is_op(n, op))
 
 
-def _build_dual_ar_add_graph(strategy_a="NCCL", strategy_b="NCCL"):
+def _build_dual_ar_add_graph(strategy_a="NCCL", strategy_b="NCCL", alpha=1):
     """add(all_reduce(a, sA), all_reduce(b, sB)) -> output."""
     graph = torch.fx.Graph()
     a = graph.placeholder("a")
     b = graph.placeholder("b")
     ar_a = graph.call_function(_AR, args=(a, strategy_a))
     ar_b = graph.call_function(_AR, args=(b, strategy_b))
-    add = graph.call_function(torch.ops.aten.add.Tensor, args=(ar_a, ar_b))
+    add = graph.call_function(torch.ops.aten.add.Tensor, args=(ar_a, ar_b), kwargs={"alpha": alpha})
     return _finalize(graph, add)
+
+
+def _build_fp8_linear_add_allreduce_graph(alpha=1, linear_first=True):
+    """all_reduce(add(fp8_linear(x), residual, alpha=alpha)) -> output."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    weight = graph.placeholder("weight")
+    weight_scale = graph.placeholder("weight_scale")
+    residual = graph.placeholder("residual")
+    linear = graph.call_function(
+        _LINEAR,
+        args=(x, weight, None, [], [weight_scale], [], []),
+    )
+    add_args = (linear, residual) if linear_first else (residual, linear)
+    add = graph.call_function(
+        torch.ops.aten.add.Tensor,
+        args=add_args,
+        kwargs={"alpha": alpha},
+    )
+    allreduce = graph.call_function(_AR, args=(add, "NCCL"))
+    graph.output(allreduce)
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    for node in gm.graph.nodes:
+        if node.op == "placeholder":
+            if node.target == "x":
+                node.meta["val"] = _meta(shape=(_N, _K))
+            elif node.target == "weight":
+                node.meta["val"] = _meta(shape=(_H, _K), dtype=torch.float8_e4m3fn)
+            elif node.target == "weight_scale":
+                node.meta["val"] = _meta(shape=(1, 1), dtype=torch.float32)
+            else:
+                node.meta["val"] = _meta()
+        elif is_op(node, (_LINEAR, torch.ops.aten.add.Tensor, _AR)):
+            node.meta["val"] = _meta()
+    return gm
 
 
 def _build_dual_ar_with_noop_cast_graph(cast_op=torch.ops.aten._to_copy.default):
@@ -109,6 +149,29 @@ def test_fuses_dual_allreduce():
     # The surviving all_reduce must consume the add (i.e. AR(a + b), not add(AR, AR)).
     ar = next(n for n in gm.graph.nodes if is_op(n, _AR))
     assert is_op(ar.args[0], torch.ops.aten.add.Tensor)
+
+
+def test_skips_scaled_dual_allreduce_add():
+    """Moving an add with non-unit alpha ahead of the reductions changes its value."""
+    gm = _build_dual_ar_add_graph(alpha=2)
+    gm, info = _run(gm)
+    assert info.num_matches == 0
+    assert _count(gm, _AR) == 2
+
+
+def test_fp8_residual_add_fuses_only_for_unit_alpha():
+    transform_name = "fuse_fp8_linear_allreduce_add"
+    gm = _build_fp8_linear_add_allreduce_graph()
+    gm, info = _run(gm, name=transform_name)
+    assert info.num_matches == 1
+    assert _count(gm, _LINEAR_RESIDUAL_ADD) == 1
+
+    for linear_first in (True, False):
+        gm = _build_fp8_linear_add_allreduce_graph(alpha=2, linear_first=linear_first)
+        gm, info = _run(gm, name=transform_name)
+        assert info.num_matches == 0
+        assert _count(gm, _LINEAR) == 1
+        assert _count(gm, _LINEAR_RESIDUAL_ADD) == 0
 
 
 def test_fuses_through_noop_to_copy():

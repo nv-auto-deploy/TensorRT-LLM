@@ -117,6 +117,19 @@ def test_matches_reference_other_pow2_dims(dim):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_noncontiguous_leading_dims_write_returned_output():
+    torch.manual_seed(4)
+    base = torch.randn((2, 3, 128), device="cuda", dtype=torch.bfloat16)
+    x = base.transpose(0, 1)
+    assert x.stride(-1) == 1 and not x.is_contiguous()
+
+    out = _fused(x)
+
+    assert out.is_contiguous()
+    assert torch.equal(out, _ref(x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "R",

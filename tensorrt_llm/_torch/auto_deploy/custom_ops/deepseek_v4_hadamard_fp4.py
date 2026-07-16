@@ -239,7 +239,7 @@ def deepseek_v4_hadamard_fp4(x: torch.Tensor, block_size: int = 32) -> torch.Ten
     assert dim % block_size == 0, "dim must be a multiple of block_size"
     assert x.stride(-1) == 1, "last dim of x must be contiguous"
 
-    out = torch.empty_like(x)
+    out = torch.empty_like(x, memory_format=torch.contiguous_format)
     R = x.numel() // dim
     if R == 0:
         return out
@@ -292,4 +292,4 @@ def deepseek_v4_hadamard_fp4(x: torch.Tensor, block_size: int = 32) -> torch.Ten
 
 @deepseek_v4_hadamard_fp4.register_fake
 def _deepseek_v4_hadamard_fp4_fake(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
-    return torch.empty_like(x)
+    return torch.empty_like(x, memory_format=torch.contiguous_format)

@@ -4973,6 +4973,98 @@ def _build_placeholder_topk_idxs(
     return torch.cat((window_idxs, compressed_idxs), dim=-1).to(torch.int64)
 
 
+def _rebuild_initial_prefill_ratio4_topk_idxs(
+    topk_idxs: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    max_compressed_len: int,
+    indexer_q: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    indexer_compressor_kv: torch.Tensor,
+    indexer_compressor_gate: torch.Tensor,
+    indexer_compressor_ape: torch.Tensor,
+    indexer_compressor_norm_weight: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    position_ids: torch.Tensor,
+    rms_norm_eps: float,
+    rope_dim: int,
+    *,
+    weights_are_scaled: bool = False,
+) -> torch.Tensor:
+    """Restore learned ratio-4 selection once visible rows exceed ``index_topk``."""
+    batch_size, seq_len, _ = topk_idxs.shape
+    index_topk = int(topk_idxs.shape[-1]) - window_size
+    visible_rows = min(seq_len // compress_ratio, max_compressed_len)
+    if index_topk <= 0 or visible_rows <= index_topk:
+        return topk_idxs
+
+    # Before this token every visible row fits in the fixed-width selection, so the
+    # dense-prefix placeholder has the same candidate set. Recompute only the tail
+    # where the learned indexer must choose a strict subset.
+    tail_start = (index_topk + 1) * compress_ratio - 1
+    completed_tokens = visible_rows * compress_ratio
+    state_dim = int(indexer_compressor_kv.shape[-1])
+    index_head_dim = int(indexer_q.shape[-1])
+    if state_dim != 2 * index_head_dim:
+        raise ValueError(
+            "ratio-4 indexer compressor state width must be twice the index head width, "
+            f"got {state_dim} and {index_head_dim}"
+        )
+
+    row_offsets = torch.arange(visible_rows, device=indexer_q.device)
+    token_offsets = torch.arange(compress_ratio, device=indexer_q.device)
+    gather_idxs = row_offsets.unsqueeze(1) * compress_ratio + token_offsets
+    flat_idxs = gather_idxs.reshape(-1)
+    index_kv = indexer_compressor_kv[:, :completed_tokens].float()
+    index_gate = indexer_compressor_gate[:, :completed_tokens].float()
+    index_kv = index_kv[:, flat_idxs].view(batch_size, visible_rows, compress_ratio, state_dim)
+    index_gate = index_gate[:, flat_idxs].view(batch_size, visible_rows, compress_ratio, state_dim)
+    index_gate = index_gate + indexer_compressor_ape.to(index_gate.dtype)
+    index_kv = _overlap_transform_projected(index_kv, index_head_dim, 0.0)
+    index_gate = _overlap_transform_projected(index_gate, index_head_dim, -1.0e20)
+    index_k = torch.ops.auto_deploy.deepseek_v4_compress_pool(index_kv, index_gate).to(
+        indexer_q.dtype
+    )
+    index_k = torch.ops.auto_deploy.torch_rmsnorm(
+        index_k, indexer_compressor_norm_weight, rms_norm_eps
+    )
+
+    row_position_ids = position_ids[:, row_offsets * compress_ratio]
+    cos = cos_table[row_position_ids]
+    sin = sin_table[row_position_ids]
+    nope, pe = torch.split(index_k, [index_head_dim - rope_dim, rope_dim], dim=-1)
+    index_k = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(nope, pe, cos, sin, False)
+    index_k = torch.ops.auto_deploy.deepseek_v4_hadamard_fp4(index_k, 32)
+
+    q_tail = indexer_q[:, tail_start:]
+    index_score = torch.matmul(
+        q_tail.transpose(1, 2), index_k.transpose(1, 2).unsqueeze(1)
+    ).transpose(1, 2)
+    index_score = index_score.float()
+    weights = indexer_weights[:, tail_start:].float()
+    if not weights_are_scaled:
+        index_n_heads = int(indexer_q.shape[2])
+        weights = weights * (index_head_dim**-0.5 * index_n_heads**-0.5)
+    index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
+
+    valid_lengths = torch.arange(tail_start + 1, seq_len + 1, device=indexer_q.device).unsqueeze(1)
+    valid_lengths = valid_lengths // compress_ratio
+    index_score = index_score.masked_fill(
+        (row_offsets.unsqueeze(0) >= valid_lengths).unsqueeze(0), -1.0e20
+    )
+    selected_rows = index_score.topk(index_topk, dim=-1).indices
+    selected_rows = torch.where(
+        selected_rows >= valid_lengths.unsqueeze(0),
+        -1,
+        selected_rows + seq_len,
+    ).to(torch.int64)
+
+    rebuilt = topk_idxs.clone()
+    rebuilt[:, tail_start:, window_size:] = selected_rows
+    return rebuilt
+
+
 @torch.library.custom_op("auto_deploy::torch_deepseek_v4_sparse_attention", mutates_args=())
 def torch_deepseek_v4_sparse_attention(
     q: torch.Tensor,
@@ -5013,18 +5105,7 @@ def torch_deepseek_v4_sparse_attention(
     value-reading prefill gather stays bit-identical while the per-layer index chain is
     kept out of the model graph.
     """
-    del (
-        indexer_q,
-        indexer_weights,
-        indexer_compressor_kv,
-        indexer_compressor_gate,
-        indexer_compressor_ape,
-        indexer_compressor_norm_weight,
-        enable_sharding,
-        layer_type,
-        layer_idx,
-        head_dim,
-    )
+    del enable_sharding, layer_type, layer_idx, head_dim
     _validate_deepseek_v4_sparse_attention_inputs(q, kv, attn_sink, topk_idxs)
     _compression_mode(compress_ratio)
     if topk_is_placeholder and not compress_ratio:
@@ -5050,6 +5131,24 @@ def torch_deepseek_v4_sparse_attention(
             topk_idxs = _build_placeholder_topk_idxs(
                 window_size, compress_ratio, q.shape[0], q.shape[1], compressed_width, q.device
             )
+            if _compression_mode(compress_ratio).uses_indexer:
+                topk_idxs = _rebuild_initial_prefill_ratio4_topk_idxs(
+                    topk_idxs,
+                    window_size,
+                    compress_ratio,
+                    max_compressed_len,
+                    indexer_q,
+                    indexer_weights,
+                    indexer_compressor_kv,
+                    indexer_compressor_gate,
+                    indexer_compressor_ape,
+                    indexer_compressor_norm_weight,
+                    cos_table,
+                    sin_table,
+                    position_ids,
+                    rms_norm_eps,
+                    rope_dim,
+                )
         compressed_kv = _build_full_compressed_kv(
             compressor_kv,
             compressor_gate,
@@ -5950,6 +6049,25 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                 indexer_compressor_gate, seq_idx, flat_start, seq_len_i
             )
             mode = _compression_mode(compress_ratio)
+            if topk_is_placeholder and input_pos_i == 0 and mode.uses_indexer:
+                topk_seq = _rebuild_initial_prefill_ratio4_topk_idxs(
+                    topk_seq.unsqueeze(0),
+                    window_size,
+                    compress_ratio,
+                    compressed_capacity,
+                    indexer_q_seq.unsqueeze(0),
+                    indexer_weights_seq.unsqueeze(0),
+                    indexer_compressor_kv_seq.unsqueeze(0),
+                    indexer_compressor_gate_seq.unsqueeze(0),
+                    indexer_compressor_ape,
+                    indexer_compressor_norm_weight,
+                    cos_table,
+                    sin_table,
+                    position_ids_seq,
+                    rms_norm_eps,
+                    rope_dim,
+                    weights_are_scaled=True,
+                ).squeeze(0)
             raw_cache_rows_already_written = False
             if input_pos_i == 0:
                 raw_caches = [swa_cache, compressor_kv_cache, compressor_gate_cache]
