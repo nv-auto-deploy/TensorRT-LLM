@@ -143,18 +143,24 @@ def _detach_finalizers(finalizers: list[weakref.finalize]) -> None:
         finalizer.detach()
 
 
-def _evict_mxfp4_weight_cache_entry(key: WeightCacheKey) -> None:
-    entry = _MXFP4_WEIGHT_CACHE.pop(key, None)
+# A weight cache maps ``WeightCacheKey`` -> ``(prepared_entry, finalizers)``; the
+# helpers below are shared by every such cache in this module (``_MXFP4_WEIGHT_CACHE``,
+# ``_TRTLLM_GEN_MXFP4_CACHE``), so finalizers must be registered with the cache dict
+# that actually holds the entry.
+WeightCache = OrderedDict
+
+
+def _evict_cache_entry(cache: WeightCache, key: WeightCacheKey) -> None:
+    entry = cache.pop(key, None)
     if entry is None:
         return
     _, finalizers = entry
     _detach_finalizers(finalizers)
 
 
-def _trim_mxfp4_weight_cache() -> None:
-    max_entries = 256
-    while len(_MXFP4_WEIGHT_CACHE) > max_entries:
-        _, (_, finalizers) = _MXFP4_WEIGHT_CACHE.popitem(last=False)
+def _trim_cache(cache: WeightCache, max_entries: int = 256) -> None:
+    while len(cache) > max_entries:
+        _, (_, finalizers) = cache.popitem(last=False)
         _detach_finalizers(finalizers)
 
 
@@ -165,7 +171,7 @@ def _clear_mxfp4_weight_cache() -> None:
 
 
 def _register_cache_finalizers(
-    key: WeightCacheKey, tensors: tuple[torch.Tensor, ...]
+    cache: WeightCache, key: WeightCacheKey, tensors: tuple[torch.Tensor, ...]
 ) -> list[weakref.finalize]:
     finalizers: list[weakref.finalize] = []
     seen_sources: set[int] = set()
@@ -175,7 +181,7 @@ def _register_cache_finalizers(
         if source_id in seen_sources:
             continue
         seen_sources.add(source_id)
-        finalizers.append(weakref.finalize(source, _evict_mxfp4_weight_cache_entry, key))
+        finalizers.append(weakref.finalize(source, _evict_cache_entry, cache, key))
     return finalizers
 
 
@@ -503,10 +509,11 @@ def _prepare_trtllm_gen_mxfp4_cached(
     swiglu_limit = torch.full((e_local,), kernel_limit, dtype=torch.float32, device=dev)
     bundle = (prepared, swiglu_alpha, swiglu_beta, swiglu_limit)
 
-    _TRTLLM_GEN_MXFP4_CACHE[key] = (bundle, _register_cache_finalizers(key, raw_tensors))
-    while len(_TRTLLM_GEN_MXFP4_CACHE) > 256:
-        _, (_, finalizers) = _TRTLLM_GEN_MXFP4_CACHE.popitem(last=False)
-        _detach_finalizers(finalizers)
+    _TRTLLM_GEN_MXFP4_CACHE[key] = (
+        bundle,
+        _register_cache_finalizers(_TRTLLM_GEN_MXFP4_CACHE, key, raw_tensors),
+    )
+    _trim_cache(_TRTLLM_GEN_MXFP4_CACHE)
     return bundle
 
 
@@ -769,9 +776,9 @@ def _prepare_weights_scales_cached(
     )
     _MXFP4_WEIGHT_CACHE[key] = (
         prepared_weights,
-        _register_cache_finalizers(key, raw_tensors),
+        _register_cache_finalizers(_MXFP4_WEIGHT_CACHE, key, raw_tensors),
     )
-    _trim_mxfp4_weight_cache()
+    _trim_cache(_MXFP4_WEIGHT_CACHE)
     return prepared_weights
 
 

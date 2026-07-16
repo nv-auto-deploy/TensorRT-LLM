@@ -267,6 +267,18 @@ class QuantizationFusionMixin(ABC):
                 names across transforms let a later ``setattr`` overwrite an earlier
                 param, so its ``get_attr`` nodes silently resolve to the wrong tensor.
         """
+        # The fused node reuses linear_nodes[0].kwargs verbatim, so siblings must agree
+        # on kwargs that change the op's numerics/behavior (e.g. activation-scale format
+        # or layer-type hints); otherwise the fused op would silently apply node 0's.
+        for kwarg_name in ("input_scale_fmt", "layer_type"):
+            kwarg_values = {n.kwargs.get(kwarg_name) for n in linear_nodes}
+            if len(kwarg_values) > 1:
+                ad_logger.warning(
+                    f"Skipping quantized GEMM fusion because siblings disagree on "
+                    f"{kwarg_name!r}: {sorted(map(str, kwarg_values))}"
+                )
+                return False
+
         keys_unfused = _extract_fusable_weight_names(linear_nodes)
         if len(keys_unfused) != len(linear_nodes):
             ad_logger.warning(
@@ -725,6 +737,11 @@ class FuseFP4Gemms(QuantizationFusionMixin, BaseTransform):
         return self._apply_fusion_pass(gm, cm, factory, shared_config)
 
 
+# FineGrained (block-wise) FP8 quantizes weights in 128x128 blocks; the dim-0
+# (out_features) block size the fused scale layout must stay aligned to.
+_FINEGRAINED_FP8_BLOCK_N = 128
+
+
 @TransformRegistry.register("fuse_finegrained_fp8_gemms")
 class FuseFineGrainedFP8Gemms(QuantizationFusionMixin, BaseTransform):
     """Fuse FineGrained (block-wise) FP8 GEMMs sharing the same input activation.
@@ -753,6 +770,16 @@ class FuseFineGrainedFP8Gemms(QuantizationFusionMixin, BaseTransform):
                 f"Cannot fuse finegrained FP8: inconsistent per-weight block sizes {block_ns}"
             )
         block_n = block_ns[0]
+
+        # A ragged sibling (N_i not a multiple of the quant block) keeps the same
+        # inferred block_n (ceil-div scale rows) but its last, partial scale block
+        # would land mid-fused-tensor and misalign every following sibling's scales.
+        ragged_ns = [w.size(0) for w in weights if w.size(0) % _FINEGRAINED_FP8_BLOCK_N != 0]
+        if ragged_ns:
+            raise NotImplementedError(
+                f"Cannot fuse finegrained FP8: out_features {ragged_ns} are not "
+                f"multiples of the {_FINEGRAINED_FP8_BLOCK_N} quant block"
+            )
 
         total_N = sum(w.size(0) for w in weights)
         total_scale_n = sum(ws.size(0) for ws in weight_scale_inv)

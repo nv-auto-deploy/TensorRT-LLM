@@ -1804,8 +1804,12 @@ def shard_weight_tensor(
         param_key=param_name,
         param_shape=sharded_shape,
     )
-    submod._register_load_state_dict_pre_hook(
-        mark_pipeline_cache_hook(
+    # A custom splitter cannot be reconstructed from the declarative "shard_tp" spec
+    # (the restore path would silently fall back to the even dim-0 chunk), so leave
+    # such hooks unmarked: collect_hook_specs then reports them as unrecognized and
+    # the pipeline-cache save is skipped instead of caching a wrong split.
+    if custom_shard_fn is None:
+        hook = mark_pipeline_cache_hook(
             hook,
             {
                 "type": "shard_tp",
@@ -1818,7 +1822,7 @@ def shard_weight_tensor(
                 "fused_weight_dims": list(fused_weight_dims) if fused_weight_dims else None,
             },
         )
-    )
+    submod._register_load_state_dict_pre_hook(hook)
     param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=requires_grad)
     setattr(submod, param_name, param_new)
 

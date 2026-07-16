@@ -318,8 +318,14 @@ class FuseCollinearAllreduce(BaseTransform):
                 continue
             val_a = in_a.meta.get("val")
             val_b = in_b.meta.get("val")
-            # Matching shapes => (in_a + in_b) reproduces the original add exactly.
-            if val_a is None or val_b is None or tuple(val_a.shape) != tuple(val_b.shape):
+            # Matching shapes and dtypes => (in_a + in_b) reproduces the original add
+            # exactly (no broadcast, no type promotion moved before the collective).
+            if (
+                val_a is None
+                or val_b is None
+                or tuple(val_a.shape) != tuple(val_b.shape)
+                or val_a.dtype != val_b.dtype
+            ):
                 continue
 
             with graph.inserting_before(node):
