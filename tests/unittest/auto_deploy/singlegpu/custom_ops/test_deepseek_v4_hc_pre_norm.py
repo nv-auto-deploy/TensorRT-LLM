@@ -90,7 +90,7 @@ def test_hc_combine_rmsnorm_bf16_input_bit_exact(shape, hc_mult, H):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_hc_combine_rmsnorm_zero_weight_identity():
-    """weight == 0 -> output all zeros (sanity on the weight broadcast)."""
+    """Weight == 0 -> output all zeros (sanity on the weight broadcast)."""
     torch.manual_seed(1)
     hc_mult, H, eps = 4, 512, 1e-6
     pre = torch.rand(8, hc_mult, device="cuda", dtype=torch.float32) + 0.1
@@ -104,7 +104,7 @@ def test_hc_combine_rmsnorm_zero_weight_identity():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_hc_combine_rmsnorm_unit_rms():
-    """ones weight, unit-variance constant row -> normalized output ~= the sign pattern."""
+    """Ones weight, unit-variance constant row -> normalized output ~= the sign pattern."""
     torch.manual_seed(2)
     hc_mult, H, eps = 4, 2048, 1e-6
     # Build flat so the combine yields a known constant-magnitude vector.

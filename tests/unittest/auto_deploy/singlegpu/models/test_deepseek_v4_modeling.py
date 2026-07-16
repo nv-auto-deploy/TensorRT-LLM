@@ -1085,38 +1085,47 @@ def test_moe_shared_experts_use_configured_swiglu_limit() -> None:
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_router_hash_and_score_routing_match_reference() -> None:
     assert DeepseekV4Router is not None, "DeepSeek V4 router class must be exposed for tests"
     config = _small_config()
-    hidden_states = torch.linspace(-1.0, 1.0, 5 * config.hidden_size).view(5, config.hidden_size)
-    input_ids = torch.tensor([0, 1, 2, 3, 4])
+    hidden_states = torch.linspace(-1.0, 1.0, 5 * config.hidden_size, device="cuda").view(
+        5, config.hidden_size
+    )
+    input_ids = torch.tensor([0, 1, 2, 3, 4], device="cuda")
 
-    hash_router = DeepseekV4Router(config, layer_idx=0).eval()
+    # On CUDA the router GEMV runs through cuBLAS (torch_linear_simple) and the
+    # scoring/top-k tail through the fused Triton routing kernel, whose fp32
+    # accumulation order differs slightly from the eager reference — loosen the
+    # weight tolerance accordingly (selected experts must still match exactly).
+    hash_router = DeepseekV4Router(config, layer_idx=0).eval().cuda()
     _set_router_weights(hash_router)
     expected_hash = _ref_router(hash_router, hidden_states, input_ids, config, hash_routing=True)
     actual_hash = hash_router(hidden_states, input_ids)
     torch.testing.assert_close(actual_hash[0], expected_hash[0])
-    torch.testing.assert_close(actual_hash[1], expected_hash[1], rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(actual_hash[1], expected_hash[1], rtol=1e-3, atol=1e-5)
 
-    score_router = DeepseekV4Router(config, layer_idx=config.num_hash_layers).eval()
+    score_router = DeepseekV4Router(config, layer_idx=config.num_hash_layers).eval().cuda()
     _set_router_weights(score_router)
     expected_score = _ref_router(score_router, hidden_states, input_ids, config, hash_routing=False)
     actual_score = score_router(hidden_states, input_ids)
     torch.testing.assert_close(actual_score[0], expected_score[0])
-    torch.testing.assert_close(actual_score[1], expected_score[1], rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(actual_score[1], expected_score[1], rtol=1e-3, atol=1e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("layer_idx", [0, 1], ids=["hash-routing", "score-routing"])
 def test_moe_uses_packed_mxfp4_routed_experts(layer_idx: int) -> None:
     config = _small_config(num_hidden_layers=2, compress_ratios=(0, 0))
     moe = DeepseekV4MoE(config, layer_idx=layer_idx).eval()
     _set_router_weights(moe.gate)
     _set_mlp_weights(moe.shared_experts, offset=0.4)
+    moe = moe.cuda()
 
-    hidden_states = torch.linspace(-1.5, 1.5, 2 * 3 * config.hidden_size).view(
+    hidden_states = torch.linspace(-1.5, 1.5, 2 * 3 * config.hidden_size, device="cuda").view(
         2, 3, config.hidden_size
     )
-    input_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
+    input_ids = torch.tensor([[0, 1, 2], [3, 4, 5]], device="cuda")
 
     actual = moe(hidden_states, input_ids)
 
@@ -1136,12 +1145,23 @@ def test_moe_uses_packed_mxfp4_routed_experts(layer_idx: int) -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_dense_attention_with_sinks_matches_reference() -> None:
-    config = _small_config(num_hidden_layers=1, compress_ratios=(0,), num_hash_layers=0)
+    # head_dim - qk_rope_head_dim must be a multiple of the fused KV front-end's
+    # fp8 block (64): deepseek_v4_kv_norm_rope_concat requires Dn % 64 == 0.
+    config = _small_config(
+        num_hidden_layers=1,
+        compress_ratios=(0,),
+        num_hash_layers=0,
+        head_dim=128,
+        qk_rope_head_dim=64,
+    )
     attn = DeepseekV4Attention(config, layer_idx=0).eval()
     with torch.no_grad():
         attn.attn_sink.copy_(torch.tensor([-0.5, 0.0, 0.25, 0.75]))
-    hidden_states = torch.randn(2, 5, config.hidden_size)
+    attn = attn.cuda()
+    torch.manual_seed(0)
+    hidden_states = torch.randn(2, 5, config.hidden_size, device="cuda")
     position_ids = _position_ids(2, 5, hidden_states.device)
 
     actual = _call_attention(attn, hidden_states, position_ids, config)
@@ -1183,6 +1203,7 @@ def test_torch_attention_with_sinks_accepts_bfloat16_inputs() -> None:
     torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_compressor_matches_independent_reference_with_fake_fp8_nope_path() -> None:
     config = _small_config(
         hidden_size=8,
@@ -1204,8 +1225,9 @@ def test_compressor_matches_independent_reference_with_fake_fp8_nope_path() -> N
             torch.linspace(-0.2, 0.3, compressor.ape.numel()).view_as(compressor.ape)
         )
         compressor.norm.weight.copy_(torch.linspace(0.6, 1.4, config.head_dim))
+    compressor = compressor.cuda()
 
-    hidden_states = torch.linspace(-1.5, 1.75, 2 * 5 * config.hidden_size)
+    hidden_states = torch.linspace(-1.5, 1.75, 2 * 5 * config.hidden_size, device="cuda")
     hidden_states = hidden_states.view(2, 5, config.hidden_size).to(torch.bfloat16)
     position_ids = _position_ids(2, 5, hidden_states.device)
     table_positions = torch.arange(config.ad_rope_cache_len, device=hidden_states.device)
@@ -1222,6 +1244,7 @@ def test_compressor_matches_independent_reference_with_fake_fp8_nope_path() -> N
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0.01, atol=0.01)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_ratio4_indexer_matches_independent_reference_and_masks_invalid_prefix() -> None:
     config = _small_config(
         hidden_size=8,
@@ -1249,11 +1272,14 @@ def test_ratio4_indexer_matches_independent_reference_and_masks_invalid_prefix()
             )
         )
         indexer.compressor.norm.weight.copy_(torch.linspace(0.7, 1.3, config.index_head_dim))
+    indexer = indexer.cuda()
 
-    hidden_states = torch.linspace(-1.4, 1.6, 2 * 5 * config.hidden_size).view(
+    hidden_states = torch.linspace(-1.4, 1.6, 2 * 5 * config.hidden_size, device="cuda").view(
         2, 5, config.hidden_size
     )
-    q_lora = torch.linspace(-0.9, 1.1, 2 * 5 * config.q_lora_rank).view(2, 5, config.q_lora_rank)
+    q_lora = torch.linspace(-0.9, 1.1, 2 * 5 * config.q_lora_rank, device="cuda").view(
+        2, 5, config.q_lora_rank
+    )
     position_ids = _position_ids(2, 5, hidden_states.device)
     cos, sin = _rope_cos_sin(position_ids, config.qk_rope_head_dim, config.compress_rope_theta)
     table_positions = torch.arange(config.ad_rope_cache_len, device=hidden_states.device)
@@ -1293,10 +1319,21 @@ def test_ratio4_indexer_matches_independent_reference_and_masks_invalid_prefix()
     assert (actual[:, 3:] >= 0).sum(dim=-1).eq(1).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_export_dynamic_shapes_finite_logits_and_expected_ops() -> None:
-    config = _small_config(num_hidden_layers=2, compress_ratios=(0, 4), num_hash_layers=1)
-    model = DeepseekV4ForCausalLM(config).eval()
-    input_ids = torch.randint(0, config.vocab_size, (2, 6))
+    # Production-like head dims: the fused CUDA front-ends require
+    # (head_dim - qk_rope_head_dim) % 64 == 0 (kv_norm_rope_concat) and a
+    # power-of-two index_head_dim in [32, 256] (hadamard-fp4 indexer tail).
+    config = _small_config(
+        num_hidden_layers=2,
+        compress_ratios=(0, 4),
+        num_hash_layers=1,
+        head_dim=128,
+        qk_rope_head_dim=64,
+        index_head_dim=128,
+    )
+    model = DeepseekV4ForCausalLM(config).eval().cuda()
+    input_ids = torch.randint(0, config.vocab_size, (2, 6), device="cuda")
     position_ids = _position_ids(2, 6, input_ids.device)
 
     gm = torch_export_to_gm(
@@ -1316,7 +1353,7 @@ def test_export_dynamic_shapes_finite_logits_and_expected_ops() -> None:
     assert torch.isfinite(exported).all()
     assert_rmse_close(exported, eager, rmse_ratio_tol=0.05, msg="Export first shape: ")
 
-    input_ids_2 = torch.randint(0, config.vocab_size, (1, 4))
+    input_ids_2 = torch.randint(0, config.vocab_size, (1, 4), device="cuda")
     position_ids_2 = _position_ids(1, 4, input_ids_2.device)
     with torch.no_grad():
         out_2 = _output_logits(gm(input_ids_2, position_ids=position_ids_2))
@@ -1334,10 +1371,18 @@ def test_export_dynamic_shapes_finite_logits_and_expected_ops() -> None:
         for name in set(target_names)
         if name.startswith("auto_deploy.") and not name.startswith("auto_deploy.torch_")
     )
-    assert non_torch_ad_ops == [
-        "auto_deploy.all_reduce.default",
-        "auto_deploy.view.default",
+    # The modeling intentionally emits fused ``deepseek_v4_*`` custom ops
+    # (export-safe, fake-registered); besides those, only the sharding
+    # all_reduce and the AD view op may appear.
+    unexpected_ops = [
+        name
+        for name in non_torch_ad_ops
+        if not name.startswith("auto_deploy.deepseek_v4_")
+        and name not in ("auto_deploy.all_reduce.default", "auto_deploy.view.default")
     ]
+    assert unexpected_ops == []
+    assert "auto_deploy.all_reduce.default" in non_torch_ad_ops
+    assert "auto_deploy.view.default" in non_torch_ad_ops
 
 
 def test_export_mxfp4_experts_apply_sharding_hints_rank1_ep_graph() -> None:
@@ -1606,13 +1651,19 @@ def test_factory_registration() -> None:
     assert ModelFactoryRegistry.get("DeepseekV4AutoModelForCausalLM") is factory_cls
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_factory_example_inputs_cover_forward_contract(tmp_path) -> None:
+    # Production-like head dims for the fused CUDA front-ends (see the export
+    # test above for the constraints).
     config = _small_config(
         num_hidden_layers=2,
         compress_ratios=(0, 4),
         ad_rope_cache_len=16,
         ad_compress_max_seq_len=12,
         max_position_embeddings=32,
+        head_dim=128,
+        qk_rope_head_dim=64,
+        index_head_dim=128,
     )
     config.save_pretrained(tmp_path)
     factory_cls = ModelFactoryRegistry.get("DeepseekV4AutoModelForCausalLM")
@@ -1629,7 +1680,7 @@ def test_factory_example_inputs_cover_forward_contract(tmp_path) -> None:
     assert position_ids.shape == input_ids.shape
     assert torch.equal(position_ids, _position_ids(2, 8, input_ids.device))
 
-    model = DeepseekV4ForCausalLM(config).eval()
+    model = DeepseekV4ForCausalLM(config).eval().cuda()
     with torch.no_grad():
-        logits = model(**example_inputs).logits
+        logits = model(**{k: v.cuda() for k, v in example_inputs.items()}).logits
     assert logits.shape == (2, 8, config.vocab_size)

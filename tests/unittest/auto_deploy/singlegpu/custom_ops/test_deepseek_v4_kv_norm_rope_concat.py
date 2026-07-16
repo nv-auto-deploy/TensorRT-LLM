@@ -52,11 +52,13 @@ def _ref_kv(kv, weight, eps, cos, sin, block_size=64):
 
 
 def _eager_fake_fp8(x, block_size=64):
-    """Verbatim *eager* body of ``utils.quantization_utils.fake_fp8_act_quant`` — the
-    ``abs/amax/log2/ceil/pow/clamp/cast/mul`` decomposition that the DSV4 decode graph
-    actually runs for the main-KV nope (the fused Triton op only fires for the
+    """Verbatim *eager* body of ``utils.quantization_utils.fake_fp8_act_quant``.
+
+    The ``abs/amax/log2/ceil/pow/clamp/cast/mul`` decomposition that the DSV4 decode
+    graph actually runs for the main-KV nope (the fused Triton op only fires for the
     compressor/indexer paths). Kept here so the fold is validated against the exact
-    kernels it replaces in production, independent of the Triton-op equivalence."""
+    kernels it replaces in production, independent of the Triton-op equivalence.
+    """
     dim = x.shape[-1]
     dtype = x.dtype
     x_float = x.float()
@@ -161,9 +163,11 @@ def test_kv_fold_bf16_faithful(B, S, Dn, D):
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_weight_split_mapping():
-    """A distinctive per-position weight (so nope vs pe-even vs pe-odd are all
-    different) forces any mis-mapping of the weight onto the wrong head lanes to
-    produce a large, tolerance-breaking error."""
+    """A distinctive per-position weight exposes any mis-mapping onto the wrong head lanes.
+
+    The weight makes nope vs pe-even vs pe-odd all different, so any mis-mapping of
+    the weight onto the wrong head lanes produces a large, tolerance-breaking error.
+    """
     B, S, Dn, D = 1, 1, 448, 64
     torch.manual_seed(11)
     kv = torch.randn(B, S, Dn + D, device=DEV, dtype=torch.float32)
@@ -195,8 +199,10 @@ def test_eps_used():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
 def test_kv_fold_bf16_byte_exact_vs_eager_fp8(seed):
-    """The decode graph runs the eager fp8 decomposition for the main-KV nope, so
-    validate the fold against that exact chain (not only the Triton fp8 op)."""
+    """The decode graph runs the eager fp8 decomposition for the main-KV nope.
+
+    Validate the fold against that exact chain (not only the Triton fp8 op).
+    """
     kv, weight, cos, sin = _mk(1, 1, 448, 64, torch.bfloat16, torch.float32, seed)
     ref = _ref_kv_eager_fp8(kv, weight, 1e-6, cos, sin)
     out = _fused_kv(kv, weight, 1e-6, cos, sin)

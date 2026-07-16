@@ -58,8 +58,10 @@ def test_compress_pool_matches_reference(shape, dtype):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_compress_pool_validity_masking(dtype):
-    """Rows masked to -1e20 (invalid candidates) must get ~zero softmax weight,
-    and fully-masked columns must reduce to the (uniform) mean exactly as torch."""
+    """Rows masked to -1e20 (invalid candidates) must get ~zero softmax weight.
+
+    Fully-masked columns must reduce to the (uniform) mean exactly as torch.
+    """
     torch.manual_seed(1)
     B, R, D = 2, 8, 512
     kv = torch.randn(B, R, D, device="cuda", dtype=dtype)

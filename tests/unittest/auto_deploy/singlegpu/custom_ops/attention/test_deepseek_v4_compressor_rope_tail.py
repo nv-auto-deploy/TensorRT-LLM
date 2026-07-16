@@ -92,8 +92,10 @@ def test_rotate_false_matches_eager(shape, rope_dim):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(2, 512), (1, 512), (1, 257, 512), (3, 40, 512)])
 def test_compressor_rms_norm_byte_identical(shape):
-    """The main-compressor RMSNorm routed through triton_rms_norm must be byte-identical
-    to the eager _rms_norm_ref for the head_dim=512 compressor shapes."""
+    """The main-compressor RMSNorm routed through triton_rms_norm must be byte-identical to the eager ref.
+
+    Compared against _rms_norm_ref for the head_dim=512 compressor shapes.
+    """
     torch.manual_seed(2)
     head_dim = shape[-1]
     x = torch.randn(*shape, device=DEV, dtype=torch.bfloat16)

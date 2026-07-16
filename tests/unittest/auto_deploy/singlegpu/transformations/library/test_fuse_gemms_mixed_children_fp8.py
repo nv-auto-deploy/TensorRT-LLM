@@ -91,8 +91,11 @@ def _populate_getattr_val_meta(gm):
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
 @pytest.mark.parametrize("M", [8, 16])
 def test_different_shaped_concat_bit_exact_base_kernel(M):
-    """M > 4 uses the deterministic (non split-K) base kernel -> byte-exact merge, even
-    when the fused siblings have different output widths (wq_a=512 + wkv=1024 style)."""
+    """M > 4 uses the deterministic (non split-K) base kernel -> byte-exact merge.
+
+    Holds even when the fused siblings have different output widths
+    (wq_a=512 + wkv=1024 style).
+    """
     device = "cuda"
     K, Na, Nb = 256, 512, 1024  # different N, both 128-aligned
     x = (torch.randn(M, K, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
@@ -117,8 +120,11 @@ def test_different_shaped_concat_bit_exact_base_kernel(M):
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
 def test_different_shaped_concat_matches_splitk_decode():
-    """M=1, K>=4096 hits the split-K atomic decode path; the concat is algebraically
-    identical, differing only by the split-K's own atomic-reduction rounding."""
+    """M=1, K>=4096 hits the split-K atomic decode path.
+
+    The concat is algebraically identical, differing only by the split-K's own
+    atomic-reduction rounding.
+    """
     device = "cuda"
     K, Na, Nb = 4096, 512, 1024
     x = (torch.randn(1, K, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
@@ -148,8 +154,10 @@ def test_different_shaped_concat_matches_splitk_decode():
 # Graph-level: the transform fuses the sibling group and preserves numerics.
 # ---------------------------------------------------------------------------
 class _FP8Proj(torch.nn.Module):
-    """One block-FP8 projection stored as ``<name>.weight`` + ``<name>.weight_scale_inv``
-    (mirrors the checkpoint layout the fuser reconstructs the scale name from)."""
+    """One block-FP8 projection stored as ``<name>.weight`` + ``<name>.weight_scale_inv``.
+
+    Mirrors the checkpoint layout the fuser reconstructs the scale name from.
+    """
 
     def __init__(self, N, K, device, seed):
         super().__init__()

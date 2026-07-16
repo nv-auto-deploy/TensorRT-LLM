@@ -70,8 +70,9 @@ def test_prepare_decode_page_addr_matches_reference(tokens_per_block, num_seq):
 @pytest.mark.parametrize("tokens_per_block", [32, 64])
 @pytest.mark.parametrize("num_seq", [1, 2, 3])
 def test_prepare_decode_page_addr_overlap_and_full_maps_match_reference(tokens_per_block, num_seq):
-    """The hoisted ratio-4 overlap + full-range maps must be bit-identical to the
-    per-layer ``_decode_page_ids_and_offsets`` translation they replace in
+    """The hoisted ratio-4 overlap + full-range maps must be bit-identical to the per-layer translation.
+
+    They replace the ``_decode_page_ids_and_offsets`` translation in
     ``_batched_compressed_rows_from_paged_state`` (overlap) and
     ``_batched_overlap_compressed_rows_fullrange``.
     """
@@ -169,10 +170,11 @@ def test_prepare_decode_page_addr_overlap_fake_shape():
 def test_prepare_decode_page_addr_triton_matches_torch_reference(
     dtypes, tokens_per_block, num_seq, m, dense_m
 ):
-    """The single-launch Triton path must be bit-identical to the torch
-    reference body across page boundaries, out-of-range rows, compressed-row
-    completion boundaries, negative (padded) positions, and multi-sequence inputs
-    with per-sequence page counts. The CPU invocation takes the torch path, the CUDA
+    """The single-launch Triton path must be bit-identical to the torch reference body.
+
+    Covers page boundaries, out-of-range rows, compressed-row completion
+    boundaries, negative (padded) positions, and multi-sequence inputs with
+    per-sequence page counts. The CPU invocation takes the torch path, the CUDA
     invocation the Triton path; all 18 outputs must be ``torch.equal``.
     """
     torch.manual_seed(num_seq * 1009 + tokens_per_block + m)

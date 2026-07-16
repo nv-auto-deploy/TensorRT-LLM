@@ -80,8 +80,10 @@ def test_page_map_identical_across_caches(tokens_per_block, num_seq):
 @pytest.mark.parametrize("tokens_per_block", [32, 64])
 @pytest.mark.parametrize("num_seq", [1, 2])
 def test_decode_cache_rows_page_map_is_transparent(tokens_per_block, num_seq):
-    """Passing a precomputed page_map yields byte-identical rows to recomputing it,
-    including reusing a kv-derived map to gather the gate cache."""
+    """Passing a precomputed page_map yields byte-identical rows to recomputing it.
+
+    Includes reusing a kv-derived map to gather the gate cache.
+    """
     cu_num_pages, cache_loc, total_pages = _build_page_table(
         num_seq, tokens_per_block, seed=num_seq + 7
     )

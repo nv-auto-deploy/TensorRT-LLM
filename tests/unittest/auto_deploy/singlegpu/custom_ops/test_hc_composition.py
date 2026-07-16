@@ -61,10 +61,12 @@ def test_hc_split_sinkhorn_matches_reference(shape, hc_mult, iters):
 
 
 def _two_op_reference(x, hc_fn, hc_scale, hc_base, weight, hc_mult, iters, eps, norm_eps, rms_eps):
-    """The two-op HC-pre path the fused op must reproduce bit-for-bit: a
-    standalone split-D partials launch feeding the partials-consuming op
+    """The two-op HC-pre path the fused op must reproduce bit-for-bit.
+
+    A standalone split-D partials launch feeding the partials-consuming op
     (identical kernels on the decode path; the identical eager cublas front on
-    the n > 64 prefill fallback, where the partials are ignored)."""
+    the n > 64 prefill fallback, where the partials are ignored).
+    """
     parts = _make_partials(x.reshape(-1, x.shape[-1]), hc_fn)
     return torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine_partials(
         parts, x, hc_fn, hc_scale, hc_base, weight, hc_mult, iters, eps, norm_eps, rms_eps, x.dtype
@@ -259,8 +261,10 @@ def test_hc_pre_mix_combine_partials_y32_non_bf16(dtype):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_hc_pre_mix_combine_partials_y32_cudagraph_fresh_input_replay():
-    """Capture the y32 op in a CUDA graph, replay on fresh inputs: outputs must
-    equal a direct call on the same fresh inputs (the deployment mode)."""
+    """Capture the y32 op in a CUDA graph, replay on fresh inputs.
+
+    Outputs must equal a direct call on the same fresh inputs (the deployment mode).
+    """
     shape, hc_mult, H = (2, 1), 4, 4096
     eps, norm_eps, rms_eps, iters = 1e-6, 1e-6, 3e-5, 20
     x0, hc_fn, hc_scale, hc_base, weight, parts0 = _y32_op_inputs(shape, hc_mult, H, seed=11)

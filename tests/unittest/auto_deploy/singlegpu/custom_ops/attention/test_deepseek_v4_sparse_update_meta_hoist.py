@@ -261,8 +261,11 @@ def _run_update(common, mhc, update_meta):
 @pytest.mark.parametrize("compress_ratio", [_RATIO4, _RATIO128])
 @pytest.mark.parametrize("num_rows", [1, 3])
 def test_update_with_hoisted_meta_byte_exact(compress_ratio, num_rows):
-    """Feeding the hoisted update metadata must give a byte-identical mhc_cache to the
-    un-hoisted per-layer path (both drive the same fused reconstruction+store)."""
+    """Feeding hoisted update metadata must give a mhc_cache byte-identical to the un-hoisted path.
+
+    Both the hoisted and un-hoisted per-layer paths drive the same fused
+    reconstruction+store.
+    """
     assert M._HAS_TRITON, "test requires triton"
     common, mhc_base, update_meta = _build_update_inputs(
         compress_ratio, num_rows, seed=400 + compress_ratio + num_rows

@@ -76,8 +76,10 @@ def _reference_swa_bundle(
     total_pages: int,
     w: int,
 ):
-    """The per-layer chain the hoist replaces (fallback path of
-    ``_decode_local_cache_rows`` + ``_decode_attention_from_rows``)."""
+    """The per-layer chain the hoist replaces.
+
+    Fallback path of ``_decode_local_cache_rows`` + ``_decode_attention_from_rows``.
+    """
     num_seq = positions.shape[0]
     seq_idx = torch.arange(num_seq, dtype=torch.long)
     offsets = torch.arange(w, dtype=torch.long)

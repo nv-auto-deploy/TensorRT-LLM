@@ -219,8 +219,11 @@ def _ref_indexer_row_stack(
 # Helpers to build small random paged caches + a valid page table.
 # ---------------------------------------------------------------------------
 def _build_page_table(num_seq, tokens_per_block, pages_per_seq, seed, device):
-    """Random-but-valid page table. Every sequence gets ``pages_per_seq`` pages
-    drawn from a shuffled pool so an identity (non-paged) translation is detected."""
+    """Random-but-valid page table.
+
+    Every sequence gets ``pages_per_seq`` pages drawn from a shuffled pool so an
+    identity (non-paged) translation is detected.
+    """
     g = torch.Generator(device="cpu").manual_seed(seed)
     cu_num_pages = torch.arange(0, (num_seq + 1) * pages_per_seq, pages_per_seq, dtype=torch.long)
     total_pages = int(cu_num_pages[-1].item())
@@ -310,9 +313,12 @@ def test_gather_paged_rows_all_invalid_and_all_valid(device):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="rotate=True path uses CUDA triton ops")
 @pytest.mark.parametrize("query_pos", [3, 4, 7, 8, 40, 128])
 def test_indexer_row_stack_bit_exact(query_pos):
-    """The vectorized ``_batched_compressed_rows_from_paged_state`` used by the new
-    ``_select_ratio4_indexer_rows`` must produce the same ``index_k`` row-stack that the
-    old ``_compressed_row_from_paged_state`` loop produced."""
+    """The vectorized row gather must reproduce the old loop's ``index_k`` row-stack.
+
+    ``_batched_compressed_rows_from_paged_state`` (used by the new
+    ``_select_ratio4_indexer_rows``) must produce the same ``index_k`` row-stack that
+    the old ``_compressed_row_from_paged_state`` loop produced.
+    """
     device = "cuda"
     torch.manual_seed(query_pos + 3)
 
@@ -401,8 +407,11 @@ def test_indexer_row_stack_bit_exact(query_pos):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="rotate=True path uses CUDA triton ops")
 @pytest.mark.parametrize("query_pos", [0, 1, 2, 3])
 def test_select_ratio4_indexer_rows_short_seq(query_pos):
-    """Short-sequence guards: visible_len<=0 returns the -1 / empty sentinel, and the
-    end-to-end selection matches a loop-based reference for the smallest valid window."""
+    """Short-sequence guards.
+
+    visible_len<=0 returns the -1 / empty sentinel, and the end-to-end selection
+    matches a loop-based reference for the smallest valid window.
+    """
     device = "cuda"
     torch.manual_seed(100 + query_pos)
 

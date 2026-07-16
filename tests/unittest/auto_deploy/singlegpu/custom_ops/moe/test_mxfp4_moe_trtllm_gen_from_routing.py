@@ -134,10 +134,12 @@ def test_trtllm_gen_mxfp4_from_routing_matches_torch_ref(batch):
 @pytest.mark.skipif(not is_sm_100f(), reason="trtllm-gen MXFP4 runners require SM100 (Blackwell)")
 @pytest.mark.parametrize("batch", [1, 2, 8])
 def test_trtllm_gen_mxfp4_from_routing_localized_matches_global(batch):
-    """``routing_localized=True`` (pre-localized int32/bf16 gate outputs, the
-    fuse_moe_routing_localization contract) must be byte-equal to the default path:
-    the localized inputs are exactly what ``_localize_routing_eager`` produces,
-    so the runner consumes bit-identical ``(topk_ids, topk_weights)`` either way."""
+    """``routing_localized=True`` must be byte-equal to the default path.
+
+    Pre-localized int32/bf16 gate outputs (the fuse_moe_routing_localization
+    contract) are exactly what ``_localize_routing_eager`` produces, so the runner
+    consumes bit-identical ``(topk_ids, topk_weights)`` either way.
+    """
     x, sel, rw, weights, expert_start, alpha, limit, H = _make_case(batch)
     gu_blocks, gu_bias, gu_scales, dn_blocks, dn_bias, dn_scales = weights
     e_local = gu_blocks.shape[0]

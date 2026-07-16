@@ -176,8 +176,10 @@ def test_hash_routing_prefill_fallback_bit_exact(num_tokens):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_ambient_cublas_dispatch_contract():
-    """Pin the cuBLAS behavior the fused kernel mirrors: fp32 gemv at T=1,
-    TF32 with round-to-nearest-even input conversion at T>=2 (when TF32 is on).
+    """Pin the cuBLAS behavior the fused kernel mirrors.
+
+    fp32 gemv at T=1, TF32 with round-to-nearest-even input conversion at T>=2
+    (when TF32 is on).
 
     If this test starts failing after a cuBLAS/torch upgrade, the
     ``tf32_trunc`` heuristic in ``deepseek_v4_hash_routing_fn`` must be

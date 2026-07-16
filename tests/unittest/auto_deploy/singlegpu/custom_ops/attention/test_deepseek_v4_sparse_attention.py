@@ -56,36 +56,35 @@ def _page_meta(
     input_positions: list[int],
     slot_indices: list[int],
     tokens_per_block: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     cu_num_pages = [0]
     cache_loc = []
-    last_page_len = []
     next_page_id = 0
     for seq_len, input_pos, slot_idx in zip(seq_lens, input_positions, slot_indices, strict=True):
         total_len = input_pos + seq_len
         if tokens_per_block is None:
             seq_pages = [slot_idx]
-            lpl = max(total_len, 1)
         else:
             num_pages = max((max(total_len, 1) + tokens_per_block - 1) // tokens_per_block, 1)
             seq_pages = list(range(next_page_id, next_page_id + num_pages))
             next_page_id += num_pages
-            lpl = ((max(total_len, 1) - 1) % tokens_per_block) + 1
         cache_loc.extend(seq_pages)
         cu_num_pages.append(cu_num_pages[-1] + len(seq_pages))
-        last_page_len.append(lpl)
 
     return (
         torch.tensor(cu_num_pages, dtype=torch.int32),
         torch.tensor(cache_loc, dtype=torch.int32),
-        torch.tensor(last_page_len, dtype=torch.int32),
     )
 
 
 def _context_meta(seq_len: int, tokens_per_block: int | None = None):
+    """Base metadata tuple.
+
+    (batch_info, seq_len, input_pos, slot_idx, cu_seqlen, cu_num_pages, cache_loc).
+    """
     batch_info_host = BatchInfo()
     batch_info_host.update([1, seq_len, 0, 0, 0, 0])
-    cu_num_pages, cache_loc, last_page_len = _page_meta([seq_len], [0], [0], tokens_per_block)
+    cu_num_pages, cache_loc = _page_meta([seq_len], [0], [0], tokens_per_block)
     return (
         batch_info_host.serialize(),
         torch.tensor([seq_len], dtype=torch.int32),
@@ -94,7 +93,6 @@ def _context_meta(seq_len: int, tokens_per_block: int | None = None):
         torch.tensor([0, seq_len], dtype=torch.int32),
         cu_num_pages,
         cache_loc,
-        last_page_len,
     )
 
 
@@ -107,7 +105,7 @@ def _multi_context_meta(seq_lens: list[int], tokens_per_block: int | None = None
     batch_info_host = BatchInfo()
     batch_info_host.update([len(seq_lens), total_tokens, 0, 0, 0, 0])
     slot_indices = list(range(len(seq_lens)))
-    cu_num_pages, cache_loc, last_page_len = _page_meta(
+    cu_num_pages, cache_loc = _page_meta(
         seq_lens, [0] * len(seq_lens), slot_indices, tokens_per_block
     )
     return (
@@ -118,14 +116,13 @@ def _multi_context_meta(seq_lens: list[int], tokens_per_block: int | None = None
         torch.tensor(cu_seqlen, dtype=torch.int32),
         cu_num_pages,
         cache_loc,
-        last_page_len,
     )
 
 
 def _decode_meta(input_pos: int, tokens_per_block: int | None = None):
     batch_info_host = BatchInfo()
     batch_info_host.update([0, 0, 0, 0, 1, 1])
-    cu_num_pages, cache_loc, last_page_len = _page_meta([1], [input_pos], [0], tokens_per_block)
+    cu_num_pages, cache_loc = _page_meta([1], [input_pos], [0], tokens_per_block)
     return (
         batch_info_host.serialize(),
         torch.tensor([1], dtype=torch.int32),
@@ -134,7 +131,6 @@ def _decode_meta(input_pos: int, tokens_per_block: int | None = None):
         torch.tensor([0, 1], dtype=torch.int32),
         cu_num_pages,
         cache_loc,
-        last_page_len,
     )
 
 
@@ -144,9 +140,7 @@ def _multi_decode_meta(input_positions: list[int], tokens_per_block: int | None 
     batch_info_host = BatchInfo()
     batch_info_host.update([0, 0, 0, 0, len(input_positions), len(input_positions)])
     slot_indices = list(range(len(input_positions)))
-    cu_num_pages, cache_loc, last_page_len = _page_meta(
-        seq_lens, input_positions, slot_indices, tokens_per_block
-    )
+    cu_num_pages, cache_loc = _page_meta(seq_lens, input_positions, slot_indices, tokens_per_block)
     return (
         batch_info_host.serialize(),
         torch.tensor(seq_lens, dtype=torch.int32),
@@ -155,7 +149,6 @@ def _multi_decode_meta(input_positions: list[int], tokens_per_block: int | None 
         torch.tensor(cu_seqlen, dtype=torch.int32),
         cu_num_pages,
         cache_loc,
-        last_page_len,
     )
 
 
@@ -168,7 +161,6 @@ def _cuda_decode_meta(input_pos: int, slot_idx: int = 0, tokens_per_block: int |
         cu_seqlen,
         cu_num_pages,
         cache_loc,
-        last_page_len,
     ) = _decode_meta(input_pos, tokens_per_block=tokens_per_block)
     input_pos_tensor.fill_(input_pos)
     slot_idx_tensor.fill_(slot_idx)
@@ -182,8 +174,88 @@ def _cuda_decode_meta(input_pos: int, slot_idx: int = 0, tokens_per_block: int |
         cu_seqlen.cuda(),
         cu_num_pages.cuda(),
         cache_loc.cuda(),
-        last_page_len.cuda(),
     )
+
+
+def _standard_metadata(base_meta: tuple[torch.Tensor, ...], device: torch.device):
+    """The 10 standard metadata tensors of the cached op (device tensors + host mirrors).
+
+    Mirrors ``DeepSeekV4SparseAttention.get_standard_metadata_args``: the op consumes
+    ``batch_info_host`` plus device-side ``input_pos`` / ``slot_idx`` / ``cu_num_pages`` /
+    ``cache_loc`` on the decode path, and the ``*_host`` SequenceInfo mirrors on the
+    prefill path (no device-side ``seq_len`` / ``cu_seqlen``).
+    """
+    batch_info_host, seq_len, input_pos, slot_idx, cu_seqlen, cu_num_pages, cache_loc = base_meta
+    return (
+        batch_info_host,
+        input_pos.to(device),
+        slot_idx.to(device),
+        cu_num_pages.to(device),
+        cache_loc.to(device),
+        seq_len.cpu(),
+        input_pos.cpu(),
+        cu_seqlen.cpu(),
+        cu_num_pages.cpu(),
+        cache_loc.cpu(),
+    )
+
+
+def _prepare_extra_metadata(
+    base_meta: tuple[torch.Tensor, ...],
+    swa_cache: torch.Tensor,
+    *,
+    window_size: int | None = None,
+    compress_ratio: int = 0,
+    max_compressed_len: int | None = None,
+    position_ids: torch.Tensor | None = None,
+) -> list[torch.Tensor]:
+    """The 23 hoisted metadata tensors, produced the way production does.
+
+    The cache-insertion transform wires ``deepseek_v4_sparse_prepare_decode_page_addr``
+    as a once-per-forward prepare op whose 23 outputs feed every cached-attention
+    invocation. Reproduce that call here from the base metadata and the layer
+    parameters (``overlap_m`` / ``dense_m`` / ``window_size`` are kept >= 1 exactly like
+    ``get_prepare_extra_metadata_info`` so the fixed 23-output contract always holds).
+    """
+    _, _, input_pos, _, _, cu_num_pages, cache_loc = base_meta
+    device = swa_cache.device
+    input_pos = input_pos.to(device)
+    cu_num_pages = cu_num_pages.to(device).contiguous()
+    cache_loc = cache_loc.to(device).contiguous()
+    position_ids = input_pos if position_ids is None else position_ids.to(device)
+    overlap_m = max_compressed_len if compress_ratio == 4 else None
+    dense_m = max_compressed_len if compress_ratio == 128 else None
+    return torch.ops.auto_deploy.deepseek_v4_sparse_prepare_decode_page_addr(
+        input_pos,
+        position_ids,
+        cu_num_pages,
+        cache_loc,
+        int(swa_cache.shape[1]),
+        max(int(overlap_m or 1), 1),
+        max(int(dense_m or 1), 1),
+        max(int(window_size or 1), 1),
+    )
+
+
+def _op_metadata(
+    base_meta: tuple[torch.Tensor, ...],
+    swa_cache: torch.Tensor,
+    *,
+    window_size: int | None = None,
+    compress_ratio: int = 0,
+    max_compressed_len: int | None = None,
+    position_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Full 33-tensor metadata bundle (10 standard + 23 hoisted) for the cached op."""
+    extra = _prepare_extra_metadata(
+        base_meta,
+        swa_cache,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+        max_compressed_len=max_compressed_len,
+        position_ids=position_ids,
+    )
+    return (*_standard_metadata(base_meta, swa_cache.device), *extra)
 
 
 def _sparse_attention_reference(
@@ -265,13 +337,19 @@ def _run_cached_sparse_attention(
     compressor_gate_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
     indexer_compressor_kv_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
     indexer_compressor_gate_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
+    full_metadata = _op_metadata(
+        metadata,
+        swa_cache,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+    )
     return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache(
         q,
         kv,
         attn_sink,
         topk_idxs,
         *_empty_sparse_attention_tensors(q, kv),
-        *metadata,
+        *full_metadata,
         swa_cache,
         mhc_cache,
         compressor_kv_cache,
@@ -422,6 +500,14 @@ def _run_cached_sparse_attention_with_compressor(
         if indexer_compressor_gate_cache is not None
         else q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
     )
+    full_metadata = _op_metadata(
+        metadata,
+        swa_cache,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+        max_compressed_len=compressor.max_compressed_len,
+        position_ids=position_ids,
+    )
     return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache(
         q,
         kv,
@@ -440,7 +526,7 @@ def _run_cached_sparse_attention_with_compressor(
         indexer_compressor_gate,
         indexer_compressor_ape,
         indexer_compressor_norm_weight,
-        *metadata,
+        *full_metadata,
         swa_cache,
         mhc_cache,
         compressor_kv_cache,
@@ -471,6 +557,7 @@ def _compressor_case(
     *,
     compressed_capacity_tokens: int | None = None,
     batch_size: int = 1,
+    device: str | torch.device = "cuda",
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -480,6 +567,9 @@ def _compressor_case(
     torch.Tensor,
     torch.Tensor,
 ]:
+    # The compressor forward (and the compressed cached-attention path) routes
+    # through Triton-only fused ops (deepseek_v4_fused_rope_concat /
+    # deepseek_v4_hadamard_fp4), so compressor-based cases run on CUDA.
     hidden_size = 16
     head_dim = 8
     rope_dim = 4
@@ -495,11 +585,13 @@ def _compressor_case(
         ad_compress_max_seq_len=capacity,
         ad_rope_cache_len=max(capacity, seq_len, 1),
     )
-    compressor = DeepseekV4Compressor(config, compress_ratio, head_dim).eval()
-    hidden_states = torch.randn(batch_size, seq_len, hidden_size)
+    compressor = DeepseekV4Compressor(config, compress_ratio, head_dim).eval().to(device)
+    hidden_states = torch.randn(batch_size, seq_len, hidden_size, device=device)
     compressor_kv, compressor_gate = compressor.project(hidden_states)
-    cos_table, sin_table = _rope_tables(max(capacity, seq_len, 1), rope_dim)
-    position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1).contiguous()
+    cos_table, sin_table = (t.to(device) for t in _rope_tables(max(capacity, seq_len, 1), rope_dim))
+    position_ids = (
+        torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1).contiguous()
+    )
     compressed_kv = compressor(hidden_states, cos_table, sin_table, position_ids)
     return (
         compressor_kv,
@@ -541,12 +633,13 @@ def _make_sparse_attention_caches(
     fill_value: float = 0.0,
     *,
     num_slots: int = 1,
+    device: str | torch.device = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
-        torch.full((num_slots, max_seq_len, head_dim), fill_value),
-        torch.full((num_slots, max_seq_len, head_dim), fill_value),
-        torch.full((num_slots, max_seq_len, compressor_state_dim), fill_value),
-        torch.full((num_slots, max_seq_len, compressor_state_dim), fill_value),
+        torch.full((num_slots, max_seq_len, head_dim), fill_value, device=device),
+        torch.full((num_slots, max_seq_len, head_dim), fill_value, device=device),
+        torch.full((num_slots, max_seq_len, compressor_state_dim), fill_value, device=device),
+        torch.full((num_slots, max_seq_len, compressor_state_dim), fill_value, device=device),
     )
 
 
@@ -556,13 +649,15 @@ def _make_paged_sparse_attention_caches(
     head_dim: int,
     compressor_state_dim: int,
     fill_value: float = 0.0,
+    *,
+    device: str | torch.device = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_pages = max((max_seq_len + tokens_per_block - 1) // tokens_per_block, 1)
     return (
-        torch.full((num_pages, tokens_per_block, head_dim), fill_value),
-        torch.full((num_pages, tokens_per_block, head_dim), fill_value),
-        torch.full((num_pages, tokens_per_block, compressor_state_dim), fill_value),
-        torch.full((num_pages, tokens_per_block, compressor_state_dim), fill_value),
+        torch.full((num_pages, tokens_per_block, head_dim), fill_value, device=device),
+        torch.full((num_pages, tokens_per_block, head_dim), fill_value, device=device),
+        torch.full((num_pages, tokens_per_block, compressor_state_dim), fill_value, device=device),
+        torch.full((num_pages, tokens_per_block, compressor_state_dim), fill_value, device=device),
     )
 
 
@@ -574,8 +669,70 @@ def _paged_cache_row(
     return cache[logical_pos // tokens_per_block, logical_pos % tokens_per_block]
 
 
+def _compressed_row_from_paged_state(
+    compressor_kv_cache: torch.Tensor,
+    compressor_gate_cache: torch.Tensor,
+    seq_idx: int,
+    row_idx: int,
+    row_position_id: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
+    compressor_ape: torch.Tensor,
+    compressor_norm_weight: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    rms_norm_eps: float,
+    rope_dim: int,
+    compress_ratio: int,
+    head_dim: int,
+    state_dim: int,
+    dtype: torch.dtype,
+    rotate: bool = False,
+) -> torch.Tensor:
+    """One-row compatibility wrapper reconstructing a single compressed row.
+
+    The scalar per-row helper was deleted from production (which only has batched
+    callers now); this private copy delegates to the live batched
+    ``_compressed_rows_from_paged_state`` — the same approach as the frozen copy in
+    ``test_deepseek_v4_sparse_gather_vectorized.py``.
+    """
+    del state_dim
+    row_idx_tensor = torch.tensor([row_idx], dtype=torch.long, device=compressor_kv_cache.device)
+    position_id_tensor = torch.tensor(
+        [row_position_id], dtype=torch.long, device=compressor_kv_cache.device
+    )
+    return dsv4_sparse._compressed_rows_from_paged_state(
+        compressor_kv_cache,
+        compressor_gate_cache,
+        seq_idx,
+        row_idx_tensor,
+        position_id_tensor,
+        cu_num_pages_host,
+        cache_loc_host,
+        compressor_ape,
+        compressor_norm_weight,
+        cos_table,
+        sin_table,
+        rms_norm_eps,
+        rope_dim,
+        compress_ratio,
+        head_dim,
+        dtype,
+        rotate=rotate,
+    ).squeeze(0)
+
+
 def _has_resource_with_suffix(resource_names: list[str], suffix: str) -> bool:
     return any(name.endswith(suffix) for name in resource_names)
+
+
+# The compressed (ratio 4 / 128) paths route through Triton-only fused ops
+# (deepseek_v4_fused_rope_concat / deepseek_v4_hadamard_fp4), so every
+# compressor-based case requires CUDA.
+_requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="compressed sparse-attention path requires CUDA (Triton fused ops)",
+)
 
 
 def test_sink_only_all_negative_topk_yields_finite_zero_output() -> None:
@@ -843,15 +1000,22 @@ def test_cached_ratio0_decode_cuda_graph_replay_uses_runtime_slot_and_input_pos(
     indexer_compressor_gate_cache = q.new_empty(2, 6, 0)
     out = torch.empty_like(q)
     empty_sparse_args = _empty_sparse_attention_tensors(q, kv)
+    # Host mirrors are captured once (D2H copies are not allowed inside a CUDA
+    # graph); the device-side prepare op below re-runs inside the graph so the
+    # hoisted metadata tracks the runtime input_pos / cache_loc, exactly like the
+    # production graph where the prepare op is a captured node.
+    std_metadata = _standard_metadata(metadata, q.device)
 
     def run_op() -> None:
+        extra_metadata = _prepare_extra_metadata(metadata, swa_cache)
         torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache(
             q,
             kv,
             attn_sink,
             topk_idxs,
             *empty_sparse_args,
-            *metadata,
+            *std_metadata,
+            *extra_metadata,
             swa_cache,
             mhc_cache,
             compressor_kv_cache,
@@ -950,13 +1114,14 @@ def test_cached_ratio0_out_buffer_returns_dummy_and_fills_output() -> None:
     torch.testing.assert_close(out[:, 2:], torch.zeros_like(out[:, 2:]), rtol=0, atol=0)
 
 
+@_requires_cuda
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 def test_source_matches_expanded_sparse_construction(compress_ratio: int) -> None:
     torch.manual_seed(123 + compress_ratio)
     seq_len = compress_ratio
-    q = torch.randn(1, seq_len, 1, 8)
-    kv = torch.randn(1, seq_len, 8)
-    attn_sink = torch.tensor([-0.25])
+    q = torch.randn(1, seq_len, 1, 8, device="cuda")
+    kv = torch.randn(1, seq_len, 8, device="cuda")
+    attn_sink = torch.tensor([-0.25], device="cuda")
     (
         compressor_kv,
         compressor_gate,
@@ -966,8 +1131,8 @@ def test_source_matches_expanded_sparse_construction(compress_ratio: int) -> Non
         sin_table,
         position_ids,
     ) = _compressor_case(compress_ratio, seq_len)
-    topk_idxs = torch.arange(seq_len + compressor.max_compressed_len).view(1, 1, -1)
-    topk_idxs = topk_idxs.expand(1, seq_len, -1).to(torch.int64)
+    topk_idxs = torch.arange(seq_len + compressor.max_compressed_len, device="cuda")
+    topk_idxs = topk_idxs.view(1, 1, -1).expand(1, seq_len, -1).to(torch.int64)
 
     output = _run_sparse_attention_with_compressor(
         q,
@@ -997,13 +1162,14 @@ def test_source_matches_expanded_sparse_construction(compress_ratio: int) -> Non
     )
 
 
+@_requires_cuda
 def test_cached_ratio0_prefill_and_decode_match_source() -> None:
     torch.manual_seed(37)
     total_len = 3
     prefill_len = 2
-    q = torch.randn(1, total_len, 1, 8)
-    kv = torch.randn(1, total_len, 8)
-    attn_sink = torch.tensor([-0.25])
+    q = torch.randn(1, total_len, 1, 8, device="cuda")
+    kv = torch.randn(1, total_len, 8, device="cuda")
+    attn_sink = torch.tensor([-0.25], device="cuda")
     (
         compressor_kv,
         compressor_gate,
@@ -1019,10 +1185,11 @@ def test_cached_ratio0_prefill_and_decode_match_source() -> None:
             kv.shape[-1],
             compressor_kv.shape[-1],
             fill_value=777.0,
+            device="cuda",
         )
     )
 
-    topk_prefill = torch.tensor([[[0, 1], [1, 0]]], dtype=torch.int64)
+    topk_prefill = torch.tensor([[[0, 1], [1, 0]]], dtype=torch.int64, device="cuda")
     output_prefill = _run_cached_sparse_attention_with_compressor(
         q[:, :prefill_len],
         kv[:, :prefill_len],
@@ -1064,7 +1231,7 @@ def test_cached_ratio0_prefill_and_decode_match_source() -> None:
         msg="cached ratio-0 prefill: ",
     )
 
-    topk_decode = torch.tensor([[[0, 2]]], dtype=torch.int64)
+    topk_decode = torch.tensor([[[0, 2]]], dtype=torch.int64, device="cuda")
     output_decode = _run_cached_sparse_attention_with_compressor(
         q[:, prefill_len:],
         kv[:, prefill_len:],
@@ -1108,13 +1275,14 @@ def test_cached_ratio0_prefill_and_decode_match_source() -> None:
     )
 
 
+@_requires_cuda
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 def test_cached_compressed_prefill_matches_source(compress_ratio: int) -> None:
     torch.manual_seed(311 + compress_ratio)
     seq_len = compress_ratio
-    q = torch.randn(1, seq_len, 1, 8)
-    kv = torch.randn(1, seq_len, 8)
-    attn_sink = torch.tensor([-0.25])
+    q = torch.randn(1, seq_len, 1, 8, device="cuda")
+    kv = torch.randn(1, seq_len, 8, device="cuda")
+    attn_sink = torch.tensor([-0.25], device="cuda")
     (
         compressor_kv,
         compressor_gate,
@@ -1130,10 +1298,11 @@ def test_cached_compressed_prefill_matches_source(compress_ratio: int) -> None:
             kv.shape[-1],
             compressor_kv.shape[-1],
             fill_value=777.0,
+            device="cuda",
         )
     )
-    topk_idxs = torch.arange(seq_len + compressor.max_compressed_len).view(1, 1, -1)
-    topk_idxs = topk_idxs.expand(1, seq_len, -1).to(torch.int64)
+    topk_idxs = torch.arange(seq_len + compressor.max_compressed_len, device="cuda")
+    topk_idxs = topk_idxs.view(1, 1, -1).expand(1, seq_len, -1).to(torch.int64)
 
     output = _run_cached_sparse_attention_with_compressor(
         q,
@@ -1175,6 +1344,7 @@ def test_cached_compressed_prefill_matches_source(compress_ratio: int) -> None:
     )
 
 
+@_requires_cuda
 def test_cached_ratio128_token_input_pos_matches_full_source() -> None:
     torch.manual_seed(183)
     compress_ratio = 128
@@ -1182,9 +1352,9 @@ def test_cached_ratio128_token_input_pos_matches_full_source() -> None:
     compressed_capacity_tokens = 256
     prefill_len = total_len - 1
     window_size = 4
-    q = torch.randn(1, total_len, 1, 8)
-    kv = torch.randn(1, total_len, 8)
-    attn_sink = torch.tensor([-0.5])
+    q = torch.randn(1, total_len, 1, 8, device="cuda")
+    kv = torch.randn(1, total_len, 8, device="cuda")
+    attn_sink = torch.tensor([-0.5], device="cuda")
     (
         compressor_kv,
         compressor_gate,
@@ -1205,6 +1375,7 @@ def test_cached_ratio128_token_input_pos_matches_full_source() -> None:
             kv.shape[-1],
             state_dim,
             fill_value=777.0,
+            device="cuda",
         )
     )
 
@@ -1241,7 +1412,7 @@ def test_cached_ratio128_token_input_pos_matches_full_source() -> None:
         q[:, prefill_len:],
         kv[:, prefill_len:],
         attn_sink,
-        torch.zeros(1, 1, 1, dtype=torch.int64),
+        torch.zeros(1, 1, 1, dtype=torch.int64, device="cuda"),
         compressor_kv[:, prefill_len:],
         compressor_gate[:, prefill_len:],
         compressor,
@@ -1289,6 +1460,7 @@ def test_cached_ratio128_token_input_pos_matches_full_source() -> None:
     )
 
 
+@_requires_cuda
 def test_cached_ratio128_decode_uses_offset_position_ids_for_compressed_row() -> None:
     torch.manual_seed(229)
     compress_ratio = 128
@@ -1297,9 +1469,9 @@ def test_cached_ratio128_decode_uses_offset_position_ids_for_compressed_row() ->
     prefill_len = total_len - 1
     position_offset = 17
     window_size = 4
-    q = torch.randn(1, total_len, 1, 8)
-    kv = torch.randn(1, total_len, 8)
-    attn_sink = torch.tensor([-0.5])
+    q = torch.randn(1, total_len, 1, 8, device="cuda")
+    kv = torch.randn(1, total_len, 8, device="cuda")
+    attn_sink = torch.tensor([-0.5], device="cuda")
     (
         compressor_kv,
         compressor_gate,
@@ -1313,9 +1485,12 @@ def test_cached_ratio128_decode_uses_offset_position_ids_for_compressed_row() ->
         total_len,
         compressed_capacity_tokens=compressed_capacity_tokens,
     )
-    cos_table, sin_table = _rope_tables(
-        position_offset + compressed_capacity_tokens,
-        compressor.rope_head_dim,
+    cos_table, sin_table = (
+        t.cuda()
+        for t in _rope_tables(
+            position_offset + compressed_capacity_tokens,
+            compressor.rope_head_dim,
+        )
     )
     position_ids = position_ids + position_offset
     state_dim = compressor_kv.shape[-1]
@@ -1325,6 +1500,7 @@ def test_cached_ratio128_decode_uses_offset_position_ids_for_compressed_row() ->
             kv.shape[-1],
             state_dim,
             fill_value=777.0,
+            device="cuda",
         )
     )
 
@@ -1361,7 +1537,7 @@ def test_cached_ratio128_decode_uses_offset_position_ids_for_compressed_row() ->
         q[:, prefill_len:],
         kv[:, prefill_len:],
         attn_sink,
-        torch.zeros(1, 1, 1, dtype=torch.int64),
+        torch.zeros(1, 1, 1, dtype=torch.int64, device="cuda"),
         compressor_kv[:, prefill_len:],
         compressor_gate[:, prefill_len:],
         compressor,
@@ -1408,6 +1584,7 @@ def test_cached_ratio128_decode_uses_offset_position_ids_for_compressed_row() ->
     )
 
 
+@_requires_cuda
 def test_cached_ratio128_multi_decode_metadata_matches_source_and_writes_slots() -> None:
     torch.manual_seed(217)
     batch_size = 2
@@ -1416,9 +1593,9 @@ def test_cached_ratio128_multi_decode_metadata_matches_source_and_writes_slots()
     prefill_len = total_len - 1
     window_size = 4
     compressed_capacity_tokens = 256
-    q = torch.randn(batch_size, total_len, 1, 8)
-    kv = torch.randn(batch_size, total_len, 8)
-    attn_sink = torch.tensor([-0.5])
+    q = torch.randn(batch_size, total_len, 1, 8, device="cuda")
+    kv = torch.randn(batch_size, total_len, 8, device="cuda")
+    attn_sink = torch.tensor([-0.5], device="cuda")
     (
         compressor_kv,
         compressor_gate,
@@ -1440,6 +1617,7 @@ def test_cached_ratio128_multi_decode_metadata_matches_source_and_writes_slots()
             compressor_kv.shape[-1],
             fill_value=777.0,
             num_slots=batch_size,
+            device="cuda",
         )
     )
 
@@ -1477,7 +1655,7 @@ def test_cached_ratio128_multi_decode_metadata_matches_source_and_writes_slots()
         q[:, prefill_len:],
         kv[:, prefill_len:],
         attn_sink,
-        torch.zeros(batch_size, 1, 1, dtype=torch.int64),
+        torch.zeros(batch_size, 1, 1, dtype=torch.int64, device="cuda"),
         compressor_kv[:, prefill_len:],
         compressor_gate[:, prefill_len:],
         compressor,
@@ -1531,15 +1709,16 @@ def test_cached_ratio128_multi_decode_metadata_matches_source_and_writes_slots()
     )
 
 
+@_requires_cuda
 def test_cached_ratio4_decode_matches_source_with_learned_indexer_topk() -> None:
     torch.manual_seed(44)
     compress_ratio = 4
-    prefill_len = 7
-    total_len = 8
+    prefill_len = 15
+    total_len = 16
     window_size = 4
-    q = torch.randn(1, total_len, 1, 8)
-    kv = torch.randn(1, total_len, 8)
-    attn_sink = torch.tensor([-0.5])
+    q = torch.randn(1, total_len, 1, 8, device="cuda")
+    kv = torch.randn(1, total_len, 8, device="cuda")
+    attn_sink = torch.tensor([-0.5], device="cuda")
     (
         compressor_kv,
         compressor_gate,
@@ -1549,6 +1728,10 @@ def test_cached_ratio4_decode_matches_source_with_learned_indexer_topk() -> None
         sin_table,
         position_ids,
     ) = _compressor_case(compress_ratio, total_len)
+    # index_head_dim must be a multiple of the hadamard-fp4 block (32), and
+    # index_topk >= 2 (the fused top-k select kernel has no single-slot config)
+    # while staying below the visible compressed rows (4 at decode) so the
+    # learned selection still differs from all-visible.
     indexer_config = DeepseekV4Config(
         hidden_size=16,
         num_hidden_layers=1,
@@ -1558,15 +1741,15 @@ def test_cached_ratio4_decode_matches_source_with_learned_indexer_topk() -> None
         q_lora_rank=8,
         qk_rope_head_dim=4,
         index_n_heads=1,
-        index_head_dim=8,
-        index_topk=1,
+        index_head_dim=32,
+        index_topk=2,
         compress_ratios=(compress_ratio,),
         ad_compress_max_seq_len=total_len,
         ad_rope_cache_len=total_len,
     )
-    indexer = DeepseekV4Indexer(indexer_config, compress_ratio).eval()
-    hidden_states = torch.randn(1, total_len, indexer_config.hidden_size)
-    q_lora = torch.randn(1, total_len, indexer_config.q_lora_rank)
+    indexer = DeepseekV4Indexer(indexer_config, compress_ratio).eval().cuda()
+    hidden_states = torch.randn(1, total_len, indexer_config.hidden_size, device="cuda")
+    q_lora = torch.randn(1, total_len, indexer_config.q_lora_rank, device="cuda")
     cos = cos_table[position_ids]
     sin = sin_table[position_ids]
     indexer_q, indexer_weights, indexer_compressor_kv, indexer_compressor_gate = indexer.project(
@@ -1597,16 +1780,18 @@ def test_cached_ratio4_decode_matches_source_with_learned_indexer_topk() -> None
     )[:, prefill_len:]
     swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = (
         _make_sparse_attention_caches(
-            8,
+            total_len,
             kv.shape[-1],
             compressor_kv.shape[-1],
             fill_value=777.0,
+            device="cuda",
         )
     )
     indexer_compressor_kv_cache = torch.full(
-        (1, 8, indexer_compressor_kv.shape[-1]),
+        (1, total_len, indexer_compressor_kv.shape[-1]),
         777.0,
         dtype=indexer_compressor_kv.dtype,
+        device="cuda",
     )
     indexer_compressor_gate_cache = torch.full_like(indexer_compressor_kv_cache, 777.0)
 
@@ -1662,7 +1847,7 @@ def test_cached_ratio4_decode_matches_source_with_learned_indexer_topk() -> None
         q[:, prefill_len:],
         kv[:, prefill_len:],
         attn_sink,
-        torch.zeros(1, 1, window_size + indexer.index_topk, dtype=torch.int64),
+        torch.zeros(1, 1, window_size + indexer.index_topk, dtype=torch.int64, device="cuda"),
         compressor_kv[:, prefill_len:],
         compressor_gate[:, prefill_len:],
         compressor,
@@ -1724,138 +1909,22 @@ def test_cached_ratio4_decode_matches_source_with_learned_indexer_topk() -> None
         compress_ratio=compress_ratio,
     )
 
-    torch.testing.assert_close(mhc_cache[0, compress_ratio], compressed_kv[0, 1])
+    # Decode (input_pos == 15) completes compressed row 3 at logical position 12.
+    torch.testing.assert_close(mhc_cache[0, 3 * compress_ratio], compressed_kv[0, 3])
     assert_rmse_close(output, expected, rmse_ratio_tol=1e-6, msg="cached ratio-4 indexer: ")
     assert not torch.allclose(output, all_visible, rtol=1e-6, atol=1e-6)
 
 
-def test_cached_ratio4_indexer_runtime_all_reduce_flips_selected_row(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    compress_ratio = 4
-    window_size = 4
-    max_seq_len = 12
-    head_dim = 8
-    index_head_dim = 2
-    indexer_state_dim = 2 * index_head_dim
-    input_pos = 8
-    q = torch.zeros(1, 1, 1, head_dim)
-    q[0, 0, 0, 0] = 1.0
-    kv = torch.zeros(1, 1, head_dim)
-    attn_sink = torch.tensor([-20.0])
-    compressor_config = DeepseekV4Config(
-        hidden_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=1,
-        num_key_value_heads=1,
-        head_dim=head_dim,
-        q_lora_rank=8,
-        qk_rope_head_dim=0,
-        compress_ratios=(compress_ratio,),
-        ad_compress_max_seq_len=max_seq_len,
-        ad_rope_cache_len=max_seq_len,
-    )
-    compressor = DeepseekV4Compressor(compressor_config, compress_ratio, head_dim).eval()
-    compressor_kv = torch.zeros(1, 1, 2 * head_dim)
-    compressor_gate = torch.zeros_like(compressor_kv)
-    cos_table, sin_table = _rope_tables(max_seq_len, compressor.rope_head_dim)
-    position_ids = torch.tensor([[input_pos]], dtype=torch.int64)
-    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = (
-        _make_sparse_attention_caches(
-            max_seq_len,
-            head_dim,
-            compressor_kv.shape[-1],
-        )
-    )
-    mhc_cache[0, 0, 0] = 4.0
-    mhc_cache[0, compress_ratio, 1] = 4.0
-
-    indexer_q = torch.tensor([[[[0.0, 1.0]]]])
-    indexer_weights = torch.ones(1, 1, 1)
-    indexer_compressor_kv = torch.zeros(1, 1, indexer_state_dim)
-    indexer_compressor_gate = torch.zeros_like(indexer_compressor_kv)
-    indexer_compressor_kv_cache = torch.zeros(1, max_seq_len, indexer_state_dim)
-    indexer_compressor_gate_cache = torch.zeros_like(indexer_compressor_kv_cache)
-    indexer_compressor_kv_cache[0, :4, :index_head_dim] = torch.tensor([0.0, 1.0])
-    indexer_compressor_kv_cache[0, :4, index_head_dim:] = torch.tensor([1.0, 0.0])
-    indexer_compressor_kv_cache[0, 4:8, index_head_dim:] = torch.tensor([0.0, 1.0])
-    indexer_compressor_ape = torch.zeros(compress_ratio, indexer_state_dim)
-    indexer_compressor_norm_weight = torch.ones(index_head_dim)
-    all_reduce_inputs: list[torch.Tensor] = []
-
-    def fake_all_reduce(
-        tensor: torch.Tensor,
-        op: object = None,
-        group: object = None,
-        async_op: bool = False,
-    ) -> None:
-        assert op == dsv4_sparse.dist_common.ReduceOp.SUM
-        assert group is None
-        assert not async_op
-        all_reduce_inputs.append(tensor.clone())
-        tensor.copy_(torch.tensor([[0.0, 100.0, 1000.0]], dtype=tensor.dtype, device=tensor.device))
-
-    monkeypatch.setattr(dsv4_sparse.dist_common, "is_initialized", lambda: True)
-    monkeypatch.setattr(dsv4_sparse.dist_common, "get_world_size", lambda: 2)
-    monkeypatch.setattr(dsv4_sparse.dist_common, "all_reduce", fake_all_reduce)
-
-    output = _run_cached_sparse_attention_with_compressor(
-        q,
-        kv,
-        attn_sink,
-        torch.zeros(1, 1, window_size + 1, dtype=torch.int64),
-        compressor_kv,
-        compressor_gate,
-        compressor,
-        cos_table,
-        sin_table,
-        position_ids,
-        _decode_meta(input_pos=input_pos),
-        swa_cache,
-        mhc_cache,
-        compressor_kv_cache,
-        compressor_gate_cache,
-        window_size=window_size,
-        compress_ratio=compress_ratio,
-        indexer_q=indexer_q,
-        indexer_weights=indexer_weights,
-        indexer_compressor_kv=indexer_compressor_kv,
-        indexer_compressor_gate=indexer_compressor_gate,
-        indexer_compressor_ape=indexer_compressor_ape,
-        indexer_compressor_norm_weight=indexer_compressor_norm_weight,
-        indexer_compressor_kv_cache=indexer_compressor_kv_cache,
-        indexer_compressor_gate_cache=indexer_compressor_gate_cache,
-    )
-
-    assert len(all_reduce_inputs) == 1
-    assert all_reduce_inputs[0][0, 0] > all_reduce_inputs[0][0, 1]
-    expected_topk = torch.arange(window_size + 1, dtype=torch.int64).view(1, 1, -1)
-    local_window = swa_cache[:, input_pos - window_size + 1 : input_pos + 1]
-    expected = _run_sparse_attention(
-        q,
-        torch.cat((local_window, mhc_cache[:, compress_ratio : compress_ratio + 1]), dim=1),
-        attn_sink,
-        expected_topk,
-    )
-    without_reduce = _run_sparse_attention(
-        q,
-        torch.cat((local_window, mhc_cache[:, 0:1]), dim=1),
-        attn_sink,
-        expected_topk,
-    )
-    torch.testing.assert_close(output, expected)
-    assert not torch.allclose(output, without_reduce, rtol=1e-6, atol=1e-6)
-
-
+@_requires_cuda
 def test_cached_ratio128_emits_boundary_row_and_hides_future_rows() -> None:
     torch.manual_seed(128)
     compress_ratio = 128
     total_len = 128
     prefill_len = total_len - 1
     window_size = 4
-    q = torch.randn(1, total_len, 1, 8)
-    kv = torch.randn(1, total_len, 8)
-    attn_sink = torch.tensor([-0.5])
+    q = torch.randn(1, total_len, 1, 8, device="cuda")
+    kv = torch.randn(1, total_len, 8, device="cuda")
+    attn_sink = torch.tensor([-0.5], device="cuda")
     (
         compressor_kv,
         compressor_gate,
@@ -1875,6 +1944,7 @@ def test_cached_ratio128_emits_boundary_row_and_hides_future_rows() -> None:
             kv.shape[-1],
             compressor_kv.shape[-1],
             fill_value=777.0,
+            device="cuda",
         )
     )
 
@@ -1911,7 +1981,7 @@ def test_cached_ratio128_emits_boundary_row_and_hides_future_rows() -> None:
         q[:, prefill_len:],
         kv[:, prefill_len:],
         attn_sink,
-        torch.zeros(1, 1, 1, dtype=torch.int64),
+        torch.zeros(1, 1, 1, dtype=torch.int64, device="cuda"),
         compressor_kv[:, prefill_len:],
         compressor_gate[:, prefill_len:],
         compressor,
@@ -1958,6 +2028,7 @@ def test_cached_ratio128_emits_boundary_row_and_hides_future_rows() -> None:
     assert_rmse_close(output, expected, rmse_ratio_tol=1e-6, msg="cached ratio-128 boundary: ")
 
 
+@_requires_cuda
 def test_cached_ratio128_mhc_cache_uses_token_domain_paged_positions() -> None:
     torch.manual_seed(129)
     compress_ratio = 128
@@ -1965,9 +2036,9 @@ def test_cached_ratio128_mhc_cache_uses_token_domain_paged_positions() -> None:
     total_len = 256
     prefill_len = total_len - 1
     window_size = 4
-    q = torch.randn(1, total_len, 1, 8)
-    kv = torch.randn(1, total_len, 8)
-    attn_sink = torch.tensor([-0.25])
+    q = torch.randn(1, total_len, 1, 8, device="cuda")
+    kv = torch.randn(1, total_len, 8, device="cuda")
+    attn_sink = torch.tensor([-0.25], device="cuda")
     (
         compressor_kv,
         compressor_gate,
@@ -1988,6 +2059,7 @@ def test_cached_ratio128_mhc_cache_uses_token_domain_paged_positions() -> None:
             kv.shape[-1],
             compressor_kv.shape[-1],
             fill_value=777.0,
+            device="cuda",
         )
     )
 
@@ -2027,7 +2099,7 @@ def test_cached_ratio128_mhc_cache_uses_token_domain_paged_positions() -> None:
         q[:, prefill_len:],
         kv[:, prefill_len:],
         attn_sink,
-        torch.zeros(1, 1, 1, dtype=torch.int64),
+        torch.zeros(1, 1, 1, dtype=torch.int64, device="cuda"),
         compressor_kv[:, prefill_len:],
         compressor_gate[:, prefill_len:],
         compressor,
@@ -2082,7 +2154,9 @@ def test_cached_ratio128_mhc_cache_uses_token_domain_paged_positions() -> None:
 @pytest.mark.parametrize(
     ("compress_ratio", "capture_pos", "replay_pos", "state_dim", "topk_width"),
     [
-        (4, 3, 7, 16, 5),
+        # ratio-4 topk width = window (4) + index_topk (2): the fused top-k
+        # select kernel has no single-slot (index_topk == 1) config.
+        (4, 3, 7, 16, 6),
         (128, 127, 255, 8, 6),
     ],
 )
@@ -2124,13 +2198,15 @@ def test_cached_compressed_decode_cuda_graph_replay_updates_runtime_compressed_r
     compressor_gate_cache[1, :replay_pos] = compressor_gate_values[1, :replay_pos]
 
     if compress_ratio == 4:
-        indexer_q = torch.ones(1, 1, 1, 2, device="cuda")
+        # index_head_dim must be a multiple of the hadamard-fp4 block (32).
+        index_head_dim = 32
+        indexer_q = torch.ones(1, 1, 1, index_head_dim, device="cuda")
         indexer_weights = torch.ones(1, 1, 1, device="cuda")
-        indexer_compressor_kv = torch.randn(1, 1, 4, device="cuda")
-        indexer_compressor_gate = torch.randn(1, 1, 4, device="cuda")
-        indexer_compressor_ape = torch.zeros(compress_ratio, 4, device="cuda")
-        indexer_compressor_norm_weight = torch.ones(2, device="cuda")
-        indexer_compressor_kv_cache = torch.zeros(2, max_seq_len, 4, device="cuda")
+        indexer_compressor_kv = torch.randn(1, 1, 2 * index_head_dim, device="cuda")
+        indexer_compressor_gate = torch.randn(1, 1, 2 * index_head_dim, device="cuda")
+        indexer_compressor_ape = torch.zeros(compress_ratio, 2 * index_head_dim, device="cuda")
+        indexer_compressor_norm_weight = torch.ones(index_head_dim, device="cuda")
+        indexer_compressor_kv_cache = torch.zeros(2, max_seq_len, 2 * index_head_dim, device="cuda")
         indexer_compressor_gate_cache = torch.zeros_like(indexer_compressor_kv_cache)
     else:
         indexer_q = q.new_empty(1, 1, 0, 0)
@@ -2143,8 +2219,21 @@ def test_cached_compressed_decode_cuda_graph_replay_updates_runtime_compressed_r
         indexer_compressor_gate_cache = q.new_empty(2, max_seq_len, 0)
 
     out = torch.empty_like(q)
+    # Host mirrors are captured once (D2H copies are not allowed inside a CUDA
+    # graph); the device-side prepare op below re-runs inside the graph so the
+    # hoisted metadata tracks the runtime input_pos / position_ids / cache_loc,
+    # exactly like the production graph where the prepare op is a captured node.
+    std_metadata = _standard_metadata(metadata, q.device)
 
     def run_op() -> None:
+        extra_metadata = _prepare_extra_metadata(
+            metadata,
+            swa_cache,
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+            max_compressed_len=max_compressed_len,
+            position_ids=position_ids,
+        )
         torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache(
             q,
             kv,
@@ -2163,7 +2252,8 @@ def test_cached_compressed_decode_cuda_graph_replay_updates_runtime_compressed_r
             indexer_compressor_gate,
             indexer_compressor_ape,
             indexer_compressor_norm_weight,
-            *metadata,
+            *std_metadata,
+            *extra_metadata,
             swa_cache,
             mhc_cache,
             compressor_kv_cache,
@@ -2200,7 +2290,7 @@ def test_cached_compressed_decode_cuda_graph_replay_updates_runtime_compressed_r
     graph.replay()
     torch.cuda.synchronize()
 
-    expected_row = dsv4_sparse._compressed_row_from_paged_state(
+    expected_row = _compressed_row_from_paged_state(
         compressor_kv_cache,
         compressor_gate_cache,
         0,
@@ -2248,7 +2338,7 @@ def test_cached_sparse_attention_rejects_short_metadata() -> None:
     topk_idxs = torch.zeros(1, 1, 1, dtype=torch.int64)
     batch_info_host = BatchInfo()
     batch_info_host.update([1, 1, 0, 0, 0, 0])
-    cu_num_pages, cache_loc, last_page_len = _page_meta([1], [0], [0])
+    cu_num_pages, cache_loc = _page_meta([1], [0], [0])
     metadata = (
         batch_info_host.serialize(),
         torch.tensor([1], dtype=torch.int32),
@@ -2257,10 +2347,9 @@ def test_cached_sparse_attention_rejects_short_metadata() -> None:
         torch.tensor([0], dtype=torch.int32),
         cu_num_pages,
         cache_loc,
-        last_page_len,
     )
 
-    with pytest.raises(ValueError, match="cu_seqlen must have at least 2 elements"):
+    with pytest.raises(ValueError, match="cu_seqlen_host must have at least 2 elements"):
         _run_cached_sparse_attention(
             q,
             kv,
@@ -2636,7 +2725,9 @@ def test_overlap_fullrange_matches_generic_paged_gather(
     device = torch.device("cuda")
     dtype = torch.bfloat16
     compress_ratio = 4
-    head_dim = 8
+    # head_dim must be a multiple of the hadamard-fp4 block (32) for the
+    # rotate=True index-key tail.
+    head_dim = 32
     state_dim = 2 * head_dim  # overlap mode -> channels == 2
     rope_dim = 4
     rms_norm_eps = 1e-6

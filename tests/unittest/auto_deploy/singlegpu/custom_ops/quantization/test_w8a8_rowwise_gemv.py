@@ -112,7 +112,7 @@ def test_rowwise_deterministic(N, K):
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
 def test_rowwise_residual_epilogue_exact():
-    """residual path == round(acc) -> fp32 add -> round, bit-for-bit."""
+    """Residual path == round(acc) -> fp32 add -> round, bit-for-bit."""
     N, K = 4096, 512  # the shared-w2 merge-add site
     a_fp8, a_s, b_fp8, b_s = _make_case(N, K, seed=2)
     residual = torch.randn(1, N, device="cuda", dtype=torch.bfloat16)
@@ -201,9 +201,12 @@ def _fused_ue8m0(a, b_fp8, b_s, residual=None):
 
 
 def _assert_bf16_adjacent(out, ref, max_flips):
-    """Fused vs standalone may differ only by fp32 reduction order: few flips,
-    each either 1 bf16 ULP or a negligible absolute diff at near-cancellation
-    outputs (a multi-ULP step there is ULP inflation of a ~0 value)."""
+    """Fused vs standalone may differ only by fp32 reduction order.
+
+    Few flips, each either 1 bf16 ULP or a negligible absolute diff at
+    near-cancellation outputs (a multi-ULP step there is ULP inflation of a ~0
+    value).
+    """
     neq = out != ref
     flips = int(neq.sum())
     assert flips <= max_flips, f"{flips} mismatches (allowed {max_flips})"

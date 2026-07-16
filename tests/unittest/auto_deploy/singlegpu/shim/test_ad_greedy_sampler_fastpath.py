@@ -73,8 +73,11 @@ def _make_request(
 
 
 def _setup_generation_request(sampler: TorchSampler, req: LlmRequest) -> ScheduledRequests:
-    """Register the request with the sampler store (as the real context step would)
-    and return a generation-only batch containing it."""
+    """Register the request with the sampler store.
+
+    Mirrors the real context step, then returns a generation-only batch
+    containing the request.
+    """
     ctx_batch = ScheduledRequests()
     ctx_batch.append_context_request(req)
     sampler.setup_sampler_step(ctx_batch)
@@ -122,6 +125,12 @@ def test_fast_greedy_matches_generic_over_handoffs(finish_mode):
 
     generic = TorchSampler(_make_sampler_args())
     fast = ADGreedyDecodeTorchSampler(_make_sampler_args())
+    # The samplers allocate store.new_tokens uninitialized; slots no request ever
+    # writes hold whatever the CUDA caching allocator left behind, so zero both
+    # buffers up front to keep the whole-buffer bit-exact comparison below
+    # deterministic regardless of previously run tests.
+    generic.store.new_tokens.zero_()
+    fast.store.new_tokens.zero_()
 
     req_g = _make_request(0, prompt, max_new_tokens, end_id)
     req_f = _make_request(0, prompt, max_new_tokens, end_id)

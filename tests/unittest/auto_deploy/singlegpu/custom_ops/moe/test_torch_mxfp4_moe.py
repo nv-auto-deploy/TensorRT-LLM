@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: E402, F401
+import tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.mxfp4_moe as mxfp4_moe_mod  # noqa: E402
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (  # noqa: E402
     DeepseekV4PackedMxfp4ExpertsCheckpointLayout,
     build_deepseek_v4_packed_mxfp4_experts_layout,
@@ -545,6 +546,20 @@ def test_torch_mxfp4_moe_ep_partitions_experts_and_sums_to_full_output() -> None
     torch.testing.assert_close(partial_sum, expected_sum, rtol=1e-5, atol=1e-5)
 
 
+@pytest.fixture
+def force_torch_reference_from_routing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the pure-torch dequant reference branch of ``*_moe_from_routing``.
+
+    On SM100 (Blackwell) the op auto-dispatches to the trtllm-gen W4A8 runner
+    (an SM-based gate independent of the input device). The tests below pin the
+    torch reference semantics — the trtllm-gen fast path has its own dedicated
+    coverage in ``test_mxfp4_moe_trtllm_gen_from_routing.py`` — so force the
+    reference branch here.
+    """
+    monkeypatch.setattr(mxfp4_moe_mod, "is_sm_100f", lambda: False)
+
+
+@pytest.mark.usefixtures("force_torch_reference_from_routing")
 def test_torch_mxfp4_moe_from_routing_matches_deepseek_layout_reference() -> None:
     num_experts = 3
     hidden_size = 32
@@ -596,6 +611,7 @@ def test_torch_mxfp4_moe_from_routing_matches_deepseek_layout_reference() -> Non
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.usefixtures("force_torch_reference_from_routing")
 def test_torch_mxfp4_moe_from_routing_matches_reference_across_token_chunks() -> None:
     num_experts = 3
     hidden_size = 32
@@ -651,6 +667,7 @@ def test_torch_mxfp4_moe_from_routing_matches_reference_across_token_chunks() ->
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.usefixtures("force_torch_reference_from_routing")
 def test_torch_mxfp4_moe_from_routing_ep_partitions_deepseek_layout_experts() -> None:
     num_experts = 5
     ep_size = 3
@@ -712,6 +729,7 @@ def test_torch_mxfp4_moe_from_routing_ep_partitions_deepseek_layout_experts() ->
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for CUDA graph capture")
+@pytest.mark.usefixtures("force_torch_reference_from_routing")
 def test_torch_mxfp4_moe_from_routing_ep_allows_cuda_graph_capture() -> None:
     num_experts = 2
     hidden_size = 32
@@ -828,7 +846,9 @@ def test_mxfp4_transform_rejects_expert_dims_not_divisible_by_block_size(
     expected_name: str,
 ) -> None:
     gm = torch.fx.symbolic_trace(_DenseMoeTransformModule(hidden_size, intermediate_size))
-    transform = InsertMXFP4MLP(MXFP4MLPConfig(stage=Stages.PATTERN_MATCHER))
+    # Pin backend="triton": the divisibility validation under test lives in the
+    # triton packing path (the SM-based default dispatches to trtllm-gen on SM100).
+    transform = InsertMXFP4MLP(MXFP4MLPConfig(stage=Stages.PATTERN_MATCHER, backend="triton"))
     factory = _QuantConfigFactory({"quant_method": "mxfp4", "expert_block_size": 32})
 
     with pytest.raises(ValueError, match=f"{expected_name}.*divisible.*32"):

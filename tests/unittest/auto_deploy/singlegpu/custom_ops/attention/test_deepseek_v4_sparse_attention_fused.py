@@ -85,6 +85,32 @@ def test_decode_shape_matches_reference(dtype):
     kv = torch.randn(B, L, D, device="cuda", dtype=dtype)
     sink = torch.randn(H, device="cuda", dtype=dtype)
     topk = torch.arange(L, device="cuda", dtype=torch.int64).view(1, 1, L).expand(B, S, L)
+    # The decode shape must actually route into the fused Triton kernel.
+    assert dsv4._can_use_fused_sparse_attention(q.reshape(B * S, H, D), kv, topk.reshape(B * S, L))
+    _check(q, kv, sink, topk, D**-0.5)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 512])
+def test_decode_head_dim(head_dim):
+    """Decode across head_dim (the kernel's D_BLOCK = next_pow2(D) tail masking)."""
+    torch.manual_seed(1)
+    B, S, H, L = 1, 1, 8, 384
+    q = torch.randn(B, S, H, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(B, L, head_dim, device="cuda", dtype=torch.bfloat16)
+    sink = torch.randn(H, device="cuda", dtype=torch.bfloat16)
+    topk = torch.arange(L, device="cuda", dtype=torch.int64).view(1, 1, L)
+    _check(q, kv, sink, topk, head_dim**-0.5)
+
+
+def test_decode_partial_mask_consistency():
+    """Decode (split-K path) with a mix of valid and masked (-1) slots per query."""
+    torch.manual_seed(4)
+    B, S, H, D, L = 1, 1, 8, 512, 512
+    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(B, L, D, device="cuda", dtype=torch.bfloat16)
+    sink = torch.randn(H, device="cuda", dtype=torch.bfloat16)
+    topk = torch.arange(L, device="cuda", dtype=torch.int64).view(1, 1, L).clone()
+    topk[0, 0, ::3] = -1  # mask every third slot
     _check(q, kv, sink, topk, D**-0.5)
 
 

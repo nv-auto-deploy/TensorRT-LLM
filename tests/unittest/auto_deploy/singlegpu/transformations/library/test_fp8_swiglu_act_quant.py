@@ -124,8 +124,11 @@ def test_fused_swiglu_act_quant_strided_views(fmt):
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
 @pytest.mark.parametrize("fmt", ["", "ue8m0"])
 def test_fused_swiglu_act_quant_edge_values(fmt):
-    """Boundary/degenerate blocks: all-zero (scale floor), exact +/-limit, huge values,
-    deeply negative gate (silu underflow), fp16 model dtype."""
+    """Boundary/degenerate blocks.
+
+    All-zero (scale floor), exact +/-limit, huge values, deeply negative gate
+    (silu underflow), fp16 model dtype.
+    """
     device = "cuda"
     dtype = torch.bfloat16
     width = 256
@@ -179,8 +182,10 @@ def test_prequant_residual_add_matches_fused_op():
 # Graph-level: real export + fuse_gemms_mixed_children + the new transform.
 # ---------------------------------------------------------------------------
 class _FP8Proj(nn.Module):
-    """Block-FP8 weight stored as ``<name>.weight`` + ``<name>.weight_scale_inv``
-    (the layout the mixed-children fuser reconstructs the scale name from)."""
+    """Block-FP8 weight stored as ``<name>.weight`` + ``<name>.weight_scale_inv``.
+
+    The layout the mixed-children fuser reconstructs the scale name from.
+    """
 
     def __init__(self, n, k, device, seed):
         super().__init__()

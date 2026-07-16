@@ -133,8 +133,10 @@ def test_decode_gemv_strict(M, N, K):
 @pytest.mark.parametrize("M", [16, 64, 512])
 @pytest.mark.parametrize("N,K", SHAPES)
 def test_prefill_rmse(M, N, K):
-    """Prefill: fp8 RMSE bar (robust to the pre-existing sparse Blackwell glitch,
-    but catches gross scale-indexing errors)."""
+    """Prefill: fp8 RMSE bar.
+
+    Robust to the pre-existing sparse Blackwell glitch, but catches gross scale-indexing errors.
+    """
     out, ref = _run(M, N, K)
     assert out.shape == (M, N)
     scale = ref.abs().amax().clamp(min=1e-6)
@@ -264,9 +266,11 @@ def _run_splitk(M, N, K, split_k, block_size_n=64, block_size_k=None, num_warps=
 @pytest.mark.parametrize("M", [1, 2])
 @pytest.mark.parametrize("N,K", [(1536, 7168), (576, 7168), (2304, 7168), (256, 7168)])
 def test_splitk_matches_reference(M, N, K, split_k):
-    """Split-K GEMV == fp64 ground truth for the K=7168 decode projection shapes,
-    across SPLIT_K values (incl. 7 and 16 that do NOT divide the 56 K-blocks evenly,
-    exercising the ragged-tail K-mask)."""
+    """Split-K GEMV == fp64 ground truth for the K=7168 decode projection shapes.
+
+    Covers SPLIT_K values incl. 7 and 16 that do NOT divide the 56 K-blocks evenly,
+    exercising the ragged-tail K-mask.
+    """
     out, ref = _run_splitk(M, N, K, split_k)
     assert out.shape == (M, N) and out.dtype == torch.bfloat16
     scale = ref.abs().amax().clamp(min=1e-6)
@@ -278,8 +282,10 @@ def test_splitk_matches_reference(M, N, K, split_k):
 @pytest.mark.parametrize("split_k", [4, 8])
 @pytest.mark.parametrize("block_size_n", [32, 64, 128])
 def test_splitk_block_n_and_ragged_n(split_k, block_size_n):
-    """Split-K with N NOT a multiple of BLOCK_SIZE_N (576) across BLOCK_SIZE_N
-    choices -- guards the masked-tile atomic store."""
+    """Split-K with N NOT a multiple of BLOCK_SIZE_N (576) across BLOCK_SIZE_N choices.
+
+    Guards the masked-tile atomic store.
+    """
     out, ref = _run_splitk(1, 576, 7168, split_k, block_size_n=block_size_n)
     scale = ref.abs().amax().clamp(min=1e-6)
     max_rel = ((out.float() - ref).abs().amax() / scale).item()
@@ -295,7 +301,8 @@ def test_splitk_block_size_k(N, K, split_k, block_size_k):
 
     A tile of BLOCK_SIZE_K in {32,64,128} stays inside one 128-wide scale block, so
     the per-tile scale index ``(k*BLOCK_SIZE_K)//group_k`` must still reconstruct the
-    fp64 ground truth across SPLIT_K and the K=7168 decode projection Ns (M=1)."""
+    fp64 ground truth across SPLIT_K and the K=7168 decode projection Ns (M=1).
+    """
     out, ref = _run_splitk(1, N, K, split_k, block_size_k=block_size_k)
     assert out.shape == (1, N) and out.dtype == torch.bfloat16
     scale = ref.abs().amax().clamp(min=1e-6)
@@ -309,9 +316,11 @@ def test_splitk_block_size_k(N, K, split_k, block_size_k):
 @pytest.mark.parametrize("M", [1, 2])
 @pytest.mark.parametrize("N,K", [(1024, 4096), (1536, 4096)])
 def test_splitk_tp4_band(M, N, K, split_k, num_warps):
-    """K=4096 (32 K-blocks) TP4 band: SPLIT_K up to 32 (1 K-block per CTA) and the
-    new num_warps=2 launch must reconstruct the fp64 ground truth (incl. the ragged
-    SPLIT_K=24 case where 8 CTAs per tile take 2 K-blocks)."""
+    """K=4096 (32 K-blocks) TP4 band: split-K launches must reconstruct the fp64 ground truth.
+
+    Covers SPLIT_K up to 32 (1 K-block per CTA) and the new num_warps=2 launch, incl.
+    the ragged SPLIT_K=24 case where 8 CTAs per tile take 2 K-blocks.
+    """
     out, ref = _run_splitk(M, N, K, split_k, num_warps=num_warps)
     assert out.shape == (M, N) and out.dtype == torch.bfloat16
     scale = ref.abs().amax().clamp(min=1e-6)
@@ -351,8 +360,10 @@ def test_splitk_tp4_heuristic_defaults():
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
 def test_splitk_block_size_k_must_divide_group():
-    """BLOCK_SIZE_K that does not divide the quant block_k straddles a scale block
-    and is rejected (guards the scale-index correctness invariant)."""
+    """BLOCK_SIZE_K that does not divide the quant block_k straddles a scale block and is rejected.
+
+    Guards the scale-index correctness invariant.
+    """
     with pytest.raises(AssertionError, match="must divide quant block_k"):
         _run_splitk(1, 256, 7168, 24, block_size_k=96)
 
@@ -396,10 +407,12 @@ def _exact_case(M, N, K, seed):
 @pytest.mark.parametrize("M", [1, 2, 4])
 @pytest.mark.parametrize("N,K", [(1024, 4096), (1536, 4096)])
 def test_splitk_quant_prologue_exact_arithmetic(M, N, K):
-    """Fused-prologue split-K == standalone quant + split-K, bit-for-bit, on
-    exact-arithmetic inputs (any atomic order sums the same exact fp32 values).
-    M in {2,4} exercises the %M-padded rows (each padded row re-quantizes the
-    identical data row, so scales/payloads dedupe by construction)."""
+    """Fused-prologue split-K == standalone quant + split-K, bit-for-bit, on exact-arithmetic inputs.
+
+    Any atomic order sums the same exact fp32 values. M in {2,4} exercises the
+    %M-padded rows (each padded row re-quantizes the identical data row, so
+    scales/payloads dedupe by construction).
+    """
     a, b_fp8, b_s = _exact_case(M, N, K, seed=21)
     a_fp8, a_s = _safe_act_quant(a.contiguous(), 128, "ue8m0")
     ref = _w8a8_block_fp8_matmul_splitk(a_fp8, b_fp8, a_s, b_s, 128, 128, torch.bfloat16, M, N, K)
@@ -411,9 +424,11 @@ def test_splitk_quant_prologue_exact_arithmetic(M, N, K):
 @pytest.mark.parametrize("M", [2, 4])
 @pytest.mark.parametrize("N,K", [(1024, 4096), (1536, 4096)])
 def test_splitk_quant_prologue_random(M, N, K):
-    """Fused-prologue split-K vs fp64 ground truth of the standalone-quantized
-    operands on random data (the strict decode bar; atomic order precludes a
-    bitwise fused-vs-standalone assert here)."""
+    """Fused-prologue split-K vs fp64 ground truth of standalone-quantized operands on random data.
+
+    This is the strict decode bar; atomic order precludes a bitwise
+    fused-vs-standalone assert here.
+    """
     torch.manual_seed(22)
     a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1
     b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.1
@@ -428,8 +443,10 @@ def test_splitk_quant_prologue_random(M, N, K):
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
 def test_splitk_quant_prologue_requires_full_group_tile():
-    """The fused prologue must reject an MMA tile narrower than the quant group
-    (its per-tile amax would only see part of the 128-group)."""
+    """The fused prologue must reject an MMA tile narrower than the quant group.
+
+    Its per-tile amax would only see part of the 128-group.
+    """
     a, b_fp8, b_s = _exact_case(1, 1024, 4096, seed=23)
     with pytest.raises(AssertionError, match="quant prologue requires"):
         _w8a8_block_fp8_matmul_splitk(
@@ -439,8 +456,10 @@ def test_splitk_quant_prologue_requires_full_group_tile():
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
 def test_deferred_quant_prefill_falls_back_to_standalone():
-    """As=None with a non-decode M must quantize standalone inside the dispatch
-    and reproduce the eager quant+full-K pipeline byte-for-byte."""
+    """As=None with a non-decode M must quantize standalone inside the dispatch.
+
+    It must reproduce the eager quant+full-K pipeline byte-for-byte.
+    """
     M, N, K = 64, 1536, 4096
     torch.manual_seed(24)
     a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1

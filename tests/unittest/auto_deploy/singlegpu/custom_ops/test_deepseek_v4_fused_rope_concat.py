@@ -53,10 +53,13 @@ def _fused(nope, pe, cos, sin, inverse=False):
 
 
 def _assert_match(out, ref):
-    """The kernel folds ``even*cos - odd*sin`` into an FMA (one rounding) while the
+    """Assert kernel-vs-reference match up to the ~1-ULP FMA rounding difference.
+
+    The kernel folds ``even*cos - odd*sin`` into an FMA (one rounding) while the
     reference does separate mul/sub (three roundings), so results can differ by up
     to ~1 ULP. Real bugs (wrong index/formula/broadcast) are orders of magnitude
-    larger, so a ~1-ULP tolerance still catches them."""
+    larger, so a ~1-ULP tolerance still catches them.
+    """
     tol = {torch.float32: 1e-5, torch.float16: 1.5e-3, torch.bfloat16: 1e-2}[out.dtype]
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
 
@@ -148,8 +151,10 @@ def test_kv_mismatched_row_strides():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_bf16_cos_is_close():
-    """When cos/sin are bf16, the kernel's fp32 math is *more* accurate than the
-    reference's bf16 math — outputs are close but not bit-exact (justified)."""
+    """When cos/sin are bf16, the kernel's fp32 math is *more* accurate than the reference's bf16 math.
+
+    Outputs are close but not bit-exact (justified).
+    """
     torch.manual_seed(4)
     B, S, H, Dn, D = 1, 1, 8, 512, 64
     nope = torch.randn(B, S, H, Dn, device=DEV, dtype=torch.bfloat16)
@@ -167,10 +172,12 @@ def test_bf16_cos_is_close():
 
 
 def _ref_norm(nope, pe, cos, sin, eps, head_broadcast, inverse=False):
-    """Reference: weightless per-head RMS norm over the FULL (nope||pe) head,
-    applied BEFORE the split, then the plain rope/concat. Mirrors modeling line
+    """Reference: weightless per-head RMS norm over the FULL (nope||pe) head, then the plain rope/concat.
+
+    The norm is applied BEFORE the split. Mirrors modeling line
     ``q = q * rsqrt(q.float().square().mean(-1)+eps).to(q.dtype)`` then split +
-    ``deepseek_v4_fused_rope_concat``."""
+    ``deepseek_v4_fused_rope_concat``.
+    """
     x = torch.cat((nope, pe), dim=-1)
     x = x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps).to(x.dtype)
     nope_n, pe_n = torch.split(x, [nope.shape[-1], pe.shape[-1]], dim=-1)
@@ -193,10 +200,12 @@ def _fused_norm(nope, pe, cos, sin, eps, inverse=False):
     ],
 )
 def test_norm_fold_fp32(B, S, H, Dn, D, inverse):
-    """fp32: the rsqrt factor is not bf16-rounded, so the only deviation from the
-    split reference is fp32 reduction order (~1e-6). A tight tolerance therefore
-    proves the norm math itself — reduction over the full head, /head_dim, factor
-    applied to both nope and pe — is exactly right."""
+    """fp32: the only deviation from the split reference is fp32 reduction order (~1e-6).
+
+    The rsqrt factor is not bf16-rounded. A tight tolerance therefore proves the
+    norm math itself — reduction over the full head, /head_dim, factor applied to
+    both nope and pe — is exactly right.
+    """
     torch.manual_seed(5)
     eps = 1e-6
     nope = torch.randn(B, S, H, Dn, device=DEV, dtype=torch.float32)
@@ -219,9 +228,12 @@ def test_norm_fold_fp32(B, S, H, Dn, D, inverse):
     ],
 )
 def test_norm_fold_bf16(B, S, H, Dn, D, inverse):
-    """bf16: the folded op rounds the rsqrt factor to bf16 (matching `.to(q.dtype)`)
-    and materializes each normalized value in bf16 before RoPE, so it is bit-faithful
-    to the split reference up to the rope FMA (~1 ULP) and fp32 reduction order."""
+    """bf16: the folded op matches the split reference up to the rope FMA (~1 ULP) and reduction order.
+
+    It rounds the rsqrt factor to bf16 (matching `.to(q.dtype)`) and materializes
+    each normalized value in bf16 before RoPE, so it is bit-faithful to the split
+    reference up to the rope FMA (~1 ULP) and fp32 reduction order.
+    """
     torch.manual_seed(6)
     eps = 1e-6
     nope = torch.randn(B, S, H, Dn, device=DEV, dtype=torch.bfloat16)
@@ -252,8 +264,10 @@ def test_norm_fold_strided_split_views():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_rms_eps_zero_is_plain_rope():
-    """rms_eps defaulting to 0 must leave every non-Q call site (kv/indexer/...)
-    byte-identical to the plain rope/concat."""
+    """rms_eps defaulting to 0 must leave non-Q call sites (kv/indexer/...) byte-identical.
+
+    Every non-Q call site must match the plain rope/concat exactly.
+    """
     torch.manual_seed(8)
     B, S, H, Dn, D = 1, 1, 8, 448, 64
     nope = torch.randn(B, S, H, Dn, device=DEV, dtype=torch.bfloat16)

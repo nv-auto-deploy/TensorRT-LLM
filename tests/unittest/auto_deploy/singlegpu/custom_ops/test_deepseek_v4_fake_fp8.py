@@ -124,7 +124,7 @@ def test_byte_exact_many_random_seeds():
 
 @requires_cuda
 def test_guard_passthrough():
-    """dim not divisible by block_size returns input unchanged (mirrors the helper guard)."""
+    """Dim not divisible by block_size returns input unchanged (mirrors the helper guard)."""
     x = torch.randn(4, 100, device="cuda", dtype=torch.bfloat16)  # 100 % 64 != 0
     got = _op(x, 64)
     assert torch.equal(got, x)

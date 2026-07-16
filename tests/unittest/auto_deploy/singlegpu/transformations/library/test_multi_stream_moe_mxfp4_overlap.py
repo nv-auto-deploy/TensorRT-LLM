@@ -54,8 +54,11 @@ PACKED = BLOCK // 2
 
 
 class _SharedPlusRoutedMoE(nn.Module):
-    """Mirror of the DSV4 MoE dataflow: shared MLP dispatched first, then the
-    from-routing MXFP4 op, merged with a single add (routed + shared)."""
+    """Mirror of the DSV4 MoE dataflow.
+
+    Shared MLP dispatched first, then the from-routing MXFP4 op, merged with a
+    single add (routed + shared).
+    """
 
     def __init__(self, seed: int = 0) -> None:
         super().__init__()
@@ -233,9 +236,11 @@ def test_multi_stream_moe_mxfp4_bit_exact_under_cuda_graph():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 def test_multi_stream_moe_from_routing_entry_is_scoped_and_checked_in():
-    """The checked-in enablement path: ``multi_stream_moe_from_routing`` ships
-    enabled in ``default.yaml`` with an op allowlist scoped to the DSV4
-    from-routing MXFP4 ops, and the allowlist actually gates the rewrite."""
+    """The checked-in enablement path for ``multi_stream_moe_from_routing``.
+
+    It ships enabled in ``default.yaml`` with an op allowlist scoped to the DSV4
+    from-routing MXFP4 ops, and the allowlist actually gates the rewrite.
+    """
     import os
 
     import yaml
@@ -283,8 +288,10 @@ def test_multi_stream_moe_from_routing_entry_is_scoped_and_checked_in():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 def test_multi_stream_moe_rewrite_is_idempotent():
-    """A second application (e.g. both transform entries enabled with overlapping
-    op lists) must be a no-op instead of nesting begin/end stream switches."""
+    """A second application must be a no-op instead of nesting begin/end stream switches.
+
+    E.g. both transform entries enabled with overlapping op lists.
+    """
     device = "cuda"
     cuda_stream_manager.add_device(torch.cuda.current_device())
     mod = _SharedPlusRoutedMoE().to(device)
@@ -327,8 +334,10 @@ def _fp8_weight(n, k, g):
 
 
 class _MXFP4RoutedBuffers(nn.Module):
-    """Routed-expert MXFP4 buffers for hidden size ``H_FP8`` (gpt-oss swiglu mode
-    keeps the tiny shapes on the torch-reference path)."""
+    """Routed-expert MXFP4 buffers for hidden size ``H_FP8``.
+
+    gpt-oss swiglu mode keeps the tiny shapes on the torch-reference path.
+    """
 
     def __init__(self, g) -> None:
         super().__init__()
@@ -379,12 +388,14 @@ class _MXFP4RoutedBuffers(nn.Module):
 
 
 class _FP8SharedRoutedMoEStrandedTail(_MXFP4RoutedBuffers):
-    """Post-idea_0007 node ORDER as ``fuse_fp8_swiglu_act_quant`` used to emit it:
-    the shared-expert head (merged gate_up FP8 GEMM + narrows) is dispatched before
+    """Post-idea_0007 node ORDER as ``fuse_fp8_swiglu_act_quant`` used to emit it.
+
+    The shared-expert head (merged gate_up FP8 GEMM + narrows) is dispatched before
     the routed op, but the fused swiglu+act-quant tail and the residual-add-prequant
     down projection sit AFTER the routed op in graph order (the fusion inserted them
     at the old down-projection site, which follows the MoE op once the merge add is
-    folded into it as its residual)."""
+    folded into it as its residual).
+    """
 
     def __init__(self, seed: int = 0) -> None:
         g = torch.Generator(device="cpu").manual_seed(seed)
@@ -411,9 +422,11 @@ class _FP8SharedRoutedMoEStrandedTail(_MXFP4RoutedBuffers):
 
 
 class _FP8SharedRoutedMoEResidualDown(_MXFP4RoutedBuffers):
-    """Post-idea_0008 form (the input ``fuse_fp8_swiglu_act_quant`` consumes): the
-    unfused clamped-SwiGLU chain feeding the residual-add down projection whose
-    residual is the routed MoE output."""
+    """Post-idea_0008 form (the input ``fuse_fp8_swiglu_act_quant`` consumes).
+
+    The unfused clamped-SwiGLU chain feeding the residual-add down projection whose
+    residual is the routed MoE output.
+    """
 
     def __init__(self, seed: int = 0) -> None:
         g = torch.Generator(device="cpu").manual_seed(seed)
@@ -480,9 +493,11 @@ def _overlap_indices(gm):
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
 def test_multi_stream_moe_hoists_stranded_fp8_prequant_tail():
-    """The rewrite must compact a shared-expert tail stranded after the routed op
-    back in front of it: ``begin``/``end`` bracket a positional aux-stream window,
-    so a routed op inside the window would serialize both branches on aux."""
+    """The rewrite must compact a shared-expert tail stranded after the routed op back in front of it.
+
+    ``begin``/``end`` bracket a positional aux-stream window, so a routed op inside
+    the window would serialize both branches on aux.
+    """
     device = "cuda"
     cuda_stream_manager.add_device(torch.cuda.current_device())
     mod = _FP8SharedRoutedMoEStrandedTail().to(device)
@@ -533,10 +548,12 @@ def test_multi_stream_moe_hoists_stranded_fp8_prequant_tail():
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
 def test_swiglu_fusion_keeps_shared_first_dispatch_for_overlap():
-    """End-to-end at the real pipeline seam: ``fuse_fp8_swiglu_act_quant`` on the
-    residual-add down projection must emit the fused tail ahead of the routed op
-    (anchored at its gate/up sources), and the multi-stream rewrite must then
-    bracket only the shared branch."""
+    """End-to-end at the real pipeline seam.
+
+    ``fuse_fp8_swiglu_act_quant`` on the residual-add down projection must emit the
+    fused tail ahead of the routed op (anchored at its gate/up sources), and the
+    multi-stream rewrite must then bracket only the shared branch.
+    """
     device = "cuda"
     cuda_stream_manager.add_device(torch.cuda.current_device())
     mod = _FP8SharedRoutedMoEResidualDown().to(device)

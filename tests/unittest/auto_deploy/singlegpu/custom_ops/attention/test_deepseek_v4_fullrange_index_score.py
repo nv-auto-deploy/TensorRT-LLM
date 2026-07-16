@@ -451,9 +451,9 @@ def test_raw_weight_scale_fold_matches_prescaled(m, input_pos):
     reason="fused index-score fold requires triton + CUDA",
 )
 def test_selection_path_routes_through_fold_and_matches():
-    """End-to-end ``_select_decode_ratio4_indexer_rows`` (which now routes H > 8
-    through the fold) must keep the exact selection of the two-kernel chain.
+    """End-to-end ``_select_decode_ratio4_indexer_rows`` must keep the exact two-kernel-chain selection.
 
+    The helper now routes H > 8 through the fold.
     The selection helper consumes RAW model-dtype weights and folds the
     indexer pre-scale (``head_dim**-0.5 * num_heads**-0.5``) into
     the kernel, so the reference chain applies the identical ``w_scale``.

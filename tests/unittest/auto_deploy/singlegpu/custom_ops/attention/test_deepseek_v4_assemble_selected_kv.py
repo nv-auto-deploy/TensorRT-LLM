@@ -160,9 +160,11 @@ def test_fused_assemble_matches_eager(head_dim, compress_ratio, topk, cache_dtyp
 )
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 def test_fused_assemble_large_decode_position(compress_ratio):
-    """Real-scale regime: input_pos ~1000 (the proxy decode window) with many pages
-    and wide top-k, so paged positions cross many page boundaries and physical page
-    ids are large (guards the int64 address arithmetic against int32 overflow)."""
+    """Real-scale regime: input_pos ~1000 (the proxy decode window) with many pages and wide top-k.
+
+    Paged positions cross many page boundaries and physical page ids are large
+    (guards the int64 address arithmetic against int32 overflow).
+    """
     torch.manual_seed(70123 + compress_ratio)
     device = "cuda"
     dtype = torch.bfloat16
@@ -241,12 +243,14 @@ def test_fused_assemble_large_decode_position(compress_ratio):
 def test_fused_assemble_dense_in_kernel_matches_materialized(
     window_size, tokens_per_block, max_compressed_len, cache_dtype
 ):
-    """Dense (ratio-128) mode: ``selected_rows=None`` derives the row ids
-    and their visibility in-kernel; the result must be bit-identical to both the
-    materialized arange/floordiv/clamp/lt chain fed through the fused kernel and the
-    eager reference. The input_pos sweep crosses the ratio-128 row boundaries
+    """Dense (ratio-128) mode: ``selected_rows=None`` derives the row ids and visibility in-kernel.
+
+    The result must be bit-identical to both the materialized
+    arange/floordiv/clamp/lt chain fed through the fused kernel and the eager
+    reference. The input_pos sweep crosses the ratio-128 row boundaries
     (126/127/128/255/256), partial pages, short histories, and negative (padded)
-    rows where torch's floor division semantics differ from truncation."""
+    rows where torch's floor division semantics differ from truncation.
+    """
     compress_ratio = 128
     torch.manual_seed(90_000 + window_size + max_compressed_len)
     device = "cuda"
