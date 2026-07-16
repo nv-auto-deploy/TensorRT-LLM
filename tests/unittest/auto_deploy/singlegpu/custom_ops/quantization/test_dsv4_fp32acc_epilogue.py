@@ -268,7 +268,6 @@ def test_splitk_c_out_rejects_finish_cast_output_dtype() -> None:
 
 def _build_q_norm_graph(
     *,
-    prequant: bool = False,
     hidden_size: int = DSV4_FLASH_HIDDEN,
     q_start: int = 0,
     q_width: int = Q_LORA,
@@ -316,17 +315,10 @@ def _build_q_norm_graph(
     q_weight = graph.get_attr("q_weight")
     kv_weight = graph.get_attr("kv_weight")
     bias = graph.get_attr("bias") if with_bias else None
-    if prequant:
-        input_scale = graph.placeholder("input_scale")
-        linear = graph.call_function(
-            torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_prequant.default,
-            args=(input_node, input_scale, weight_fp8, bias, [weight_scale]),
-        )
-    else:
-        linear = graph.call_function(
-            torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default,
-            args=(input_node, weight_fp8, bias, [], [weight_scale], [], []),
-        )
+    linear = graph.call_function(
+        torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default,
+        args=(input_node, weight_fp8, bias, [], [weight_scale], [], []),
+    )
 
     q_narrow = graph.call_function(torch.narrow, args=(linear, -1, q_start, q_width))
     q_contiguous = graph.call_method("contiguous", args=(q_narrow,))
@@ -377,10 +369,9 @@ def _apply_q_norm_transform(
     return transform._apply(graph_module, None, None, None)
 
 
-@pytest.mark.parametrize("prequant", [False, True])
-def test_fuse_deepseek_v4_q_rmsnorm_matches_exact_dsv4_graph(prequant: bool) -> None:
-    """Both producer forms match at the exact DSV4-Flash [1536, 4096] shape."""
-    graph_module = _build_q_norm_graph(prequant=prequant)
+def test_fuse_deepseek_v4_q_rmsnorm_matches_exact_dsv4_graph() -> None:
+    """The producer matches at the exact DSV4-Flash [1536, 4096] shape."""
+    graph_module = _build_q_norm_graph()
     new_graph_module, info = _apply_q_norm_transform(graph_module)
 
     targets = [str(node.target) for node in new_graph_module.graph.nodes]
@@ -388,15 +379,9 @@ def test_fuse_deepseek_v4_q_rmsnorm_matches_exact_dsv4_graph(prequant: bool) -> 
     assert sum("deepseek_v4_q_rmsnorm" in target for target in targets) == 1
     assert sum("deepseek_v4_kv_norm_rope_concat" in target for target in targets) == 1
     assert not any("fp32acc" in target for target in targets)
-    if prequant:
-        assert any(
-            target.endswith("torch_fake_quant_finegrained_fp8_linear_prequant.default")
-            for target in targets
-        )
-    else:
-        assert any(
-            target.endswith("torch_fake_quant_finegrained_fp8_linear.default") for target in targets
-        )
+    assert any(
+        target.endswith("torch_fake_quant_finegrained_fp8_linear.default") for target in targets
+    )
 
 
 @pytest.mark.parametrize(

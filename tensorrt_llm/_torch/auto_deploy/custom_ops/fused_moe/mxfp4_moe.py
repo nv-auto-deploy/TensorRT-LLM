@@ -301,26 +301,10 @@ def _split_range_last_remainder(num_experts: int, world_size: int, rank: int) ->
     return lo, hi
 
 
-def _check_decoded_mxfp4_shapes(
-    gate_up_weight: torch.Tensor, down_weight: torch.Tensor, hidden_size: int
-) -> None:
-    if gate_up_weight.shape[-1] != hidden_size:
-        raise ValueError(
-            f"Decoded gate/up MXFP4 weight hidden dimension {gate_up_weight.shape[-1]} "
-            f"does not match hidden states dimension {hidden_size}."
-        )
-    if down_weight.shape[-2] != hidden_size:
-        raise ValueError(
-            f"Decoded down MXFP4 weight output dimension {down_weight.shape[-2]} "
-            f"does not match hidden states dimension {hidden_size}."
-        )
-
-
 def _run_torch_mxfp4_dense_slots(
     x: torch.Tensor,
     leading_shape: torch.Size,
-    local_expert_idx: torch.Tensor,
-    valid_route: torch.Tensor,
+    selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
     gate_up_weight: torch.Tensor,
     gate_up_bias: torch.Tensor,
@@ -328,17 +312,22 @@ def _run_torch_mxfp4_dense_slots(
     down_bias: torch.Tensor,
     alpha: float,
     limit: float,
+    expert_start: int,
     gate_up_order: str,
     swiglu_mode: str,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """All local experts already dequantized; index_select the routed expert per slot.
-
-    ``local_expert_idx`` is the clamped [num_tokens, top_k] local index;
-    ``valid_route`` masks out non-local routes.
-    """
+    """All local experts already dequantized; index_select the routed expert per slot."""
     hidden_size = x.shape[-1]
     output = torch.zeros((x.shape[0], hidden_size), device=x.device, dtype=torch.float32)
+
+    local_experts = gate_up_weight.shape[0]
+    if local_experts <= 0:
+        raise ValueError("MXFP4 MoE requires at least one local expert.")
+
+    local_expert_idx = selected_experts - int(expert_start)
+    valid_route = (local_expert_idx >= 0) & (local_expert_idx < local_experts)
+    local_expert_idx = local_expert_idx.clamp(0, local_experts - 1)
 
     x_for_bmm = x.unsqueeze(-1)
     for route_idx in range(local_expert_idx.shape[1]):
@@ -408,12 +397,10 @@ def _run_torch_mxfp4_mlp_core(
 # DSV4-Flash feeds *precomputed* routing (selected_experts / routing_weights, its
 # custom sqrtsoftplus+hash routing stays upstream) to ``torch_mxfp4_moe_from_routing(_ep)``.
 # On SM100 the routed MXFP4 MLP runs on the trtllm-gen runner
-# ``mxe4m3_mxe2m1_block_scale_moe_runner``: one hand-tuned cubin consuming mxfp4 weights +
-# mxfp8-quantized activations, 21-28x faster than the fp32 dequant+bmm torch reference at
-# DSV4 EP=8 decode shapes (microbench), 17x faster than matmul_ogs (which regressed +34%).
+# ``mxe4m3_mxe2m1_block_scale_moe_runner`` (mxfp4 weights + mxfp8-quantized activations).
 # Precomputed routing is forwarded as topk_ids/topk_weights (used verbatim — PT folds
 # routed_scaling_factor into token_final_scales the same way, routing.py:380/419).
-# The torch reference below stays as the non-SM100 fallback / test oracle.
+# The torch reference stays as the non-SM100 fallback / test oracle.
 
 # Kernel-ready (pad/shard/shuffle) weights + per-expert SwiGLU tensors, keyed by raw-weight
 # identity. The prep is expensive (per-expert TMA-layout shuffle) and must run once before
@@ -528,8 +515,8 @@ def _run_trtllm_gen_mxfp4_from_routing(
     down_bias: torch.Tensor,
     down_scales: torch.Tensor,
     expert_start: int,
-    alpha: float = 1.0,
-    limit: float = float("inf"),
+    alpha: float,
+    limit: float,
     routing_localized: bool = False,
 ) -> torch.Tensor:
     """Run the routed MXFP4 MLP via the trtllm-gen W4A8 mxfp8-act runner.
@@ -687,26 +674,27 @@ def _run_torch_mxfp4_from_routing_core(
     leading_shape = hidden_states.shape[:-1]
     hidden_size = hidden_states.shape[-1]
     x = hidden_states.reshape(-1, hidden_size).to(torch.float32)
-    num_tokens = x.shape[0]
 
-    selected_experts = selected_experts.reshape(num_tokens, -1).to(torch.int64)
+    selected_experts = selected_experts.reshape(x.shape[0], -1).to(torch.int64)
     routing_weights = routing_weights.reshape_as(selected_experts).to(torch.float32)
-    local_experts = gate_up_blocks.shape[0]
-    if local_experts <= 0:
-        raise ValueError("MXFP4 MoE requires at least one local expert.")
-
-    local_expert_idx = selected_experts - int(expert_start)
-    valid_route = (local_expert_idx >= 0) & (local_expert_idx < local_experts)
-    local_expert_idx = local_expert_idx.clamp(0, local_experts - 1)
 
     gate_up_weight = _decode_mxfp4_blocks(gate_up_blocks, gate_up_scales)
     down_weight = _decode_mxfp4_blocks(down_blocks, down_scales)
-    _check_decoded_mxfp4_shapes(gate_up_weight, down_weight, hidden_size)
+    if gate_up_weight.shape[-1] != hidden_size:
+        raise ValueError(
+            f"Decoded gate/up MXFP4 weight hidden dimension {gate_up_weight.shape[-1]} "
+            f"does not match hidden states dimension {hidden_size}."
+        )
+    if down_weight.shape[-2] != hidden_size:
+        raise ValueError(
+            f"Decoded down MXFP4 weight output dimension {down_weight.shape[-2]} "
+            f"does not match hidden states dimension {hidden_size}."
+        )
+
     return _run_torch_mxfp4_dense_slots(
         x,
         leading_shape,
-        local_expert_idx,
-        valid_route,
+        selected_experts,
         routing_weights,
         gate_up_weight,
         gate_up_bias,
@@ -714,6 +702,7 @@ def _run_torch_mxfp4_from_routing_core(
         down_bias,
         alpha,
         limit,
+        int(expert_start),
         gate_up_order,
         swiglu_mode,
         hidden_states.dtype,

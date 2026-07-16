@@ -41,12 +41,12 @@ _allreduce_cache = {}
 # Not a TRT-LLM ``AllReduceStrategy``: ``trtllm_dist_all_reduce`` resolves it per
 # call to ONESHOT for messages of at most ``_ONESHOT_SMALL_MAX_NUMEL`` elements
 # (the one-token decode shape) and to NCCL for everything larger, so prefill and
-# multi-token batches on the same graph node keep NCCL.
+# multi-token batches on the same graph node keep NCCL. Threshold rationale:
+# at one decode token x hidden_size 4096 (8 KiB bf16), TRT-LLM ONESHOT measured
+# ~5.5x faster than NCCL on a matched single-node TP4 grid, while >= 6144
+# elements measured at NCCL parity.
 ONESHOT_SMALL_STRATEGY = "ONESHOT_SMALL"
 
-# One decode token at hidden_size 4096 (8 KiB bf16): TRT-LLM ONESHOT measured
-# ~5.5x faster than NCCL on a matched single-node TP4 grid, while >= 6144
-# elements measured at NCCL parity — so larger calls keep NCCL.
 _ONESHOT_SMALL_MAX_NUMEL = 4096
 
 
@@ -179,10 +179,8 @@ def trtllm_dist_all_reduce(t: torch.Tensor, strategy: str) -> torch.Tensor:
     This op always uses TRT-LLM's optimized allreduce and is used in MPI mode.
 
     ``strategy`` is a TRT-LLM ``AllReduceStrategy`` name (e.g. "NCCL") applied
-    as-is, or the ``ONESHOT_SMALL`` token the sharding transforms emit on
-    qualified nodes: calls with at most ``_ONESHOT_SMALL_MAX_NUMEL`` elements
-    (one-token decode hidden states) run the ONESHOT kernel while larger calls
-    (prefill, multi-token batches) run NCCL. Explicit strategy names are never
+    as-is, or the ``ONESHOT_SMALL`` token, resolved per call by message size
+    (see ``ONESHOT_SMALL_STRATEGY`` above). Explicit strategy names are never
     reinterpreted here.
     """
     if strategy == ONESHOT_SMALL_STRATEGY:

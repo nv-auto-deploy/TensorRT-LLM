@@ -15,46 +15,30 @@
 
 """Fused attention-pool COMPUTE for the DeepSeek-V4 compressor.
 
-The compressor's softmax-weighted pool ``(kv * gate.softmax(dim=R)).sum(dim=R)``
-runs for both the main compressor and the lightning-indexer compressor, in the
-context (``_build_full_compressed_kv``) and decode (``_batched_*``) paths of the
-sparse-attention op, as well as
-the eager indexer ``compress_projected`` in the model. In every site the reduction
-axis is the ratio/candidate dim ``-2`` and the channel dim ``-1`` is ``head_dim``.
-
-In decomposed form each call emits a non-last-dim ``softmax`` — a serial
-``cunn_SpatialSoftMaxForward`` (one CTA, grid ``(1,1,1)``) that dominates the
-``reduction`` op-type — plus a ``kv * w`` ``elementwise`` mul and a ``sum``
-``reduce``. This op collapses those three kernels into ONE Triton kernel that
-parallelizes over ``(row, channel)`` and reduces the small ratio axis in fp32
-registers: ``out[n,d] = sum_r kv[n,r,d] * softmax(gate[n,:,d])[r]``.
+Collapses the compressor's softmax-weighted pool
+``(kv * gate.softmax(dim=-2)).sum(dim=-2)`` (main + lightning-indexer
+compressors, context and decode paths of the sparse-attention op, and the eager
+indexer ``compress_projected``) into ONE Triton kernel parallelized over
+``(row, channel)``: ``out[n,d] = sum_r kv[n,r,d] * softmax(gate[n,:,d])[r]``.
 
 The kernel name deliberately contains neither ``softmax``/``reduce``/``sum`` nor
 ``copy``/``mul`` so the collapsed work classifies under the ``other`` op-type and
 leaves the ``reduction`` / ``elementwise`` buckets (the perf signal). All math is
 fp32 internal, matching the reference's fp32 softmax; the output keeps ``kv``'s
-dtype so the op is a drop-in for ``(kv * gate.softmax(dim=-2)).sum(dim=-2)``.
+dtype so the op is a drop-in replacement.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-# Autotune the launch occupancy (num_warps / num_stages) per compressed-pool
-# shape.  Each program owns one ``(row, D-block)`` ``[BLOCK_R, BLOCK_D]`` tile and
-# reduces the tiny ratio axis (``R <= 8``) in registers.  The decode grid is large
-# -- the indexer fullrange path launches ``N = B * max_compressed_len`` (~1024)
-# programs -- so it already saturates the SMs and every extra warp/program only
-# adds a cross-warp reduction barrier with no parallelism gain.  ``num_warps=1``
-# (a single-warp shuffle reduction, no shared-memory barrier) measured 2-6x faster
-# than the old hardcoded ``num_warps=4`` across every decode AND prefill shape on
-# B200/sm100; ``num_stages`` is inert (the kernel is loop-free).  Keyed on
-# ``(R, D)`` -- the only dims that change the optimal occupancy -- so each
-# compressor (indexer ``D=128`` / main ``D=512``) tunes once and the choice is
-# reused across all ``N`` (``num_warps=1`` wins for every ``N``).  This mirrors the
-# hardcoded ``num_warps=1`` already shipped for the analogous ``_act_quant_kernel``
-# per-channel reduction, expressed here as an autotune so the cross-warp configs
-# are kept as a measured safety margin.
+# Autotune the launch occupancy per compressed-pool shape. Each program owns one
+# ``[BLOCK_R, BLOCK_D]`` tile and reduces the tiny ratio axis (``R <= 8``) in
+# registers, so ``num_warps=1`` (single-warp shuffle reduction, no shared-memory
+# barrier) wins across every decode and prefill shape; ``num_stages`` is inert
+# (loop-free kernel). Keyed on ``(R, D)`` — the only dims that change the optimal
+# occupancy — so each compressor (indexer ``D=128`` / main ``D=512``) tunes once;
+# the cross-warp configs are kept as a measured safety margin.
 _DSV4_COMPRESS_POOL_CONFIGS = [
     triton.Config({}, num_warps=1, num_stages=1),
     triton.Config({}, num_warps=2, num_stages=1),
@@ -129,36 +113,20 @@ def deepseek_v4_compress_pool(kv: torch.Tensor, gate: torch.Tensor) -> torch.Ten
     D = kv.shape[-1]
     out = torch.empty((*kv.shape[:-2], D), device=kv.device, dtype=kv.dtype)
     N = out.numel() // D if D > 0 else 0
-    if N == 0 or R == 0 or D == 0 or kv.device.type != "cuda":
-        # Degenerate / non-CUDA: fall back to the eager reference.
-        if N == 0 or R == 0 or D == 0:
-            return out
+    if N == 0 or R == 0 or D == 0:
+        return out
+    if kv.device.type != "cuda":
         return _compress_pool_ref(kv, gate).to(kv.dtype)
 
     kvc = kv.contiguous()
     gatec = gate.contiguous()
 
-    # Element-to-thread mapping over the D axis, adapted to the launch occupancy.
-    # Each program owns one ``(row, D-block)`` tile and is a single warp
-    # (``num_warps=1``).  The grid is ``(N, cdiv(D, BLOCK_D))`` so the total CTA
-    # count is ``N * cdiv(D, BLOCK_D)``.
-    #
-    #   * Large-N launches (e.g. the 75%-of-decode PRIMARY ``N=1024, D=128`` and
-    #     all prefill shapes) already supply >=512 CTAs at the maximal D-block, so
-    #     ``BLOCK_D=128`` is kept -- it gives the best coalescing (a full 256B
-    #     contiguous segment per ratio-row) and the fewest CTAs / least grid
-    #     scheduling overhead.  Splitting D further only *adds* CTAs and regresses
-    #     these shapes (bd64 +8%, bd32 +62% on PRIMARY, measured B200/sm100).
-    #   * Small-N decode shapes are occupancy-starved at ``BLOCK_D=128``: the
-    #     main-compressor new-row path ``N<=2, D=512`` launches only 4-8 CTAs onto
-    #     148 SMs.  Fanning the D axis across more CTAs (smaller ``BLOCK_D``)
-    #     recovers the launch-overhead floor -- small-N decode -15%, prefill
-    #     ``N=256, D=128`` -3% -- saturating at a coalescing floor of ``BLOCK_D=16``
-    #     (going below is mixed/noise).
-    #
-    # So: start at the maximal D-block and halve while the grid is below the
-    # machine-fill target (~512 CTAs), down to a floor of 16.  Large-N (incl.
-    # PRIMARY) keeps the byte-identical ``BLOCK_D=128`` launch.
+    # D-axis tiling: grid is ``(N, cdiv(D, BLOCK_D))``. Large-N launches already
+    # saturate the SMs at the maximal ``BLOCK_D=128`` (best coalescing, fewest
+    # CTAs); small-N decode shapes (e.g. the main-compressor new-row path,
+    # ``N<=2, D=512``) are occupancy-starved there, so halve ``BLOCK_D`` until
+    # the grid reaches the machine-fill target (~512 CTAs), down to a coalescing
+    # floor of 16. Large-N keeps the byte-identical ``BLOCK_D=128`` launch.
     cap = min(128, triton.next_power_of_2(D))
     BLOCK_D = cap
     while BLOCK_D > 16 and N * triton.cdiv(D, BLOCK_D) < 512:

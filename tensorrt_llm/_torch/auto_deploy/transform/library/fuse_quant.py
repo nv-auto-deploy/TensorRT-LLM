@@ -17,7 +17,6 @@ from typing import Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
-import triton
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
@@ -730,7 +729,7 @@ def _finegrained_fp8_block_k(
     scale_k = scale.shape[1]
     if scale_k == 0:
         return None
-    return int(triton.cdiv(K, scale_k))
+    return -(-K // scale_k)  # ceil-div
 
 
 class FuseFP8ActQuantCSEConfig(TransformConfig):
@@ -757,12 +756,8 @@ class FuseFP8ActQuantCSE(BaseTransform):
     kernels by flipping a module-level flag (``set_w8a8_quant_prologue``) once at
     transform time, before warmup/graph capture, so eager and captured paths agree.
 
-    Historical note: this transform used to CSE-share one activation quant across
-    sibling FineGrained FP8 linears that consume the same input (DeepSeek-V4
-    ``wq_a``+``wkv``, ``wq_b``+``indexer.wq_b``, shared-expert ``w1``+``w3``).
-    ``fuse_gemms_mixed_children`` now merges every such sibling group into a single
-    projection before this stage runs, so the rewrite matched nothing and was
-    removed. The registry key is kept so existing configs remain valid.
+    The registry key predates the removal of an act-quant CSE rewrite superseded
+    by ``fuse_gemms_mixed_children``; it is kept so existing configs stay valid.
     """
 
     config: FuseFP8ActQuantCSEConfig
@@ -979,14 +974,11 @@ class FuseDeepSeekV4QRMSNorm(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        linear_ops = (
-            torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear,
-            torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_prequant,
-        )
+        linear_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
         q_rmsnorm_op = torch.ops.auto_deploy.deepseek_v4_q_rmsnorm.default
         num_matches = 0
         for producer in list(gm.graph.nodes):
-            if not any(is_op(producer, linear_op) for linear_op in linear_ops):
+            if not is_op(producer, linear_op):
                 continue
             weight, bias = extract_op_args(producer, "weight_quantized", "bias")
             weight_tensor = _resolve_attr_tensor(gm, weight)

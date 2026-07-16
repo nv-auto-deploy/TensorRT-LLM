@@ -637,6 +637,46 @@ def _overlap_transform(tensor: torch.Tensor, head_dim: int, value: float) -> tor
     return torch.cat((previous, current), dim=2)
 
 
+def _empty_sparse_attention_inputs(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+    include_compressor: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """Empty stand-ins for the sparse-attention inputs a layer variant lacks.
+
+    Indexer stand-ins for layers without a lightning indexer (window-only and
+    ratio-128), plus — with ``include_compressor`` — compressor/rope-table
+    stand-ins for window-only layers. The creation order (and the sharing of
+    one empty per shape) is load-bearing: it keeps the exported graph's node
+    sequence identical to the pre-refactor layout.
+    """
+    empty_state = kv.new_empty(batch_size, seq_len, 0)
+    empty_ape = kv.new_empty(0, 0)
+    empty_norm_weight = kv.new_empty(0)
+    kwargs: Dict[str, torch.Tensor] = {}
+    if include_compressor:
+        empty_rope_table = kv.new_empty(0, 0)
+        kwargs.update(
+            compressor_kv=empty_state,
+            compressor_gate=empty_state,
+            compressor_ape=empty_ape,
+            compressor_norm_weight=empty_norm_weight,
+            cos_compress_table=empty_rope_table,
+            sin_compress_table=empty_rope_table,
+        )
+    kwargs.update(
+        indexer_q=q.new_empty(batch_size, seq_len, 0, 0),
+        indexer_weights=q.new_empty(batch_size, seq_len, 0),
+        indexer_compressor_kv=empty_state,
+        indexer_compressor_gate=empty_state,
+        indexer_compressor_ape=empty_ape,
+        indexer_compressor_norm_weight=empty_norm_weight,
+    )
+    return kwargs
+
+
 def _sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -662,8 +702,17 @@ def _sparse_attention(
     max_compressed_len: Optional[int],
     rope_dim: Optional[int],
     rms_norm_eps: float,
-    topk_is_placeholder: bool = False,
 ) -> torch.Tensor:
+    """Call the cached sparse-attention source op.
+
+    ``topk_idxs`` is always a width-only placeholder: the cached prefill and
+    decode paths recompute the index-score selection from the compressor caches
+    (or the ``input_pos`` window) and read only its static width, and the op
+    rebuilds the real indices on the eager prefill path
+    (``topk_is_placeholder=True``). This keeps the per-layer
+    arange/where/expand/cat/cast index chain out of the decode graph while
+    leaving prefill/decode outputs bit-identical.
+    """
     return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
         q,
         kv,
@@ -692,7 +741,7 @@ def _sparse_attention(
         head_dim=kv.shape[-1],
         rope_dim=rope_dim,
         rms_norm_eps=rms_norm_eps,
-        topk_is_placeholder=topk_is_placeholder,
+        topk_is_placeholder=True,
     )
 
 
@@ -1404,13 +1453,13 @@ class DeepseekV4Attention(nn.Module):
             kv_nope, kv_pe, self.kv_norm.weight, cos, sin, self.kv_norm.eps, 64
         )
 
-        empty_compressor_state = kv.new_empty(batch_size, seq_len, 0)
-        empty_compressor_ape = kv.new_empty(0, 0)
-        empty_compressor_norm_weight = kv.new_empty(0)
-        empty_rope_table = kv.new_empty(0, 0)
-        empty_indexer_q = q.new_empty(batch_size, seq_len, 0, 0)
-        empty_indexer_weights = q.new_empty(batch_size, seq_len, 0)
         if self.compress_ratio:
+            if self.indexer is None:
+                # Ratio-128: no lightning indexer. The stand-ins are created
+                # BEFORE the compressor projections to keep the exported
+                # graph's node order identical to the pre-refactor layout.
+                indexer_kwargs = _empty_sparse_attention_inputs(q, kv, batch_size, seq_len)
+                compressed_width = self.compressor.max_compressed_len
             compressor_kv, compressor_gate = self.compressor.project(hidden_states)
             if self.indexer is not None:
                 (
@@ -1424,29 +1473,16 @@ class DeepseekV4Attention(nn.Module):
                     cos_compress,
                     sin_compress,
                 )
+                indexer_kwargs = dict(
+                    indexer_q=indexer_q,
+                    indexer_weights=indexer_weights,
+                    indexer_compressor_kv=indexer_compressor_kv,
+                    indexer_compressor_gate=indexer_compressor_gate,
+                    indexer_compressor_ape=self.indexer.compressor.ape,
+                    indexer_compressor_norm_weight=self.indexer.compressor.norm.weight,
+                )
                 compressed_width = self.indexer.index_topk
-                indexer_compressor_ape = self.indexer.compressor.ape
-                indexer_compressor_norm_weight = self.indexer.compressor.norm.weight
-            else:
-                indexer_q = empty_indexer_q
-                indexer_weights = empty_indexer_weights
-                indexer_compressor_kv = empty_compressor_state
-                indexer_compressor_gate = empty_compressor_state
-                indexer_compressor_ape = empty_compressor_ape
-                indexer_compressor_norm_weight = empty_compressor_norm_weight
-                compressed_width = self.compressor.max_compressed_len
-            # The model-side indexer compression (`compress_projected`) and top-k
-            # scoring (`select_topk`) are dead work under the cached sparse-attention
-            # op: both the cached prefill path (`_cached_compressed_attention`) and the
-            # decode path (`_decode_compressed_cache_attention`) recompute the
-            # index-score selection from the indexer compressor caches and consume the
-            # top-k tensor only for its static width
-            # (`index_topk = topk_idxs.shape[-1] - window_size`). Only the value-reading
-            # initial-prefill gather needs the real window+compressed indices, so emit a
-            # cheap width-only placeholder here and let the sparse-attention op rebuild
-            # them on the eager prefill path (`topk_is_placeholder=True`). This removes
-            # the per-layer arange/where/expand/cat/cast index chain from the decode
-            # graph while leaving prefill/decode outputs bit-identical.
+            # Width-only top-k placeholder; see the _sparse_attention docstring.
             topk_idxs = hidden_states.new_empty(
                 batch_size, seq_len, self.window_size + compressed_width, dtype=torch.int64
             )
@@ -1455,37 +1491,29 @@ class DeepseekV4Attention(nn.Module):
                 kv,
                 self.attn_sink,
                 topk_idxs,
-                compressor_kv,
-                compressor_gate,
-                self.compressor.ape,
-                self.compressor.norm.weight,
-                cos_compress_table,
-                sin_compress_table,
-                position_ids,
-                indexer_q,
-                indexer_weights,
-                indexer_compressor_kv,
-                indexer_compressor_gate,
-                indexer_compressor_ape,
-                indexer_compressor_norm_weight,
-                self.softmax_scale,
-                self.layer_idx,
-                self.window_size,
-                self.compress_ratio,
-                self.compressor.max_compressed_len,
-                self.rope_head_dim,
-                self.rms_eps,
-                topk_is_placeholder=True,
+                compressor_kv=compressor_kv,
+                compressor_gate=compressor_gate,
+                compressor_ape=self.compressor.ape,
+                compressor_norm_weight=self.compressor.norm.weight,
+                cos_compress_table=cos_compress_table,
+                sin_compress_table=sin_compress_table,
+                position_ids=position_ids,
+                softmax_scale=self.softmax_scale,
+                layer_idx=self.layer_idx,
+                window_size=self.window_size,
+                compress_ratio=self.compress_ratio,
+                max_compressed_len=self.compressor.max_compressed_len,
+                rope_dim=self.rope_head_dim,
+                rms_norm_eps=self.rms_eps,
+                **indexer_kwargs,
             )
         else:
-            # Window-only layers mirror the compressed-layer placeholder trick above:
-            # the cached decode path derives the local window from ``input_pos``
-            # directly (hoisted once per forward) and never reads
-            # ``topk_idxs`` values, so emit a width-only allocation and let the
-            # sparse-attention op rebuild the real window selection on the eager
-            # prefill path (``topk_is_placeholder=True``). This removes the per-layer
-            # arange/where/expand index chain from the decode graph while leaving
-            # prefill/decode outputs bit-identical.
+            # Window-only layer: every compressor/indexer input is an empty
+            # stand-in.
+            empty_kwargs = _empty_sparse_attention_inputs(
+                q, kv, batch_size, seq_len, include_compressor=True
+            )
+            # Width-only top-k placeholder; see the _sparse_attention docstring.
             topk_idxs = hidden_states.new_empty(
                 batch_size, seq_len, self.window_size, dtype=torch.int64
             )
@@ -1494,27 +1522,15 @@ class DeepseekV4Attention(nn.Module):
                 kv,
                 self.attn_sink,
                 topk_idxs,
-                empty_compressor_state,
-                empty_compressor_state,
-                empty_compressor_ape,
-                empty_compressor_norm_weight,
-                empty_rope_table,
-                empty_rope_table,
-                position_ids,
-                empty_indexer_q,
-                empty_indexer_weights,
-                empty_compressor_state,
-                empty_compressor_state,
-                empty_compressor_ape,
-                empty_compressor_norm_weight,
-                self.softmax_scale,
-                self.layer_idx,
-                self.window_size,
-                self.compress_ratio,
-                None,
-                None,
-                self.rms_eps,
-                topk_is_placeholder=True,
+                position_ids=position_ids,
+                softmax_scale=self.softmax_scale,
+                layer_idx=self.layer_idx,
+                window_size=self.window_size,
+                compress_ratio=self.compress_ratio,
+                max_compressed_len=None,
+                rope_dim=None,
+                rms_norm_eps=self.rms_eps,
+                **empty_kwargs,
             )
 
         out_nope, out_pe = torch.split(
@@ -1595,61 +1611,19 @@ class DeepseekV4Block(nn.Module):
         hc_partials: Optional[torch.Tensor] = None,
         emit_fp32: bool = False,
     ) -> Tuple[torch.Tensor, ...]:
-        # Fully fused HC-pre: bf16 input -> fp32 RMS statistic + the MIX_HC-output
-        # hc_fn GEMV + ordered rsqrt scaling + sigmoid/softmax/sinkhorn + the
-        # weighted-combine folded with the block RMSNorm, in two launches at
-        # decode (split-D partials + one composition/combine kernel). The ``pre``
-        # gate stays in registers instead of round-tripping through HBM to a
-        # third (combine) launch, and the register-only sinkhorn chain overlaps
-        # the combine's ``flat`` load latency. Bit-identical to the previous
-        # composition + deepseek_v4_hc_combine_rmsnorm two-op sequence on
-        # every path; see hc_composition.py.
-        #
-        # When ``hc_partials`` is given (every site except layer 0's attn), the
-        # preceding fused ``_hc_post`` seam op already produced this site's
-        # split-D partials while storing the residual stream, so the decode path
-        # skips even the partials launch — one composition/combine kernel per
-        # site (the seam partials match the standalone launch to ~1-2 fp32 ULP;
-        # see deepseek_v4_hc_post.py).
-        #
-        # With ``emit_fp32`` (learned-router FFN sites) the return is a 4-tuple
-        # ``(y, y32, post, comb)`` where ``y32 == y.float()`` bit-for-bit: the
-        # combine kernel stores the fp32 widening of the just-rounded ``y`` as a
-        # second output, absorbing the router's bf16->fp32 boundary copy.
-        flat = x.flatten(2)
-        if hc_partials is None:
-            y, post, comb = torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine(
-                flat,
-                hc_fn,
-                hc_scale,
-                hc_base,
-                norm.weight,
-                self.hc_mult,
-                self.hc_sinkhorn_iters,
-                self.hc_eps,
-                self.norm_eps,
-                norm.eps,
-                x.dtype,
-            )
-            return y, post, comb
-        if emit_fp32:
-            return torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine_partials_y32(
-                hc_partials,
-                flat,
-                hc_fn,
-                hc_scale,
-                hc_base,
-                norm.weight,
-                self.hc_mult,
-                self.hc_sinkhorn_iters,
-                self.hc_eps,
-                self.norm_eps,
-                norm.eps,
-                x.dtype,
-            )
-        return torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine_partials(
-            hc_partials,
-            flat,
+        # Fully fused HC-pre (mix front + sinkhorn composition + weighted-combine
+        # + block RMSNorm); bit-identical to the previous composition +
+        # deepseek_v4_hc_combine_rmsnorm two-op sequence on every path; see
+        # hc_composition.py. When ``hc_partials`` is given (every site except
+        # layer 0's attn), the preceding fused ``_hc_post`` seam op already
+        # produced this site's split-D partials, so the decode path skips even
+        # the partials launch (seam partials match the standalone launch to
+        # ~1-2 fp32 ULP; see deepseek_v4_hc_post.py). With ``emit_fp32``
+        # (learned-router FFN sites) the return is a 4-tuple
+        # ``(y, y32, post, comb)`` with ``y32 == y.float()`` bit-for-bit,
+        # absorbing the router's bf16->fp32 boundary copy.
+        common_args = (
+            x.flatten(2),
             hc_fn,
             hc_scale,
             hc_base,
@@ -1661,6 +1635,14 @@ class DeepseekV4Block(nn.Module):
             norm.eps,
             x.dtype,
         )
+        if hc_partials is None:
+            return torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine(*common_args)
+        op = (
+            torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine_partials_y32
+            if emit_fp32
+            else torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine_partials
+        )
+        return op(hc_partials, *common_args)
 
     @staticmethod
     def _hc_post(
@@ -1715,30 +1697,25 @@ class DeepseekV4Block(nn.Module):
         )
 
         residual = hidden_states
+        # Learned-router layers (``ffn_router_fp32``, a per-layer Python
+        # constant): the fused HC-pre also emits the fp32 mirror of its output
+        # for the router GEMV, replacing the per-step bf16->fp32 boundary copy
+        # (values are bit-identical to the copy).
+        hc_out = self._hc_pre(
+            hidden_states,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.ffn_norm,
+            hc_partials,
+            emit_fp32=self.ffn_router_fp32,
+        )
         if self.ffn_router_fp32:
-            # Learned-router layers: the fused HC-pre also emits the fp32 mirror
-            # of its output for the router GEMV, replacing the per-step
-            # bf16->fp32 boundary copy (values are bit-identical to the copy).
-            hidden_states, router_states_fp32, post, comb = self._hc_pre(
-                hidden_states,
-                self.hc_ffn_fn,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                self.ffn_norm,
-                hc_partials,
-                emit_fp32=True,
-            )
-            hidden_states = self.ffn(hidden_states, input_ids, router_states_fp32)
+            hidden_states, router_states_fp32, post, comb = hc_out
         else:
-            hidden_states, post, comb = self._hc_pre(
-                hidden_states,
-                self.hc_ffn_fn,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                self.ffn_norm,
-                hc_partials,
-            )
-            hidden_states = self.ffn(hidden_states, input_ids)
+            hidden_states, post, comb = hc_out
+            router_states_fp32 = None
+        hidden_states = self.ffn(hidden_states, input_ids, router_states_fp32)
         # ``next_hc_fn`` belongs to the next consumer of the residual stream:
         # the next layer's ``hc_attn_fn``, or ``hc_head_fn`` after the last layer.
         return self._hc_post(hidden_states, residual, post, comb, next_hc_fn)

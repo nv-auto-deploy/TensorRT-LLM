@@ -20,12 +20,13 @@ into one concatenated ``[sum_N, K]`` block-FP8 GEMM + ``torch.narrow`` views, in
 the DIFFERENT-shaped DeepSeek-V4 attention groups (``wq_a``+``wkv``,
 ``wq_b``+``indexer.wq_b``), so these tests guard the general different-N concat identity.
 
-They also guard the fused-parameter namespace: the transform registers its fused weights
-under a ``mixed_children_fused_weight_{idx}`` prefix instead of the generic
-``fused_weight_{idx}`` used by ``_insert_fused_gemm`` / ``fuse_replicated_bf16_linear``.
-Without that unique prefix the two transforms collide — the later ``setattr`` overwrites
-the earlier fused weight, so an FP8 fused node silently reads a smaller bf16 tensor and
-shape-prop fails with ``start (0) + length (N) exceeds dimension size``.
+They also guard the fused-parameter namespace: each transform registers its fused
+weights under its own unique prefix (``mixed_children_fused_weight_{idx}`` here,
+``replicated_bf16_fused_weight_{idx}`` for ``fuse_replicated_bf16_linear``) instead of
+``_insert_fused_gemm``'s generic ``fused_weight_{idx}`` default. Without unique prefixes
+the two transforms collide — the later ``setattr`` overwrites the earlier fused weight,
+so an FP8 fused node silently reads a smaller bf16 tensor and shape-prop fails with
+``start (0) + length (N) exceeds dimension size``.
 """
 
 import pytest
@@ -279,10 +280,10 @@ def test_no_param_collision_with_replicated_bf16():
         n.target for n in gm.graph.nodes if n.op == "get_attr" and "fused_weight" in str(n.target)
     ]
     mixed = [n for n in fused_names if str(n).startswith("mixed_children_fused_weight")]
-    generic = [n for n in fused_names if str(n).startswith("fused_weight")]
+    bf16 = [n for n in fused_names if str(n).startswith("replicated_bf16_fused_weight")]
     assert mixed, "mixed_children fused weight not found under its unique prefix"
-    assert generic, "bf16 fused weight not found under the generic prefix"
-    assert set(mixed).isdisjoint(set(generic)), f"fused param name collision: {fused_names}"
+    assert bf16, "bf16 fused weight not found under its unique prefix"
+    assert set(mixed).isdisjoint(set(bf16)), f"fused param name collision: {fused_names}"
 
     # And the graph must still execute correctly (the collision previously corrupted the
     # FP8 fused weight -> shape-prop / runtime error).

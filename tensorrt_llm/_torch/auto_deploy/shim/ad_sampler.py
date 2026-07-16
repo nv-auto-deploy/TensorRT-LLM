@@ -50,10 +50,8 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     SampleStateTensorsHostTorch,
     SampleStateTorch,
     TorchSampler,
-    _request_strategy,
     add_token,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_utils import GREEDY
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import prefer_pinned
 
@@ -73,10 +71,6 @@ class ADGreedyDecodeTorchSampler(TorchSampler):
     multi-request behavior are preserved.
     """
 
-    # Strategy probe: greediness does not depend on vocab size (same probe value
-    # as TorchSampler._can_use_fast_greedy_path).
-    _STRATEGY_PROBE_VOCAB_SIZE = 2**31
-
     def __init__(self, args: TorchSampler.Args):
         super().__init__(args)
         # Cache keyed on the batch's seq-slot tuple; steady decode reuses it and
@@ -94,7 +88,7 @@ class ADGreedyDecodeTorchSampler(TorchSampler):
         self, scheduled_requests: ScheduledRequests, model_outputs: dict[str, Any]
     ) -> Optional[list[LlmRequest]]:
         """Return the generation requests iff the whole batch qualifies, else None."""
-        if self._fast_state_pending or self.max_beam_width > 1 or self.async_worker_enabled():
+        if self._fast_state_pending or self._use_beam_search or self.async_worker_enabled():
             return None
         # d2t token translation belongs to the speculative one-model path.
         if "d2t" in model_outputs:
@@ -110,18 +104,19 @@ class ADGreedyDecodeTorchSampler(TorchSampler):
         # (appended after the real requests) may trail and are ignored.
         if logits.dim() != 2 or logits.shape[0] < len(requests):
             return None
+        # Greedy strategy + no logprobs, via the base sampler's shared probe.
+        if not self._can_use_fast_greedy_path(requests):
+            return None
         for req in requests:
             if (
                 req.is_dummy
                 or req.py_is_draft
                 or req.py_seq_slot is None
                 or get_draft_token_length(req) > 0
-                or req.py_return_log_probs
                 or req.py_return_generation_logits
                 or req.py_stop_words_list
                 or req.py_min_length
                 or req._py_embedding_bias_1d is not None
-                or _request_strategy(req, vocab_size=self._STRATEGY_PROBE_VOCAB_SIZE) != GREEDY
             ):
                 return None
         return requests
@@ -173,7 +168,6 @@ class ADGreedyDecodeTorchSampler(TorchSampler):
                 new_tokens=self._fast_new_tokens_host,
                 finish_reasons=None,
                 first_finish_reasons=None,
-                logprobs_state=None,
             ),
             sampler_event=sampler_event,
         )

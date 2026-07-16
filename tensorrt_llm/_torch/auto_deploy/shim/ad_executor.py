@@ -157,9 +157,9 @@ def maybe_pad_for_cuda_graph(func):
         # segments would never replay. Attention-DP still requires the cross-rank
         # agreement path below because different ranks may have different batch
         # compositions and runtime scalar metadata.
+        # _piecewise_cuda_graph_used already implies cuda_graph_used (see __init__).
         can_run_piecewise = (
-            self.cuda_graph_used
-            and getattr(self, "_piecewise_cuda_graph_used", False)
+            self._piecewise_cuda_graph_used
             and scheduled_requests.num_context_requests > 0
             and not self.enable_attention_dp
             and self.spec_config is None

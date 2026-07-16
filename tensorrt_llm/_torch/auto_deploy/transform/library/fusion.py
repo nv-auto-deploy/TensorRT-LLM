@@ -557,6 +557,9 @@ class FuseGemmsMixedChildren(BaseTransform):
         max_out = self.config.max_fused_out_features
 
         grouped_nodes: Dict[tuple, List[Node]] = defaultdict(list)
+        # Per-node out_features resolved during grouping (None when the weight
+        # parameter cannot be resolved), reused by the bound check below.
+        out_sizes: Dict[Node, Optional[int]] = {}
         for node in gm.graph.nodes:
             is_bf16 = is_linear_op(node)
             is_quant = is_fake_quantized_linear_op(node)
@@ -576,8 +579,9 @@ class FuseGemmsMixedChildren(BaseTransform):
                 w = gm.get_parameter(weight_name)
                 if any(d == 1 for d in w.shape):
                     continue
+                out_sizes[node] = w.size(0)
             except (AttributeError, KeyError):
-                pass
+                out_sizes[node] = None
             grouped_nodes[(node.args[0], _get_op_key(node))].append(node)
 
         idx = -1
@@ -587,25 +591,20 @@ class FuseGemmsMixedChildren(BaseTransform):
                 if len(lin_children) < 2:
                     continue
                 # Bound the fused output width to keep the transient weight-concat
-                # allocation small (avoids the unrestricted fuse_gemms OOM).
+                # allocation small (avoids the unrestricted fuse_gemms OOM). Skipped
+                # when any member's weight was unresolvable during grouping.
                 if max_out is not None:
-                    total_out = 0
-                    for n in lin_children:
-                        wname = extract_weight_name(n)
-                        try:
-                            total_out += gm.get_parameter(wname).size(0)
-                        except (AttributeError, KeyError, TypeError):
-                            total_out = None
-                            break
+                    sizes = [out_sizes[n] for n in lin_children]
+                    total_out = None if any(s is None for s in sizes) else sum(sizes)
                     if total_out is not None and total_out > max_out:
                         ad_logger.debug(
                             f"Skipping mixed-children fusion of {len(lin_children)} GEMMs: "
                             f"fused out_features {total_out} exceeds bound {max_out}"
                         )
                         continue
-                # Unique key_prefix so the registered fused params never collide with the
-                # generic "fused_weight_{idx}" that fuse_gemms / fuse_replicated_bf16_linear
-                # also register (a collision silently overwrites this transform's params).
+                # Unique key_prefix so the registered fused params never collide with
+                # other transforms reusing these helpers (a collision silently
+                # overwrites the earlier transform's params).
                 if is_linear_op(lin_children[0]):
                     if _insert_fused_gemm(
                         gm,
@@ -818,29 +817,15 @@ class FuseFineGrainedFP8Gemms(QuantizationFusionMixin, BaseTransform):
 class FuseReplicatedBf16Linear(BaseTransform):
     """Merge sibling *replicated* bf16 linear projections that read the same activation.
 
-    Some MLA models (DeepSeek-V4, etc.) launch several small, un-sharded bf16 GEMVs on
-    the *same* activation tensor within one decoder layer. On a DeepSeek-V4 ratio-4
-    (sparse-attention) layer the layer input ``hidden_states`` feeds five independent
-    ``tp_mode="none"`` (replicated) bf16 ``torch_linear_simple`` projections:
-
-      * ``attn.compressor.wkv`` + ``attn.compressor.wgate``      ([2*head_dim, hidden])
-      * ``attn.indexer.weights_proj``                            ([index_n_heads, hidden])
-      * ``attn.indexer.compressor.wkv`` + ``.wgate``             ([2*index_head_dim, hidden])
-
-    (ratio-128 layers carry only the ``attn.compressor`` pair; the FP8 ``wq_a/wkv`` and
-    the replicated index-score ``indexer.wq_b`` are separate quantized ops and are never
-    grouped here.) At batch=1 decode each is an ``M=1`` GEMV so CTA-starved that cuBLASLt
-    falls back to a split-K + reduce pair to fill the GPU; the layer therefore pays five
-    launches (and their split-K reduces) for what is one shared read of ``hidden_states``.
-
-    This transform groups replicated (``tp_mode="none"``), bias-free bf16
-    ``torch_linear_simple`` nodes by their shared input node and, for every group with
-    >= 2 members, concatenates the weights along dim 0 into one ``[sum_N, K]`` projection,
-    issues a single GEMV, and splits the result back with zero-copy ``torch.narrow`` views
-    (:func:`_insert_fused_gemm` with ``allow_not_contigous=True``). Concatenating output
-    rows is reference-exact: every output row's ``K``-reduction is unchanged, and each
-    consumer immediately casts its slice to fp32 (``.float()``), materializing the strided
-    view before further use.
+    Groups replicated (``tp_mode="none"``), bias-free bf16 ``torch_linear_simple``
+    nodes by their shared input node and, for every group with >= 2 members,
+    concatenates the weights along dim 0 into one ``[sum_N, K]`` projection, issuing
+    a single GEMV and splitting the result back with zero-copy ``torch.narrow`` views
+    (:func:`_insert_fused_gemm` with ``allow_not_contigous=True``). Row concatenation
+    is reference-exact: every output row's ``K``-reduction is unchanged. Canonical
+    target: DeepSeek-V4 sparse-attention layers, where several CTA-starved ``M=1``
+    decode GEMVs (attn/indexer compressor ``wkv``/``wgate``, indexer
+    ``weights_proj``) all read the layer ``hidden_states``.
 
     Scope is deliberately narrow to avoid the model-wide OOM that disables ``fuse_gemms``
     (issue #4674): only ``tp_mode="none"`` (never-sharded, small) replicated weights are
@@ -888,24 +873,24 @@ class FuseReplicatedBf16Linear(BaseTransform):
 
         idx = -1
         num_matches = 0
-        num_removed = 0
         with cuda_memory_tracker():
             for parent_node, lin_children in groups.items():
                 if len(lin_children) < 2:
                     continue
+                # Unique key_prefix: _insert_fused_gemm's default "fused_weight" would
+                # collide with other transforms reusing the helper (the later setattr
+                # silently overwrites the earlier fused param).
                 if _insert_fused_gemm(
-                    gm, idx := idx + 1, parent_node, lin_children, allow_not_contigous=True
+                    gm,
+                    idx := idx + 1,
+                    parent_node,
+                    lin_children,
+                    allow_not_contigous=True,
+                    key_prefix="replicated_bf16_fused_weight",
                 ):
                     num_matches += 1
-                    num_removed += len(lin_children) - 1
 
         torch.cuda.empty_cache()
-
-        if num_matches:
-            ad_logger.info(
-                f"fuse_replicated_bf16_linear: merged {num_matches} replicated bf16 linear "
-                f"group(s), removed {num_removed} GEMV launch(es) per forward"
-            )
 
         info = TransformInfo(
             skipped=(num_matches == 0),

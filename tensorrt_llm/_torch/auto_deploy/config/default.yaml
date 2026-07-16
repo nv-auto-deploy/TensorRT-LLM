@@ -164,13 +164,10 @@ transforms:
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
   # Fuse sibling quantized projections that read the same activation into one
-  # concatenated GEMM + narrow views. Scoped to fake-quantized groups (fp8_only)
-  # with a bounded fused output width to avoid the unrestricted fuse_gemms OOM
-  # (issue #4674). On DeepSeek-V4 this merges the FineGrained-FP8 attn wq_a+wkv,
-  # wq_b+indexer.wq_b, and shared-expert w1+w3 matmuls (each also drops one
-  # activation-quant), collapsing CTA-starved B=1 decode GEMVs. Runs before
-  # fuse_fp8_act_quant_cse, which then no-ops on the
-  # already-merged groups. Replicated bf16 GEMVs stay with fuse_replicated_bf16_linear.
+  # concatenated GEMM + narrow views (DeepSeek-V4: attn wq_a+wkv, wq_b+indexer.wq_b,
+  # shared-expert w1+w3). fp8_only + max_fused_out_features scope the transform to
+  # avoid the unrestricted fuse_gemms OOM (issue #4674); replicated bf16 GEMVs stay
+  # with fuse_replicated_bf16_linear.
   fuse_gemms_mixed_children:
     stage: post_load_fusion
     enabled: true
@@ -211,20 +208,15 @@ transforms:
     # W8A8 GEMV/split-K kernel prologues (op-internal flag, no graph rewrite;
     # bit-exact, ue8m0-only). Prefill and non-decode shapes are unaffected.
     w8a8_quant_prologue: true
-  # DeepSeek-V4-only optimization. The matcher proves the complete fused wq_a+wkv
-  # projection shape and Q1024/KV(448+64) fanout, then replaces only the Q-LoRA BF16
-  # torch_rmsnorm decomposition with one fixed-BF16 kernel. Projection and KV behavior
-  # are unchanged. The exact DSV4 op provenance makes this a no-op for other models,
-  # so no model- or campaign-specific flag is needed.
+  # DeepSeek-V4-only: replace the Q-LoRA BF16 torch_rmsnorm decomposition with one
+  # fixed-BF16 kernel. The matcher's exact DSV4 op provenance makes this a no-op for
+  # other models, so no model-specific flag is needed.
   fuse_deepseek_v4_q_rmsnorm:
     stage: post_load_fusion
     run_shape_prop: true
-  # Merge sibling replicated (tp_mode="none") bf16 linear projections that read the same
-  # activation into one multi-output projection + narrow slices (e.g. DeepSeek-V4 sparse
-  # layers: attn/indexer compressor wkv+wgate and indexer weights_proj all read the layer
-  # hidden_states). Collapses several CTA-starved M=1 decode GEMVs (and their split-K
-  # reduces) into one. Scoped to small replicated weights to avoid the model-wide
-  # fuse_gemms OOM. run_shape_prop populates meta on the merged matmul + narrow nodes.
+  # Merge sibling replicated (tp_mode="none") bf16 linear projections that read the
+  # same activation into one projection + narrow slices (DeepSeek-V4 sparse layers).
+  # Scoped to small replicated weights to avoid the model-wide fuse_gemms OOM.
   fuse_replicated_bf16_linear:
     stage: post_load_fusion
     run_shape_prop: true
@@ -257,20 +249,16 @@ transforms:
   fuse_collinear_allreduce:
     stage: post_load_fusion
     requires_shape_prop: true
-  # Fold the merge add feeding a distributed all_reduce into the producing
-  # bias-free block-FP8 linear's epilogue (one kernel writes the collective's
-  # input buffer directly, bit-exact). Runs AFTER fuse_collinear_allreduce,
-  # which creates the canonical match: DeepSeek-V4's per-MoE-layer
-  # ``AR(routed_moe_out + shared_down_proj_out)`` seam.
+  # Fold the merge add feeding a distributed all_reduce into the producing bias-free
+  # block-FP8 linear's epilogue (bit-exact). Must run AFTER fuse_collinear_allreduce,
+  # which creates the canonical DeepSeek-V4 MoE-seam match.
   fuse_fp8_linear_allreduce_add:
     stage: post_load_fusion
     requires_shape_prop: true
-  # Fuse the clamped-SwiGLU + down-input act-quant chain between a merged block-FP8
-  # gate/up projection and its down projection (DeepSeek-V4 shared experts: the
-  # generic SwiGLU matcher cannot span the clamp/FP32-cast nodes) into one Triton
-  # kernel feeding the matmul-only prequant down linear. Bit-exact. Runs AFTER
-  # fuse_fp8_linear_allreduce_add so the down projection is matched in its final
-  # (residual-add) form and that fusion's collective-input epilogue is preserved.
+  # Fuse the clamped-SwiGLU + down-input act-quant chain of a merged block-FP8
+  # gate/up projection into one Triton kernel (bit-exact; DeepSeek-V4 shared
+  # experts). Must run AFTER fuse_fp8_linear_allreduce_add so the down projection
+  # is matched in its final (residual-add) form.
   fuse_fp8_swiglu_act_quant:
     stage: post_load_fusion
     run_shape_prop: true

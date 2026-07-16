@@ -171,7 +171,7 @@ def test_prequant_residual_add_matches_fused_op():
         ref = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add(
             x, w, None, [], [ws], [], [], input_scale_fmt=fmt, residual=residual
         )
-        q, s = torch.ops.auto_deploy.torch_fp8_finegrained_act_quant(x, BLOCK_SIZE, fmt)
+        q, s = _safe_act_quant(x, BLOCK_SIZE, fmt)
         got = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add_prequant(
             q, s, w, None, [ws], residual
         )

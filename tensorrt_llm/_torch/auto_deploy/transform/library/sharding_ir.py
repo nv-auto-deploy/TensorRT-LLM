@@ -67,6 +67,7 @@ from .sharding import (
     SplitDimension,
     _get_dist_ops,
     _load_hook,
+    _register_split_load_hook,
     _shard_fp4_weight_scale,
     resolve_plain_allreduce_strategy,
     shard_weight_tensor,
@@ -1459,27 +1460,13 @@ class StackedMoEShardableNode(ShardableNode):
             setattr(submod, attr_name, local_tensor)
 
         arg.meta["val"] = local_tensor
-        f_split = partial(cls._slice_experts, lo=lo, hi=hi)
-        hook = partial(
-            _load_hook,
-            f_split=f_split,
-            param_key=attr_name,
-            param_shape=local_tensor.shape,
+        _register_split_load_hook(
+            submod,
+            partial(cls._slice_experts, lo=lo, hi=hi),
+            attr_name,
+            local_tensor.shape,
+            {"type": "shard_ep_expert_slice", "lo": int(lo), "hi": int(hi)},
         )
-        # The f_split closure (a partial over a bound classmethod) is not
-        # JSON-serializable, so attach an explicit reconstruction spec; otherwise
-        # the pipeline cache treats the hook as unrecognized and skips saving.
-        mark_pipeline_cache_hook(
-            hook,
-            {
-                "type": "shard_ep_expert_slice",
-                "param_key": attr_name,
-                "param_shape": list(local_tensor.shape),
-                "lo": int(lo),
-                "hi": int(hi),
-            },
-        )
-        submod._register_load_state_dict_pre_hook(hook)
         invalidate_weight_node_cache(gm)
         return arg
 
@@ -1850,6 +1837,12 @@ class ApplyShardingHints(BaseTransform):
                         shardable_node, (MoEShardableNode, StackedMoEShardableNode)
                     ):
                         continue
+                    # layer_type hint (None when the op schema has no such arg),
+                    # shared by the LM-head trigger and shard_layers filter below.
+                    is_lin = is_any_lin_op(node)
+                    lt = None
+                    if is_lin or shard_layers is not None:
+                        [lt] = extract_op_args(node, "layer_type")
                     # Gather-shard the LM-head vocab projection (column split +
                     # all_gather) regardless of shard_layers -- the hint-driven
                     # sharder would otherwise leave it replicated, so every rank
@@ -1857,8 +1850,7 @@ class ApplyShardingHints(BaseTransform):
                     # step. Triggered either by a model-emitted layer_type="lm_head"
                     # hint (e.g. DeepSeek-V4 head) or a simple_shard_filter
                     # weight-name match.
-                    if is_any_lin_op(node):
-                        [lt] = extract_op_args(node, "layer_type")
+                    if is_lin:
                         gather_head = lt == "lm_head"
                         if not gather_head and simple_shard_filter:
                             wnodes = extract_weight_nodes(node)
@@ -1867,11 +1859,9 @@ class ApplyShardingHints(BaseTransform):
                         if gather_head:
                             num_updates += _simple_shard_node(gm, node, dc)
                             continue
-                    if shard_layers is not None:
-                        [lt] = extract_op_args(node, "layer_type")
-                        if lt is not None and lt not in shard_layers:
-                            num_skipped += 1
-                            continue
+                    if shard_layers is not None and lt is not None and lt not in shard_layers:
+                        num_skipped += 1
+                        continue
 
                     num_updates += shardable_node.apply(gm, dc, max_num_tokens)
 

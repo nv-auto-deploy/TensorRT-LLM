@@ -15,26 +15,13 @@
 
 """Fused Hadamard-rotate + fake-FP4 activation-quant custom op for DeepSeek-V4.
 
-The DeepSeek-V4 indexer quantizes its query (and the rotated compressor output)
-with ``fake_fp4_act_quant(hadamard_rotate(x), block_size=32)`` at two sites in
-``modeling_deepseek_v4.py``. In eager/decomposed form that composite is a swarm
-of tiny launch-bound kernels per call:
-
-* ``hadamard_rotate`` is a ``log2(dim)``-stage Walsh-Hadamard butterfly. Each
-  stage emits an ``add``, a ``sub`` and a ``cat`` (``CatArrayBatchedCopy``), plus
-  a leading ``.float()`` and a trailing ``* dim**-0.5`` / ``.to(dtype)`` — ~15
-  ``elementwise`` + ~9 ``copy_cast`` kernels for ``dim=128`` (7 stages).
-* ``fake_fp4_act_quant`` is a ~15-op chain: ``.float()``, per-block ``abs``/
-  ``amax`` (a ``reduce``), ``ceil_pow2_scale`` (clamp/div/log2/ceil/exp2),
-  ``clamp``, ``abs``, a 7-level ``torch.where`` ladder, ``sign``, two ``mul`` and
-  a final ``.to(dtype)`` — ~18 ``elementwise`` + 1 ``reduction`` + 2 ``copy_cast``.
-
-This op collapses the whole ~30-40-kernel chain into a *single* Triton kernel:
-one program per ``dim``-length row loads the row, runs the Hadamard butterfly and
-the FP4 quant entirely in registers (fp32), and stores the result. The fp32 math
-mirrors the reference exactly (including the intermediate ``bf16`` round-trip the
-reference incurs between ``hadamard_rotate``'s ``.to(dtype)`` and
-``fake_fp4_act_quant``'s ``.float()``), so the result is bit-identical.
+Collapses the indexer's ``fake_fp4_act_quant(hadamard_rotate(x), block_size=32)``
+composite (a ~30-40-kernel eager swarm at its two ``modeling_deepseek_v4.py``
+sites) into a *single* Triton kernel: one program per ``dim``-length row runs
+the Walsh-Hadamard butterfly and the FP4 quant entirely in fp32 registers. The
+math mirrors the reference exactly — including the intermediate ``bf16``
+round-trip the reference incurs between ``hadamard_rotate``'s ``.to(dtype)``
+and ``fake_fp4_act_quant``'s ``.float()`` — so the result is bit-identical.
 
 Triton (3.x) loop induction variables are runtime tensors, so the butterfly is
 unrolled with compile-time ``if DIM >= 2**(s+1)`` guards calling a ``constexpr``

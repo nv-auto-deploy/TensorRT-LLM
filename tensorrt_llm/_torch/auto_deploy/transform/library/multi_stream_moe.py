@@ -438,12 +438,9 @@ class MultiStreamMOE(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        # Ensure that aux stream and events for the current device are added to the
-        # CudaStreamManager (the singleton already registers the import-time device;
-        # the guard avoids a re-add warning on every graph module).
-        device = torch.cuda.current_device()
-        if device not in cuda_stream_manager.devices:
-            cuda_stream_manager.add_device(device)
+        # Ensure aux stream and events for the current device exist in the
+        # CudaStreamManager (add_device is a no-op for already-added devices).
+        cuda_stream_manager.add_device(torch.cuda.current_device())
         gm, num_matches = _execute_shared_expert_in_aux_stream(gm, moe_ops)
         info = TransformInfo(
             skipped=False,

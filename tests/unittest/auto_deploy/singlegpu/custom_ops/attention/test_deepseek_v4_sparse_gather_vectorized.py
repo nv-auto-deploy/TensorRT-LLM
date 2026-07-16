@@ -134,12 +134,11 @@ def _ref_gather_paged_rows_from_positions(
     cu_num_pages_host: torch.Tensor,
     cache_loc_host: torch.Tensor,
     dtype: torch.dtype,
-    width=None,
 ):
     positions_host = positions.detach().cpu().to(torch.long).flatten()
     rows = []
     valid_rows = []
-    row_width = cache.shape[-1] if width is None else width
+    row_width = cache.shape[-1]
     zero = cache.new_zeros(row_width)
     for logical_pos_tensor in positions_host:
         logical_pos = int(logical_pos_tensor.item())
@@ -149,10 +148,7 @@ def _ref_gather_paged_rows_from_positions(
             page_id, page_offset = _host_page_id_and_offset(
                 cache, seq_idx, logical_pos, cu_num_pages_host, cache_loc_host
             )
-            row = cache[page_id, page_offset]
-            if width is not None:
-                row = row[..., :width]
-            rows.append(row.to(dtype))
+            rows.append(cache[page_id, page_offset].to(dtype))
         else:
             rows.append(zero.to(dtype))
 
@@ -243,9 +239,8 @@ _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
     "pos_shape",
     [(0,), (1,), (7,), (3, 4), (2, 5)],
 )
-@pytest.mark.parametrize("width", [None, 3])
-def test_gather_paged_rows_bit_exact(device, tokens_per_block, pos_shape, width):
-    torch.manual_seed(hash((tokens_per_block, pos_shape, width)) & 0xFFFF)
+def test_gather_paged_rows_bit_exact(device, tokens_per_block, pos_shape):
+    torch.manual_seed(hash((tokens_per_block, pos_shape)) & 0xFFFF)
     num_seq = 3
     pages_per_seq = 6
     cu_num_pages, cache_loc, total_pages = _build_page_table(
@@ -269,10 +264,10 @@ def test_gather_paged_rows_bit_exact(device, tokens_per_block, pos_shape, width)
 
     for seq_idx in range(num_seq):
         ref_rows, ref_valid = _ref_gather_paged_rows_from_positions(
-            cache, seq_idx, positions, cu_num_pages, cache_loc, torch.bfloat16, width=width
+            cache, seq_idx, positions, cu_num_pages, cache_loc, torch.bfloat16
         )
         new_rows, new_valid = M._gather_paged_rows_from_positions(
-            cache, seq_idx, positions, cu_num_pages, cache_loc, torch.bfloat16, width=width
+            cache, seq_idx, positions, cu_num_pages, cache_loc, torch.bfloat16
         )
         assert new_rows.shape == ref_rows.shape, (seq_idx, ref_rows.shape, new_rows.shape)
         assert new_valid.shape == ref_valid.shape

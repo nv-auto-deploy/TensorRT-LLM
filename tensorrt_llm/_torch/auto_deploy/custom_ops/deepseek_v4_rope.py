@@ -13,32 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused interleaved-RoPE + concat custom op for DeepSeek-V4.
+"""Fused interleaved-RoPE + concat custom ops for DeepSeek-V4.
 
-``_apply_interleaved_rope`` in ``modeling_deepseek_v4.py`` does an even/odd split,
-4 muls + 1 add + 1 sub, a ``stack`` and a ``flatten`` (the ``stack`` itself emits a
-``CatArrayBatchedCopy``), then a ``.to(dtype)`` cast — and every call site is
-immediately followed by ``torch.cat((nope, pe))`` to repack the head. In eager /
-decomposed form each call therefore emits ~6 tiny ``elementwise`` kernels plus
-``stack`` / ``cat`` ``copy_cast`` kernels, run up to 5x per layer per step (main
-q/kv/out, the compressor, and the indexer query).
-
-This op collapses the rotation **and** the nope/pe concat into a *single* Triton
-kernel: one program per ``(position, head)`` row copies the ``nope`` slice through
-and writes the interleaved-rotated ``pe`` slice contiguously next to it — no
-intermediate ``stack``, no ``cat``. All rotation math stays in fp32 (matching the
-reference's bf16*fp32 type promotion).
+Collapses ``_apply_interleaved_rope`` plus the ``torch.cat((nope, pe))`` that
+follows every call site (up to 5x per layer per step) into a *single* Triton
+kernel: one program per ``(position, head)`` row copies the ``nope`` slice
+through and writes the interleaved-rotated ``pe`` slice contiguously next to
+it. All rotation math stays in fp32 (matching the reference's bf16*fp32 type
+promotion).
 
 The kernel name contains ``rope`` on purpose so the collapsed work classifies
 under the ``rope`` op-type and leaves the ``elementwise`` / ``copy_cast`` buckets.
 
-The main-Q path additionally normalizes each head with a weightless RMS norm
-(``q *= rsqrt(mean(q^2) + eps).to(q.dtype)``) immediately before the split/rope.
-Passing ``rms_eps > 0`` folds that reduction/elementwise chain into this same
-kernel: the sum-of-squares is gathered over the full ``nope || pe`` head, the
-rsqrt factor is rounded to the output dtype (matching the reference
-``.to(q.dtype)``), and each normalized value is materialized in the output dtype
-before RoPE — bit-faithful to running the norm as a separate pre-split step.
+Passing ``rms_eps > 0`` (main-Q path) additionally folds the pre-split
+weightless per-head RMS norm ``q *= rsqrt(mean(q^2) + eps).to(q.dtype)`` into
+the same kernel — bit-faithful: the rsqrt factor is rounded to the output dtype
+(matching the reference ``.to(q.dtype)``) and each normalized value is
+materialized in the output dtype before RoPE reads it back.
 """
 
 import torch
@@ -219,21 +210,13 @@ def _deepseek_v4_fused_rope_concat_fake(
 # KV front-end: weighted RMS norm + no-PE fake-FP8 quant + interleaved RoPE    #
 # --------------------------------------------------------------------------- #
 #
-# The main-KV path in ``modeling_deepseek_v4.py`` runs, back to back:
-#   ``kv = kv_norm(kv)``            (weighted RMS norm over the full head, an
-#                                    ``auto_deploy::torch_rmsnorm`` custom op that
-#                                    decomposes into a reduction + several
-#                                    elementwise + copy_cast kernels at runtime),
-#   ``kv_nope, kv_pe = split(kv)``  (nope/pe split of the normed head),
-#   ``kv_nope = fake_fp8_act_quant(kv_nope, 64)``  (a fused ``other``-bucket kernel),
-#   ``deepseek_v4_fused_rope_concat(kv_nope, kv_pe, cos, sin)``  (the proven op).
+# ``deepseek_v4_kv_norm_rope_concat`` collapses the main-KV chain
+# ``kv_norm -> nope/pe split -> fake_fp8_act_quant(nope) ->
+# deepseek_v4_fused_rope_concat`` into one kernel: it takes the *raw* (pre-norm)
+# split views + the norm weight and writes ``cat((fp8(nope), rope(pe)))``.
 #
-# ``deepseek_v4_kv_norm_rope_concat`` collapses all four into a single kernel: it
-# takes the *raw* (pre-norm) split views + the norm weight, normalizes the full
-# ``nope || pe`` head, fake-FP8-quantizes the nope slice per block, interleaved-
-# rotates the pe slice, and writes ``cat((fp8(nope), rope(pe)))`` — no separate
-# normed-kv tensor, no fp8 buffer, one launch. Every rounding point is reproduced
-# bit-for-bit (see below and ``test_deepseek_v4_kv_norm_rope_concat.py``):
+# Numerics contract — every rounding point is reproduced bit-for-bit (see
+# ``test_deepseek_v4_kv_norm_rope_concat.py``):
 #   * RMS norm — ``torch_rmsnorm`` semantics: ``variance = mean(x^2)`` in fp32, an
 #     *unrounded* fp32 ``rsqrt`` factor, then ``round(normed_bf16) -> * weight(fp32)
 #     -> round_bf16`` (two rounding points, matching
@@ -243,8 +226,7 @@ def _deepseek_v4_fused_rope_concat_fake(
 #     ``(clamp(x/scale, -448, 448) -> bf16 -> fp32) * scale -> bf16`` — identical to
 #     ``deepseek_v4_fake_fp8_act_quant``.
 # The name contains ``rope`` so the collapsed work stays in the ``rope`` op-type
-# bucket (net-flat rope count) while the norm/fp8 kernels leave the reduction /
-# elementwise / copy_cast / other buckets.
+# bucket while the norm/fp8 kernels leave their original buckets.
 
 
 @triton.jit

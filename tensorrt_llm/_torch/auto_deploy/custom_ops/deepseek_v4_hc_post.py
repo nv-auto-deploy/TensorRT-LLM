@@ -17,35 +17,19 @@
 
 The HC ``_hc_post`` step in ``modeling_deepseek_v4.py`` re-mixes the sublayer
 output ``x`` (``[..., H]``) back into the ``hc_mult``-wide residual stream
-``residual`` (``[..., hc_mult, H]``) using the per-token ``post`` gate
-(``[..., hc_mult]``) and the doubly-stochastic ``comb`` matrix
-(``[..., hc_mult, hc_mult]``)::
+``residual`` (``[..., hc_mult, H]``)::
 
     y = post.unsqueeze(-1) * x.unsqueeze(-2)  # [.., hc_mult, H]
     y = y + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)  # mix over streams
     return y.to(x.dtype)
 
-In eager / decomposed form this emits two *broadcast* muls — one over the
-``[N, hc_mult, H]`` post product and a much larger one over the
-``[N, hc_mult, hc_mult, H]`` comb product — plus an ``M``-axis ``sum`` reduce,
-an ``add``, and a bf16 ``cast``. The comb product alone materializes an
-``hc_mult * hc_mult * H`` fp32 intermediate in HBM (for DeepSeek-V4-Flash
-``hc_mult=4``, ``H=4096`` -> 256 KB / token) that is then read straight back by
-the reduce. The whole tail runs *twice* per layer per step and lands squarely in
-the decode ``elementwise`` + ``reduction`` tiny-kernel sea, where each launch
-pays a GPU execution floor not hidden by CUDA graphs.
-
-This op collapses the entire chain into a *single* Triton kernel. Writing the
-per-token, per-output-stream math as::
+This op collapses that chain into a *single* Triton kernel computing::
 
     y[n, o, h] = post[n, o] * x[n, h] + sum_m comb[n, m, o] * residual[n, m, h]
 
-each program loads the ``hc_mult`` residual streams for its ``H`` tile *once*
-into fp32 registers, then accumulates all ``hc_mult`` output streams in fp32 —
-the ``[hc_mult, hc_mult, H]`` broadcast product is **never** materialized in
-HBM. One launch instead of ~5, and the 16x-hidden fp32 intermediate write+read
-is eliminated. The arithmetic mirrors the reference (fp32 accumulate, single
-bf16 store), differing only in the float reduction association.
+with the ``[hc_mult, hc_mult, H]`` broadcast product **never** materialized in
+HBM. The arithmetic mirrors the reference (fp32 accumulate, single bf16
+store), differing only in the float reduction association.
 
 The kernel name (``_hc_post_compose_kernel``) deliberately avoids every op-type
 regex (no ``sum`` / ``mean`` / ``reduce`` / ``mul`` / ``add`` / ``cast`` /
@@ -53,6 +37,7 @@ regex (no ``sum`` / ``mean`` / ``reduce`` / ``mul`` / ``add`` / ``cast`` /
 ``reduction`` / ``copy_cast`` buckets entirely.
 """
 
+import math
 from typing import Tuple
 
 import torch
@@ -69,41 +54,23 @@ def _hc_post_launch_config(n: int, hc_mult: int):
     """Pick ``(num_warps, num_stages, block_h, o_per_cta)`` for the kernel launch.
 
     The kernel grid is ``(n, cdiv(HM, O_PER_CTA), cdiv(H, BLOCK_H))``. ``O_PER_CTA``
-    is how many of the ``HM`` output residual streams each CTA computes — the
-    *output-stream* (``hc_mult``) tiling of the ``[hc_mult, H]`` per-token output:
+    is how many of the ``HM`` output residual streams each CTA computes:
 
-      * ``O_PER_CTA == HM`` -> one CTA computes **all** streams (loads the
-        ``[HM, BLOCK_H]`` residual tile **once**, reuses it). Minimum HBM traffic.
-      * ``O_PER_CTA == 1``  -> ``HM`` CTAs per (token, H-tile), each computing one
-        stream (so each re-loads the full residual tile -> ``HM``x redundant
-        residual reads, but ``HM``x more CTAs / in-flight warps).
+      * ``n <= 16`` (decode) -> ``O_PER_CTA=1``: the all-streams launch starves
+        the GPU of CTAs, so the output-stream axis is split onto the grid for
+        ``HM``x more CTAs *without* fragmenting the coalesced H-tile loads (a
+        finer ``BLOCK_H`` fragments them and is worse). Bit-identical: each
+        stream's fp32 reduction is unchanged, only its owning CTA differs.
+      * ``n > 16`` (prefill) -> ``O_PER_CTA=HM``: ample CTAs already, so loading
+        the ``[HM, BLOCK_H]`` residual tile once (instead of ``HM``x redundant
+        reads) wins sharply.
 
-    Microbench (CUDA-graph stacked amortized timing) on B200 (H=4096, hc_mult=4):
-
-      * ``n <= 16`` (decode, incl. the primary concurrency-1 tpot shape) ->
-        ``O_PER_CTA=1``, ``BLOCK_H=512``, ``nw=2``. The all-streams launch only
-        fills ``8n`` CTAs (``cdiv(4096,512)=8`` H-tiles), so for small ``n`` the
-        GPU is starved of in-flight warps and the single token is bound by one
-        CTA's serial load->reduce->store tail. Splitting the output-stream axis
-        onto the grid gives ``4x`` the CTAs *without* fragmenting the (coalesced,
-        full-width) H-tile loads — unlike a finer ``BLOCK_H``, which fragments the
-        loads and is non-monotonically worse. Result: **n=1 1.75us -> 1.37us
-        (-22%)** (bit-identical: each stream's fp32 reduction is unchanged, only
-        its owning CTA differs). The win tapers as ``n`` fills the GPU on its own
-        (n=1 -22%, n=8 -18%, n=16 -8%), crossing over near n~24.
-      * ``n > 16`` (prefill, up to n=1000) -> ``O_PER_CTA=HM``, ``BLOCK_H=512``,
-        ``nw=2``. Here ``n`` already supplies ample CTAs, so the ``HM``x redundant
-        residual reads of ``O_PER_CTA=1`` dominate and regress sharply
-        (``O_PER_CTA=1`` is +73% at n=256, +114% at n=1000). Loading the residual
-        tile once is best (3.2us at n=256, 8.4us at n=1000).
-
-    ``nw=4/8`` regress the decode o-split path badly (2.2us / 3.7us at n=1) and
-    ``num_stages`` is pinned to 2 (the unrolled ``HM`` loop gains nothing from more
-    pipeline stages). Chosen deterministically rather than via ``@triton.autotune``
-    because these sub-floor kernels defeat the autotuner's ``do_bench`` (it
-    resolves the host launch cadence, not GPU time) and the model's varying
-    prefill token counts would otherwise force a synchronizing re-tune each shape
-    (cf. sibling ``_hc_weighted_combine_kernel``).
+    ``nw=4/8`` regress the decode o-split path; ``num_stages`` is pinned to 2
+    (the unrolled ``HM`` loop gains nothing from more stages). Chosen
+    deterministically rather than via ``@triton.autotune`` because these
+    sub-floor kernels defeat the autotuner's ``do_bench`` (it resolves the host
+    launch cadence, not GPU time) and varying prefill token counts would force
+    a synchronizing re-tune per shape (cf. sibling ``_hc_weighted_combine_kernel``).
     """
     if n <= 16:
         return 2, 2, 512, 1
@@ -190,21 +157,15 @@ def _hc_post_compose_kernel(
 #
 # Every ``_hc_post`` output is immediately re-read by the *next* HC-pre's
 # ``_hc_fn_partials_kernel`` (attn-post -> ffn-pre, ffn-post -> next layer's
-# attn-pre, last ffn-post -> ``_hc_head``). At decode that is two back-to-back
-# launches over the same ``[N, HM * H]`` tensor. This op merges them: the fused
-# kernel adopts the partials kernel's ``(N, SPLIT)`` grid / CHUNK layout /
-# ``num_warps`` and, per D-chunk, composes the hc_post output in registers
-# (identical per-element math and ``m``-axis reduce as
-# ``_hc_post_compose_kernel``), stores the bf16 residual, then computes the
-# next site's square-sum + hc_fn dot partials from the *rounded* value —
-# exactly what the standalone partials kernel would have re-loaded from HBM.
-# Both outputs match the two-kernel sequence to ~1-2 fp32 ULP (ptxas contracts
-# the mul+add chains into FMAs differently across kernel bodies; measured 1 /
-# 16384 output elements and ~45 / 3200 partials at the model shape, warp-count
-# invariant) — the same numerics contract as the landed
-# ``deepseek_v4_hc_pre_mix_combine`` front. One launch and the ``[N, HM * H]`` HBM
-# re-read are removed per seam.
+# attn-pre, last ffn-post -> ``_hc_head``). This op merges the two launches:
+# per D-chunk it composes the hc_post output in registers, stores the bf16
+# residual, then computes the next site's square-sum + hc_fn dot partials from
+# the *rounded* value — exactly what the standalone partials kernel would have
+# re-loaded from HBM.
 #
+# Numerics contract: both outputs match the two-kernel sequence to ~1-2 fp32
+# ULP (ptxas contracts the mul+add chains into FMAs differently across kernel
+# bodies; warp-count invariant) — the same contract as the fused HC-pre front.
 # At prefill (n > _HC_PRE_MIX_FUSED_N_MAX) the downstream HC-pre takes its
 # eager cublas front and never reads partials, so this op runs the unchanged
 # ``_hc_post_compose_kernel`` and returns the partials buffer unfilled.
@@ -321,9 +282,7 @@ def deepseek_v4_hc_post_next_partials(
     lead = list(x.shape[:-1])
     H = x.shape[-1]
     hc_mult = post.shape[-1]
-    n = 1
-    for s in lead:
-        n *= s
+    n = math.prod(lead)
     D = hc_mult * H
     mix_hc = next_hc_fn.shape[0]
     assert next_hc_fn.shape[-1] == D, "next_hc_fn last dim must equal hc_mult * H"
@@ -400,9 +359,7 @@ def _deepseek_v4_hc_post_next_partials_fake(
     H = x.shape[-1]
     hc_mult = post.shape[-1]
     mix_hc = next_hc_fn.shape[0]
-    n = 1
-    for s in lead:
-        n *= s
+    n = math.prod(lead)
     _, split = hc_partials_layout(next_hc_fn.shape[-1])
     out = x.new_empty((*lead, hc_mult, H))
     partials = x.new_empty((n, mix_hc + 1, split), dtype=torch.float32)

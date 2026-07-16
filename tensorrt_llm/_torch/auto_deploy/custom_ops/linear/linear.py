@@ -59,7 +59,7 @@ def simple(
         GQA where ``num_kv_heads < tp_size`` (set to ``head_dim``).
         ``layer_type``: Layer classification for selective sharding via
         ``shard_layers`` config. Values: ``"mha"``, ``"mla"``, ``"mlp"``,
-        ``"moe"``, ``"ssm"``, ``"delta"``, ``"unknown"``.
+        ``"moe"``, ``"ssm"``, ``"delta"``, ``"lm_head"``, ``"unknown"``.
 
     These hint arguments do not change the numeric result of the linear; they only
     guide graph transforms when tensor-parallel sharding is applied.

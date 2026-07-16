@@ -922,26 +922,17 @@ class BMMShardingInfo(ShardingTransformInfo):
                 gm.get_submodule(modname).register_parameter(param_name, param_new)
 
                 # Register load state dict hook
-                hook = partial(
-                    _load_hook,
-                    f_split=slice_tensor,
-                    param_key=weight_key,
-                    param_shape=param_new.shape,
-                )
-                # slice_tensor is a partial (not JSON-serializable), so attach an
-                # explicit reconstruction spec; otherwise the pipeline cache treats
-                # the hook as unrecognized and skips saving.
-                mark_pipeline_cache_hook(
-                    hook,
+                _register_split_load_hook(
+                    gm,
+                    slice_tensor,
+                    weight_key,
+                    param_new.shape,
                     {
                         "type": "shard_slice_first_dim",
-                        "param_key": weight_key,
-                        "param_shape": list(param_new.shape),
                         "start": int(start_idx),
                         "end": int(end_idx),
                     },
                 )
-                gm._register_load_state_dict_pre_hook(hook)
             else:
                 # Handle dynamic tensor
                 with gm.graph.inserting_before(bmm_node):
@@ -1480,6 +1471,34 @@ def _slice_first_dim(t: torch.Tensor, *, start: int, end: int) -> torch.Tensor:
     return t[start:end]
 
 
+def _register_split_load_hook(
+    module: nn.Module,
+    f_split: Callable,
+    param_key: str,
+    param_shape: torch.Size,
+    cache_spec: Dict[str, Any],
+) -> None:
+    """Register a shape-gated ``_load_hook`` split hook on *module*.
+
+    ``f_split`` is typically a partial (not JSON-serializable), so ``cache_spec``
+    attaches an explicit reconstruction spec via ``mark_pipeline_cache_hook``;
+    otherwise the pipeline cache treats the hook as unrecognized and skips saving.
+    ``param_key``/``param_shape`` are added to the spec automatically; the
+    rebuilders in ``transform.pipeline_cache.hooks`` re-derive ``f_split`` from
+    the remaining fields.
+    """
+    hook = partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=param_key,
+        param_shape=param_shape,
+    )
+    mark_pipeline_cache_hook(
+        hook, {**cache_spec, "param_key": param_key, "param_shape": list(param_shape)}
+    )
+    module._register_load_state_dict_pre_hook(hook)
+
+
 def validate_allreduce_strategy(v):
     """Convert string names like 'AUTO' to AllReduceStrategy enum.
 
@@ -1510,13 +1529,11 @@ def validate_allreduce_strategy(v):
     return v  # Let Pydantic handle other types
 
 
-# Static qualification for the small-message ONESHOT allreduce upgrade. Scoped
-# to exactly the measured win: a matched single-node 4-rank TP grid reducing
-# plain-SUM bf16 hidden states of size 4096 — TRT-LLM's ONESHOT kernel measured
-# ~5.5x faster than NCCL at that 8 KiB one-token message, while >= 6144
-# elements measured at NCCL parity. The trtllm op applies the complementary
-# per-call numel gate at runtime, so prefill / multi-token calls on the same
-# graph node keep NCCL (see custom_ops.distributed.trtllm_dist).
+# Static qualification for the small-message ONESHOT allreduce upgrade, scoped
+# to exactly the measured win (single-node 4-rank TP grid, plain-SUM bf16 hidden
+# states of size 4096). See ``ONESHOT_SMALL_STRATEGY`` in
+# ``custom_ops.distributed.trtllm_dist`` for the measured rationale and the
+# complementary per-call numel gate applied at runtime.
 _ONESHOT_SMALL_WORLD_SIZE = 4
 _ONESHOT_SMALL_HIDDEN_SIZE = 4096
 
@@ -2068,30 +2085,21 @@ def _tp_shard_moe_scale(
 
     # Register load hook on the owning submodule so it runs after any
     # parent-level checkpoint format conversion hooks (e.g., fused MoE unfusing).
-    hook = partial(
-        _load_hook,
-        f_split=f_split,
-        param_key=attr_name,
-        param_shape=sharded_scale.shape,
-    )
-    # f_split is a partial (not JSON-serializable), so attach an explicit
-    # reconstruction spec; otherwise the pipeline cache treats the hook as
-    # unrecognized and skips saving. The rebuilder re-derives f_split from
-    # scale_name, mirroring the branching above.
-    mark_pipeline_cache_hook(
-        hook,
+    # The rebuilder re-derives f_split from scale_name, mirroring the branching above.
+    _register_split_load_hook(
+        submod,
+        f_split,
+        attr_name,
+        sharded_scale.shape,
         {
             "type": "shard_tp_moe_scale",
             "scale_name": scale_name,
-            "param_key": attr_name,
-            "param_shape": list(sharded_scale.shape),
             "orig_weight_shape": list(orig_weight_shape),
             "dim": int(dim),
             "rank": rank,
             "world_size": world_size,
         },
     )
-    submod._register_load_state_dict_pre_hook(hook)
 
 
 def _insert_sharded_moe(

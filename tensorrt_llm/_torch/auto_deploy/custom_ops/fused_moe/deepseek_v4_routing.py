@@ -13,32 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused Triton kernel for the DeepSeek V4 MoE router head (sqrtsoftplus scoring).
+"""Fused Triton kernels for the DeepSeek V4 MoE router head (sqrtsoftplus scoring).
 
-The reference ``DeepseekV4MoEGate.forward`` (non-hash layers) runs a chain of
-~6 tiny per-token kernels around the unavoidable top-k:
-
-    scores  = softplus(router_logits).sqrt()        # 2 elementwise
-    biased  = scores + bias                          # 1 elementwise
-    idx     = biased.topk(top_k).indices             # gatherTopK + radixSort/bitonicSort
-    weights = scores.gather(1, idx)                  # gather
-    weights = weights / (weights.sum(-1) + 1e-20)    # reduce + add + div
-    weights = weights * routed_scaling_factor        # mul
-
-At decode (1-2 tokens) every one of these is a launch-bound CUDA-graph node, and
-the top-k/sort kernels alone are ~2% of total decode GPU time (in the
-``reduction`` op-type bucket). This module collapses the whole chain into ONE
-Triton program per token: it computes the sqrtsoftplus scores in registers,
-selects the top-k of ``scores + bias`` via iterative arg-max (no separate sort),
-gathers the (unbiased) scores at the selected experts, renormalizes and scales —
-producing the identical ``(selected_experts, routing_weights)`` pair.
+Collapses the reference ``DeepseekV4MoEGate.forward`` chain — sqrtsoftplus
+scoring, bias-add, top-k, gather, renorm, scale (~6 launch-bound kernels per
+token at decode) — into ONE Triton program per token, selecting the top-k of
+``scores + bias`` via iterative arg-max (no separate sort) and producing the
+identical ``(selected_experts, routing_weights)`` pair.
 
 Note the kernel is deliberately NOT named with ``topk``/``sort``/``sum`` so the
 fused work is reclassified out of the ``reduction`` bucket rather than back into
 it.
 """
 
-import math
 from typing import Tuple
 
 import torch
@@ -158,10 +145,6 @@ def _deepseek_v4_routing_kernel(
         )
 
 
-def _next_power_of_2(n: int) -> int:
-    return 1 << math.ceil(math.log2(max(n, 1)))
-
-
 def deepseek_v4_routing_fn(
     router_logits: torch.Tensor,
     bias: torch.Tensor,
@@ -201,8 +184,8 @@ def deepseek_v4_routing_fn(
     weights = torch.empty((num_tokens, top_k), dtype=w_dtype, device=router_logits.device)
     indices = torch.empty((num_tokens, top_k), dtype=idx_dtype, device=router_logits.device)
 
-    BLOCK_E = _next_power_of_2(num_experts)
-    BLOCK_K = _next_power_of_2(top_k)
+    BLOCK_E = triton.next_power_of_2(num_experts)
+    BLOCK_K = triton.next_power_of_2(top_k)
     grid = (num_tokens,)
 
     # Single-warp launch: every program does an E-wide (~256) reduction repeated
@@ -547,9 +530,7 @@ def deepseek_v4_hash_routing_fn(
     # GEMM when torch has TF32 matmul enabled (the shipping container default).
     tf32_trunc = torch.backends.cuda.matmul.allow_tf32 and num_tokens > 1
 
-    block_h, num_warps = 512, 4
-
-    BLOCK_K = _next_power_of_2(top_k)
+    BLOCK_K = triton.next_power_of_2(top_k)
     grid = (num_tokens,)
     _deepseek_v4_hash_routing_kernel[grid](
         hidden_states,
@@ -579,8 +560,8 @@ def deepseek_v4_hash_routing_fn(
         LOCALIZED=localized,
         TOP_K=top_k,
         BLOCK_K=BLOCK_K,
-        BLOCK_H=block_h,
-        num_warps=num_warps,
+        BLOCK_H=512,
+        num_warps=4,
     )
     return indices, weights
 

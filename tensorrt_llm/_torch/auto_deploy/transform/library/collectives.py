@@ -28,7 +28,7 @@ from torch.fx import GraphModule, Node
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
-from ...utils.node_utils import is_op
+from ...utils.node_utils import extract_op_args, is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
@@ -343,7 +343,6 @@ class FuseCollinearAllreduce(BaseTransform):
         if cnt > 0:
             graph.eliminate_dead_code()
             gm.recompile()
-            ad_logger.info(f"fused {cnt} collinear all_reduce pair(s) -> single all_reduce")
 
         info = TransformInfo(
             skipped=False,
@@ -359,10 +358,10 @@ class FuseCollinearAllreduce(BaseTransform):
 # linear's epilogue so the projection writes the collective's input directly.
 # ============================================================================
 
-# Positional argument order + keyword defaults of
-# ``auto_deploy::torch_fake_quant_finegrained_fp8_linear`` (used to normalize a
-# matched graph node's args/kwargs into the full positional tuple for the fused
-# residual-add variant, whose signature is the same list + trailing ``residual``).
+# Positional argument order of ``auto_deploy::torch_fake_quant_finegrained_fp8_linear``
+# (used to build the full positional tuple for the fused residual-add variant, whose
+# signature is the same list + trailing ``residual``). Values are read schema-driven
+# via ``extract_op_args``, which fills in the op's keyword defaults.
 _FINEGRAINED_FP8_LINEAR_ARG_NAMES = (
     "input",
     "weight_quantized",
@@ -377,13 +376,6 @@ _FINEGRAINED_FP8_LINEAR_ARG_NAMES = (
     "layer_type",
     "input_scale_fmt",
 )
-_FINEGRAINED_FP8_LINEAR_ARG_DEFAULTS = {
-    "tp_mode": "none",
-    "output_sizes": None,
-    "tp_min_local_shape": 1,
-    "layer_type": "unknown",
-    "input_scale_fmt": "",
-}
 
 
 @TransformRegistry.register("fuse_fp8_linear_allreduce_add")
@@ -444,10 +436,12 @@ class FuseFp8LinearAllreduceAdd(BaseTransform):
                 # rewrite (net -1 kernel, not a duplicated matmul).
                 if len(linear.users) != 1:
                     continue
-                vals = dict(zip(_FINEGRAINED_FP8_LINEAR_ARG_NAMES, linear.args))
-                vals.update(linear.kwargs)
-                for name, default in _FINEGRAINED_FP8_LINEAR_ARG_DEFAULTS.items():
-                    vals.setdefault(name, default)
+                vals = dict(
+                    zip(
+                        _FINEGRAINED_FP8_LINEAR_ARG_NAMES,
+                        extract_op_args(linear, *_FINEGRAINED_FP8_LINEAR_ARG_NAMES),
+                    )
+                )
                 # The fused epilogue reproduces add(matmul_out, residual); a bias
                 # would introduce a second, differently-ordered rounding point.
                 if vals.get("bias") is not None:
@@ -486,7 +480,6 @@ class FuseFp8LinearAllreduceAdd(BaseTransform):
         if cnt > 0:
             graph.eliminate_dead_code()
             gm.recompile()
-            ad_logger.info(f"fused {cnt} allreduce-input merge add(s) into block-FP8 linear(s)")
 
         info = TransformInfo(
             skipped=False,
