@@ -1639,7 +1639,7 @@ class FuseMoeRoutingLocalization(BaseTransform):
     """Fold the EP global->local routing localization into the DSV4 router gate ops.
 
     On the trtllm-gen MXFP4 path every ``torch_mxfp4_moe_from_routing[_ep]`` call
-    launches ``deepseek_v4_localize_routing`` (one Triton program per MoE layer per
+    runs a standalone EP localization step (once per MoE layer per
     decode step) to convert the gate's GLOBAL ``(int64 ids, fp32 weights)`` pair
     into the runner's LOCAL dispatch contract: int32 local expert ids with the
     invalid sentinel ``local_experts`` for off-rank routes + zero-masked bf16
@@ -1727,7 +1727,7 @@ class FuseMoeRoutingLocalization(BaseTransform):
         if num_matches:
             ad_logger.info(
                 f"fuse_moe_routing_localization: localized {num_matches} DSV4 MoE gate(s); "
-                f"dropped the standalone deepseek_v4_localize_routing launch per MoE call"
+                f"dropped the standalone routing-localization step per MoE call"
             )
 
         info = TransformInfo(

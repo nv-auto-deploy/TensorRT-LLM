@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from ..._compat import is_sm_100f
+from .deepseek_v4_routing import _localize_routing_eager
 
 # NOTE: ``triton_kernels`` is an optional dependency. The torch-reference MXFP4 ops
 # (``torch_mxfp4_moe`` etc.) must remain importable and usable without it, so all
@@ -327,10 +328,8 @@ def _run_torch_mxfp4_dense_slots(
 ) -> torch.Tensor:
     """All local experts already dequantized; index_select the routed expert per slot.
 
-    Used for large token counts (prefill / warmup), where dequantizing the full
-    expert set once and reusing it across tokens is cheaper than gathering and
-    dequantizing ``num_tokens * top_k`` slots. ``local_expert_idx`` is the clamped
-    [num_tokens, top_k] local index; ``valid_route`` masks out non-local routes.
+    ``local_expert_idx`` is the clamped [num_tokens, top_k] local index;
+    ``valid_route`` masks out non-local routes.
     """
     hidden_size = x.shape[-1]
     output = torch.zeros((x.shape[0], hidden_size), device=x.device, dtype=torch.float32)
@@ -350,59 +349,6 @@ def _run_torch_mxfp4_dense_slots(
                 down_weight.index_select(0, expert_idx), inter.unsqueeze(-1)
             ).squeeze(-1)
             expert_output = expert_output + down_bias.index_select(0, expert_idx).to(torch.float32)
-            route_scale = routing_weights[token_slice, route_idx, None] * valid_route[
-                token_slice, route_idx, None
-            ].to(torch.float32)
-            output[token_slice] = output[token_slice] + expert_output * route_scale
-
-    return output.reshape(*leading_shape, hidden_size).to(output_dtype)
-
-
-def _run_torch_mxfp4_selected_slots(
-    x: torch.Tensor,
-    leading_shape: torch.Size,
-    top_k: int,
-    valid_route: torch.Tensor,
-    routing_weights: torch.Tensor,
-    gate_up_weight: torch.Tensor,
-    gate_up_bias: torch.Tensor,
-    down_weight: torch.Tensor,
-    down_bias: torch.Tensor,
-    alpha: float,
-    limit: float,
-    gate_up_order: str,
-    swiglu_mode: str,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    """Per-slot dequantized weights/biases laid out [num_tokens * top_k, ...].
-
-    One row per (token, route) slot. The slot's expert weight is selected by a plain
-    slice of the [num_tokens, top_k, ...] view instead of an index_select over the
-    full expert set.
-    """
-    hidden_size = x.shape[-1]
-    num_tokens = x.shape[0]
-    output = torch.zeros((num_tokens, hidden_size), device=x.device, dtype=torch.float32)
-
-    gate_up_weight = gate_up_weight.reshape(num_tokens, top_k, *gate_up_weight.shape[1:])
-    down_weight = down_weight.reshape(num_tokens, top_k, *down_weight.shape[1:])
-    gate_up_bias = gate_up_bias.reshape(num_tokens, top_k, -1)
-    down_bias = down_bias.reshape(num_tokens, top_k, -1)
-
-    x_for_bmm = x.unsqueeze(-1)
-    for route_idx in range(top_k):
-        for start in range(0, num_tokens, _TORCH_MXFP4_ROUTED_MOE_TOKEN_CHUNK):
-            end = min(start + _TORCH_MXFP4_ROUTED_MOE_TOKEN_CHUNK, num_tokens)
-            token_slice = slice(start, end)
-            gate_up = torch.bmm(
-                gate_up_weight[token_slice, route_idx], x_for_bmm[token_slice]
-            ).squeeze(-1)
-            gate_up = gate_up + gate_up_bias[token_slice, route_idx]
-            inter = _apply_swiglu(gate_up, alpha, limit, gate_up_order, swiglu_mode)
-            expert_output = torch.bmm(
-                down_weight[token_slice, route_idx], inter.unsqueeze(-1)
-            ).squeeze(-1)
-            expert_output = expert_output + down_bias[token_slice, route_idx]
             route_scale = routing_weights[token_slice, route_idx, None] * valid_route[
                 token_slice, route_idx, None
             ].to(torch.float32)
@@ -451,18 +397,17 @@ def _run_torch_mxfp4_mlp_core(
 
 
 # ---------------------------------------------------------------------------
-# TRT-LLM-Gen W4A16 (bf16-act) MXFP4 MoE decode path (Blackwell / SM100)
+# TRT-LLM-Gen W4A8 (mxfp8-act) MXFP4 MoE path (Blackwell / SM100)
 # ---------------------------------------------------------------------------
 # DSV4-Flash feeds *precomputed* routing (selected_experts / routing_weights, its
 # custom sqrtsoftplus+hash routing stays upstream) to ``torch_mxfp4_moe_from_routing(_ep)``.
-# The torch reference then dequantizes the routed expert slots and runs the SwiGLU MLP in
-# fp32 bmm — the #1 decode-time op (routed off the full-expert dequant; the
-# remaining per-slot dequant+bmm is the dominant residual). The trtllm-gen W4A16 runner
-# ``bf16_mxe2m1_block_scale_moe_runner`` does the same math in one hand-tuned cubin and is
-# 21-28x faster at DSV4 EP=8 decode shapes (microbench), 17x faster than matmul_ogs
-# (which regressed +34%). The kernel consumes mxfp4 weights + bf16 activations
-# directly; precomputed routing is forwarded as topk_ids/topk_weights (used verbatim — PT folds
+# On SM100 the routed MXFP4 MLP runs on the trtllm-gen runner
+# ``mxe4m3_mxe2m1_block_scale_moe_runner``: one hand-tuned cubin consuming mxfp4 weights +
+# mxfp8-quantized activations, 21-28x faster than the fp32 dequant+bmm torch reference at
+# DSV4 EP=8 decode shapes (microbench), 17x faster than matmul_ogs (which regressed +34%).
+# Precomputed routing is forwarded as topk_ids/topk_weights (used verbatim — PT folds
 # routed_scaling_factor into token_final_scales the same way, routing.py:380/419).
+# The torch reference below stays as the non-SM100 fallback / test oracle.
 
 # Kernel-ready (pad/shard/shuffle) weights + per-expert SwiGLU tensors, keyed by raw-weight
 # identity. The prep is expensive (per-expert TMA-layout shuffle) and must run once before
@@ -518,8 +463,6 @@ def _prepare_trtllm_gen_mxfp4_cached(
         down_scales,
         down_bias,
     )
-    # Prepared layout is shared by both trtllm-gen act dtypes (W4A16 bf16 / W4A8 mxfp8):
-    # only activation handling differs at forward time, so the key is act-dtype-agnostic.
     key: WeightCacheKey = (
         "trtllm_gen_mxfp4",
         hidden_size,
@@ -580,18 +523,12 @@ def _run_trtllm_gen_mxfp4_from_routing(
     expert_start: int,
     alpha: float = 1.0,
     limit: float = float("inf"),
-    act_dtype: str = "mxfp8",
     routing_localized: bool = False,
 ) -> torch.Tensor:
-    """Run the routed MXFP4 MLP via the trtllm-gen runner (W4A8 mxfp8-act by default).
+    """Run the routed MXFP4 MLP via the trtllm-gen W4A8 mxfp8-act runner.
 
-    ``act_dtype`` selects the activation precision / cubin family (same switch as
-    ``trtllm_quant_mxfp4_trtllm_gen_moe_fused`` in ``trtllm_moe.py``):
-      * ``"mxfp8"`` (W4A8, default) — activations pre-quantized to MXFP8 (E4M3 + UE8M0
-        per-32-elem block scales via ``trtllm.mxfp8_quantize``) and fed to
-        ``mxe4m3_mxe2m1_block_scale_moe_runner``. Weights, routing localization, and
-        top-k ordering are identical to the bf16 path; only activation precision changes.
-      * ``"bf16"`` (W4A16) — bf16 activations fed to ``bf16_mxe2m1_block_scale_moe_runner``.
+    Activations are pre-quantized to MXFP8 (E4M3 + UE8M0 per-32-elem block scales via
+    ``trtllm.mxfp8_quantize``) and fed to ``mxe4m3_mxe2m1_block_scale_moe_runner``.
 
     Produces this rank's *local* partial output (tokens routed to off-rank experts contribute
     zero, exactly like the torch reference's ``valid_route`` masking); the sharding transform's
@@ -638,12 +575,12 @@ def _run_trtllm_gen_mxfp4_from_routing(
         local_idx = sel
         weights = routing_weights.reshape(num_tokens, top_k)
     else:
-        # Fuse the global->local subtraction, range mask, invalid-sentinel select, int32
-        # cast, and routing-weight mask/bf16-cast (plus the upstream model-side bf16 cast)
-        # into one Triton program. Off-rank / out-of-range routes get the sentinel
+        # Fallback for graphs where ``fuse_moe_routing_localization`` did not fire:
+        # global->local subtraction, range mask, invalid-sentinel select, int32 cast, and
+        # routing-weight mask/bf16-cast. Off-rank / out-of-range routes get the sentinel
         # ``local_experts`` so the runner SKIPS them; valid weights are bit-identical bf16,
         # invalid ones are bf16(0).
-        local_idx, weights = torch.ops.auto_deploy.deepseek_v4_localize_routing(
+        local_idx, weights = _localize_routing_eager(
             sel,
             routing_weights.reshape(num_tokens, top_k),
             int(expert_start),
@@ -656,80 +593,45 @@ def _run_trtllm_gen_mxfp4_from_routing(
         x2d = torch.nn.functional.pad(x2d, (0, expected_hidden - hidden_size))
 
     intermediate_size_padded = int(prepared.fc1_weights_mxfp4.shape[1] // 2)
-    if act_dtype == "mxfp8":
-        # W4A8: pre-quantize the (already padded) bf16 activations to MXFP8 (E4M3 elem +
-        # UE8M0 per-32-elem block scale). alignment=512 matches PT's
-        # ``W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.input_hidden_alignment`` (a no-op here —
-        # ``expected_hidden`` is already 512-aligned). ``x_scale`` stays 1D: the C++ runner
-        # asserts ``hidden_states_scale must be 1D``.
-        x_mxfp8, x_scale = torch.ops.trtllm.mxfp8_quantize(
-            x2d,
-            False,  # is_sf_swizzled_layout
-            alignment=512,
-        )
-        result = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
-            None,  # routing_logits (precomputed routing -> None)
-            None,  # routing_bias
-            x_mxfp8,  # hidden_states (E4M3-packed)
-            x_scale,  # hidden_states_scale (UE8M0 per-32-elem block scale)
-            prepared.fc1_weights_mxfp4,
-            prepared.fc1_weights_scale_ue8m0,
-            prepared.fc1_bias_f32,
-            sg_alpha,
-            sg_beta,
-            sg_limit,
-            prepared.fc2_weights_mxfp4,
-            prepared.fc2_weights_scale_ue8m0,
-            prepared.fc2_bias_f32,
-            local_experts,  # num_experts (local routing space; topk_ids in [0, local_experts))
-            int(top_k),
-            None,  # n_group
-            None,  # topk_group
-            intermediate_size_padded,
-            prepared.valid_hidden_size,
-            prepared.valid_intermediate_size,
-            0,  # local_expert_offset (local expert coords)
-            local_experts,  # local_num_experts
-            None,  # routed_scaling_factor (already folded into routing_weights upstream)
-            1,  # routing_method_type = Renormalize (no-op: topk precomputed)
-            0,  # act_type = SwiGlu
-            topk_weights=weights,
-            topk_ids=local_idx,
-        )
-    elif act_dtype == "bf16":
-        result = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
-            None,  # routing_logits (precomputed routing -> None)
-            None,  # routing_bias
-            x2d,
-            prepared.fc1_weights_mxfp4,
-            prepared.fc1_weights_scale_ue8m0,
-            prepared.fc1_bias_f32,
-            sg_alpha,
-            sg_beta,
-            sg_limit,
-            prepared.fc2_weights_mxfp4,
-            prepared.fc2_weights_scale_ue8m0,
-            prepared.fc2_bias_f32,
-            local_experts,  # num_experts (local routing space; topk_ids in [0, local_experts))
-            int(top_k),
-            None,  # n_group
-            None,  # topk_group
-            intermediate_size_padded,
-            prepared.valid_hidden_size,
-            prepared.valid_intermediate_size,
-            0,  # local_expert_offset (local expert coords)
-            local_experts,  # local_num_experts
-            None,  # routed_scaling_factor (already folded into routing_weights upstream)
-            1,  # routing_method_type = Renormalize (no-op: topk precomputed)
-            0,  # act_type = SwiGlu
-            topk_weights=weights,
-            topk_ids=local_idx,
-        )
-    else:
-        raise ValueError(
-            f"_run_trtllm_gen_mxfp4_from_routing: act_dtype must be 'mxfp8' or 'bf16', "
-            f"got {act_dtype!r}."
-        )
+    # W4A8: pre-quantize the (already padded) bf16 activations to MXFP8 (E4M3 elem +
+    # UE8M0 per-32-elem block scale). alignment=512 matches PT's
+    # ``W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.input_hidden_alignment`` (a no-op here —
+    # ``expected_hidden`` is already 512-aligned). ``x_scale`` stays 1D: the C++ runner
+    # asserts ``hidden_states_scale must be 1D``.
+    x_mxfp8, x_scale = torch.ops.trtllm.mxfp8_quantize(
+        x2d,
+        False,  # is_sf_swizzled_layout
+        alignment=512,
+    )
+    result = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+        None,  # routing_logits (precomputed routing -> None)
+        None,  # routing_bias
+        x_mxfp8,  # hidden_states (E4M3-packed)
+        x_scale,  # hidden_states_scale (UE8M0 per-32-elem block scale)
+        prepared.fc1_weights_mxfp4,
+        prepared.fc1_weights_scale_ue8m0,
+        prepared.fc1_bias_f32,
+        sg_alpha,
+        sg_beta,
+        sg_limit,
+        prepared.fc2_weights_mxfp4,
+        prepared.fc2_weights_scale_ue8m0,
+        prepared.fc2_bias_f32,
+        local_experts,  # num_experts (local routing space; topk_ids in [0, local_experts))
+        int(top_k),
+        None,  # n_group
+        None,  # topk_group
+        intermediate_size_padded,
+        prepared.valid_hidden_size,
+        prepared.valid_intermediate_size,
+        0,  # local_expert_offset (local expert coords)
+        local_experts,  # local_num_experts
+        None,  # routed_scaling_factor (already folded into routing_weights upstream)
+        1,  # routing_method_type = Renormalize (no-op: topk precomputed)
+        0,  # act_type = SwiGlu
+        topk_weights=weights,
+        topk_ids=local_idx,
+    )
 
     valid_h = prepared.valid_hidden_size
     if result.shape[-1] > valid_h:
@@ -782,60 +684,13 @@ def _run_torch_mxfp4_from_routing_core(
 
     selected_experts = selected_experts.reshape(num_tokens, -1).to(torch.int64)
     routing_weights = routing_weights.reshape_as(selected_experts).to(torch.float32)
-    top_k = selected_experts.shape[-1]
     local_experts = gate_up_blocks.shape[0]
     if local_experts <= 0:
         raise ValueError("MXFP4 MoE requires at least one local expert.")
 
-    if routing_localized:
-        # Inputs already carry LOCAL expert coords with the invalid sentinel
-        # ``local_experts`` and zero-masked (bf16-rounded) weights, so localization
-        # reduces to the sentinel check. Only reachable when the localization fusion
-        # transform fired on a non-trtllm-gen fallback path.
-        local_expert_idx = selected_experts
-        valid_route = local_expert_idx < local_experts
-    else:
-        local_expert_idx = selected_experts - int(expert_start)
-        valid_route = (local_expert_idx >= 0) & (local_expert_idx < local_experts)
+    local_expert_idx = selected_experts - int(expert_start)
+    valid_route = (local_expert_idx >= 0) & (local_expert_idx < local_experts)
     local_expert_idx = local_expert_idx.clamp(0, local_experts - 1)
-
-    # Decode regime: when the routing references fewer expert slots than there are
-    # local experts (num_tokens * top_k < local_experts), gather each slot's *packed*
-    # (uint8) blocks and dequantize only those slots instead of materializing the full
-    # [local_experts, ...] fp32 weight every step. The (data-volume-bound)
-    # `table[blocks]` dequant then runs over num_tokens * top_k slots — the dominant
-    # per-step decode cost. `_decode_mxfp4_blocks` is elementwise over the leading
-    # expert dim, so decode(blocks[idx]) == decode(blocks)[idx]: bit-identical to
-    # dequantizing the full expert set and index_select-ing afterwards. For large
-    # token counts (prefill / warmup), dequantizing all experts once and reusing them
-    # across tokens is cheaper, so fall back to the dense path there.
-    if num_tokens * top_k < local_experts:
-        slot_idx = local_expert_idx.reshape(-1)
-        gate_up_weight = _decode_mxfp4_blocks(
-            gate_up_blocks.index_select(0, slot_idx),
-            gate_up_scales.index_select(0, slot_idx),
-        )
-        down_weight = _decode_mxfp4_blocks(
-            down_blocks.index_select(0, slot_idx),
-            down_scales.index_select(0, slot_idx),
-        )
-        _check_decoded_mxfp4_shapes(gate_up_weight, down_weight, hidden_size)
-        return _run_torch_mxfp4_selected_slots(
-            x,
-            leading_shape,
-            top_k,
-            valid_route,
-            routing_weights,
-            gate_up_weight,
-            gate_up_bias.index_select(0, slot_idx).to(torch.float32),
-            down_weight,
-            down_bias.index_select(0, slot_idx).to(torch.float32),
-            alpha,
-            limit,
-            gate_up_order,
-            swiglu_mode,
-            hidden_states.dtype,
-        )
 
     gate_up_weight = _decode_mxfp4_blocks(gate_up_blocks, gate_up_scales)
     down_weight = _decode_mxfp4_blocks(down_blocks, down_scales)

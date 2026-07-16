@@ -16,20 +16,20 @@
 """Bit-exact parity tests for the EP-LOCALIZED DeepSeek V4 router gate ops.
 
 ``deepseek_v4_routing_localized`` / ``deepseek_v4_hash_routing_localized`` fold the
-EP global->local localization (``deepseek_v4_localize_routing``) into the gate
-kernel tail. The contract is byte-exact equality with running the two ops back to
-back, across decode (fused kernel) and prefill (hash reference-chain branch)
-token counts, EP shards including the last-rank remainder, and fully-off-rank
-tokens (sentinel + zero weight).
+EP global->local localization (``_localize_routing_eager``) into the gate kernel
+tail. The contract is byte-exact equality with running the global gate op followed
+by the eager localization chain, across decode (fused kernel) and prefill (hash
+reference-chain branch) token counts, EP shards including the last-rank remainder,
+and fully-off-rank tokens (sentinel + zero weight).
 """
 
 import pytest
 import torch
 
-# Importing the modules registers the auto_deploy custom ops.
-from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe import (  # noqa: F401
-    deepseek_v4_localize_routing,
-    deepseek_v4_routing,
+# Importing the module registers the auto_deploy custom ops.
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe import deepseek_v4_routing  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.deepseek_v4_routing import (
+    _localize_routing_eager,
 )
 
 # (expert_start, local_experts, num_global): non-EP full set, EP4 shards (incl. first,
@@ -43,10 +43,8 @@ _SHARDS = [
 
 
 def _compose_reference(sel_global, rw_global, expert_start, local_experts):
-    """The unfused chain: global gate outputs -> standalone localize op."""
-    return torch.ops.auto_deploy.deepseek_v4_localize_routing(
-        sel_global, rw_global, expert_start, local_experts
-    )
+    """The unfused chain: global gate outputs -> eager localization."""
+    return _localize_routing_eager(sel_global, rw_global, expert_start, local_experts)
 
 
 def _assert_localized_pair_equal(out, ref, local_experts):
@@ -121,43 +119,6 @@ def test_hash_routing_localized_bit_exact(
         hidden_states, weight, tid2eid, input_ids, rsf, norm_topk_prob, expert_start, local_experts
     )
     _assert_localized_pair_equal(out, ref, local_experts)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("expert_start,local_experts", [(0, 64), (64, 64), (0, 256)])
-def test_gate_gemv_localized_chain_parity(expert_start, local_experts):
-    """Triton gate GEMV feeding routing_localized vs the cuBLAS M=1 chain.
-
-    The trtllm-gen dispatch contract (int32 local ids incl. sentinel, bf16
-    masked weights): selection must match exactly across the GEMV swap; the
-    bf16 weights absorb the ~1e-6 fp32 logits deviation almost everywhere.
-    """
-    torch.manual_seed(7)
-    device = "cuda"
-    num_experts, hidden, top_k = 256, 4096, 6
-    W = (torch.randn(num_experts, hidden, device=device) * 0.05).float()
-    bias = (torch.randn(num_experts, device=device) * 0.5).float()
-
-    n_weight_flips = 0
-    for seed in range(64):
-        torch.manual_seed(seed)
-        x = torch.randn(1, hidden, device=device, dtype=torch.float32)
-        logits_ref = torch.nn.functional.linear(x, W)
-        logits_tri = torch.ops.auto_deploy.deepseek_v4_gate_gemv(x, W, None)
-        idx_ref, w_ref = torch.ops.auto_deploy.deepseek_v4_routing_localized(
-            logits_ref, bias, top_k, 1.5, True, expert_start, local_experts
-        )
-        idx_tri, w_tri = torch.ops.auto_deploy.deepseek_v4_routing_localized(
-            logits_tri, bias, top_k, 1.5, True, expert_start, local_experts
-        )
-        assert idx_tri.dtype == torch.int32 and w_tri.dtype == torch.bfloat16
-        assert torch.equal(idx_ref, idx_tri), (
-            f"localized selection flip (seed {seed}): ref={idx_ref}, tri={idx_tri}"
-        )
-        torch.testing.assert_close(w_tri.float(), w_ref.float(), rtol=2e-2, atol=1e-3)
-        n_weight_flips += int((w_tri != w_ref).sum())
-    # bf16 rounding may flip the odd last bit; it must stay rare, never systematic.
-    assert n_weight_flips <= 8, f"too many bf16 weight LSB flips: {n_weight_flips}"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

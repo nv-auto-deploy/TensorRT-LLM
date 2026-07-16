@@ -1,17 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Parity checks: trtllm-gen MXFP4 MoE from-routing path (W4A8 mxfp8-act default, W4A16
-bf16-act fallback) vs torch reference.
+"""Parity checks: trtllm-gen MXFP4 MoE from-routing path (W4A8 mxfp8-act) vs torch reference.
 
-Covers the DSV4-Flash routed MXFP4 MLP on Blackwell (SM100). The trtllm-gen runners
-(``mxe4m3_mxe2m1_block_scale_moe_runner`` for ``act_dtype="mxfp8"`` — the default — and
-``bf16_mxe2m1_block_scale_moe_runner`` for ``act_dtype="bf16"``) replace the fp32 dequant+bmm
-reference for the ``up_gate``/``deepseek`` signature. This validates the integration details the
+Covers the DSV4-Flash routed MXFP4 MLP on Blackwell (SM100). The trtllm-gen runner
+(``mxe4m3_mxe2m1_block_scale_moe_runner``) replaces the fp32 dequant+bmm reference for the
+``up_gate``/``deepseek`` signature. This validates the integration details the
 the original microbench did NOT exercise: re-interleave of the ``[up|gate]`` split-half layout,
 remote-route masking under EP (some routes off-rank, one token fully remote must be exactly
 zero), and NON-ZERO expert biases. Output is a reduced-precision kernel vs fp32-reference, so we
-assert high cosine similarity (not bit-exactness); the W4A8-vs-W4A16 check isolates the
-activation-quantization error with a tighter bound.
+assert high cosine similarity (not bit-exactness).
 """
 
 import pytest
@@ -19,6 +16,9 @@ import torch
 
 from tensorrt_llm._torch.auto_deploy._compat import is_sm_100f
 from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe import mxfp4_moe
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.deepseek_v4_routing import (
+    _localize_routing_eager,
+)
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -88,7 +88,7 @@ def _torch_ref(x, sel, rw, weights, expert_start, alpha, limit):
         mxfp4_moe.is_sm_100f = orig
 
 
-def _trtllm_gen(x, sel, rw, weights, expert_start, alpha, limit, act_dtype):
+def _trtllm_gen(x, sel, rw, weights, expert_start, alpha, limit):
     gu_blocks, gu_bias, gu_scales, dn_blocks, dn_bias, dn_scales = weights
     return mxfp4_moe._run_trtllm_gen_mxfp4_from_routing(
         x,
@@ -103,18 +103,16 @@ def _trtllm_gen(x, sel, rw, weights, expert_start, alpha, limit, act_dtype):
         expert_start,
         alpha,
         limit,
-        act_dtype=act_dtype,
     )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.skipif(not is_sm_100f(), reason="trtllm-gen MXFP4 runners require SM100 (Blackwell)")
-@pytest.mark.parametrize("act_dtype", ["mxfp8", "bf16"])
 @pytest.mark.parametrize("batch", [1, 2, 8])
-def test_trtllm_gen_mxfp4_from_routing_matches_torch_ref(batch, act_dtype):
+def test_trtllm_gen_mxfp4_from_routing_matches_torch_ref(batch):
     x, sel, rw, weights, expert_start, alpha, limit, H = _make_case(batch)
     out_ref = _torch_ref(x, sel, rw, weights, expert_start, alpha, limit)
-    out_trt = _trtllm_gen(x, sel, rw, weights, expert_start, alpha, limit, act_dtype)
+    out_trt = _trtllm_gen(x, sel, rw, weights, expert_start, alpha, limit)
 
     assert out_trt.shape == out_ref.shape == (batch, H)
     assert out_trt.dtype == x.dtype
@@ -124,15 +122,12 @@ def test_trtllm_gen_mxfp4_from_routing_matches_torch_ref(batch, act_dtype):
     if batch > 1:
         assert (out_ref[-1] == 0).all(), "torch ref: fully-remote token must be exactly zero"
         assert (out_trt[-1] == 0).all(), (
-            f"{act_dtype}: fully-remote token must be exactly zero (EP partial-sum invariant)"
+            "fully-remote token must be exactly zero (EP partial-sum invariant)"
         )
     cos = _cos(out_trt, out_ref)
     # Reduced-precision kernel vs fp32 reference on pathological random mxfp4 weights; real
-    # weights are tighter. Same bar for both act dtypes: the mxfp8 activation-quant error is
-    # small relative to the bf16-vs-fp32 gap at this scale (see the W4A8-vs-W4A16 test below).
-    assert cos > 0.85, (
-        f"trtllm-gen[{act_dtype}] vs torch-ref cosine too low: {cos:.4f} (batch={batch})"
-    )
+    # weights are tighter.
+    assert cos > 0.85, f"trtllm-gen vs torch-ref cosine too low: {cos:.4f} (batch={batch})"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -141,16 +136,14 @@ def test_trtllm_gen_mxfp4_from_routing_matches_torch_ref(batch, act_dtype):
 def test_trtllm_gen_mxfp4_from_routing_localized_matches_global(batch):
     """``routing_localized=True`` (pre-localized int32/bf16 gate outputs, the
     fuse_moe_routing_localization contract) must be byte-equal to the default path:
-    the localized inputs are exactly what ``deepseek_v4_localize_routing`` produces,
+    the localized inputs are exactly what ``_localize_routing_eager`` produces,
     so the runner consumes bit-identical ``(topk_ids, topk_weights)`` either way."""
     x, sel, rw, weights, expert_start, alpha, limit, H = _make_case(batch)
     gu_blocks, gu_bias, gu_scales, dn_blocks, dn_bias, dn_scales = weights
     e_local = gu_blocks.shape[0]
 
-    out_global = _trtllm_gen(x, sel, rw, weights, expert_start, alpha, limit, "mxfp8")
-    local_idx, local_w = torch.ops.auto_deploy.deepseek_v4_localize_routing(
-        sel, rw, expert_start, e_local
-    )
+    out_global = _trtllm_gen(x, sel, rw, weights, expert_start, alpha, limit)
+    local_idx, local_w = _localize_routing_eager(sel, rw, expert_start, e_local)
     out_localized = mxfp4_moe._run_trtllm_gen_mxfp4_from_routing(
         x,
         local_idx,
@@ -164,7 +157,6 @@ def test_trtllm_gen_mxfp4_from_routing_localized_matches_global(batch):
         expert_start,
         alpha,
         limit,
-        act_dtype="mxfp8",
         routing_localized=True,
     )
     assert torch.equal(out_localized, out_global), (
@@ -187,34 +179,13 @@ def test_trtllm_gen_mxfp4_from_routing_localized_matches_global(batch):
             expert_start,
             alpha,
             limit,
-            act_dtype="mxfp8",
             routing_localized=True,
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.skipif(not is_sm_100f(), reason="trtllm-gen MXFP4 runners require SM100 (Blackwell)")
-@pytest.mark.parametrize("batch", [1, 2, 8])
-def test_trtllm_gen_mxfp4_from_routing_w4a8_close_to_w4a16(batch):
-    """Isolate the activation-quantization delta: W4A8 (mxfp8 act) vs W4A16 (bf16 act) on the
-    SAME prepared weights, routing localization, and top-k ordering. The only difference is the
-    MXFP8 quantization of the activations, so the bound is much tighter than vs the fp32 ref."""
-    x, sel, rw, weights, expert_start, alpha, limit, H = _make_case(batch)
-    out_bf16 = _trtllm_gen(x, sel, rw, weights, expert_start, alpha, limit, "bf16")
-    out_mxfp8 = _trtllm_gen(x, sel, rw, weights, expert_start, alpha, limit, "mxfp8")
-
-    assert out_mxfp8.shape == out_bf16.shape == (batch, H)
-    assert torch.isfinite(out_mxfp8).all()
-    cos = _cos(out_mxfp8, out_bf16)
-    assert cos > 0.98, f"W4A8 vs W4A16 cosine too low: {cos:.4f} (batch={batch})"
-
-
 if __name__ == "__main__":
     for b in (1, 2, 8):
-        for a in ("mxfp8", "bf16"):
-            test_trtllm_gen_mxfp4_from_routing_matches_torch_ref(b, a)
-            print(f"batch={b} act={a}: OK")
-        test_trtllm_gen_mxfp4_from_routing_w4a8_close_to_w4a16(b)
-        print(f"batch={b} w4a8-vs-w4a16: OK")
+        test_trtllm_gen_mxfp4_from_routing_matches_torch_ref(b)
+        print(f"batch={b}: OK")
         test_trtllm_gen_mxfp4_from_routing_localized_matches_global(b)
         print(f"batch={b} localized-vs-global: OK")
