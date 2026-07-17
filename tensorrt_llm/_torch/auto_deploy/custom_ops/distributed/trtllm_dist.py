@@ -94,20 +94,8 @@ def trtllm_symm_mem_allgather_impl(tensor, dim, sizes, workspace_id):
     return trtllm_allgather(tensor, dim=dim, sizes=sizes)
 
 
-def _get_cached_allreduce(dtype: torch.dtype, strategy_enum: AllReduceStrategy) -> AllReduce:
-    """Get or create the cached AllReduce module for (rank, world_size, dtype, strategy)."""
-    rank, world_size = get_rank_world_size()
-    # Cache key includes rank, world_size, dtype, and strategy to handle different configurations
-    cache_key = (rank, world_size, dtype, strategy_enum)
-    if cache_key not in _allreduce_cache:
-        p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
-        _allreduce_cache[cache_key] = AllReduce(
-            mapping=p_config, strategy=strategy_enum, dtype=dtype
-        )
-    return _allreduce_cache[cache_key]
-
-
 def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
+    rank, world_size = get_rank_world_size()
     assert op == ReduceOp.SUM, "TRT-LLM all reduce only supports SUM op."
 
     # Convert string strategy to enum
@@ -120,7 +108,15 @@ def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
             f"LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC"
         )
 
-    torch_op = _get_cached_allreduce(tensor.dtype, strategy_enum)
+    # Cache key includes rank, world_size, dtype, and strategy to handle different configurations
+    cache_key = (rank, world_size, tensor.dtype, strategy_enum)
+    if cache_key not in _allreduce_cache:
+        p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+        _allreduce_cache[cache_key] = AllReduce(
+            mapping=p_config, strategy=strategy_enum, dtype=tensor.dtype
+        )
+
+    torch_op = _allreduce_cache[cache_key]
     return torch_op(tensor, all_reduce_params=all_reduce_params)
 
 
@@ -172,10 +168,16 @@ def trtllm_dist_all_reduce(t: torch.Tensor, strategy: str) -> torch.Tensor:
     This op always uses TRT-LLM's optimized allreduce and is used in MPI mode.
     """
     if strategy == ONESHOT_SMALL_STRATEGY:
-        # Build both variants up front: the first call is an eager warmup call, so the
-        # ONESHOT workspace allocation (a CPU-sync collective) never lands in graph capture.
-        _get_cached_allreduce(t.dtype, AllReduceStrategy.ONESHOT)
-        _get_cached_allreduce(t.dtype, AllReduceStrategy.NCCL)
+        # Warm the cache for both variants (mirrors trtllm_allreduce): the first call is
+        # an eager warmup call, so the ONESHOT workspace allocation stays out of capture.
+        rank, world_size = get_rank_world_size()
+        for warm_enum in (AllReduceStrategy.ONESHOT, AllReduceStrategy.NCCL):
+            cache_key = (rank, world_size, t.dtype, warm_enum)
+            if cache_key not in _allreduce_cache:
+                p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+                _allreduce_cache[cache_key] = AllReduce(
+                    mapping=p_config, strategy=warm_enum, dtype=t.dtype
+                )
         strategy = resolve_oneshot_small_strategy(t.numel())
     return trtllm_allreduce(t, op=ReduceOp.SUM, strategy=strategy)
 
