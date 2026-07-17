@@ -1022,13 +1022,6 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         original_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, original_shape[-1])
-        # The shared-expert MLP is dispatched BEFORE the router and the routed
-        # experts: the ``multi_stream_moe`` transform inserts
-        # ``begin_aux_stream_passthrough`` right before the first shared-expert
-        # op, and that passthrough makes the aux stream wait for everything
-        # enqueued on the main stream *so far*. Shared-first order keeps the
-        # routed-expert kernels out of that wait set, so the shared MLP (aux
-        # stream) genuinely overlaps the gate + routed experts (main stream).
         shared = self.shared_experts(hidden_states_flat)
         router_states_flat = (
             hidden_states_fp32.view(-1, original_shape[-1])

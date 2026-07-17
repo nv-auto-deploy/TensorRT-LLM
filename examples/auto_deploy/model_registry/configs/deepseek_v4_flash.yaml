@@ -47,5 +47,3 @@ transforms:
     enabled: true
   compile_model:
     piecewise_enabled: false
-  multi_stream_moe:
-    enabled: false
