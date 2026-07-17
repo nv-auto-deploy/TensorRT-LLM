@@ -31,6 +31,10 @@ from ..utils.logger import ad_logger
 
 _MASTER_ADDR = "127.0.0.1"
 
+# Allreduce-strategy token emitted by qualify_small_oneshot_allreduce (sharding); the
+# trtllm backend resolves it per call via resolve_oneshot_small_strategy (trtllm_dist).
+ONESHOT_SMALL_STRATEGY = "ONESHOT_SMALL"
+
 # Sentinel exit code used by init_and_run_process to signal a port conflict
 # (DistNetworkError during init_process_group).  spawn_multiprocess_job detects
 # this code and retries with a fresh port, recovering from the TOCTOU race

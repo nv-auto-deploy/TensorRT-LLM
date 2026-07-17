@@ -29,23 +29,25 @@ from tensorrt_llm._torch.distributed.symm_mem_allgather import SymmetricMemoryAl
 from tensorrt_llm._torch.modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
-from ...distributed.common import ReduceOp, get_rank_world_size, get_world_size, is_ompi
+from ...distributed.common import (
+    ONESHOT_SMALL_STRATEGY,
+    ReduceOp,
+    get_rank_world_size,
+    get_world_size,
+    is_ompi,
+)
 
 # Cache AllReduce modules to avoid recreating on every call
 # This is critical for CUDA graph compatibility - recreating modules during
 # warmup causes hangs due to workspace allocation with CPU synchronization
 _allreduce_cache = {}
 
-# Token emitted by transform.library.sharding.qualify_small_oneshot_allreduce, resolved
-# per call: ONESHOT (~5.5x faster than NCCL) up to _ONESHOT_SMALL_MAX_NUMEL, else NCCL.
-ONESHOT_SMALL_STRATEGY = "ONESHOT_SMALL"
-
-_ONESHOT_SMALL_MAX_NUMEL = 4096
-
 
 def resolve_oneshot_small_strategy(numel: int) -> str:
-    """Per-call strategy the ``ONESHOT_SMALL`` token resolves to for *numel*."""
-    return "ONESHOT" if numel <= _ONESHOT_SMALL_MAX_NUMEL else "NCCL"
+    """Resolve the ``ONESHOT_SMALL`` token per call: ONESHOT up to one decode token
+    (measured ~5.5x faster than NCCL on single-node TP4), else NCCL."""
+    max_numel = 4096  # one decode token x hidden_size 4096
+    return "ONESHOT" if numel <= max_numel else "NCCL"
 
 
 # SymmetricMemoryAllGather instances keyed on (rank, world_size, workspace_id).

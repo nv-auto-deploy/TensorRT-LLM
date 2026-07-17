@@ -49,11 +49,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
 from ..._compat import AllReduceStrategy
+from ...distributed.common import ONESHOT_SMALL_STRATEGY
 
 try:
-    from ...custom_ops.distributed.trtllm_dist import ONESHOT_SMALL_STRATEGY, is_trtllm_op_available
+    from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
 except (ModuleNotFoundError, ImportError):
-    ONESHOT_SMALL_STRATEGY = "ONESHOT_SMALL"
 
     def is_trtllm_op_available():
         return False
@@ -1491,11 +1491,8 @@ def validate_allreduce_strategy(v):
     return v  # Let Pydantic handle other types
 
 
-# Static qualification for the small-message ONESHOT allreduce upgrade, scoped
-# to exactly the measured win (single-node 4-rank TP grid, plain-SUM bf16 hidden
-# states of size 4096). See ``ONESHOT_SMALL_STRATEGY`` in
-# ``custom_ops.distributed.trtllm_dist`` for the measured rationale and the
-# complementary per-call numel gate applied at runtime.
+# Static gates for the small-message ONESHOT allreduce upgrade (the measured win:
+# single-node TP4, plain-SUM bf16, hidden 4096); the runtime numel gate is in trtllm_dist.
 _ONESHOT_SMALL_WORLD_SIZE = 4
 _ONESHOT_SMALL_HIDDEN_SIZE = 4096
 
