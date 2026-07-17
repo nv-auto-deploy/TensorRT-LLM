@@ -21,6 +21,7 @@ This module provides various normalization implementations:
 - triton_fused_add_rms_norm_quant_fp8: Fused Add + RMSNorm + FP8 quantization
 - l2norm: L2 normalization operations
 - flashinfer_fused_add_rms_norm: Fused add + RMSNorm operation
+- deepseek_v4_q_rmsnorm: DeepSeek-V4 Q-LoRA RMSNorm fusion
 """
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "triton_fused_add_rms_norm_quant_fp8",
     "l2norm",
     "flashinfer_fused_add_rms_norm",
+    "deepseek_v4_q_rmsnorm",
 ]

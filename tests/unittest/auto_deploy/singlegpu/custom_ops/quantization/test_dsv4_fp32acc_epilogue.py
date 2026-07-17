@@ -21,7 +21,8 @@ import pytest
 import torch
 
 # Register the custom ops (side-effect imports).
-import tensorrt_llm._torch.auto_deploy.custom_ops.deepseek_v4_rope  # noqa: F401
+import tensorrt_llm._torch.auto_deploy.custom_ops.deepseek_v4_rope_fusion  # noqa: F401
+import tensorrt_llm._torch.auto_deploy.custom_ops.normalization.deepseek_v4_q_rmsnorm  # noqa: F401
 import tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm  # noqa: F401
 import tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (

@@ -13,23 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused interleaved-RoPE + concat custom ops for DeepSeek-V4.
+"""Fused Triton RoPE paths for DeepSeek-V4 attention.
 
-Collapses ``_apply_interleaved_rope`` plus the ``torch.cat((nope, pe))`` that
-follows every call site (up to 5x per layer per step) into a *single* Triton
-kernel: one program per ``(position, head)`` row copies the ``nope`` slice
-through and writes the interleaved-rotated ``pe`` slice contiguously next to
-it. All rotation math stays in fp32 (matching the reference's bf16*fp32 type
-promotion).
+The fused paths replace these PyTorch operation chains:
 
-The kernel name contains ``rope`` on purpose so the collapsed work classifies
-under the ``rope`` op-type and leaves the ``elementwise`` / ``copy_cast`` buckets.
+* Main Q
+  Before: ``RMSNorm(Q) -> split(noPE, PE) -> RoPE(PE) -> concat``.
+  After: ``_interleaved_rope_concat_kernel`` performs the normalization and
+  writes ``[noPE | rotated PE]`` directly in one kernel.
+* Main KV
+  Before: ``RMSNorm(KV) -> split(noPE, PE) -> fake-FP8(noPE) -> RoPE(PE) -> concat``.
+  After: ``_kv_norm_fp8_rope_concat_kernel`` performs the entire chain and
+  writes the final KV tensor directly in one kernel.
 
-Passing ``rms_eps > 0`` (main-Q path) additionally folds the pre-split
-weightless per-head RMS norm ``q *= rsqrt(mean(q^2) + eps).to(q.dtype)`` into
-the same kernel — bit-faithful: the rsqrt factor is rounded to the output dtype
-(matching the reference ``.to(q.dtype)``) and each normalized value is
-materialized in the output dtype before RoPE reads it back.
+The first kernel is also used without RMSNorm by the compressor and indexer,
+and with inverse RoPE for the attention output. The kernels preserve the FP32
+math and BF16 rounding points of the PyTorch paths they replace.
 """
 
 import torch
@@ -38,7 +37,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _fused_interleaved_rope_concat_kernel(
+def _interleaved_rope_concat_kernel(
     nope_ptr,  # [R, Dn] (strided) — copied through
     pe_ptr,  # [R, D]  (strided) — interleaved-rotated
     cos_ptr,  # [N_pos, Dh]
@@ -169,7 +168,7 @@ def deepseek_v4_fused_rope_concat(
     cossin_row_stride = cos.stride(-2) if cos.dim() >= 2 else Dh
 
     grid = (R,)
-    _fused_interleaved_rope_concat_kernel[grid](
+    _interleaved_rope_concat_kernel[grid](
         nope,
         pe,
         cos,
@@ -225,12 +224,8 @@ def _deepseek_v4_fused_rope_concat_fake(
 #     ``scale = 2**ceil(log2(clamp_min(amax, 1e-4) / 448))`` then
 #     ``(clamp(x/scale, -448, 448) -> bf16 -> fp32) * scale -> bf16`` — identical to
 #     ``deepseek_v4_fake_fp8_act_quant``.
-# The name contains ``rope`` so the collapsed work stays in the ``rope`` op-type
-# bucket while the norm/fp8 kernels leave their original buckets.
-
-
 @triton.jit
-def _kv_norm_rope_concat_kernel(
+def _kv_norm_fp8_rope_concat_kernel(
     nope_ptr,  # [R, Dn] raw (strided) — normed, fp8-quantized, then copied through
     pe_ptr,  # [R, D]  raw (strided) — normed, then interleaved-rotated
     weight_ptr,  # [Dn + D] RMS-norm weight (loaded in its native dtype -> fp32)
@@ -368,7 +363,7 @@ def deepseek_v4_kv_norm_rope_concat(
     cossin_row_stride = cos.stride(-2) if cos.dim() >= 2 else Dh
 
     grid = (R,)
-    _kv_norm_rope_concat_kernel[grid](
+    _kv_norm_fp8_rope_concat_kernel[grid](
         nope,
         pe,
         weight,
@@ -407,106 +402,3 @@ def _deepseek_v4_kv_norm_rope_concat_fake(
     fp8_block_size: int = 64,
 ) -> torch.Tensor:
     return pe.new_empty((*pe.shape[:-1], nope.shape[-1] + pe.shape[-1]))
-
-
-@triton.jit
-def _deepseek_v4_q_rmsnorm_kernel(
-    x_ptr,  # [R, N] bf16 input (strided rows)
-    w_ptr,  # [N] RMS-norm weight (native dtype -> fp32)
-    out_ptr,  # [R, N] contiguous, model dtype
-    N,
-    x_row_stride,
-    out_row_stride,
-    eps,
-    BLOCK_N: tl.constexpr,
-):
-    row = tl.program_id(0)
-    out_ty = out_ptr.dtype.element_ty
-    cols = tl.arange(0, BLOCK_N)
-    mask = cols < N
-
-    x = tl.load(x_ptr + row * x_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
-
-    # torch_rmsnorm reference math: fp32 mean(x^2), unrounded fp32 rsqrt factor,
-    # then round(x * factor) -> * fp32 weight -> round — the exact two rounding
-    # points of ``out.copy_(weight * (input * rsqrt(var + eps)).to(out.dtype))``.
-    var = tl.sum(x * x) / N
-    factor = tl.rsqrt(var + eps)
-    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    y = (w * (x * factor).to(out_ty).to(tl.float32)).to(out_ty)
-    tl.store(out_ptr + row * out_row_stride + cols, y, mask=mask)
-
-
-@torch.library.custom_op("auto_deploy::deepseek_v4_q_rmsnorm", mutates_args=())
-def deepseek_v4_q_rmsnorm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    """One-kernel BF16 RMS norm for the DeepSeek-V4 Q-LoRA projection.
-
-    This op keeps the projection-to-consumer contract BF16 and reproduces
-    ``torch_rmsnorm``'s fp32 reduction and BF16 rounding points. It is selected only
-    for the 1024-wide Q child of the DeepSeek-V4 fused Q/KV projection.
-
-    Args:
-        input: ``[..., 1024]`` BF16 Q-LoRA projection output. A
-            last-dimension-contiguous narrow view is supported.
-        weight: ``[1024]`` BF16 or FP32 RMS-norm weight, applied in FP32.
-        eps: RMS-norm epsilon.
-
-    Returns:
-        A contiguous BF16 tensor with the same shape as ``input``.
-    """
-    q_lora_width = 1024
-    if input.dtype != torch.bfloat16:
-        raise TypeError(f"input must be bfloat16, got {input.dtype}")
-    if weight.dtype not in (torch.bfloat16, torch.float32):
-        raise TypeError(f"weight must be bfloat16 or float32, got {weight.dtype}")
-    if input.device != weight.device:
-        raise ValueError(
-            f"input and weight must be on the same device, got {input.device} and {weight.device}"
-        )
-    if input.dim() == 0 or input.shape[-1] != q_lora_width:
-        raise ValueError(f"input must have shape [..., {q_lora_width}], got {tuple(input.shape)}")
-    if input.stride(-1) != 1:
-        raise ValueError("input last dimension must be contiguous")
-    if input.dim() >= 2 and input.shape[-2] > 1 and input.stride(-2) < q_lora_width:
-        raise ValueError("input rows must not overlap")
-    if input.dim() > 2:
-        expected_stride = input.shape[-2] * input.stride(-2)
-        for dim in range(input.dim() - 3, -1, -1):
-            if input.shape[dim] > 1 and input.stride(dim) != expected_stride:
-                raise ValueError("input leading dimensions must flatten to regularly strided rows")
-            expected_stride *= input.shape[dim]
-    if weight.dim() != 1 or weight.numel() != q_lora_width or weight.stride(0) != 1:
-        raise ValueError(f"weight must be contiguous with shape [{q_lora_width}]")
-    N = q_lora_width
-
-    out = torch.empty(input.shape, device=input.device, dtype=torch.bfloat16)
-    R = input.numel() // N
-    if R == 0:
-        return out
-    x_row_stride = input.stride(-2) if input.dim() >= 2 else N
-
-    _deepseek_v4_q_rmsnorm_kernel[(R,)](
-        input,
-        weight,
-        out,
-        N,
-        x_row_stride,
-        N,
-        eps,
-        BLOCK_N=triton.next_power_of_2(N),
-        num_warps=4,
-    )
-    return out
-
-
-@deepseek_v4_q_rmsnorm.register_fake
-def _deepseek_v4_q_rmsnorm_fake(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    return input.new_empty(input.shape, dtype=torch.bfloat16)

@@ -25,7 +25,7 @@ import pytest
 import torch
 
 # Register the custom op (side-effect import).
-import tensorrt_llm._torch.auto_deploy.custom_ops.deepseek_v4_rope  # noqa: F401
+import tensorrt_llm._torch.auto_deploy.custom_ops.deepseek_v4_rope_fusion  # noqa: F401
 
 
 def _apply_interleaved_rope(
