@@ -49,16 +49,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
 from ..._compat import AllReduceStrategy
+from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
 from ...distributed.common import ONESHOT_SMALL_STRATEGY
-
-try:
-    from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
-except (ModuleNotFoundError, ImportError):
-
-    def is_trtllm_op_available():
-        return False
-
-
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import del_attr_by_name, eliminate_dead_code
