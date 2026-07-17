@@ -906,10 +906,9 @@ class BMMShardingInfo(ShardingTransformInfo):
                 end_idx: End index for sharding
             """
 
-            # Define slice function for the sharding. Use an importable partial
-            # (not a local closure) so the load hook can be serialized by the
-            # pipeline cache below.
-            slice_tensor = partial(_slice_first_dim, start=start_idx, end=end_idx)
+            # Define slice function for the sharding
+            def slice_tensor(t: torch.Tensor) -> torch.Tensor:
+                return t[start_idx:end_idx]
 
             if tensor_node.op == "get_attr":
                 # Handle parameter tensor
@@ -922,17 +921,13 @@ class BMMShardingInfo(ShardingTransformInfo):
                 gm.get_submodule(modname).register_parameter(param_name, param_new)
 
                 # Register load state dict hook
-                _register_split_load_hook(
-                    gm,
-                    slice_tensor,
-                    weight_key,
-                    param_new.shape,
-                    {
-                        "type": "shard_slice_first_dim",
-                        "start": int(start_idx),
-                        "end": int(end_idx),
-                    },
+                hook = partial(
+                    _load_hook,
+                    f_split=slice_tensor,
+                    param_key=weight_key,
+                    param_shape=param_new.shape,
                 )
+                gm._register_load_state_dict_pre_hook(hook)
             else:
                 # Handle dynamic tensor
                 with gm.graph.inserting_before(bmm_node):
@@ -1464,39 +1459,6 @@ def _load_hook_remove(
     key = prefix + param_key
     ad_logger.debug(f"Sharder LOAD hook is called for '{key}'")
     state_dict.pop(key, None)
-
-
-def _slice_first_dim(t: torch.Tensor, *, start: int, end: int) -> torch.Tensor:
-    """Importable dim-0 slice used as a pipeline-cache-serializable ``f_split``."""
-    return t[start:end]
-
-
-def _register_split_load_hook(
-    module: nn.Module,
-    f_split: Callable,
-    param_key: str,
-    param_shape: torch.Size,
-    cache_spec: Dict[str, Any],
-) -> None:
-    """Register a shape-gated ``_load_hook`` split hook on *module*.
-
-    ``f_split`` is typically a partial (not JSON-serializable), so ``cache_spec``
-    attaches an explicit reconstruction spec via ``mark_pipeline_cache_hook``;
-    otherwise the pipeline cache treats the hook as unrecognized and skips saving.
-    ``param_key``/``param_shape`` are added to the spec automatically; the
-    rebuilders in ``transform.pipeline_cache.hooks`` re-derive ``f_split`` from
-    the remaining fields.
-    """
-    hook = partial(
-        _load_hook,
-        f_split=f_split,
-        param_key=param_key,
-        param_shape=param_shape,
-    )
-    mark_pipeline_cache_hook(
-        hook, {**cache_spec, "param_key": param_key, "param_shape": list(param_shape)}
-    )
-    module._register_load_state_dict_pre_hook(hook)
 
 
 def validate_allreduce_strategy(v):
@@ -2085,21 +2047,13 @@ def _tp_shard_moe_scale(
 
     # Register load hook on the owning submodule so it runs after any
     # parent-level checkpoint format conversion hooks (e.g., fused MoE unfusing).
-    # The rebuilder re-derives f_split from scale_name, mirroring the branching above.
-    _register_split_load_hook(
-        submod,
-        f_split,
-        attr_name,
-        sharded_scale.shape,
-        {
-            "type": "shard_tp_moe_scale",
-            "scale_name": scale_name,
-            "orig_weight_shape": list(orig_weight_shape),
-            "dim": int(dim),
-            "rank": rank,
-            "world_size": world_size,
-        },
+    hook = partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=attr_name,
+        param_shape=sharded_scale.shape,
     )
+    submod._register_load_state_dict_pre_hook(hook)
 
 
 def _insert_sharded_moe(

@@ -30,7 +30,6 @@ from ...utils.logger import ad_logger
 from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import extract_op_args, is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
-from ...utils.pipeline_cache_hooks import mark_pipeline_cache_hook
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
 
 # MXFP4 layout constants (mirror the on-disk HF format the trtllm-gen kernel
@@ -353,22 +352,6 @@ def _register_mxfp4_expert_layout_hook(
         num_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-    )
-    # The checkpoint_layout kwarg is a dataclass (with compiled regex fields) that
-    # the pipeline cache's generic serializer cannot encode, so attach an explicit
-    # reconstruction spec; otherwise the cache treats the hook as unrecognized and
-    # silently skips saving.
-    mark_pipeline_cache_hook(
-        hook,
-        {
-            "type": "mxfp4_expert_layout_load_hook",
-            "checkpoint_layout": checkpoint_layout.to_serializable_dict(),
-            "target_names": dict(target_names),
-            "layer": layer,
-            "num_experts": num_experts,
-            "hidden_size": hidden_size,
-            "intermediate_size": intermediate_size,
-        },
     )
     gm._register_load_state_dict_pre_hook(hook)
     return True

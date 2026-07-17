@@ -67,7 +67,6 @@ from .sharding import (
     SplitDimension,
     _get_dist_ops,
     _load_hook,
-    _register_split_load_hook,
     _shard_fp4_weight_scale,
     resolve_plain_allreduce_strategy,
     shard_weight_tensor,
@@ -148,23 +147,6 @@ def _fp4_weight_scale_pipeline_cache_spec(
         "world_size": world_size,
         "min_local_shape": min_local_shape,
         "fused_weight_dims": list(fused_weight_dims) if fused_weight_dims else None,
-    }
-
-
-def _grouped_fp8_scale_pipeline_cache_spec(
-    sn: WeightNode,
-    sharded_scale: torch.Tensor,
-    num_groups: int,
-    rank: int,
-    world_size: int,
-) -> Dict[str, Any]:
-    return {
-        "type": "shard_grouped_fp8_scale",
-        "param_key": sn.node_key,
-        "param_shape": list(sharded_scale.shape),
-        "num_groups": int(num_groups),
-        "rank": rank,
-        "world_size": world_size,
     }
 
 
@@ -612,15 +594,7 @@ class GroupedFineGrainedFP8LinearShardableNode(ShardableNode):
         )
         scale_weight_node = _weight_node_from_attr(gm, scale_node, scale_tensor)
         sharded_scale = scale_split(scale_tensor)
-        _shard_scale_and_hook(
-            gm,
-            scale_weight_node,
-            sharded_scale,
-            scale_split,
-            _grouped_fp8_scale_pipeline_cache_spec(
-                scale_weight_node, sharded_scale, num_groups, dc.tp_rank, dc.tp_size
-            ),
-        )
+        _shard_scale_and_hook(gm, scale_weight_node, sharded_scale, scale_split)
 
         view_localizes_groups = self._input_is_tp_scaled_group_view(input_node, group_dim)
         if view_localizes_groups:
@@ -1460,12 +1434,13 @@ class StackedMoEShardableNode(ShardableNode):
             setattr(submod, attr_name, local_tensor)
 
         arg.meta["val"] = local_tensor
-        _register_split_load_hook(
-            submod,
-            partial(cls._slice_experts, lo=lo, hi=hi),
-            attr_name,
-            local_tensor.shape,
-            {"type": "shard_ep_expert_slice", "lo": int(lo), "hi": int(hi)},
+        submod._register_load_state_dict_pre_hook(
+            partial(
+                _load_hook,
+                f_split=partial(cls._slice_experts, lo=lo, hi=hi),
+                param_key=attr_name,
+                param_shape=local_tensor.shape,
+            )
         )
         invalidate_weight_node_cache(gm)
         return arg
