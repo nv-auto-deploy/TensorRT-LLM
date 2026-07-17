@@ -701,7 +701,7 @@ class FuseFineGrainedFP8Linear(BaseTransform):
 
 
 # ============================================================================
-# FineGrained FP8 activation-quant helpers + W8A8 quant-prologue control
+# FineGrained FP8 activation-quant helpers
 # ============================================================================
 
 
@@ -730,292 +730,6 @@ def _finegrained_fp8_block_k(
     if scale_k == 0:
         return None
     return -(-K // scale_k)  # ceil-div
-
-
-class FuseFP8ActQuantCSEConfig(TransformConfig):
-    """Configuration for ``fuse_fp8_act_quant_cse`` (W8A8 quant-prologue control)."""
-
-    w8a8_quant_prologue: bool = Field(
-        default=False,
-        description=(
-            "Fuse the standalone block-FP8 activation-quant kernel into the "
-            "prologue of the consuming decode W8A8 GEMV/split-K kernels (op-"
-            "internal flag, no graph rewrite). Applies only to ue8m0-scale "
-            "linears on the torch reference path; bit-exact vs the standalone "
-            "quant. Prefill and non-decode shapes keep the standalone kernel."
-        ),
-    )
-
-
-@TransformRegistry.register("fuse_fp8_act_quant_cse")
-class FuseFP8ActQuantCSE(BaseTransform):
-    """Control the op-internal W8A8 fused quant-prologue flag (no graph rewrite).
-
-    When ``w8a8_quant_prologue`` is enabled, the standalone block-FP8 activation
-    quant is fused into the prologue of the consuming decode W8A8 GEMV/split-K
-    kernels by flipping a module-level flag (``set_w8a8_quant_prologue``) once at
-    transform time, before warmup/graph capture, so eager and captured paths agree.
-
-    The registry key predates the removal of an act-quant CSE rewrite superseded
-    by ``fuse_gemms_mixed_children``; it is kept so existing configs stay valid.
-    """
-
-    config: FuseFP8ActQuantCSEConfig
-
-    @classmethod
-    def get_config_class(cls) -> Type[TransformConfig]:
-        return FuseFP8ActQuantCSEConfig
-
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm: CachedSequenceInterface,
-        factory: ModelFactory,
-        shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        if self.config.w8a8_quant_prologue:
-            # Op-internal fused quant prologue (no graph rewrite): flip the module
-            # flag once, before warmup/capture, so eager and captured paths agree.
-            from ...custom_ops.quantization.torch_quant import set_w8a8_quant_prologue
-
-            set_w8a8_quant_prologue(True)
-            ad_logger.info("FP8 act-quant: fused W8A8 decode quant prologue enabled")
-
-        info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-        return gm, info
-
-
-# ============================================================================
-# DeepSeek-V4 Q-LoRA RMS-norm fusion
-# ============================================================================
-
-
-_DSV4_HIDDEN_WIDTH = 4096
-_DSV4_Q_LORA_WIDTH = 1024
-_DSV4_KV_NOPE_WIDTH = 448
-_DSV4_KV_ROPE_WIDTH = 64
-_DSV4_KV_WIDTH = _DSV4_KV_NOPE_WIDTH + _DSV4_KV_ROPE_WIDTH
-_DSV4_QKV_WIDTH = _DSV4_Q_LORA_WIDTH + _DSV4_KV_WIDTH
-
-
-def _positional_or_keyword(node: Node, position: int, name: str, default=None):
-    if name in node.kwargs:
-        return node.kwargs[name]
-    if len(node.args) > position:
-        return node.args[position]
-    return default
-
-
-def _is_last_dim(dim, source: Node) -> bool:
-    if dim == -1:
-        return True
-    val = source.meta.get("val")
-    return isinstance(dim, int) and isinstance(val, torch.Tensor) and dim == val.dim() - 1
-
-
-def _last_dim_interval(node: Node, producer: Node) -> Optional[Tuple[int, int]]:
-    """Return the half-open producer interval represented by a view node."""
-    if node is producer:
-        return (0, _DSV4_QKV_WIDTH)
-    if node.op == "call_method" and node.target == "contiguous":
-        return _last_dim_interval(node.args[0], producer)
-    if is_op(node, torch.ops.aten.contiguous):
-        return _last_dim_interval(node.args[0], producer)
-    if is_op(node, torch.narrow) or is_op(node, torch.ops.aten.narrow):
-        source = node.args[0]
-        parent = _last_dim_interval(source, producer) if isinstance(source, Node) else None
-        dim = _positional_or_keyword(node, 1, "dim")
-        start = _positional_or_keyword(node, 2, "start")
-        length = _positional_or_keyword(node, 3, "length")
-        if (
-            parent is None
-            or not _is_last_dim(dim, source)
-            or not isinstance(start, int)
-            or not isinstance(length, int)
-            or start < 0
-            or length < 0
-            or start + length > parent[1] - parent[0]
-        ):
-            return None
-        return (parent[0] + start, parent[0] + start + length)
-    if is_op(node, operator.getitem):
-        split_node = node.args[0]
-        index = node.args[1]
-        if not isinstance(split_node, Node) or not isinstance(index, int):
-            return None
-        if not is_op(split_node, torch.ops.aten.split_with_sizes):
-            return None
-        source = split_node.args[0]
-        parent = _last_dim_interval(source, producer) if isinstance(source, Node) else None
-        sizes = _positional_or_keyword(split_node, 1, "split_sizes")
-        dim = _positional_or_keyword(split_node, 2, "dim", 0)
-        if (
-            parent is None
-            or not _is_last_dim(dim, source)
-            or not isinstance(sizes, (list, tuple))
-            or not all(isinstance(size, int) for size in sizes)
-            or any(size < 0 for size in sizes)
-            or sum(sizes) != parent[1] - parent[0]
-            or index < 0
-            or index >= len(sizes)
-        ):
-            return None
-        start = parent[0] + sum(sizes[:index])
-        return (start, start + sizes[index])
-    return None
-
-
-def _is_supported_dsv4_view(node: Node) -> bool:
-    return (
-        (node.op == "call_method" and node.target == "contiguous")
-        or is_op(node, torch.narrow)
-        or is_op(node, torch.ops.aten.narrow)
-        or is_op(node, torch.ops.aten.contiguous)
-        or is_op(node, torch.ops.aten.split_with_sizes)
-        or is_op(node, operator.getitem)
-    )
-
-
-def _bf16_meta_with_width(node: Node, width: int) -> bool:
-    val = node.meta.get("val")
-    return (
-        isinstance(val, torch.Tensor)
-        and val.dtype == torch.bfloat16
-        and val.dim() > 0
-        and val.shape[-1] == width
-    )
-
-
-def _match_dsv4_qkv_consumers(gm: GraphModule, producer: Node) -> Optional[Tuple[Node, Node]]:
-    """Match the exact BF16 Q1024 + KV(448,64) DeepSeek-V4 projection fanout."""
-    rms_op = torch.ops.auto_deploy.torch_rmsnorm
-    kv_op = torch.ops.auto_deploy.deepseek_v4_kv_norm_rope_concat
-    visited = {producer}
-    terminals = set()
-    stack = [producer]
-    while stack:
-        current = stack.pop()
-        for user in current.users:
-            if _is_supported_dsv4_view(user):
-                if user.args[0] is not current:
-                    return None
-                if user not in visited:
-                    visited.add(user)
-                    stack.append(user)
-            elif is_op(user, rms_op) or is_op(user, kv_op):
-                terminals.add(user)
-            else:
-                return None
-
-    rms_nodes = [node for node in terminals if is_op(node, rms_op)]
-    kv_nodes = [node for node in terminals if is_op(node, kv_op)]
-    if len(rms_nodes) != 1 or len(kv_nodes) != 1 or len(terminals) != 2:
-        return None
-    rms_node = rms_nodes[0]
-    kv_node = kv_nodes[0]
-    q_input, q_weight = extract_op_args(rms_node, "input", "weight")
-    kv_nope, kv_pe, kv_weight = extract_op_args(kv_node, "nope", "pe", "weight")
-    if not all(isinstance(node, Node) for node in (q_input, q_weight, kv_nope, kv_pe, kv_weight)):
-        return None
-    if _last_dim_interval(q_input, producer) != (0, _DSV4_Q_LORA_WIDTH):
-        return None
-    if _last_dim_interval(kv_nope, producer) != (
-        _DSV4_Q_LORA_WIDTH,
-        _DSV4_Q_LORA_WIDTH + _DSV4_KV_NOPE_WIDTH,
-    ):
-        return None
-    if _last_dim_interval(kv_pe, producer) != (
-        _DSV4_Q_LORA_WIDTH + _DSV4_KV_NOPE_WIDTH,
-        _DSV4_QKV_WIDTH,
-    ):
-        return None
-    if not (
-        _bf16_meta_with_width(producer, _DSV4_QKV_WIDTH)
-        and _bf16_meta_with_width(q_input, _DSV4_Q_LORA_WIDTH)
-        and _bf16_meta_with_width(rms_node, _DSV4_Q_LORA_WIDTH)
-        and _bf16_meta_with_width(kv_nope, _DSV4_KV_NOPE_WIDTH)
-        and _bf16_meta_with_width(kv_pe, _DSV4_KV_ROPE_WIDTH)
-        and _bf16_meta_with_width(kv_node, _DSV4_KV_WIDTH)
-    ):
-        return None
-    q_weight_tensor = _resolve_attr_tensor(gm, q_weight)
-    kv_weight_tensor = _resolve_attr_tensor(gm, kv_weight)
-    if q_weight_tensor is None or tuple(q_weight_tensor.shape) != (_DSV4_Q_LORA_WIDTH,):
-        return None
-    if kv_weight_tensor is None or tuple(kv_weight_tensor.shape) != (_DSV4_KV_WIDTH,):
-        return None
-    return rms_node, kv_node
-
-
-@TransformRegistry.register("fuse_deepseek_v4_q_rmsnorm")
-class FuseDeepSeekV4QRMSNorm(BaseTransform):
-    """Replace only the exact DeepSeek-V4 Q-LoRA BF16 RMS-norm decomposition.
-
-    The transform recognizes the fused FineGrained-FP8 ``wq_a+wkv`` projection
-    with weight shape ``[1536, 4096]`` and proves its complete fanout is Q1024 plus
-    KV512 split as 448 no-PE and 64 RoPE dimensions. It replaces only the Q child's
-    ``torch_rmsnorm`` with a fixed-BF16 one-kernel implementation. Projection
-    outputs, the KV path, and the full-K prefill path remain unchanged.
-
-    The exact DeepSeek-V4 op provenance and shapes make the transform a no-op for
-    every other model, so it needs no model- or campaign-specific configuration.
-    """
-
-    config: TransformConfig
-
-    @classmethod
-    def get_config_class(cls) -> Type[TransformConfig]:
-        return TransformConfig
-
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm: CachedSequenceInterface,
-        factory: ModelFactory,
-        shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        linear_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
-        q_rmsnorm_op = torch.ops.auto_deploy.deepseek_v4_q_rmsnorm.default
-        num_matches = 0
-        for producer in list(gm.graph.nodes):
-            if not is_op(producer, linear_op):
-                continue
-            weight, bias = extract_op_args(producer, "weight_quantized", "bias")
-            weight_tensor = _resolve_attr_tensor(gm, weight)
-            if bias is not None or weight_tensor is None:
-                continue
-            if tuple(weight_tensor.shape) != (_DSV4_QKV_WIDTH, _DSV4_HIDDEN_WIDTH):
-                continue
-            match = _match_dsv4_qkv_consumers(gm, producer)
-            if match is None:
-                continue
-            rms_node, _ = match
-            q_input, q_weight, eps = extract_op_args(rms_node, "input", "weight", "eps")
-            with gm.graph.inserting_before(rms_node):
-                replacement = gm.graph.call_function(
-                    q_rmsnorm_op,
-                    args=(q_input, q_weight, eps),
-                )
-            replacement.meta["val"] = rms_node.meta["val"]
-            rms_node.replace_all_uses_with(replacement)
-            gm.graph.erase_node(rms_node)
-            num_matches += 1
-
-        if num_matches:
-            gm.graph.eliminate_dead_code()
-            gm.recompile()
-            ad_logger.info(
-                "fuse_deepseek_v4_q_rmsnorm: replaced "
-                f"{num_matches} exact Q-LoRA RMS-norm decomposition(s)"
-            )
-
-        info = TransformInfo(
-            skipped=(num_matches == 0),
-            num_matches=num_matches,
-            is_clean=(num_matches == 0),
-            has_valid_shapes=(num_matches == 0),
-        )
-        return gm, info
 
 
 # ============================================================================
@@ -1153,12 +867,12 @@ class FuseFP8SwigluActQuant(BaseTransform):
     again and again. The default SwiGLU matcher cannot span the clamp/FP32-cast nodes
     (``swiglu_limit=10``), so this chain survives every generic fusion pass.
 
-    This transform rewrites, per matched down projection::
+    This transform rewrites the production residual-add down projection::
 
-        lin[_residual_add](to(silu(to_f32(clamp(g))) * to_f32(clamp(u)), dt), w2, ...)
+        lin_residual_add(to(silu(to_f32(clamp(g))) * to_f32(clamp(u)), dt), w2, ...)
       ->
         q, s = torch_fp8_swiglu_clamp_act_quant(g, u, limit, block_k, fmt)
-        lin[_residual_add]_prequant(q, s, w2, ...)
+        lin_residual_add(q, w2, input_scale=[s], ...)
 
     consuming the gate/up ``torch.narrow`` views of the merged gate_up GEMM in place
     (any ``.contiguous()`` wrappers are bypassed; the kernel reads strided views).
@@ -1168,11 +882,11 @@ class FuseFP8SwigluActQuant(BaseTransform):
     consumes byte-identical ``(qfp8, scale)`` inputs.
 
     Runs in post_load_fusion AFTER ``fuse_fp8_linear_allreduce_add`` so it sees the
-    down projection in its final form (plain or with the folded merge add) and keeps
-    that fusion's collective-input epilogue: the residual stays a positional data
-    dependency on the rewritten node, preserving the shared/routed merge point that
-    stream-overlap transforms classify. A no-op when linears route to
-    trtllm/deepgemm (those quantize internally).
+    down projection with the folded merge add and keeps that fusion's
+    collective-input epilogue. The residual remains a data dependency on the
+    rewritten node, preserving the shared/routed merge point that stream-overlap
+    transforms classify. A no-op when linears route to trtllm/deepgemm (those
+    quantize internally).
     """
 
     config: TransformConfig
@@ -1189,23 +903,14 @@ class FuseFP8SwigluActQuant(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         ad_ops = torch.ops.auto_deploy
-        plain_lin = ad_ops.torch_fake_quant_finegrained_fp8_linear
         residual_lin = ad_ops.torch_fake_quant_finegrained_fp8_linear_residual_add
         quant_op = ad_ops.torch_fp8_swiglu_clamp_act_quant.default
-        prequant_op = ad_ops.torch_fake_quant_finegrained_fp8_linear_prequant.default
-        residual_prequant_op = (
-            ad_ops.torch_fake_quant_finegrained_fp8_linear_residual_add_prequant.default
-        )
 
         graph = gm.graph
         cnt = 0
         node_order = {n: i for i, n in enumerate(graph.nodes)}
         for node in list(graph.nodes):
-            if is_op(node, residual_lin):
-                is_residual = True
-            elif is_op(node, plain_lin):
-                is_residual = False
-            else:
+            if not is_op(node, residual_lin):
                 continue
             inp, weight, bias, weight_scale, fmt = extract_op_args(
                 node, "input", "weight_quantized", "bias", "weight_scale", "input_scale_fmt"
@@ -1218,11 +923,9 @@ class FuseFP8SwigluActQuant(BaseTransform):
             block_k = _finegrained_fp8_block_k(gm, weight, weight_scale)
             if block_k is None or matched["width"] % block_k != 0:
                 continue
-            residual = None
-            if is_residual:
-                (residual,) = extract_op_args(node, "residual")
-                if not isinstance(residual, Node):
-                    continue
+            (residual,) = extract_op_args(node, "residual")
+            if not isinstance(residual, Node):
+                continue
 
             # Insert the fused act-quant chain right after its gate/up sources, NOT
             # at the down-projection site: with the residual-add form the down node
@@ -1251,15 +954,11 @@ class FuseFP8SwigluActQuant(BaseTransform):
             with graph.inserting_after(qfp8):
                 qscale = graph.call_function(operator.getitem, args=(act, 1))
             with graph.inserting_before(node):
-                if is_residual:
-                    new_node = graph.call_function(
-                        residual_prequant_op,
-                        args=(qfp8, qscale, weight, None, weight_scale, residual),
-                    )
-                else:
-                    new_node = graph.call_function(
-                        prequant_op, args=(qfp8, qscale, weight, None, weight_scale)
-                    )
+                new_node = graph.call_function(
+                    residual_lin.default,
+                    args=(qfp8, weight, None, [qscale], weight_scale, [], []),
+                    kwargs={"residual": residual},
+                )
             node.replace_all_uses_with(new_node)
             graph.erase_node(node)
             cnt += 1
@@ -1269,7 +968,7 @@ class FuseFP8SwigluActQuant(BaseTransform):
             gm.recompile()
             ad_logger.info(
                 f"fuse_fp8_swiglu_act_quant: fused {cnt} clamped-SwiGLU + act-quant chain(s) "
-                "into single-kernel prequant down projections"
+                "into single-kernel prequantized down projections"
             )
 
         info = TransformInfo(

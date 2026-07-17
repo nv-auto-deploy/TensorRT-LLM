@@ -45,7 +45,7 @@ def test_fuse_gemms_skips_linear_without_parameter_weight():
     graph.output((first, second))
     gm = torch.fx.GraphModule({}, graph)
 
-    assert not _insert_fused_gemm(gm, 0, x, [first, second])
+    assert not _insert_fused_gemm(gm, x, [first, second])
 
 
 class TestModel(nn.Module):

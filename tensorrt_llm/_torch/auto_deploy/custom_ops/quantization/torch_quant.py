@@ -478,23 +478,9 @@ def torch_fake_quant_int4_gptq_linear_fake(
     return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)
 
 
-# In-kernel activation-quant prologue for the decode W8A8 GEMV/split-K kernels:
-# enabled once at transform time (fuse_fp8_act_quant_cse ``w8a8_quant_prologue``),
-# read per op call. Default off keeps the standalone _act_quant_kernel launches.
-_W8A8_QUANT_PROLOGUE = False
-
-
-def set_w8a8_quant_prologue(enabled: bool) -> None:
-    """Transform-time switch for the fused activation-quant prologue."""
-    global _W8A8_QUANT_PROLOGUE
-    _W8A8_QUANT_PROLOGUE = bool(enabled)
-
-
 def _use_quant_prologue(input_scale_fmt: str) -> bool:
-    # Only the pow-2 (ue8m0) scale branch is replicated in-kernel: its scales are
-    # exactly representable in the model dtype, so the recomputed fp32 scale is
-    # bit-identical to the standalone kernel's stored-then-reloaded scale.
-    return _W8A8_QUANT_PROLOGUE and input_scale_fmt.lower() == "ue8m0"
+    """Use the measured in-kernel quant path for power-of-two activation scales."""
+    return input_scale_fmt.lower() == "ue8m0"
 
 
 @triton.jit
@@ -564,32 +550,6 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str
 # they are free to tune. Configs were measured on B200 (sm100) over the
 # DeepSeek-V4 MLA/dense per-rank projection shapes.
 
-# DeepSeek-V4-Flash TP4 per-rank decode additions. Each exact M=1
-# full-K key is pinned to its measured winner so independent ranks cannot choose
-# different near-tie configs during Triton autotuning.
-_W8A8_TP4_QIDX_CONFIG = triton.Config(
-    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "GROUP_SIZE_M": 1},
-    num_warps=8,
-    num_stages=4,
-)
-_W8A8_TP4_Q_CONFIG = triton.Config(
-    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1},
-    num_warps=8,
-    num_stages=4,
-)
-_W8A8_TP4_WO_B_CONFIG = triton.Config(
-    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "GROUP_SIZE_M": 1},
-    num_warps=8,
-    num_stages=5,
-)
-_W8A8_TP4_DECODE_CONFIG_BY_KEY = {
-    (1, 16384, 1024): _W8A8_TP4_QIDX_CONFIG,  # fused wq_b + indexer.wq_b
-    (1, 8192, 1024): _W8A8_TP4_Q_CONFIG,  # wq_b
-    (1, 4096, 2048): _W8A8_TP4_WO_B_CONFIG,  # wo_b
-}
-_W8A8_TP4_DECODE_CONFIGS = tuple(_W8A8_TP4_DECODE_CONFIG_BY_KEY.values())
-_W8A8_TP4_DECODE_KEYS = frozenset(_W8A8_TP4_DECODE_CONFIG_BY_KEY)
-
 _W8A8_BLOCK_FP8_MATMUL_CONFIGS = [
     # Decode / small-M (BLOCK_SIZE_M=16): the autotuner (keyed on N) picks
     # BLOCK_SIZE_N=32 (small N: spread work over more CTAs) vs 64 (large N: stay
@@ -608,11 +568,6 @@ _W8A8_BLOCK_FP8_MATMUL_CONFIGS = [
     triton.Config(
         {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=3
     ),
-    # Exact DeepSeek-V4-Flash TP4 M=1 full-K keys (wider / shorter-K than the
-    # K=7168 shapes above), each pinned to its measured winner -- see
-    # _W8A8_TP4_DECODE_CONFIG_BY_KEY. Every other key, including M=2, prefill,
-    # and N=4096/K=512 shared w2, sees the pre-existing config set.
-    *_W8A8_TP4_DECODE_CONFIGS,
     # Prefill / large-M (BLOCK_SIZE_M>=64): num_warps=8, BLOCK_SIZE_N=128 only.
     # IMPORTANT: the stock kernel is run-to-run NON-deterministic on sm100 at large
     # M (>=256) with large K (>=2048) for several (BLOCK_SIZE_*, num_warps) combos
@@ -630,24 +585,9 @@ _W8A8_BLOCK_FP8_MATMUL_CONFIGS = [
 ]
 
 
-def _w8a8_prune_tp4_decode_configs(configs, nargs, **kwargs):
-    """Pin exact measured TP4 keys and preserve the old list everywhere else.
-
-    Pinning prevents per-rank autotuner noise from selecting a slower near-tie.
-    Other models, shared w2, chunked prefill, and larger-batch selection behavior
-    remain identical to the pre-idea config set.
-    """
-    key = (nargs["M"], nargs["N"], nargs["K"])
-    pinned_config = _W8A8_TP4_DECODE_CONFIG_BY_KEY.get(key)
-    if pinned_config is not None:
-        return [pinned_config]
-    return [config for config in configs if config not in _W8A8_TP4_DECODE_CONFIGS]
-
-
 @triton.autotune(
     configs=_W8A8_BLOCK_FP8_MATMUL_CONFIGS,
     key=["M", "N", "K"],
-    prune_configs_by={"early_config_prune": _w8a8_prune_tp4_decode_configs},
 )
 @triton.jit
 def _w8a8_block_fp8_matmul_kernel(
@@ -1028,47 +968,6 @@ def _splitk_num_warps(N: int, K: Optional[int] = None, M: Optional[int] = None) 
     return _SPLITK_NUM_WARPS
 
 
-def _validate_splitk_c_out(
-    C_out: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: Optional[torch.Tensor],
-    Bs: torch.Tensor,
-    output_dtype: torch.dtype,
-    M: int,
-    N: int,
-    K: int,
-) -> None:
-    """Validate a caller-owned split-K accumulator without reading device data."""
-    expected_shape = (M, N)
-    # As is None on the deferred-quant path (in-kernel activation-quant prologue).
-    operands = [("A", A), ("B", B), ("Bs", Bs)] + ([] if As is None else [("As", As)])
-    if A.dim() != 2 or tuple(A.shape) != (M, K):
-        raise ValueError(f"A must have shape {(M, K)} when C_out is used, got {tuple(A.shape)}")
-    if C_out.dtype != torch.float32:
-        raise TypeError(f"C_out must have dtype float32, got {C_out.dtype}")
-    if output_dtype != torch.float32:
-        raise ValueError("C_out requires output_dtype=torch.float32")
-    if C_out.layout != torch.strided:
-        raise ValueError(f"C_out must use strided layout, got {C_out.layout}")
-    for name, tensor in operands:
-        if C_out.device != tensor.device:
-            raise ValueError(
-                f"C_out and {name} must be on the same device, "
-                f"got {C_out.device} and {tensor.device}"
-            )
-    if C_out.dim() != 2 or tuple(C_out.shape) != expected_shape:
-        raise ValueError(f"C_out must have shape {expected_shape}, got {tuple(C_out.shape)}")
-    if C_out.stride(1) != 1 or C_out.stride(0) < N:
-        raise ValueError(
-            "C_out must have unit column stride and row stride >= N; "
-            f"got stride {tuple(C_out.stride())} for N={N}"
-        )
-    for name, tensor in operands:
-        if torch._C._overlaps(C_out, tensor):
-            raise ValueError(f"C_out must not overlap {name}")
-
-
 def _w8a8_block_fp8_matmul_splitk(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1081,56 +980,28 @@ def _w8a8_block_fp8_matmul_splitk(
     N: int,
     K: int,
     *,
-    SPLIT_K: Optional[int] = None,
-    BLOCK_SIZE_N: Optional[int] = None,
-    BLOCK_SIZE_K: Optional[int] = None,
-    num_warps: Optional[int] = None,
     C_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Split-K block-FP8 GEMM for the decode GEMV (see kernel docstring above).
 
     Accumulates fp32 partials from ``SPLIT_K`` contraction-slices via atomics into a
-    pre-zeroed fp32 buffer, then casts to ``output_dtype``. ``SPLIT_K`` /
-    ``BLOCK_SIZE_N`` / ``num_warps`` default (``None``) to the tuned heuristics
-    (``_splitk_split_k`` / ``_splitk_block_n`` / ``_splitk_num_warps``), which
-    select per (N, K) band, and ``BLOCK_SIZE_K`` to the quantization ``block_k``;
-    the microbench passes them explicitly to sweep the config.
+    pre-zeroed fp32 buffer, then casts to ``output_dtype``. The launch configuration
+    comes from the measured per-shape schedules below.
 
-    ``BLOCK_SIZE_K`` is the MMA contraction-tile depth and is *decoupled* from the
-    quantization ``block_k`` (the scale group). It must divide ``block_k`` so a tile
-    never straddles a scale-block boundary (the kernel loads one scale per tile,
-    indexed ``(k * BLOCK_SIZE_K) // group_k``); a smaller tile keeps the same atomic
-    count as ``SPLIT_K`` but raises the K-loop iteration count (deeper pipelining).
-
-    ``C_out``, when given, is a caller-provided, pre-zeroed FP32 accumulator. It must
-    be a non-overlapping ``[M, N]`` view with unit column stride, must not alias any
-    input, and is returned directly (``output_dtype`` must be FP32). This lets
-    grouped GEMVs use disjoint column slices of one allocation and one later finish
-    cast. Split-K uses FP32 atomics, so launch-to-launch accumulation order is not
+    ``C_out`` is the pre-zeroed FP32 column slice created by the grouped-GEMV path;
+    accumulating each group into one allocation allows one finish cast for the full
+    output. Split-K uses FP32 atomics, so launch-to-launch accumulation order is not
     deterministic; a later BF16 cast normally absorbs the variation but values on a
     BF16 rounding boundary can differ by one ULP.
     """
-    if SPLIT_K is None:
-        SPLIT_K = _splitk_split_k(N, K, M)
-    if BLOCK_SIZE_N is None:
-        BLOCK_SIZE_N = _splitk_block_n(N, K, M)
-    if BLOCK_SIZE_K is None:
-        BLOCK_SIZE_K = block_k
-    if num_warps is None:
-        num_warps = _splitk_num_warps(N, K, M)
-    # The MMA tile must fit inside a single scale block (one scale loaded per tile).
-    assert block_k % BLOCK_SIZE_K == 0, (
-        f"BLOCK_SIZE_K={BLOCK_SIZE_K} must divide quant block_k={block_k}"
-    )
+    split_k = _splitk_split_k(N, K, M)
+    block_size_n = _splitk_block_n(N, K, M)
+    num_warps = _splitk_num_warps(N, K, M)
     if As is None:
         # Deferred-quant path: the per-row group amax is reduced over one K tile,
         # so the tile must cover exactly one whole quant group.
-        assert BLOCK_SIZE_K == block_k and K % block_k == 0, (
-            f"quant prologue requires BLOCK_SIZE_K == block_k ({BLOCK_SIZE_K} vs {block_k}) "
-            f"and K % block_k == 0 (K={K})"
-        )
+        assert K % block_k == 0, f"quant prologue requires K % block_k == 0 (K={K})"
     if C_out is not None:
-        _validate_splitk_c_out(C_out, A, B, As, Bs, output_dtype, M, N, K)
         C_acc = C_out
     else:
         C_shape = A.shape[:-1] + (N,)
@@ -1138,8 +1009,8 @@ def _w8a8_block_fp8_matmul_splitk(
         C_acc = A.new_zeros(C_shape, dtype=torch.float32)
 
     grid = (
-        triton.cdiv(M, _SPLITK_BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
-        SPLIT_K,
+        triton.cdiv(M, _SPLITK_BLOCK_SIZE_M) * triton.cdiv(N, block_size_n),
+        split_k,
     )
     _w8a8_block_fp8_matmul_splitk_kernel[grid](
         A,
@@ -1163,9 +1034,9 @@ def _w8a8_block_fp8_matmul_splitk(
         Bs.stride(1),
         Bs.stride(0),
         BLOCK_SIZE_M=_SPLITK_BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        SPLIT_K=SPLIT_K,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_k,
+        SPLIT_K=split_k,
         QUANT_PROLOGUE=As is None,
         num_warps=num_warps,
         num_stages=_SPLITK_NUM_STAGES,
@@ -1400,9 +1271,8 @@ def _finegrained_fp8_matmul(
     ``out_dtype``. ``input`` is either the raw model-dtype activation
     (``input_scale is None``; quantized here via ``_safe_act_quant`` unless
     ``allow_quant_prologue`` defers the quant into the decode kernels' prologue)
-    or a pre-quantized FP8 activation with its per-block scale (``*_prequant``
-    ops). ``block_n``/``block_k`` are inferred from the weight and per-block
-    ``weight_scale_inv`` shapes.
+    or a pre-quantized FP8 activation with its per-block scale. ``block_n``/``block_k``
+    are inferred from the weight and per-block ``weight_scale_inv`` shapes.
     """
     block_n, block_k = _finegrained_fp8_block_sizes(weight_quantized, weight_scale_inv)
     if input_scale is not None:
@@ -1480,56 +1350,13 @@ def _torch_fake_quant_finegrained_fp8_linear_fake(
 
 
 @torch.library.custom_op(
-    "auto_deploy::torch_fake_quant_finegrained_fp8_linear_prequant", mutates_args=()
-)
-def torch_fake_quant_finegrained_fp8_linear_prequant(
-    qinput: torch.Tensor,  # [..., K] float8_e4m3fn (pre-quantized activation)
-    input_scale: torch.Tensor,  # [..., K//block_k] per-block act scale (model dtype)
-    weight_quantized: torch.Tensor,  # [N, K] float8_e4m3fn
-    bias: Optional[torch.Tensor],  # [N] or None
-    weight_scale: List[torch.Tensor],  # [weight_scale_inv]
-) -> torch.Tensor:
-    """Matmul half of ``torch_fake_quant_finegrained_fp8_linear``.
-
-    Consumes a pre-quantized activation + per-block scale (produced by
-    ``torch_fp8_swiglu_clamp_act_quant`` in the ``fuse_fp8_swiglu_act_quant``
-    rewrite) and runs the same block-FP8 W8A8 matmul + bias the original op runs
-    after its in-line ``_safe_act_quant``. The output dtype is recovered from
-    ``input_scale.dtype``, which the quant allocates in the original activation
-    dtype, so the result is bit-for-bit identical to the fused op.
-    """
-    return _finegrained_fp8_matmul(
-        qinput,
-        weight_quantized,
-        weight_scale[0],
-        input_scale.dtype,
-        input_scale=input_scale,
-        bias=bias,
-    )
-
-
-@torch_fake_quant_finegrained_fp8_linear_prequant.register_fake
-def _torch_fake_quant_finegrained_fp8_linear_prequant_fake(
-    qinput: torch.Tensor,
-    input_scale: torch.Tensor,
-    weight_quantized: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    weight_scale: List[torch.Tensor],
-) -> torch.Tensor:
-    out_features = weight_quantized.shape[0]
-    return torch.empty(
-        (*qinput.shape[:-1], out_features), dtype=input_scale.dtype, device=qinput.device
-    )
-
-
-@torch.library.custom_op(
     "auto_deploy::torch_fake_quant_finegrained_fp8_linear_residual_add", mutates_args=()
 )
 def torch_fake_quant_finegrained_fp8_linear_residual_add(
     input: torch.Tensor,  # [..., K]
     weight_quantized: torch.Tensor,  # [N, K] float8_e4m3fn
     bias: Optional[torch.Tensor],  # must be None (the fusion only matches bias-free linears)
-    input_scale: List[torch.Tensor],  # unused for FineGrained FP8 (input quantized on the fly)
+    input_scale: List[torch.Tensor],  # [] for raw input, [scale] for pre-quantized input
     weight_scale: List[torch.Tensor],  # [weight_scale_inv]
     input_zp: List[torch.Tensor],  # unused
     weight_zp: List[torch.Tensor],  # unused
@@ -1544,19 +1371,24 @@ def torch_fake_quant_finegrained_fp8_linear_residual_add(
 
     Computes ``torch_fake_quant_finegrained_fp8_linear(input, ...) + residual`` with
     the add folded into the W8A8 block-FP8 matmul epilogue (one kernel instead of
-    matmul + standalone elementwise add). The matmul accumulator is rounded to the
-    output dtype *before* the add, so the result is bit-for-bit identical to the
-    unfused sequence. Emitted by the ``fuse_fp8_linear_allreduce_add`` transform for
-    the MoE routed+shared merge add feeding a distributed all_reduce (the summed
-    tensor is the collective's input buffer).
+    matmul + standalone elementwise add). ``input`` may be either a raw model-dtype
+    activation (``input_scale=[]``) or a pre-quantized FP8 activation paired with
+    ``input_scale=[scale]``. The matmul accumulator is rounded to the output dtype
+    *before* the add, so the result is bit-for-bit identical to the unfused sequence.
+    Emitted by the ``fuse_fp8_linear_allreduce_add`` transform for the MoE
+    routed+shared merge add feeding a distributed all_reduce (the summed tensor is
+    the collective's input buffer).
     """
     assert bias is None, "fused residual-add linear only supports bias-free linears"
     assert residual is not None, "residual tensor is required"
+    activation_scale = input_scale[0] if input_scale else None
+    out_dtype = activation_scale.dtype if activation_scale is not None else input.dtype
     return _finegrained_fp8_matmul(
         input,
         weight_quantized,
         weight_scale[0],
-        input.dtype,
+        out_dtype,
+        input_scale=activation_scale,
         residual=residual,
         input_scale_fmt=input_scale_fmt,
     )
@@ -1580,7 +1412,8 @@ def _torch_fake_quant_finegrained_fp8_linear_residual_add_fake(
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
     out_features = weight_quantized.shape[0]
-    return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
+    out_dtype = input_scale[0].dtype if input_scale else input.dtype
+    return torch.empty((*input.shape[:-1], out_features), dtype=out_dtype, device=input.device)
 
 
 @triton.jit
@@ -1652,7 +1485,7 @@ def torch_fp8_swiglu_clamp_act_quant(
     block_size: int,  # activation quant group (== matmul block_k)
     input_scale_fmt: str = "",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fused clamped-SwiGLU + block-FP8 activation quant feeding a *_prequant linear.
+    """Fused clamped-SwiGLU + block-FP8 activation quant feeding a down projection.
 
     Computes, in one kernel launch, the DeepSeek-V4 shared-expert epilogue between
     the merged gate/up projection and the down projection::
@@ -1711,52 +1544,6 @@ def _torch_fp8_swiglu_clamp_act_quant_fake(
         (*gate.shape[:-1], gate.shape[-1] // block_size), dtype=gate.dtype, device=gate.device
     )
     return qhidden, scale
-
-
-@torch.library.custom_op(
-    "auto_deploy::torch_fake_quant_finegrained_fp8_linear_residual_add_prequant",
-    mutates_args=(),
-)
-def torch_fake_quant_finegrained_fp8_linear_residual_add_prequant(
-    qinput: torch.Tensor,  # [..., K] float8_e4m3fn (pre-quantized activation)
-    input_scale: torch.Tensor,  # [..., K//block_k] per-block act scale (model dtype)
-    weight_quantized: torch.Tensor,  # [N, K] float8_e4m3fn
-    bias: Optional[torch.Tensor],  # must be None (the fusion only matches bias-free linears)
-    weight_scale: List[torch.Tensor],  # [weight_scale_inv]
-    residual: torch.Tensor,  # [..., N] added to the matmul output
-) -> torch.Tensor:
-    """Matmul half of ``torch_fake_quant_finegrained_fp8_linear_residual_add``.
-
-    Consumes a pre-quantized activation + per-block scale (e.g. produced by
-    ``torch_fp8_swiglu_clamp_act_quant``) and runs the same block-FP8 W8A8 matmul
-    with the merge add folded into the epilogue. Output dtype is recovered from
-    ``input_scale.dtype`` exactly like the prequant linear, so the result is
-    bit-for-bit identical to the internally-quantizing residual-add op.
-    """
-    assert bias is None, "fused residual-add linear only supports bias-free linears"
-    return _finegrained_fp8_matmul(
-        qinput,
-        weight_quantized,
-        weight_scale[0],
-        input_scale.dtype,
-        input_scale=input_scale,
-        residual=residual,
-    )
-
-
-@torch_fake_quant_finegrained_fp8_linear_residual_add_prequant.register_fake
-def _torch_fake_quant_finegrained_fp8_linear_residual_add_prequant_fake(
-    qinput: torch.Tensor,
-    input_scale: torch.Tensor,
-    weight_quantized: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    weight_scale: List[torch.Tensor],
-    residual: torch.Tensor,
-) -> torch.Tensor:
-    out_features = weight_quantized.shape[0]
-    return torch.empty(
-        (*qinput.shape[:-1], out_features), dtype=input_scale.dtype, device=qinput.device
-    )
 
 
 @torch.library.custom_op(

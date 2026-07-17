@@ -47,10 +47,8 @@ SHAPES = [
     (256, 7168),  # shared-expert gate/up-like
 ]
 
-# DeepSeek-V4-Flash TP4 per-rank decode shapes. Full-K keys carry the
-# BLOCK_SIZE_N in {128,64,32} / num_warps=8 autotune additions; the K=4096 shapes
-# dispatch to the split-K path and exercise the exact M=1, K=4096 schedule through
-# ``_w8a8_block_fp8_matmul_triton``.
+# DeepSeek-V4-Flash TP4 per-rank shapes. M=1 dispatches to the rowwise kernel;
+# M=2 and prefill exercise the split-K and full-K fallbacks.
 TP4_SHAPES = [
     (16384, 1024),  # fused wq_b + indexer.wq_b
     (8192, 1024),  # wq_b alone (ratio-128/0 layers)
@@ -168,55 +166,6 @@ def test_tp4_prefill_rmse(M, N, K):
     assert rmse_rel < 2.5e-2, f"M={M} N={N} K={K}: RMSE/amax={rmse_rel:.4e}"
 
 
-def test_tp4_decode_config_prune_pins_exact_fullk_keys():
-    """Each measured key is pinned; all other keys retain the old list."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
-        _W8A8_BLOCK_FP8_MATMUL_CONFIGS,
-        _W8A8_TP4_DECODE_CONFIG_BY_KEY,
-        _W8A8_TP4_DECODE_CONFIGS,
-        _W8A8_TP4_DECODE_KEYS,
-        _w8a8_prune_tp4_decode_configs,
-    )
-
-    base_configs = [
-        config
-        for config in _W8A8_BLOCK_FP8_MATMUL_CONFIGS
-        if config not in _W8A8_TP4_DECODE_CONFIGS
-    ]
-    expected_signatures = {
-        (1, 16384, 1024): (16, 128, 1, 8, 4),
-        (1, 8192, 1024): (16, 64, 1, 8, 4),
-        (1, 4096, 2048): (16, 32, 1, 8, 5),
-    }
-    assert _W8A8_TP4_DECODE_KEYS == frozenset(expected_signatures)
-    for key, pinned_config in _W8A8_TP4_DECODE_CONFIG_BY_KEY.items():
-        M, N, K = key
-        selected = _w8a8_prune_tp4_decode_configs(
-            _W8A8_BLOCK_FP8_MATMUL_CONFIGS, {"M": M, "N": N, "K": K}
-        )
-        assert selected == [pinned_config]
-        signature = (
-            pinned_config.kwargs["BLOCK_SIZE_M"],
-            pinned_config.kwargs["BLOCK_SIZE_N"],
-            pinned_config.kwargs["GROUP_SIZE_M"],
-            pinned_config.num_warps,
-            pinned_config.num_stages,
-        )
-        assert signature == expected_signatures[key]
-
-    # Shared w2 has no measured win; non-target M/N/K keys keep the old list.
-    for M, N, K in [
-        (1, 4096, 512),
-        (1, 4096, 1024),
-        (2, 16384, 1024),
-        (16, 8192, 1024),
-    ]:
-        selected = _w8a8_prune_tp4_decode_configs(
-            _W8A8_BLOCK_FP8_MATMUL_CONFIGS, {"M": M, "N": N, "K": K}
-        )
-        assert selected == base_configs
-
-
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
 def test_decode_gemv_multi_kblock():
     """M=1 GEMV across K spanning several K-blocks (scale-indexing in the loop)."""
@@ -233,7 +182,7 @@ def test_decode_gemv_multi_kblock():
 # ----------------------------------------------------------------------------------
 
 
-def _run_splitk(M, N, K, split_k, block_size_n=64, block_size_k=None, num_warps=4, seed=0):
+def _run_splitk(M, N, K, seed=0):
     """Drive the split-K helper directly (independent of the dispatch gate)."""
     torch.manual_seed(seed)
     block_n = block_k = 128
@@ -252,80 +201,33 @@ def _run_splitk(M, N, K, split_k, block_size_n=64, block_size_k=None, num_warps=
         M,
         N,
         K,
-        SPLIT_K=split_k,
-        BLOCK_SIZE_N=block_size_n,
-        BLOCK_SIZE_K=block_size_k,
-        num_warps=num_warps,
     )
     ref = (_dequant_act(a_fp8, a_s).double() @ _dequant_weight(b_fp8, b_s).double().t()).float()
     return out, ref
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
-@pytest.mark.parametrize("split_k", [2, 4, 7, 8, 16])
 @pytest.mark.parametrize("M", [1, 2])
 @pytest.mark.parametrize("N,K", [(1536, 7168), (576, 7168), (2304, 7168), (256, 7168)])
-def test_splitk_matches_reference(M, N, K, split_k):
-    """Split-K GEMV == fp64 ground truth for the K=7168 decode projection shapes.
-
-    Covers SPLIT_K values incl. 7 and 16 that do NOT divide the 56 K-blocks evenly,
-    exercising the ragged-tail K-mask.
-    """
-    out, ref = _run_splitk(M, N, K, split_k)
+def test_splitk_matches_reference(M, N, K):
+    """Split-K GEMV matches fp64 ground truth with its production schedule."""
+    out, ref = _run_splitk(M, N, K)
     assert out.shape == (M, N) and out.dtype == torch.bfloat16
     scale = ref.abs().amax().clamp(min=1e-6)
     max_rel = ((out.float() - ref).abs().amax() / scale).item()
-    assert max_rel < 1.5e-2, f"M={M} N={N} K={K} SPLIT_K={split_k}: max_rel={max_rel:.4e}"
+    assert max_rel < 1.5e-2, f"M={M} N={N} K={K}: max_rel={max_rel:.4e}"
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
-@pytest.mark.parametrize("split_k", [4, 8])
-@pytest.mark.parametrize("block_size_n", [32, 64, 128])
-def test_splitk_block_n_and_ragged_n(split_k, block_size_n):
-    """Split-K with N NOT a multiple of BLOCK_SIZE_N (576) across BLOCK_SIZE_N choices.
-
-    Guards the masked-tile atomic store.
-    """
-    out, ref = _run_splitk(1, 576, 7168, split_k, block_size_n=block_size_n)
-    scale = ref.abs().amax().clamp(min=1e-6)
-    max_rel = ((out.float() - ref).abs().amax() / scale).item()
-    assert max_rel < 1.5e-2, f"N=576 BLOCK_N={block_size_n} SPLIT_K={split_k}: {max_rel:.4e}"
-
-
-@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
-@pytest.mark.parametrize("block_size_k", [32, 64, 128])
-@pytest.mark.parametrize("split_k", [12, 24, 48])
-@pytest.mark.parametrize("N,K", [(1536, 7168), (576, 7168), (2304, 7168), (256, 7168)])
-def test_splitk_block_size_k(N, K, split_k, block_size_k):
-    """BLOCK_SIZE_K (MMA tile depth) decoupled from the quant scale group.
-
-    A tile of BLOCK_SIZE_K in {32,64,128} stays inside one 128-wide scale block, so
-    the per-tile scale index ``(k*BLOCK_SIZE_K)//group_k`` must still reconstruct the
-    fp64 ground truth across SPLIT_K and the K=7168 decode projection Ns (M=1).
-    """
-    out, ref = _run_splitk(1, N, K, split_k, block_size_k=block_size_k)
-    assert out.shape == (1, N) and out.dtype == torch.bfloat16
-    scale = ref.abs().amax().clamp(min=1e-6)
-    max_rel = ((out.float() - ref).abs().amax() / scale).item()
-    assert max_rel < 1.5e-2, f"N={N} K={K} SPLIT_K={split_k} BK={block_size_k}: {max_rel:.4e}"
-
-
-@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
-@pytest.mark.parametrize("num_warps", [2, 4])
-@pytest.mark.parametrize("split_k", [8, 16, 24, 32])
 @pytest.mark.parametrize("M", [1, 2])
 @pytest.mark.parametrize("N,K", [(1024, 4096), (1536, 4096)])
-def test_splitk_tp4_band(M, N, K, split_k, num_warps):
-    """K=4096 (32 K-blocks) TP4 band: split-K launches must reconstruct the fp64 ground truth.
-
-    Covers SPLIT_K up to 32 (1 K-block per CTA) and the new num_warps=2 launch, incl.
-    the ragged SPLIT_K=24 case where 8 CTAs per tile take 2 K-blocks.
-    """
-    out, ref = _run_splitk(M, N, K, split_k, num_warps=num_warps)
+def test_splitk_tp4_band(M, N, K):
+    """The measured TP4 schedule reconstructs the fp64 ground truth."""
+    out, ref = _run_splitk(M, N, K)
     assert out.shape == (M, N) and out.dtype == torch.bfloat16
     scale = ref.abs().amax().clamp(min=1e-6)
     max_rel = ((out.float() - ref).abs().amax() / scale).item()
-    assert max_rel < 1.5e-2, f"M={M} N={N} K={K} SK={split_k} nw={num_warps}: {max_rel:.4e}"
+    assert max_rel < 1.5e-2, f"M={M} N={N} K={K}: max_rel={max_rel:.4e}"
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
@@ -352,20 +254,10 @@ def test_splitk_tp4_heuristic_defaults():
     assert _splitk_num_warps(1536, 7168) == 4 and _splitk_num_warps(1536) == 4
 
     for N in (1024, 1536):
-        out, ref = _run_splitk(1, N, 4096, None, block_size_n=None, num_warps=None)
+        out, ref = _run_splitk(1, N, 4096)
         scale = ref.abs().amax().clamp(min=1e-6)
         max_rel = ((out.float() - ref).abs().amax() / scale).item()
         assert max_rel < 1.5e-2, f"heuristic N={N} K=4096: {max_rel:.4e}"
-
-
-@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
-def test_splitk_block_size_k_must_divide_group():
-    """BLOCK_SIZE_K that does not divide the quant block_k straddles a scale block and is rejected.
-
-    Guards the scale-index correctness invariant.
-    """
-    with pytest.raises(AssertionError, match="must divide quant block_k"):
-        _run_splitk(1, 256, 7168, 24, block_size_k=96)
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
@@ -439,19 +331,6 @@ def test_splitk_quant_prologue_random(M, N, K):
     scale = ref.abs().amax().clamp(min=1e-6)
     max_rel = ((out.float() - ref).abs().amax() / scale).item()
     assert max_rel < 1.5e-2, f"M={M} N={N} K={K}: max_rel={max_rel:.4e}"
-
-
-@pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
-def test_splitk_quant_prologue_requires_full_group_tile():
-    """The fused prologue must reject an MMA tile narrower than the quant group.
-
-    Its per-tile amax would only see part of the 128-group.
-    """
-    a, b_fp8, b_s = _exact_case(1, 1024, 4096, seed=23)
-    with pytest.raises(AssertionError, match="quant prologue requires"):
-        _w8a8_block_fp8_matmul_splitk(
-            a, b_fp8, None, b_s, 128, 128, torch.bfloat16, 1, 1024, 4096, BLOCK_SIZE_K=64
-        )
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")

@@ -26,10 +26,13 @@ import yaml
 from pydantic import ValidationError
 
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
+from tensorrt_llm._torch.auto_deploy.utils._config import deep_merge_dicts
 
 # Root directory for the example configs
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[5]
 _AD_EXAMPLES_DIR = _REPO_ROOT / "examples" / "auto_deploy"
+_DEFAULT_CONFIG = _REPO_ROOT / "tensorrt_llm" / "_torch" / "auto_deploy" / "config" / "default.yaml"
+_MODEL_CONFIGS = _AD_EXAMPLES_DIR / "model_registry" / "configs"
 
 # Files that are not LlmArgs configs and should be excluded from validation
 _EXCLUDED_FILES = {
@@ -117,3 +120,35 @@ def test_config_yaml_dry_run_ingestion(config_yaml_path):
     except ValidationError as e:
         if not _is_tolerable_validation_error(e):
             raise
+
+
+def _load_yaml(path):
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def test_deepseek_v4_fusions_are_model_scoped():
+    defaults = _load_yaml(_DEFAULT_CONFIG)
+    deepseek_v4 = deep_merge_dicts(defaults, _load_yaml(_MODEL_CONFIGS / "deepseek_v4_flash.yaml"))
+
+    names = (
+        "fuse_gemms_mixed_children",
+        "fuse_replicated_bf16_linear",
+        "fuse_fp8_swiglu_act_quant",
+    )
+    assert all(not defaults["transforms"][name]["enabled"] for name in names)
+    assert all(deepseek_v4["transforms"][name]["enabled"] for name in names)
+    assert deepseek_v4["transforms"]["fuse_gemms_mixed_children"]["quantized_only"]
+
+
+@pytest.mark.parametrize(
+    "model_config", ["gpt_oss.yaml", "qwen3.5_moe_35b.yaml", "llama3_1_8b.yaml"]
+)
+def test_other_mixed_children_configs_keep_bf16_fusion(model_config):
+    merged = deep_merge_dicts(
+        _load_yaml(_DEFAULT_CONFIG), _load_yaml(_MODEL_CONFIGS / model_config)
+    )
+    mixed_children = merged["transforms"]["fuse_gemms_mixed_children"]
+
+    assert mixed_children["enabled"]
+    assert not mixed_children.get("quantized_only", False)

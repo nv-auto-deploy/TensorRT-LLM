@@ -755,6 +755,14 @@ class DeepseekV4RMSNorm(nn.Module):
         return torch.ops.auto_deploy.torch_rmsnorm(x, self.weight, self.eps)
 
 
+class _DeepseekV4QRMSNorm(DeepseekV4RMSNorm):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # AutoDeploy represents CUDA tensors as meta tensors during export.
+        if x.dtype == torch.bfloat16 and x.shape[-1] == 1024 and x.device.type in ("cuda", "meta"):
+            return torch.ops.auto_deploy.deepseek_v4_q_rmsnorm(x, self.weight, self.eps)
+        return super().forward(x)
+
+
 class DeepseekV4RotaryEmbedding(nn.Module):
     def __init__(self, config: DeepseekV4Config) -> None:
         super().__init__()
@@ -1355,7 +1363,7 @@ class DeepseekV4Attention(nn.Module):
         self.group_head_width = (self.n_heads * self.head_dim) // self.n_groups
 
         self.wq_a = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False)
-        self.q_norm = DeepseekV4RMSNorm(self.q_lora_rank, self.rms_eps)
+        self.q_norm = _DeepseekV4QRMSNorm(self.q_lora_rank, self.rms_eps)
         self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.wkv = nn.Linear(self.hidden_size, self.head_dim, bias=False)
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, self.rms_eps)

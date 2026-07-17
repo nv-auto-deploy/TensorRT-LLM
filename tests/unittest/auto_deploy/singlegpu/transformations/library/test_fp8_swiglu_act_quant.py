@@ -19,8 +19,8 @@ shared-expert epilogue between the merged gate/up projection and the down
 projection -- ``clamp(gate, max=L); clamp(up, -L, L);
 (silu(gate.float()) * up.float()).to(model_dtype); _safe_act_quant(...)`` -- into
 one Triton launch. The ``fuse_fp8_swiglu_act_quant`` transform rewrites the chain
-and feeds the pre-quantized pair into the matmul-only
-``torch_fake_quant_finegrained_fp8_linear[_residual_add]_prequant`` down linear.
+and feeds the pre-quantized pair into the existing residual-add down linear through
+its ``input_scale`` argument.
 
 The claim under test is *exact* equivalence, not approximate accuracy: every
 op-level case asserts byte equality of the FP8 payload and ``torch.equal`` of the
@@ -158,8 +158,8 @@ def test_fused_swiglu_act_quant_edge_values(fmt):
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
-def test_prequant_residual_add_matches_fused_op():
-    """residual_add_prequant(quant(x), ...) == residual_add(x, ...) bit for bit."""
+def test_residual_add_accepts_prequantized_input():
+    """residual_add(quant(x), input_scale=[s]) matches its raw-input form exactly."""
     device = "cuda"
     M, N, K = 8, 256, 512
     x = torch.randn(M, K, device=device, dtype=torch.bfloat16) * 0.5
@@ -172,10 +172,10 @@ def test_prequant_residual_add_matches_fused_op():
             x, w, None, [], [ws], [], [], input_scale_fmt=fmt, residual=residual
         )
         q, s = _safe_act_quant(x, BLOCK_SIZE, fmt)
-        got = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add_prequant(
-            q, s, w, None, [ws], residual
+        got = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add(
+            q, w, None, [s], [ws], [], [], residual=residual
         )
-        assert torch.equal(got, ref), f"prequant residual-add mismatch (fmt={fmt!r})"
+        assert torch.equal(got, ref), f"prequantized residual-add mismatch (fmt={fmt!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -205,18 +205,17 @@ class _SharedExpertMLP(nn.Module):
     """DeepSeek-V4 shared-expert MLP in its post-quantization graph form.
 
     Mirrors ``DeepseekV4MLP.forward`` after the quantization transform rewrote the
-    three linears to ``torch_fake_quant_finegrained_fp8_linear`` -- plus, for the
-    residual form, the down projection as ``..._residual_add`` (the node
+    three linears to ``torch_fake_quant_finegrained_fp8_linear``, then rewrote the
+    down projection to ``..._residual_add`` (the node
     ``fuse_fp8_linear_allreduce_add`` leaves for the MoE merge seam).
     """
 
-    def __init__(self, hidden, inter, device, fmt, residual_form):
+    def __init__(self, hidden, inter, device, fmt):
         super().__init__()
         self.w1 = _FP8Proj(inter, hidden, device, seed=1)
         self.w3 = _FP8Proj(inter, hidden, device, seed=3)
         self.w2 = _FP8Proj(hidden, inter, device, seed=2)
         self.fmt = fmt
-        self.residual_form = residual_form
         self.limit = LIMIT
 
     def forward(self, x, routed):
@@ -244,19 +243,7 @@ class _SharedExpertMLP(nn.Module):
         gate = torch.clamp(gate, max=self.limit)
         up = torch.clamp(up, min=-self.limit, max=self.limit)
         hidden = (F.silu(gate.float()) * up.float()).to(x.dtype)
-        if self.residual_form:
-            return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add(
-                hidden,
-                self.w2.weight,
-                None,
-                [],
-                [self.w2.weight_scale_inv],
-                [],
-                [],
-                input_scale_fmt=self.fmt,
-                residual=routed,
-            )
-        down = lin(
+        return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add(
             hidden,
             self.w2.weight,
             None,
@@ -265,8 +252,8 @@ class _SharedExpertMLP(nn.Module):
             [],
             [],
             input_scale_fmt=self.fmt,
+            residual=routed,
         )
-        return down + routed
 
 
 def _count_ops(gm, op):
@@ -274,12 +261,11 @@ def _count_ops(gm, op):
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
-@pytest.mark.parametrize("residual_form", [True, False])
 @pytest.mark.parametrize("fmt", ["", "ue8m0"])
-def test_transform_fuses_dsv4_shared_expert_chain(residual_form, fmt):
+def test_transform_fuses_dsv4_shared_expert_chain(fmt):
     device = "cuda"
     hidden, inter, M = 256, 512, 8  # M>4 + K<4096 -> deterministic base matmul kernel
-    model = _SharedExpertMLP(hidden, inter, device, fmt, residual_form).eval()
+    model = _SharedExpertMLP(hidden, inter, device, fmt).eval()
     # Wide activations so the clamps actually clip (gate/up std ~ 0.1*5*sqrt(256) ~ 8).
     x = torch.randn(M, hidden, device=device, dtype=torch.bfloat16) * 5.0
     routed = torch.randn(M, hidden, device=device, dtype=torch.bfloat16)
@@ -290,7 +276,7 @@ def test_transform_fuses_dsv4_shared_expert_chain(residual_form, fmt):
     gm = torch_export_to_gm(model, args=(x, routed))
 
     # Stage 1 (production order): merge the sibling gate/up projections.
-    mixed_cfg = FuseGemmsMixedChildrenConfig(stage=Stages.POST_LOAD_FUSION, fp8_only=True)
+    mixed_cfg = FuseGemmsMixedChildrenConfig(stage=Stages.POST_LOAD_FUSION, quantized_only=True)
     gm, info_mixed = FuseGemmsMixedChildren(mixed_cfg)._apply(gm, None, None, SharedConfig())
     assert info_mixed.num_matches == 1, f"gate/up merge expected 1 match, got {info_mixed}"
     gm.recompile()
@@ -313,45 +299,33 @@ def test_transform_fuses_dsv4_shared_expert_chain(residual_form, fmt):
     gm.recompile()
     assert info.num_matches == 1, f"swiglu act-quant fusion expected 1 match, got {info}"
 
-    # The elementwise chain and the internally-quantizing down linear are gone.
+    # The elementwise chain is gone and the down linear consumes the fused quant output.
     assert _count_ops(gm, torch.ops.aten.silu) == 0
     assert not any(
         is_op(n, (torch.ops.aten.clamp, torch.ops.aten.clamp_max, torch.ops.aten.clamp_min))
         for n in gm.graph.nodes
     )
     assert _count_ops(gm, torch.ops.auto_deploy.torch_fp8_swiglu_clamp_act_quant) == 1
-    if residual_form:
-        assert (
-            _count_ops(
-                gm,
-                torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add_prequant,
-            )
-            == 1
-        )
-        assert (
-            _count_ops(
-                gm, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add
-            )
-            == 0
-        )
-    else:
-        assert (
-            _count_ops(gm, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_prequant)
-            == 1
-        )
+    residual_nodes = [
+        node
+        for node in gm.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add)
+    ]
+    assert len(residual_nodes) == 1
+    assert len(residual_nodes[0].args[3]) == 1, "rewritten down linear must consume qscale"
 
     with torch.no_grad():
         out = gm(x, routed)
     out = out[0] if isinstance(out, (tuple, list)) else out
     assert torch.equal(out, merged_ref), (
-        f"fusion changed the merged graph's output (residual_form={residual_form}, "
-        f"fmt={fmt!r}): max abs diff {(out.float() - merged_ref.float()).abs().max().item()}"
+        f"fusion changed the merged graph's output (fmt={fmt!r}): "
+        f"max abs diff {(out.float() - merged_ref.float()).abs().max().item()}"
     )
     if fmt == "":
         # With the default scale format the gate/up merge itself is lossless, so the
         # rewritten graph must also reproduce the original eager module bit for bit.
         assert torch.equal(out, ref), (
-            f"rewritten graph diverges from eager (residual_form={residual_form}): "
+            "rewritten graph diverges from eager: "
             f"max abs diff {(out.float() - ref.float()).abs().max().item()}"
         )
 

@@ -13,9 +13,9 @@ the fused epilogue rounds the fp32 accumulator to the output dtype first (the
 base kernel's store rounding) and then performs the add in fp32 opmath with one
 final rounding (aten's elementwise add semantics). Every case therefore asserts
 ``torch.equal`` against the unfused two-op reference
-``torch_fake_quant_finegrained_fp8_linear(...) + residual`` — including shapes
-that dispatch to the split-K decode path (where the op intentionally keeps the
-add as a separate elementwise epilogue with identical rounding).
+``torch_fake_quant_finegrained_fp8_linear(...) + residual`` — including M=2/4
+shapes that dispatch to the split-K decode path (where the op intentionally keeps
+the add as a separate elementwise epilogue with identical rounding).
 """
 
 import pytest
@@ -30,7 +30,7 @@ torch.manual_seed(0)
 # (N, K) shapes. The DeepSeek-V4-Flash TP4 shared-expert down projection is
 # N=4096, K=512 (full-K kernel path). N=576 exercises the masked-tile store with
 # the residual load mask; (1024, 4096) dispatches to the split-K decode path at
-# M<=4 and exercises the op's separate-add fallback.
+# M=2/4 and exercises the op's separate-add fallback (M=1 uses rowwise GEMV).
 SHAPES = [
     (4096, 512),  # DSV4 shared-expert w2 (the fusion's production shape)
     (2048, 512),
@@ -96,7 +96,8 @@ def test_fp8_linear_residual_add_commutes(order: str):
     assert torch.equal(fused, ref)
 
 
-def test_fp8_linear_residual_add_splitk_dispatch_covered():
-    """Guard the shape list: (1024, 4096) at M=1 must exercise the split-K fallback."""
-    assert _use_splitk_decode(1, 1024, 4096)
+@pytest.mark.parametrize("M", [2, 4])
+def test_fp8_linear_residual_add_splitk_dispatch_covered(M: int):
+    """Guard the shape list: M=2/4 must exercise the split-K fallback."""
+    assert _use_splitk_decode(M, 1024, 4096)
     assert not _use_splitk_decode(1, 4096, 512)

@@ -705,24 +705,8 @@ def test_finegrained_fp8_dequant_per_row_scale_expands_by_one():
 
 
 # ---------------------------------------------------------------------------
-# Fused W8A8 activation-quant prologue flag (v6)
+# Automatic W8A8 activation-quant prologue dispatch
 # ---------------------------------------------------------------------------
-#
-# ``set_w8a8_quant_prologue(True)`` (transform knob ``w8a8_quant_prologue`` on
-# fuse_fp8_act_quant_cse) makes the FineGrained FP8 linear/grouped ops defer
-# the ue8m0 activation quant into the decode GEMV/split-K kernel prologues.
-# The quant math is replicated bit-exactly; the re-tuned fused launch configs
-# change the consumer's fp32 summation-tree order, so random-data outputs may
-# differ from the flag-off pipeline by at most one bf16 ULP at rare
-# near-cancellation outputs (same acceptance class as the rowwise-GEMV landing
-# and the split-K path's pre-existing atomic wobble). Prefill (M >> 1),
-# non-ue8m0 formats, and the flag-off default must be byte-identical.
-
-
-def _w8a8_prologue(enabled: bool):
-    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization import torch_quant
-
-    torch_quant.set_w8a8_quant_prologue(enabled)
 
 
 def _fg_ue8m0_linear_case(N, K, M=1, seed=42):
@@ -743,24 +727,8 @@ def _fg_linear(x, w_fp8, ws_inv, fmt="ue8m0"):
     )
 
 
-def _assert_bf16_adjacent(out, ref, max_flips):
-    """Assert fused-vs-standalone differences are reduction-order noise only.
-
-    Few flips, each either 1 bf16 ULP or a negligible absolute diff at
-    near-cancellation outputs.
-    """
-    neq = out != ref
-    flips = int(neq.sum())
-    assert flips <= max_flips, f"{flips} mismatches (allowed {max_flips})"
-    if flips:
-        steps = (out.view(torch.int16).int() - ref.view(torch.int16).int()).abs()[neq]
-        adiff = (out.float() - ref.float()).abs()[neq]
-        scale = float(ref.float().abs().mean()) + 1e-12
-        big = steps > 1
-        assert bool((adiff[big] <= 1e-4 * scale).all()), (
-            f"non-negligible mismatch beyond 1 bf16 ULP: max step {int(steps.max())}, "
-            f"max adiff {float(adiff.max()):.3e} vs tensor scale {scale:.3e}"
-        )
+def _fail_standalone_act_quant(*args, **kwargs):
+    raise AssertionError("supported decode path must fuse activation quantization")
 
 
 @pytest.mark.parametrize(
@@ -768,56 +736,41 @@ def _assert_bf16_adjacent(out, ref, max_flips):
     [(1536, 4096), (1024, 4096), (16384, 1024), (8192, 1024), (4096, 512), (4096, 2048)],
 )
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
-def test_finegrained_fp8_linear_quant_prologue_decode(N, K):
-    """Flag-on decode (M=1) output vs the flag-off pipeline at every TP4 shape."""
+def test_finegrained_fp8_linear_uses_quant_prologue_for_decode(monkeypatch, N, K):
+    """Every measured TP4 decode shape bypasses standalone activation quantization."""
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization import torch_quant
+
     x, w_fp8, ws_inv = _fg_ue8m0_linear_case(N, K)
-    _w8a8_prologue(False)
-    ref = _fg_linear(x, w_fp8, ws_inv)
-    try:
-        _w8a8_prologue(True)
-        out = _fg_linear(x, w_fp8, ws_inv)
-    finally:
-        _w8a8_prologue(False)
-    _assert_bf16_adjacent(out, ref, max_flips=max(2, N // 1024))
-    # Flag restored -> byte-identical to the first flag-off run.
-    assert torch.equal(_fg_linear(x, w_fp8, ws_inv), ref)
+    monkeypatch.setattr(torch_quant, "_safe_act_quant", _fail_standalone_act_quant)
+    assert _fg_linear(x, w_fp8, ws_inv).shape == (1, N)
 
 
-@pytest.mark.parametrize("M", [64])
+@pytest.mark.parametrize("M,fmt", [(64, "ue8m0"), (1, "")])
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
-def test_finegrained_fp8_linear_quant_prologue_prefill_invariant(M):
-    """Flag-on prefill must be byte-identical (standalone quant + full-K path)."""
+def test_finegrained_fp8_linear_falls_back_to_standalone_quant(monkeypatch, M, fmt):
+    """Prefill and non-UE8M0 inputs retain the standalone quantization path."""
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization import torch_quant
+
+    calls = 0
+    safe_act_quant = torch_quant._safe_act_quant
+
+    def count_safe_act_quant(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return safe_act_quant(*args, **kwargs)
+
+    monkeypatch.setattr(torch_quant, "_safe_act_quant", count_safe_act_quant)
     x, w_fp8, ws_inv = _fg_ue8m0_linear_case(1536, 4096, M=M)
-    ref = _fg_linear(x, w_fp8, ws_inv)
-    try:
-        _w8a8_prologue(True)
-        out = _fg_linear(x, w_fp8, ws_inv)
-    finally:
-        _w8a8_prologue(False)
-    assert torch.equal(out, ref)
-
-
-@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
-def test_finegrained_fp8_linear_quant_prologue_non_ue8m0_invariant(M=1):
-    """The prologue is gated to ue8m0: raw-scale format stays byte-identical."""
-    x, w_fp8, ws_inv = _fg_ue8m0_linear_case(4096, 2048, M=M)
-    ref = _fg_linear(x, w_fp8, ws_inv, fmt="")
-    try:
-        _w8a8_prologue(True)
-        out = _fg_linear(x, w_fp8, ws_inv, fmt="")
-    finally:
-        _w8a8_prologue(False)
-    assert torch.equal(out, ref)
+    assert _fg_linear(x, w_fp8, ws_inv, fmt=fmt).shape == (M, 1536)
+    assert calls == 1
 
 
 @pytest.mark.parametrize("num_groups", [1, 2])
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
-def test_grouped_finegrained_fp8_linear_quant_prologue(num_groups):
-    """Grouped wo_a decode (rank=1024, K=4096) flag-on vs flag-off.
+def test_grouped_finegrained_fp8_linear_uses_quant_prologue(monkeypatch, num_groups):
+    """Grouped wo_a decode also bypasses standalone activation quantization."""
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization import torch_quant
 
-    Exact-arithmetic inputs (lossless quant, fp32-exact sums) make the result
-    independent of the split-K atomic order, so torch.equal is a hard gate.
-    """
     rank, K = 1024, 4096
     N = num_groups * rank
     torch.manual_seed(43)
@@ -826,46 +779,34 @@ def test_grouped_finegrained_fp8_linear_quant_prologue(num_groups):
     w_fp8 = torch.randint(-2, 3, (N, K), device="cuda").float().to(torch.float8_e4m3fn)
     ws_inv = torch.ones(N // 128, K // 128, device="cuda", dtype=torch.float32)
 
-    def run():
-        return torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear(
-            x, w_fp8, None, [], [ws_inv], [], [], input_scale_fmt="ue8m0"
-        )
-
-    _w8a8_prologue(False)
-    ref = run()
-    try:
-        _w8a8_prologue(True)
-        out = run()
-    finally:
-        _w8a8_prologue(False)
-    assert torch.equal(out, ref)
+    monkeypatch.setattr(torch_quant, "_safe_act_quant", _fail_standalone_act_quant)
+    out = torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear(
+        x, w_fp8, None, [], [ws_inv], [], [], input_scale_fmt="ue8m0"
+    )
+    assert out.shape == (1, 1, N)
 
 
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
 def test_finegrained_fp8_linear_quant_prologue_cudagraph():
-    """Flag-on decode op must capture/replay in a CUDA graph and match eager."""
+    """The automatic decode prologue captures and replays in a CUDA graph."""
     x, w_fp8, ws_inv = _fg_ue8m0_linear_case(4096, 2048)
     x_static = x.clone()
-    try:
-        _w8a8_prologue(True)
-        eager = _fg_linear(x_static, w_fp8, ws_inv)
-        # warmup on a side stream, then capture (deterministic kernel -> equal)
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            _fg_linear(x_static, w_fp8, ws_inv)
-        torch.cuda.current_stream().wait_stream(s)
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            out = _fg_linear(x_static, w_fp8, ws_inv)
-        out.zero_()
-        g.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(out, eager)
-        # replay after mutating the static input in place
-        x_static.copy_(x * 2.0)
-        g.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(out, _fg_linear(x_static, w_fp8, ws_inv))
-    finally:
-        _w8a8_prologue(False)
+    eager = _fg_linear(x_static, w_fp8, ws_inv)
+    # Warm up on a side stream before capture.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _fg_linear(x_static, w_fp8, ws_inv)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = _fg_linear(x_static, w_fp8, ws_inv)
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
+
+    x_static.copy_(x * 2.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, _fg_linear(x_static, w_fp8, ws_inv))

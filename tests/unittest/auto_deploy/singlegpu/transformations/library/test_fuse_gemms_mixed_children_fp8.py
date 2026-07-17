@@ -12,21 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Correctness + no-collision proof for the scoped ``fuse_gemms_mixed_children``.
+"""Correctness tests for quantized mixed-children GEMM fusion.
 
-Enabling ``fuse_gemms_mixed_children`` (``fp8_only=True``) merges sibling
+Enabling ``fuse_gemms_mixed_children`` (``quantized_only=True``) merges sibling
 ``torch_fake_quant_finegrained_fp8_linear`` projections that read the *same* activation
 into one concatenated ``[sum_N, K]`` block-FP8 GEMM + ``torch.narrow`` views, including
 the DIFFERENT-shaped DeepSeek-V4 attention groups (``wq_a``+``wkv``,
 ``wq_b``+``indexer.wq_b``), so these tests guard the general different-N concat identity.
 
-They also guard the fused-parameter namespace: each transform registers its fused
-weights under its own unique prefix (``mixed_children_fused_weight_{idx}`` here,
-``replicated_bf16_fused_weight_{idx}`` for ``fuse_replicated_bf16_linear``) instead of
-``_insert_fused_gemm``'s generic ``fused_weight_{idx}`` default. Without unique prefixes
-the two transforms collide — the later ``setattr`` overwrites the earlier fused weight,
-so an FP8 fused node silently reads a smaller bf16 tensor and shape-prop fails with
-``start (0) + length (N) exceeds dimension size``.
+The mixed quantized and replicated-bf16 transforms may run on the same graph, so the
+registered fused weights must also remain distinct.
 """
 
 import pytest
@@ -202,7 +197,7 @@ def test_transform_fuses_different_shaped_fp8_siblings():
 
     assert sum(1 for n in gm.graph.nodes if is_op(n, lin_op)) == 3
 
-    cfg = FuseGemmsMixedChildrenConfig(stage=Stages.POST_LOAD_FUSION, fp8_only=True)
+    cfg = FuseGemmsMixedChildrenConfig(stage=Stages.POST_LOAD_FUSION, quantized_only=True)
     new_gm, info = FuseGemmsMixedChildren(cfg)._apply(gm, None, None, SharedConfig())
     new_gm.recompile()
 
@@ -227,9 +222,8 @@ def test_transform_fuses_different_shaped_fp8_siblings():
 class _MixedModule(torch.nn.Module):
     """x feeds BOTH block-FP8 siblings and replicated bf16 siblings.
 
-    mixed_children fuses the FP8 pair (registers a fused weight), then
-    fuse_replicated_bf16_linear fuses the bf16 pair. Both used to register
-    ``fused_weight_0`` -> the second overwrote the first and shape-prop blew up.
+    mixed_children fuses the FP8 pair, then fuse_replicated_bf16_linear fuses
+    the bf16 pair. Their graph-derived fused-weight attributes must be distinct.
     """
 
     def __init__(self, K, device):
@@ -265,7 +259,7 @@ def test_no_param_collision_with_replicated_bf16():
     ref = tuple(t.clone() for t in gm(x))
 
     # Run mixed_children (FP8) FIRST, then the bf16 fusion -- the production order.
-    cfg = FuseGemmsMixedChildrenConfig(stage=Stages.POST_LOAD_FUSION, fp8_only=True)
+    cfg = FuseGemmsMixedChildrenConfig(stage=Stages.POST_LOAD_FUSION, quantized_only=True)
     gm, info_fp8 = FuseGemmsMixedChildren(cfg)._apply(gm, None, None, SharedConfig())
     gm, info_bf16 = FuseReplicatedBf16Linear(TransformConfig(stage=Stages.POST_LOAD_FUSION))._apply(
         gm, None, None, SharedConfig()
@@ -275,15 +269,11 @@ def test_no_param_collision_with_replicated_bf16():
     assert info_fp8.num_matches == 1, "FP8 sibling pair should fuse"
     assert info_bf16.num_matches == 1, "bf16 sibling pair should fuse"
 
-    # The two transforms must register disjoint fused-parameter namespaces.
-    fused_names = [
-        n.target for n in gm.graph.nodes if n.op == "get_attr" and "fused_weight" in str(n.target)
-    ]
-    mixed = [n for n in fused_names if str(n).startswith("mixed_children_fused_weight")]
-    bf16 = [n for n in fused_names if str(n).startswith("replicated_bf16_fused_weight")]
-    assert mixed, "mixed_children fused weight not found under its unique prefix"
-    assert bf16, "bf16 fused weight not found under its unique prefix"
-    assert set(mixed).isdisjoint(set(bf16)), f"fused param name collision: {fused_names}"
+    # The two transforms must register distinct fused-weight attributes.
+    fused_names = [name for name, _ in gm.named_parameters() if name.startswith("fused_weight_")]
+    assert len(fused_names) == 2
+    assert len(set(fused_names)) == 2, f"fused param name collision: {fused_names}"
+    assert all(hasattr(gm, name) for name in fused_names)
 
     # And the graph must still execute correctly (the collision previously corrupted the
     # FP8 fused weight -> shape-prop / runtime error).

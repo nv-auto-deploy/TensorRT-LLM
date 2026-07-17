@@ -1040,6 +1040,81 @@ def test_rmsnorm_matches_reference() -> None:
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_q_lora_rmsnorm_export_uses_specialized_kernel() -> None:
+    config = _small_config(
+        num_hidden_layers=1,
+        compress_ratios=(0,),
+        num_hash_layers=0,
+        q_lora_rank=1024,
+    )
+    norm = DeepseekV4Attention(config, layer_idx=0).q_norm.eval().cuda()
+    x = torch.randn(2, 3, config.q_lora_rank, device="cuda", dtype=torch.bfloat16)
+
+    gm = torch_export_to_gm(norm, args=(x,))
+
+    optimized_op = torch.ops.auto_deploy.deepseek_v4_q_rmsnorm.default
+    assert len(_call_nodes(gm, optimized_op)) == 1
+    assert len(_call_nodes(gm, torch.ops.auto_deploy.torch_rmsnorm.default)) == 0
+    torch.testing.assert_close(
+        gm(x),
+        torch.ops.auto_deploy.torch_rmsnorm(x, norm.weight, norm.eps),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_q_lora_rmsnorm_falls_back_on_cpu() -> None:
+    config = _small_config(
+        num_hidden_layers=1,
+        compress_ratios=(0,),
+        num_hash_layers=0,
+        q_lora_rank=1024,
+    )
+    norm = DeepseekV4Attention(config, layer_idx=0).q_norm.eval()
+    x = torch.randn(2, 3, config.q_lora_rank, dtype=torch.bfloat16)
+
+    gm = torch.export.export(norm, (x,), strict=False).module()
+
+    assert len(_call_nodes(gm, torch.ops.auto_deploy.deepseek_v4_q_rmsnorm.default)) == 0
+    assert len(_call_nodes(gm, torch.ops.auto_deploy.torch_rmsnorm.default)) == 1
+    torch.testing.assert_close(
+        gm(x),
+        torch.ops.auto_deploy.torch_rmsnorm(x, norm.weight, norm.eps),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("width", "dtype"),
+    [(1024, torch.float32), (16, torch.bfloat16)],
+)
+def test_q_lora_rmsnorm_falls_back_for_unsupported_cuda_input(
+    width: int, dtype: torch.dtype
+) -> None:
+    config = _small_config(
+        num_hidden_layers=1,
+        compress_ratios=(0,),
+        num_hash_layers=0,
+        q_lora_rank=width,
+    )
+    norm = DeepseekV4Attention(config, layer_idx=0).q_norm.eval().cuda()
+    x = torch.randn(2, 3, width, device="cuda", dtype=dtype)
+
+    gm = torch_export_to_gm(norm, args=(x,))
+
+    assert len(_call_nodes(gm, torch.ops.auto_deploy.deepseek_v4_q_rmsnorm.default)) == 0
+    assert len(_call_nodes(gm, torch.ops.auto_deploy.torch_rmsnorm.default)) == 1
+    torch.testing.assert_close(
+        gm(x),
+        torch.ops.auto_deploy.torch_rmsnorm(x, norm.weight, norm.eps),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_mlp_swiglu_limit_matches_reference() -> None:
     mlp = DeepseekV4MLP(16, 12, swiglu_limit=0.5).eval()
     _set_mlp_weights(mlp)

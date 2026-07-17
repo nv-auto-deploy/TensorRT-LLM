@@ -163,16 +163,9 @@ transforms:
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
-  # Fuse sibling quantized projections that read the same activation into one
-  # concatenated GEMM + narrow views (DeepSeek-V4: attn wq_a+wkv, wq_b+indexer.wq_b,
-  # shared-expert w1+w3). fp8_only + max_fused_out_features scope the transform to
-  # avoid the unrestricted fuse_gemms OOM (issue #4674); replicated bf16 GEMVs stay
-  # with fuse_replicated_bf16_linear.
   fuse_gemms_mixed_children:
     stage: post_load_fusion
-    enabled: true
-    fp8_only: true
-    max_fused_out_features: 65536
+    enabled: false
   fuse_gemms:
     stage: post_load_fusion
     enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
@@ -202,23 +195,9 @@ transforms:
   fuse_finegrained_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
-  fuse_fp8_act_quant_cse:
-    stage: post_load_fusion
-    # Fuse the remaining standalone act-quant launches into the consuming decode
-    # W8A8 GEMV/split-K kernel prologues (op-internal flag, no graph rewrite;
-    # bit-exact, ue8m0-only). Prefill and non-decode shapes are unaffected.
-    w8a8_quant_prologue: true
-  # DeepSeek-V4-only: replace the Q-LoRA BF16 torch_rmsnorm decomposition with one
-  # fixed-BF16 kernel. The matcher's exact DSV4 op provenance makes this a no-op for
-  # other models, so no model-specific flag is needed.
-  fuse_deepseek_v4_q_rmsnorm:
-    stage: post_load_fusion
-    run_shape_prop: true
-  # Merge sibling replicated (tp_mode="none") bf16 linear projections that read the
-  # same activation into one projection + narrow slices (DeepSeek-V4 sparse layers).
-  # Scoped to small replicated weights to avoid the model-wide fuse_gemms OOM.
   fuse_replicated_bf16_linear:
     stage: post_load_fusion
+    enabled: false
     run_shape_prop: true
   fuse_mxfp4_moe:
     stage: post_load_fusion
@@ -255,12 +234,9 @@ transforms:
   fuse_fp8_linear_allreduce_add:
     stage: post_load_fusion
     requires_shape_prop: true
-  # Fuse the clamped-SwiGLU + down-input act-quant chain of a merged block-FP8
-  # gate/up projection into one Triton kernel (bit-exact; DeepSeek-V4 shared
-  # experts). Must run AFTER fuse_fp8_linear_allreduce_add so the down projection
-  # is matched in its final (residual-add) form.
   fuse_fp8_swiglu_act_quant:
     stage: post_load_fusion
+    enabled: false
     run_shape_prop: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
