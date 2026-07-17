@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused RMSNorm for the DeepSeek-V4 Q-LoRA projection.
+"""Fused RMSNorm for the DeepSeek-V4 1024-wide Q-LoRA projection.
 
-Before: ``torch_rmsnorm(Q-LoRA)`` decomposes into separate reduction,
-normalization, weight multiplication, and cast operations.
-After: ``_deepseek_v4_q_rmsnorm_kernel`` performs the complete RMSNorm in one
-Triton kernel while preserving the FP32 reduction and BF16 rounding points.
+Before — ``torch_rmsnorm`` runs eagerly as ~7 kernels with fp32 intermediates in HBM:
+    x32 = x.to(fp32); var = x32.pow(2).mean(-1, keepdim=True)
+    out = weight * (x32 * rsqrt(var + eps)).to(bf16)
+After — one Triton kernel per row, nothing intermediate leaves registers:
+    x32 = load(bf16 row); factor = rsqrt(sum(x32*x32)/N + eps)
+    store(bf16(w32 * bf16(x32 * factor)))
+Bit-identical: same fp32 reduction, same two bf16 rounding points as torch_rmsnorm.
 """
 
 import torch
