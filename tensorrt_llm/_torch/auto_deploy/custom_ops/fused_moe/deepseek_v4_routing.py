@@ -13,17 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused Triton kernels for the DeepSeek V4 MoE router head (sqrtsoftplus scoring).
+"""Fused Triton kernels for the DeepSeek V4 MoE router gate.
 
-Collapses the reference ``DeepseekV4MoEGate.forward`` chain — sqrtsoftplus
-scoring, bias-add, top-k, gather, renorm, scale (~6 launch-bound kernels per
-token at decode) — into ONE Triton program per token, selecting the top-k of
-``scores + bias`` via iterative arg-max (no separate sort) and producing the
-identical ``(selected_experts, routing_weights)`` pair.
+Four custom ops, each collapsing its reference torch chain (spelled out per op
+in the op docstrings) into one Triton program per token:
 
-Note the kernel is deliberately NOT named with ``topk``/``sort``/``sum`` so the
-fused work is reclassified out of the ``reduction`` bucket rather than back into
-it.
+- ``deepseek_v4_routing``: learned head — sqrtsoftplus scoring + bias-add +
+  top-k (iterative arg-max, no sort) + gather + renorm + scale.
+- ``deepseek_v4_routing_localized``: same head, with the EP global->local
+  expert localization folded into the kernel tail (int32 local ids + bf16
+  masked weights).
+- ``deepseek_v4_hash_routing``: hash gate — decode reads only the top_k router
+  weight rows named by ``tid2eid[input_ids]``, then gemv + sqrtsoftplus +
+  gather + renorm + scale.
+- ``deepseek_v4_hash_routing_localized``: hash gate with the same EP fold.
 """
 
 from typing import Tuple
