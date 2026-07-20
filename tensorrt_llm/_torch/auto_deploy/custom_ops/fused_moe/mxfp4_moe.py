@@ -13,7 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# MXFP4 MoE ops with packed expert decode and SwiGLU activation.
+"""MXFP4 MoE custom ops (packed expert weights, SwiGLU activation).
+
+Three execution backends behind six ops:
+
+- ``torch_mxfp4_moe`` / ``torch_mxfp4_moe_ep``: reference path — dequantize the
+  local experts to fp32 and run chunked per-slot bmms (router computed in-op).
+- ``torch_mxfp4_moe_from_routing`` / ``..._from_routing_ep``: same MLP fed by
+  precomputed routing (DSV4's sqrtsoftplus/hash gates stay upstream). On SM100
+  with the DSV4 layout these dispatch to the trtllm-gen W4A8 runner (MXFP4
+  weights x MXFP8-quantized activations); elsewhere the torch reference runs
+  and doubles as the test oracle.
+- ``triton_mxfp4_moe`` / ``triton_mxfp4_moe_ep``: gpt-oss path on
+  ``triton_kernels.matmul_ogs`` with fused SwiGLU (router computed in-op).
+"""
 
 import weakref
 from collections import OrderedDict
@@ -394,33 +407,24 @@ def _run_torch_mxfp4_mlp_core(
 # ---------------------------------------------------------------------------
 # TRT-LLM-Gen W4A8 (mxfp8-act) MXFP4 MoE path (Blackwell / SM100)
 # ---------------------------------------------------------------------------
-# DSV4-Flash feeds *precomputed* routing (selected_experts / routing_weights, its
-# custom sqrtsoftplus+hash routing stays upstream) to ``torch_mxfp4_moe_from_routing(_ep)``.
-# On SM100 the routed MXFP4 MLP runs on the trtllm-gen runner
-# ``mxe4m3_mxe2m1_block_scale_moe_runner`` (mxfp4 weights + mxfp8-quantized activations).
-# Precomputed routing is forwarded as topk_ids/topk_weights (used verbatim — PT folds
-# routed_scaling_factor into token_final_scales the same way, routing.py:380/419).
-# The torch reference stays as the non-SM100 fallback / test oracle.
+# Precomputed routing is forwarded verbatim as topk_ids/topk_weights
+# (routed_scaling_factor is already folded into the weights upstream, matching
+# the PT backend); the torch reference stays the non-SM100 fallback.
 
-# Kernel-ready (pad/shard/shuffle) weights + per-expert SwiGLU tensors, keyed by raw-weight
-# identity. The prep is expensive (per-expert TMA-layout shuffle) and must run once before
-# CUDA-graph capture; captured decode steps reuse the cache, mirroring
-# ``_prepare_weights_scales_cached`` for the matmul_ogs path.
+# Kernel-ready (pad/shard/shuffle) weights + per-expert SwiGLU tensors, keyed by
+# raw-weight identity. The per-expert TMA-layout shuffle is expensive and must run
+# once before CUDA-graph capture; captured decode steps hit the cache.
 _TRTLLM_GEN_MXFP4_CACHE: OrderedDict[WeightCacheKey, tuple[object, list[weakref.finalize]]] = (
     OrderedDict()
 )
 
 
 def _reinterleave_up_gate(t: torch.Tensor, intermediate_size: int) -> torch.Tensor:
-    """Convert DSV4 ``up_gate`` split-half (``[up(I) | gate(I)]`` on the 2I axis) into the
-    HF-interleaved layout (gate at even rows, up at odd rows) that
-    :func:`prepare_trtllm_gen_moe_mxfp4_weights` (gpt-oss layout) expects.
-
-    The torch reference (``gate_up_order='up_gate'``) reads ``up = t[:, :I]`` /
-    ``gate = t[:, I:]``; prepare's ``_deinterleave_gate_up`` reads ``gate = t[:, 0::2]`` /
-    ``up = t[:, 1::2]``. Re-interleaving so even=gate, odd=up makes prepare see the same
-    gate/up halves the reference does — THE fix that lifts cos 0.012 -> 0.977.
-    Handles weights ``[E, 2I, H/32, 16]``, scales ``[E, 2I, H/32]`` and bias ``[E, 2I]``.
+    """Convert DSV4 ``up_gate`` split-half rows (``[up(I) | gate(I)]``) into the
+    HF-interleaved layout (gate at even rows, up at odd) that
+    :func:`prepare_trtllm_gen_moe_mxfp4_weights` de-interleaves, so prepare sees the
+    same gate/up halves the torch reference reads. Handles weights
+    ``[E, 2I, H/32, 16]``, scales ``[E, 2I, H/32]``, and bias ``[E, 2I]``.
     """
     up = t[:, :intermediate_size]
     gate = t[:, intermediate_size:]
@@ -442,11 +446,9 @@ def _prepare_trtllm_gen_mxfp4_cached(
 ):
     """Re-interleave DSV4 gate/up + run :func:`prepare_trtllm_gen_moe_mxfp4_weights`, cached.
 
-    Returns ``(prepared_weights, swiglu_alpha, swiglu_beta, swiglu_limit)``. The SwiGLU params
-    (alpha from the op, beta=0, limit from the op) make the kernel's gated activation
-    ``clamp(gate, max=limit) * sigmoid(alpha * clamp(gate, max=limit)) * clamp(up, ±limit)``
-    bit-equivalent to the torch reference's deepseek SwiGLU (``swiglu_mode='deepseek'`` with the
-    same clamp), so values stay faithful even when activations exceed ``limit``.
+    Returns ``(prepared_weights, swiglu_alpha, swiglu_beta, swiglu_limit)``; the SwiGLU
+    params make the kernel's gated activation bit-equivalent to the torch reference's
+    deepseek SwiGLU, including the clamp behavior past ``limit``.
     """
     raw_tensors = (
         gate_up_blocks,
@@ -550,17 +552,15 @@ def _run_trtllm_gen_mxfp4_from_routing(
         limit,
     )
 
-    # Global -> local expert coords + remote-route masking. Off-rank routes are tagged with the
-    # invalid sentinel ``expert_id == local_experts`` (== num_experts here) so the kernel SKIPS
-    # them — matching the trtllm-gen EP convention (``invalid_expert_id = num_experts`` in
-    # ``_run_moe_with_alltoall``). Clamping them onto a valid expert instead floods that expert's
-    # routing histogram and drops real routes (capacity overflow), under-computing the output.
+    # Global -> local expert coords; off-rank routes carry the invalid sentinel
+    # ``expert_id == local_experts`` so the kernel SKIPS them (trtllm-gen EP convention).
+    # Do NOT clamp instead: clamping floods that expert's routing histogram and drops
+    # real routes (capacity overflow), silently under-computing the output.
     sel = selected_experts.reshape(num_tokens, -1)
     top_k = sel.shape[-1]
     if routing_localized:
-        # The router already emitted the runner's contract (int32 local ids with the
-        # invalid sentinel ``local_experts`` for off-rank routes + masked bf16
-        # weights) via the ``*_routing_localized`` gate ops — nothing to localize.
+        # The ``*_routing_localized`` gate already emitted the runner's contract
+        # (int32 local ids with the invalid sentinel + masked bf16 weights).
         if sel.dtype != torch.int32 or routing_weights.dtype != torch.bfloat16:
             raise TypeError(
                 "routing_localized=True expects int32 local expert ids and bf16 "
@@ -569,11 +569,8 @@ def _run_trtllm_gen_mxfp4_from_routing(
         local_idx = sel
         weights = routing_weights.reshape(num_tokens, top_k)
     else:
-        # Fallback for graphs where ``fuse_moe_routing_localization`` did not fire:
-        # global->local subtraction, range mask, invalid-sentinel select, int32 cast, and
-        # routing-weight mask/bf16-cast. Off-rank / out-of-range routes get the sentinel
-        # ``local_experts`` so the runner SKIPS them; valid weights are bit-identical bf16,
-        # invalid ones are bf16(0).
+        # The localized-gate rewrite did not fire: localize eagerly (bit-identical
+        # to the fused gate tail).
         local_idx, weights = _localize_routing_eager(
             sel,
             routing_weights.reshape(num_tokens, top_k),
@@ -587,11 +584,9 @@ def _run_trtllm_gen_mxfp4_from_routing(
         x2d = torch.nn.functional.pad(x2d, (0, expected_hidden - hidden_size))
 
     intermediate_size_padded = int(prepared.fc1_weights_mxfp4.shape[1] // 2)
-    # W4A8: pre-quantize the (already padded) bf16 activations to MXFP8 (E4M3 elem +
-    # UE8M0 per-32-elem block scale). alignment=512 matches PT's
-    # ``W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.input_hidden_alignment`` (a no-op here —
-    # ``expected_hidden`` is already 512-aligned). ``x_scale`` stays 1D: the C++ runner
-    # asserts ``hidden_states_scale must be 1D``.
+    # W4A8: pre-quantize the padded bf16 activations to MXFP8 (E4M3 + UE8M0 per-32-elem
+    # block scales). alignment=512 matches the PT backend's input_hidden_alignment;
+    # ``x_scale`` stays 1D — the C++ runner asserts it.
     x_mxfp8, x_scale = torch.ops.trtllm.mxfp8_quantize(
         x2d,
         False,  # is_sf_swizzled_layout
@@ -650,10 +645,8 @@ def _run_torch_mxfp4_from_routing_core(
     swiglu_mode: str = "deepseek",
     routing_localized: bool = False,
 ) -> torch.Tensor:
-    # Blackwell fast path: the DSV4 (up_gate / deepseek-SwiGLU) routed MXFP4 MLP runs on the
-    # trtllm-gen W4A8 mxfp8-act runner (activations quantized to MXFP8; MXFP4 weights, routing
-    # localization and top-k ordering unchanged) instead of the fp32 dequant+bmm reference.
-    # gpt-oss (interleaved / gpt_oss-SwiGLU) and non-SM100 keep the torch reference below.
+    # SM100 + DSV4 layout (up_gate / deepseek SwiGLU) -> trtllm-gen W4A8 runner;
+    # gpt-oss layouts and non-SM100 keep the fp32 dequant+bmm reference below.
     if is_sm_100f() and gate_up_order == "up_gate" and swiglu_mode == "deepseek":
         return _run_trtllm_gen_mxfp4_from_routing(
             hidden_states,
