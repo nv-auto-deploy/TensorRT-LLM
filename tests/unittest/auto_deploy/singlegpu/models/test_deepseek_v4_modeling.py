@@ -1053,14 +1053,14 @@ def test_q_lora_rmsnorm_export_uses_specialized_kernel() -> None:
 
     gm = torch_export_to_gm(norm, args=(x,))
 
-    optimized_op = torch.ops.auto_deploy.deepseek_v4_q_rmsnorm.default
+    optimized_op = torch.ops.auto_deploy.triton_rms_norm.default
     assert len(_call_nodes(gm, optimized_op)) == 1
     assert len(_call_nodes(gm, torch.ops.auto_deploy.torch_rmsnorm.default)) == 0
     torch.testing.assert_close(
         gm(x),
         torch.ops.auto_deploy.torch_rmsnorm(x, norm.weight, norm.eps),
-        rtol=0,
-        atol=0,
+        rtol=2e-2,
+        atol=1e-2,
     )
 
 
@@ -1076,7 +1076,7 @@ def test_q_lora_rmsnorm_falls_back_on_cpu() -> None:
 
     gm = torch.export.export(norm, (x,), strict=False).module()
 
-    assert len(_call_nodes(gm, torch.ops.auto_deploy.deepseek_v4_q_rmsnorm.default)) == 0
+    assert len(_call_nodes(gm, torch.ops.auto_deploy.triton_rms_norm.default)) == 0
     assert len(_call_nodes(gm, torch.ops.auto_deploy.torch_rmsnorm.default)) == 1
     torch.testing.assert_close(
         gm(x),
@@ -1105,7 +1105,7 @@ def test_q_lora_rmsnorm_falls_back_for_unsupported_cuda_input(
 
     gm = torch_export_to_gm(norm, args=(x,))
 
-    assert len(_call_nodes(gm, torch.ops.auto_deploy.deepseek_v4_q_rmsnorm.default)) == 0
+    assert len(_call_nodes(gm, torch.ops.auto_deploy.triton_rms_norm.default)) == 0
     assert len(_call_nodes(gm, torch.ops.auto_deploy.torch_rmsnorm.default)) == 1
     torch.testing.assert_close(
         gm(x),

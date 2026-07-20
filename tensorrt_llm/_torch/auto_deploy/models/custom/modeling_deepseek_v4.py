@@ -759,7 +759,7 @@ class _DeepseekV4QRMSNorm(DeepseekV4RMSNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # AutoDeploy represents CUDA tensors as meta tensors during export.
         if x.dtype == torch.bfloat16 and x.shape[-1] == 1024 and x.device.type in ("cuda", "meta"):
-            return torch.ops.auto_deploy.deepseek_v4_q_rmsnorm(x, self.weight, self.eps)
+            return torch.ops.auto_deploy.triton_rms_norm(x, self.weight, self.eps)
         return super().forward(x)
 
 

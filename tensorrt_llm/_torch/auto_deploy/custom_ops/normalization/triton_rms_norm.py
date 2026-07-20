@@ -29,14 +29,8 @@ def rms_norm_kernel(
     eps: tl.constexpr,
     N_COLS: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    TORCH_EXACT: tl.constexpr,
 ):
-    """RMSNorm with an fp32 reduction and fp32 weight multiply.
-
-    TORCH_EXACT reproduces ``torch_rmsnorm``'s exact rounding points — fp32 rsqrt
-    factor, round(x * factor) to the input dtype, fp32 weight multiply, round
-    again — so the output is bit-identical to the eager reference.
-    """
+    """RMSNorm with an fp32 reduction and fp32 weight multiply."""
     prog_id = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_N)
     mask = offsets < N_COLS
@@ -46,11 +40,7 @@ def rms_norm_kernel(
     xf = x.to(tl.float32)
 
     var = tl.sum(xf * xf, 0) * float(1.0 / N_COLS)
-    if TORCH_EXACT:
-        y = (xf * tl.rsqrt(var + eps)).to(x.dtype).to(tl.float32)
-        out = (w.to(tl.float32) * y).to(x.dtype)
-    else:
-        out = (w.to(tl.float32) * (xf / tl.sqrt(var + eps))).to(x.dtype)
+    out = (w.to(tl.float32) * (xf / tl.sqrt(var + eps))).to(x.dtype)
 
     tl.store(output + prog_id * output_row_stride + offsets, out, mask=mask)
 
@@ -71,8 +61,8 @@ def _flattens_to_regular_rows(t: Tensor, feat_size: int) -> bool:
     return True
 
 
-def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5, torch_exact: bool = False):
-    """RMSNorm; ``torch_exact`` selects the bit-exact ``torch_rmsnorm`` rounding recipe.
+def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5):
+    """RMSNorm.
 
     Regularly strided rows (e.g. narrow views) are consumed in place; irregular
     layouts fall back to one ``contiguous()`` copy. The output is always contiguous.
@@ -95,7 +85,6 @@ def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5, torch_exa
         eps=eps,
         N_COLS=feat_size,
         BLOCK_N=BLOCK_N,
-        TORCH_EXACT=torch_exact,
         num_warps=4,
         num_stages=3,
     )
