@@ -27,7 +27,7 @@ import pytest
 import torch
 
 # Register the custom op (side-effect import).
-import tensorrt_llm._torch.auto_deploy.custom_ops.fake_fp8_quant  # noqa: F401
+import tensorrt_llm._torch.auto_deploy.custom_ops.quantization.fake_fp8_quant  # noqa: F401
 
 
 def _fake_fp8_act_quant_ref(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:

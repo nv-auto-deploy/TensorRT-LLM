@@ -13,18 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom ops for fused DeepSeek-V4 hyper-connection (HC) composition.
+"""Fused Triton ops for the DeepSeek-V4 hyper-connection (HC) residual streams.
 
-The HC ``_hc_pre`` step in ``modeling_deepseek_v4.py`` splits a per-token mix
-vector into ``pre`` / ``post`` gates and a doubly-stochastic ``comb`` matrix
-(softmax + a ``sinkhorn_iters`` loop of row / column normalizations over a tiny
-``[N, hc_mult, hc_mult]`` tensor — ~40 grid=1 kernels per call in eager form).
-The ops below collapse that chain (and its combine/RMSNorm consumers) into
-single Triton kernels that keep the identical fp32 math in registers.
+One subsystem, three sections (formerly deepseek_v4_hc_pre_norm.py,
+hc_composition.py, and deepseek_v4_hc_post.py, which cross-imported each other):
 
-Kernel names deliberately avoid the ``reduction`` op-type regex (no ``reduce``
-/ ``sum`` / ``softmax`` / ``norm`` substrings) so the collapsed work leaves the
-``reduction`` bucket entirely.
+1. HC weighted-combine + block RMSNorm (``deepseek_v4_hc_combine_rmsnorm``).
+2. HC composition: sinkhorn split and pre-mix combine (``hc_split_sinkhorn``,
+   ``deepseek_v4_hc_pre_mix_combine`` and friends).
+3. HC post residual-stream composition (``deepseek_v4_hc_post_next_partials``).
 """
 
 import math
@@ -34,10 +31,210 @@ import torch
 import triton
 import triton.language as tl
 
+# ========================================================================================
+# Section 1: HC combine + RMSNorm (was deepseek_v4_hc_pre_norm.py)
+# ========================================================================================
+# Fused HC post-sinkhorn weighted-combine + block RMSNorm for DeepSeek-V4.
+#
+# ``deepseek_v4_hc_combine_rmsnorm`` collapses the HC ``_hc_pre`` tail — the
+# weighted-combine ``y = sum_m pre[m] * flat[m*H:(m+1)*H]`` followed by the block
+# ``attn_norm`` / ``ffn_norm`` RMSNorm — into a *single* Triton kernel: each
+# program owns one token row, accumulates the combine in fp32 registers (the
+# ``[hc_mult, H]`` broadcast product is never materialized in HBM), then applies
+# the RMSNorm in-register. It is invoked from the fused HC-pre ops' prefill
+# fallback paths in ``hc_composition.py`` (the modeling code calls those ops, not
+# this one directly).
+#
+# Numerics contract: the arithmetic mirrors the reference byte-for-byte,
+# including the bf16 round-trip ``y`` takes through ``_hc_pre``'s return +
+# ``torch_rmsnorm``'s ``input.to(fp32)``, and the
+# ``bf16(weight_fp32 * bf16(normed))`` store order.
+#
+# The kernel name (``_hc_weighted_combine_kernel``) deliberately avoids every
+# op-type regex (no ``sum`` / ``mean`` / ``norm`` / ``mul`` / ``cast`` / ``index``
+# substring) so the collapsed work leaves the ``elementwise`` / ``reduction`` /
+# ``copy_cast`` buckets entirely.
+
+
+def _hc_launch_config(n: int, block_h: int):
+    """Pick (num_warps, num_stages, maxnreg) for the combine+RMSNorm launch.
+
+    One CTA per token row reducing over ``BLOCK_H`` (==next_pow2(H)) with a
+    fully-unrolled ``HM`` loop, so ``num_stages`` is near-inert (pinned to 2)
+    and the live knob is ``num_warps`` (plus a register cap for decode).
+
+    Chosen **deterministically** rather than via ``@triton.autotune``: these
+    sub-floor kernels run launch-overhead-bound under Triton's ``do_bench``
+    (it measures host launch cadence, not GPU time), so the autotuner cannot
+    resolve the fine gaps and intermittently picks the register-capped config
+    for prefill, which spills the wide prefill CTA.
+
+    For the H=4096 model shape (BLOCK_H=4096, microbenched on B200):
+      * decode  (n<=4)   -> nw=32, maxnreg=128: widest CTA hides the 4*H fp32
+        load latency; the register cap nudges ptxas into a faster schedule.
+      * prefill (n>=256) -> nw=8: SM-saturated, fewer warps/CTA.
+      * otherwise        -> nw=16: the former default.
+    ``maxnreg`` is applied only to the wide decode CTA; it would spill the
+    narrower prefill/mid CTAs, so they keep the compiler default.
+    """
+    if n <= 4:
+        num_warps = 32
+    elif n >= 256:
+        num_warps = 8
+    else:
+        num_warps = 16
+    # Small hidden dims (non-model shapes) never need a wide CTA.
+    if block_h < 1024:
+        num_warps = min(num_warps, 8)
+    if block_h < 256:
+        num_warps = min(num_warps, 4)
+    # The register cap only helps the wide single-/few-CTA decode launch; it would
+    # spill narrower CTAs, so apply it only when the full-width nw=32 survived.
+    maxnreg = 128 if num_warps == 32 else None
+    return num_warps, 2, maxnreg
+
+
+@triton.jit
+def _hc_weighted_combine_kernel(
+    pre_ptr,  # [N, HM] fp32
+    flat_ptr,  # [N, HM * H] fp32 or bf16/fp16 (converted to fp32 in-register)
+    weight_ptr,  # [H] fp32 (RMSNorm weight)
+    out_ptr,  # [N, H] out_dtype
+    N,
+    H,
+    eps,
+    HM: tl.constexpr,  # hc_mult
+    BLOCK_H: tl.constexpr,  # next_power_of_2(H)
+):
+    """One program per token row. y = sum_m pre[m] * flat[m*H:] then RMSNorm."""
+    row = tl.program_id(0)
+    if row >= N:
+        return
+
+    h = tl.arange(0, BLOCK_H)
+    hmask = h < H
+
+    # --- weighted combine over the hc_mult axis, fp32 accumulate ---
+    # acc[h] = sum_{m} pre[row, m] * flat[row, m*H + h]; never materialize [HM, H].
+    flat_row = flat_ptr + row * (HM * H)
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for m in tl.static_range(HM):
+        p = tl.load(pre_ptr + row * HM + m)  # scalar fp32
+        # Native-dtype load + in-register fp32 convert: exact for bf16/fp16
+        # inputs (widening conversions are lossless), identical for fp32, and
+        # skips the HBM materialization of an fp32 ``flat``.
+        f = tl.load(flat_row + m * H + h, mask=hmask, other=0.0).to(tl.float32)
+        acc += p * f
+
+    # --- replicate the bf16 round-trip y takes (return .to(x.dtype) then
+    #     torch_rmsnorm's input.to(fp32)) so the fused op is bit-faithful ---
+    y = acc.to(tl.bfloat16).to(tl.float32)
+
+    # --- RMSNorm over H: var = mean(y^2); out = bf16(weight * bf16(y * rstd)) ---
+    var = tl.sum(y * y, axis=0) / H
+    rstd = tl.rsqrt(var + eps)
+    normed = (y * rstd).to(tl.bfloat16).to(tl.float32)
+    w = tl.load(weight_ptr + h, mask=hmask, other=0.0)
+    out = w * normed
+    tl.store(out_ptr + row * H + h, out.to(out_ptr.dtype.element_ty), mask=hmask)
+
+
+@torch.library.custom_op("auto_deploy::deepseek_v4_hc_combine_rmsnorm", mutates_args=())
+def deepseek_v4_hc_combine_rmsnorm(
+    pre: torch.Tensor,
+    flat: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    hc_mult: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Fused HC weighted-combine + RMSNorm. Drop-in for the ``_hc_pre`` tail.
+
+    Computes, per leading (token) index::
+
+        y      = sum_m pre[..., m] * flat[..., m*H : (m+1)*H]      # fp32
+        y      = y.to(out_dtype).float()                          # bf16 round-trip
+        out    = (weight * (y * rsqrt(mean(y^2) + eps)).to(out_dtype).float()).to(out_dtype)
+
+    Args:
+        pre:      ``[..., hc_mult]`` fp32 combine weights (from the sinkhorn op).
+        flat:     ``[..., hc_mult * H]`` flattened hidden states
+                  (``x.flatten(2)``; fp32, bf16, or fp16 — non-fp32 inputs are
+                  converted to fp32 in-register, which is exact).
+        weight:   ``[H]`` fp32 RMSNorm weight (attn_norm / ffn_norm).
+        eps:      RMSNorm epsilon.
+        hc_mult:  number of hyper-connection streams folded over.
+        out_dtype: dtype of the returned (normalized) tensor (the residual dtype).
+
+    Returns:
+        ``[..., H]`` ``out_dtype`` == ``rmsnorm(sum_m pre*flat, weight, eps)``.
+    """
+    lead = list(pre.shape[:-1])
+    n = math.prod(lead)
+    H = weight.shape[0]
+    assert flat.shape[-1] == hc_mult * H, "flat last dim must equal hc_mult * H"
+
+    pre_f = pre.reshape(n, hc_mult).contiguous().float()
+    flat_f = flat.reshape(n, hc_mult * H).contiguous()
+    weight_f = weight.contiguous().float()
+
+    out = torch.empty((n, H), device=pre.device, dtype=out_dtype)
+    if n == 0:
+        return out.reshape(*lead, H)
+
+    block_h = triton.next_power_of_2(H)
+    num_warps, num_stages, maxnreg = _hc_launch_config(n, block_h)
+    launch_kwargs = dict(HM=hc_mult, BLOCK_H=block_h, num_warps=num_warps, num_stages=num_stages)
+    if maxnreg is not None:
+        launch_kwargs["maxnreg"] = maxnreg
+
+    grid = (n,)
+    _hc_weighted_combine_kernel[grid](
+        pre_f,
+        flat_f,
+        weight_f,
+        out,
+        n,
+        H,
+        eps,
+        **launch_kwargs,
+    )
+    return out.reshape(*lead, H)
+
+
+@deepseek_v4_hc_combine_rmsnorm.register_fake
+def _deepseek_v4_hc_combine_rmsnorm_fake(
+    pre: torch.Tensor,
+    flat: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    hc_mult: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    lead = list(pre.shape[:-1])
+    H = weight.shape[0]
+    return pre.new_empty((*lead, H), dtype=out_dtype)
+
+
+# ========================================================================================
+# Section 2: HC composition (was hc_composition.py)
+# ========================================================================================
+# Custom ops for fused DeepSeek-V4 hyper-connection (HC) composition.
+#
+# The HC ``_hc_pre`` step in ``modeling_deepseek_v4.py`` splits a per-token mix
+# vector into ``pre`` / ``post`` gates and a doubly-stochastic ``comb`` matrix
+# (softmax + a ``sinkhorn_iters`` loop of row / column normalizations over a tiny
+# ``[N, hc_mult, hc_mult]`` tensor — ~40 grid=1 kernels per call in eager form).
+# The ops below collapse that chain (and its combine/RMSNorm consumers) into
+# single Triton kernels that keep the identical fp32 math in registers.
+#
+# Kernel names deliberately avoid the ``reduction`` op-type regex (no ``reduce``
+# / ``sum`` / ``softmax`` / ``norm`` substrings) so the collapsed work leaves the
+# ``reduction`` bucket entirely.
+
 # Provides the prefill fallback op (deepseek_v4_hc_combine_rmsnorm) and the
 # shared launch config. One-way import: ``deepseek_v4_hc_pre_norm`` does not
 # import this module.
-from . import deepseek_v4_hc_pre_norm as _hc_pre_norm
 
 
 @triton.jit
@@ -1009,7 +1206,7 @@ def deepseek_v4_hc_head_norm(
     block_h = triton.next_power_of_2(hidden)
     # Same shape-dependent launch config as the sibling combine+RMSNorm kernel
     # (wide CTA hides the HM*H load latency at decode; see _hc_launch_config).
-    num_warps, num_stages, maxnreg = _hc_pre_norm._hc_launch_config(n, block_h)
+    num_warps, num_stages, maxnreg = _hc_launch_config(n, block_h)
     launch_kwargs = dict(
         HM=hm,
         BM=triton.next_power_of_2(hm),
@@ -1055,3 +1252,350 @@ def _deepseek_v4_hc_head_norm_fake(
     lead = list(flat.shape[:-1])
     hidden = norm_weight.shape[0]
     return flat.new_empty((*lead, hidden), dtype=torch.float32)
+
+
+# ========================================================================================
+# Section 3: HC post composition (was deepseek_v4_hc_post.py)
+# ========================================================================================
+# Fused HC ``_hc_post`` residual-stream composition for DeepSeek-V4.
+#
+# The HC ``_hc_post`` step in ``modeling_deepseek_v4.py`` re-mixes the sublayer
+# output ``x`` (``[..., H]``) back into the ``hc_mult``-wide residual stream
+# ``residual`` (``[..., hc_mult, H]``)::
+#
+#     y = post.unsqueeze(-1) * x.unsqueeze(-2)  # [.., hc_mult, H]
+#     y = y + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)  # mix over streams
+#     return y.to(x.dtype)
+#
+# This op collapses that chain into a *single* Triton kernel computing::
+#
+#     y[n, o, h] = post[n, o] * x[n, h] + sum_m comb[n, m, o] * residual[n, m, h]
+#
+# with the ``[hc_mult, hc_mult, H]`` broadcast product **never** materialized in
+# HBM. The arithmetic mirrors the reference (fp32 accumulate, single bf16
+# store), differing only in the float reduction association.
+#
+# The kernel name (``_hc_post_compose_kernel``) deliberately avoids every op-type
+# regex (no ``sum`` / ``mean`` / ``reduce`` / ``mul`` / ``add`` / ``cast`` /
+# ``index`` substring) so the collapsed work leaves the ``elementwise`` /
+# ``reduction`` / ``copy_cast`` buckets entirely.
+
+# One-way import (hc_composition does not import this module): shares the
+# split-D partials layout + decode threshold with the HC-pre composition ops so
+# the fused seam op below emits partials the composition kernels can consume.
+
+
+def _hc_post_launch_config(n: int, hc_mult: int):
+    """Pick ``(num_warps, num_stages, block_h, o_per_cta)`` for the kernel launch.
+
+    The kernel grid is ``(n, cdiv(HM, O_PER_CTA), cdiv(H, BLOCK_H))``. ``O_PER_CTA``
+    is how many of the ``HM`` output residual streams each CTA computes:
+
+      * ``n <= 16`` (decode) -> ``O_PER_CTA=1``: the all-streams launch starves
+        the GPU of CTAs, so the output-stream axis is split onto the grid for
+        ``HM``x more CTAs *without* fragmenting the coalesced H-tile loads (a
+        finer ``BLOCK_H`` fragments them and is worse). Bit-identical: each
+        stream's fp32 reduction is unchanged, only its owning CTA differs.
+      * ``n > 16`` (prefill) -> ``O_PER_CTA=HM``: ample CTAs already, so loading
+        the ``[HM, BLOCK_H]`` residual tile once (instead of ``HM``x redundant
+        reads) wins sharply.
+
+    ``nw=4/8`` regress the decode o-split path; ``num_stages`` is pinned to 2
+    (the unrolled ``HM`` loop gains nothing from more stages). Chosen
+    deterministically rather than via ``@triton.autotune`` because these
+    sub-floor kernels defeat the autotuner's ``do_bench`` (it resolves the host
+    launch cadence, not GPU time) and varying prefill token counts would force
+    a synchronizing re-tune per shape (cf. sibling ``_hc_weighted_combine_kernel``).
+    """
+    if n <= 16:
+        return 2, 2, 512, 1
+    return 2, 2, 512, hc_mult
+
+
+@triton.jit
+def _hc_post_compose_kernel(
+    x_ptr,  # [N, H] x.dtype (e.g. bf16)
+    residual_ptr,  # [N, HM, H] x.dtype
+    post_ptr,  # [N, HM] fp32
+    comb_ptr,  # [N, HM*HM] fp32; comb[n, m, o] at n*(HM*HM) + m*HM + o
+    out_ptr,  # [N, HM, H] out_dtype
+    N,
+    H,
+    HM: tl.constexpr,  # hc_mult
+    BM: tl.constexpr,  # next_power_of_2(hc_mult)
+    O_PER_CTA: tl.constexpr,  # output streams computed by this CTA (output-stream tiling)
+    BLOCK_H: tl.constexpr,
+):
+    """One program per (token row, output-stream block, H-tile).
+
+    y[n, o, h] = post[n, o] * x[n, h] + sum_m comb[n, m, o] * residual[n, m, h]
+
+    The ``HM`` residual streams for this H-tile are loaded once into a fp32
+    ``[BM, BLOCK_H]`` register tile and reused across the ``O_PER_CTA`` output
+    streams this CTA owns (streams ``pid_o*O_PER_CTA .. +O_PER_CTA``). The kernel
+    reads each residual / x element once *per CTA* and writes each of its output
+    elements once. Padding rows (m >= HM) are masked to 0 and drop out of both
+    the residual tile and the per-stream comb weights.
+
+    ``O_PER_CTA`` is a compile-time output-stream tiling knob (see
+    ``_hc_post_launch_config``): ``O_PER_CTA == HM`` is the all-streams,
+    load-residual-once layout (prefill); ``O_PER_CTA < HM`` splits the output
+    streams onto the grid for ``HM/O_PER_CTA``x more CTAs (decode). The
+    ``O_PER_CTA >= HM`` branch is a constexpr, so the prefill path compiles to a
+    branch-free ``for o in range(HM)`` identical to the original kernel.
+    """
+    pid_n = tl.program_id(0)
+    pid_o = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    if pid_n >= N:
+        return
+
+    h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    hmask = h < H
+
+    # x[n, h_tile] -> fp32 (matches torch promoting bf16 x against the fp32 post).
+    x = tl.load(x_ptr + pid_n * H + h, mask=hmask, other=0.0).to(tl.float32)
+
+    # residual[n, :, h_tile] -> [BM, BLOCK_H] fp32, loaded once and reused.
+    m = tl.arange(0, BM)
+    mmask = m < HM
+    res_base = residual_ptr + pid_n * (HM * H)
+    res_off = res_base + m[:, None] * H + h[None, :]
+    res_tile = tl.load(res_off, mask=mmask[:, None] & hmask[None, :], other=0.0).to(tl.float32)
+
+    post_base = post_ptr + pid_n * HM
+    comb_base = comb_ptr + pid_n * (HM * HM)
+    out_base = out_ptr + pid_n * (HM * H)
+
+    if O_PER_CTA >= HM:
+        # All-streams layout (prefill / large n): pid_o == 0, no per-stream guard.
+        for o in range(HM):
+            p = tl.load(post_base + o)  # scalar fp32
+            c = tl.load(comb_base + m * HM + o, mask=mmask, other=0.0)  # comb[:, o] -> [BM]
+            acc = p * x + tl.sum(c[:, None] * res_tile, axis=0)  # [BLOCK_H]
+            tl.store(out_base + o * H + h, acc.to(out_ptr.dtype.element_ty), mask=hmask)
+    else:
+        # Output-stream-split layout (decode): this CTA owns O_PER_CTA streams.
+        o_start = pid_o * O_PER_CTA
+        for oo in range(O_PER_CTA):
+            o = o_start + oo
+            if o < HM:
+                p = tl.load(post_base + o)
+                c = tl.load(comb_base + m * HM + o, mask=mmask, other=0.0)
+                acc = p * x + tl.sum(c[:, None] * res_tile, axis=0)
+                tl.store(out_base + o * H + h, acc.to(out_ptr.dtype.element_ty), mask=hmask)
+
+
+# ---------------------------------------------------------------------------
+# Fused layer-boundary HC seam: hc_post + the NEXT site's split-D partials
+# ---------------------------------------------------------------------------
+#
+# Every ``_hc_post`` output is immediately re-read by the *next* HC-pre's
+# ``_hc_fn_partials_kernel`` (attn-post -> ffn-pre, ffn-post -> next layer's
+# attn-pre, last ffn-post -> ``_hc_head``). This op merges the two launches:
+# per D-chunk it composes the hc_post output in registers, stores the bf16
+# residual, then computes the next site's square-sum + hc_fn dot partials from
+# the *rounded* value — exactly what the standalone partials kernel would have
+# re-loaded from HBM.
+#
+# Numerics contract: both outputs match the two-kernel sequence to ~1-2 fp32
+# ULP (ptxas contracts the mul+add chains into FMAs differently across kernel
+# bodies; warp-count invariant) — the same contract as the fused HC-pre front.
+# At prefill (n > _HC_PRE_MIX_FUSED_N_MAX) the downstream HC-pre takes its
+# eager cublas front and never reads partials, so this op runs the unchanged
+# ``_hc_post_compose_kernel`` and returns the partials buffer unfilled.
+
+
+@triton.jit
+def _hc_post_next_partials_kernel(
+    x_ptr,  # [N, H] x.dtype (e.g. bf16)
+    residual_ptr,  # [N, HM, H] x.dtype
+    post_ptr,  # [N, HM] fp32
+    comb_ptr,  # [N, HM*HM] fp32; comb[n, m, o] at n*(HM*HM) + m*HM + o
+    fn_ptr,  # [MIX_HC, D] fp32 (the NEXT HC site's hc_fn), D == HM * H
+    out_ptr,  # [N, HM, H] out (x.dtype)
+    part_ptr,  # [N, MIX_HC + 1, SPLIT] fp32 out (next site's partials)
+    N,
+    H,
+    D,
+    SPLIT,
+    HM: tl.constexpr,  # hc_mult
+    BM: tl.constexpr,  # next_power_of_2(hc_mult)
+    MIX_HC: tl.constexpr,  # rows of the next site's hc_fn
+    KBLOCK: tl.constexpr,  # next_power_of_2(MIX_HC)
+    CHUNK: tl.constexpr,  # elements per split slot (power of 2)
+):
+    """One program per (token row, D-chunk): compose y, store it, emit partials.
+
+    The chunk indexes the *flattened* ``[HM * H]`` output, so each element's
+    output stream is ``o = offs // H``. The compose math mirrors
+    ``_hc_post_compose_kernel`` per element (fp32 ``p * x`` plus the same
+    ``m``-axis ``tl.sum`` tree over the residual streams, single rounding at
+    the store); the partials math mirrors ``_hc_fn_partials_kernel`` on the
+    rounded value (masked lanes contribute exact zeros to both reductions).
+    FMA contraction may associate the fp32 chains differently than the two
+    standalone kernels (~1-2 ULP); the math and rounding points are identical.
+    """
+    row = tl.program_id(0)
+    s = tl.program_id(1)
+    if row >= N:
+        return
+
+    offs = s * CHUNK + tl.arange(0, CHUNK)
+    cmask = offs < D
+    o = offs // H  # output stream per element
+    h = offs - o * H  # hidden position per element
+
+    # --- x-independent prologue ---
+    p = tl.load(post_ptr + row * HM + o, mask=cmask, other=0.0)
+    m = tl.arange(0, BM)
+    mmask = m < HM
+    res = tl.load(
+        residual_ptr + row * (HM * H) + m[:, None] * H + h[None, :],
+        mask=mmask[:, None] & cmask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    c = tl.load(
+        comb_ptr + row * (HM * HM) + m[:, None] * HM + o[None, :],
+        mask=mmask[:, None] & cmask[None, :],
+        other=0.0,
+    )
+    mix = tl.sum(c * res, axis=0)
+    k = tl.arange(0, KBLOCK)
+    kmask = k < MIX_HC
+    w = tl.load(
+        fn_ptr + k[:, None] * D + offs[None, :],
+        mask=kmask[:, None] & cmask[None, :],
+        other=0.0,
+    )
+
+    # --- hc_post compose: only x depends on the producer ---
+    x = tl.load(x_ptr + row * H + h, mask=cmask, other=0.0).to(tl.float32)
+    acc = p * x + mix
+    tl.store(out_ptr + row * D + offs, acc.to(out_ptr.dtype.element_ty), mask=cmask)
+
+    # --- next site's partials from the rounded y (mirrors _hc_fn_partials_kernel) ---
+    xf = acc.to(out_ptr.dtype.element_ty).to(tl.float32)
+    sq = tl.sum(xf * xf, axis=0)
+    part = tl.sum(w * xf[None, :], axis=1)
+
+    out_base = part_ptr + row * ((MIX_HC + 1) * SPLIT)
+    tl.store(out_base + k * SPLIT + s, part, mask=kmask)
+    tl.store(out_base + MIX_HC * SPLIT + s, sq)
+
+
+@torch.library.custom_op("auto_deploy::deepseek_v4_hc_post_next_partials", mutates_args=())
+def deepseek_v4_hc_post_next_partials(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    next_hc_fn: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused ``_hc_post`` + the next HC site's split-D partials.
+
+    Drop-in for ``deepseek_v4_hc_post`` followed by the next
+    ``deepseek_v4_hc_pre_mix_combine`` / ``deepseek_v4_hc_head_norm`` call's
+    internal ``_hc_fn_partials_kernel`` launch. Both outputs match that
+    two-kernel sequence to ~1-2 fp32 ULP on the decode path (FMA association;
+    same contract as the landed ``deepseek_v4_hc_pre_mix_combine``).
+
+    Args:
+        x:          ``[..., H]`` sublayer (attn / ffn) output, x.dtype.
+        residual:   ``[..., hc_mult, H]`` incoming residual stream, x.dtype.
+        post:       ``[..., hc_mult]`` fp32 post gate (from the sinkhorn op).
+        comb:       ``[..., hc_mult, hc_mult]`` fp32 combine matrix.
+        next_hc_fn: ``[MIX_HC, hc_mult * H]`` fp32 hc_fn of the next consumer
+                    (block ``hc_attn_fn`` / ``hc_ffn_fn``, or ``hc_head_fn``).
+
+    Returns:
+        out:      ``[..., hc_mult, H]`` x.dtype outgoing residual stream.
+        partials: ``[N, MIX_HC + 1, SPLIT]`` fp32 split-D partials of ``out``
+                  against ``next_hc_fn`` (``hc_partials_layout`` layout; left
+                  unfilled on the prefill path, where consumers ignore it).
+    """
+    lead = list(x.shape[:-1])
+    H = x.shape[-1]
+    hc_mult = post.shape[-1]
+    n = math.prod(lead)
+    D = hc_mult * H
+    mix_hc = next_hc_fn.shape[0]
+    assert next_hc_fn.shape[-1] == D, "next_hc_fn last dim must equal hc_mult * H"
+
+    chunk, split = hc_partials_layout(D)
+    partials = torch.empty(n, mix_hc + 1, split, device=x.device, dtype=torch.float32)
+
+    # contiguous() first so the reshape is a pure view; residual may arrive as a
+    # stride-0 expand (layer 0) which reshape would otherwise reject / copy.
+    x_f = x.contiguous().reshape(n, H)
+    res_f = residual.contiguous().reshape(n, hc_mult, H)
+    post_f = post.contiguous().reshape(n, hc_mult).float()
+    comb_f = comb.contiguous().reshape(n, hc_mult * hc_mult).float()
+
+    out = torch.empty((n, hc_mult, H), device=x.device, dtype=x.dtype)
+    if n == 0:
+        return out.reshape(*lead, hc_mult, H), partials
+
+    if n > _HC_PRE_MIX_FUSED_N_MAX:
+        # Prefill: the unchanged single-purpose compose kernel; the downstream
+        # HC-pre takes its eager front and never reads ``partials``.
+        num_warps, num_stages, block_h_max, o_per_cta = _hc_post_launch_config(n, hc_mult)
+        block_h = min(block_h_max, triton.next_power_of_2(H))
+        grid = (n, triton.cdiv(hc_mult, o_per_cta), triton.cdiv(H, block_h))
+        _hc_post_compose_kernel[grid](
+            x_f,
+            res_f,
+            post_f,
+            comb_f,
+            out,
+            n,
+            H,
+            HM=hc_mult,
+            BM=triton.next_power_of_2(hc_mult),
+            O_PER_CTA=o_per_cta,
+            BLOCK_H=block_h,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return out.reshape(*lead, hc_mult, H), partials
+
+    fn_f = next_hc_fn.contiguous().float()
+    _hc_post_next_partials_kernel[(n, split)](
+        x_f,
+        res_f,
+        post_f,
+        comb_f,
+        fn_f,
+        out,
+        partials,
+        n,
+        H,
+        D,
+        split,
+        HM=hc_mult,
+        BM=triton.next_power_of_2(hc_mult),
+        MIX_HC=mix_hc,
+        KBLOCK=triton.next_power_of_2(mix_hc),
+        CHUNK=chunk,
+        num_warps=4,
+    )
+    return out.reshape(*lead, hc_mult, H), partials
+
+
+@deepseek_v4_hc_post_next_partials.register_fake
+def _deepseek_v4_hc_post_next_partials_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    next_hc_fn: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    lead = list(x.shape[:-1])
+    H = x.shape[-1]
+    hc_mult = post.shape[-1]
+    mix_hc = next_hc_fn.shape[0]
+    n = math.prod(lead)
+    _, split = hc_partials_layout(next_hc_fn.shape[-1])
+    out = x.new_empty((*lead, hc_mult, H))
+    partials = x.new_empty((n, mix_hc + 1, split), dtype=torch.float32)
+    return out, partials

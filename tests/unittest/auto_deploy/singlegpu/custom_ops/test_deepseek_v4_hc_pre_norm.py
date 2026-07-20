@@ -14,7 +14,7 @@ import pytest
 import torch
 
 # Registers auto_deploy::deepseek_v4_hc_combine_rmsnorm.
-from tensorrt_llm._torch.auto_deploy.custom_ops import deepseek_v4_hc_pre_norm  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops import deepseek_v4_hyper_connections  # noqa: F401
 
 
 def _ref_hc_combine_rmsnorm(pre, flat, weight, eps, hc_mult, out_dtype):

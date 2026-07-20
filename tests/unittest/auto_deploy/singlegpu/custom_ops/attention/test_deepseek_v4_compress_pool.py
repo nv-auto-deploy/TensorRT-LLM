@@ -18,8 +18,10 @@ import pytest
 import torch
 
 # Registers auto_deploy::deepseek_v4_compress_pool
-import tensorrt_llm._torch.auto_deploy.custom_ops.deepseek_v4_compressor  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.custom_ops.deepseek_v4_compressor import _compress_pool_ref
+import tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_compressor  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_compressor import (
+    _compress_pool_ref,
+)
 
 
 def _ref(kv, gate):

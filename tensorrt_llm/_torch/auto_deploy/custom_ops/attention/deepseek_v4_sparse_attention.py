@@ -2520,7 +2520,7 @@ if _HAS_TRITON:
     # Shared Walsh-Hadamard butterfly stage + fake-FP4 quant constants: the fused
     # index-k kernel below inlines the exact ``deepseek_v4_hadamard_fp4`` tail, so
     # it reuses the same jit stage helper / constants to stay bit-identical.
-    from ..deepseek_v4_hadamard_fp4 import _FP4_MAX, _FP4_MIN, _hadamard_stage
+    from ..quantization.deepseek_v4_hadamard_fp4 import _FP4_MAX, _FP4_MIN, _hadamard_stage
 
     @triton.jit
     def _prepare_meta_floordiv(x, d):

@@ -15,7 +15,9 @@ import torch
 import triton
 
 # Registers auto_deploy::hc_split_sinkhorn.
-from tensorrt_llm._torch.auto_deploy.custom_ops import hc_composition  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops import (
+    deepseek_v4_hyper_connections as hc_composition,  # noqa: F401
+)
 
 
 def _ref_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):

@@ -33,11 +33,11 @@ shapes against the exact production chain.
 import pytest
 import torch
 
-import tensorrt_llm._torch.auto_deploy.custom_ops.deepseek_v4_rope_fusion  # noqa: F401
+import tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm  # noqa: F401
 
 # Register the custom ops (side-effect imports).
-import tensorrt_llm._torch.auto_deploy.custom_ops.fake_fp8_quant  # noqa: F401
-import tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm  # noqa: F401
+import tensorrt_llm._torch.auto_deploy.custom_ops.quantization.fake_fp8_quant  # noqa: F401
+import tensorrt_llm._torch.auto_deploy.custom_ops.rope.deepseek_v4_rope_fusion  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fake_fp8_act_quant
 
 DEV = "cuda"

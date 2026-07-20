@@ -207,7 +207,9 @@ def test_deepseek_v4_routing_fp32_mirror_input_parity():
     """
     import triton
 
-    from tensorrt_llm._torch.auto_deploy.custom_ops import hc_composition
+    from tensorrt_llm._torch.auto_deploy.custom_ops import (
+        deepseek_v4_hyper_connections as hc_composition,
+    )
     from tensorrt_llm._torch.auto_deploy.custom_ops.linear import linear  # noqa: F401
 
     torch.manual_seed(17)

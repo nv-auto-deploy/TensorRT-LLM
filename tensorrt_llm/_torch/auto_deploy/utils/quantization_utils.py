@@ -125,7 +125,7 @@ def fake_fp8_act_quant(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
         return x
 
     # CUDA: one fused Triton kernel, byte-identical to the eager body below
-    # (custom_ops/fake_fp8_quant.py).
+    # (custom_ops/quantization/fake_fp8_quant.py).
     if x.is_cuda:
         return torch.ops.auto_deploy.fake_fp8_act_quant(x, block_size)
 

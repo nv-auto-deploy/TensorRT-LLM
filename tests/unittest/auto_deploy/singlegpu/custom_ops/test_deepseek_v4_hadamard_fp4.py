@@ -26,7 +26,7 @@ import pytest
 import torch
 
 # Register the custom op (side-effect import).
-import tensorrt_llm._torch.auto_deploy.custom_ops.deepseek_v4_hadamard_fp4  # noqa: F401
+import tensorrt_llm._torch.auto_deploy.custom_ops.quantization.deepseek_v4_hadamard_fp4  # noqa: F401
 
 
 # --- canonical eager reference for the fused op (the production helpers were

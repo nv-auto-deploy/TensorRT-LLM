@@ -23,9 +23,10 @@ import pytest
 import torch
 import triton
 
+from tensorrt_llm._torch.auto_deploy.custom_ops import deepseek_v4_hyper_connections as hc_comp_mod
+
 # Registers all auto_deploy HC ops (hc_composition imports deepseek_v4_hc_pre_norm).
-from tensorrt_llm._torch.auto_deploy.custom_ops import deepseek_v4_hc_post as hc_post_mod
-from tensorrt_llm._torch.auto_deploy.custom_ops import hc_composition as hc_comp_mod
+from tensorrt_llm._torch.auto_deploy.custom_ops import deepseek_v4_hyper_connections as hc_post_mod
 
 
 def _assert_ulp_close(actual, ref, rtol, atol, what, max_diff_frac=None):
