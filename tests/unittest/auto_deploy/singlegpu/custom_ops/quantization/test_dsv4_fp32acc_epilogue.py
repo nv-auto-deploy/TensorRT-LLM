@@ -13,15 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Correctness tests for the scoped DeepSeek-V4 Q norm and grouped epilogue fold."""
+"""Correctness tests for the DeepSeek-V4 grouped fine-grained FP8 epilogue fold."""
 
 import pytest
 import torch
 
-# Register the custom ops (side-effect imports).
-import tensorrt_llm._torch.auto_deploy.custom_ops.deepseek_v4_rope_fusion  # noqa: F401
-import tensorrt_llm._torch.auto_deploy.custom_ops.normalization.deepseek_v4_q_rmsnorm  # noqa: F401
-import tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm  # noqa: F401
+# Register the custom ops (side-effect import).
 import tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
     torch_fake_quant_grouped_finegrained_fp8_linear,
@@ -30,10 +27,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
 DEVICE = "cuda"
-Q_LORA = 1024
-FUSED_OUT = 1536
 DSV4_FLASH_HIDDEN = 4096
-EPS = 1e-6
 
 
 def _rand_acc(shape: tuple[int, ...], seed: int, scale: float = 8.0) -> torch.Tensor:
@@ -75,44 +69,6 @@ def _assert_equal_up_to_splitk_atomic_wiggle(
         "mismatches exceed BF16 rounding-boundary flips: "
         f"{actual[:4].tolist()} vs {expected[:4].tolist()}"
     )
-
-
-@pytest.mark.parametrize("seed", [0, 1, 2])
-@pytest.mark.parametrize("rows", [1, 37])
-@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
-def test_deepseek_v4_q_rmsnorm_matches_bf16_reference(
-    seed: int, rows: int, weight_dtype: torch.dtype
-) -> None:
-    """The specialized op keeps both sides of the public contract explicitly BF16."""
-    full = _rand_acc((1, rows, FUSED_OUT), seed).to(torch.bfloat16)
-    q = full.narrow(-1, 0, Q_LORA)
-    generator = torch.Generator(device=DEVICE).manual_seed(seed + 100)
-    weight = (
-        torch.rand(Q_LORA, generator=generator, device=DEVICE, dtype=torch.float32) * 2 - 0.5
-    ).to(weight_dtype)
-
-    ref = torch.ops.auto_deploy.torch_rmsnorm(q, weight, EPS)
-    out = torch.ops.auto_deploy.deepseek_v4_q_rmsnorm(q, weight, EPS)
-
-    assert q.dtype == torch.bfloat16
-    assert ref.dtype == torch.bfloat16
-    assert out.dtype == torch.bfloat16
-    assert torch.equal(out, ref)
-
-
-@pytest.mark.parametrize("input_dtype", [torch.float16, torch.float32])
-def test_deepseek_v4_q_rmsnorm_rejects_non_bf16_input(input_dtype: torch.dtype) -> None:
-    q = torch.randn((1, 1, Q_LORA), device=DEVICE, dtype=input_dtype)
-    weight = torch.ones(Q_LORA, device=DEVICE, dtype=torch.float32)
-    with pytest.raises(TypeError, match="input must be bfloat16"):
-        torch.ops.auto_deploy.deepseek_v4_q_rmsnorm(q, weight, EPS)
-
-
-def test_deepseek_v4_q_rmsnorm_rejects_unsupported_weight_dtype() -> None:
-    q = torch.randn((1, 1, Q_LORA), device=DEVICE, dtype=torch.bfloat16)
-    weight = torch.ones(Q_LORA, device=DEVICE, dtype=torch.float16)
-    with pytest.raises(TypeError, match="weight must be bfloat16 or float32"):
-        torch.ops.auto_deploy.deepseek_v4_q_rmsnorm(q, weight, EPS)
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
