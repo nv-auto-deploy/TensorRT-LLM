@@ -223,7 +223,7 @@ def _deepseek_v4_fused_rope_concat_fake(
 #   * fake-FP8 — per ``block_size`` group of the *normed* nope:
 #     ``scale = 2**ceil(log2(clamp_min(amax, 1e-4) / 448))`` then
 #     ``(clamp(x/scale, -448, 448) -> bf16 -> fp32) * scale -> bf16`` — identical to
-#     ``deepseek_v4_fake_fp8_act_quant``.
+#     ``fake_fp8_act_quant`` (custom_ops/fake_fp8_quant.py).
 @triton.jit
 def _kv_norm_fp8_rope_concat_kernel(
     nope_ptr,  # [R, Dn] raw (strided) — normed, fp8-quantized, then copied through

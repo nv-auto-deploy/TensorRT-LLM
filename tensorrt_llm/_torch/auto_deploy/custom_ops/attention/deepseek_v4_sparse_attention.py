@@ -6433,6 +6433,10 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
                 head_dim,
                 dtype=dtype,
             ),
+            # TODO (nvchenghaoz): the nope slice of these rows is pre-snapped to the fp8
+            # grid (fake_fp8_act_quant), so storing it as real fp8 + scales would halve
+            # this cache accuracy-free; needs a split nope/pe layout and fp8 read paths
+            # in the reader kernels.
             "mhc_cache": PagedResourceHandler(head_dim, dtype=dtype),
             "compressor_kv_cache": PagedResourceHandler(
                 compressor_state_dim,

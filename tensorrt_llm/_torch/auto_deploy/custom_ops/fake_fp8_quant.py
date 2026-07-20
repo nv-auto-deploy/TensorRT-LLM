@@ -13,33 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused fake-FP8 block activation-quant custom op for DeepSeek-V4.
+"""Fused fake-FP8 block activation-quant custom op.
 
-``fake_fp8_act_quant`` in ``utils/quantization_utils.py`` simulates block-wise FP8
-activation quantization on a bf16 tensor: per group of ``block_size`` elements along
-the last dim it derives a power-of-two scale from the block amax, divides, clamps to
-the e4m3 ``[-448, 448]`` range, round-trips through the input dtype (bf16) to emulate
-the FP8 mantissa, then multiplies the scale back. In eager / exported form this
-decomposes into a long chain of tiny kernels per call -- ``abs``, an ``amax``
-reduction, ``clamp_min``, ``div``, ``log2``, ``ceil``, ``pow``, ``div``, ``clamp``,
-two bf16 round-trip casts and a ``mul`` -- and the helper is called up to 3x per layer
-per step (main q-compressor nope, main kv nope, and the sparse-indexer compressed
-nope). The trace shows ~180 such chains; the ``max``/``pow``/``log2``/``ceil`` kernels
-alone exceed 1.2 ms before the clamp/cast/div/mul work.
-
-This op collapses the whole chain into a *single* Triton kernel: one program per
-``block_size``-element group loads the block, reduces the amax, derives the power-of-
-two scale, and writes the dequantized result. All intermediate math stays in fp32 and
-the two bf16 round-trips are reproduced bit-for-bit, so the output is byte-identical to
-the reference (see ``test_deepseek_v4_fake_fp8.py``). The full-tensor fp32 ``.float()``
-materialization the reference performs is avoided entirely (bf16 in, bf16 out).
+One Triton kernel replacing the ~14-op eager chain of
+``utils/quantization_utils.fake_fp8_act_quant`` (abs/amax/log2/ceil/pow/clamp/
+bf16 round-trips/mul): one program per ``block_size`` group derives the
+power-of-two scale from the block amax and writes the dequantized result,
+byte-identical to the eager body (see ``test_fake_fp8_quant.py``).
 """
 
 import torch
 import triton
 import triton.language as tl
 
-__all__ = ["deepseek_v4_fake_fp8_act_quant"]
+__all__ = ["fake_fp8_act_quant"]
 
 
 @triton.jit
@@ -97,8 +84,8 @@ def _is_row_pitch_indexable(x: torch.Tensor) -> bool:
     return True
 
 
-@torch.library.custom_op("auto_deploy::deepseek_v4_fake_fp8_act_quant", mutates_args=())
-def deepseek_v4_fake_fp8_act_quant(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
+@torch.library.custom_op("auto_deploy::fake_fp8_act_quant", mutates_args=())
+def fake_fp8_act_quant(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
     """Fused, byte-exact replacement for ``utils.quantization_utils.fake_fp8_act_quant``.
 
     Per ``block_size``-element group along the last dim: dequantized fake-FP8 round trip
@@ -134,6 +121,6 @@ def deepseek_v4_fake_fp8_act_quant(x: torch.Tensor, block_size: int = 64) -> tor
     return out
 
 
-@deepseek_v4_fake_fp8_act_quant.register_fake
-def _deepseek_v4_fake_fp8_act_quant_fake(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
+@fake_fp8_act_quant.register_fake
+def _fake_fp8_act_quant_fake(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
     return torch.empty_like(x, memory_format=torch.contiguous_format)

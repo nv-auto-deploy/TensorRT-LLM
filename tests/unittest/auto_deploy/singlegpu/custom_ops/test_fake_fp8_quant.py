@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for ``auto_deploy::deepseek_v4_fake_fp8_act_quant``.
+"""Unit tests for ``auto_deploy::fake_fp8_act_quant``.
 
 The fused Triton op must reproduce the eager reference in
 ``utils/quantization_utils.fake_fp8_act_quant`` **byte-for-byte** for bf16 inputs:
@@ -27,7 +27,7 @@ import pytest
 import torch
 
 # Register the custom op (side-effect import).
-import tensorrt_llm._torch.auto_deploy.custom_ops.deepseek_v4_fake_fp8  # noqa: F401
+import tensorrt_llm._torch.auto_deploy.custom_ops.fake_fp8_quant  # noqa: F401
 
 
 def _fake_fp8_act_quant_ref(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
@@ -48,7 +48,7 @@ def _fake_fp8_act_quant_ref(x: torch.Tensor, block_size: int = 64) -> torch.Tens
 
 
 def _op(x, block_size=64):
-    return torch.ops.auto_deploy.deepseek_v4_fake_fp8_act_quant(x, block_size)
+    return torch.ops.auto_deploy.fake_fp8_act_quant(x, block_size)
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
