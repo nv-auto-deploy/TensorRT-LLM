@@ -15,20 +15,29 @@
 
 """Fused Triton RoPE paths for DeepSeek-V4 attention.
 
-The fused paths replace these PyTorch operation chains:
+Main Q — before::
 
-* Main Q
-  Before: ``RMSNorm(Q) -> split(noPE, PE) -> RoPE(PE) -> concat``.
-  After: ``_interleaved_rope_concat_kernel`` performs the normalization and
-  writes ``[noPE | rotated PE]`` directly in one kernel.
-* Main KV
-  Before: ``RMSNorm(KV) -> split(noPE, PE) -> fake-FP8(noPE) -> RoPE(PE) -> concat``.
-  After: ``_kv_norm_fp8_rope_concat_kernel`` performs the entire chain and
-  writes the final KV tensor directly in one kernel.
+    q = q * torch.rsqrt(q.float().pow(2).mean(-1, keepdim=True) + eps).to(q.dtype)
+    nope, pe = q.split([Dn, D], dim=-1)
+    q = torch.cat((nope, _apply_interleaved_rope(pe, cos, sin)), dim=-1)
+
+after: ``deepseek_v4_fused_rope_concat(nope, pe, cos, sin, rms_eps=eps)``
+(one launch of ``_interleaved_rope_concat_kernel``).
+
+Main KV — before::
+
+    kv = torch.ops.auto_deploy.torch_rmsnorm(kv, weight, eps)
+    nope, pe = kv.split([Dn, D], dim=-1)
+    nope = fake_fp8_act_quant(nope, block_size=64)
+    kv = torch.cat((nope, _apply_interleaved_rope(pe, cos, sin)), dim=-1)
+
+after: ``deepseek_v4_kv_norm_rope_concat(nope, pe, weight, cos, sin, eps)``
+(one launch of ``_kv_norm_fp8_rope_concat_kernel``).
 
 The first kernel is also used without RMSNorm by the compressor and indexer,
 and with inverse RoPE for the attention output. The kernels preserve the FP32
-math and BF16 rounding points of the PyTorch paths they replace.
+math and BF16 rounding points of the PyTorch chains they replace
+(``_apply_interleaved_rope`` reference copy: ``test_deepseek_v4_fused_rope_concat.py``).
 """
 
 import torch
