@@ -29,7 +29,9 @@ import torch
 import tensorrt_llm._torch.auto_deploy.custom_ops.deepseek_v4_hadamard_fp4  # noqa: F401
 
 
-# --- verbatim reference from utils/quantization_utils.py ---
+# --- canonical eager reference for the fused op (the production helpers were
+# --- removed; this copy and test_deepseek_v4_modeling.py's independently-written
+# --- variant are the surviving oracles) ---
 def _ceil_pow2_scale(amax, max_value, min_value):
     return torch.pow(2.0, torch.ceil(torch.log2(amax.clamp_min(min_value) / max_value)))
 
