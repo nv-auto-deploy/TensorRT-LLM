@@ -406,6 +406,9 @@ def _run_torch_mxfp4_mlp_core(
 # the PT backend); the torch reference stays the non-SM100 fallback.
 
 
+# TODO (nvchenghaoz): move this runtime prep+cache to a post-load transform (as
+# fuse_mxfp4_moe already does for gpt-oss) so the checkpoint-layout originals can
+# be freed — the runtime design keeps both copies of the expert weights resident.
 def _prepare_trtllm_gen_mxfp4_cached(
     hidden_size: int,
     intermediate_size: int,
