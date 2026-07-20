@@ -233,25 +233,16 @@ def test_splitk_tp4_band(M, N, K):
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8 tensor cores")
 def test_splitk_tp4_heuristic_defaults():
     """Check the exact M=1 TP4 schedule and unchanged legacy fallbacks."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
-        _splitk_block_n,
-        _splitk_num_warps,
-        _splitk_split_k,
-    )
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import _splitk_schedule
 
-    assert _splitk_split_k(1024, 4096, 1) == 32
-    assert _splitk_split_k(1536, 4096, 1) == 24
-    assert _splitk_block_n(1024, 4096, 1) == 64
-    assert _splitk_block_n(1536, 4096, 1) == 64
-    assert _splitk_num_warps(1024, 4096, 1) == 2
-    assert _splitk_num_warps(1536, 4096, 1) == 2
-    # M=2 and K=7168 keep the legacy schedules.
-    assert _splitk_split_k(1024, 4096, 2) == 24
-    assert _splitk_block_n(1024, 4096, 2) == 128
-    assert _splitk_num_warps(1024, 4096, 2) == 4
-    assert _splitk_split_k(1536, 7168) == 24 and _splitk_split_k(1536) == 24
-    assert _splitk_block_n(1536, 7168) == 128 and _splitk_block_n(1536) == 128
-    assert _splitk_num_warps(1536, 7168) == 4 and _splitk_num_warps(1536) == 4
+    # (BLOCK_SIZE_N, SPLIT_K, num_warps): exact M=1 TP4 schedule...
+    assert _splitk_schedule(1, 1024, 4096) == (64, 32, 2)
+    assert _splitk_schedule(1, 1536, 4096) == (64, 24, 2)
+    # ...while M=2 and K=7168 keep the legacy schedules.
+    assert _splitk_schedule(2, 1024, 4096) == (128, 24, 4)
+    assert _splitk_schedule(1, 1536, 7168) == (128, 24, 4)
+    assert _splitk_schedule(1, 256, 7168) == (32, 48, 4)
+    assert _splitk_schedule(1, 2304, 7168) == (128, 16, 4)
 
     for N in (1024, 1536):
         out, ref = _run_splitk(1, N, 4096)

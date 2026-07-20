@@ -509,6 +509,15 @@ def _act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, ROUND_SCALE
     tl.store(s_ptr + pid, s)
 
 
+@triton.jit
+def _ue8m0_quant_rows(x):
+    """In-register ue8m0 block-FP8 quant of one whole quant group per row of ``x``
+    (identical scale math and rounding to ``_act_quant_kernel``'s ROUND_SCALE path)."""
+    amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
+    s = tl.exp2(tl.ceil(tl.log2(amax / 448.0)))
+    return (x / s[:, None]).to(tl.float8e4nv), s
+
+
 def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str = "") -> tuple:
     """Block-wise FP8 activation quantization (CUDA-graph safe).
 
@@ -537,25 +546,14 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str
     return y, s
 
 
-# Adapted from sgl-project/sglang fp8 block matmul kernel, vendored here to
-# decouple from transformers.integrations.finegrained_fp8 (which removed
-# w8a8_block_fp8_matmul_triton in transformers 5.5.x).
-#
-# Autotune over (BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M, num_warps, num_stages).
-# BLOCK_SIZE_K is intentionally NOT autotuned -- it is passed at the call site and
-# pinned to the quantization group_k so the in-loop scale index
-# ``offs_ks = (k * BLOCK_SIZE_K) // group_k`` never straddles a scale block
-# (a K-tile that does not divide group_k would load one scale for several groups
-# and corrupt the result). BLOCK_SIZE_N / BLOCK_SIZE_M fetch per-element scales so
-# they are free to tune. Configs were measured on B200 (sm100) over the
-# DeepSeek-V4 MLA/dense per-rank projection shapes.
+# Adapted from sgl-project/sglang, vendored because transformers 5.5.x removed
+# w8a8_block_fp8_matmul_triton. BLOCK_SIZE_K is NOT autotuned: it must stay pinned
+# to the quantization group_k or the in-loop scale index straddles a scale block
+# and corrupts the result. Configs measured on B200 over the DSV4 per-rank shapes.
 
 _W8A8_BLOCK_FP8_MATMUL_CONFIGS = [
-    # Decode / small-M (BLOCK_SIZE_M=16): the autotuner (keyed on N) picks
-    # BLOCK_SIZE_N=32 (small N: spread work over more CTAs) vs 64 (large N: stay
-    # within one wave). num_warps is pinned to 4 because the 4-vs-8 gap is too
-    # small for do_bench to resolve, which would re-introduce run-to-run
-    # selection flicker.
+    # Decode / small-M: BLOCK_SIZE_N 32 vs 64 selected by the autotuner; num_warps
+    # pinned to 4 (the 4-vs-8 gap is below do_bench resolution -> selection flicker).
     triton.Config(
         {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=4
     ),
@@ -568,14 +566,10 @@ _W8A8_BLOCK_FP8_MATMUL_CONFIGS = [
     triton.Config(
         {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=3
     ),
-    # Prefill / large-M (BLOCK_SIZE_M>=64): num_warps=8, BLOCK_SIZE_N=128 only.
-    # IMPORTANT: the stock kernel is run-to-run NON-deterministic on sm100 at large
-    # M (>=256) with large K (>=2048) for several (BLOCK_SIZE_*, num_warps) combos
-    # -- a sparse fp8-MMA pipelining glitch (global RMSE stays ~1e-3 but a few
-    # near-cancellation outputs flip). BLOCK_SIZE_N=128 with num_warps=8 was
-    # verified deterministic at every measured shape; faster-but-racy configs
-    # (e.g. BLOCK_SIZE_N=256, or any large-tile num_warps=4) are deliberately
-    # excluded because the autotuner selects on latency only.
+    # Prefill / large-M: ONLY BLOCK_SIZE_N=128 + num_warps=8. Other large-tile
+    # configs are run-to-run NON-deterministic on sm100 at M>=256/K>=2048 (fp8-MMA
+    # pipelining glitch); do not add faster-but-racy configs — the autotuner
+    # selects on latency only.
     triton.Config(
         {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=4
     ),
@@ -666,11 +660,8 @@ def _w8a8_block_fp8_matmul_kernel(
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     if HAS_RESIDUAL:
-        # Fused merge add (e.g. routed-MoE output + this shared-expert down
-        # projection feeding one all_reduce). ``c`` was already rounded to the
-        # output dtype above, so widening both addends to fp32 and rounding once
-        # reproduces the eager two-kernel sequence ``add(matmul_out, residual)``
-        # bit-for-bit (aten elementwise add computes in fp32 opmath).
+        # Fused merge add: ``c`` is already rounded to the output dtype, so fp32
+        # widen + add + one rounding reproduces the eager add(matmul_out, residual).
         r_ptrs = R + stride_rm * offs_cm[:, None] + stride_rn * offs_cn[None, :]
         r = tl.load(r_ptrs, mask=c_mask, other=0.0)
         c = (c.to(tl.float32) + r.to(tl.float32)).to(C.dtype.element_ty)
@@ -695,10 +686,8 @@ def _w8a8_block_fp8_matmul_triton(
 
     assert A.shape[-1] == B.shape[-1]
     if As is None:
-        # Deferred activation quant (``_use_quant_prologue``): A is the raw
-        # model-dtype activation. The decode GEMV/split-K kernels below fuse the
-        # ue8m0 quant into their prologue; any other shape quantizes standalone
-        # right before the full-K kernel (byte-identical to the eager pipeline).
+        # Deferred activation quant: the decode GEMV/split-K kernels fuse the ue8m0
+        # quant into their prologue; other shapes quantize standalone below.
         assert A.is_contiguous() and A.shape[-1] % block_k == 0
     else:
         assert As.numel() != 1, "per-tensor scales unsupported in vendored path"
@@ -714,25 +703,13 @@ def _w8a8_block_fp8_matmul_triton(
 
     C_shape = A.shape[:-1] + (N,)
 
-    # Split-K decode path: at small M (decode GEMV) with a long K reduction the
-    # default one-CTA-per-(M,N)-tile kernel walks the entire K dimension in a single
-    # serial loop and launches only ``cdiv(N, BLOCK_N)`` CTAs (e.g. M=1,N=256,K=7168
-    # -> 4-8 CTAs over 56 K-blocks), leaving the GPU almost idle and bottlenecked on
-    # K-loop latency. ``_w8a8_block_fp8_matmul_splitk`` partitions the K reduction
-    # across ``SPLIT_K`` CTAs (grid axis 1) and reduces the fp32 partials, raising
-    # occupancy ~SPLIT_K x. Restricted to small M + large K where the base grid is
-    # CTA-starved; everything else keeps the autotuned full-K kernel.
     if residual is not None:
         assert residual.shape == C_shape, "residual must match the matmul output shape"
         assert residual.dtype == output_dtype, "residual must match the matmul output dtype"
         assert residual.dim() >= 2 and residual.is_contiguous()
 
-    # Rowwise direct-store decode GEMV: the exact measured M=1
-    # DeepSeek-V4-Flash TP4 per-rank shapes bypass both incumbent paths -- one
-    # flat rowwise kernel replaces full-K MMA launches and the split-K
-    # (zero-fill + atomic matmul + finish-cast) triple, with the residual merge
-    # add fused in the same epilogue as the full-K kernel. See the kernel
-    # docstring/comment block for the measured schedule and numerics.
+    # Dispatch: exact measured M=1 TP4 shapes -> rowwise direct-store GEMV;
+    # small-M/long-K (CTA-starved base grid) -> split-K; else autotuned full-K.
     if _use_rowwise_gemv(M, N, K, block_n, block_k, A, B, As, Bs):
         return _w8a8_gemv_rowwise(
             A, B, As, Bs, block_n, block_k, output_dtype, N, K, residual=residual
@@ -748,8 +725,7 @@ def _w8a8_block_fp8_matmul_triton(
         return C
 
     if As is None:
-        # No fused-prologue decode path for this shape (e.g. prefill): quantize
-        # standalone and fall through to the full-K autotuned kernel.
+        # No fused-prologue decode path for this shape (e.g. prefill).
         A, As = _safe_act_quant(A, block_k, input_scale_fmt)
 
     C = A.new_empty(C_shape, dtype=output_dtype)
@@ -790,21 +766,12 @@ def _w8a8_block_fp8_matmul_triton(
     return C
 
 
-# Split-K decode GEMV reduction layout.
-#
-# The full-K kernel above assigns one CTA per (M,N) output tile and walks the whole
-# K dimension serially. At decode M (1/2) with K=7168 (56 K-blocks of 128) the base
-# grid is only cdiv(N, BLOCK_N) CTAs (4-36 for the DeepSeek-V4 MLA/dense projection
-# Ns), so the kernel is reduction-/latency-bound and the GPU is almost idle.
-#
-# This kernel splits the K reduction across ``SPLIT_K`` CTAs (grid axis 1). Each CTA
-# strides through ``k = pid_sk, pid_sk+SPLIT_K, ...`` K-blocks (balanced + handles a
-# K-block count not divisible by SPLIT_K via the existing K-mask), accumulates its
-# partial in fp32, and ``tl.atomic_add``s into a pre-zeroed fp32 accumulator. The
-# split is along the contraction only, so the result equals the serial sum up to
-# fp32 add-ordering (~1e-7 rel, far under the fp8 quant error); decode is bit-stable
-# enough for the strict M=1/2 accuracy bar. BLOCK_SIZE_K stays pinned to the
-# quantization group_k so the per-block scale index never straddles a scale block.
+# Split-K decode GEMV: at decode M with long K the full-K kernel launches only
+# cdiv(N, BLOCK_N) CTAs and is K-loop-latency-bound. This kernel fans the K
+# reduction out across SPLIT_K CTAs (grid axis 1, strided K-blocks) and
+# tl.atomic_add's fp32 partials into a pre-zeroed accumulator — equal to the
+# serial sum up to fp32 add ordering (~1e-7 rel, far under fp8 quant error).
+# BLOCK_SIZE_K stays pinned to group_k (scale-index correctness).
 @triton.jit
 def _w8a8_block_fp8_matmul_splitk_kernel(
     A,
@@ -862,14 +829,10 @@ def _w8a8_block_fp8_matmul_splitk_kernel(
 
         offs_ks = (k * BLOCK_SIZE_K) // group_k
         if QUANT_PROLOGUE:
-            # A is the raw model-dtype activation and BLOCK_SIZE_K == group_k, so
-            # the tile is one quant group per row: replicate _act_quant_kernel's
-            # ue8m0 scale math + fp8 cast in-register (bit-identical) and feed the
-            # fp8 tile to tl.dot exactly like the memory-loaded path.
+            # A is the raw activation; BLOCK_SIZE_K == group_k makes each tile row
+            # one quant group, so quantize in-register and feed fp8 to tl.dot.
             x = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0).to(tl.float32)
-            amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
-            a_s = tl.exp2(tl.ceil(tl.log2(amax / 448.0)))
-            a = (x / a_s[:, None]).to(tl.float8e4nv)
+            a, a_s = _ue8m0_quant_rows(x)
         else:
             a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
             a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
@@ -886,15 +849,10 @@ def _w8a8_block_fp8_matmul_splitk_kernel(
     tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
 
 
-# Split-K launch config for the decode GEMV. Two tuned bands (see the per-knob
-# heuristics below): the legacy schedule tuned on B200 over K=7168 decode
-# projection shapes (N in {256,576,1536,2304}; kernel_layout axis), and exact M=1,
-# K=4096 DeepSeek-V4-Flash TP4 per-rank shapes (N in {1024,1536};
-# kernel_autotune axis).
+# Split-K launch config for the decode GEMV, tuned on B200 over the K=7168 decode
+# projection shapes (N in {256,576,1536,2304}) plus the exact M=1/K=4096
+# DeepSeek-V4-Flash TP4 per-rank shapes (N in {1024,1536}).
 _SPLITK_BLOCK_SIZE_M = 16
-# Mid-N default / fallback SPLIT_K (see ``_splitk_split_k`` for the per-N schedule).
-_SPLITK_SPLIT_K = 24
-_SPLITK_NUM_WARPS = 4
 _SPLITK_NUM_STAGES = 3
 # Gate: small M (decode) + long K reduction, where the base grid is CTA-starved.
 _SPLITK_MAX_M = 4
@@ -905,67 +863,21 @@ def _use_splitk_decode(M: int, N: int, K: int) -> bool:
     return M <= _SPLITK_MAX_M and K >= _SPLITK_MIN_K
 
 
-def _use_dsv4_tp4_m1_splitk_schedule(M: Optional[int], N: int, K: Optional[int]) -> bool:
-    """Return whether the exact measured DeepSeek-V4-Flash TP4 schedule applies."""
-    return M == 1 and K == 4096 and N in (1024, 1536)
+def _splitk_schedule(M: int, N: int, K: int) -> Tuple[int, int, int]:
+    """(BLOCK_SIZE_N, SPLIT_K, num_warps) for the split-K decode GEMV.
 
-
-def _splitk_block_n(N: int, K: Optional[int] = None, M: Optional[int] = None) -> int:
-    """BLOCK_SIZE_N for the split-K decode GEMV, scaled with N and measured shape.
-
-    Small N is CTA-starved so a narrow N-tile spreads work over more CTAs; large N
-    has enough output tiles that a wide N-tile (better MMA / fewer atomic stores)
-    wins. Measured B200 optima at K=7168: N=256->32, N=576->64, N>=1024
-    (1536/2304)->128.
-
-    Exact M=1, K=4096 shapes (DeepSeek-V4-Flash TP4 per-rank decode: fused
-    wq_a+wkv N=1536, shared w1+w3 / grouped wo_a N=1024, all K=4096): with only 32
-    K-blocks the wide 128-N tile leaves too few CTAs in flight; BLOCK_SIZE_N=64
-    wins in the measured L2-cold and L2-hot regimes. All other shapes preserve
-    the legacy K=7168-tuned schedule.
+    Small N is CTA-starved: narrow N-tiles plus a deeper K-split spread work over
+    more CTAs; wide-N shapes prefer fat tiles and a shallower split (fewer
+    atomics). The exact M=1/K=4096 TP4 shapes were re-measured separately: with
+    only 32 K-blocks a 128-wide tile is too coarse (BLOCK_N=64 wins), N=1024
+    wants the balanced SPLIT_K=32 (24 leaves 2-K-block stragglers), and the
+    short per-CTA reduction only needs 2 warps.
     """
-    if _use_dsv4_tp4_m1_splitk_schedule(M, N, K):
-        return 64
-    if N <= 512:
-        return 32
-    if N >= 1024:
-        return 128
-    return 64
-
-
-def _splitk_split_k(N: int, K: Optional[int] = None, M: Optional[int] = None) -> int:
-    """SPLIT_K (K-reduction CTA fan-out) for the split-K decode GEMV.
-
-    The launch grid is ``cdiv(N, BLOCK_SIZE_N) * SPLIT_K`` and the atomic-reduction
-    count scales with ``SPLIT_K``: narrow-N tiles yield few n-tiles and want a
-    *deeper* K-split (more CTAs), wide 128-N tiles want a *shallower* split (less
-    atomic over-subscription). Measured B200 optima (BLOCK_SIZE_K=128, K=7168,
-    M=1): N=256/576->48, N=1536->24, N=2304->16.
-
-    Exact M=1, K=4096 shapes: 32 K-blocks make SPLIT_K=24 ragged (the 2-K-block
-    straggler CTAs set the kernel tail), so the balanced SPLIT_K=32 wins at
-    N=1024; N=1536 measured slightly faster keeping 24. All other shapes preserve
-    the legacy schedule.
-    """
-    if _use_dsv4_tp4_m1_splitk_schedule(M, N, K):
-        return 32 if N == 1024 else _SPLITK_SPLIT_K
-    if N < 1024:
-        return 48
-    if N <= 1792:
-        return _SPLITK_SPLIT_K  # 24
-    return 16
-
-
-def _splitk_num_warps(N: int, K: Optional[int] = None, M: Optional[int] = None) -> int:
-    """num_warps for the split-K decode GEMV.
-
-    The exact M=1/K=4096/N={1024,1536} shapes use 2 warps; their short
-    per-CTA K reduction does not benefit from the legacy 4-warps schedule. Every
-    other shape keeps the tuned 4-warps default.
-    """
-    if _use_dsv4_tp4_m1_splitk_schedule(M, N, K):
-        return 2
-    return _SPLITK_NUM_WARPS
+    if M == 1 and K == 4096 and N in (1024, 1536):
+        return 64, (32 if N == 1024 else 24), 2
+    block_n = 32 if N <= 512 else (64 if N < 1024 else 128)
+    split_k = 48 if N < 1024 else (24 if N <= 1792 else 16)
+    return block_n, split_k, 4
 
 
 def _w8a8_block_fp8_matmul_splitk(
@@ -994,9 +906,7 @@ def _w8a8_block_fp8_matmul_splitk(
     deterministic; a later BF16 cast normally absorbs the variation but values on a
     BF16 rounding boundary can differ by one ULP.
     """
-    split_k = _splitk_split_k(N, K, M)
-    block_size_n = _splitk_block_n(N, K, M)
-    num_warps = _splitk_num_warps(N, K, M)
+    block_size_n, split_k, num_warps = _splitk_schedule(M, N, K)
     if As is None:
         # Deferred-quant path: the per-row group amax is reduced over one K tile,
         # so the tile must cover exactly one whole quant group.
@@ -1046,32 +956,14 @@ def _w8a8_block_fp8_matmul_splitk(
     return C_acc.to(output_dtype)
 
 
-# Rowwise direct-store decode GEMV backend.
-#
-# At M=1 both incumbent paths carry structural overhead this memory-bound GEMV
-# does not need:
-#   * the full-K MMA kernel loads B as (BLOCK_K, BLOCK_N) tiles -- 128-byte
-#     segments per output column -- and pads the M=1 row to a 16-row MMA tile;
-#   * the split-K path adds a zero-fill kernel before and an fp32->bf16 finish
-#     cast kernel after every call (three CUDA-graph nodes per GEMV) plus an
-#     fp32 atomic reduction.
-# This kernel instead assigns each CTA a small band of B *rows* and streams them
-# along K in (BLOCK_N, GROUPS, group_k) tiles: per row the K segment read per
-# load is ``GROUPS * group_k`` bytes (up to a whole 4 KiB row) instead of 128,
-# there are no atomics, no MMA row padding, and the bf16 result (plus the
-# optional fused residual add) is stored directly -- one kernel, no fill/cast.
-#
-# Numerics: for each row the per-scale-group partial dot products are formed in
-# fp32 and accumulated in a deterministic order (sequential over GROUPS-sized
-# chunks, tree-reduced within a chunk), with the same ``(partial * a_s) * b_s``
-# scale association as the incumbent kernels. It therefore matches the full-K
-# kernel up to the intra-group summation-tree order and *removes* the split-K
-# path's atomic-order run-to-run nondeterminism on the shapes it covers.
-#
-# The launch schedules below were measured per exact DeepSeek-V4-Flash TP4
-# per-rank M=1 decode shape on B200 (persistent / work-queue kernel variants
-# lost to this flat one-task-per-CTA grid at every shape). Non-listed shapes,
-# M>=2, and non-128 quant blocks keep the incumbent paths.
+# Rowwise direct-store decode GEMV: at M=1 the full-K kernel pays MMA row padding
+# and 128-byte B loads per column, and the split-K path pays a zero-fill + atomic
+# reduction + finish-cast triple. This kernel gives each CTA a band of B rows and
+# streams whole (GROUPS * group_k)-byte K segments per row, storing bf16 (plus the
+# fused residual add) directly — one kernel, no atomics, deterministic fp32
+# accumulation order. Schedules below were measured per exact DSV4-Flash TP4 M=1
+# shape on B200; non-listed shapes / M>=2 / non-128 quant blocks keep the
+# incumbent paths.
 
 # (N, K) -> (BLOCK_N rows/CTA, GROUPS k-groups/iter, num_warps, num_stages)
 _W8A8_TP4_M1_ROWWISE_CFG = {
@@ -1083,11 +975,9 @@ _W8A8_TP4_M1_ROWWISE_CFG = {
     (4096, 2048): (4, 8, 2, 5),  # wo_b                      (was full-K BN32)
 }
 
-# Launch schedule for the fused-quant-prologue variant (QUANT_PROLOGUE=True).
-# The in-kernel quant shifts the register/occupancy balance, so each shape was
-# re-swept with the same drift-controlled CUDA-graph microbench: every entry
-# below beat (or tied, minus one launch) the standalone quant + GEMV pair.
-# Key set must match _W8A8_TP4_M1_ROWWISE_CFG (shared _use_rowwise_gemv gate).
+# Fused-quant-prologue variant: the in-kernel quant shifts the register balance,
+# so each shape was re-swept. Key set must match _W8A8_TP4_M1_ROWWISE_CFG
+# (shared _use_rowwise_gemv gate).
 _W8A8_TP4_M1_ROWWISE_PROLOGUE_CFG = {
     (1536, 4096): (4, 32, 4, 3),  # 4.01 vs 4.08 us pair (BLOCK_N=1 regressed)
     (1024, 4096): (2, 32, 4, 5),  # 3.53 vs 4.20 us pair
@@ -1165,12 +1055,10 @@ def _w8a8_gemv_rowwise_kernel(
     for g0 in range(0, num_k_groups, GROUPS):
         kk = (g0 + offs_g)[:, None] * GROUP_K + offs_k[None, :]
         if QUANT_PROLOGUE:
-            # A is the raw model-dtype activation: replicate _act_quant_kernel's
-            # ue8m0 scale math + fp8 round-trip in-register (bit-identical).
+            # A is the raw model-dtype activation: ue8m0 fp8 round-trip in-register.
             x = tl.load(A + kk).to(tl.float32)  # (GROUPS, GROUP_K)
-            amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
-            a_s = tl.exp2(tl.ceil(tl.log2(amax / 448.0)))
-            a = (x / a_s[:, None]).to(tl.float8e4nv).to(tl.float32)
+            a, a_s = _ue8m0_quant_rows(x)
+            a = a.to(tl.float32)
         else:
             a = tl.load(A + kk).to(tl.float32)  # (GROUPS, GROUP_K)
             a_s = tl.load(As + g0 + offs_g).to(tl.float32)
@@ -1367,17 +1255,11 @@ def torch_fake_quant_finegrained_fp8_linear_residual_add(
     input_scale_fmt: str = "",
     residual: Optional[torch.Tensor] = None,  # [..., N] added to the matmul output
 ) -> torch.Tensor:
-    """``torch_fake_quant_finegrained_fp8_linear`` with a fused trailing merge add.
-
-    Computes ``torch_fake_quant_finegrained_fp8_linear(input, ...) + residual`` with
-    the add folded into the W8A8 block-FP8 matmul epilogue (one kernel instead of
-    matmul + standalone elementwise add). ``input`` may be either a raw model-dtype
-    activation (``input_scale=[]``) or a pre-quantized FP8 activation paired with
-    ``input_scale=[scale]``. The matmul accumulator is rounded to the output dtype
-    *before* the add, so the result is bit-for-bit identical to the unfused sequence.
-    Emitted by the ``fuse_fp8_linear_allreduce_add`` transform for the MoE
-    routed+shared merge add feeding a distributed all_reduce (the summed tensor is
-    the collective's input buffer).
+    """``torch_fake_quant_finegrained_fp8_linear`` with the merge add fused into the
+    matmul epilogue (one kernel instead of matmul + elementwise add); same rounding
+    as the unfused sequence. ``input`` is raw (``input_scale=[]``) or pre-quantized
+    FP8 (``input_scale=[scale]``). Emitted by ``fuse_fp8_linear_allreduce_add`` for
+    the MoE routed+shared merge add feeding an all_reduce.
     """
     assert bias is None, "fused residual-add linear only supports bias-free linears"
     assert residual is not None, "residual tensor is required"
@@ -1432,21 +1314,12 @@ def _swiglu_clamp_act_quant_kernel(
 ):
     """Fused (clamped) SwiGLU + block-wise FP8 activation quantization.
 
-    One program handles one ``BLOCK_SIZE`` (=quant group) chunk of one row. It
-    reproduces the eager chain
-    ``clamp(gate, max=L); clamp(up, -L, L); silu(gate.float()) * up.float();
-    .to(model_dtype); _act_quant_kernel`` bit for bit:
-
-    * clamps use ``tl.where`` so NaN inputs propagate exactly like ``aten.clamp``
-      (a plain ``tl.minimum`` would replace NaN with the bound);
-    * comparing/selecting in fp32 after the exact bf16->fp32 widening selects the
-      same value ``aten.clamp`` picks in bf16 (the bound is bf16-representable);
-    * silu uses aten's fp32 formula ``x / (1 + expf(-x))``;
-    * the product is rounded to the model dtype in-register at the same point the
-      reference chain stores it, then re-widened, so the quantization sees the
-      identical values ``_act_quant_kernel`` loads from memory;
-    * the scale math (both fmt branches) matches ``_act_quant_kernel`` line for
-      line, including storing the fp32-divided payload with a bf16-rounded scale.
+    One program per quant-group chunk of one row, reproducing the eager chain
+    ``clamp(gate/up) -> silu(gate.f32) * up.f32 -> .to(model_dtype) ->
+    _act_quant_kernel`` with the same rounding points. Clamps use ``tl.where`` so
+    NaN propagates like ``aten.clamp`` (``tl.minimum`` would swallow it), and the
+    product is rounded to the model dtype in-register at the same point the
+    reference stores it.
     """
     pid = tl.program_id(axis=0)
     row = pid // GROUPS
@@ -1620,17 +1493,11 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
             output = output + bias.reshape(out_rows).to(output.dtype)
         return output.to(dtype=input.dtype)
 
-    # Direct grouped block-FP8 W8A8 matmul: keep both operands in FP8 and let the proven
-    # block-FP8 kernel apply the per-block input/weight scales inside its FP32 accumulator.
-    # This removes the per-call input quantize->dequantize round-trip and the FP8->BF16 weight
-    # dequant entirely, and reads the FP8 weight (1 byte/elem) instead of a dequantized BF16
-    # weight (2 byte/elem) -- the dominant HBM cost of this memory-bound decode GEMV. It is the
-    # same arithmetic the non-grouped FineGrained FP8 path already uses, and is numerically
-    # *more* faithful than the prior dequant->BF16-BMM (no BF16 rounding of the dequantized
-    # operands; the per-block scale is constant within a block so factoring it out of the
-    # contraction is exact). Under tensor parallelism the DeepSeek-V4 MLA ``wo_a`` per-rank
-    # group count is 1, so this is a single 2D block-FP8 GEMM (K=4096 -> the split-K decode
-    # path); block-aligned ``num_groups > 1`` uses per-group launches of the same proven kernel.
+    # Direct grouped block-FP8 W8A8 matmul: keep both operands in FP8 and let the
+    # block-FP8 kernel apply the per-block scales in its fp32 accumulator — no
+    # quant round-trip, no bf16 weight dequant (halves the HBM read of this
+    # memory-bound GEMV). Per-rank DSV4 wo_a has num_groups == 1 (a single 2D GEMM);
+    # block-aligned num_groups > 1 launches the same kernel per group.
     m_tokens = input_contiguous.numel() // (num_groups * in_features)
     # Deferred activation quant: the decode split-K/GEMV kernels fuse the
     # ue8m0 quant into their prologue; other branches quantize standalone.
@@ -1656,20 +1523,10 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
         )
         output = out2d.reshape(*lead_shape, out_rows)
     elif _use_splitk_decode(m_tokens, rank, in_features):
-        # Decode GEMV epilogue collapse: every per-rank group takes the
-        # split-K path here, and the old per-group dispatch paid a (zero-fill +
-        # fp32->bf16 finish cast) pair per group plus a ``torch.stack`` copy to
-        # re-concatenate the group outputs. Instead, atomically accumulate all
-        # groups into ONE pre-zeroed fp32 buffer laid out exactly like the stacked
-        # result ([M, G*rank], group-major columns) — the split-K kernel writes
-        # each group's disjoint column slice through explicit strides — then run
-        # ONE finish cast over the whole buffer. This preserves the kernel, launch
-        # configuration, and mathematical FP32 reduction for each group while
-        # removing redundant fills/casts and the stack copy. Split-K atomic arrival
-        # order remains nondeterministic; values exactly on a BF16 rounding boundary
-        # can vary by one ULP just as they can on the original per-group path. The
-        # strided ``qin`` / ``sin`` slices need no ``.contiguous()`` because the
-        # kernel consumes explicit row strides.
+        # Accumulate every group into ONE pre-zeroed fp32 buffer laid out like the
+        # stacked result (each group writes its disjoint column slice via strides),
+        # then one finish cast — instead of a per-group zero-fill/cast pair plus a
+        # torch.stack copy. Per-group math and launch config are unchanged.
         weight_grouped = weight_quantized.view(num_groups, rank, in_features)
         scale_rows = scale_n // num_groups
         scale_grouped = weight_scale_inv.view(num_groups, scale_rows, scale_k)
