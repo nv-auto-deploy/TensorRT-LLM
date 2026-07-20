@@ -156,24 +156,18 @@ def _detach_finalizers(finalizers: list[weakref.finalize]) -> None:
         finalizer.detach()
 
 
-# A weight cache maps ``WeightCacheKey`` -> ``(prepared_entry, finalizers)``; the
-# helpers below are shared by every such cache in this module (``_MXFP4_WEIGHT_CACHE``,
-# ``_TRTLLM_GEN_MXFP4_CACHE``), so finalizers must be registered with the cache dict
-# that actually holds the entry.
-WeightCache = OrderedDict
-
-
-def _evict_cache_entry(cache: WeightCache, key: WeightCacheKey) -> None:
-    entry = cache.pop(key, None)
+def _evict_mxfp4_weight_cache_entry(key: WeightCacheKey) -> None:
+    entry = _MXFP4_WEIGHT_CACHE.pop(key, None)
     if entry is None:
         return
     _, finalizers = entry
     _detach_finalizers(finalizers)
 
 
-def _trim_cache(cache: WeightCache, max_entries: int = 256) -> None:
-    while len(cache) > max_entries:
-        _, (_, finalizers) = cache.popitem(last=False)
+def _trim_mxfp4_weight_cache() -> None:
+    max_entries = 256
+    while len(_MXFP4_WEIGHT_CACHE) > max_entries:
+        _, (_, finalizers) = _MXFP4_WEIGHT_CACHE.popitem(last=False)
         _detach_finalizers(finalizers)
 
 
@@ -184,7 +178,7 @@ def _clear_mxfp4_weight_cache() -> None:
 
 
 def _register_cache_finalizers(
-    cache: WeightCache, key: WeightCacheKey, tensors: tuple[torch.Tensor, ...]
+    key: WeightCacheKey, tensors: tuple[torch.Tensor, ...]
 ) -> list[weakref.finalize]:
     finalizers: list[weakref.finalize] = []
     seen_sources: set[int] = set()
@@ -194,7 +188,7 @@ def _register_cache_finalizers(
         if source_id in seen_sources:
             continue
         seen_sources.add(source_id)
-        finalizers.append(weakref.finalize(source, _evict_cache_entry, cache, key))
+        finalizers.append(weakref.finalize(source, _evict_mxfp4_weight_cache_entry, key))
     return finalizers
 
 
@@ -411,13 +405,6 @@ def _run_torch_mxfp4_mlp_core(
 # (routed_scaling_factor is already folded into the weights upstream, matching
 # the PT backend); the torch reference stays the non-SM100 fallback.
 
-# Kernel-ready (pad/shard/shuffle) weights + per-expert SwiGLU tensors, keyed by
-# raw-weight identity. The per-expert TMA-layout shuffle is expensive and must run
-# once before CUDA-graph capture; captured decode steps hit the cache.
-_TRTLLM_GEN_MXFP4_CACHE: OrderedDict[WeightCacheKey, tuple[object, list[weakref.finalize]]] = (
-    OrderedDict()
-)
-
 
 def _reinterleave_up_gate(t: torch.Tensor, intermediate_size: int) -> torch.Tensor:
     """Convert DSV4 ``up_gate`` split-half rows (``[up(I) | gate(I)]``) into the
@@ -466,9 +453,13 @@ def _prepare_trtllm_gen_mxfp4_cached(
         float(limit),
         *(_tensor_cache_key(tensor) for tensor in raw_tensors),
     )
-    entry = _TRTLLM_GEN_MXFP4_CACHE.get(key)
+    # Kernel-ready (pad/shard/shuffle) weights + per-expert SwiGLU tensors, keyed by
+    # raw-weight identity ("trtllm_gen_mxfp4" prefix keeps the key space disjoint from
+    # the matmul_ogs entries). The per-expert TMA-layout shuffle is expensive and must
+    # run once before CUDA-graph capture; captured decode steps hit the cache.
+    entry = _MXFP4_WEIGHT_CACHE.get(key)
     if entry is not None:
-        _TRTLLM_GEN_MXFP4_CACHE.move_to_end(key)
+        _MXFP4_WEIGHT_CACHE.move_to_end(key)
         return entry[0]
 
     from .prepare_trtllm_gen_moe_mxfp4_weights import prepare_trtllm_gen_moe_mxfp4_weights
@@ -498,11 +489,11 @@ def _prepare_trtllm_gen_mxfp4_cached(
     swiglu_limit = torch.full((e_local,), kernel_limit, dtype=torch.float32, device=dev)
     bundle = (prepared, swiglu_alpha, swiglu_beta, swiglu_limit)
 
-    _TRTLLM_GEN_MXFP4_CACHE[key] = (
+    _MXFP4_WEIGHT_CACHE[key] = (
         bundle,
-        _register_cache_finalizers(_TRTLLM_GEN_MXFP4_CACHE, key, raw_tensors),
+        _register_cache_finalizers(key, raw_tensors),
     )
-    _trim_cache(_TRTLLM_GEN_MXFP4_CACHE)
+    _trim_mxfp4_weight_cache()
     return bundle
 
 
@@ -758,9 +749,9 @@ def _prepare_weights_scales_cached(
     )
     _MXFP4_WEIGHT_CACHE[key] = (
         prepared_weights,
-        _register_cache_finalizers(_MXFP4_WEIGHT_CACHE, key, raw_tensors),
+        _register_cache_finalizers(key, raw_tensors),
     )
-    _trim_cache(_MXFP4_WEIGHT_CACHE)
+    _trim_mxfp4_weight_cache()
     return prepared_weights
 
 
