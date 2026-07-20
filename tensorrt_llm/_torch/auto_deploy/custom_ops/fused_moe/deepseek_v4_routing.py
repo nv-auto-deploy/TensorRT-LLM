@@ -126,19 +126,11 @@ def _deepseek_v4_routing_kernel(
         valid = (local >= 0) & (local < local_experts)
         out_idx = tl.where(valid, local, local_experts).to(tl.int32)
         out_w = tl.where(valid, topk_w, 0.0).to(tl.bfloat16)
-        tl.store(weights_ptr + token_id * stride_wt + offs_k * stride_wk, out_w, mask=mask_k)
-        tl.store(indices_ptr + token_id * stride_it + offs_k * stride_ik, out_idx, mask=mask_k)
     else:
-        tl.store(
-            weights_ptr + token_id * stride_wt + offs_k * stride_wk,
-            topk_w,
-            mask=mask_k,
-        )
-        tl.store(
-            indices_ptr + token_id * stride_it + offs_k * stride_ik,
-            topk_idxs.to(tl.int64),
-            mask=mask_k,
-        )
+        out_idx = topk_idxs.to(tl.int64)
+        out_w = topk_w
+    tl.store(weights_ptr + token_id * stride_wt + offs_k * stride_wk, out_w, mask=mask_k)
+    tl.store(indices_ptr + token_id * stride_it + offs_k * stride_ik, out_idx, mask=mask_k)
 
 
 def deepseek_v4_routing_fn(
@@ -394,11 +386,11 @@ def _deepseek_v4_hash_routing_kernel(
         valid = (local >= 0) & (local < local_experts)
         out_idx = tl.where(valid, local, local_experts).to(tl.int32)
         out_w = tl.where(valid, w_k, 0.0).to(tl.bfloat16)
-        tl.store(weights_ptr + token_id * stride_wt + offs_k * stride_wk, out_w, mask=mask_k)
-        tl.store(indices_ptr + token_id * stride_it + offs_k * stride_ik, out_idx, mask=mask_k)
     else:
-        tl.store(weights_ptr + token_id * stride_wt + offs_k * stride_wk, w_k, mask=mask_k)
-        tl.store(indices_ptr + token_id * stride_it + offs_k * stride_ik, eids, mask=mask_k)
+        out_idx = eids
+        out_w = w_k
+    tl.store(weights_ptr + token_id * stride_wt + offs_k * stride_wk, out_w, mask=mask_k)
+    tl.store(indices_ptr + token_id * stride_it + offs_k * stride_ik, out_idx, mask=mask_k)
 
 
 # At/below this bound (covers the decode CUDA-graph batch sizes) the fused kernel
