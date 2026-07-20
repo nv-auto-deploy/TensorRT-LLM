@@ -233,16 +233,31 @@ def _shuffle_per_expert(
     return out
 
 
-def _deinterleave_gate_up(
+def _split_gate_up_rows(
     gu_3d: torch.Tensor,  # [E, 2I, H/2]
     gate_up_scales: torch.Tensor,  # [E, 2I, H/32]
     gate_up_bias: torch.Tensor,  # [E, 2I]
+    gate_up_order: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split the HF interleaved 2I axis (gate at even rows, up at odd rows) into separate halves.
+    """Split the 2I axis into gate/up rows: ``interleaved`` (HF/gpt-oss, gate at even
+    rows) or ``up_gate`` (DSV4, ``[up(I) | gate(I)]`` split halves).
 
-    Kept separate so downstream row-padding puts the zero-pad rows INSIDE each half before re-concat
-    as ``[up | gate]`` — matches PT's ``dst_w3 = up`` / ``dst_w1 = gate`` chunk layout.
+    Kept as separate halves so downstream row-padding puts the zero-pad rows INSIDE each half
+    before re-concat as ``[up | gate]`` — matches PT's ``dst_w3 = up`` / ``dst_w1 = gate``
+    chunk layout.
     """
+    if gate_up_order == "up_gate":
+        half = gu_3d.shape[1] // 2
+        return (
+            gu_3d[:, half:, :].contiguous(),  # gate_rows_w
+            gu_3d[:, :half, :].contiguous(),  # up_rows_w
+            gate_up_scales[:, half:, :].contiguous(),  # gate_rows_s
+            gate_up_scales[:, :half, :].contiguous(),  # up_rows_s
+            gate_up_bias[:, half:].contiguous(),  # gate_b
+            gate_up_bias[:, :half].contiguous(),  # up_b
+        )
+    if gate_up_order != "interleaved":
+        raise ValueError(f"Unsupported gate_up_order: {gate_up_order}.")
     return (
         gu_3d[:, 0::2, :].contiguous(),  # gate_rows_w
         gu_3d[:, 1::2, :].contiguous(),  # up_rows_w
@@ -511,8 +526,12 @@ def prepare_trtllm_gen_moe_mxfp4_weights(
     tp_size: int = 1,
     tp_rank: int = 0,
     scratch: MXFP4PrepScratch | None = None,
+    gate_up_order: str = "interleaved",
 ) -> TRTLLMGenMXFP4MoEWeights:
     """Convert HF on-disk MXFP4 expert weights to the trtllm-gen kernel layout.
+
+    ``gate_up_order`` names the checkpoint's 2I row layout: ``interleaved``
+    (HF/gpt-oss) or ``up_gate`` (DSV4 split halves).
 
     Mirrors PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod`` (``post_load_weights`` +
     ``load_expert_w{3_w1,2}_weight{,_scale_mxfp4}``).
@@ -542,11 +561,11 @@ def prepare_trtllm_gen_moe_mxfp4_weights(
 
     assert down_blocks.size(0) == gate_up_blocks.size(0)
 
-    # 1. Flatten blocks ([..., 16] → flattened) and de-interleave gate/up halves.
+    # 1. Flatten blocks ([..., 16] → flattened) and split the gate/up rows.
     gu_3d = _flatten_block_dim(gate_up_blocks)  # [E, 2I, H/2]
     dn_3d = _flatten_block_dim(down_blocks)  # [E, H, I/2]
-    gate_rows_w, up_rows_w, gate_rows_s, up_rows_s, gate_b, up_b = _deinterleave_gate_up(
-        gu_3d, gate_up_scales, gate_up_bias
+    gate_rows_w, up_rows_w, gate_rows_s, up_rows_s, gate_b, up_b = _split_gate_up_rows(
+        gu_3d, gate_up_scales, gate_up_bias, gate_up_order
     )
 
     # 2. TP slicing on the intermediate axis (no-op for tp_size == 1).

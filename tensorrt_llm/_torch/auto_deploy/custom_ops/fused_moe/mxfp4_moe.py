@@ -406,19 +406,6 @@ def _run_torch_mxfp4_mlp_core(
 # the PT backend); the torch reference stays the non-SM100 fallback.
 
 
-def _reinterleave_up_gate(t: torch.Tensor, intermediate_size: int) -> torch.Tensor:
-    """Convert DSV4 ``up_gate`` split-half rows (``[up(I) | gate(I)]``) into the
-    HF-interleaved layout (gate at even rows, up at odd) that
-    :func:`prepare_trtllm_gen_moe_mxfp4_weights` de-interleaves, so prepare sees the
-    same gate/up halves the torch reference reads. Handles weights
-    ``[E, 2I, H/32, 16]``, scales ``[E, 2I, H/32]``, and bias ``[E, 2I]``.
-    """
-    up = t[:, :intermediate_size]
-    gate = t[:, intermediate_size:]
-    interleaved = torch.stack([gate, up], dim=2)  # [E, I, 2, ...] -> rows g0,u0,g1,u1,...
-    return interleaved.reshape(t.shape[0], 2 * intermediate_size, *t.shape[2:]).contiguous()
-
-
 def _prepare_trtllm_gen_mxfp4_cached(
     hidden_size: int,
     intermediate_size: int,
@@ -431,7 +418,7 @@ def _prepare_trtllm_gen_mxfp4_cached(
     alpha: float,
     limit: float,
 ):
-    """Re-interleave DSV4 gate/up + run :func:`prepare_trtllm_gen_moe_mxfp4_weights`, cached.
+    """Run :func:`prepare_trtllm_gen_moe_mxfp4_weights` on the DSV4 tensors, cached.
 
     Returns ``(prepared_weights, swiglu_alpha, swiglu_beta, swiglu_limit)``; the SwiGLU
     params make the kernel's gated activation bit-equivalent to the torch reference's
@@ -464,13 +451,10 @@ def _prepare_trtllm_gen_mxfp4_cached(
 
     from .prepare_trtllm_gen_moe_mxfp4_weights import prepare_trtllm_gen_moe_mxfp4_weights
 
-    gu_blocks_i = _reinterleave_up_gate(gate_up_blocks, intermediate_size)
-    gu_scales_i = _reinterleave_up_gate(gate_up_scales, intermediate_size)
-    gu_bias_i = _reinterleave_up_gate(gate_up_bias, intermediate_size)
     prepared = prepare_trtllm_gen_moe_mxfp4_weights(
-        gu_blocks_i,
-        gu_scales_i,
-        gu_bias_i,
+        gate_up_blocks,
+        gate_up_scales,
+        gate_up_bias,
         down_blocks,
         down_scales,
         down_bias,
@@ -478,6 +462,7 @@ def _prepare_trtllm_gen_mxfp4_cached(
         intermediate_size=intermediate_size,
         tp_size=1,
         tp_rank=0,
+        gate_up_order="up_gate",
     )
     e_local = gate_up_blocks.shape[0]
     dev = gate_up_blocks.device
