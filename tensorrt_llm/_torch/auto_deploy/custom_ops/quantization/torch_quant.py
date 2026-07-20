@@ -485,12 +485,8 @@ def _use_quant_prologue(input_scale_fmt: str) -> bool:
 
 @triton.jit
 def _act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, ROUND_SCALE: tl.constexpr):
-    """Block-wise FP8 activation quantization, safe for all-zero blocks.
-
-    Identical to HuggingFace's act_quant_kernel except that the per-block scale
-    is clamped to a minimum of 1e-12 before dividing.  This avoids 0/0 = NaN
-    when every element in a block is zero.
-    """
+    """Block-wise FP8 activation quantization (HF's act_quant_kernel plus a
+    >=1e-12 scale clamp so all-zero blocks produce 0 instead of 0/0 = NaN)."""
     pid = tl.program_id(axis=0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x = tl.load(x_ptr + offs).to(tl.float32)
@@ -519,13 +515,8 @@ def _ue8m0_quant_rows(x):
 
 
 def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str = "") -> tuple:
-    """Block-wise FP8 activation quantization (CUDA-graph safe).
-
-    Drop-in replacement for ``transformers.integrations.finegrained_fp8.act_quant``
-    that fixes the NaN-on-zero-block bug by clamping the per-block scale inside
-    the Triton kernel itself.  No post-hoc fixup tensors are created, so the
-    op is fully compatible with CUDA graphs.
-    """
+    """Block-wise FP8 activation quantization (drop-in for HF's ``act_quant``);
+    the NaN fix lives inside the kernel, so no fixup tensors and CUDA-graph safe."""
     assert x.is_contiguous()
     assert x.shape[-1] % block_size == 0
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
@@ -535,13 +526,8 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str
 
     grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)  # noqa: E731
     round_scale = input_scale_fmt.lower() == "ue8m0"
-    # Each program reduces exactly one `block_size` (=128) chunk to a single scale
-    # -- a tiny single-reduction workload. One warp (32 lanes, ~4 elems/lane,
-    # intra-warp shuffle, no shared-mem barrier) beats the Triton default
-    # num_warps=4 (128 lanes + a cross-warp reduction) by ~5% on the DeepSeek-V4
-    # decode mean and ~1-2% at prefill, with zero numeric change (drift-controlled
-    # round-robin CUDA-graph microbench on B200/sm100). num_stages is left at the
-    # default -- this kernel is loop-free, so software pipelining is inert.
+    # num_warps=1: each program is a single 128-elem reduction, so one warp keeps it
+    # intra-warp (no smem barrier); measured faster than the 4-warp default.
     _act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size, ROUND_SCALE=round_scale, num_warps=1)
     return y, s
 
@@ -894,17 +880,11 @@ def _w8a8_block_fp8_matmul_splitk(
     *,
     C_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Split-K block-FP8 GEMM for the decode GEMV (see kernel docstring above).
+    """Split-K block-FP8 GEMM for the decode GEMV (see kernel comment above).
 
-    Accumulates fp32 partials from ``SPLIT_K`` contraction-slices via atomics into a
-    pre-zeroed fp32 buffer, then casts to ``output_dtype``. The launch configuration
-    comes from the measured per-shape schedules below.
-
-    ``C_out`` is the pre-zeroed FP32 column slice created by the grouped-GEMV path;
-    accumulating each group into one allocation allows one finish cast for the full
-    output. Split-K uses FP32 atomics, so launch-to-launch accumulation order is not
-    deterministic; a later BF16 cast normally absorbs the variation but values on a
-    BF16 rounding boundary can differ by one ULP.
+    ``C_out`` is a pre-zeroed fp32 column slice from the grouped-GEMV path (all
+    groups share one allocation and one finish cast). Atomic accumulation order is
+    nondeterministic: values on a BF16 rounding boundary can differ by one ULP.
     """
     block_size_n, split_k, num_warps = _splitk_schedule(M, N, K)
     if As is None:
@@ -956,14 +936,10 @@ def _w8a8_block_fp8_matmul_splitk(
     return C_acc.to(output_dtype)
 
 
-# Rowwise direct-store decode GEMV: at M=1 the full-K kernel pays MMA row padding
-# and 128-byte B loads per column, and the split-K path pays a zero-fill + atomic
-# reduction + finish-cast triple. This kernel gives each CTA a band of B rows and
-# streams whole (GROUPS * group_k)-byte K segments per row, storing bf16 (plus the
-# fused residual add) directly — one kernel, no atomics, deterministic fp32
-# accumulation order. Schedules below were measured per exact DSV4-Flash TP4 M=1
-# shape on B200; non-listed shapes / M>=2 / non-128 quant blocks keep the
-# incumbent paths.
+# Rowwise direct-store decode GEMV: gives each CTA a band of B rows and streams
+# whole K segments per row — one kernel (no zero-fill/cast pair), no atomics,
+# deterministic accumulation. Schedules below were measured per exact DSV4-Flash
+# TP4 M=1 shape on B200; non-listed shapes / M>=2 keep the incumbent paths.
 
 # (N, K) -> (BLOCK_N rows/CTA, GROUPS k-groups/iter, num_warps, num_stages)
 _W8A8_TP4_M1_ROWWISE_CFG = {
@@ -1153,15 +1129,10 @@ def _finegrained_fp8_matmul(
     input_scale_fmt: str = "",
     allow_quant_prologue: bool = False,
 ) -> torch.Tensor:
-    """Shared body of the FineGrained FP8 linear ops.
-
-    (Quantize +) block-FP8 W8A8 matmul (+ bias / fused residual add), cast to
-    ``out_dtype``. ``input`` is either the raw model-dtype activation
-    (``input_scale is None``; quantized here via ``_safe_act_quant`` unless
-    ``allow_quant_prologue`` defers the quant into the decode kernels' prologue)
-    or a pre-quantized FP8 activation with its per-block scale. ``block_n``/``block_k``
-    are inferred from the weight and per-block ``weight_scale_inv`` shapes.
-    """
+    """Shared body of the FineGrained FP8 linear ops: (quantize +) block-FP8 W8A8
+    matmul (+ bias / fused residual add). ``input_scale is None`` means a raw
+    activation — quantized here, or in the decode kernels' prologue when
+    ``allow_quant_prologue``. Block sizes are inferred from the scale shapes."""
     block_n, block_k = _finegrained_fp8_block_sizes(weight_quantized, weight_scale_inv)
     if input_scale is not None:
         qinput, scale = input, input_scale
@@ -1368,10 +1339,8 @@ def torch_fp8_swiglu_clamp_act_quant(
         hidden = (silu(gate.float()) * up.float()).to(gate.dtype)
         return _safe_act_quant(hidden, block_size, input_scale_fmt)
 
-    ``gate``/``up`` may be non-contiguous last-dim-unit-stride views (e.g. the two
-    ``torch.narrow`` halves of one fused gate_up GEMM output), so the sliced halves
-    are consumed in place without materializing them. Bit-for-bit identical to the
-    unfused aten chain + ``_act_quant_kernel`` (see the kernel docstring).
+    ``gate``/``up`` may be strided views (the two narrow halves of one fused
+    gate_up GEMM output), consumed in place without materializing them.
     """
     assert gate.dim() == 2 and up.dim() == 2, "expected flattened [tokens, features] inputs"
     assert gate.shape == up.shape and gate.dtype == up.dtype
