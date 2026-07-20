@@ -15,13 +15,13 @@
 
 """Fused Hadamard-rotate + fake-FP4 activation-quant custom op for DeepSeek-V4.
 
-Collapses the indexer's ``fake_fp4_act_quant(hadamard_rotate(x), block_size=32)``
-composite (a ~30-40-kernel eager swarm at its two ``modeling_deepseek_v4.py``
-sites) into a *single* Triton kernel: one program per ``dim``-length row runs
-the Walsh-Hadamard butterfly and the FP4 quant entirely in fp32 registers. The
-math mirrors the reference exactly — including the intermediate ``bf16``
-round-trip the reference incurs between ``hadamard_rotate``'s ``.to(dtype)``
-and ``fake_fp4_act_quant``'s ``.float()`` — so the result is bit-identical.
+Collapses the indexer's eager Hadamard-rotate + fake-FP4 round-trip chain (a
+~30-40-kernel swarm at its two ``modeling_deepseek_v4.py`` sites) into a
+*single* Triton kernel: one program per ``dim``-length row runs the
+Walsh-Hadamard butterfly and the FP4 quant entirely in fp32 registers. The math
+mirrors the eager reference exactly — including the intermediate ``bf16``
+round-trip between the rotate's output cast and the quant's fp32 widening — so
+the result is bit-identical (reference copy: ``test_deepseek_v4_hadamard_fp4.py``).
 
 Triton (3.x) loop induction variables are runtime tensors, so the butterfly is
 unrolled with compile-time ``if DIM >= 2**(s+1)`` guards calling a ``constexpr``
@@ -32,8 +32,8 @@ import torch
 import triton
 import triton.language as tl
 
-# FP4 (e2m1) quant constants — must match
-# ``utils/quantization_utils.fake_fp4_act_quant`` / ``ceil_pow2_scale``.
+# FP4 (e2m1) quant constants — the amax -> power-of-two scale recipe pinned by
+# the reference implementation in ``test_deepseek_v4_hadamard_fp4.py``.
 _FP4_MAX = 6.0
 _FP4_MIN = 6.0 * 2.0**-126
 
@@ -94,9 +94,8 @@ def _hadamard_fp4_kernel(
     tl.static_assert(DIM <= 256, "deepseek_v4_hadamard_fp4 supports DIM <= 256")
     x = x * INV_SQRT_DIM
 
-    # Reference: hadamard_rotate casts the rotated row to the input dtype (bf16)
-    # and fake_fp4_act_quant immediately casts it back to fp32 — replicate that
-    # round-trip so the fused result is bit-identical.
+    # The eager reference casts the rotated row to the input dtype (bf16) and
+    # immediately back to fp32 — replicate that round-trip for bit-identity.
     x = x.to(out_ptr.dtype.element_ty).to(tl.float32)
 
     # --- block fake-FP4 quant ---
@@ -226,7 +225,7 @@ _BLOCK_R = 2
 
 @torch.library.custom_op("auto_deploy::deepseek_v4_hadamard_fp4", mutates_args=())
 def deepseek_v4_hadamard_fp4(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
-    """Fused ``fake_fp4_act_quant(hadamard_rotate(x), block_size)``.
+    """Fused Hadamard rotate + fake-FP4 block-quant round-trip.
 
     ``x`` has shape ``[..., dim]`` with ``dim`` a power of two (<= 256) and a
     multiple of ``block_size``. The last dim must be contiguous. Returns a tensor

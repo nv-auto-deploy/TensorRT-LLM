@@ -3114,7 +3114,7 @@ if _HAS_TRITON:
             x = _hadamard_stage(x, BLOCK_D, BLOCK_D // 256, 128)
         tl.static_assert(BLOCK_D <= 256, "fused index-k hadamard supports HEAD_DIM <= 256")
         x = x * INV_SQRT_DIM
-        # bf16 round-trip mirror (hadamard_rotate .to(dtype) -> fake_fp4 .float()).
+        # bf16 round-trip mirror of the eager hadamard/fake-fp4 chain's dtype casts.
         x = x.to(ROUND).to(tl.float32)
 
         xb = tl.reshape(x, (NB, FP4_BLOCK))
