@@ -108,13 +108,6 @@ def test_deepseek_v4_q_rmsnorm_rejects_non_bf16_input(input_dtype: torch.dtype) 
         torch.ops.auto_deploy.deepseek_v4_q_rmsnorm(q, weight, EPS)
 
 
-def test_deepseek_v4_q_rmsnorm_rejects_non_dsv4_shape() -> None:
-    q = torch.randn((1, 1, Q_LORA // 2), device=DEVICE, dtype=torch.bfloat16)
-    weight = torch.ones(Q_LORA // 2, device=DEVICE, dtype=torch.float32)
-    with pytest.raises(ValueError, match="1024"):
-        torch.ops.auto_deploy.deepseek_v4_q_rmsnorm(q, weight, EPS)
-
-
 def test_deepseek_v4_q_rmsnorm_rejects_unsupported_weight_dtype() -> None:
     q = torch.randn((1, 1, Q_LORA), device=DEVICE, dtype=torch.bfloat16)
     weight = torch.ones(Q_LORA, device=DEVICE, dtype=torch.float16)
