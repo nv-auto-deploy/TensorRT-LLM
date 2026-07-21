@@ -84,13 +84,9 @@ def _interleaved_rope_concat_kernel(
     even = tl.load(pe_base + 2 * k, mask=mh, other=0.0).to(tl.float32)
     odd = tl.load(pe_base + 2 * k + 1, mask=mh, other=0.0).to(tl.float32)
 
-    # --- optional per-head weightless RMS norm over the full (nope || pe) head ---
-    # Reproduces ``q * rsqrt(mean(q^2) + eps).to(q.dtype)`` applied to the *full*
-    # head BEFORE the nope/pe split: sum-of-squares is order-independent so it is
-    # gathered from the nope block and the pe even/odd lanes. The rsqrt factor is
-    # rounded to the output dtype (matching the reference ``.to(q.dtype)`` on the
-    # rsqrt) and every normalized value is materialized in the output dtype before
-    # RoPE reads it back, so the fused result is bit-faithful to the split reference.
+    # --- optional weightless RMS norm over the full (nope || pe) head ---
+    # The reference rounds the rsqrt factor to q.dtype and stores the normalized
+    # head before RoPE re-reads it; both roundings are reproduced in-register.
     if HAS_NORM:
         out_ty0 = out_ptr.dtype.element_ty
         nope_f = nope.to(tl.float32)
@@ -134,9 +130,9 @@ def deepseek_v4_fused_rope_concat(
     """Fused replacement for ``cat((nope, _apply_interleaved_rope(pe, cos, sin)))``.
 
     Args:
-        nope: ``[..., Dn]`` slice that is concatenated **before** the rotated pe.
-            For the main KV path this is the already-fp8-quantized nope; for every
-            other site it is the raw nope slice.
+        nope: ``[..., Dn]`` slice that is concatenated **before** the rotated pe
+            (the compressor tail passes an already-fp8-quantized nope; other sites
+            pass the raw slice).
         pe:   ``[..., D]`` slice to interleaved-rotate (``D`` even). Shares ``nope``'s
             leading dims. May be a (leading-contiguous) view of a larger tensor.
         cos:  ``[..M.., Dh]`` (``Dh == D // 2``). Its leading dims are ``pe``'s
@@ -144,13 +140,10 @@ def deepseek_v4_fused_rope_concat(
             heads exactly like ``cos.unsqueeze(head_dim)`` did in the reference.
         sin:  same shape as ``cos``.
         inverse: if True, negate ``sin`` (the attention-output inverse rotation).
-        rms_eps: if ``> 0``, additionally fold a *weightless* per-head RMS
-            normalization over the full ``[..., Dn + D]`` head — i.e.
-            ``q *= rsqrt(mean(q^2, dim=-1) + rms_eps).to(q.dtype)`` — that would
-            otherwise run as a separate reduction/elementwise chain immediately
-            before this op (the main-Q path). ``nope``/``pe`` must be the *raw*
-            (un-normalized) split views. Defaults to ``0.0`` (no norm) so every
-            other call site is unchanged.
+        rms_eps: if ``> 0``, first fold the weightless per-head RMS norm
+            ``q *= rsqrt(mean(q^2, dim=-1) + rms_eps).to(q.dtype)`` over the full
+            head (the main-Q path); ``nope``/``pe`` must then be the *raw*
+            un-normalized split views. ``0.0`` (default) = no norm.
 
     Returns:
         ``[..., Dn + D]`` contiguous tensor == ``cat((nope, rope(pe)), dim=-1)``,
@@ -214,13 +207,6 @@ def _deepseek_v4_fused_rope_concat_fake(
     return pe.new_empty((*pe.shape[:-1], nope.shape[-1] + pe.shape[-1]))
 
 
-# --------------------------------------------------------------------------- #
-# KV front-end: weighted RMS norm + no-PE fake-FP8 quant + interleaved RoPE    #
-# --------------------------------------------------------------------------- #
-# Rounding points match the eager chain bit-for-bit (pinned by
-# ``test_deepseek_v4_kv_norm_rope_concat.py``): ``torch_rmsnorm``'s two bf16
-# roundings and ``fake_fp8_act_quant``'s ue8m0 recipe
-# (custom_ops/quantization/fake_fp8_quant.py).
 @triton.jit
 def _kv_norm_fp8_rope_concat_kernel(
     nope_ptr,  # [R, Dn] raw (strided) — normed, fp8-quantized, then copied through
@@ -246,6 +232,13 @@ def _kv_norm_fp8_rope_concat_kernel(
     BLOCK_DN: tl.constexpr,  # next_pow2(Dn) == NB * FP8_BLOCK
     BLOCK_DH: tl.constexpr,  # next_pow2(Dh)
 ):
+    """KV front-end: weighted RMS norm + no-PE fake-FP8 quant + interleaved RoPE.
+
+    Rounding points match the eager chain bit-for-bit (pinned by
+    ``test_deepseek_v4_kv_norm_rope_concat.py``): ``torch_rmsnorm``'s two bf16
+    roundings and ``fake_fp8_act_quant``'s ue8m0 recipe
+    (custom_ops/quantization/fake_fp8_quant.py).
+    """
     row = tl.program_id(0)
     if row >= R:
         return
@@ -265,10 +258,8 @@ def _kv_norm_fp8_rope_concat_kernel(
     odd = tl.load(pe_base + 2 * k + 1, mask=mh, other=0.0).to(tl.float32)
 
     # --- weighted RMS norm over the FULL (nope || pe) head (torch_rmsnorm) ---
-    # sum-of-squares is order-independent, so it is gathered from the (zero-padded)
-    # nope block and the pe even/odd lanes. The rsqrt factor stays fp32 (unrounded);
-    # the normed value is rounded to the output dtype, multiplied by the fp32 weight,
-    # and rounded again — the two rounding points of ``out.copy_(weight * x.to(dt))``.
+    # fp32 (unrounded) rsqrt factor; normed value rounded to out dtype, multiplied
+    # by the fp32 weight, rounded again — torch_rmsnorm's two rounding points.
     ss = tl.sum(nope * nope) + tl.sum(even * even) + tl.sum(odd * odd)
     factor = tl.rsqrt(ss / (Dn + D) + rms_eps)
 
