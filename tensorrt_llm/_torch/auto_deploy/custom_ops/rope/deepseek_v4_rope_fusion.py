@@ -217,22 +217,10 @@ def _deepseek_v4_fused_rope_concat_fake(
 # --------------------------------------------------------------------------- #
 # KV front-end: weighted RMS norm + no-PE fake-FP8 quant + interleaved RoPE    #
 # --------------------------------------------------------------------------- #
-#
-# ``deepseek_v4_kv_norm_rope_concat`` collapses the main-KV chain
-# ``kv_norm -> nope/pe split -> fake_fp8_act_quant(nope) ->
-# deepseek_v4_fused_rope_concat`` into one kernel: it takes the *raw* (pre-norm)
-# split views + the norm weight and writes ``cat((fp8(nope), rope(pe)))``.
-#
-# Numerics contract — every rounding point is reproduced bit-for-bit (see
-# ``test_deepseek_v4_kv_norm_rope_concat.py``):
-#   * RMS norm — ``torch_rmsnorm`` semantics: ``variance = mean(x^2)`` in fp32, an
-#     *unrounded* fp32 ``rsqrt`` factor, then ``round(normed_bf16) -> * weight(fp32)
-#     -> round_bf16`` (two rounding points, matching
-#     ``out.copy_(weight * input.to(out.dtype))``).
-#   * fake-FP8 — per ``block_size`` group of the *normed* nope:
-#     ``scale = 2**ceil(log2(clamp_min(amax, 1e-4) / 448))`` then
-#     ``(clamp(x/scale, -448, 448) -> bf16 -> fp32) * scale -> bf16`` — identical to
-#     ``fake_fp8_act_quant`` (custom_ops/fake_fp8_quant.py).
+# Rounding points match the eager chain bit-for-bit (pinned by
+# ``test_deepseek_v4_kv_norm_rope_concat.py``): ``torch_rmsnorm``'s two bf16
+# roundings and ``fake_fp8_act_quant``'s ue8m0 recipe
+# (custom_ops/quantization/fake_fp8_quant.py).
 @triton.jit
 def _kv_norm_fp8_rope_concat_kernel(
     nope_ptr,  # [R, Dn] raw (strided) — normed, fp8-quantized, then copied through
