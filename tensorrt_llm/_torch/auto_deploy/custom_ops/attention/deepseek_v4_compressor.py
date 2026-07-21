@@ -13,32 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused attention-pool COMPUTE for the DeepSeek-V4 compressor.
+"""Fused softmax-weighted pool for the DeepSeek-V4 compressor.
 
-Collapses the compressor's softmax-weighted pool
-``(kv * gate.softmax(dim=-2)).sum(dim=-2)`` (main + lightning-indexer
-compressors, context and decode paths of the sparse-attention op, and the eager
-indexer ``compress_projected``) into ONE Triton kernel parallelized over
-``(row, channel)``: ``out[n,d] = sum_r kv[n,r,d] * softmax(gate[n,:,d])[r]``.
-
-The kernel name deliberately contains neither ``softmax``/``reduce``/``sum`` nor
-``copy``/``mul`` so the collapsed work classifies under the ``other`` op-type and
-leaves the ``reduction`` / ``elementwise`` buckets (the perf signal). All math is
-fp32 internal, matching the reference's fp32 softmax; the output keeps ``kv``'s
-dtype so the op is a drop-in replacement.
+Replaces ``(kv * gate.softmax(dim=-2)).sum(dim=-2)`` — softmax + mul + sum over
+the ratio axis — with a single Triton kernel:
+``out[n,d] = sum_r kv[n,r,d] * softmax(gate[n,:,d])[r]``.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-# Autotune the launch occupancy per compressed-pool shape. Each program owns one
-# ``[BLOCK_R, BLOCK_D]`` tile and reduces the tiny ratio axis (``R <= 8``) in
-# registers, so ``num_warps=1`` (single-warp shuffle reduction, no shared-memory
-# barrier) wins across every decode and prefill shape; ``num_stages`` is inert
-# (loop-free kernel). Keyed on ``(R, D)`` — the only dims that change the optimal
-# occupancy — so each compressor (indexer ``D=128`` / main ``D=512``) tunes once;
-# the cross-warp configs are kept as a measured safety margin.
+# R <= 8 reduces in registers, so num_warps=1 wins on all measured shapes; the
+# cross-warp configs are a safety margin. Keyed on (R, D), the only dims that
+# affect occupancy.
 _DSV4_COMPRESS_POOL_CONFIGS = [
     triton.Config({}, num_warps=1, num_stages=1),
     triton.Config({}, num_warps=2, num_stages=1),
@@ -67,15 +55,13 @@ def _dsv4_compress_pool_kernel(
     rs = tl.arange(0, BLOCK_R)
     rmask = rs < R
 
-    # [BLOCK_R, BLOCK_D] tile of row n. Padded rows (rs >= R) load -inf for gate
-    # (zero softmax weight) and 0 for kv.
+    # Padded rows (rs >= R) load -inf gate (zero softmax weight) and 0 kv.
     offs = n * R * D + rs[:, None] * D + ds[None, :]
     mask = rmask[:, None] & dmask[None, :]
     g = tl.load(gate_ptr + offs, mask=mask, other=float("-inf")).to(tl.float32)
     k = tl.load(kv_ptr + offs, mask=mask, other=0.0).to(tl.float32)
 
-    # Per-channel softmax over the ratio axis, then weighted sum — same op order
-    # as ``(kv * gate.softmax(dim=-2)).sum(dim=-2)``.
+    # Per-channel softmax over the ratio axis, then weighted sum.
     m = tl.max(g, axis=0)  # [BLOCK_D]
     e = tl.exp(g - m[None, :])  # [BLOCK_R, BLOCK_D]; masked/padded rows -> 0
     s = tl.sum(e, axis=0)  # [BLOCK_D]
@@ -86,25 +72,16 @@ def _dsv4_compress_pool_kernel(
 
 
 def _compress_pool_ref(kv: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    """Eager reference == the expression this op replaces (used on non-CUDA / fake)."""
+    """Eager reference; used on non-CUDA devices."""
     return (kv * gate.softmax(dim=-2)).sum(dim=-2)
 
 
 @torch.library.custom_op("auto_deploy::deepseek_v4_compress_pool", mutates_args=())
 def deepseek_v4_compress_pool(kv: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    """Fused softmax-weighted pool over the ratio axis (dim ``-2``).
+    """``(kv * gate.softmax(dim=-2)).sum(dim=-2)`` with fp32-internal softmax.
 
-    Args:
-        kv:   ``[..., R, D]`` gathered (and, for overlap layers, overlap-expanded)
-            compressor value states. ``R`` is the ratio / candidate count, ``D`` is
-            ``head_dim``.
-        gate: ``[..., R, D]`` same shape — gate logits with the ape bias added and
-            the validity masking (``-1e20``) and overlap transform already applied
-            by the caller.
-
-    Returns:
-        ``[..., D]`` == ``(kv * gate.softmax(dim=-2)).sum(dim=-2)`` in ``kv``'s dtype,
-        computed with an fp32-internal softmax.
+    ``kv`` and ``gate`` are ``[..., R, D]`` (same shape); returns ``[..., D]``
+    in ``kv``'s dtype.
     """
     assert kv.shape == gate.shape, f"kv/gate shape mismatch: {kv.shape} vs {gate.shape}"
     assert kv.dim() >= 2, "kv/gate must have rank >= 2 ([..., R, D])"
@@ -121,12 +98,8 @@ def deepseek_v4_compress_pool(kv: torch.Tensor, gate: torch.Tensor) -> torch.Ten
     kvc = kv.contiguous()
     gatec = gate.contiguous()
 
-    # D-axis tiling: grid is ``(N, cdiv(D, BLOCK_D))``. Large-N launches already
-    # saturate the SMs at the maximal ``BLOCK_D=128`` (best coalescing, fewest
-    # CTAs); small-N decode shapes (e.g. the main-compressor new-row path,
-    # ``N<=2, D=512``) are occupancy-starved there, so halve ``BLOCK_D`` until
-    # the grid reaches the machine-fill target (~512 CTAs), down to a coalescing
-    # floor of 16. Large-N keeps the byte-identical ``BLOCK_D=128`` launch.
+    # BLOCK_D=128 when the grid fills the machine; for small-N decode shapes,
+    # halve BLOCK_D (floor 16) until the grid reaches ~512 CTAs.
     cap = min(128, triton.next_power_of_2(D))
     BLOCK_D = cap
     while BLOCK_D > 16 and N * triton.cdiv(D, BLOCK_D) < 512:
