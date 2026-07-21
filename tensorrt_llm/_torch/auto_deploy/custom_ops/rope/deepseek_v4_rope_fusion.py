@@ -21,8 +21,9 @@ Main Q — before::
     nope, pe = q.split([Dn, D], dim=-1)
     q = torch.cat((nope, _apply_interleaved_rope(pe, cos, sin)), dim=-1)
 
-after: ``deepseek_v4_fused_rope_concat(nope, pe, cos, sin, rms_eps=eps)``
-(one launch of ``_interleaved_rope_concat_kernel``).
+after (one launch of ``_interleaved_rope_concat_kernel``)::
+
+    q = deepseek_v4_fused_rope_concat(nope, pe, cos, sin, rms_eps=eps)  # [..., Dn+D]
 
 Main KV — before::
 
@@ -31,8 +32,12 @@ Main KV — before::
     nope = fake_fp8_act_quant(nope, block_size=64)
     kv = torch.cat((nope, _apply_interleaved_rope(pe, cos, sin)), dim=-1)
 
-after: ``deepseek_v4_kv_norm_rope_concat(nope, pe, weight, cos, sin, eps)``
-(one launch of ``_kv_norm_fp8_rope_concat_kernel``).
+after (one launch of ``_kv_norm_fp8_rope_concat_kernel``)::
+
+    kv = deepseek_v4_kv_norm_rope_concat(nope, pe, weight, cos, sin, eps)  # [..., Dn+D]
+
+Each op returns exactly one contiguous ``[..., Dn + D]`` tensor (``q`` / ``kv``);
+the fake-FP8 quant is a round-trip, so no scale tensor leaves the KV kernel.
 
 The first kernel is also used without RMSNorm by the compressor and indexer,
 and with inverse RoPE for the attention output. The kernels preserve the FP32
