@@ -46,7 +46,8 @@ def _dsv4_compress_pool_kernel(
     BLOCK_R: tl.constexpr,  # next_pow2(R)
     BLOCK_D: tl.constexpr,
 ):
-    n = tl.program_id(0)
+    # int64: offsets overflow int32 once kv.numel() >= 2**31.
+    n = tl.program_id(0).to(tl.int64)
     if n >= N:
         return
     d0 = tl.program_id(1) * BLOCK_D
