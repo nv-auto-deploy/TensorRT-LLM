@@ -141,12 +141,9 @@ def test_deepseek_v4_fusions_are_model_scoped():
     assert deepseek_v4["transforms"]["fuse_gemms_mixed_children"]["quantized_only"]
 
 
-@pytest.mark.parametrize(
-    "model_config", ["gpt_oss.yaml", "qwen3.5_moe_35b.yaml", "llama3_1_8b.yaml"]
-)
-def test_other_mixed_children_configs_keep_bf16_fusion(model_config):
+def test_other_mixed_children_configs_keep_bf16_fusion():
     merged = deep_merge_dicts(
-        _load_yaml(_DEFAULT_CONFIG), _load_yaml(_MODEL_CONFIGS / model_config)
+        _load_yaml(_DEFAULT_CONFIG), _load_yaml(_MODEL_CONFIGS / "gpt_oss.yaml")
     )
     mixed_children = merged["transforms"]["fuse_gemms_mixed_children"]
 

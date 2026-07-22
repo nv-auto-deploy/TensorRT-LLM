@@ -12,8 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Tests for vectorized DeepSeek-V4 compressed-cache prefill updates."""
+"""Tests for the DeepSeek-V4 paged-cache write paths (prefill + decode stores)."""
 
 import math
 
@@ -22,9 +21,12 @@ import torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_sparse_attention as M
 
+# ---------------------------------------------------------------------------
+# Prefill compressed-cache updates
+# ---------------------------------------------------------------------------
+
 
 def test_cached_op_uses_host_prefill_metadata_within_schema_limit():
-    """Host mirrors replace per-layer D2H reads without exceeding PyTorch's op limit."""
     metadata_args = M.DeepSeekV4SparseAttention.get_standard_metadata_args()
     assert metadata_args == [
         "batch_info_host",
@@ -43,15 +45,12 @@ def test_cached_op_uses_host_prefill_metadata_within_schema_limit():
     assert len(schema.arguments) == 64
     assert "last_page_len" not in {argument.name for argument in schema.arguments}
     arg_names = {argument.name for argument in schema.arguments}
-    # Device-side seq_len / cu_seqlen were dropped (only their *_host mirrors are
-    # read); their slots carry the hoisted long decode metadata.
+    # Device-side seq_len / cu_seqlen were dropped; their slots carry the hoisted
+    # long decode metadata.
     assert {"seq_idx_long", "input_pos_long"} <= arg_names
     assert "seq_len" not in arg_names and "cu_seqlen" not in arg_names
 
 
-# Scalar host page-address helper, moved verbatim out of the production op module
-# (which no longer has scalar per-position callers) so the reference writers in
-# this test stay self-contained.
 def _host_page_id_and_offset(
     cache: torch.Tensor,
     seq_idx: int,
@@ -59,6 +58,7 @@ def _host_page_id_and_offset(
     cu_num_pages_host: torch.Tensor,
     cache_loc_host: torch.Tensor,
 ) -> tuple:
+    """Scalar host page translation used by the reference writers below."""
     if logical_pos < 0:
         raise ValueError(f"logical_pos must be non-negative, got {logical_pos}")
     tokens_per_block = int(cache.shape[1])
@@ -75,25 +75,14 @@ def _host_page_id_and_offset(
     return int(cache_loc_host[page_table_idx].item()), page_offset
 
 
-def _scalar_write_paged_cache_rows(
-    values,
-    cache,
-    seq_idx,
-    input_pos,
-    cu_num_pages,
-    cache_loc,
-):
-    """Reference implementation that writes one contiguous slice per physical page."""
+def _scalar_write_paged_cache_rows(values, cache, seq_idx, input_pos, cu_num_pages, cache_loc):
+    """Reference: one contiguous slice per physical page."""
     cursor = 0
     logical_pos = input_pos
     tokens_per_block = int(cache.shape[1])
     while cursor < values.shape[0]:
         page_id, page_offset = _host_page_id_and_offset(
-            cache,
-            seq_idx,
-            logical_pos,
-            cu_num_pages,
-            cache_loc,
+            cache, seq_idx, logical_pos, cu_num_pages, cache_loc
         )
         write_len = min(values.shape[0] - cursor, tokens_per_block - page_offset)
         cache[page_id, page_offset : page_offset + write_len].copy_(
@@ -121,7 +110,7 @@ def _legacy_compressed_row(
     head_dim,
     dtype,
 ):
-    """Row-at-a-time implementation that predates the vectorized prefill path."""
+    """Row-at-a-time reference predating the vectorized prefill path."""
     anchor = row_idx * ratio
     kv_rows = []
     gate_rows = []
@@ -136,22 +125,10 @@ def _legacy_compressed_row(
                 )
                 continue
             kv_state = M._gather_paged_rows(
-                kv_cache,
-                seq_idx,
-                position,
-                position + 1,
-                cu_num_pages,
-                cache_loc,
-                dtype,
+                kv_cache, seq_idx, position, position + 1, cu_num_pages, cache_loc, dtype
             ).squeeze(0)
             gate_state = M._gather_paged_rows(
-                gate_cache,
-                seq_idx,
-                position,
-                position + 1,
-                cu_num_pages,
-                cache_loc,
-                dtype,
+                gate_cache, seq_idx, position, position + 1, cu_num_pages, cache_loc, dtype
             ).squeeze(0)
             kv_rows.append(kv_state[:head_dim])
             gate_rows.append(gate_state[:head_dim] + ape[offset, :head_dim].to(dtype))
@@ -159,22 +136,10 @@ def _legacy_compressed_row(
         for offset in range(ratio):
             position = anchor + offset
             kv_state = M._gather_paged_rows(
-                kv_cache,
-                seq_idx,
-                position,
-                position + 1,
-                cu_num_pages,
-                cache_loc,
-                dtype,
+                kv_cache, seq_idx, position, position + 1, cu_num_pages, cache_loc, dtype
             ).squeeze(0)
             gate_state = M._gather_paged_rows(
-                gate_cache,
-                seq_idx,
-                position,
-                position + 1,
-                cu_num_pages,
-                cache_loc,
-                dtype,
+                gate_cache, seq_idx, position, position + 1, cu_num_pages, cache_loc, dtype
             ).squeeze(0)
             kv_rows.append(kv_state[head_dim : 2 * head_dim])
             gate_rows.append(
@@ -184,22 +149,10 @@ def _legacy_compressed_row(
         for offset in range(ratio):
             position = anchor + offset
             kv_state = M._gather_paged_rows(
-                kv_cache,
-                seq_idx,
-                position,
-                position + 1,
-                cu_num_pages,
-                cache_loc,
-                dtype,
+                kv_cache, seq_idx, position, position + 1, cu_num_pages, cache_loc, dtype
             ).squeeze(0)
             gate_state = M._gather_paged_rows(
-                gate_cache,
-                seq_idx,
-                position,
-                position + 1,
-                cu_num_pages,
-                cache_loc,
-                dtype,
+                gate_cache, seq_idx, position, position + 1, cu_num_pages, cache_loc, dtype
             ).squeeze(0)
             kv_rows.append(kv_state[:head_dim])
             gate_rows.append(gate_state[:head_dim] + ape[offset, :head_dim].to(dtype))
@@ -238,8 +191,7 @@ def _legacy_update(inp, kv_cache, gate_cache, mhc_cache):
 
     old_completed = min(inp["input_pos"] // ratio, inp["max_compressed_len"])
     new_completed = min(
-        (inp["input_pos"] + inp["kv_seq"].shape[0]) // ratio,
-        inp["max_compressed_len"],
+        (inp["input_pos"] + inp["kv_seq"].shape[0]) // ratio, inp["max_compressed_len"]
     )
     flat_position_ids = inp["position_ids"].flatten()
     first_position_id = int(flat_position_ids[0].item())
@@ -268,24 +220,12 @@ def _legacy_update(inp, kv_cache, gate_cache, mhc_cache):
             inp["kv_seq"].dtype,
         )
         page_id, page_offset = _host_page_id_and_offset(
-            mhc_cache,
-            inp["seq_idx"],
-            row_idx * ratio,
-            inp["cu_num_pages"],
-            inp["cache_loc"],
+            mhc_cache, inp["seq_idx"], row_idx * ratio, inp["cu_num_pages"], inp["cache_loc"]
         )
         mhc_cache[page_id, page_offset].copy_(row.to(mhc_cache.dtype))
 
 
-def _build_case(
-    ratio,
-    input_pos,
-    seq_len,
-    max_compressed_len,
-    seq_idx,
-    device,
-    head_dim=128,
-):
+def _build_case(ratio, input_pos, seq_len, max_compressed_len, seq_idx, device, head_dim=128):
     torch.manual_seed(7100 + ratio + input_pos)
     rope_dim = 64
     channels = 2 if ratio == 4 else 1
@@ -301,11 +241,7 @@ def _build_case(
     kv_cache = torch.randn(total_pages, tokens_per_block, state_dim, device=device)
     gate_cache = torch.randn_like(kv_cache)
     mhc_cache = torch.randn(
-        total_pages,
-        tokens_per_block,
-        head_dim,
-        dtype=torch.bfloat16,
-        device=device,
+        total_pages, tokens_per_block, head_dim, dtype=torch.bfloat16, device=device
     )
     kv_seq = torch.randn(seq_len, state_dim, dtype=torch.bfloat16, device=device)
     gate_seq = torch.randn_like(kv_seq)
@@ -314,8 +250,7 @@ def _build_case(
     max_position_id = 256 + max(0, seq_len - 1) * 3
     cos_table = torch.randn(max(1024, max_position_id + 1), rope_dim // 2, device=device)
     sin_table = torch.randn_like(cos_table)
-    # A non-unit stride makes the in-chunk lookup distinguishable from the
-    # first-id extrapolation used when a row starts before this chunk.
+    # Non-unit stride distinguishes in-chunk lookup from first-id extrapolation.
     position_ids = (torch.arange(seq_len, dtype=torch.long, device=device) * 3 + 256).unsqueeze(0)
     return {
         "ratio": ratio,
@@ -391,51 +326,25 @@ def _source_compressed_rows(inp, max_compressed_len):
 @pytest.mark.parametrize(
     "tokens_per_block,input_pos,num_rows",
     [
-        (4, 3, 17),
-        (32, 0, 1004),
-        (32, 31, 1004),
+        (4, 3, 17),  # tiny pages, mid-page start
+        (32, 31, 1004),  # page-boundary start, many pages
     ],
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_vectorized_contiguous_paged_write_matches_page_loop(
-    tokens_per_block,
-    input_pos,
-    num_rows,
-):
-    """One indexed write preserves shuffled-page layout and untouched cache bytes."""
+def test_vectorized_contiguous_paged_write_matches_page_loop(tokens_per_block, input_pos, num_rows):
     torch.manual_seed(8100 + tokens_per_block + input_pos)
     num_seq = 2
     pages_per_seq = math.ceil((input_pos + num_rows) / tokens_per_block) + 1
     total_pages = num_seq * pages_per_seq
     cu_num_pages = torch.arange(num_seq + 1, dtype=torch.long) * pages_per_seq
     cache_loc = torch.randperm(total_pages, dtype=torch.long)
-    cache = torch.randn(
-        total_pages,
-        tokens_per_block,
-        64,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+    cache = torch.randn(total_pages, tokens_per_block, 64, dtype=torch.bfloat16, device="cuda")
     values = torch.randn(num_rows, 64, dtype=torch.bfloat16, device="cuda")
     expected = cache.clone()
     actual = cache.clone()
 
-    _scalar_write_paged_cache_rows(
-        values,
-        expected,
-        1,
-        input_pos,
-        cu_num_pages,
-        cache_loc,
-    )
-    M._write_paged_cache_rows(
-        values,
-        actual,
-        1,
-        input_pos,
-        cu_num_pages,
-        cache_loc,
-    )
+    _scalar_write_paged_cache_rows(values, expected, 1, input_pos, cu_num_pages, cache_loc)
+    M._write_paged_cache_rows(values, actual, 1, input_pos, cu_num_pages, cache_loc)
 
     assert torch.equal(actual, expected)
 
@@ -445,13 +354,7 @@ def test_vectorized_contiguous_paged_write_matches_page_loop(
     [
         (
             (512, 1024, 1024, 256, 256),
-            (
-                torch.bfloat16,
-                torch.float32,
-                torch.float32,
-                torch.float32,
-                torch.float32,
-            ),
+            (torch.bfloat16, torch.float32, torch.float32, torch.float32, torch.float32),
         ),
         (
             (512, 512, 512),
@@ -462,7 +365,6 @@ def test_vectorized_contiguous_paged_write_matches_page_loop(
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_fused_initial_prefill_multi_cache_write_matches_reference(state_dims, dtypes):
-    """The fused R4/R128 layouts preserve all prompt rows and untouched page bytes."""
     torch.manual_seed(8200 + len(state_dims))
     tokens_per_block = 32
     num_rows = 1004
@@ -474,13 +376,7 @@ def test_fused_initial_prefill_multi_cache_write_matches_reference(state_dims, d
     seq_idx = 1
 
     actual = [
-        torch.randn(
-            total_pages,
-            tokens_per_block,
-            state_dim,
-            dtype=dtype,
-            device="cuda",
-        )
+        torch.randn(total_pages, tokens_per_block, state_dim, dtype=dtype, device="cuda")
         for state_dim, dtype in zip(state_dims, dtypes)
     ]
     expected = [cache.clone() for cache in actual]
@@ -490,22 +386,9 @@ def test_fused_initial_prefill_multi_cache_write_matches_reference(state_dims, d
     ]
 
     for cache, rows in zip(expected, values):
-        M._write_paged_cache_rows(
-            rows,
-            cache,
-            seq_idx,
-            0,
-            cu_num_pages,
-            cache_loc,
-        )
+        M._write_paged_cache_rows(rows, cache, seq_idx, 0, cu_num_pages, cache_loc)
     used_fused = M._try_fused_initial_prefill_cache_write(
-        actual,
-        values,
-        seq_idx,
-        cu_num_pages.cuda(),
-        cache_loc.cuda(),
-        cu_num_pages,
-        cache_loc,
+        actual, values, seq_idx, cu_num_pages.cuda(), cache_loc.cuda(), cu_num_pages, cache_loc
     )
 
     assert used_fused
@@ -514,7 +397,6 @@ def test_fused_initial_prefill_multi_cache_write_matches_reference(state_dims, d
 
 
 def test_initial_prefill_multi_cache_write_fallback_does_not_mutate():
-    """Unsupported page layouts return cleanly so the caller can run the reference path."""
     caches = [torch.randn(4, 7, 8), torch.randn(4, 7, 16)]
     before = [cache.clone() for cache in caches]
     values = [torch.randn(13, 8), torch.randn(13, 16)]
@@ -522,13 +404,7 @@ def test_initial_prefill_multi_cache_write_fallback_does_not_mutate():
     cache_loc = torch.arange(4, dtype=torch.long)
 
     used_fused = M._try_fused_initial_prefill_cache_write(
-        caches,
-        values,
-        0,
-        cu_num_pages,
-        cache_loc,
-        cu_num_pages,
-        cache_loc,
+        caches, values, 0, cu_num_pages, cache_loc, cu_num_pages, cache_loc
     )
 
     assert not used_fused
@@ -547,7 +423,6 @@ def test_initial_prefill_multi_cache_write_fallback_does_not_mutate():
 def test_vectorized_prefill_cache_update_matches_row_at_a_time_reference(
     ratio, input_pos, seq_len, max_compressed_len, seq_idx
 ):
-    """Pin R4/R128, continuation offsets, page boundaries, and shuffled page maps."""
     inp = _build_case(ratio, input_pos, seq_len, max_compressed_len, seq_idx, "cuda")
     legacy = tuple(inp[name].clone() for name in ("kv_cache", "gate_cache", "mhc_cache"))
     vectorized = tuple(inp[name].clone() for name in ("kv_cache", "gate_cache", "mhc_cache"))
@@ -560,15 +435,7 @@ def test_vectorized_prefill_cache_update_matches_row_at_a_time_reference(
 
 
 def test_vectorized_prefill_position_ids_keep_legacy_chunk_boundary_rule(monkeypatch):
-    """Rows before the chunk extrapolate; rows in the chunk gather their exact IDs."""
-    inp = _build_case(
-        4,
-        input_pos=6,
-        seq_len=11,
-        max_compressed_len=5,
-        seq_idx=0,
-        device="cpu",
-    )
+    inp = _build_case(4, input_pos=6, seq_len=11, max_compressed_len=5, seq_idx=0, device="cpu")
     captured = {}
 
     def fake_compress(*args, **_kwargs):
@@ -580,10 +447,7 @@ def test_vectorized_prefill_position_ids_keep_legacy_chunk_boundary_rule(monkeyp
 
     monkeypatch.setattr(M, "_compressed_rows_from_paged_state", fake_compress)
     _vectorized_update(
-        inp,
-        inp["kv_cache"].clone(),
-        inp["gate_cache"].clone(),
-        inp["mhc_cache"].clone(),
+        inp, inp["kv_cache"].clone(), inp["gate_cache"].clone(), inp["mhc_cache"].clone()
     )
 
     # Completed rows are 1..3. Row 1 starts two tokens before the chunk and is
@@ -600,11 +464,7 @@ def test_vectorized_prefill_position_ids_keep_legacy_chunk_boundary_rule(monkeyp
     ],
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_initial_source_rows_match_paged_reconstruction_cache_layout(
-    ratio,
-    max_compressed_len,
-):
-    """Direct source rows preserve production R4/R128 paged-cache bytes exactly."""
+def test_initial_source_rows_match_paged_reconstruction_cache_layout(ratio, max_compressed_len):
     inp = _build_case(
         ratio,
         input_pos=0,
@@ -614,9 +474,8 @@ def test_initial_source_rows_match_paged_reconstruction_cache_layout(
         device="cuda",
         head_dim=512,
     )
-    # The cached op widens raw activation-dtype compressor rows once before any
-    # prefill consumer. Mirror that production boundary so the direct
-    # source path and paged-cache reconstruction use the same FP32 inputs.
+    # Mirror the production boundary: raw rows are widened once before any prefill
+    # consumer, so both paths see the same FP32 inputs.
     inp["kv_seq"] = inp["kv_seq"].float()
     inp["gate_seq"] = inp["gate_seq"].float()
     paged = tuple(inp[name].clone() for name in ("kv_cache", "gate_cache", "mhc_cache"))
@@ -624,11 +483,7 @@ def test_initial_source_rows_match_paged_reconstruction_cache_layout(
 
     source_rows = _source_compressed_rows(inp, max_compressed_len)
     _vectorized_update(inp, *paged)
-    _vectorized_update(
-        inp,
-        *reused,
-        precomputed_initial_rows=source_rows,
-    )
+    _vectorized_update(inp, *reused, precomputed_initial_rows=source_rows)
 
     for actual, expected in zip(reused, paged):
         assert torch.equal(actual, expected)
@@ -636,40 +491,18 @@ def test_initial_source_rows_match_paged_reconstruction_cache_layout(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_preexisting_raw_cache_rows_skip_duplicate_writes(monkeypatch):
-    """The compressed-cache update writes MHC rows without rewriting fused raw rows."""
-    inp = _build_case(
-        4,
-        input_pos=0,
-        seq_len=20,
-        max_compressed_len=8,
-        seq_idx=0,
-        device="cuda",
-    )
+    inp = _build_case(4, input_pos=0, seq_len=20, max_compressed_len=8, seq_idx=0, device="cuda")
     names = ("kv_cache", "gate_cache", "mhc_cache")
     expected = tuple(inp[name].clone() for name in names)
     actual = tuple(inp[name].clone() for name in names)
     source_rows = _source_compressed_rows(inp, inp["max_compressed_len"])
 
-    _vectorized_update(
-        inp,
-        *expected,
-        precomputed_initial_rows=source_rows,
+    _vectorized_update(inp, *expected, precomputed_initial_rows=source_rows)
+    M._write_paged_cache_rows(
+        inp["kv_seq"], actual[0], inp["seq_idx"], 0, inp["cu_num_pages"], inp["cache_loc"]
     )
     M._write_paged_cache_rows(
-        inp["kv_seq"],
-        actual[0],
-        inp["seq_idx"],
-        0,
-        inp["cu_num_pages"],
-        inp["cache_loc"],
-    )
-    M._write_paged_cache_rows(
-        inp["gate_seq"],
-        actual[1],
-        inp["seq_idx"],
-        0,
-        inp["cu_num_pages"],
-        inp["cache_loc"],
+        inp["gate_seq"], actual[1], inp["seq_idx"], 0, inp["cu_num_pages"], inp["cache_loc"]
     )
 
     def unexpected_raw_write(*_args, **_kwargs):
@@ -677,10 +510,7 @@ def test_preexisting_raw_cache_rows_skip_duplicate_writes(monkeypatch):
 
     monkeypatch.setattr(M, "_write_paged_cache_rows", unexpected_raw_write)
     _vectorized_update(
-        inp,
-        *actual,
-        precomputed_initial_rows=source_rows,
-        raw_cache_rows_already_written=True,
+        inp, *actual, precomputed_initial_rows=source_rows, raw_cache_rows_already_written=True
     )
 
     for fused_cache, reference_cache in zip(actual, expected):
@@ -688,15 +518,7 @@ def test_preexisting_raw_cache_rows_skip_duplicate_writes(monkeypatch):
 
 
 def test_preexisting_raw_cache_rows_reject_continuation():
-    """A continuation cannot claim that its raw rows came from the fresh-prefill path."""
-    inp = _build_case(
-        4,
-        input_pos=4,
-        seq_len=4,
-        max_compressed_len=4,
-        seq_idx=0,
-        device="cpu",
-    )
+    inp = _build_case(4, input_pos=4, seq_len=4, max_compressed_len=4, seq_idx=0, device="cpu")
     with pytest.raises(ValueError, match="require input_pos == 0"):
         _vectorized_update(
             inp,
@@ -715,12 +537,7 @@ def test_preexisting_raw_cache_rows_reject_continuation():
     ],
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_initial_attention_reused_rows_match_source_op(
-    ratio,
-    seq_len,
-    max_compressed_len,
-):
-    """Reusing source-built rows preserves initial attention output exactly."""
+def test_initial_attention_reused_rows_match_source_op(ratio, seq_len, max_compressed_len):
     inp = _build_case(
         ratio,
         input_pos=0,
@@ -734,38 +551,16 @@ def test_initial_attention_reused_rows_match_source_op(
     batch_size = 1
     num_heads = 2
     q = torch.randn(
-        batch_size,
-        seq_len,
-        num_heads,
-        inp["head_dim"],
-        dtype=torch.bfloat16,
-        device="cuda",
+        batch_size, seq_len, num_heads, inp["head_dim"], dtype=torch.bfloat16, device="cuda"
     )
-    kv = torch.randn(
-        batch_size,
-        seq_len,
-        inp["head_dim"],
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+    kv = torch.randn(batch_size, seq_len, inp["head_dim"], dtype=torch.bfloat16, device="cuda")
     attn_sink = torch.randn(num_heads, dtype=torch.bfloat16, device="cuda")
     topk = M._build_placeholder_topk_idxs(
-        window_size,
-        ratio,
-        batch_size,
-        seq_len,
-        max_compressed_len,
-        q.device,
+        window_size, ratio, batch_size, seq_len, max_compressed_len, q.device
     )
     source_rows = _source_compressed_rows(inp, max_compressed_len)
     initial_kv = torch.cat((kv, source_rows.unsqueeze(0).to(kv.dtype)), dim=1)
-    actual = M._deepseek_v4_sparse_attention(
-        q,
-        initial_kv,
-        attn_sink,
-        topk,
-        1.0,
-    )
+    actual = M._deepseek_v4_sparse_attention(q, initial_kv, attn_sink, topk, 1.0)
 
     empty_indexer_q = q.new_empty(batch_size, seq_len, 0, 0)
     empty_indexer_weights = q.new_empty(batch_size, seq_len, 0)
@@ -796,3 +591,213 @@ def test_initial_attention_reused_rows_match_source_op(
         rms_norm_eps=inp["eps"],
     )
     assert torch.equal(actual, expected)
+
+
+# ---------------------------------------------------------------------------
+# Fused decode current-token multi-cache store
+# ---------------------------------------------------------------------------
+
+
+def _reference_store(caches, values, page_ids, page_offsets):
+    """Per-cache index_put the fused store replaces (numel==0 values skipped)."""
+    for cache, value in zip(caches, values):
+        if value.numel() == 0:
+            continue
+        cache[page_ids, page_offsets] = value.to(cache.dtype)
+
+
+def _make_page_addr(num_pages, tokens_per_block, num_rows, device):
+    # Distinct (page_id, page_offset) per row, as in real decode (no aliasing).
+    base = torch.randperm(num_pages * tokens_per_block, device=device)[:num_rows]
+    page_ids = (base // tokens_per_block).to(torch.long)
+    page_offsets = (base % tokens_per_block).to(torch.long)
+    return page_ids, page_offsets
+
+
+# (cache dtype, state_dim) per cache -- SWA (activation dtype) + fp32 compressors.
+_CONFIGS = {
+    # 5-cache ratio-4 layers (SWA kv + compressor kv/gate + indexer kv/gate).
+    "ratio4": [
+        (torch.bfloat16, 128),
+        (torch.float32, 256),
+        (torch.float32, 256),
+        (torch.float32, 192),
+        (torch.float32, 192),
+    ],
+    # 3-cache ratio-128 layers.
+    "ratio128": [
+        (torch.bfloat16, 128),
+        (torch.float32, 256),
+        (torch.float32, 256),
+    ],
+    # Compression-off layers write only the SWA kv cache (fused kernel, N_CACHES=1).
+    "off": [
+        (torch.bfloat16, 128),
+    ],
+    # Row width above the 1024 BLOCK_S cap exercises the multi-block (cdiv) grid.
+    "bigdim": [
+        (torch.bfloat16, 1152),
+        (torch.float32, 1536),
+    ],
+}
+
+_STORE_GUARD = pytest.mark.skipif(
+    not (M._HAS_TRITON and torch.cuda.is_available()),
+    reason="fused current-token store requires triton + CUDA",
+)
+
+
+@_STORE_GUARD
+@pytest.mark.parametrize("config", list(_CONFIGS))
+@pytest.mark.parametrize("value_dtype", [torch.bfloat16, torch.float32])
+def test_fused_current_token_store_matches_per_cache(config, value_dtype):
+    # Whole-cache torch.equal vs the index_put reference on randomized clones also
+    # proves the store touches only the addressed slots.
+    num_rows = 3
+    torch.manual_seed(20260703 + num_rows + len(config))
+    device = "cuda"
+    num_pages, tokens_per_block = 19, 8
+    specs = _CONFIGS[config]
+
+    page_ids, page_offsets = _make_page_addr(num_pages, tokens_per_block, num_rows, device)
+
+    caches_ref = [
+        torch.randn(num_pages, tokens_per_block, s, device=device).to(dt) for dt, s in specs
+    ]
+    caches_fused = [c.clone() for c in caches_ref]
+    values = [torch.randn(num_rows, s, device=device, dtype=value_dtype) for _, s in specs]
+
+    # Page-table args are unused on the fused path (addresses are precomputed).
+    seq_idx = torch.arange(num_rows, device=device)
+    input_pos = torch.full((num_rows,), 1000, dtype=torch.long, device=device)
+    cu_num_pages = torch.tensor([0, num_pages], dtype=torch.long, device=device)
+    cache_loc = torch.arange(num_pages, dtype=torch.long, device=device)
+
+    _reference_store(caches_ref, values, page_ids, page_offsets)
+    M._fused_current_token_store(
+        caches_fused, values, seq_idx, input_pos, cu_num_pages, cache_loc, page_ids, page_offsets
+    )
+
+    for i, (ref, fused) in enumerate(zip(caches_ref, caches_fused)):
+        assert torch.equal(fused, ref), (
+            f"fused store diverged: config={config} cache={i} value_dtype={value_dtype}"
+        )
+
+
+@_STORE_GUARD
+def test_fused_current_token_store_empty_rows_noop():
+    device = "cuda"
+    num_pages, tokens_per_block, state_dim = 9, 8, 128
+    cu_num_pages = torch.tensor([0, num_pages], dtype=torch.long, device=device)
+    cache_loc = torch.arange(num_pages, dtype=torch.long, device=device)
+    empty_idx = torch.empty(0, dtype=torch.long, device=device)
+
+    cache = torch.randn(num_pages, tokens_per_block, state_dim, device=device).to(torch.bfloat16)
+    before = cache.clone()
+    empty_values = [torch.empty(0, state_dim, device=device, dtype=torch.bfloat16)]
+    M._fused_current_token_store(
+        [cache], empty_values, empty_idx, empty_idx, cu_num_pages, cache_loc, empty_idx, empty_idx
+    )
+    assert torch.equal(cache, before)
+
+
+@_STORE_GUARD
+def test_fused_current_token_store_extreme_bf16_widening():
+    # The Triton store performs the bf16 -> fp32 widening (no torch pre-cast); it
+    # must round-trip inf/NaN/zeros/max/min/subnormals byte-identically.
+    device = "cuda"
+    num_pages, tokens_per_block = 4, 8
+    extremes = torch.tensor(
+        [
+            float("inf"),
+            float("-inf"),
+            float("nan"),
+            0.0,
+            -0.0,
+            3.3895313892515355e38,  # bf16 max normal
+            -3.3895313892515355e38,
+            1.1754943508222875e-38,  # bf16 min normal
+            9.183549615799121e-41,  # bf16 subnormal
+            -9.183549615799121e-41,
+            1.0,
+            -2.0,
+        ],
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    state_dim = extremes.numel()
+    # Rows at the in-page boundaries (offset 0 and tokens_per_block - 1).
+    page_ids = torch.tensor([1, 2], dtype=torch.long, device=device)
+    page_offsets = torch.tensor([0, tokens_per_block - 1], dtype=torch.long, device=device)
+    num_rows = 2
+
+    caches_ref = [
+        torch.zeros(num_pages, tokens_per_block, state_dim, device=device, dtype=torch.bfloat16),
+        torch.zeros(num_pages, tokens_per_block, state_dim, device=device, dtype=torch.float32),
+    ]
+    caches_fused = [c.clone() for c in caches_ref]
+    values = [extremes.expand(num_rows, state_dim).contiguous() for _ in caches_ref]
+
+    seq_idx = torch.arange(num_rows, device=device)
+    input_pos = torch.full((num_rows,), 7, dtype=torch.long, device=device)
+    cu_num_pages = torch.tensor([0, num_pages], dtype=torch.long, device=device)
+    cache_loc = torch.arange(num_pages, dtype=torch.long, device=device)
+
+    _reference_store(caches_ref, values, page_ids, page_offsets)
+    M._fused_current_token_store(
+        caches_fused, values, seq_idx, input_pos, cu_num_pages, cache_loc, page_ids, page_offsets
+    )
+    for i, (ref, fused) in enumerate(zip(caches_ref, caches_fused)):
+        # Bitwise comparison (torch.equal treats NaN != NaN).
+        assert torch.equal(
+            fused.view(torch.int16 if fused.dtype == torch.bfloat16 else torch.int32),
+            ref.view(torch.int16 if ref.dtype == torch.bfloat16 else torch.int32),
+        ), f"extreme-value widening diverged on cache {i}"
+
+
+@_STORE_GUARD
+def test_fused_current_token_store_cuda_graph_replay():
+    torch.manual_seed(92)
+    device = "cuda"
+    num_pages, tokens_per_block, num_rows = 6, 8, 2
+    specs = _CONFIGS["ratio4"]
+
+    page_ids, page_offsets = _make_page_addr(num_pages, tokens_per_block, num_rows, device)
+    caches = [torch.zeros(num_pages, tokens_per_block, s, device=device).to(dt) for dt, s in specs]
+    values = [torch.randn(num_rows, s, device=device, dtype=torch.bfloat16) for _, s in specs]
+    seq_idx = torch.arange(num_rows, device=device)
+    input_pos = torch.full((num_rows,), 3, dtype=torch.long, device=device)
+    cu_num_pages = torch.tensor([0, num_pages], dtype=torch.long, device=device)
+    cache_loc = torch.arange(num_pages, dtype=torch.long, device=device)
+
+    def _run():
+        M._fused_current_token_store(
+            caches, values, seq_idx, input_pos, cu_num_pages, cache_loc, page_ids, page_offsets
+        )
+
+    # Warm up on a side stream (Triton JIT + allocator), then capture one launch.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _run()
+    torch.cuda.current_stream().wait_stream(stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run()
+
+    for it in range(3):
+        for v in values:
+            v.copy_(torch.randn_like(v))
+        for c in caches:
+            c.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        refs = [torch.zeros_like(c) for c in caches]
+        _reference_store(refs, values, page_ids, page_offsets)
+        for i, (ref, cache) in enumerate(zip(refs, caches)):
+            assert torch.equal(cache, ref), f"replay {it} diverged on cache {i}"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

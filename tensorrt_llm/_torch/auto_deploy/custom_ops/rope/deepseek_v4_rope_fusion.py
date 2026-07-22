@@ -240,7 +240,7 @@ def _kv_norm_fp8_rope_concat_kernel(
     """KV front-end: weighted RMS norm + no-PE fake-FP8 quant + interleaved RoPE.
 
     Rounding points match the eager chain bit-for-bit (pinned by
-    ``test_deepseek_v4_kv_norm_rope_concat.py``): ``torch_rmsnorm``'s two bf16
+    ``test_deepseek_v4_fused_rope_concat.py``): ``torch_rmsnorm``'s two bf16
     roundings and ``fake_fp8_act_quant``'s ue8m0 recipe
     (custom_ops/quantization/fake_fp8_quant.py).
     """

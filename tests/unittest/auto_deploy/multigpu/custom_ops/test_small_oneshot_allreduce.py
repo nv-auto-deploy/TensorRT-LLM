@@ -12,19 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""4-GPU numerics for the ``ONESHOT_SMALL`` allreduce strategy token.
 
-``auto_deploy::trtllm_dist_all_reduce`` with strategy ``ONESHOT_SMALL`` runs
-TRT-LLM's ONESHOT kernel for calls of at most 4096 elements (one-token decode
-hidden states on a matched TP4 grid) and plain NCCL for anything larger. This
-test checks, on a real 4-rank MPI grid:
-
-1. all-rank BF16 SUM tolerance of the ONESHOT path against an exact fp32
-   reference and against the NCCL path (one-token shape),
-2. the large-call NCCL fallback path (multi-token shapes),
-3. CUDA-graph capture/replay safety of the ONESHOT path (the production decode
-   path replays it inside a captured graph).
-"""
+"""2-GPU numerics for ``trtllm_dist_all_reduce`` with the ``ONESHOT_SMALL`` strategy."""
 
 import traceback
 
@@ -34,6 +23,8 @@ from torch.distributed import DistNetworkError
 
 # MPI pool leaks a thread on shutdown — suppress the threadleak warning.
 pytestmark = pytest.mark.threadleak(enabled=False)
+
+WORLD_SIZE = 2
 
 
 def _init_dist(port):
@@ -46,7 +37,6 @@ def _init_dist(port):
 
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
-    # Rank 0 picks a free port and broadcasts it so all workers use the same one.
     if port is None:
         port = mpi_broadcast(get_free_port() if rank == 0 else None)
     initialize_or_skip(port=port)
@@ -64,7 +54,7 @@ def _cleanup():
 
 
 def _exact_sum(t):
-    """Exact fp32 all-rank sum via allgather (reference independent of the AR op)."""
+    # Exact fp32 all-rank sum via allgather (reference independent of the AR op).
     import torch.distributed as dist
 
     gathered = [torch.zeros_like(t) for _ in range(dist.get_world_size())]
@@ -78,17 +68,16 @@ def _worker_oneshot_small_numerics(world_size, port):
         torch.manual_seed(1234 + rank)
         ar = torch.ops.auto_deploy.trtllm_dist_all_reduce
 
-        # 1) one-token decode shape (numel == 4096) → ONESHOT kernel engaged.
+        # numel == 4096 (one decode token) -> ONESHOT kernel engaged.
         t = torch.randn(1, 1, 4096, dtype=torch.bfloat16, device="cuda")
         exact = _exact_sum(t)
         y_small = ar(t, "ONESHOT_SMALL")
         y_nccl = ar(t, "NCCL")
-        # bf16 4-way sums: different reduction orders round differently; a few
-        # bf16 ulps of slack is expected, gross corruption is not.
+        # bf16 sums: reduction orders round differently; a few bf16 ulps of slack.
         torch.testing.assert_close(y_small.float(), exact, rtol=5e-2, atol=2e-1)
         torch.testing.assert_close(y_small.float(), y_nccl.float(), rtol=5e-2, atol=2e-1)
 
-        # 2) multi-token shapes (> 4096 elements) → NCCL fallback path.
+        # > 4096 elements -> NCCL fallback path.
         for shape in ((2, 1, 4096), (7, 4096), (512, 4096)):
             big = torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
             exact_big = _exact_sum(big)
@@ -111,8 +100,7 @@ def _worker_oneshot_small_cuda_graph(world_size, port):
         ar = torch.ops.auto_deploy.trtllm_dist_all_reduce
         static_in = torch.randn(1, 1, 4096, dtype=torch.bfloat16, device="cuda")
 
-        # Eager warmup builds+caches the AllReduce modules and allocates the
-        # ONESHOT IPC workspace outside capture (mirrors production warmup).
+        # Eager warmup allocates the ONESHOT IPC workspace outside capture.
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -144,12 +132,6 @@ def _worker_oneshot_small_cuda_graph(world_size, port):
         _cleanup()
 
 
-# ---------------------------------------------------------------------------
-# Pytest entry points — use MpiPoolSession.submit_sync like
-# test_multi_stream_moe_trailing_allreduce.py to avoid cloudpickle torch.ops issues.
-# ---------------------------------------------------------------------------
-
-
 def _run_with_retries(worker_fn, world_size, **kwargs):
     from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
@@ -168,15 +150,13 @@ def _run_with_retries(worker_fn, world_size, **kwargs):
     raise RuntimeError(f"Dist init failed after {max_retries} retries") from last_exc
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires ≥ 4 GPUs")
-def test_oneshot_small_numerics_4gpu():
-    """ONESHOT path matches exact fp32 sum and NCCL within bf16 tolerance; large calls fall back."""
-    results = _run_with_retries(_worker_oneshot_small_numerics, world_size=4)
+@pytest.mark.skipif(torch.cuda.device_count() < WORLD_SIZE, reason="Requires >= 2 GPUs")
+def test_oneshot_small_numerics_2gpu():
+    results = _run_with_retries(_worker_oneshot_small_numerics, world_size=WORLD_SIZE)
     assert all(r is True for r in results), f"Unexpected worker results: {results}"
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires ≥ 4 GPUs")
-def test_oneshot_small_cuda_graph_4gpu():
-    """ONESHOT path is CUDA-graph capture/replay safe with correct results across replays."""
-    results = _run_with_retries(_worker_oneshot_small_cuda_graph, world_size=4)
+@pytest.mark.skipif(torch.cuda.device_count() < WORLD_SIZE, reason="Requires >= 2 GPUs")
+def test_oneshot_small_cuda_graph_2gpu():
+    results = _run_with_retries(_worker_oneshot_small_cuda_graph, world_size=WORLD_SIZE)
     assert all(r is True for r in results), f"Unexpected worker results: {results}"

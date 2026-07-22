@@ -22,7 +22,6 @@ from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
 )
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _shard_fp4_weight_scale
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
-    ceil_pow2_scale,
     fake_fp8_act_quant,
     fp4_global_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
@@ -132,19 +131,6 @@ def test_fp8_load_hook_maps_prequantized_scales_with_prefix():
     )
     assert prefix + "layer.proj.activation_scale" not in mock_state_dict
     assert prefix + "layer.proj.weight_scale_inv" not in mock_state_dict
-
-
-def _ref_fake_fp8_act_quant(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
-    dim = x.shape[-1]
-    if dim == 0 or dim % block_size != 0:
-        return x
-
-    dtype = x.dtype
-    x_float = x.float()
-    grouped = x_float.reshape(*x_float.shape[:-1], dim // block_size, block_size)
-    scale = ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 448.0, 1.0e-4)
-    quant = torch.clamp(grouped / scale, -448.0, 448.0).to(dtype).float()
-    return (quant * scale).reshape_as(x_float).to(dtype)
 
 
 def test_fake_fp8_act_quant_export_keeps_prefix_inferred_for_sharding() -> None:

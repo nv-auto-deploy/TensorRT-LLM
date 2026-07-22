@@ -1,31 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the decode-tail host fast paths.
+"""Byte-exactness tests for the decode-tail host fast paths."""
 
-The TP4 decode cadence is host-bound: every rank re-runs the per-token host path
-(sampler bookkeeping -> nest_sequences staging -> CapturedGraph replay dispatch) and
-the slowest rank sets when everyone enters the next token's first allreduce. These
-tests pin byte-exactness of the fast paths that shorten that host path:
-
-1. ``SequenceInfo.rescatter_input_ids_`` identity fast path: when the overlap
-   scheduler emits identity gather/scatter indices (steady-state generate-only
-   batches), the triton gather/scatter is replaced by a prefix ``copy_``. Must
-   write the exact same ``input_ids`` as the triton op, and non-identity index
-   patterns must still route through the generic triton path unchanged.
-
-2. ``nest_sequences`` generate-only ``position_ids`` fast path: with all
-   ``seq_len == 1``, ``position_ids == input_pos``. Mixed batches must keep the
-   general repeat/cumsum result.
-
-3. ``CapturedGraph`` replay fast path: direct kwargs values + cached input views +
-   ``_foreach_copy_`` must reproduce eager outputs for every captured batch size.
-"""
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import CapturedGraph
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
+from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
 def _make_seq_info(device: str) -> SequenceInfo:
@@ -157,3 +143,9 @@ def test_captured_graph_direct_kwargs_and_foreach_copy():
 
         # replays must have populated the per-shape input-view cache
         assert len(cg._input_views_cache) >= 1
+
+    # engine graph release must drop the cached views (they alias freed buffers)
+    ADEngine._release_cuda_graphs(SimpleNamespace(model=cg))
+    assert cg._input_views_cache == {}
+    assert cg.cudagraphs == {}
+    assert cg._input_buffers == []

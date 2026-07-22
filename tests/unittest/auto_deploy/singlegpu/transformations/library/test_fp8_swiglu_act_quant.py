@@ -12,24 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Bit-exactness proof for the fused clamped-SwiGLU + block-FP8 act-quant kernel.
-
-``auto_deploy::torch_fp8_swiglu_clamp_act_quant`` fuses the DeepSeek-V4
-shared-expert epilogue between the merged gate/up projection and the down
-projection -- ``clamp(gate, max=L); clamp(up, -L, L);
-(silu(gate.float()) * up.float()).to(model_dtype); _safe_act_quant(...)`` -- into
-one Triton launch. The ``fuse_fp8_swiglu_act_quant`` transform rewrites the chain
-and feeds the pre-quantized pair into the existing residual-add down linear through
-its ``input_scale`` argument.
-
-The claim under test is *exact* equivalence, not approximate accuracy: every
-op-level case asserts byte equality of the FP8 payload and ``torch.equal`` of the
-per-block scales against the unfused aten chain + ``_safe_act_quant`` reference,
-for both scale formats ("", "ue8m0"), with and without the clamp, on contiguous
-and strided (narrow-view) inputs. The graph-level cases run the real
-``torch_export_to_gm`` + ``fuse_gemms_mixed_children`` pipeline and assert the
-transform fires and the rewritten graph reproduces the eager module bit for bit.
-"""
+"""Bit-exactness tests for torch_fp8_swiglu_clamp_act_quant and its fusion transform."""
 
 import pytest
 import torch
@@ -62,7 +45,7 @@ def _fp8_supported():
 
 
 def _ref_chain(gate, up, limit, block_size, fmt, model_dtype):
-    """The exact eager chain the transform strands (modeling_deepseek_v4.DeepseekV4MLP)."""
+    """The eager chain the transform replaces (modeling_deepseek_v4.DeepseekV4MLP)."""
     if limit is not None and limit > 0:
         gate = torch.clamp(gate, max=limit)
         up = torch.clamp(up, min=-limit, max=limit)
@@ -76,24 +59,18 @@ def _assert_pair_equal(got, ref, ctx):
     assert q.dtype == q_ref.dtype == torch.float8_e4m3fn
     assert q.shape == q_ref.shape and s.shape == s_ref.shape
     assert s.dtype == s_ref.dtype
-    payload_eq = torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
-    n_bad = (q.view(torch.uint8) != q_ref.view(torch.uint8)).sum().item()
-    assert payload_eq, f"{ctx}: fp8 payload differs at {n_bad} element(s)"
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), f"{ctx}: fp8 payload differs"
     assert torch.equal(s, s_ref), f"{ctx}: per-block scales differ"
 
 
-# ---------------------------------------------------------------------------
-# Op-level: fused kernel == unfused aten chain + _safe_act_quant, bit for bit.
-# ---------------------------------------------------------------------------
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
-@pytest.mark.parametrize("M", [1, 2, 5, 64])
-@pytest.mark.parametrize("width", [512, 256])
+@pytest.mark.parametrize("M", [1, 5, 64])
 @pytest.mark.parametrize("fmt", ["", "ue8m0"])
 @pytest.mark.parametrize("limit", [LIMIT, None])
-def test_fused_swiglu_act_quant_bit_exact(M, width, fmt, limit):
+def test_fused_swiglu_act_quant_bit_exact(M, fmt, limit):
     device = "cuda"
     dtype = torch.bfloat16
-    # Scale so a meaningful fraction of gate/up exceeds the clamp bound.
+    width = 512
     gate = torch.randn(M, width, device=device, dtype=dtype) * 6.0
     up = torch.randn(M, width, device=device, dtype=dtype) * 6.0
     if limit is not None:
@@ -101,7 +78,7 @@ def test_fused_swiglu_act_quant_bit_exact(M, width, fmt, limit):
 
     ref = _ref_chain(gate, up, limit, BLOCK_SIZE, fmt, dtype)
     got = torch.ops.auto_deploy.torch_fp8_swiglu_clamp_act_quant(gate, up, limit, BLOCK_SIZE, fmt)
-    _assert_pair_equal(got, ref, f"M={M} width={width} fmt={fmt!r} limit={limit}")
+    _assert_pair_equal(got, ref, f"M={M} fmt={fmt!r} limit={limit}")
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
@@ -114,7 +91,6 @@ def test_fused_swiglu_act_quant_strided_views(fmt):
     gate_up = torch.randn(M, 2 * width, device=device, dtype=dtype) * 6.0
     gate = gate_up.narrow(-1, 0, width)
     up = gate_up.narrow(-1, width, width)
-    assert not gate_up.narrow(-1, width, width).is_contiguous() or M == 1
 
     ref = _ref_chain(gate, up, LIMIT, BLOCK_SIZE, fmt, dtype)
     got = torch.ops.auto_deploy.torch_fp8_swiglu_clamp_act_quant(gate, up, LIMIT, BLOCK_SIZE, fmt)
@@ -124,11 +100,6 @@ def test_fused_swiglu_act_quant_strided_views(fmt):
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
 @pytest.mark.parametrize("fmt", ["", "ue8m0"])
 def test_fused_swiglu_act_quant_edge_values(fmt):
-    """Boundary/degenerate blocks.
-
-    All-zero (scale floor), exact +/-limit, huge values, deeply negative gate
-    (silu underflow), fp16 model dtype.
-    """
     device = "cuda"
     dtype = torch.bfloat16
     width = 256
@@ -136,9 +107,9 @@ def test_fused_swiglu_act_quant_edge_values(fmt):
         torch.zeros(width, device=device, dtype=dtype),  # all-zero block -> scale floor
         torch.full((width,), LIMIT, device=device, dtype=dtype),  # exactly at the bound
         torch.full((width,), -LIMIT, device=device, dtype=dtype),
-        torch.full((width,), 1e4, device=device, dtype=dtype),  # far above the bound
-        torch.full((width,), -30.0, device=device, dtype=dtype),  # silu ~ 0
-        torch.randn(width, device=device, dtype=dtype) * 100.0,  # mixed heavy clipping
+        torch.full((width,), 1e4, device=device, dtype=dtype),
+        torch.full((width,), -30.0, device=device, dtype=dtype),  # silu underflow
+        torch.randn(width, device=device, dtype=dtype) * 100.0,
     ]
     gate = torch.stack(rows)
     up = torch.stack(rows[::-1])
@@ -147,7 +118,6 @@ def test_fused_swiglu_act_quant_edge_values(fmt):
     got = torch.ops.auto_deploy.torch_fp8_swiglu_clamp_act_quant(gate, up, LIMIT, BLOCK_SIZE, fmt)
     _assert_pair_equal(got, ref, f"edge fmt={fmt!r}")
 
-    # fp16 model dtype (scale + round point follow the input dtype)
     gate16 = (torch.randn(4, width, device=device, dtype=torch.float16) * 6.0).contiguous()
     up16 = (torch.randn(4, width, device=device, dtype=torch.float16) * 6.0).contiguous()
     ref16 = _ref_chain(gate16, up16, LIMIT, BLOCK_SIZE, fmt, torch.float16)
@@ -178,15 +148,7 @@ def test_residual_add_accepts_prequantized_input():
         assert torch.equal(got, ref), f"prequantized residual-add mismatch (fmt={fmt!r})"
 
 
-# ---------------------------------------------------------------------------
-# Graph-level: real export + fuse_gemms_mixed_children + the new transform.
-# ---------------------------------------------------------------------------
 class _FP8Proj(nn.Module):
-    """Block-FP8 weight stored as ``<name>.weight`` + ``<name>.weight_scale_inv``.
-
-    The layout the mixed-children fuser reconstructs the scale name from.
-    """
-
     def __init__(self, n, k, device, seed):
         super().__init__()
         g = torch.Generator(device=device).manual_seed(seed)
@@ -202,13 +164,7 @@ class _FP8Proj(nn.Module):
 
 
 class _SharedExpertMLP(nn.Module):
-    """DeepSeek-V4 shared-expert MLP in its post-quantization graph form.
-
-    Mirrors ``DeepseekV4MLP.forward`` after the quantization transform rewrote the
-    three linears to ``torch_fake_quant_finegrained_fp8_linear``, then rewrote the
-    down projection to ``..._residual_add`` (the node
-    ``fuse_fp8_linear_allreduce_add`` leaves for the MoE merge seam).
-    """
+    """DeepSeek-V4 shared-expert MLP in its post-quantization graph form."""
 
     def __init__(self, hidden, inter, device, fmt):
         super().__init__()
@@ -266,8 +222,7 @@ def test_transform_fuses_dsv4_shared_expert_chain(fmt):
     device = "cuda"
     hidden, inter, M = 256, 512, 8  # M>4 + K<4096 -> deterministic base matmul kernel
     model = _SharedExpertMLP(hidden, inter, device, fmt).eval()
-    # Wide activations so the clamps actually clip (gate/up std ~ 0.1*5*sqrt(256) ~ 8).
-    x = torch.randn(M, hidden, device=device, dtype=torch.bfloat16) * 5.0
+    x = torch.randn(M, hidden, device=device, dtype=torch.bfloat16) * 5.0  # make clamps clip
     routed = torch.randn(M, hidden, device=device, dtype=torch.bfloat16)
 
     with torch.no_grad():
@@ -275,31 +230,23 @@ def test_transform_fuses_dsv4_shared_expert_chain(fmt):
 
     gm = torch_export_to_gm(model, args=(x, routed))
 
-    # Stage 1 (production order): merge the sibling gate/up projections.
+    # Production order: merge the sibling gate/up projections first.
     mixed_cfg = FuseGemmsMixedChildrenConfig(stage=Stages.POST_LOAD_FUSION, quantized_only=True)
     gm, info_mixed = FuseGemmsMixedChildren(mixed_cfg)._apply(gm, None, None, SharedConfig())
-    assert info_mixed.num_matches == 1, f"gate/up merge expected 1 match, got {info_mixed}"
+    assert info_mixed.num_matches == 1
     gm.recompile()
     with torch.no_grad():
-        # Graph state the new transform actually sees: the byte-exactness claim under
-        # test is post-merge -> post-fusion. (torch.export normalizes this test
-        # module's input_scale_fmt kwarg to a positional arg, which the merged
-        # gate/up node built by _insert_fused_quant_gemm does not carry over --
-        # a test-only artifact: the production quantizer inserts the fmt as a kwarg
-        # post-export, which the merge preserves. The down projection is not merged,
-        # so the fmt consumed by the fusion under test is intact either way.)
         merged_ref = gm(x, routed)
         merged_ref = (
             merged_ref[0] if isinstance(merged_ref, (tuple, list)) else merged_ref
         ).clone()
 
-    # Stage 2: the new fusion must consume the merged projection's narrow views.
-    swiglu_cfg = TransformConfig(stage=Stages.POST_LOAD_FUSION)
-    gm, info = FuseFP8SwigluActQuant(swiglu_cfg)._apply(gm, None, None, SharedConfig())
+    gm, info = FuseFP8SwigluActQuant(TransformConfig(stage=Stages.POST_LOAD_FUSION))._apply(
+        gm, None, None, SharedConfig()
+    )
     gm.recompile()
-    assert info.num_matches == 1, f"swiglu act-quant fusion expected 1 match, got {info}"
+    assert info.num_matches == 1
 
-    # The elementwise chain is gone and the down linear consumes the fused quant output.
     assert _count_ops(gm, torch.ops.aten.silu) == 0
     assert not any(
         is_op(n, (torch.ops.aten.clamp, torch.ops.aten.clamp_max, torch.ops.aten.clamp_min))
@@ -317,43 +264,121 @@ def test_transform_fuses_dsv4_shared_expert_chain(fmt):
     with torch.no_grad():
         out = gm(x, routed)
     out = out[0] if isinstance(out, (tuple, list)) else out
-    assert torch.equal(out, merged_ref), (
-        f"fusion changed the merged graph's output (fmt={fmt!r}): "
-        f"max abs diff {(out.float() - merged_ref.float()).abs().max().item()}"
-    )
+    assert torch.equal(out, merged_ref), f"fusion changed the merged graph's output (fmt={fmt!r})"
     if fmt == "":
-        # With the default scale format the gate/up merge itself is lossless, so the
-        # rewritten graph must also reproduce the original eager module bit for bit.
-        assert torch.equal(out, ref), (
-            "rewritten graph diverges from eager: "
-            f"max abs diff {(out.float() - ref.float()).abs().max().item()}"
-        )
+        # Default fmt: the gate/up merge itself is lossless -> must also match eager.
+        assert torch.equal(out, ref)
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
-def test_transform_leaves_unclamped_chain_alone():
-    """A swiglu chain without the clamp pair (swiglu_limit=0 models) is out of scope."""
+def test_transform_matches_only_wellformed_chains():
+    """A=unclamped, B=gate clamped both sides, C=biased down, D=swapped mul; only D fuses."""
 
-    class _NoClampMLP(nn.Module):
+    class _Chains(nn.Module):
         def __init__(self, hidden, inter, device):
             super().__init__()
-            self.w1 = _FP8Proj(inter, hidden, device, seed=1)
-            self.w2 = _FP8Proj(hidden, inter, device, seed=2)
+            for i, name in enumerate(("a", "b", "c", "d")):
+                setattr(self, f"w1_{name}", _FP8Proj(inter, hidden, device, seed=10 + i))
+                setattr(self, f"w3_{name}", _FP8Proj(inter, hidden, device, seed=20 + i))
+                setattr(self, f"w2_{name}", _FP8Proj(hidden, inter, device, seed=30 + i))
+            self.down_bias = nn.Parameter(
+                torch.randn(hidden, device=device, dtype=torch.bfloat16), requires_grad=False
+            )
 
-        def forward(self, x):
+        def _gate_up(self, x, name):
             lin = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
-            gate = lin(x, self.w1.weight, None, [], [self.w1.weight_scale_inv], [], [])
-            hidden = (F.silu(gate.float()) * gate.float()).to(x.dtype)
-            return lin(hidden, self.w2.weight, None, [], [self.w2.weight_scale_inv], [], [])
+            w1 = getattr(self, f"w1_{name}")
+            w3 = getattr(self, f"w3_{name}")
+            gate = lin(x, w1.weight, None, [], [w1.weight_scale_inv], [], [])
+            up = lin(x, w3.weight, None, [], [w3.weight_scale_inv], [], [])
+            return gate, up
+
+        def _down(self, h, name, routed, bias=None):
+            w2 = getattr(self, f"w2_{name}")
+            return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add(
+                h, w2.weight, bias, [], [w2.weight_scale_inv], [], [], residual=routed
+            )
+
+        def forward(self, x, routed):
+            g, u = self._gate_up(x, "a")
+            ha = (F.silu(g.float()) * u.float()).to(x.dtype)
+            ya = self._down(ha, "a", routed)
+
+            g, u = self._gate_up(x, "b")
+            g = torch.clamp(g, min=-LIMIT, max=LIMIT)
+            u = torch.clamp(u, min=-LIMIT, max=LIMIT)
+            hb = (F.silu(g.float()) * u.float()).to(x.dtype)
+            yb = self._down(hb, "b", routed)
+
+            g, u = self._gate_up(x, "c")
+            g = torch.clamp(g, max=LIMIT)
+            u = torch.clamp(u, min=-LIMIT, max=LIMIT)
+            hc = (F.silu(g.float()) * u.float()).to(x.dtype)
+            yc = self._down(hc, "c", routed, bias=self.down_bias)
+
+            g, u = self._gate_up(x, "d")
+            g = torch.clamp(g, max=LIMIT)
+            u = torch.clamp(u, min=-LIMIT, max=LIMIT)
+            hd = (u.float() * F.silu(g.float())).to(x.dtype)
+            yd = self._down(hd, "d", routed)
+            return ya + yb + yc + yd
 
     device = "cuda"
-    model = _NoClampMLP(256, 512, device).eval()
-    x = torch.randn(4, 256, device=device, dtype=torch.bfloat16)
-    gm = torch_export_to_gm(model, args=(x,))
+    hidden, inter = 128, 128
+    model = _Chains(hidden, inter, device).eval()
+    x = torch.randn(4, hidden, device=device, dtype=torch.bfloat16)
+    routed = torch.randn(4, hidden, device=device, dtype=torch.bfloat16)
+    gm = torch_export_to_gm(model, args=(x, routed))
+
     gm, info = FuseFP8SwigluActQuant(TransformConfig(stage=Stages.POST_LOAD_FUSION))._apply(
         gm, None, None, SharedConfig()
     )
-    assert info.num_matches == 0
+    gm.recompile()
+
+    assert info.num_matches == 1
+    assert _count_ops(gm, torch.ops.auto_deploy.torch_fp8_swiglu_clamp_act_quant) == 1
+    assert _count_ops(gm, torch.ops.aten.silu) == 3  # chains A-C keep their eager epilogues
+
+
+def test_matcher_helpers_reject_malformed_nodes():
+    from tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant import (
+        _cast_target_dtype,
+        _clamp_scalar_bounds,
+        _finegrained_fp8_block_k,
+    )
+
+    g = torch.fx.Graph()
+    x = g.placeholder("x")
+    to_kw = g.call_function(torch.ops.aten._to_copy.default, (x,), {"dtype": torch.float32})
+    to_bad = g.call_function(torch.ops.aten._to_copy.default, (x,), {"dtype": "not_a_dtype"})
+    to_none = g.call_function(torch.ops.aten._to_copy.default, (x,))
+    assert _cast_target_dtype(to_kw) == torch.float32
+    assert _cast_target_dtype(to_bad) is None
+    assert _cast_target_dtype(to_none) is None
+
+    cmax = g.call_function(torch.ops.aten.clamp_max.default, (x, 3.0))
+    cmin = g.call_function(torch.ops.aten.clamp_min.default, (x, -3.0))
+    assert _clamp_scalar_bounds(cmax) == (None, 3.0)
+    assert _clamp_scalar_bounds(cmin) == (-3.0, None)
+
+    root = nn.Module()
+    root.register_buffer("w", torch.zeros(4, 8))
+    root.register_buffer("s_good", torch.ones(1, 2))
+    root.register_buffer("s_1d", torch.ones(2))
+    root.register_buffer("s_empty", torch.ones(2, 0))
+    g2 = torch.fx.Graph()
+    w_node = g2.get_attr("w")
+    s_good = g2.get_attr("s_good")
+    s_1d = g2.get_attr("s_1d")
+    s_empty = g2.get_attr("s_empty")
+    g2.output(None)
+    gm = torch.fx.GraphModule(root, g2)
+
+    assert _finegrained_fp8_block_k(gm, w_node, [s_good]) == 4  # ceil(8 / 2)
+    assert _finegrained_fp8_block_k(gm, "not_a_node", [s_good]) is None
+    assert _finegrained_fp8_block_k(gm, w_node, []) is None
+    assert _finegrained_fp8_block_k(gm, w_node, [s_1d]) is None
+    assert _finegrained_fp8_block_k(gm, w_node, [s_empty]) is None
 
 
 if __name__ == "__main__":

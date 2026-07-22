@@ -41,7 +41,11 @@ from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4 import (
 from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4 import (
     QuantizeMXFP4MOEConfig as MXFP4MLPConfig,
 )
-from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _get_dist_ops
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
+    MXFP4EPShardingInfo,
+    ShardingTransformConfig,
+    _get_dist_ops,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args, is_op, shape
@@ -1238,3 +1242,48 @@ def test_stacked_mxfp4_routing_driven_rank1_preserves_expert_start_with_torch_ba
     assert expert_start == 2
     assert len(_call_nodes(gm_out, torch.ops.auto_deploy.torch_dist_all_reduce.default)) == 1
     assert len(_call_nodes(gm_out, torch.ops.auto_deploy.trtllm_dist_all_reduce.default)) == 0
+
+
+@pytest.mark.parametrize(
+    "base_name,ep_name",
+    [("torch_mxfp4_moe", "torch_mxfp4_moe_ep"), ("triton_mxfp4_moe", "triton_mxfp4_moe_ep")],
+)
+def test_mxfp4_ep_sharding_info_rewrites_to_matching_ep_variant(base_name, ep_name):
+    # detect_sharding EP path: MXFP4EPShardingInfo must accept both MXFP4 MoE ops and
+    # rewrite each to its matching *_ep op with runtime expert slices + an all_reduce.
+    from tensorrt_llm.functional import AllReduceStrategy
+
+    base_op = _optional_auto_deploy_default(base_name)
+    ep_op = _optional_auto_deploy_default(ep_name)
+    if base_op is None or ep_op is None:
+        pytest.skip("MXFP4 MoE custom ops are not registered in this environment")
+
+    gm = _make_stacked_mxfp4_graph(base_op, include_optionals=True)
+    node = next(n for n in gm.graph.nodes if is_op(n, base_op))
+    config = ShardingTransformConfig(
+        rank=1,
+        world_size=2,
+        stage="sharding",
+        allreduce_strategy=AllReduceStrategy.AUTO,
+        dist_backend="torch",
+    )
+    info = MXFP4EPShardingInfo(target_node=node.name, config=config)
+
+    non_moe = next(n for n in gm.graph.nodes if n.op == "placeholder")
+    assert not info.validate(gm, non_moe)
+    assert info.validate(gm, node)
+
+    info.apply(gm, node)
+    ep_nodes = _call_nodes(gm, ep_op)
+    assert len(ep_nodes) == 1
+    [ep_size, ep_rank, layer_type] = extract_op_args(
+        ep_nodes[0], "ep_size", "ep_rank", "layer_type"
+    )
+    assert (ep_size, ep_rank) == (2, 1)
+    assert layer_type == "moe"
+    # rank 1 of 2 with 4 experts -> runtime slices [2:4) on all six expert args.
+    expert_args = extract_op_args(ep_nodes[0], *_STACKED_MOE_EXPERT_ARG_NAMES)
+    for arg in expert_args:
+        assert is_op(arg, torch.ops.aten.slice.Tensor)
+        assert arg.args[1:5] == (0, 2, 4, 1)
+    assert len(_call_nodes(gm, torch.ops.auto_deploy.torch_dist_all_reduce.default)) == 1

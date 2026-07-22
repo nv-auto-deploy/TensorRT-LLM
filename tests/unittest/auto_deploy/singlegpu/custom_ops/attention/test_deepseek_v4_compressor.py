@@ -1,65 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit test for the fused compressed-row cache update.
-
-``_update_decode_compressed_caches`` reconstructs the just-completed main-compressor
-compressed row at decode time and stores it into ``mhc_cache`` on the ~1-in-ratio steps
-that complete a row.  the fused path collapses the ratio-4 (overlap) reconstruction swarm
-(gather / slice / ape-add / where / cat / pool / rmsnorm), the rope/fake-fp8 tail
-(``_apply_compressed_rope_and_quantize``, rotate=False), the ``cos``/``sin`` gathers and
-the validity-masked store into two Triton kernels
-(``_dsv4_compressed_row_r4_front_kernel`` + ``_dsv4_rope_fp8_masked_store_kernel``).
-
-the fused path extends the same collapse to the ratio-128 (dense, non-overlap) layers, whose
-``[ratio, head_dim]`` pool tile is too large for the ratio-4 one-program-per-row strategy:
-the pool is D-tiled (``_dsv4_paged_compress_pool_kernel``), RMSNorm is the shipped fused
-``triton_rms_norm`` (``_compressor_rms_norm``), and the rope/fp8/validity-masked-store tail
-is the same shared ``_dsv4_rope_fp8_masked_store_kernel`` the fused path introduced.
-
-The fused path folds that rope/fp8/masked-store tail into the producing kernels as a
-register-fed final stage (``_dsv4_rope_fp8_store_tail``): the ratio-4 front kernel now
-stores the mhc row directly, and the ratio-128 rmsnorm + tail collapse into
-``_dsv4_norm_rope_fp8_masked_store_kernel`` -- removing one launch per compressed layer
-per decode step plus the ``[N, head_dim]`` normed-row round-trip.  The original
-stage-2 kernel (and its ``_launch_compressed_rope_fp8_store`` launcher) lives on
-byte-for-byte in THIS file (moved out of the production module) as the frozen
-pre-fold reference the fold is pinned against (``torch.equal``, whole cache) below.
-
-The fused path replicates the eager numerics -- fp32-internal softmax pool and RMSNorm
-with bf16 rounding at the same points as the reference, a byte-identical block fake-fp8
-on the nope slice and an interleaved RoPE on the pe slice -- so the stored ``mhc_cache``
-must match the eager op-by-op path up to the ``rsqrt`` primitive (bf16-absorbed) and the
-rope FMA folding (<=1 ULP).  The ratio-128 paged pool is even byte-identical to
-``gather + ape + deepseek_v4_compress_pool`` (same rounding points; pinned separately).
-These tests pin that equivalence for the ratio-4 and ratio-128 modes so a regression in one
-cannot hide in the other, and they exercise both row-completing (valid) and non-completing
-(invalid, no-write) decode steps across multi-page position spans.
-
-Row gating runs every program of those kernels behind ``row_valid`` at entry: a compressed
-row completes only once every ``ratio`` decode steps, and invalid rows were already
-no-write, so on the other steps the programs now retire after one scalar load instead of
-paying the paged loads / pool / rmsnorm / rope / fp8 math whose result was discarded.
-The added tests pin the gate's invariants: all-invalid steps (including the boundary
-positions one before / one after a completion) leave the whole cache byte-identical,
-the gated pool is byte-identical to the ungated pool on valid rows, and the gate keeps
-working under CUDA-graph capture/replay when only the ``row_valid`` buffer content flips
-between replays -- the exact production decode pattern.
-"""
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for the DeepSeek-V4 compressor ops and the fused compressed-row update."""
 
 import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_sparse_attention as M
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fake_fp8_act_quant
 
 DEV = "cuda"
 
-
-# ---------------------------------------------------------------------------
-# Frozen pre-fold stage-2 reference, moved verbatim from the production op
-# module when the rope/fp8/masked-store tail was folded into the producing
-# kernels (`_dsv4_rope_fp8_store_tail`).  Kept byte-for-byte so the bit-exact
-# pins below keep their meaning: this kernel IS the launch the fold removed.
-# ---------------------------------------------------------------------------
+# Frozen pre-fold stage-2 kernel (moved verbatim out of the production module when
+# the rope/fp8/masked-store tail was folded into the producing kernels): the
+# byte-exact reference the fold is pinned against below.
 if M._HAS_TRITON:
     import triton
     import triton.language as tl
@@ -77,42 +42,19 @@ if M._HAS_TRITON:
         stride_p,
         stride_t,
         stride_s,
-        cossin_row_stride,  # cos/sin row stride (== DH)
+        cossin_row_stride,
         N,
         HEAD_DIM,
         NOPE_DIM,  # HEAD_DIM - ROPE_DIM (multiple of FP8_BLOCK)
         DH,  # ROPE_DIM // 2
-        FP8_BLOCK: tl.constexpr,  # 64 (fake-fp8 group width)
-        NUM_FP8_BLOCKS: tl.constexpr,  # NOPE_DIM // FP8_BLOCK
-        BLOCK_D: tl.constexpr,  # next_pow2(HEAD_DIM)
-        BLOCK_DH: tl.constexpr,  # next_pow2(DH)
+        FP8_BLOCK: tl.constexpr,
+        NUM_FP8_BLOCKS: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        BLOCK_DH: tl.constexpr,
         MAX_VAL: tl.constexpr,  # 448.0 (e4m3 absmax)
         MIN_VAL: tl.constexpr,  # 1e-4 (amax floor)
     ):
-        """Fused main-compressor rope + fake-fp8 + validity-masked store (stage 2).
-
-        No longer launched by the production compressed-row updates -- the tail is
-        folded into the producing kernels as the register-fed
-        ``_dsv4_rope_fp8_store_tail`` epilogue (ratio-4 front kernel /
-        ``_dsv4_norm_rope_fp8_masked_store_kernel``).  Retained byte-for-byte as the
-        isolated tail-math reference the compressed-row update unit tests pin the
-        fold against (via ``_launch_compressed_rope_fp8_store``).
-
-        One program per decode row ``b``.  Reads a post-rmsnorm ``[N, HEAD_DIM]``
-        normed row and, only when ``row_valid[b]``, writes the
-        fully reconstructed compressed row to ``cache[page_ids[b], page_offsets[b]]``.
-        Collapses the rope-tail chain ``_apply_compressed_rope_and_quantize``
-        (rotate=False: block fake-fp8 on the nope slice + interleaved RoPE/concat on
-        the pe slice) plus the ``cos``/``sin`` gathers plus the ``_masked_paged_store``
-        into a single launch.
-
-        Byte-identical to the reference on the nope slice -- the block amax, the
-        ``scale = 2**ceil(log2(clamp_min(amax,1e-4)/448))``, the ``clamp -> bf16 ->
-        fp32`` round-trip and the ``* scale`` reproduce ``fake_fp8_act_quant`` exactly
-        -- and equal to <=1 ULP on the pe slice (FMA folding, as for
-        ``deepseek_v4_fused_rope_concat``).  Invalid rows store nothing, leaving the
-        slot byte-identical to the prior read-old + write-back no-op.
-        """
+        """Fake-fp8(nope) + interleaved RoPE(pe) + validity-masked paged store."""
         RD = normed_ptr.dtype.element_ty  # rounding dtype for the fp8/rope math
         CT = cache_ptr.dtype.element_ty  # cache store dtype
 
@@ -125,12 +67,12 @@ if M._HAS_TRITON:
         dst_base = cache_ptr + pid * stride_p + poff * stride_t
         nrow = normed_ptr + b.to(tl.int64) * HEAD_DIM
 
-        # --- fake-fp8 block quant on the nope slice [0, NOPE_DIM) ---
+        # fake-fp8 block quant on the nope slice [0, NOPE_DIM)
         d = tl.arange(0, BLOCK_D)
         nmask = d < NOPE_DIM
-        nope = tl.load(nrow + d, mask=nmask, other=0.0).to(tl.float32)  # bf16 -> fp32
+        nope = tl.load(nrow + d, mask=nmask, other=0.0).to(tl.float32)
         blk = d // FP8_BLOCK
-        scale_per_d = tl.full([BLOCK_D], 1.0, tl.float32)  # 1.0 outside the nope slice
+        scale_per_d = tl.full([BLOCK_D], 1.0, tl.float32)
         for j in tl.static_range(NUM_FP8_BLOCKS):
             in_blk = nmask & (blk == j)
             amax_j = tl.max(tl.where(in_blk, tl.abs(nope), 0.0), axis=0)
@@ -142,7 +84,7 @@ if M._HAS_TRITON:
         nope_out = (q * scale_per_d).to(RD)
         tl.store(dst_base + d * stride_s, nope_out.to(CT), mask=nmask & valid)
 
-        # --- interleaved RoPE on the pe slice [NOPE_DIM, HEAD_DIM) ---
+        # interleaved RoPE on the pe slice [NOPE_DIM, HEAD_DIM)
         k = tl.arange(0, BLOCK_DH)
         kmask = k < DH
         pe_base = nrow + NOPE_DIM
@@ -158,29 +100,17 @@ if M._HAS_TRITON:
         tl.store(pe_out_base + (2 * k + 1) * stride_s, out_odd.to(RD).to(CT), mask=kmask & valid)
 
     def _launch_compressed_rope_fp8_store(
-        normed: torch.Tensor,  # [N, head_dim] post-rmsnorm rows (activation dtype)
-        cos_table: torch.Tensor,  # [n_pos, rope_dim//2]
-        sin_table: torch.Tensor,  # [n_pos, rope_dim//2]
-        row_position_id: torch.Tensor,  # [N] int64, already clamped into [0, n_pos)
-        row_valid: torch.Tensor,  # [N] bool -- store the row iff valid
-        mhc_page_ids: torch.Tensor,  # [N] int64 write page id per row
-        mhc_page_offsets: torch.Tensor,  # [N] int64 in-page offset per row
-        mhc_cache: torch.Tensor,  # [P, T, head_dim] paged mhc cache (mutated in place)
+        normed: torch.Tensor,
+        cos_table: torch.Tensor,
+        sin_table: torch.Tensor,
+        row_position_id: torch.Tensor,
+        row_valid: torch.Tensor,
+        mhc_page_ids: torch.Tensor,
+        mhc_page_offsets: torch.Tensor,
+        mhc_cache: torch.Tensor,
         head_dim: int,
         rope_dim: int,
     ) -> None:
-        """Standalone stage-2 tail: fp8(nope) + interleaved RoPE(pe) + validity-masked store.
-
-        Launches ``_dsv4_rope_fp8_masked_store_kernel`` over the ``[N, head_dim]``
-        post-rmsnorm rows.  No longer called by the production compressed-row updates -- the tail is
-        folded into the producing kernels as the register-fed
-        ``_dsv4_rope_fp8_store_tail`` epilogue -- but retained (with the kernel, byte-for-byte)
-        as the isolated tail-math reference the compressed-row update unit tests pin the fold
-        against.  Ratio-agnostic: both the ratio-4 (overlap) and ratio-128 (dense) updates
-        produce an identical ``[N, head_dim]`` normed row and write the same ``head_dim``-wide
-        mhc row.  Invalid rows write nothing (byte-identical to the prior read-old +
-        write-back no-op).
-        """
         n = int(normed.shape[0])
         if n == 0 or head_dim == 0:
             return
@@ -215,6 +145,280 @@ if M._HAS_TRITON:
         )
 
 
+# ---------------------------------------------------------------------------
+# auto_deploy::deepseek_v4_compress_pool
+# ---------------------------------------------------------------------------
+
+
+def _pool_ref(kv, gate):
+    # The exact eager expression the op replaces (fp32-internal softmax).
+    return (kv * gate.softmax(dim=-2)).sum(dim=-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (4, 512),  # rank-2 decode row, small-N BLOCK_D halving
+        (2, 130, 8, 128),  # rank-4 overlap, indexer head_dim, odd row count
+        (3, 5, 96),  # non-pow2 ratio and channel dims
+    ],
+)
+def test_compress_pool_matches_reference(shape, dtype):
+    torch.manual_seed(0)
+    kv = torch.randn(shape, device=DEV, dtype=dtype)
+    gate = torch.randn(shape, device=DEV, dtype=dtype)
+
+    out = torch.ops.auto_deploy.deepseek_v4_compress_pool(kv, gate)
+    ref = _pool_ref(kv, gate)
+
+    assert out.shape == ref.shape
+    assert out.dtype == kv.dtype
+    atol, rtol = (2e-4, 2e-4) if dtype == torch.float32 else (8e-3, 8e-3)
+    torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_compress_pool_validity_masking():
+    torch.manual_seed(1)
+    B, R, D = 2, 8, 512
+    dtype = torch.bfloat16
+    kv = torch.randn(B, R, D, device=DEV, dtype=dtype)
+    gate = torch.randn(B, R, D, device=DEV, dtype=dtype)
+    # -1e20 gate == invalid candidate row; row 1 is fully masked.
+    gate[0, R // 2 :, :] = -1.0e20
+    gate[1, :, :] = -1.0e20
+
+    out = torch.ops.auto_deploy.deepseek_v4_compress_pool(kv, gate)
+    ref = _pool_ref(kv, gate)
+
+    torch.testing.assert_close(out.float(), ref.float(), atol=8e-3, rtol=8e-3)
+    assert torch.isfinite(out[1]).all()
+
+
+def test_compress_pool_cpu_empty_and_fake():
+    torch.manual_seed(2)
+    kv = torch.randn(2, 4, 64)
+    gate = torch.randn(2, 4, 64)
+    out_cpu = torch.ops.auto_deploy.deepseek_v4_compress_pool(kv, gate)
+    torch.testing.assert_close(out_cpu, _pool_ref(kv, gate))
+
+    empty = torch.empty(0, 4, 64)
+    out_empty = torch.ops.auto_deploy.deepseek_v4_compress_pool(empty, empty)
+    assert out_empty.shape == (0, 64)
+
+    with torch._subclasses.FakeTensorMode():
+        fkv = torch.empty(2, 4, 64, dtype=torch.bfloat16)
+        fout = torch.ops.auto_deploy.deepseek_v4_compress_pool(fkv, fkv)
+    assert fout.shape == (2, 64) and fout.dtype == torch.bfloat16
+
+
+# ---------------------------------------------------------------------------
+# Rope/quant tail + compressor RMSNorm
+# ---------------------------------------------------------------------------
+
+
+def _old_tail(
+    compressed: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rope_dim: int,
+    rotate: bool,
+) -> torch.Tensor:
+    """Verbatim copy of the original eager tail implementation."""
+    nope_dim = compressed.shape[-1] - rope_dim
+    nope, pe = torch.split(compressed, [nope_dim, rope_dim], dim=-1)
+    pe = M._apply_interleaved_rope_ref(pe, cos, sin)
+    compressed = torch.cat((nope, pe), dim=-1)
+    if rotate:
+        return torch.ops.auto_deploy.deepseek_v4_hadamard_fp4(compressed, 32)
+    nope, pe = torch.split(compressed, [nope_dim, rope_dim], dim=-1)
+    nope = fake_fp8_act_quant(nope, block_size=64)
+    return torch.cat((nope, pe), dim=-1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "shape,rope_dim",
+    [
+        ((2, 512), 64),  # decode row: [B, head_dim], nope=448 (7*64)
+        ((1, 257, 512), 64),  # context build: [B, max_compressed_len, head_dim]
+        ((2, 130), 64),  # nope_dim=66 not %64 -> fake_fp8 is a pass-through
+    ],
+)
+def test_rotate_false_matches_eager(shape, rope_dim):
+    torch.manual_seed(0)
+    compressed = torch.randn(*shape, device=DEV, dtype=torch.bfloat16)
+    head_dim = shape[-1]
+    dh = rope_dim // 2
+    cos = torch.randn(*shape[:-1], dh, device=DEV, dtype=torch.float32)
+    sin = torch.randn(*shape[:-1], dh, device=DEV, dtype=torch.float32)
+
+    out = M._apply_compressed_rope_and_quantize(compressed, cos, sin, rope_dim, rotate=False)
+    ref = _old_tail(compressed, cos, sin, rope_dim, rotate=False)
+
+    assert out.shape == ref.shape == (*shape[:-1], head_dim)
+    assert out.dtype == ref.dtype == torch.bfloat16
+
+    nope_dim = head_dim - rope_dim
+    # fp8(nope) half byte-exact; rope(pe) half <=1 ULP (fused FMA vs eager mul/sub).
+    torch.testing.assert_close(out[..., :nope_dim], ref[..., :nope_dim], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(out[..., nope_dim:], ref[..., nope_dim:], atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("shape", [(2, 512), (3, 40, 512)])
+def test_compressor_rms_norm_byte_identical(shape):
+    torch.manual_seed(2)
+    head_dim = shape[-1]
+    x = torch.randn(*shape, device=DEV, dtype=torch.bfloat16)
+    w = torch.randn(head_dim, device=DEV, dtype=torch.bfloat16)
+    eps = 1e-6
+    assert torch.equal(M._compressor_rms_norm(x, w, eps), M._rms_norm_ref(x, w, eps))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_compressor_rms_norm_falls_back_no_weight():
+    x = torch.randn(2, 512, device=DEV, dtype=torch.bfloat16)
+    empty = torch.empty(0, device=DEV, dtype=torch.bfloat16)
+    assert torch.equal(M._compressor_rms_norm(x, empty, 1e-6), M._rms_norm_ref(x, empty, 1e-6))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "shape,rope_dim",
+    [
+        ((4, 128), 64),  # indexer decode row
+        ((1, 5, 128), 64),  # indexer context rows
+    ],
+)
+def test_rotate_true_byte_identical(shape, rope_dim):
+    torch.manual_seed(1)
+    compressed = torch.randn(*shape, device=DEV, dtype=torch.bfloat16)
+    dh = rope_dim // 2
+    cos = torch.randn(*shape[:-1], dh, device=DEV, dtype=torch.float32)
+    sin = torch.randn(*shape[:-1], dh, device=DEV, dtype=torch.float32)
+
+    out = M._apply_compressed_rope_and_quantize(compressed, cos, sin, rope_dim, rotate=True)
+    ref = _old_tail(compressed, cos, sin, rope_dim, rotate=True)
+    assert torch.equal(out, ref)
+
+
+# ---------------------------------------------------------------------------
+# Source (prefill) path: raw bf16 compressor rows == their fp32 widening
+# ---------------------------------------------------------------------------
+
+
+def _rope_tables(n_pos: int, rope_dim: int, device: torch.device):
+    positions = torch.arange(n_pos, dtype=torch.float32, device=device).unsqueeze(1)
+    freqs = torch.linspace(0.05, 0.25, rope_dim // 2, dtype=torch.float32, device=device)
+    angles = positions * freqs.unsqueeze(0)
+    return angles.cos(), angles.sin()
+
+
+def _source_case(compress_ratio: int, device: torch.device):
+    batch_size = 1
+    head_dim = 8
+    rope_dim = 4
+    channels = 2 if compress_ratio == 4 else 1
+    state_dim = channels * head_dim
+    max_compressed_len = 2
+    seq_len = max_compressed_len * compress_ratio
+    window_size = 4
+    num_heads = 2
+
+    # fp32 q/kv keeps the attend on the deterministic reference chunk loop, so the
+    # two invocations differ ONLY in the compressor input dtype.
+    q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
+    kv = torch.randn(batch_size, seq_len, head_dim, device=device)
+    attn_sink = torch.tensor([-0.25, 0.1], device=device)
+
+    compressor_kv = torch.randn(batch_size, seq_len, state_dim, device=device).to(torch.bfloat16)
+    compressor_gate = torch.randn(batch_size, seq_len, state_dim, device=device).to(torch.bfloat16)
+    ape = torch.randn(compress_ratio, state_dim, device=device)
+    norm_weight = torch.randn(head_dim, device=device)
+    cos_table, sin_table = _rope_tables(seq_len + 4, rope_dim, device)
+    position_ids = torch.arange(seq_len, device=device).unsqueeze(0).contiguous()
+
+    return dict(
+        q=q,
+        kv=kv,
+        attn_sink=attn_sink,
+        compressor_kv=compressor_kv,
+        compressor_gate=compressor_gate,
+        ape=ape,
+        norm_weight=norm_weight,
+        cos_table=cos_table,
+        sin_table=sin_table,
+        position_ids=position_ids,
+        head_dim=head_dim,
+        rope_dim=rope_dim,
+        window_size=window_size,
+        max_compressed_len=max_compressed_len,
+        seq_len=seq_len,
+        batch_size=batch_size,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="compressed pool ops require CUDA")
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+def test_source_op_bf16_rows_match_fp32_widening(compress_ratio: int) -> None:
+    torch.manual_seed(20260708 + compress_ratio)
+    device = torch.device(DEV)
+    case = _source_case(compress_ratio, device)
+
+    empty_iq = case["q"].new_empty(case["batch_size"], case["seq_len"], 0, 0)
+    empty_iw = case["q"].new_empty(case["batch_size"], case["seq_len"], 0)
+    empty_state = case["q"].new_empty(case["batch_size"], case["seq_len"], 0)
+    empty_ape = case["q"].new_empty(0, 0)
+    empty_norm = case["q"].new_empty(0)
+    width_only_topk = case["q"].new_empty(
+        case["batch_size"],
+        case["seq_len"],
+        case["window_size"] + case["max_compressed_len"],
+        dtype=torch.int64,
+    )
+
+    def _run_op(compressor_kv: torch.Tensor, compressor_gate: torch.Tensor) -> torch.Tensor:
+        return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
+            case["q"],
+            case["kv"],
+            case["attn_sink"],
+            width_only_topk,
+            compressor_kv,
+            compressor_gate,
+            case["ape"],
+            case["norm_weight"],
+            case["cos_table"],
+            case["sin_table"],
+            case["position_ids"],
+            empty_iq,
+            empty_iw,
+            empty_state,
+            empty_state,
+            empty_ape,
+            empty_norm,
+            case["head_dim"] ** -0.5,
+            window_size=case["window_size"],
+            compress_ratio=compress_ratio,
+            max_compressed_len=case["max_compressed_len"],
+            rope_dim=case["rope_dim"],
+            rms_norm_eps=1e-6,
+            topk_is_placeholder=True,
+        )
+
+    out_bf16 = _run_op(case["compressor_kv"], case["compressor_gate"])
+    out_f32 = _run_op(case["compressor_kv"].float(), case["compressor_gate"].float())
+
+    assert torch.equal(out_bf16, out_f32)
+
+
+# ---------------------------------------------------------------------------
+# Fused decode compressed-row cache update
+# ---------------------------------------------------------------------------
+
+
 def _build_inputs(compress_ratio, num_rows, seed):
     torch.manual_seed(seed)
     head_dim = 512
@@ -226,7 +430,6 @@ def _build_inputs(compress_ratio, num_rows, seed):
     eps = 1e-6
     dtype = torch.bfloat16
 
-    # Enough pages per sequence to cover every position the reconstruction reads.
     max_pos = max_compressed_len * compress_ratio + tokens_per_block
     pages_per_seq = (max_pos + tokens_per_block - 1) // tokens_per_block
     page_counts = [pages_per_seq] * num_rows
@@ -257,12 +460,18 @@ def _build_inputs(compress_ratio, num_rows, seed):
     cos_table = torch.randn(n_pos, rope_dim // 2, device=DEV)
     sin_table = torch.randn(n_pos, rope_dim // 2, device=DEV)
 
+    # Hoisted maps + update metadata from the production prepare op.
+    overlap_m = max_compressed_len if compress_ratio == 4 else 1
+    dense_m = max_compressed_len if compress_ratio == 128 else 1
+    outs = M.deepseek_v4_sparse_prepare_decode_page_addr(
+        input_pos, position_ids, cu_num_pages, cache_loc, tokens_per_block, overlap_m, dense_m
+    )
     overlap_page_map = None
     if compress_ratio == 4:
-        outs = M.deepseek_v4_sparse_prepare_decode_page_addr(
-            input_pos, position_ids, cu_num_pages, cache_loc, tokens_per_block, max_compressed_len
-        )
         overlap_page_map = (outs[2][:num_rows], outs[3][:num_rows], outs[4][:num_rows])
+        update_meta = (*(o[:num_rows] for o in outs[8:12]), None, None)
+    else:
+        update_meta = tuple(o[:num_rows] for o in outs[12:18])
 
     return dict(
         compressor_kv_decode=compressor_kv_decode,
@@ -284,10 +493,11 @@ def _build_inputs(compress_ratio, num_rows, seed):
         compress_ratio=compress_ratio,
         max_compressed_len=max_compressed_len,
         overlap_page_map=overlap_page_map,
+        update_meta=update_meta,
     )
 
 
-def _run(inp, mhc):
+def _run_update(inp, mhc, update_meta=None):
     M._update_decode_compressed_caches(
         inp["compressor_kv_decode"],
         inp["compressor_gate_decode"],
@@ -308,27 +518,25 @@ def _run(inp, mhc):
         inp["compress_ratio"],
         inp["max_compressed_len"],
         inp["overlap_page_map"],
+        update_meta,
     )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
-@pytest.mark.parametrize("num_rows", [1, 3])
-def test_ratio4_fused_matches_eager(monkeypatch, num_rows):
-    """Ratio-4 (overlap) fused two-kernel path == eager op-by-op reconstruction+store."""
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+def test_fused_update_matches_eager(monkeypatch, compress_ratio):
     assert M._HAS_TRITON, "test requires triton"
-    inp = _build_inputs(compress_ratio=4, num_rows=num_rows, seed=100 + num_rows)
+    num_rows = 3 if compress_ratio == 4 else 2
+    inp = _build_inputs(compress_ratio, num_rows, seed=100 + compress_ratio + num_rows)
 
     mhc_fused = inp["mhc_cache"].clone()
-    _run(inp, mhc_fused)  # real _HAS_TRITON -> fused
+    _run_update(inp, mhc_fused)  # real _HAS_TRITON -> fused
 
     monkeypatch.setattr(M, "_HAS_TRITON", False)
     mhc_eager = inp["mhc_cache"].clone()
-    _run(inp, mhc_eager)  # forced fallback -> eager
+    _run_update(inp, mhc_eager)  # forced fallback -> eager op-by-op
 
-    # End-to-end the whole chain (pool -> rmsnorm -> fp8/rope -> store) matches the eager
-    # path up to the rsqrt primitive: the rsqrt <=1 ULP in the normed row propagates into
-    # the fp8 quant, so even the nope slice is only ULP-close end-to-end (byte-exactness of
-    # the fp8 stage GIVEN an identical normed input is pinned separately below).
+    # End-to-end only ULP-close: the rsqrt <=1 ULP propagates into the fp8 quant.
     exact = (mhc_fused == mhc_eager).float().mean().item()
     max_abs = (mhc_fused.float() - mhc_eager.float()).abs().max().item()
     assert exact >= 0.95, f"exact bf16 match ratio {exact} too low (max_abs={max_abs})"
@@ -336,17 +544,9 @@ def test_ratio4_fused_matches_eager(monkeypatch, num_rows):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
-@pytest.mark.parametrize("num_rows", [1, 3])
-def test_rope_fp8_store_kernel_byte_exact(num_rows):
-    """Stage-2 kernel vs the eager rope/fp8 tail + masked store, fed an IDENTICAL normed row.
-
-    Isolates the new math from the upstream rsqrt: the fake-fp8 nope slice must be
-    byte-identical (op order unchanged) and the rope pe slice equal to <=1 ULP.  Invalid
-    rows are left untouched (no-write).
-    """
+def test_rope_fp8_store_kernel_byte_exact():
     assert M._HAS_TRITON, "test requires triton"
-    import triton
-
+    num_rows = 3
     torch.manual_seed(7 + num_rows)
     head_dim, rope_dim, tokens_per_block = 512, 64, 8
     nope_dim, dh = head_dim - rope_dim, rope_dim // 2
@@ -364,8 +564,7 @@ def test_rope_fp8_store_kernel_byte_exact(num_rows):
     mhc_cache = torch.randn(total_pages, tokens_per_block, head_dim, device=DEV, dtype=dtype)
 
     mhc_fused = mhc_cache.clone()
-    grid = (num_rows,)
-    _dsv4_rope_fp8_masked_store_kernel[grid](
+    _launch_compressed_rope_fp8_store(
         normed,
         cos_table,
         sin_table,
@@ -374,21 +573,8 @@ def test_rope_fp8_store_kernel_byte_exact(num_rows):
         mhc_page_ids,
         mhc_page_offsets,
         mhc_fused,
-        mhc_fused.stride(0),
-        mhc_fused.stride(1),
-        mhc_fused.stride(2),
-        int(cos_table.stride(0)),
-        num_rows,
         head_dim,
-        nope_dim,
-        dh,
-        FP8_BLOCK=64,
-        NUM_FP8_BLOCKS=nope_dim // 64,
-        BLOCK_D=triton.next_power_of_2(head_dim),
-        BLOCK_DH=triton.next_power_of_2(dh),
-        MAX_VAL=448.0,
-        MIN_VAL=1.0e-4,
-        num_warps=4,
+        rope_dim,
     )
 
     # Eager reference: gather cos/sin, run the shipped rope/fp8 tail, masked store.
@@ -400,7 +586,6 @@ def test_rope_fp8_store_kernel_byte_exact(num_rows):
         if bool(row_valid[r]):
             mhc_ref[int(mhc_page_ids[r]), int(mhc_page_offsets[r])] = compressed[r].to(dtype)
 
-    # Invalid rows: byte-identical to the untouched original.
     for r in range(num_rows):
         if not bool(row_valid[r]):
             assert torch.equal(
@@ -417,29 +602,12 @@ def test_rope_fp8_store_kernel_byte_exact(num_rows):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
-@pytest.mark.parametrize("num_rows", [1, 3])
-@pytest.mark.parametrize("head_dim,rope_dim", [(512, 64), (256, 64)])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "num_rows,head_dim,rope_dim,dtype",
+    [(3, 512, 64, torch.bfloat16), (3, 256, 64, torch.float16)],
+)
 def test_norm_rope_store_fused_kernel_matches_two_stage(num_rows, head_dim, rope_dim, dtype):
-    """Byte-pin: the fused rmsnorm+rope+fp8+masked-store kernel == the old chain.
-
-    Feeds an identical pooled row to the two-stage reference
-    (``_compressor_rms_norm`` -> ``_launch_compressed_rope_fp8_store``, i.e. the
-    ``rms_norm_kernel`` launch plus the byte-for-byte frozen
-    ``_dsv4_rope_fp8_masked_store_kernel`` kept in this file) and to the new single
-    kernel, then compares
-    the ENTIRE mhc cache with ``torch.equal``.  This pins bit-identity of (a) the
-    in-kernel RMSNorm replication of ``rms_norm_kernel`` (same ``sum(x*x) * (1/N)``
-    mean, ``x / sqrt(var + eps)`` and left-weight multiply, same BLOCK/num_warps
-    reduction shape) and (b) the shared register-fed
-    ``_dsv4_rope_fp8_store_tail`` epilogue -- the reshape/split pe deinterleave, the
-    rope FMA expressions, the fake-fp8 block quant and the validity-masked store --
-    which the folded ratio-4 front kernel reuses verbatim.  Untouched cache slots and
-    invalid (no-write) rows are covered by the whole-cache compare.
-    """
     assert M._HAS_TRITON, "test requires triton"
-    import triton
-
     torch.manual_seed(11 + num_rows + head_dim)
     tokens_per_block = 8
     nope_dim, dh = head_dim - rope_dim, rope_dim // 2
@@ -457,7 +625,7 @@ def test_norm_rope_store_fused_kernel_matches_two_stage(num_rows, head_dim, rope
     mhc_page_offsets = torch.randint(0, tokens_per_block, (num_rows,), dtype=torch.long, device=DEV)
     mhc_cache = torch.randn(total_pages, tokens_per_block, head_dim, device=DEV, dtype=dtype)
 
-    # Reference: the removed two-stage chain (rms_norm_kernel launch + stage-2 kernel).
+    # Reference: the removed two-stage chain (rms_norm launch + frozen stage-2 kernel).
     mhc_ref = mhc_cache.clone()
     normed_ref = M._compressor_rms_norm(pooled, norm_weight, eps)
     _launch_compressed_rope_fp8_store(
@@ -473,7 +641,6 @@ def test_norm_rope_store_fused_kernel_matches_two_stage(num_rows, head_dim, rope
         rope_dim,
     )
 
-    # Fused single kernel.
     mhc_fused = mhc_cache.clone()
     grid = (num_rows,)
     M._dsv4_norm_rope_fp8_masked_store_kernel[grid](
@@ -512,52 +679,12 @@ def test_norm_rope_store_fused_kernel_matches_two_stage(num_rows, head_dim, rope
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
-@pytest.mark.parametrize("num_rows", [1, 2])
-def test_ratio128_fused_matches_eager(monkeypatch, num_rows):
-    """Ratio-128 (dense) fused three-launch path == eager op-by-op reconstruction+store.
-
-    Ratio-128: the fused path (D-tiled paged pool -> rmsnorm -> rope/fp8/masked-store) must
-    match the eager ``_batched_compressed_rows_from_paged_state`` (non-overlap) + eager
-    where/write-back store.  The paged pool is bit-identical to ``gather + ape + pool`` and
-    RMSNorm is unchanged, so end-to-end the only deviation is the tail rope FMA (<=1 ULP);
-    the nope slice is byte-exact.  ``_build_inputs`` mixes a row-completing (valid) row with
-    a non-completing (invalid, no-write) row, and the 128-token position span crosses many
-    ``tokens_per_block=8`` page boundaries.
-    """
+def test_ratio128_paged_pool_matches_gather_pool():
     assert M._HAS_TRITON, "test requires triton"
-    inp = _build_inputs(compress_ratio=128, num_rows=num_rows, seed=200 + num_rows)
-
-    mhc_fused = inp["mhc_cache"].clone()
-    _run(inp, mhc_fused)  # real _HAS_TRITON -> fused ratio-128 path
-
-    monkeypatch.setattr(M, "_HAS_TRITON", False)
-    mhc_eager = inp["mhc_cache"].clone()
-    _run(inp, mhc_eager)  # forced fallback -> eager reconstruction + where/write-back store
-
-    exact = (mhc_fused == mhc_eager).float().mean().item()
-    max_abs = (mhc_fused.float() - mhc_eager.float()).abs().max().item()
-    assert exact >= 0.95, f"exact bf16 match ratio {exact} too low (max_abs={max_abs})"
-    torch.testing.assert_close(mhc_fused.float(), mhc_eager.float(), rtol=2e-2, atol=2e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
-@pytest.mark.parametrize("num_rows", [1, 3])
-def test_ratio128_paged_pool_matches_gather_pool(num_rows):
-    """Isolate the ratio-128 paged pool front kernel from the rsqrt/rope tail.
-
-    ``_paged_compress_pool`` (paged gather + ape add + softmax pool) reproduces the eager
-    ``gather + ape + deepseek_v4_compress_pool`` it collapses to <=1 ULP: it rounds the fp32
-    cache reads to the activation dtype (== the gather ``.to(dtype)``), adds the ape in the
-    activation dtype, and runs the same fp32-internal per-channel softmax pool.  The only
-    deviation is the fp32 reduction order over the 128-slot ratio axis (this kernel fixes
-    ``num_warps=4`` while ``deepseek_v4_compress_pool`` autotunes it), which flips at most a
-    handful of near-zero channels by one bf16 ULP.  The 128-token span crosses many
-    ``tokens_per_block`` page boundaries.
-    """
-    assert M._HAS_TRITON, "test requires triton"
+    num_rows = 3
     torch.manual_seed(300 + num_rows)
     head_dim, ratio, tokens_per_block = 512, 128, 8
-    state_dim = head_dim  # channels == 1 for the dense (non-overlap) compressor
+    state_dim = head_dim
     dtype = torch.bfloat16
 
     max_pos = ratio + tokens_per_block
@@ -574,7 +701,6 @@ def test_ratio128_paged_pool_matches_gather_pool(num_rows):
     ape = torch.randn(ratio, state_dim, device=DEV)
 
     seq_idx = torch.arange(num_rows, dtype=torch.long, device=DEV)
-    # Each row reconstructs positions [0, ratio) -> spans ratio/tokens_per_block pages.
     positions = torch.arange(ratio, dtype=torch.long, device=DEV).view(1, -1).expand(num_rows, -1)
     page_ids, page_offsets, _ = M._decode_page_ids_and_offsets(
         kv_cache, seq_idx, positions, cu_num_pages, cache_loc
@@ -591,31 +717,19 @@ def test_ratio128_paged_pool_matches_gather_pool(num_rows):
     gate = gate_state[..., :head_dim] + ape[:, :head_dim].to(dtype)
     pooled_ref = torch.ops.auto_deploy.deepseek_v4_compress_pool(kv, gate)
 
+    # Only the fp32 reduction order differs (fixed vs autotuned num_warps).
     exact = (pooled_fused == pooled_ref).float().mean().item()
     max_abs = (pooled_fused.float() - pooled_ref.float()).abs().max().item()
-    assert exact >= 0.99, (
-        f"paged pool vs gather + ape + compress_pool: only {exact:.5f} bf16-exact "
-        f"(max_abs={max_abs:.2e})"
-    )
+    assert exact >= 0.99, f"only {exact:.5f} bf16-exact (max_abs={max_abs:.2e})"
     torch.testing.assert_close(pooled_fused.float(), pooled_ref.float(), rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 def test_all_invalid_steps_leave_cache_untouched(compress_ratio):
-    """Row gating: non-completing steps must write nothing, byte-for-byte.
-
-    Overrides ``input_pos`` with only non-completing positions, including both
-    validity boundaries -- one step BEFORE a row completes (``ratio-2``, e.g. 2/126)
-    and one step AFTER (``ratio``, e.g. 4/128) -- so ``row_valid`` is all-false and
-    the early-exited fused path must leave the entire mhc cache byte-identical.
-    (The completing boundary ``ratio-1`` is exercised by the mixed-validity tests
-    above and the cudagraph test below.)
-    """
     assert M._HAS_TRITON, "test requires triton"
-    inp = _build_inputs(compress_ratio=compress_ratio, num_rows=3, seed=400 + compress_ratio)
-    # Boundary non-completing positions: ratio-2 (one before), ratio (one after), and a
-    # mid-band position of the next block.
+    inp = _build_inputs(compress_ratio, num_rows=3, seed=400 + compress_ratio)
+    # Only non-completing positions, incl. one before / one after a completion.
     input_pos = torch.tensor(
         [compress_ratio - 2, compress_ratio, compress_ratio + compress_ratio // 2],
         dtype=torch.long,
@@ -639,17 +753,12 @@ def test_all_invalid_steps_leave_cache_untouched(compress_ratio):
     assert not bool((new > old).any()), "test setup must produce only non-completing steps"
 
     mhc = inp["mhc_cache"].clone()
-    _run(inp, mhc)  # real _HAS_TRITON -> fused, all rows early-exit
+    _run_update(inp, mhc)
     assert torch.equal(mhc, inp["mhc_cache"]), "all-invalid decode step mutated the mhc cache"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
 def test_ratio128_paged_pool_row_valid_gate():
-    """Row gating: the gated pool is byte-identical to the ungated pool on valid rows.
-
-    Invalid rows of the gated output are unwritten garbage by contract (their only
-    consumer early-exits before reading them), so only valid rows are compared.
-    """
     assert M._HAS_TRITON, "test requires triton"
     torch.manual_seed(500)
     head_dim, ratio, tokens_per_block = 512, 128, 8
@@ -690,26 +799,17 @@ def test_ratio128_paged_pool_row_valid_gate():
         dtype,
         row_valid=row_valid,
     )
-    assert torch.equal(pooled_gated[row_valid], pooled_ungated[row_valid]), (
-        "row_valid gate changed the pooled values of valid rows"
-    )
+    # Invalid rows of the gated output are unwritten by contract; compare valid only.
+    assert torch.equal(pooled_gated[row_valid], pooled_ungated[row_valid])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 def test_row_valid_gate_under_cudagraph_replay(compress_ratio):
-    """Row gating: the early exit is data-gated per replay, not baked in at capture.
-
-    Captures the fused decode update once with ``row_valid`` threaded in via the
-    hoisted ``update_meta`` (the production prepare-op contract), then replays the
-    SAME graph with different ``row_valid`` buffer contents: an all-false replay must
-    leave the cache byte-identical, and a subsequent mixed-validity replay must write
-    exactly what an uncaptured run with that validity writes -- including leaving the
-    invalid row untouched.  This is the captured-decode production pattern (the launch
-    replays every step; only the buffer content changes).
-    """
+    # The gate must be data-driven per replay (production captured-decode pattern),
+    # not baked in at capture time.
     assert M._HAS_TRITON, "test requires triton"
-    inp = _build_inputs(compress_ratio=compress_ratio, num_rows=2, seed=600 + compress_ratio)
+    inp = _build_inputs(compress_ratio, num_rows=2, seed=600 + compress_ratio)
     # Row 0 completes a compressed row (input_pos == ratio-1); row 1 does not.
     input_pos = torch.tensor([compress_ratio - 1, compress_ratio], dtype=torch.long, device=DEV)
     inp["input_pos"] = input_pos
@@ -726,8 +826,6 @@ def test_row_valid_gate_under_cudagraph_replay(compress_ratio):
         )
         inp["overlap_page_map"] = (outs[2][:2], outs[3][:2], outs[4][:2])
 
-    # Hoisted update metadata, mirroring the update_meta=None branch of
-    # ``_update_decode_compressed_caches`` (and the prepare op).
     ratio = compress_ratio
     max_compressed_len = inp["max_compressed_len"]
     old_completed = input_pos // ratio
@@ -756,26 +854,9 @@ def test_row_valid_gate_under_cudagraph_replay(compress_ratio):
     row_valid_buf = true_valid.clone()  # mutated in place between replays
 
     def _run_with_meta(mhc):
-        M._update_decode_compressed_caches(
-            inp["compressor_kv_decode"],
-            inp["compressor_gate_decode"],
-            inp["position_ids_decode"],
-            inp["compressor_ape"],
-            inp["compressor_norm_weight"],
-            inp["cos_table"],
-            inp["sin_table"],
-            inp["seq_idx"],
-            inp["input_pos"],
-            inp["cu_num_pages"],
-            inp["cache_loc"],
+        _run_update(
+            inp,
             mhc,
-            inp["compressor_kv_cache"],
-            inp["compressor_gate_cache"],
-            inp["rms_norm_eps"],
-            inp["rope_dim"],
-            inp["compress_ratio"],
-            inp["max_compressed_len"],
-            inp["overlap_page_map"],
             update_meta=(
                 row_valid_buf,
                 row_position_id,
@@ -803,24 +884,56 @@ def test_row_valid_gate_under_cudagraph_replay(compress_ratio):
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         _run_with_meta(mhc_graph)
-    # Capture records the launches without executing them; the cache is still pristine.
     torch.cuda.synchronize()
-    assert torch.equal(mhc_graph, mhc_orig)
+    assert torch.equal(mhc_graph, mhc_orig)  # capture records, does not execute
 
-    # Replay 1: all-invalid step -> every program early-exits, cache byte-unchanged.
+    # Replay 1: all-invalid step leaves the cache byte-unchanged.
     row_valid_buf.fill_(False)
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(mhc_graph, mhc_orig), "all-invalid cudagraph replay mutated the mhc cache"
 
-    # Replay 2: restore the true validity -> identical bytes to the uncaptured run.
+    # Replay 2: true validity restores the uncaptured bytes.
     row_valid_buf.copy_(true_valid)
     g.replay()
     torch.cuda.synchronize()
-    assert torch.equal(mhc_graph, mhc_ref), (
-        "valid-row cudagraph replay differs from the uncaptured reference"
-    )
+    assert torch.equal(mhc_graph, mhc_ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+def test_update_with_hoisted_meta_byte_exact(compress_ratio):
+    assert M._HAS_TRITON, "test requires triton"
+    inp = _build_inputs(compress_ratio, num_rows=3, seed=403 + compress_ratio)
+
+    mhc_local = inp["mhc_cache"].clone()
+    _run_update(inp, mhc_local, update_meta=None)  # per-layer metadata
+
+    mhc_hoisted = inp["mhc_cache"].clone()
+    _run_update(inp, mhc_hoisted, update_meta=inp["update_meta"])  # hoisted metadata
+
+    assert torch.equal(mhc_local, mhc_hoisted)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel requires CUDA")
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+def test_update_reconstruction_dtype_anchored_on_cache(compress_ratio):
+    # bf16 vs fp32 decode rows must not change a byte: the reconstruction reads the
+    # current token from the fp32 caches and anchors its compute dtype there.
+    assert M._HAS_TRITON, "test requires triton"
+    inp = _build_inputs(compress_ratio, num_rows=3, seed=920)
+
+    mhc_bf16 = inp["mhc_cache"].clone()
+    _run_update(inp, mhc_bf16, update_meta=inp["update_meta"])
+
+    inp_f32 = dict(inp)
+    inp_f32["compressor_kv_decode"] = inp["compressor_kv_decode"].float()
+    inp_f32["compressor_gate_decode"] = inp["compressor_gate_decode"].float()
+    mhc_f32 = inp["mhc_cache"].clone()
+    _run_update(inp_f32, mhc_f32, update_meta=inp["update_meta"])
+
+    assert torch.equal(mhc_bf16, mhc_f32)
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-x", "-q", "-s"]))
+    raise SystemExit(pytest.main([__file__, "-x", "-q"]))

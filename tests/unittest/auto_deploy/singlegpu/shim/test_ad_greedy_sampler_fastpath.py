@@ -10,14 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Equivalence tests for the AutoDeploy greedy-decode sampler fast path.
-
-The fast path must hand off exactly the same greedy token IDs and replay-bound
-state (the ``store.new_tokens`` device buffer consumed by the overlap
-scheduler's next-input gather) as the generic TorchSampler over many
-same-process decode handoffs, and must fall back to the generic path for any
-batch it does not cover.
-"""
+"""The AD greedy sampler fast path must match the generic TorchSampler handoff-for-handoff."""
 
 from types import SimpleNamespace
 
@@ -36,6 +29,10 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.bindings.executor import SamplingConfig as ExecutorSamplingConfig
 from tensorrt_llm.llmapi.llm_args import SamplerType
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="TorchSampler store allocates CUDA buffers"
+)
 
 VOCAB_SIZE = 128
 MAX_SEQ_LEN = 256
@@ -116,7 +113,6 @@ def test_sampler_factory_gates_fast_path_to_pp1(sampler_type, pp_size):
         assert type(sampler) is TorchSampler
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("finish_mode", ["end_id", "length"])
 def test_fast_greedy_matches_generic_over_handoffs(finish_mode):
     end_id = 99
@@ -125,10 +121,7 @@ def test_fast_greedy_matches_generic_over_handoffs(finish_mode):
 
     generic = TorchSampler(_make_sampler_args())
     fast = ADGreedyDecodeTorchSampler(_make_sampler_args())
-    # The samplers allocate store.new_tokens uninitialized; slots no request ever
-    # writes hold whatever the CUDA caching allocator left behind, so zero both
-    # buffers up front to keep the whole-buffer bit-exact comparison below
-    # deterministic regardless of previously run tests.
+    # zero the uninitialized stores so whole-buffer comparisons are deterministic
     generic.store.new_tokens.zero_()
     fast.store.new_tokens.zero_()
 
@@ -156,15 +149,13 @@ def test_fast_greedy_matches_generic_over_handoffs(finish_mode):
         generic.update_requests(state_g)
         fast.update_requests(state_f)
 
-        # Exact greedy token IDs and request-visible state per handoff.
         assert req_f.get_tokens(0) == req_g.get_tokens(0), f"token mismatch at step {step}"
         assert req_f.state == req_g.state, f"state mismatch at step {step}"
         assert req_f.is_finished == req_g.is_finished
         assert req_f.is_finished_due_to_length == req_g.is_finished_due_to_length
         assert req_f.py_decoding_iter == req_g.py_decoding_iter
 
-        # Replay-bound state: the device buffer the overlap scheduler gathers the
-        # next captured-graph input from must match bit-exactly.
+        # the overlap scheduler gathers next inputs from this device buffer
         torch.cuda.synchronize()
         assert torch.equal(fast.store.new_tokens, generic.store.new_tokens), (
             f"store.new_tokens mismatch at step {step}"
@@ -179,7 +170,6 @@ def test_fast_greedy_matches_generic_over_handoffs(finish_mode):
         assert not req_f.is_finished_due_to_length
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fast_greedy_multi_request_batch():
     """Two concurrent greedy requests share one batch; tokens land in their slots."""
     fast = ADGreedyDecodeTorchSampler(_make_sampler_args())
@@ -214,7 +204,6 @@ def test_fast_greedy_multi_request_batch():
         assert torch.equal(fast.store.new_tokens, generic.store.new_tokens)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fast_greedy_fallback_cases():
     """Batches outside the fast-path contract must route to the generic sampler."""
     fast = ADGreedyDecodeTorchSampler(_make_sampler_args())
@@ -265,7 +254,6 @@ def test_fast_greedy_fallback_cases():
     assert req_pad.get_tokens(0)[-1] == (7 * 3 + 3) % VOCAB_SIZE
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_outstanding_fast_state_owns_pinned_snapshot():
     """A second sample cannot overwrite an unconsumed fast-state host snapshot."""
     sampler = ADGreedyDecodeTorchSampler(_make_sampler_args())
@@ -278,8 +266,7 @@ def test_outstanding_fast_state_owns_pinned_snapshot():
     state_a = sampler.sample_async(batch, {"logits": _step_logits(0, forced_token=token_a)}, [0])
     assert isinstance(state_a, ADFastGreedySampleState)
 
-    # The persistent pinned mirror still belongs to state A. State B must use
-    # generic per-state storage rather than overwrite that mirror.
+    # the pinned mirror still belongs to state A; state B must not reuse it
     state_b = sampler.sample_async(batch, {"logits": _step_logits(1, forced_token=token_b)}, [0])
     assert not isinstance(state_b, ADFastGreedySampleState)
 

@@ -23,6 +23,7 @@ import pytest
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionType
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import (
+    ADEngine,
     create_autodeploy_executor,
     maybe_pad_for_cuda_graph,
 )
@@ -105,6 +106,44 @@ def make_mock_engine(
     mock_engine.cache_seq_interface.kv_cache_manager = kv_cache_manager
     mock_engine.cache_seq_interface.kv_cache_config_tuned = Mock()
     return mock_engine, kv_cache_manager
+
+
+def _make_duck_engine(ad_config) -> ADEngine:
+    cache_seq_interface = SimpleNamespace(
+        info=SimpleNamespace(max_num_tokens=8, max_seq_len=8, max_batch_size=2)
+    )
+    return ADEngine(lambda csi: Mock(modules=lambda: []), cache_seq_interface, ad_config=ad_config)
+
+
+@pytest.mark.parametrize(
+    ("cuda_graph_enabled", "piecewise_enabled", "expected"),
+    [(True, True, True), (True, False, False), (False, True, False)],
+)
+def test_engine_derives_piecewise_cuda_graph_flag_from_config(
+    cuda_graph_enabled, piecewise_enabled, expected
+):
+    ad_config = SimpleNamespace(
+        stream_interval=1,
+        attention_dp_config=None,
+        batch_wait_timeout_ms=0,
+        batch_wait_timeout_iters=0,
+        batch_wait_max_tokens_ratio=0.0,
+        max_beam_width=1,
+        speculative_config=None,
+        disable_overlap_scheduler=False,
+        cache_transceiver_config=None,
+        max_stats_len=1000,
+        enable_chunked_prefill=False,
+        is_cuda_graph_enabled=lambda: cuda_graph_enabled,
+        transforms={"compile_model": {"piecewise_enabled": piecewise_enabled}},
+        cuda_graph_config=None,
+    )
+
+    engine = _make_duck_engine(ad_config)
+
+    assert engine.cuda_graph_used is cuda_graph_enabled
+    assert engine._piecewise_cuda_graph_used is expected
+    assert _make_duck_engine(None)._piecewise_cuda_graph_used is False
 
 
 @pytest.mark.parametrize(

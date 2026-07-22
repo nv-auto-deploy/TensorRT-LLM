@@ -1,12 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
 import torch
-from triton_kernels import target_info
-from triton_kernels.tensor_details import layout
-from triton_kernels.tensor_details.layout import HopperMXValueLayout, StridedLayout
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe import mxfp4_moe
+# triton_kernels is an optional dependency; skip at collection when unavailable.
+target_info = pytest.importorskip("triton_kernels.target_info")
+layout = pytest.importorskip("triton_kernels.tensor_details.layout")
+HopperMXValueLayout = layout.HopperMXValueLayout
+StridedLayout = layout.StridedLayout
+
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe import mxfp4_moe  # noqa: E402
 
 
 def test_mxfp4_value_layout_uses_strided_layout_on_blackwell(monkeypatch):

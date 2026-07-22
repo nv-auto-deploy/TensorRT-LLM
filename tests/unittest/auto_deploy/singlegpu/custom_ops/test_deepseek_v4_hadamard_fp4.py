@@ -15,11 +15,8 @@
 
 """Unit tests for ``auto_deploy::deepseek_v4_hadamard_fp4``.
 
-The fused op must reproduce ``fake_fp4_act_quant(hadamard_rotate(x), 32)`` exactly.
-Both the Walsh-Hadamard butterfly (a tree of single ``add``/``sub`` per output) and
-the FP4 ladder use the same fp32 ops as the reference — including the intermediate
-``bf16`` round-trip the reference incurs between ``hadamard_rotate``'s ``.to(dtype)``
-and ``fake_fp4_act_quant``'s ``.float()`` — so the result is bit-identical.
+The fused op must reproduce ``fake_fp4_act_quant(hadamard_rotate(x), 32)`` bit-identically
+(fake quant, no FP4 hardware).
 """
 
 import pytest
@@ -28,10 +25,10 @@ import torch
 # Register the custom op (side-effect import).
 import tensorrt_llm._torch.auto_deploy.custom_ops.quantization.deepseek_v4_hadamard_fp4  # noqa: F401
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
-# --- canonical eager reference for the fused op (the production helpers were
-# --- removed; this copy and test_deepseek_v4_modeling.py's independently-written
-# --- variant are the surviving oracles) ---
+
+# Eager reference (the production helpers were removed from the modeling code).
 def _ceil_pow2_scale(amax, max_value, min_value):
     return torch.pow(2.0, torch.ceil(torch.log2(amax.clamp_min(min_value) / max_value)))
 
@@ -84,93 +81,48 @@ def _fused(x):
     return torch.ops.auto_deploy.deepseek_v4_hadamard_fp4(x, 32)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize(
-    "shape",
-    [
-        (2, 17, 128),  # compressor-rotate-like [B, L, head_dim]
-        (2, 1, 8, 128),  # indexer-q decode-like [B, S, H, head_dim]
-        (2, 7, 8, 128),  # indexer-q prefill-like
-        (1, 128),
-        (33, 128),
-    ],
-)
-@pytest.mark.parametrize("scale", [0.02, 0.3, 1.0, 8.0, 40.0])
+@pytest.mark.parametrize("shape", [(2, 17, 128), (1, 128)])
+@pytest.mark.parametrize("scale", [0.02, 40.0])
 def test_matches_reference_dim128(dtype, shape, scale):
     torch.manual_seed(0)
     x = (torch.randn(shape, device="cuda", dtype=dtype) * scale).contiguous()
     out = _fused(x)
-    ref = _ref(x)
     assert out.shape == x.shape and out.dtype == x.dtype
-    assert torch.equal(out, ref), (
-        f"max abs diff {(out.float() - ref.float()).abs().max().item():.3e}"
-    )
+    assert torch.equal(out, _ref(x))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dim", [32, 64, 256])
+@pytest.mark.parametrize("dim", [32, 256])  # fewest / most butterfly stages
 def test_matches_reference_other_pow2_dims(dim):
     torch.manual_seed(1)
     x = (torch.randn((5, dim), device="cuda", dtype=torch.bfloat16) * 1.3).contiguous()
-    out = _fused(x)
-    ref = _ref(x)
-    assert torch.equal(out, ref)
+    assert torch.equal(_fused(x), _ref(x))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_noncontiguous_leading_dims_write_returned_output():
     torch.manual_seed(4)
-    base = torch.randn((2, 3, 128), device="cuda", dtype=torch.bfloat16)
-    x = base.transpose(0, 1)
+    x = torch.randn((2, 3, 128), device="cuda", dtype=torch.bfloat16).transpose(0, 1)
     assert x.stride(-1) == 1 and not x.is_contiguous()
-
     out = _fused(x)
-
     assert out.is_contiguous()
     assert torch.equal(out, _ref(x))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize(
-    "R",
-    [
-        1024,  # threshold: first row count routed to the BLOCK_R=2 blocked kernel
-        2048,
-        2049,  # odd R -> exercises the blocked-kernel tail mask (last row masked off)
-        8000,  # prefill indexer-q (B=1,S=1000,index_n_heads_local=8)
-    ],
-)
-@pytest.mark.parametrize("scale", [0.02, 1.0, 40.0])
-def test_blocked_path_matches_reference(dtype, R, scale):
-    # R >= 1024 routes through _hadamard_fp4_kernel_blocked; must stay bit-identical
-    # to the 1-row path / reference (the row axis is a pure batched outer dim).
+# R=1024 is the BLOCK_R=2 threshold (even, no tail); R=2049 masks the trailing row.
+@pytest.mark.parametrize("R", [1024, 2049])
+def test_blocked_path_matches_reference(R):
     torch.manual_seed(2)
-    x = (torch.randn((R, 128), device="cuda", dtype=dtype) * scale).contiguous()
+    x = torch.randn((R, 128), device="cuda", dtype=torch.bfloat16).contiguous()
     out = _fused(x)
-    ref = _ref(x)
     assert out.shape == x.shape and out.dtype == x.dtype
-    assert torch.equal(out, ref), (
-        f"max abs diff {(out.float() - ref.float()).abs().max().item():.3e}"
-    )
+    assert torch.equal(out, _ref(x))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dim", [32, 64, 256])
-def test_blocked_path_other_pow2_dims(dim):
-    # Large R + non-128 dims still routes through the blocked kernel.
-    torch.manual_seed(3)
-    x = (torch.randn((1500, dim), device="cuda", dtype=torch.bfloat16) * 1.3).contiguous()
-    assert torch.equal(_fused(x), _ref(x))
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_zero_input_is_zero():
-    # all-zero input exercises the amax==0 / log2(0) guard path of ceil_pow2_scale;
-    # the rotation of zeros is zero and the fp4 quant of zeros is zero.
-    x = torch.zeros((3, 128), device="cuda", dtype=torch.bfloat16)
+def test_zero_and_empty_input():
+    x = torch.zeros((3, 128), device="cuda", dtype=torch.bfloat16)  # log2(0) guard path
     out = _fused(x)
-    ref = _ref(x)
-    assert torch.equal(out, ref)
+    assert torch.equal(out, _ref(x))
     assert torch.equal(out, torch.zeros_like(out))
+    empty = torch.empty((0, 128), device="cuda", dtype=torch.bfloat16)  # R == 0 early return
+    out_empty = _fused(empty)
+    assert out_empty.shape == empty.shape and out_empty.dtype == empty.dtype

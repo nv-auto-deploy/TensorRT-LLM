@@ -71,8 +71,9 @@ class TestModel(torch.nn.Module):
 class DirectRMSNormFP32Weight(torch.nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
+        torch.manual_seed(0)
         self.weight = torch.nn.Parameter(
-            torch.ones(hidden_size, device="cuda", dtype=torch.float32)
+            torch.randn(hidden_size, device="cuda", dtype=torch.float32)
         )
         self.eps = eps
 
@@ -202,4 +203,10 @@ def test_flashinfer_rmsnorm_casts_fp32_weight_to_input_dtype():
     assert weight_arg.args[1] == torch.float16
     assert _node_dtype(rms_node.args[0]) == torch.float16
     assert _node_dtype(weight_arg) == torch.float16
-    assert _node_dtype(rms_node.args[0]) == _node_dtype(weight_arg)
+
+    # The cast-weight flashinfer kernel must match the eager fp32-weight reference
+    # to fp16 weight-rounding tolerance.
+    with torch.inference_mode():
+        out = gm_transformed(x)
+        ref = model(x)
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)

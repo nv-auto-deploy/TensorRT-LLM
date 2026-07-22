@@ -12,17 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Correctness tests for quantized mixed-children GEMM fusion.
-
-Enabling ``fuse_gemms_mixed_children`` (``quantized_only=True``) merges sibling
-``torch_fake_quant_finegrained_fp8_linear`` projections that read the *same* activation
-into one concatenated ``[sum_N, K]`` block-FP8 GEMM + ``torch.narrow`` views, including
-the DIFFERENT-shaped DeepSeek-V4 attention groups (``wq_a``+``wkv``,
-``wq_b``+``indexer.wq_b``), so these tests guard the general different-N concat identity.
-
-The mixed quantized and replicated-bf16 transforms may run on the same graph, so the
-registered fused weights must also remain distinct.
-"""
+"""Sibling-GEMM fusion transforms: mixed-children FP8, replicated bf16, coexistence."""
 
 import pytest
 import torch
@@ -54,8 +44,7 @@ def _fp8_supported():
 def _make_fp8_weight(N, K, device, seed):
     g = torch.Generator(device=device).manual_seed(seed)
     w = (torch.randn(N, K, generator=g, device=device, dtype=torch.bfloat16) * 0.1).to(fp8)
-    # per-128x128-block weight scale, strictly positive (matches checkpoint layout)
-    ws = (
+    ws = (  # per-128x128-block weight scale, strictly positive
         torch.rand(N // 128, K // 128, generator=g, device=device, dtype=torch.float32) * 0.05
         + 0.01
     )
@@ -63,12 +52,7 @@ def _make_fp8_weight(N, K, device, seed):
 
 
 def _populate_getattr_val_meta(gm):
-    """Tag get_attr nodes with meta['val'] (their param/buffer tensor).
-
-    The production pipeline shape-props before post_load_fusion, so the weight-node
-    classifier (``is_weight_node`` -> ``has_shape``) sees a shaped ``meta['val']`` on
-    every parameter get_attr. ``symbolic_trace`` does not populate that.
-    """
+    """Mimic shape-prop: tag get_attr nodes with meta['val'] (symbolic_trace doesn't)."""
     for n in gm.graph.nodes:
         if n.op != "get_attr":
             continue
@@ -81,19 +65,23 @@ def _populate_getattr_val_meta(gm):
                 pass
 
 
+def _count_lin(gm, op):
+    return sum(1 for n in gm.graph.nodes if is_op(n, op))
+
+
+def _count_narrow(gm):
+    return sum(1 for n in gm.graph.nodes if n.op == "call_function" and "narrow" in str(n.target))
+
+
 # ---------------------------------------------------------------------------
-# Op-level identity: concatenating DIFFERENT-shaped block-FP8 siblings.
+# Quantized mixed-children FP8 fusion
 # ---------------------------------------------------------------------------
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
-@pytest.mark.parametrize("M", [8, 16])
-def test_different_shaped_concat_bit_exact_base_kernel(M):
-    """M > 4 uses the deterministic (non split-K) base kernel -> byte-exact merge.
-
-    Holds even when the fused siblings have different output widths
-    (wq_a=512 + wkv=1024 style).
-    """
+def test_different_shaped_concat_bit_exact_base_kernel():
+    """Weight/scale concat over different-N siblings is byte-exact on the base kernel."""
     device = "cuda"
-    K, Na, Nb = 256, 512, 1024  # different N, both 128-aligned
+    M = 8  # M > 4 avoids the split-K decode path -> deterministic kernel
+    K, Na, Nb = 256, 512, 1024
     x = (torch.randn(M, K, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
 
     wa, wsa = _make_fp8_weight(Na, K, device, seed=1)
@@ -104,23 +92,18 @@ def test_different_shaped_concat_bit_exact_base_kernel(M):
 
     ya, yb = _lin(wa, wsa), _lin(wb, wsb)
 
-    # Fused: cat weights + cat per-block scales along the output dim, one matmul, then slice.
     cat_w = torch.cat([wa, wb], dim=0)
     cat_s = torch.cat([wsa, wsb], dim=0)
     merged = lin_op(x, cat_w, None, input_scale=[], weight_scale=[cat_s], input_zp=[], weight_zp=[])
 
     assert merged.shape == (M, Na + Nb)
-    assert torch.equal(merged[:, :Na], ya), "first sibling slice is not bit-exact"
-    assert torch.equal(merged[:, Na:], yb), "second sibling slice is not bit-exact"
+    assert torch.equal(merged[:, :Na], ya)
+    assert torch.equal(merged[:, Na:], yb)
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
 def test_different_shaped_concat_matches_splitk_decode():
-    """M=1, K>=4096 hits the split-K atomic decode path.
-
-    The concat is algebraically identical, differing only by the split-K's own
-    atomic-reduction rounding.
-    """
+    """M=1, K>=4096 (split-K atomic path): concat matches up to reduction rounding."""
     device = "cuda"
     K, Na, Nb = 4096, 512, 1024
     x = (torch.randn(1, K, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
@@ -146,15 +129,7 @@ def test_different_shaped_concat_matches_splitk_decode():
     torch.testing.assert_close(merged[:, Na:], yb, rtol=1e-2, atol=1e-2)
 
 
-# ---------------------------------------------------------------------------
-# Graph-level: the transform fuses the sibling group and preserves numerics.
-# ---------------------------------------------------------------------------
 class _FP8Proj(torch.nn.Module):
-    """One block-FP8 projection stored as ``<name>.weight`` + ``<name>.weight_scale_inv``.
-
-    Mirrors the checkpoint layout the fuser reconstructs the scale name from.
-    """
-
     def __init__(self, N, K, device, seed):
         super().__init__()
         w, ws = _make_fp8_weight(N, K, device, seed)
@@ -162,15 +137,11 @@ class _FP8Proj(torch.nn.Module):
         self.register_buffer("weight_scale_inv", ws)
 
     def forward(self, x):
-        # Positional args (no kwargs) to mirror how the DeepSeek-V4 graph emits the op;
-        # the fuser rebuilds input_scale/weight_scale/zp positionally, so a kwarg here
-        # would double-specify them.
+        # Positional args: the fuser rebuilds the scale/zp lists positionally.
         return lin_op(x, self.weight, None, [], [self.weight_scale_inv], [], [])
 
 
 class _FP8SiblingModule(torch.nn.Module):
-    """x -> {proj_a(N=512), proj_b(N=1024)} siblings (different shapes) + a singleton."""
-
     def __init__(self, K, device):
         super().__init__()
         self.proj_a = _FP8Proj(512, K, device, seed=1)
@@ -195,37 +166,121 @@ def test_transform_fuses_different_shaped_fp8_siblings():
     _populate_getattr_val_meta(gm)
     ref_a, ref_b, ref_solo = (t.clone() for t in gm(x))
 
-    assert sum(1 for n in gm.graph.nodes if is_op(n, lin_op)) == 3
+    assert _count_lin(gm, lin_op) == 3
 
     cfg = FuseGemmsMixedChildrenConfig(stage=Stages.POST_LOAD_FUSION, quantized_only=True)
     new_gm, info = FuseGemmsMixedChildren(cfg)._apply(gm, None, None, SharedConfig())
     new_gm.recompile()
 
-    # Exactly one sibling group (proj_a + proj_b) fused; the solo projection is untouched.
-    assert info.num_matches == 1, f"expected 1 fused group, got {info.num_matches}"
-    assert sum(1 for n in new_gm.graph.nodes if is_op(n, lin_op)) == 2  # 1 fused + 1 solo
-    n_narrow = sum(
-        1 for n in new_gm.graph.nodes if n.op == "call_function" and "narrow" in str(n.target)
-    )
-    assert n_narrow == 2, f"expected 2 narrow splits, got {n_narrow}"
+    assert info.num_matches == 1
+    assert _count_lin(new_gm, lin_op) == 2  # 1 fused + 1 solo
+    assert _count_narrow(new_gm) == 2
 
     out_a, out_b, out_solo = new_gm(x)
-    # M=2 decode GEMV: algebraically identical, differs only by kernel reduction rounding.
     torch.testing.assert_close(out_a, ref_a, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(out_b, ref_b, rtol=1e-2, atol=1e-2)
-    assert torch.equal(out_solo, ref_solo), "singleton projection was altered"
+    assert torch.equal(out_solo, ref_solo)
 
 
 # ---------------------------------------------------------------------------
-# Regression: mixed-children FP8 fusion must not collide with the bf16 fusion.
+# Replicated bf16 linear fusion
+# ---------------------------------------------------------------------------
+def _bf16_lin(x, w):
+    return bf16_lin_op(x, w, None, tp_mode="none", layer_type="mla")
+
+
+class _Bf16SiblingModule(torch.nn.Module):
+    """3 eligible siblings + singleton + ineligible decoys (biased/sharded/fp16)."""
+
+    def __init__(self, K, device):
+        super().__init__()
+        g = torch.Generator(device=device).manual_seed(0)
+
+        def _w(n, scale, dtype=torch.bfloat16):
+            return torch.nn.Parameter(
+                (torch.randn(n, K, generator=g, device=device, dtype=dtype) * scale),
+                requires_grad=False,
+            )
+
+        # Very different weight magnitudes: a wrong slice->weight mapping fails loudly.
+        self.w_a = _w(64, 0.02)
+        self.w_b = _w(256, 0.20)
+        self.w_c = _w(256, 2.00)
+        self.w_other = _w(128, 0.05)
+        self.w_biased = _w(32, 0.05)
+        self.bias = torch.nn.Parameter(
+            torch.randn(32, generator=g, device=device, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.w_sharded = _w(32, 0.05)
+        self.w_fp16 = _w(32, 0.05, dtype=torch.float16)
+        self.register_buffer("z", torch.zeros(1, K, device=device, dtype=torch.bfloat16))
+
+    def forward(self, x):
+        ya = _bf16_lin(x, self.w_a)
+        yb = _bf16_lin(x, self.w_b)
+        yc = _bf16_lin(x, self.w_c)
+        y_biased = bf16_lin_op(x, self.w_biased, self.bias, tp_mode="none", layer_type="mla")
+        y_sharded = bf16_lin_op(x, self.w_sharded, None, tp_mode="colwise", layer_type="mla")
+        y_fp16 = bf16_lin_op(
+            x.to(torch.float16), self.w_fp16, None, tp_mode="none", layer_type="mla"
+        )
+        y_other = _bf16_lin(x + self.z, self.w_other)
+        return torch.cat([ya, yb, yc], dim=-1), y_other, y_biased, y_sharded, y_fp16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_replicated_bf16_transform_fuses_siblings_and_preserves_output():
+    device = "cuda"
+    K = 4096
+    x = torch.randn(2, K, device=device, dtype=torch.bfloat16)
+
+    gm: GraphModule = symbolic_trace(_Bf16SiblingModule(K, device))
+    _populate_getattr_val_meta(gm)
+    ref = [t.clone() for t in gm(x)]
+
+    assert _count_lin(gm, bf16_lin_op) == 7  # 3 siblings + 1 singleton + 3 decoys
+
+    transform = FuseReplicatedBf16Linear(TransformConfig(stage=Stages.POST_LOAD_FUSION))
+    new_gm, info = transform._apply(gm, None, None, SharedConfig())
+    new_gm.recompile()
+
+    assert info.num_matches == 1
+    assert _count_lin(new_gm, bf16_lin_op) == 5  # 1 fused + 1 singleton + 3 decoys
+    assert _count_narrow(new_gm) == 3
+
+    out = new_gm(x)
+    torch.testing.assert_close(out[0], ref[0], rtol=1e-2, atol=1e-2)
+    for got, exp in zip(out[1:], ref[1:]):  # singleton + decoys must be untouched
+        assert torch.equal(got, exp)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_concat_rows_matches_per_linear():
+    """Op-level identity: aten.linear over row-concatenated weights == per-weight linears."""
+    device = "cuda"
+    K = 4096
+    x = torch.randn(3, K, device=device, dtype=torch.bfloat16)
+    sizes = [64, 256, 256]
+    ws = [
+        torch.randn(n, K, device=device, dtype=torch.bfloat16) * s
+        for n, s in zip(sizes, [0.02, 0.2, 2.0])
+    ]
+
+    per = [torch.ops.aten.linear(x, w, None) for w in ws]
+    fused = torch.ops.aten.linear(x, torch.cat(ws, dim=0), None)
+
+    off = 0
+    for w, y in zip(ws, per):
+        n = w.shape[0]
+        torch.testing.assert_close(fused.narrow(-1, off, n), y, rtol=1e-2, atol=1e-2)
+        off += n
+
+
+# ---------------------------------------------------------------------------
+# Coexistence: both transforms on one graph must not collide on fused params
 # ---------------------------------------------------------------------------
 class _MixedModule(torch.nn.Module):
-    """x feeds BOTH block-FP8 siblings and replicated bf16 siblings.
-
-    mixed_children fuses the FP8 pair, then fuse_replicated_bf16_linear fuses
-    the bf16 pair. Their graph-derived fused-weight attributes must be distinct.
-    """
-
     def __init__(self, K, device):
         super().__init__()
         self.proj_a = _FP8Proj(512, K, device, seed=5)
@@ -243,13 +298,14 @@ class _MixedModule(torch.nn.Module):
     def forward(self, x):
         ya = self.proj_a(x)
         yb = self.proj_b(x)
-        za = bf16_lin_op(x, self.bf_a, None, tp_mode="none", layer_type="mla")
-        zb = bf16_lin_op(x, self.bf_b, None, tp_mode="none", layer_type="mla")
+        za = _bf16_lin(x, self.bf_a)
+        zb = _bf16_lin(x, self.bf_b)
         return ya, yb, za, zb
 
 
 @pytest.mark.skipif(not _fp8_supported(), reason="Requires Hopper+ FP8")
 def test_no_param_collision_with_replicated_bf16():
+    """Both fusions on one graph register distinct fused weights (suffix on collision)."""
     device = "cuda"
     K = 256
     x = (torch.randn(2, K, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
@@ -258,7 +314,11 @@ def test_no_param_collision_with_replicated_bf16():
     _populate_getattr_val_meta(gm)
     ref = tuple(t.clone() for t in gm(x))
 
-    # Run mixed_children (FP8) FIRST, then the bf16 fusion -- the production order.
+    first_fp8_node = next(n for n in gm.graph.nodes if is_op(n, lin_op))
+    planted = f"fused_weight_{first_fp8_node.name}"
+    setattr(gm, planted, torch.zeros(1, device=device))
+
+    # Production order: mixed_children (FP8) first, then the bf16 fusion.
     cfg = FuseGemmsMixedChildrenConfig(stage=Stages.POST_LOAD_FUSION, quantized_only=True)
     gm, info_fp8 = FuseGemmsMixedChildren(cfg)._apply(gm, None, None, SharedConfig())
     gm, info_bf16 = FuseReplicatedBf16Linear(TransformConfig(stage=Stages.POST_LOAD_FUSION))._apply(
@@ -266,17 +326,15 @@ def test_no_param_collision_with_replicated_bf16():
     )
     gm.recompile()
 
-    assert info_fp8.num_matches == 1, "FP8 sibling pair should fuse"
-    assert info_bf16.num_matches == 1, "bf16 sibling pair should fuse"
+    assert info_fp8.num_matches == 1
+    assert info_bf16.num_matches == 1
 
-    # The two transforms must register distinct fused-weight attributes.
     fused_names = [name for name, _ in gm.named_parameters() if name.startswith("fused_weight_")]
     assert len(fused_names) == 2
     assert len(set(fused_names)) == 2, f"fused param name collision: {fused_names}"
-    assert all(hasattr(gm, name) for name in fused_names)
+    assert f"{planted}_1" in fused_names, f"expected suffixed name, got {fused_names}"
+    assert torch.equal(getattr(gm, planted), torch.zeros(1, device=device))
 
-    # And the graph must still execute correctly (the collision previously corrupted the
-    # FP8 fused weight -> shape-prop / runtime error).
     out = gm(x)
     for got, exp in zip(out, ref):
         torch.testing.assert_close(got, exp, rtol=1e-2, atol=1e-2)

@@ -13,26 +13,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""DeepSeek V4 quantized-checkpoint-layout detection and validation tests."""
+
 import json
 import struct
 from pathlib import Path
 
+import pytest
+
 from tensorrt_llm._torch.auto_deploy.models.checkpoint_metadata import has_safetensors_metadata
-from tensorrt_llm._torch.auto_deploy.models.quant_config_reader import HFQuantConfigReader
+from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import (
+    QuantizedCheckpointLayoutError,
+)
+from tensorrt_llm._torch.auto_deploy.models.quant_config_reader import (
+    HFQuantConfigReader,
+    autodetect_quant_config_reader,
+)
+
+_DSV4_CONFIG = {
+    "model_type": "deepseek_v4",
+    "quantization_config": {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "scale_fmt": "ue8m0",
+        "weight_block_size": [128, 128],
+    },
+}
 
 
-def _write_deepseek_v4_checkpoint_fixture(tmp_path: Path) -> None:
-    config = {
-        "model_type": "deepseek_v4",
-        "quantization_config": {
-            "activation_scheme": "dynamic",
-            "fmt": "e4m3",
-            "quant_method": "fp8",
-            "scale_fmt": "ue8m0",
-            "weight_block_size": [128, 128],
-        },
-    }
-    tensor_metadata = {
+def _default_tensor_metadata() -> dict:
+    return {
         "layers.0.attn.wq_a.weight": {"dtype": "F8_E4M3", "shape": [1024, 4096]},
         "layers.0.attn.wq_a.scale": {"dtype": "F8_E8M0", "shape": [8, 32]},
         "layers.0.ffn.experts.0.w1.weight": {"dtype": "I8", "shape": [2048, 2048]},
@@ -42,6 +53,12 @@ def _write_deepseek_v4_checkpoint_fixture(tmp_path: Path) -> None:
         "layers.0.ffn.experts.0.w3.weight": {"dtype": "I8", "shape": [2048, 2048]},
         "layers.0.ffn.experts.0.w3.scale": {"dtype": "F8_E8M0", "shape": [2048, 128]},
     }
+
+
+def _write_deepseek_v4_checkpoint_fixture(
+    tmp_path: Path, tensor_metadata: dict | None = None
+) -> None:
+    tensor_metadata = tensor_metadata if tensor_metadata is not None else _default_tensor_metadata()
     safetensors_name = "model-00001-of-00001.safetensors"
     header = {
         name: {
@@ -53,7 +70,7 @@ def _write_deepseek_v4_checkpoint_fixture(tmp_path: Path) -> None:
     }
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
 
-    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (tmp_path / "config.json").write_text(json.dumps(_DSV4_CONFIG), encoding="utf-8")
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps(
             {
@@ -104,5 +121,64 @@ def test_non_deepseek_fp8_config_uses_generic_hf_behavior() -> None:
     assert "checkpoint_layout" not in qcfg
 
 
-def test_safetensors_metadata_probe_tolerates_missing_directory(tmp_path: Path) -> None:
+def test_safetensors_metadata_probe(tmp_path: Path) -> None:
+    _write_deepseek_v4_checkpoint_fixture(tmp_path)
+    assert has_safetensors_metadata(tmp_path)
+
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    (bare / "model.safetensors").write_bytes(b"")
+    assert has_safetensors_metadata(bare)
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert not has_safetensors_metadata(empty)
     assert not has_safetensors_metadata(tmp_path / "missing")
+
+
+def test_layout_detection_without_metadata_defers_when_not_required(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(_DSV4_CONFIG), encoding="utf-8")
+    assert HFQuantConfigReader.from_file(str(tmp_path), require_checkpoint_metadata=False) is None
+
+
+def _drop_expert_weight(metadata: dict) -> None:
+    del metadata["layers.0.ffn.experts.0.w1.weight"]
+
+
+def _drop_expert_projection(metadata: dict) -> None:
+    del metadata["layers.0.ffn.experts.0.w1.weight"]
+    del metadata["layers.0.ffn.experts.0.w1.scale"]
+
+
+def _bad_expert_scale_dtype(metadata: dict) -> None:
+    metadata["layers.0.ffn.experts.0.w1.scale"]["dtype"] = "F32"
+
+
+def _bad_fp8_scale_shape(metadata: dict) -> None:
+    metadata["layers.0.attn.wq_a.scale"]["shape"] = [9, 32]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        pytest.param(_drop_expert_weight, "missing companion weight", id="scale-without-weight"),
+        pytest.param(_drop_expert_projection, "missing required projection", id="no-projection"),
+        pytest.param(_bad_expert_scale_dtype, "should be F8_E8M0 scale", id="bad-scale-dtype"),
+        pytest.param(_bad_fp8_scale_shape, "does not match expected", id="bad-fp8-scale-shape"),
+    ],
+)
+def test_layout_validation_errors_surface_through_autodetect(tmp_path: Path, mutate, match) -> None:
+    metadata = _default_tensor_metadata()
+    mutate(metadata)
+    _write_deepseek_v4_checkpoint_fixture(tmp_path, tensor_metadata=metadata)
+
+    with pytest.raises(QuantizedCheckpointLayoutError, match=match):
+        autodetect_quant_config_reader(str(tmp_path))
+
+
+def test_invalid_safetensors_index_raises(tmp_path: Path) -> None:
+    _write_deepseek_v4_checkpoint_fixture(tmp_path)
+    (tmp_path / "model.safetensors.index.json").write_text("not json", encoding="utf-8")
+
+    with pytest.raises(QuantizedCheckpointLayoutError, match="Invalid safetensors index JSON"):
+        autodetect_quant_config_reader(str(tmp_path))

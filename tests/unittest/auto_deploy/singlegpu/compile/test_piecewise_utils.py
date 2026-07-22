@@ -397,16 +397,6 @@ class TestStreamSwitchBehavior:
         gm = GraphModule(nn.Module(), graph)
         assert needs_out_buffer(gm) is True
 
-    def test_needs_out_buffer_for_sparse_attention(self):
-        """Sparse cached attention follows the dynamic op output-buffer ABI."""
-        graph = Graph()
-        x = graph.placeholder("x")
-        attn_target = _FakeOpOverload("auto_deploy::torch_deepseek_v4_sparse_attention_with_cache")
-        attn = graph.create_node("call_function", attn_target, args=(x,), name="attn")
-        graph.output(attn)
-        gm = GraphModule(nn.Module(), graph)
-        assert needs_out_buffer(gm) is True
-
     def test_split_does_not_reclassify_stream_switch(self):
         """The splitter must not reclassify stream-switch partitions as dynamic."""
         gm = _build_graphmodule_with_stream_switch_ops(

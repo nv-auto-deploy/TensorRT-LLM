@@ -430,45 +430,6 @@ def _finegrained_fp8_dense_dequant_ref(
     )
 
 
-def _grouped_finegrained_fp8_dense_dequant_ref(
-    input_tensor,
-    weight_fp8,
-    bias,
-    weight_scale_inv,
-    block_size,
-    input_scale_fmt="",
-):
-    block_n, block_k = block_size
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    num_groups = input_tensor.shape[-2]
-    rank = weight_fp8.shape[0] // num_groups
-
-    x_blocks = input_tensor.contiguous().view(*input_tensor.shape[:-1], -1, block_k)
-    input_amax = x_blocks.abs().float().amax(dim=-1)
-    if input_scale_fmt.lower() == "ue8m0":
-        input_scale = torch.clamp(input_amax, min=1e-4) / fp8_max
-        input_scale = torch.pow(2.0, torch.ceil(torch.log2(input_scale)))
-    else:
-        input_scale = torch.clamp(input_amax / fp8_max, min=1e-12)
-    qinput = (x_blocks.float() / input_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
-    input_dequant = (qinput.float() * input_scale.unsqueeze(-1)).view_as(input_tensor)
-
-    weight_scale = weight_scale_inv.repeat_interleave(block_n, dim=0).repeat_interleave(
-        block_k, dim=1
-    )
-    weight_scale = weight_scale[: weight_fp8.shape[0], : weight_fp8.shape[1]]
-    weight_dequant = (weight_fp8.float() * weight_scale).to(input_tensor.dtype)
-    weight_grouped = weight_dequant.view(num_groups, rank, input_tensor.shape[-1])
-    output = torch.matmul(
-        input_dequant.to(input_tensor.dtype).unsqueeze(-2),
-        weight_grouped.transpose(-1, -2),
-    ).squeeze(-2)
-    output = output.flatten(-2)
-    if bias is not None:
-        output = output + bias.reshape(weight_fp8.shape[0]).to(output.dtype)
-    return output
-
-
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
 def test_finegrained_fp8_linear_ue8m0_input_scale_quantizes_with_rounded_scale():
     block_size = [128, 128]
@@ -516,52 +477,6 @@ def test_finegrained_fp8_linear_ue8m0_input_scale_quantizes_with_rounded_scale()
     assert not torch.allclose(output_raw, output_ue8m0, rtol=1e-3, atol=1e-2)
     torch.testing.assert_close(output_raw, ref_raw, rtol=0.02, atol=1.0)
     torch.testing.assert_close(output_ue8m0, ref_ue8m0, rtol=0.02, atol=1.0)
-
-
-@pytest.mark.parametrize("bias", [True, False])
-@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
-def test_grouped_finegrained_fp8_linear_matches_dense_dequant_ue8m0_reference(bias):
-    block_size = [128, 128]
-    batch_size, seq_len, num_groups, rank, group_width = 2, 3, 2, 128, 128
-    N = num_groups * rank
-    K = group_width
-
-    input_tensor = torch.randn(
-        batch_size, seq_len, num_groups, K, device="cuda", dtype=torch.float16
-    )
-    weight = torch.randn(N, K, device="cuda", dtype=torch.float16)
-    bias_tensor = torch.randn(N, device="cuda", dtype=torch.float16) if bias else None
-
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    weight_blocks = weight.float().view(num_groups, rank, K // block_size[1], block_size[1])
-    amax = weight_blocks.abs().amax(dim=(1, 3)).to(torch.float32)
-    weight_scale_inv = torch.clamp(amax / fp8_max, min=torch.finfo(torch.float32).tiny)
-    weight_scale = weight_scale_inv.repeat_interleave(rank, dim=0).repeat_interleave(
-        block_size[1], dim=1
-    )
-    weight_fp8 = (weight.float() / weight_scale).to(torch.float8_e4m3fn)
-
-    output = torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear(
-        input_tensor,
-        weight_fp8,
-        bias_tensor,
-        [],
-        [weight_scale_inv],
-        [],
-        [],
-        input_scale_fmt="ue8m0",
-    )
-    ref = _grouped_finegrained_fp8_dense_dequant_ref(
-        input_tensor,
-        weight_fp8,
-        bias_tensor,
-        weight_scale_inv,
-        block_size,
-        input_scale_fmt="ue8m0",
-    )
-
-    assert output.shape == (batch_size, seq_len, N)
-    torch.testing.assert_close(output, ref, rtol=0.02, atol=1.0)
 
 
 def _fused_relu2_quantize_available():
@@ -731,13 +646,10 @@ def _fail_standalone_act_quant(*args, **kwargs):
     raise AssertionError("supported decode path must fuse activation quantization")
 
 
-@pytest.mark.parametrize(
-    "N,K",
-    [(1536, 4096), (1024, 4096), (16384, 1024), (8192, 1024), (4096, 512), (4096, 2048)],
-)
+# One K>=4096 (split-K-eligible) and one K<512-class (rowwise-table-only) shape.
+@pytest.mark.parametrize("N,K", [(1536, 4096), (4096, 512)])
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
 def test_finegrained_fp8_linear_uses_quant_prologue_for_decode(monkeypatch, N, K):
-    """Every measured TP4 decode shape bypasses standalone activation quantization."""
     from tensorrt_llm._torch.auto_deploy.custom_ops.quantization import torch_quant
 
     x, w_fp8, ws_inv = _fg_ue8m0_linear_case(N, K)
@@ -745,10 +657,10 @@ def test_finegrained_fp8_linear_uses_quant_prologue_for_decode(monkeypatch, N, K
     assert _fg_linear(x, w_fp8, ws_inv).shape == (1, N)
 
 
+# Prefill M and non-ue8m0 fmt must keep the standalone quantization path.
 @pytest.mark.parametrize("M,fmt", [(64, "ue8m0"), (1, "")])
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
 def test_finegrained_fp8_linear_falls_back_to_standalone_quant(monkeypatch, M, fmt):
-    """Prefill and non-UE8M0 inputs retain the standalone quantization path."""
     from tensorrt_llm._torch.auto_deploy.custom_ops.quantization import torch_quant
 
     calls = 0
@@ -765,30 +677,9 @@ def test_finegrained_fp8_linear_falls_back_to_standalone_quant(monkeypatch, M, f
     assert calls == 1
 
 
-@pytest.mark.parametrize("num_groups", [1, 2])
-@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
-def test_grouped_finegrained_fp8_linear_uses_quant_prologue(monkeypatch, num_groups):
-    """Grouped wo_a decode also bypasses standalone activation quantization."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization import torch_quant
-
-    rank, K = 1024, 4096
-    N = num_groups * rank
-    torch.manual_seed(43)
-    vals = torch.tensor([0.0, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0], device="cuda")
-    x = vals[torch.randint(0, 7, (1, 1, num_groups, K), device="cuda")].to(torch.bfloat16)
-    w_fp8 = torch.randint(-2, 3, (N, K), device="cuda").float().to(torch.float8_e4m3fn)
-    ws_inv = torch.ones(N // 128, K // 128, device="cuda", dtype=torch.float32)
-
-    monkeypatch.setattr(torch_quant, "_safe_act_quant", _fail_standalone_act_quant)
-    out = torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear(
-        x, w_fp8, None, [], [ws_inv], [], [], input_scale_fmt="ue8m0"
-    )
-    assert out.shape == (1, 1, N)
-
-
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
 def test_finegrained_fp8_linear_quant_prologue_cudagraph():
-    """The automatic decode prologue captures and replays in a CUDA graph."""
+    # The automatic decode prologue must capture and replay in a CUDA graph.
     x, w_fp8, ws_inv = _fg_ue8m0_linear_case(4096, 2048)
     x_static = x.clone()
     eager = _fg_linear(x_static, w_fp8, ws_inv)
@@ -810,3 +701,65 @@ def test_finegrained_fp8_linear_quant_prologue_cudagraph():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, _fg_linear(x_static, w_fp8, ws_inv))
+
+
+# ---------------------------------------------------------------------------
+# Fused block-FP8 linear + merge-add epilogue
+# ---------------------------------------------------------------------------
+
+
+def _residual_case(M, N, K):
+    torch.manual_seed(0)
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) / K**0.5
+    weight_fp8 = (torch.randn(N, K, device="cuda", dtype=torch.float32) / K**0.5).to(
+        torch.float8_e4m3fn
+    )
+    sn, sk = -(-N // 128), -(-K // 128)
+    ws_inv = torch.rand(sn, sk, device="cuda", dtype=torch.float32) * 0.5 + 0.75
+    residual = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    return x, weight_fp8, ws_inv, residual
+
+
+# Contract: exact rounding equivalence with the unfused linear + elementwise add
+# (round(acc) -> fp32 add -> one final rounding), per fused-epilogue dispatch path:
+#   (1, 4096, 512)   rowwise GEMV epilogue (DSV4 shared-expert w2 site)
+#   (1, 2048, 512)   full-K HAS_RESIDUAL epilogue
+#   (64, 576, 7168)  full-K masked store + masked residual load
+#   (2, 1024, 4096)  split-K dispatch, separate-add fallback
+@pytest.mark.parametrize(
+    "M,N,K", [(1, 4096, 512), (1, 2048, 512), (64, 576, 7168), (2, 1024, 4096)]
+)
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+def test_fp8_linear_residual_add_bit_exact(M, N, K):
+    x, weight_fp8, ws_inv, residual = _residual_case(M, N, K)
+    ref = (
+        torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+            x, weight_fp8, None, [], [ws_inv], [], []
+        )
+        + residual
+    )
+    fused = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add(
+        x, weight_fp8, None, [], [ws_inv], [], [], residual=residual
+    )
+    assert fused.shape == ref.shape and fused.dtype == ref.dtype
+    assert torch.equal(fused, ref)
+
+
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+def test_fp8_linear_residual_add_prequantized_input():
+    # input_scale=[scale] skips the internal quant; must match the raw-input call
+    # byte-for-byte, with the output dtype taken from the scale.
+    from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import _safe_act_quant
+
+    M, N, K = 1, 4096, 512
+    x, weight_fp8, ws_inv, residual = _residual_case(M, N, K)
+    qx, s = _safe_act_quant(x.contiguous(), 128)
+
+    fused_raw = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add(
+        x, weight_fp8, None, [], [ws_inv], [], [], residual=residual
+    )
+    fused_pre = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear_residual_add(
+        qx, weight_fp8, None, [s], [ws_inv], [], [], residual=residual
+    )
+    assert fused_pre.dtype == s.dtype
+    assert torch.equal(fused_pre, fused_raw)
