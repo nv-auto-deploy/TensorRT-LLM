@@ -68,6 +68,7 @@ from .sharding import (
     _get_dist_ops,
     _load_hook,
     _shard_fp4_weight_scale,
+    resolve_plain_allreduce_strategy,
     shard_weight_tensor,
     validate_allreduce_strategy,
 )
@@ -592,7 +593,8 @@ class GroupedFineGrainedFP8LinearShardableNode(ShardableNode):
             world_size=dc.tp_size,
         )
         scale_weight_node = _weight_node_from_attr(gm, scale_node, scale_tensor)
-        _shard_scale_and_hook(gm, scale_weight_node, scale_split(scale_tensor), scale_split)
+        sharded_scale = scale_split(scale_tensor)
+        _shard_scale_and_hook(gm, scale_weight_node, sharded_scale, scale_split)
 
         view_localizes_groups = self._input_is_tp_scaled_group_view(input_node, group_dim)
         if view_localizes_groups:
@@ -772,9 +774,12 @@ class AllReduceShardableNode(ShardableNode):
 
         _, all_reduce_op = _get_dist_ops(dc.dist_backend)
         [x] = extract_op_args(self.node, "x")
+        strategy = resolve_plain_allreduce_strategy(dc, self.node, all_reduce_op)
         self.node.target = all_reduce_op
-        self.node.args = (x, dc.allreduce_strategy)
-        ad_logger.debug(f"  inserted real all_reduce ({all_reduce_op.__name__})")
+        self.node.args = (x, strategy)
+        ad_logger.debug(
+            f"  inserted real all_reduce ({all_reduce_op.__name__}, strategy={strategy})"
+        )
         return 1
 
 
@@ -1429,11 +1434,10 @@ class StackedMoEShardableNode(ShardableNode):
             setattr(submod, attr_name, local_tensor)
 
         arg.meta["val"] = local_tensor
-        f_split = partial(cls._slice_experts, lo=lo, hi=hi)
         submod._register_load_state_dict_pre_hook(
             partial(
                 _load_hook,
-                f_split=f_split,
+                f_split=partial(cls._slice_experts, lo=lo, hi=hi),
                 param_key=attr_name,
                 param_shape=local_tensor.shape,
             )
@@ -1507,10 +1511,11 @@ class StackedMoEShardableNode(ShardableNode):
         )
 
         _, all_reduce_op = _get_dist_ops(dc.dist_backend)
+        strategy = resolve_plain_allreduce_strategy(dc, self.node, all_reduce_op)
         with gm.graph.inserting_after(self.node):
             red = gm.graph.call_function(
                 all_reduce_op,
-                args=(self.node, dc.allreduce_strategy),
+                args=(self.node, strategy),
             )
             self.node.replace_all_uses_with(red)
             red.replace_input_with(red, self.node)
@@ -1807,19 +1812,31 @@ class ApplyShardingHints(BaseTransform):
                         shardable_node, (MoEShardableNode, StackedMoEShardableNode)
                     ):
                         continue
-                    # Gather-shard simple_shard_filter matches (e.g. lm_head) regardless of
-                    # shard_layers: column split + all_gather of the huge vocab projection.
-                    if simple_shard_filter and is_any_lin_op(node):
-                        wnodes = extract_weight_nodes(node)
-                        key = wnodes.weights[0].node_key if wnodes.weights else ""
-                        if any(kw in key for kw in simple_shard_filter):
+                    # layer_type hint (None when the op schema has no such arg),
+                    # shared by the LM-head trigger and shard_layers filter below.
+                    is_lin = is_any_lin_op(node)
+                    lt = None
+                    if is_lin or shard_layers is not None:
+                        [lt] = extract_op_args(node, "layer_type")
+                    # Gather-shard the LM-head vocab projection (column split +
+                    # all_gather) regardless of shard_layers -- the hint-driven
+                    # sharder would otherwise leave it replicated, so every rank
+                    # re-casts and matmuls the full [vocab, hidden] weight each
+                    # step. Triggered either by a model-emitted layer_type="lm_head"
+                    # hint (e.g. DeepSeek-V4 head) or a simple_shard_filter
+                    # weight-name match.
+                    if is_lin:
+                        gather_head = lt == "lm_head"
+                        if not gather_head and simple_shard_filter:
+                            wnodes = extract_weight_nodes(node)
+                            key = wnodes.weights[0].node_key if wnodes.weights else ""
+                            gather_head = any(kw in key for kw in simple_shard_filter)
+                        if gather_head:
                             num_updates += _simple_shard_node(gm, node, dc)
                             continue
-                    if shard_layers is not None:
-                        [lt] = extract_op_args(node, "layer_type")
-                        if lt is not None and lt not in shard_layers:
-                            num_skipped += 1
-                            continue
+                    if shard_layers is not None and lt is not None and lt not in shard_layers:
+                        num_skipped += 1
+                        continue
 
                     num_updates += shardable_node.apply(gm, dc, max_num_tokens)
 

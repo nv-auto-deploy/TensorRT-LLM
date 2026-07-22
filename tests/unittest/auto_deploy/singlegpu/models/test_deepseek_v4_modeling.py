@@ -17,11 +17,14 @@
 
 from __future__ import annotations
 
-import inspect
+import json
 
 import pytest
 import torch
 import torch.nn.functional as F
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import WhitespaceSplit
 from torch import nn
 from torch.export import Dim
 
@@ -31,13 +34,14 @@ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models import custom as custom_models
 from tensorrt_llm._torch.auto_deploy.models.custom import modeling_deepseek_v4 as dsv4
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
+    ADDeepseekV4Tokenizer,
     DeepseekV4Attention,
     DeepseekV4Compressor,
     DeepseekV4Config,
     DeepseekV4ForCausalLM,
     DeepseekV4Indexer,
-    DeepseekV4MLP,
     DeepseekV4MoE,
+    DeepseekV4MoEGate,
     DeepseekV4RMSNorm,
 )
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
@@ -46,12 +50,7 @@ from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args, is_op
-
-DeepseekV4Router = (
-    getattr(dsv4, "DeepseekV4Router", None)
-    or getattr(dsv4, "DeepseekV4MoEGate", None)
-    or getattr(dsv4, "DeepseekV4Gate", None)
-)
+from tensorrt_llm.inputs.utils import apply_chat_template as trtllm_apply_chat_template
 
 
 @pytest.fixture(autouse=True)
@@ -348,19 +347,17 @@ def _rope_cos_sin(
 def _position_embeddings(
     config: DeepseekV4Config, position_ids: torch.Tensor
 ) -> tuple[torch.Tensor, ...]:
-    rotary_cls = getattr(dsv4, "DeepseekV4RotaryEmbedding", None)
-    if rotary_cls is not None:
-        try:
-            return rotary_cls(config)()
-        except TypeError:
-            return rotary_cls(config)(position_ids)
-
-    table_positions = torch.arange(config.ad_rope_cache_len, device=position_ids.device)
-    cos, sin = _rope_cos_sin(table_positions, config.qk_rope_head_dim, config.rope_theta)
-    cos_comp, sin_comp = _rope_cos_sin(
-        table_positions, config.qk_rope_head_dim, config.compress_rope_theta
+    cos_base_table, sin_base_table, cos_compress_table, sin_compress_table = (
+        table.to(position_ids.device) for table in dsv4.DeepseekV4RotaryEmbedding(config)()
     )
-    return cos, sin, cos_comp, sin_comp
+    return (
+        cos_base_table[position_ids],
+        sin_base_table[position_ids],
+        cos_compress_table[position_ids],
+        sin_compress_table[position_ids],
+        cos_compress_table,
+        sin_compress_table,
+    )
 
 
 def _ref_compressor(
@@ -477,287 +474,6 @@ def _ref_indexer(
     return topk_idxs.to(torch.int64)
 
 
-def _ref_sparse_attention(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    attn_sink: torch.Tensor,
-    topk_idxs: torch.Tensor,
-    softmax_scale: float,
-) -> torch.Tensor:
-    batch_size, seq_len, num_heads, _ = q.shape
-    batch_idx = torch.arange(batch_size, device=q.device).view(batch_size, 1, 1)
-    batch_idx = batch_idx.expand(batch_size, seq_len, topk_idxs.shape[-1])
-
-    compute_dtype = torch.float32 if q.dtype in (torch.float16, torch.bfloat16) else q.dtype
-    gather_idxs = topk_idxs.to(torch.long).clamp(min=0)
-    selected_kv = kv[batch_idx, gather_idxs].to(compute_dtype)
-    logits = torch.matmul(q.to(compute_dtype), selected_kv.transpose(-1, -2))
-    logits = logits * softmax_scale
-    logits = logits.masked_fill((topk_idxs < 0).unsqueeze(2), float("-inf"))
-
-    sink_logits = attn_sink.to(dtype=compute_dtype).view(1, 1, num_heads, 1)
-    sink_logits = sink_logits.expand(batch_size, seq_len, num_heads, 1)
-    weights = torch.softmax(torch.cat([logits, sink_logits], dim=-1), dim=-1)
-    output = torch.matmul(weights[..., :-1], selected_kv)
-    return output.to(q.dtype)
-
-
-def _ref_window_topk_idxs(
-    window_size: int,
-    batch_size: int,
-    seq_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    query_positions = torch.arange(seq_len, device=device).unsqueeze(1)
-    key_positions = query_positions - window_size + 1 + torch.arange(window_size, device=device)
-    key_positions = torch.where(
-        (key_positions < 0) | (key_positions > query_positions),
-        -1,
-        key_positions,
-    )
-    return key_positions.unsqueeze(0).expand(batch_size, -1, -1)
-
-
-def _ref_compress_topk_idxs(
-    ratio: int,
-    batch_size: int,
-    seq_len: int,
-    offset: int,
-    max_compressed_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    compressed_positions = torch.arange(max_compressed_len, device=device)
-    valid_lengths = torch.arange(1, seq_len + 1, device=device).unsqueeze(1) // ratio
-    topk_idxs = compressed_positions.unsqueeze(0).expand(seq_len, -1)
-    topk_idxs = torch.where(topk_idxs < valid_lengths, topk_idxs + offset, -1)
-    return topk_idxs.unsqueeze(0).expand(batch_size, -1, -1)
-
-
-# `transformers.models.deepseek_v4` is unavailable in the installed transformers package.
-# The HFDeepseekV4* classes below are test-only, HF-style minimal faithful copies of the
-# local DeepSeek V4 `inference/model.py` semantics for equivalence checks.
-class HFDeepseekV4RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _ref_rmsnorm(x, self.weight, self.eps)
-
-
-class HFDeepseekV4Compressor(nn.Module):
-    def __init__(
-        self,
-        config: DeepseekV4Config,
-        compress_ratio: int,
-        head_dim: int,
-        rotate: bool = False,
-    ) -> None:
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.head_dim = head_dim
-        self.rope_head_dim = config.qk_rope_head_dim
-        self.compress_ratio = compress_ratio
-        self.rotate = rotate
-        self.overlap = compress_ratio == 4
-        channels = 2 if self.overlap else 1
-        self.max_compressed_len = max(
-            1,
-            (int(config.ad_compress_max_seq_len) + compress_ratio - 1) // compress_ratio,
-        )
-        self.max_compressed_tokens = self.max_compressed_len * compress_ratio
-        self.ape = nn.Parameter(
-            torch.zeros(compress_ratio, channels * head_dim, dtype=torch.float32)
-        )
-        self.wkv = nn.Linear(config.hidden_size, channels * head_dim, bias=False)
-        self.wgate = nn.Linear(config.hidden_size, channels * head_dim, bias=False)
-        self.norm = HFDeepseekV4RMSNorm(head_dim, config.rms_norm_eps)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cos_table: torch.Tensor,
-        sin_table: torch.Tensor,
-        position_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        return _ref_compressor(self, hidden_states, cos_table, sin_table, position_ids)
-
-
-class HFDeepseekV4Indexer(nn.Module):
-    def __init__(self, config: DeepseekV4Config, compress_ratio: int) -> None:
-        super().__init__()
-        self.index_n_heads = config.index_n_heads
-        self.index_head_dim = config.index_head_dim
-        self.rope_head_dim = config.qk_rope_head_dim
-        self.index_topk = config.index_topk
-        self.compress_ratio = compress_ratio
-        self.softmax_scale = self.index_head_dim**-0.5
-        self.wq_b = nn.Linear(
-            config.q_lora_rank, config.index_n_heads * config.index_head_dim, bias=False
-        )
-        self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
-        self.compressor = HFDeepseekV4Compressor(
-            config,
-            compress_ratio,
-            config.index_head_dim,
-            rotate=True,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        q_lora: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        cos_table: torch.Tensor,
-        sin_table: torch.Tensor,
-        position_ids: torch.Tensor,
-        offset: int,
-    ) -> torch.Tensor:
-        return _ref_indexer(
-            self,
-            hidden_states,
-            q_lora,
-            cos,
-            sin,
-            cos_table,
-            sin_table,
-            position_ids,
-            offset,
-        )
-
-
-class HFDeepseekV4Attention(nn.Module):
-    def __init__(self, config: DeepseekV4Config, layer_idx: int) -> None:
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.hidden_size = config.hidden_size
-        self.n_heads = config.num_attention_heads
-        self.head_dim = config.head_dim
-        self.rope_head_dim = config.qk_rope_head_dim
-        self.nope_head_dim = self.head_dim - self.rope_head_dim
-        self.q_lora_rank = config.q_lora_rank
-        self.o_lora_rank = config.o_lora_rank
-        self.n_groups = config.o_groups
-        self.window_size = config.sliding_window
-        self.compress_ratio = int(config.compress_ratios[layer_idx])
-        self.rms_eps = config.rms_norm_eps
-        self.softmax_scale = self.head_dim**-0.5
-        self.group_head_width = (self.n_heads * self.head_dim) // self.n_groups
-
-        self.wq_a = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False)
-        self.q_norm = HFDeepseekV4RMSNorm(self.q_lora_rank, self.rms_eps)
-        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
-        self.wkv = nn.Linear(self.hidden_size, self.head_dim, bias=False)
-        self.kv_norm = HFDeepseekV4RMSNorm(self.head_dim, self.rms_eps)
-        self.wo_a = nn.Linear(self.group_head_width, self.n_groups * self.o_lora_rank, bias=False)
-        self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, self.hidden_size, bias=False)
-        self.attn_sink = nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32))
-        if self.compress_ratio:
-            self.compressor = HFDeepseekV4Compressor(config, self.compress_ratio, self.head_dim)
-            self.indexer = (
-                HFDeepseekV4Indexer(config, self.compress_ratio)
-                if self.compress_ratio == 4
-                else None
-            )
-        else:
-            self.compressor = None
-            self.indexer = None
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-        position_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        batch_size, seq_len, _ = hidden_states.shape
-        cos_base_table, sin_base_table, cos_compress_table, sin_compress_table = position_embeddings
-        cos_base = cos_base_table[position_ids]
-        sin_base = sin_base_table[position_ids]
-        cos_compress = cos_compress_table[position_ids]
-        sin_compress = sin_compress_table[position_ids]
-        cos = cos_compress if self.compress_ratio else cos_base
-        sin = sin_compress if self.compress_ratio else sin_base
-
-        q_lora = self.q_norm(_linear_ref(hidden_states, self.wq_a))
-        q = _linear_ref(q_lora, self.wq_b).view(batch_size, seq_len, self.n_heads, self.head_dim)
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_eps).to(q.dtype)
-
-        kv = self.kv_norm(_linear_ref(hidden_states, self.wkv))
-        q_nope, q_pe = torch.split(q, [self.nope_head_dim, self.rope_head_dim], dim=-1)
-        kv_nope, kv_pe = torch.split(kv, [self.nope_head_dim, self.rope_head_dim], dim=-1)
-        q_pe = _interleaved_rope(q_pe, cos.unsqueeze(2), sin.unsqueeze(2))
-        kv_pe = _interleaved_rope(kv_pe, cos, sin)
-        kv_nope = _ref_fake_fp8_act_quant(kv_nope, block_size=64)
-        q = torch.cat((q_nope, q_pe), dim=-1)
-        kv = torch.cat((kv_nope, kv_pe), dim=-1)
-
-        if self.compress_ratio:
-            window_idxs = _ref_window_topk_idxs(
-                self.window_size, batch_size, seq_len, hidden_states.device
-            )
-            compressed_kv = self.compressor(
-                hidden_states, cos_compress_table, sin_compress_table, position_ids
-            )
-            if self.indexer is not None:
-                compressed_idxs = self.indexer(
-                    hidden_states,
-                    q_lora,
-                    cos_compress,
-                    sin_compress,
-                    cos_compress_table,
-                    sin_compress_table,
-                    position_ids,
-                    seq_len,
-                )
-            else:
-                compressed_idxs = _ref_compress_topk_idxs(
-                    self.compress_ratio,
-                    batch_size,
-                    seq_len,
-                    seq_len,
-                    self.compressor.max_compressed_len,
-                    hidden_states.device,
-                )
-            kv_for_attention = torch.cat((kv, compressed_kv), dim=1)
-            topk_idxs = torch.cat((window_idxs, compressed_idxs), dim=-1).to(torch.int64)
-            attn_output = _ref_sparse_attention(
-                q, kv_for_attention, self.attn_sink, topk_idxs, self.softmax_scale
-            )
-        else:
-            kv_heads = kv.unsqueeze(2).expand(batch_size, seq_len, self.n_heads, self.head_dim)
-            q_bh = q.transpose(1, 2).float()
-            kv_bh = kv_heads.transpose(1, 2).float()
-            scores = torch.matmul(q_bh, kv_bh.transpose(-1, -2))
-            scores = scores * self.softmax_scale
-            query_pos = position_ids[:, :, None]
-            key_pos = position_ids[:, None, :]
-            causal = key_pos <= query_pos
-            window = (query_pos - key_pos) < self.window_size
-            scores = scores.masked_fill(~(causal.unsqueeze(1) & window.unsqueeze(1)), float("-inf"))
-            sink_logits = self.attn_sink.float().view(1, self.n_heads, 1, 1)
-            sink_logits = sink_logits.expand(batch_size, self.n_heads, seq_len, 1)
-            weights = torch.softmax(torch.cat([scores, sink_logits], dim=-1), dim=-1)[..., :-1]
-            attn_output = torch.matmul(weights, kv_bh).transpose(1, 2).to(hidden_states.dtype)
-
-        out_nope, out_pe = torch.split(
-            attn_output,
-            [self.nope_head_dim, self.rope_head_dim],
-            dim=-1,
-        )
-        out_pe = _interleaved_rope(out_pe, cos.unsqueeze(2), sin.unsqueeze(2), inverse=True)
-        attn_output = torch.cat((out_nope, out_pe), dim=-1)
-        attn_output = attn_output.view(batch_size, seq_len, self.n_groups, -1)
-        wo_a = self.wo_a.weight.float().view(self.n_groups, self.o_lora_rank, -1)
-        attn_output = torch.matmul(
-            attn_output.float().unsqueeze(-2),
-            wo_a.transpose(-1, -2),
-        ).squeeze(-2)
-        attn_output = attn_output.flatten(2)
-        return _linear_ref(attn_output.to(hidden_states.dtype), self.wo_b)
-
-
 def _ref_dense_attention(
     attn: nn.Module,
     hidden_states: torch.Tensor,
@@ -817,33 +533,10 @@ def _ref_dense_attention(
     return _linear_ref(out.reshape(bsz, seq_len, group_count * config.o_lora_rank), attn.wo_b)
 
 
-def _call_attention(
-    attn: nn.Module,
-    hidden_states: torch.Tensor,
-    position_ids: torch.Tensor,
-    config: DeepseekV4Config,
-) -> torch.Tensor:
-    signature = inspect.signature(attn.forward)
-    if "position_embeddings" in signature.parameters:
-        return attn(hidden_states, _position_embeddings(config, position_ids), position_ids)
-    if "position_ids" in signature.parameters:
-        return attn(hidden_states, position_ids)
-
-    cos, sin = _rope_cos_sin(position_ids, config.qk_rope_head_dim, config.rope_theta)
-    cos_comp, sin_comp = _rope_cos_sin(
-        position_ids, config.qk_rope_head_dim, config.compress_rope_theta
-    )
-    return attn(hidden_states, cos, sin, cos_comp, sin_comp, cos_comp[0], sin_comp[0])
-
-
-def _decoder(model: DeepseekV4ForCausalLM) -> nn.Module:
-    return getattr(model, "model", model)
-
-
 def test_small_config_exercises_flash_semantics() -> None:
     config = _small_config()
     model = DeepseekV4ForCausalLM(config).eval()
-    layers = _decoder(model).layers
+    layers = model.layers
 
     assert config.compress_ratios[0] == 0
     assert set(config.compress_ratios[1:]) == {4, 128}
@@ -858,41 +551,28 @@ def test_small_config_exercises_flash_semantics() -> None:
     assert layers[0].ffn.experts.gate_up_proj_blocks.dtype == torch.uint8
 
 
-def test_load_hook_preserves_converted_keys_and_drops_mtp_layer() -> None:
+def test_load_hook_maps_checkpoint_keys_and_drops_mtp_layer() -> None:
     config = _small_config(num_hidden_layers=1, compress_ratios=(0,), num_hash_layers=0)
     model = DeepseekV4ForCausalLM(config).eval()
-    embed = _sequential_tensor(model.embed.weight.shape)
-
-    result = model.load_state_dict(
-        {
-            "embed.weight": embed,
-            "mtp.0.e_proj.weight": torch.ones(2, 2),
-        },
-        strict=False,
-    )
-
-    assert result.unexpected_keys == []
-    torch.testing.assert_close(model.embed.weight, embed, rtol=0, atol=0)
-
-
-def test_load_hook_maps_wrapper_root_keys_and_shared_expert_aliases() -> None:
-    config = _small_config(num_hidden_layers=1, compress_ratios=(0,), num_hash_layers=0)
-    model = DeepseekV4ForCausalLM(config).eval()
+    shared = model.layers[0].ffn.shared_experts
     embed = _sequential_tensor(model.embed.weight.shape)
     head = _sequential_tensor(model.head.weight.shape, offset=10.0)
     norm = _sequential_tensor(model.norm.weight.shape, offset=20.0)
-    shared_w1 = _sequential_tensor(model.layers[0].ffn.shared_experts.w1.weight.shape, offset=30.0)
-    shared_w3 = _sequential_tensor(model.layers[0].ffn.shared_experts.w3.weight.shape, offset=40.0)
-    shared_w2 = _sequential_tensor(model.layers[0].ffn.shared_experts.w2.weight.shape, offset=50.0)
+    shared_w1 = _sequential_tensor(shared.w1.weight.shape, offset=30.0)
+    shared_w3 = _sequential_tensor(shared.w3.weight.shape, offset=40.0)
+    shared_w2 = _sequential_tensor(shared.w2.weight.shape, offset=50.0)
 
     result = model.load_state_dict(
         {
-            "model.embed_tokens.weight": embed,
+            # Already-converted keys win over their wrapper-root aliases.
+            "embed.weight": embed,
+            "model.embed_tokens.weight": _sequential_tensor(model.embed.weight.shape, offset=99.0),
             "lm_head.weight": head,
             "model.norm.weight": norm,
             "model.layers.0.ffn.shared_experts.gate_proj.weight": shared_w1,
             "model.layers.0.ffn.shared_experts.up_proj.weight": shared_w3,
             "model.layers.0.ffn.shared_experts.down_proj.weight": shared_w2,
+            "mtp.0.e_proj.weight": torch.ones(2, 2),
         },
         strict=False,
     )
@@ -901,15 +581,9 @@ def test_load_hook_maps_wrapper_root_keys_and_shared_expert_aliases() -> None:
     torch.testing.assert_close(model.embed.weight, embed, rtol=0, atol=0)
     torch.testing.assert_close(model.head.weight, head, rtol=0, atol=0)
     torch.testing.assert_close(model.norm.weight, norm, rtol=0, atol=0)
-    torch.testing.assert_close(
-        model.layers[0].ffn.shared_experts.w1.weight, shared_w1, rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        model.layers[0].ffn.shared_experts.w3.weight, shared_w3, rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        model.layers[0].ffn.shared_experts.w2.weight, shared_w2, rtol=0, atol=0
-    )
+    torch.testing.assert_close(shared.w1.weight, shared_w1, rtol=0, atol=0)
+    torch.testing.assert_close(shared.w3.weight, shared_w3, rtol=0, atol=0)
+    torch.testing.assert_close(shared.w2.weight, shared_w2, rtol=0, atol=0)
 
 
 def test_rotary_embedding_returns_full_cached_tables() -> None:
@@ -926,6 +600,79 @@ def test_rotary_embedding_returns_full_cached_tables() -> None:
     assert cos_base[position_ids].shape == (2, 5, config.qk_rope_head_dim // 2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_attention_consumes_only_hoisted_rows_for_its_variant() -> None:
+    """NaN-poison the RoPE rows a layer must not touch; output must stay byte-identical."""
+    config = _small_config(head_dim=128, qk_rope_head_dim=64, index_head_dim=128)
+    position_ids = _position_ids(2, 5, "cuda")
+    embeddings = _position_embeddings(config, position_ids)
+    (
+        cos_base,
+        sin_base,
+        cos_compress,
+        sin_compress,
+        cos_compress_table,
+        sin_compress_table,
+    ) = embeddings
+    nan_rows = torch.full_like(cos_base, float("nan"))
+    nan_table = torch.full_like(cos_compress_table, float("nan"))
+
+    poisoned_by_layer = {
+        0: (cos_base, sin_base, nan_rows, nan_rows, nan_table, nan_table),
+        1: (nan_rows, nan_rows, cos_compress, sin_compress, cos_compress_table, sin_compress_table),
+        2: (nan_rows, nan_rows, cos_compress, sin_compress, cos_compress_table, sin_compress_table),
+    }
+    for layer_idx, poisoned in poisoned_by_layer.items():
+        attn = DeepseekV4Attention(config, layer_idx=layer_idx).eval().to("cuda")
+        hidden_states = torch.randn(2, 5, config.hidden_size, device="cuda")
+        with torch.no_grad():
+            reference = attn(hidden_states, embeddings, position_ids)
+            actual = attn(hidden_states, poisoned, position_ids)
+        assert torch.isfinite(reference).all(), f"layer {layer_idx}: non-finite reference"
+        assert torch.equal(actual, reference), f"layer {layer_idx}: poisoned rows leaked"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_export_hoists_rope_row_gathers_to_model_root() -> None:
+    """The exported graph carries exactly four model-root RoPE row gathers (one per table)."""
+    config = _small_config(head_dim=128, qk_rope_head_dim=64, index_head_dim=128)
+    model = DeepseekV4ForCausalLM(config).eval().to("cuda")
+    input_ids = torch.randint(0, config.vocab_size, (2, 6), device="cuda")
+    position_ids = _position_ids(2, 6, input_ids.device)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(input_ids,),
+        kwargs={"position_ids": position_ids},
+        dynamic_shapes={
+            "input_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+            "position_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        },
+        num_moe_experts_for_export=2,
+    )
+
+    table_shape = (config.ad_rope_cache_len, config.qk_rope_head_dim // 2)
+
+    def _reads_rope_table(node: torch.fx.Node) -> bool:
+        src = node.args[0]
+        if not isinstance(src, torch.fx.Node):
+            return False
+        val = src.meta.get("val")
+        return val is not None and tuple(val.shape) == table_shape
+
+    row_gathers = [
+        node
+        for node in gm.graph.nodes
+        if node.op == "call_function"
+        and node.target == torch.ops.aten.index.Tensor
+        and _reads_rope_table(node)
+    ]
+    assert len(row_gathers) == 4, (
+        f"expected 4 model-root RoPE row gathers, found {len(row_gathers)}: "
+        f"{[node.name for node in row_gathers]}"
+    )
+
+
 def test_rmsnorm_matches_reference() -> None:
     norm = DeepseekV4RMSNorm(16, eps=1e-6)
     with torch.no_grad():
@@ -938,15 +685,59 @@ def test_rmsnorm_matches_reference() -> None:
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
 
-def test_mlp_swiglu_limit_matches_reference() -> None:
-    mlp = DeepseekV4MLP(16, 12, swiglu_limit=0.5).eval()
-    _set_mlp_weights(mlp)
-    x = torch.linspace(-2.0, 2.0, 2 * 3 * 16).view(2, 3, 16)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_q_lora_rmsnorm_export_uses_specialized_kernel() -> None:
+    config = _small_config(
+        num_hidden_layers=1,
+        compress_ratios=(0,),
+        num_hash_layers=0,
+        q_lora_rank=1024,
+    )
+    norm = DeepseekV4Attention(config, layer_idx=0).q_norm.eval().cuda()
+    x = torch.randn(2, 3, config.q_lora_rank, device="cuda", dtype=torch.bfloat16)
 
-    actual = mlp(x)
-    expected = _ref_mlp(mlp, x)
+    gm = torch_export_to_gm(norm, args=(x,))
 
-    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    optimized_op = torch.ops.auto_deploy.triton_rms_norm.default
+    assert len(_call_nodes(gm, optimized_op)) == 1
+    assert len(_call_nodes(gm, torch.ops.auto_deploy.torch_rmsnorm.default)) == 0
+    torch.testing.assert_close(
+        gm(x),
+        torch.ops.auto_deploy.torch_rmsnorm(x, norm.weight, norm.eps),
+        rtol=2e-2,
+        atol=1e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("device", "width", "dtype"),
+    [
+        pytest.param("cpu", 1024, torch.bfloat16, id="cpu"),
+        pytest.param("cuda", 1024, torch.float32, id="cuda-fp32"),
+        pytest.param("cuda", 16, torch.bfloat16, id="cuda-narrow"),
+    ],
+)
+def test_q_lora_rmsnorm_falls_back_when_unsupported(
+    device: str, width: int, dtype: torch.dtype
+) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    config = _small_config(
+        num_hidden_layers=1,
+        compress_ratios=(0,),
+        num_hash_layers=0,
+        q_lora_rank=width,
+    )
+    norm = DeepseekV4Attention(config, layer_idx=0).q_norm.eval().to(device)
+    x = torch.randn(2, 3, width, device=device, dtype=dtype)
+
+    if device == "cuda":
+        gm = torch_export_to_gm(norm, args=(x,))
+    else:
+        gm = torch.export.export(norm, (x,), strict=False).module()
+
+    assert len(_call_nodes(gm, torch.ops.auto_deploy.triton_rms_norm.default)) == 0
+    assert len(_call_nodes(gm, torch.ops.auto_deploy.torch_rmsnorm.default)) == 1
 
 
 def test_deepseek_v4_chat_prompt_format_matches_reference() -> None:
@@ -967,6 +758,52 @@ def test_deepseek_v4_chat_prompt_format_matches_reference() -> None:
         "<｜begin▁of▁sentence｜>sys<｜User｜>u<｜Assistant｜></think>"
         "a<｜end▁of▁sentence｜><｜User｜>u2<｜Assistant｜></think>"
     )
+    assert (
+        dsv4._format_deepseek_v4_chat_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "block"}],
+                    "thinking_mode": "thinking",
+                },
+                {"role": "latest_reminder", "content": "r"},
+            ]
+        )
+        == "<｜begin▁of▁sentence｜><｜User｜>block<｜Assistant｜><think><｜latest_reminder｜>r"
+    )
+    with pytest.raises(NotImplementedError):
+        dsv4._format_deepseek_v4_chat_messages([{"role": "tool", "content": "x"}])
+
+
+def test_tokenizer_pins_chat_marker_and_shared_entry_point_dispatches_on_it(tmp_path) -> None:
+    tok = Tokenizer(WordLevel({"<unk>": 0, "hi": 1}, unk_token="<unk>"))
+    tok.pre_tokenizer = WhitespaceSplit()
+    tok.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps(
+            {"bos_token": {"content": "<bos>"}, "eos_token": "<eos>", "model_max_length": 64}
+        )
+    )
+
+    tokenizer = ADDeepseekV4Tokenizer.from_pretrained(tmp_path)
+    assert tokenizer.chat_template == "deepseek_v4_chat"
+
+    conversation = [{"role": "user", "content": "hi"}]
+    prompt = dsv4._format_deepseek_v4_chat_messages(conversation)
+    token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    assert tokenizer.apply_chat_template(conversation, tokenize=False) == prompt
+    assert tokenizer.apply_chat_template(conversation) == token_ids
+
+    common = dict(
+        model_type="deepseek_v4",
+        tokenizer=tokenizer,
+        processor=None,
+        conversation=conversation,
+        add_generation_prompt=True,
+        mm_placeholder_counts=[],
+    )
+    assert trtllm_apply_chat_template(**common, tools=[{"type": "function"}]) == prompt
+    assert trtllm_apply_chat_template(**common, enable_tokenize=True) == token_ids
 
 
 def test_moe_shared_experts_use_configured_swiglu_limit() -> None:
@@ -983,38 +820,43 @@ def test_moe_shared_experts_use_configured_swiglu_limit() -> None:
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_router_hash_and_score_routing_match_reference() -> None:
-    assert DeepseekV4Router is not None, "DeepSeek V4 router class must be exposed for tests"
     config = _small_config()
-    hidden_states = torch.linspace(-1.0, 1.0, 5 * config.hidden_size).view(5, config.hidden_size)
-    input_ids = torch.tensor([0, 1, 2, 3, 4])
+    hidden_states = torch.linspace(-1.0, 1.0, 5 * config.hidden_size, device="cuda").view(
+        5, config.hidden_size
+    )
+    input_ids = torch.tensor([0, 1, 2, 3, 4], device="cuda")
 
-    hash_router = DeepseekV4Router(config, layer_idx=0).eval()
+    # Loose weight tolerance: the fused Triton routing kernel accumulates fp32
+    # in a different order than the eager reference.
+    hash_router = DeepseekV4MoEGate(config, layer_idx=0).eval().cuda()
     _set_router_weights(hash_router)
     expected_hash = _ref_router(hash_router, hidden_states, input_ids, config, hash_routing=True)
     actual_hash = hash_router(hidden_states, input_ids)
     torch.testing.assert_close(actual_hash[0], expected_hash[0])
-    torch.testing.assert_close(actual_hash[1], expected_hash[1], rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(actual_hash[1], expected_hash[1], rtol=1e-3, atol=1e-5)
 
-    score_router = DeepseekV4Router(config, layer_idx=config.num_hash_layers).eval()
+    score_router = DeepseekV4MoEGate(config, layer_idx=config.num_hash_layers).eval().cuda()
     _set_router_weights(score_router)
     expected_score = _ref_router(score_router, hidden_states, input_ids, config, hash_routing=False)
     actual_score = score_router(hidden_states, input_ids)
     torch.testing.assert_close(actual_score[0], expected_score[0])
-    torch.testing.assert_close(actual_score[1], expected_score[1], rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(actual_score[1], expected_score[1], rtol=1e-3, atol=1e-5)
 
 
-@pytest.mark.parametrize("layer_idx", [0, 1], ids=["hash-routing", "score-routing"])
-def test_moe_uses_packed_mxfp4_routed_experts(layer_idx: int) -> None:
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_moe_uses_packed_mxfp4_routed_experts() -> None:
     config = _small_config(num_hidden_layers=2, compress_ratios=(0, 0))
-    moe = DeepseekV4MoE(config, layer_idx=layer_idx).eval()
+    moe = DeepseekV4MoE(config, layer_idx=0).eval()
     _set_router_weights(moe.gate)
     _set_mlp_weights(moe.shared_experts, offset=0.4)
+    moe = moe.cuda()
 
-    hidden_states = torch.linspace(-1.5, 1.5, 2 * 3 * config.hidden_size).view(
+    hidden_states = torch.linspace(-1.5, 1.5, 2 * 3 * config.hidden_size, device="cuda").view(
         2, 3, config.hidden_size
     )
-    input_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
+    input_ids = torch.tensor([[0, 1, 2], [3, 4, 5]], device="cuda")
 
     actual = moe(hidden_states, input_ids)
 
@@ -1034,53 +876,32 @@ def test_moe_uses_packed_mxfp4_routed_experts(layer_idx: int) -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_dense_attention_with_sinks_matches_reference() -> None:
-    config = _small_config(num_hidden_layers=1, compress_ratios=(0,), num_hash_layers=0)
+    # head_dim - qk_rope_head_dim must be a multiple of the fused KV front-end's
+    # fp8 block (64): deepseek_v4_kv_norm_rope_concat requires Dn % 64 == 0.
+    config = _small_config(
+        num_hidden_layers=1,
+        compress_ratios=(0,),
+        num_hash_layers=0,
+        head_dim=128,
+        qk_rope_head_dim=64,
+    )
     attn = DeepseekV4Attention(config, layer_idx=0).eval()
     with torch.no_grad():
         attn.attn_sink.copy_(torch.tensor([-0.5, 0.0, 0.25, 0.75]))
-    hidden_states = torch.randn(2, 5, config.hidden_size)
+    attn = attn.cuda()
+    torch.manual_seed(0)
+    hidden_states = torch.randn(2, 5, config.hidden_size, device="cuda")
     position_ids = _position_ids(2, 5, hidden_states.device)
 
-    actual = _call_attention(attn, hidden_states, position_ids, config)
+    actual = attn(hidden_states, _position_embeddings(config, position_ids), position_ids)
     expected = _ref_dense_attention(attn, hidden_states, position_ids, config)
 
     assert_rmse_close(actual, expected, rmse_ratio_tol=0.10, msg="Dense attention: ")
 
 
-def test_torch_attention_with_sinks_accepts_bfloat16_inputs() -> None:
-    query = torch.randn(2, 5, 4, 8, dtype=torch.bfloat16)
-    key = torch.randn(2, 5, 4, 8, dtype=torch.bfloat16)
-    value = torch.randn(2, 5, 4, 8, dtype=torch.bfloat16)
-    sinks = torch.tensor([-0.5, 0.0, 0.25, 0.75], dtype=torch.bfloat16)
-
-    actual = torch.ops.auto_deploy.torch_attention(
-        query,
-        key,
-        value,
-        dropout_p=0.0,
-        is_causal=True,
-        scale=0.5,
-        sinks=sinks,
-        sliding_window=4,
-        layout="bsnd",
-    )
-    expected = torch.ops.auto_deploy.torch_attention(
-        query.float(),
-        key.float(),
-        value.float(),
-        dropout_p=0.0,
-        is_causal=True,
-        scale=0.5,
-        sinks=sinks.float(),
-        sliding_window=4,
-        layout="bsnd",
-    )
-
-    assert actual.dtype == torch.bfloat16
-    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
-
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_compressor_matches_independent_reference_with_fake_fp8_nope_path() -> None:
     config = _small_config(
         hidden_size=8,
@@ -1102,8 +923,9 @@ def test_compressor_matches_independent_reference_with_fake_fp8_nope_path() -> N
             torch.linspace(-0.2, 0.3, compressor.ape.numel()).view_as(compressor.ape)
         )
         compressor.norm.weight.copy_(torch.linspace(0.6, 1.4, config.head_dim))
+    compressor = compressor.cuda()
 
-    hidden_states = torch.linspace(-1.5, 1.75, 2 * 5 * config.hidden_size)
+    hidden_states = torch.linspace(-1.5, 1.75, 2 * 5 * config.hidden_size, device="cuda")
     hidden_states = hidden_states.view(2, 5, config.hidden_size).to(torch.bfloat16)
     position_ids = _position_ids(2, 5, hidden_states.device)
     table_positions = torch.arange(config.ad_rope_cache_len, device=hidden_states.device)
@@ -1120,6 +942,7 @@ def test_compressor_matches_independent_reference_with_fake_fp8_nope_path() -> N
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0.01, atol=0.01)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_ratio4_indexer_matches_independent_reference_and_masks_invalid_prefix() -> None:
     config = _small_config(
         hidden_size=8,
@@ -1147,11 +970,14 @@ def test_ratio4_indexer_matches_independent_reference_and_masks_invalid_prefix()
             )
         )
         indexer.compressor.norm.weight.copy_(torch.linspace(0.7, 1.3, config.index_head_dim))
+    indexer = indexer.cuda()
 
-    hidden_states = torch.linspace(-1.4, 1.6, 2 * 5 * config.hidden_size).view(
+    hidden_states = torch.linspace(-1.4, 1.6, 2 * 5 * config.hidden_size, device="cuda").view(
         2, 5, config.hidden_size
     )
-    q_lora = torch.linspace(-0.9, 1.1, 2 * 5 * config.q_lora_rank).view(2, 5, config.q_lora_rank)
+    q_lora = torch.linspace(-0.9, 1.1, 2 * 5 * config.q_lora_rank, device="cuda").view(
+        2, 5, config.q_lora_rank
+    )
     position_ids = _position_ids(2, 5, hidden_states.device)
     cos, sin = _rope_cos_sin(position_ids, config.qk_rope_head_dim, config.compress_rope_theta)
     table_positions = torch.arange(config.ad_rope_cache_len, device=hidden_states.device)
@@ -1191,10 +1017,18 @@ def test_ratio4_indexer_matches_independent_reference_and_masks_invalid_prefix()
     assert (actual[:, 3:] >= 0).sum(dim=-1).eq(1).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_export_dynamic_shapes_finite_logits_and_expected_ops() -> None:
-    config = _small_config(num_hidden_layers=2, compress_ratios=(0, 4), num_hash_layers=1)
-    model = DeepseekV4ForCausalLM(config).eval()
-    input_ids = torch.randint(0, config.vocab_size, (2, 6))
+    config = _small_config(
+        num_hidden_layers=2,
+        compress_ratios=(0, 4),
+        num_hash_layers=1,
+        head_dim=128,
+        qk_rope_head_dim=64,
+        index_head_dim=128,
+    )
+    model = DeepseekV4ForCausalLM(config).eval().cuda()
+    input_ids = torch.randint(0, config.vocab_size, (2, 6), device="cuda")
     position_ids = _position_ids(2, 6, input_ids.device)
 
     gm = torch_export_to_gm(
@@ -1214,7 +1048,7 @@ def test_export_dynamic_shapes_finite_logits_and_expected_ops() -> None:
     assert torch.isfinite(exported).all()
     assert_rmse_close(exported, eager, rmse_ratio_tol=0.05, msg="Export first shape: ")
 
-    input_ids_2 = torch.randint(0, config.vocab_size, (1, 4))
+    input_ids_2 = torch.randint(0, config.vocab_size, (1, 4), device="cuda")
     position_ids_2 = _position_ids(1, 4, input_ids_2.device)
     with torch.no_grad():
         out_2 = _output_logits(gm(input_ids_2, position_ids=position_ids_2))
@@ -1232,27 +1066,45 @@ def test_export_dynamic_shapes_finite_logits_and_expected_ops() -> None:
         for name in set(target_names)
         if name.startswith("auto_deploy.") and not name.startswith("auto_deploy.torch_")
     )
-    assert non_torch_ad_ops == [
-        "auto_deploy.all_reduce.default",
-        "auto_deploy.view.default",
+    # Besides the fused deepseek_v4_* ops, only all_reduce and the AD view op may appear.
+    unexpected_ops = [
+        name
+        for name in non_torch_ad_ops
+        if not name.startswith("auto_deploy.deepseek_v4_")
+        and name not in ("auto_deploy.all_reduce.default", "auto_deploy.view.default")
     ]
+    assert unexpected_ops == []
+    assert "auto_deploy.all_reduce.default" in non_torch_ad_ops
+    assert "auto_deploy.view.default" in non_torch_ad_ops
 
 
-def test_export_mxfp4_experts_apply_sharding_hints_rank1_ep_graph() -> None:
+@pytest.mark.parametrize(
+    ("world_size", "rank", "num_attention_heads", "o_groups", "n_routed_experts", "hidden_size"),
+    [(2, 1, 4, 2, 4, 32), (8, 6, 8, 8, 256, 64)],
+    ids=["ws2-rank1", "ws8-rank6"],
+)
+def test_export_mxfp4_experts_apply_sharding_hints_ep_tp_graph(
+    world_size: int,
+    rank: int,
+    num_attention_heads: int,
+    o_groups: int,
+    n_routed_experts: int,
+    hidden_size: int,
+) -> None:
     config = _small_config(
         vocab_size=64,
-        hidden_size=32,
+        hidden_size=hidden_size,
         num_hidden_layers=1,
-        num_attention_heads=4,
+        num_attention_heads=num_attention_heads,
         num_key_value_heads=1,
         head_dim=8,
         q_lora_rank=8,
         qk_rope_head_dim=4,
-        o_groups=2,
+        o_groups=o_groups,
         o_lora_rank=8,
         compress_ratios=(0,),
         moe_intermediate_size=64,
-        n_routed_experts=4,
+        n_routed_experts=n_routed_experts,
         n_shared_experts=1,
         num_experts_per_tok=2,
         num_hash_layers=0,
@@ -1276,105 +1128,8 @@ def test_export_mxfp4_experts_apply_sharding_hints_rank1_ep_graph() -> None:
     assert len(_call_nodes(gm, base_op)) == 1
 
     gm_out = _make_apply_sharding_hints_optimizer(
-        world_size=2,
-        rank=1,
-        dist_backend="torch",
-    )(None, gm)
-
-    assert len(_call_nodes(gm_out, base_op)) == 0
-    ep_nodes = _call_nodes(gm_out, ep_op)
-    assert len(ep_nodes) == 1
-    ep_node = ep_nodes[0]
-
-    [expert_start, gate_up_blocks] = extract_op_args(
-        ep_node,
-        "expert_start",
-        "gate_up_blocks",
-    )
-    assert expert_start == 2
-    assert getattr(gate_up_blocks, "op", None) == "get_attr"
-    assert gm_out.get_buffer(gate_up_blocks.target).shape[0] == 2
-
-    dist_all_reduce_op = torch.ops.auto_deploy.torch_dist_all_reduce.default
-    all_reduce_nodes = _call_nodes(gm_out, dist_all_reduce_op)
-    assert len(all_reduce_nodes) == 3
-    assert any(node.args[0] is ep_node for node in all_reduce_nodes)
-    assert len(_call_nodes(gm_out, torch.ops.auto_deploy.all_reduce.default)) == 0
-
-    layer = gm_out.get_submodule("layers.0")
-    assert layer.attn.attn_sink.shape == (config.num_attention_heads // 2,)
-    assert layer.attn.wq_b.weight.shape == (
-        config.num_attention_heads * config.head_dim // 2,
-        config.q_lora_rank,
-    )
-    assert layer.attn.wo_a.weight.shape == (
-        config.o_lora_rank,
-        config.num_attention_heads * config.head_dim // config.o_groups,
-    )
-    assert layer.attn.wo_b.weight.shape == (
-        config.hidden_size,
-        config.o_groups * config.o_lora_rank // 2,
-    )
-
-    sparse_nodes = _call_nodes(
-        gm_out,
-        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention.default,
-    )
-    assert len(sparse_nodes) == 1
-    attn_sink = sparse_nodes[0].args[2]
-    assert getattr(attn_sink, "op", None) == "get_attr"
-    assert gm_out.get_parameter(attn_sink.target).shape == (config.num_attention_heads // 2,)
-
-    group_width = config.num_attention_heads * config.head_dim // config.o_groups
-    view_shapes = [
-        extract_op_args(node, "shape")[0]
-        for node in _call_nodes(gm_out, torch.ops.auto_deploy.view.default)
-    ]
-    assert [2, 4, -1, config.head_dim] in view_shapes
-    assert [2, 4, -1, group_width] in view_shapes
-    assert [-1, config.o_lora_rank, group_width] in view_shapes
-
-
-def test_export_mxfp4_experts_apply_sharding_hints_rank6_ep8_tp8_graph() -> None:
-    config = _small_config(
-        vocab_size=64,
-        hidden_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=8,
-        num_key_value_heads=1,
-        head_dim=8,
-        q_lora_rank=8,
-        qk_rope_head_dim=4,
-        o_groups=8,
-        o_lora_rank=8,
-        compress_ratios=(0,),
-        moe_intermediate_size=64,
-        n_routed_experts=256,
-        n_shared_experts=1,
-        num_experts_per_tok=2,
-        num_hash_layers=0,
-        ad_rope_cache_len=16,
-        ad_compress_max_seq_len=16,
-        max_position_embeddings=16,
-    )
-    model = DeepseekV4ForCausalLM(config).eval()
-    input_ids = torch.randint(0, config.vocab_size, (2, 4))
-    position_ids = _position_ids(2, 4, input_ids.device)
-
-    gm = torch_export_to_gm(
-        model,
-        args=(input_ids,),
-        kwargs={"position_ids": position_ids},
-        strict=False,
-    )
-
-    base_op = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing.default
-    ep_op = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing_ep.default
-    assert len(_call_nodes(gm, base_op)) == 1
-
-    gm_out = _make_apply_sharding_hints_optimizer(
-        world_size=8,
-        rank=6,
+        world_size=world_size,
+        rank=rank,
         dist_backend="torch",
     )(None, gm)
 
@@ -1389,9 +1144,8 @@ def test_export_mxfp4_experts_apply_sharding_hints_rank6_ep8_tp8_graph() -> None
         "gate_up_blocks",
         "down_blocks",
     )
-    local_expert_count = config.n_routed_experts // 8
-    assert expert_start == 192
-    assert local_expert_count == 32
+    local_expert_count = n_routed_experts // world_size
+    assert expert_start == rank * local_expert_count
     assert getattr(gate_up_blocks, "op", None) == "get_attr"
     assert getattr(down_blocks, "op", None) == "get_attr"
     assert gm_out.get_buffer(gate_up_blocks.target).shape[0] == local_expert_count
@@ -1399,24 +1153,22 @@ def test_export_mxfp4_experts_apply_sharding_hints_rank6_ep8_tp8_graph() -> None
 
     dist_all_reduce_op = torch.ops.auto_deploy.torch_dist_all_reduce.default
     all_reduce_nodes = _call_nodes(gm_out, dist_all_reduce_op)
+    assert len(all_reduce_nodes) == 3
     assert any(node.args[0] is ep_node for node in all_reduce_nodes)
     assert len(_call_nodes(gm_out, torch.ops.auto_deploy.all_reduce.default)) == 0
 
     layer = gm_out.get_submodule("layers.0")
-    local_head_count = config.num_attention_heads // 8
-    assert local_head_count == 1
+    local_head_count = num_attention_heads // world_size
+    group_width = num_attention_heads * config.head_dim // o_groups
     assert layer.attn.attn_sink.shape == (local_head_count,)
     assert layer.attn.wq_b.weight.shape == (
         local_head_count * config.head_dim,
         config.q_lora_rank,
     )
-    assert layer.attn.wo_a.weight.shape == (
-        config.o_lora_rank,
-        config.num_attention_heads * config.head_dim // config.o_groups,
-    )
+    assert layer.attn.wo_a.weight.shape == (config.o_lora_rank, group_width)
     assert layer.attn.wo_b.weight.shape == (
         config.hidden_size,
-        config.o_groups * config.o_lora_rank // 8,
+        o_groups * config.o_lora_rank // world_size,
     )
 
     sparse_nodes = _call_nodes(
@@ -1427,6 +1179,15 @@ def test_export_mxfp4_experts_apply_sharding_hints_rank6_ep8_tp8_graph() -> None
     attn_sink = sparse_nodes[0].args[2]
     assert getattr(attn_sink, "op", None) == "get_attr"
     assert gm_out.get_parameter(attn_sink.target).shape == (local_head_count,)
+
+    # Head-count-dependent view hints must stay head-count-symbolic (-1).
+    view_shapes = [
+        extract_op_args(node, "shape")[0]
+        for node in _call_nodes(gm_out, torch.ops.auto_deploy.view.default)
+    ]
+    assert [2, 4, -1, config.head_dim] in view_shapes
+    assert [2, 4, -1, group_width] in view_shapes
+    assert [-1, config.o_lora_rank, group_width] in view_shapes
 
 
 def test_ratio4_sparse_attention_sharding_only_splits_sink() -> None:
@@ -1504,6 +1265,7 @@ def test_factory_registration() -> None:
     assert ModelFactoryRegistry.get("DeepseekV4AutoModelForCausalLM") is factory_cls
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_factory_example_inputs_cover_forward_contract(tmp_path) -> None:
     config = _small_config(
         num_hidden_layers=2,
@@ -1511,6 +1273,9 @@ def test_factory_example_inputs_cover_forward_contract(tmp_path) -> None:
         ad_rope_cache_len=16,
         ad_compress_max_seq_len=12,
         max_position_embeddings=32,
+        head_dim=128,
+        qk_rope_head_dim=64,
+        index_head_dim=128,
     )
     config.save_pretrained(tmp_path)
     factory_cls = ModelFactoryRegistry.get("DeepseekV4AutoModelForCausalLM")
@@ -1527,7 +1292,78 @@ def test_factory_example_inputs_cover_forward_contract(tmp_path) -> None:
     assert position_ids.shape == input_ids.shape
     assert torch.equal(position_ids, _position_ids(2, 8, input_ids.device))
 
-    model = DeepseekV4ForCausalLM(config).eval()
+    model = DeepseekV4ForCausalLM(config).eval().cuda()
     with torch.no_grad():
-        logits = model(**example_inputs).logits
+        logits = model(**{k: v.cuda() for k, v in example_inputs.items()}).logits
     assert logits.shape == (2, 8, config.vocab_size)
+
+
+def test_moe_load_packs_mxfp4_expert_checkpoint_tensors() -> None:
+    config = _small_config(
+        num_hidden_layers=1, compress_ratios=(0,), num_hash_layers=0, n_routed_experts=2
+    )
+    model = DeepseekV4ForCausalLM(config).eval()
+    hidden, inter = config.hidden_size, config.moe_intermediate_size
+    gen = torch.Generator().manual_seed(0)
+    state_dict = {}
+    expected = {}
+    for expert in range(2):
+        for proj, rows, cols in (
+            ("w1", inter, hidden),
+            ("w3", inter, hidden),
+            ("w2", hidden, inter),
+        ):
+            weight = torch.randint(-128, 128, (rows, cols // 2), dtype=torch.int8, generator=gen)
+            scale = torch.randint(0, 255, (rows, cols // 32), dtype=torch.uint8, generator=gen)
+            state_dict[f"layers.0.ffn.experts.{expert}.{proj}.weight"] = weight
+            state_dict[f"layers.0.ffn.experts.{expert}.{proj}.scale"] = scale
+            expected[(expert, proj, "weight")] = weight.view(torch.uint8).view(rows, cols // 32, 16)
+            expected[(expert, proj, "scale")] = scale
+
+    result = model.load_state_dict(state_dict, strict=False)
+
+    assert result.unexpected_keys == []
+    experts = model.layers[0].ffn.experts
+    assert torch.equal(
+        experts.gate_up_proj_blocks,
+        torch.stack(
+            [
+                torch.cat([expected[(e, "w3", "weight")], expected[(e, "w1", "weight")]])
+                for e in range(2)
+            ]
+        ),
+    )
+    assert torch.equal(
+        experts.gate_up_proj_scales,
+        torch.stack(
+            [
+                torch.cat([expected[(e, "w3", "scale")], expected[(e, "w1", "scale")]])
+                for e in range(2)
+            ]
+        ),
+    )
+    assert torch.equal(
+        experts.down_proj_blocks, torch.stack([expected[(e, "w2", "weight")] for e in range(2)])
+    )
+    assert torch.equal(
+        experts.down_proj_scales, torch.stack([expected[(e, "w2", "scale")] for e in range(2)])
+    )
+
+
+def test_lm_head_fp32_storage_bitexact_vs_perstep_cast() -> None:
+    """bf16->fp32 is lossless, so the fp32-stored head equals the old per-step recast."""
+    config = _small_config(
+        vocab_size=257, hidden_size=128, num_hidden_layers=0, compress_ratios=(), num_hash_layers=0
+    )
+    model = DeepseekV4ForCausalLM(config).eval()
+    assert model.head.weight.dtype == torch.float32
+
+    w_bf16 = torch.randn(config.vocab_size, config.hidden_size, dtype=torch.bfloat16)
+    assert model.load_state_dict({"head.weight": w_bf16}, strict=False).unexpected_keys == []
+
+    hidden_states = torch.randn(2, 3, config.hidden_size, dtype=torch.bfloat16)
+
+    def _head_logits(weight: torch.Tensor) -> torch.Tensor:
+        return dsv4._linear(hidden_states.float(), weight, None, layer_type="lm_head").float()
+
+    assert torch.equal(_head_logits(w_bf16.float()), _head_logits(model.head.weight))

@@ -44,9 +44,7 @@ from transformers.utils import ModelOutput
 from transformers.utils.hub import cached_file
 
 from ... import custom_ops  # noqa: F401 -- register custom ops
-from ...utils.quantization_utils import fake_fp4_act_quant as _fake_fp4_act_quant
 from ...utils.quantization_utils import fake_fp8_act_quant as _fake_fp8_act_quant
-from ...utils.quantization_utils import hadamard_rotate as _hadamard_rotate
 from ..factory import ModelFactoryRegistry
 from ..hf import AutoModelForCausalLMFactory
 from ..quant_checkpoint_layout import (
@@ -614,21 +612,6 @@ def _build_rope_tables(
     return freqs.cos(), freqs.sin()
 
 
-def _apply_interleaved_rope(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    inverse: bool = False,
-) -> torch.Tensor:
-    if inverse:
-        sin = -sin
-    x_even = x[..., 0::2]
-    x_odd = x[..., 1::2]
-    out_even = x_even * cos - x_odd * sin
-    out_odd = x_even * sin + x_odd * cos
-    return torch.stack((out_even, out_odd), dim=-1).flatten(-2).to(x.dtype)
-
-
 def _window_topk_idxs(
     window_size: int,
     batch_size: int,
@@ -645,21 +628,6 @@ def _window_topk_idxs(
     return key_positions.unsqueeze(0).expand(batch_size, -1, -1)
 
 
-def _compress_topk_idxs(
-    ratio: int,
-    batch_size: int,
-    seq_len: int,
-    offset: int,
-    max_compressed_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    compressed_positions = torch.arange(max_compressed_len, device=device)
-    valid_lengths = torch.arange(1, seq_len + 1, device=device).unsqueeze(1) // ratio
-    topk_idxs = compressed_positions.unsqueeze(0).expand(seq_len, -1)
-    topk_idxs = torch.where(topk_idxs < valid_lengths, topk_idxs + offset, -1)
-    return topk_idxs.unsqueeze(0).expand(batch_size, -1, -1)
-
-
 def _overlap_transform(tensor: torch.Tensor, head_dim: int, value: float) -> torch.Tensor:
     batch_size, compressed_len, ratio, _ = tensor.shape
     previous = tensor[:, :, :, :head_dim]
@@ -667,6 +635,46 @@ def _overlap_transform(tensor: torch.Tensor, head_dim: int, value: float) -> tor
     prefix = tensor.new_full((batch_size, 1, ratio, head_dim), value)
     previous = torch.cat((prefix, previous[:, :-1]), dim=1)
     return torch.cat((previous, current), dim=2)
+
+
+def _empty_sparse_attention_inputs(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+    include_compressor: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """Empty stand-ins for the sparse-attention inputs a layer variant lacks.
+
+    Indexer stand-ins for layers without a lightning indexer (window-only and
+    ratio-128), plus — with ``include_compressor`` — compressor/rope-table
+    stand-ins for window-only layers. The creation order (and the sharing of
+    one empty per shape) is load-bearing: it keeps the exported graph's node
+    sequence identical to the pre-refactor layout.
+    """
+    empty_state = kv.new_empty(batch_size, seq_len, 0)
+    empty_ape = kv.new_empty(0, 0)
+    empty_norm_weight = kv.new_empty(0)
+    kwargs: Dict[str, torch.Tensor] = {}
+    if include_compressor:
+        empty_rope_table = kv.new_empty(0, 0)
+        kwargs.update(
+            compressor_kv=empty_state,
+            compressor_gate=empty_state,
+            compressor_ape=empty_ape,
+            compressor_norm_weight=empty_norm_weight,
+            cos_compress_table=empty_rope_table,
+            sin_compress_table=empty_rope_table,
+        )
+    kwargs.update(
+        indexer_q=q.new_empty(batch_size, seq_len, 0, 0),
+        indexer_weights=q.new_empty(batch_size, seq_len, 0),
+        indexer_compressor_kv=empty_state,
+        indexer_compressor_gate=empty_state,
+        indexer_compressor_ape=empty_ape,
+        indexer_compressor_norm_weight=empty_norm_weight,
+    )
+    return kwargs
 
 
 def _sparse_attention(
@@ -695,6 +703,16 @@ def _sparse_attention(
     rope_dim: Optional[int],
     rms_norm_eps: float,
 ) -> torch.Tensor:
+    """Call the cached sparse-attention source op.
+
+    ``topk_idxs`` is always a width-only placeholder: the cached prefill and
+    decode paths recompute the index-score selection from the compressor caches
+    (or the ``input_pos`` window) and read only its static width, and the op
+    rebuilds the real indices on the eager prefill path
+    (``topk_is_placeholder=True``). This keeps the per-layer
+    arange/where/expand/cat/cast index chain out of the decode graph while
+    leaving prefill/decode outputs bit-identical.
+    """
     return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
         q,
         kv,
@@ -723,30 +741,8 @@ def _sparse_attention(
         head_dim=kv.shape[-1],
         rope_dim=rope_dim,
         rms_norm_eps=rms_norm_eps,
+        topk_is_placeholder=True,
     )
-
-
-def _hc_split_sinkhorn(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int,
-    sinkhorn_iters: int,
-    eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    pre_logits = mixes[..., :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
-    post_logits = mixes[..., hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
-    comb_logits = mixes[..., 2 * hc_mult :] * hc_scale[2] + hc_base[2 * hc_mult :]
-
-    pre = torch.sigmoid(pre_logits) + eps
-    post = 2.0 * torch.sigmoid(post_logits)
-    comb = comb_logits.view(*comb_logits.shape[:-1], hc_mult, hc_mult)
-    comb = comb.softmax(dim=-1) + eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(sinkhorn_iters - 1):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    return pre, post, comb
 
 
 class DeepseekV4RMSNorm(nn.Module):
@@ -757,6 +753,14 @@ class DeepseekV4RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.ops.auto_deploy.torch_rmsnorm(x, self.weight, self.eps)
+
+
+class _DeepseekV4QRMSNorm(DeepseekV4RMSNorm):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # AutoDeploy represents CUDA tensors as meta tensors during export.
+        if x.dtype == torch.bfloat16 and x.shape[-1] == 1024 and x.device.type in ("cuda", "meta"):
+            return torch.ops.auto_deploy.triton_rms_norm(x, self.weight, self.eps)
+        return super().forward(x)
 
 
 class DeepseekV4RotaryEmbedding(nn.Module):
@@ -848,23 +852,47 @@ class DeepseekV4MoEGate(nn.Module):
         self,
         hidden_states_flat: torch.Tensor,
         input_ids_flat: torch.Tensor,
+        hidden_states_flat_fp32: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.score_func != "sqrtsoftplus":
             raise ValueError(f"Unsupported DeepSeek V4 scoring_func: {self.score_func}")
 
-        router_logits = _linear(hidden_states_flat.to(self.weight.dtype), self.weight).float()
-        scores = F.softplus(router_logits).sqrt()
-
         if self.hash_routing:
-            selected_experts = self.tid2eid[input_ids_flat.to(torch.long)].to(torch.int64)
-        else:
-            selected_experts = (scores + self.bias).topk(self.top_k, dim=-1).indices
+            # Hash layers: the selected experts come from the tid2eid token map, so
+            # only those top_k rows of the (E, H) fp32 router GEMV are needed. The
+            # fused op gathers just those rows and runs the whole
+            # gemv + sqrtsoftplus + gather + renorm + scale chain as one Triton
+            # program per token at decode (prefill keeps the dense reference chain).
+            return torch.ops.auto_deploy.deepseek_v4_hash_routing(
+                hidden_states_flat,
+                self.weight,
+                self.tid2eid,
+                input_ids_flat,
+                self.routed_scaling_factor,
+                self.norm_topk_prob,
+            )
 
-        routing_weights = scores.gather(1, selected_experts)
-        if self.norm_topk_prob:
-            routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        routing_weights = routing_weights * self.routed_scaling_factor
-        return selected_experts, routing_weights
+        # ``hidden_states_flat_fp32`` is the HC-pre combine kernel's fp32 mirror of
+        # ``hidden_states_flat`` (bit-equal to ``hidden_states_flat.float()``), so
+        # using it skips the per-step bf16->fp32 boundary copy while feeding the
+        # fp32 cuBLAS router GEMV exactly the values it used to consume.
+        router_in = (
+            hidden_states_flat_fp32
+            if hidden_states_flat_fp32 is not None
+            else hidden_states_flat.to(self.weight.dtype)
+        )
+        router_logits = _linear(router_in, self.weight).float()
+
+        # Non-hash layers: fuse the sqrtsoftplus scoring + bias-add + top-k + gather +
+        # renorm + scale chain into one Triton kernel (collapses the tiny per-token
+        # top-k/sort/elementwise kernel sea around the router head).
+        return torch.ops.auto_deploy.deepseek_v4_routing(
+            router_logits,
+            self.bias,
+            self.top_k,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+        )
 
 
 class DeepseekV4MoE(nn.Module):
@@ -994,14 +1022,30 @@ class DeepseekV4MoE(nn.Module):
             torch.empty(loaded.shape, dtype=loaded.dtype, device=current.device),
         )
 
-    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        hidden_states_fp32: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         original_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, original_shape[-1])
-        selected_experts, routing_weights = self.gate(hidden_states_flat, input_ids.reshape(-1))
+        shared = self.shared_experts(hidden_states_flat)
+        router_states_flat = (
+            hidden_states_fp32.view(-1, original_shape[-1])
+            if hidden_states_fp32 is not None
+            else None
+        )
+        selected_experts, routing_weights = self.gate(
+            hidden_states_flat, input_ids.reshape(-1), router_states_flat
+        )
         routed = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
             hidden_states_flat,
             selected_experts,
-            routing_weights.to(hidden_states_flat.dtype),
+            # Pass fp32 routing weights straight through: the trtllm-gen path's fused
+            # EP routing localization casts to bf16 internally (bit-identical to
+            # the old ``.to(bf16)`` -> f32 -> bf16 round-trip), so this cast is now dead.
+            routing_weights,
             self.experts.gate_up_proj_blocks,
             self.experts.gate_up_proj_bias,
             self.experts.gate_up_proj_scales,
@@ -1014,9 +1058,16 @@ class DeepseekV4MoE(nn.Module):
             "deepseek",
             "moe",
         )
-        return routed.view(*original_shape).to(hidden_states.dtype) + self.shared_experts(
-            hidden_states
-        )
+        # Sum the routed (EP) and shared (TP) partials while both are still flat
+        # [num_tokens, hidden] so the post-sharding graph contains a *direct*
+        # ``add(all_reduce(routed_local), all_reduce(shared_local))``. Both all_reduces
+        # reduce over the same (world) process group, so ``fuse_collinear_allreduce``
+        # collapses them into a single collective (AR(r)+AR(s)=AR(r+s)). Running the
+        # shared MLP on the flat activation keeps both addends the same rank/shape; the
+        # reshape+cast is deferred to after the add (mathematically identical, since the
+        # MLP and the add are both elementwise per token).
+        combined = routed + shared
+        return combined.view(*original_shape).to(hidden_states.dtype)
 
 
 class DeepseekV4Compressor(nn.Module):
@@ -1050,8 +1101,13 @@ class DeepseekV4Compressor(nn.Module):
         self.norm = DeepseekV4RMSNorm(self.head_dim, config.rms_norm_eps)
 
     def project(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        kv_all = _linear_module(hidden_states, self.wkv, layer_type="mla").float()
-        score_all = _linear_module(hidden_states, self.wgate, layer_type="mla").float()
+        # Raw activation-dtype rows: the sparse-attention op widens them
+        # where fp32 math needs it -- the decode current-token store converts in-kernel
+        # (bf16 -> fp32 is exact), so no per-layer ``.float()`` copy runs at decode.
+        # Consumers that need the fp32 tensors up front (``compress_projected`` on the
+        # standalone paths, the op's prefill branch) widen explicitly.
+        kv_all = _linear_module(hidden_states, self.wkv, layer_type="mla")
+        score_all = _linear_module(hidden_states, self.wgate, layer_type="mla")
         return kv_all, score_all
 
     def compress_projected(
@@ -1089,7 +1145,7 @@ class DeepseekV4Compressor(nn.Module):
             kv = _overlap_transform(kv, self.head_dim, 0.0)
             score = _overlap_transform(score, self.head_dim, -1.0e20)
 
-        compressed = (kv * score.softmax(dim=2)).sum(dim=2).to(output_dtype)
+        compressed = torch.ops.auto_deploy.deepseek_v4_compress_pool(kv, score).to(output_dtype)
         compressed = self.norm(compressed)
 
         row_start = row_offsets * ratio
@@ -1103,10 +1159,9 @@ class DeepseekV4Compressor(nn.Module):
             [self.head_dim - self.rope_head_dim, self.rope_head_dim],
             dim=-1,
         )
-        pe = _apply_interleaved_rope(pe, cos, sin)
-        compressed = torch.cat((nope, pe), dim=-1)
+        compressed = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(nope, pe, cos, sin, False)
         if self.rotate:
-            return _fake_fp4_act_quant(_hadamard_rotate(compressed), block_size=32)
+            return torch.ops.auto_deploy.deepseek_v4_hadamard_fp4(compressed, 32)
 
         nope, pe = torch.split(
             compressed,
@@ -1124,9 +1179,12 @@ class DeepseekV4Compressor(nn.Module):
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
         kv_all, score_all = self.project(hidden_states)
+        # ``compress_projected`` math (pool, ape add) ran on fp32 inputs before
+        # ``project`` started returning raw activation-dtype rows; widen
+        # here so this standalone path stays bit-identical.
         return self.compress_projected(
-            kv_all,
-            score_all,
+            kv_all.float(),
+            score_all.float(),
             cos_table,
             sin_table,
             position_ids,
@@ -1162,17 +1220,26 @@ class DeepseekV4Indexer(nn.Module):
         sin: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
+        # Indexer index-score projection is replicated (tp_mode="none"), NOT
+        # head-sharded. The index score is reduced over ALL index heads (sum over
+        # the head dim), so a head-sharded projection forces a partial-score
+        # all_reduce across TP ranks (the f32 RING_LL collective at select_topk and
+        # in the sparse-attention custom op). Computing the (small) projection in
+        # full on every rank makes the score already-global -> the all_reduce is
+        # dropped. The wq_b GEMV grows tp_size x in output width but stays tiny at
+        # bs=1, while a full f32 collective per layer/step is removed. Reference
+        # exact: partial-head-sum + all_reduce == full-head-sum (up to fp order).
         q = _linear_module(
             q_lora,
             self.wq_b,
-            tp_mode="colwise",
+            tp_mode="none",
             layer_type="mla",
             tp_min_local_shape=self.index_head_dim,
         )
         q = torch.ops.auto_deploy.view(
             q,
             [batch_size, seq_len, self.index_n_heads, self.index_head_dim],
-            tp_scaled_dim=2,
+            tp_scaled_dim=-1,
             layer_type="mla",
         )
         q_nope, q_pe = torch.split(
@@ -1180,16 +1247,21 @@ class DeepseekV4Indexer(nn.Module):
             [self.index_head_dim - self.rope_head_dim, self.rope_head_dim],
             dim=-1,
         )
-        q_pe = _apply_interleaved_rope(q_pe, cos.unsqueeze(2), sin.unsqueeze(2))
-        q = _fake_fp4_act_quant(_hadamard_rotate(torch.cat((q_nope, q_pe), dim=-1)), block_size=32)
+        q = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(q_nope, q_pe, cos, sin, False)
+        q = torch.ops.auto_deploy.deepseek_v4_hadamard_fp4(q, 32)
 
         weights = _linear_module(
             hidden_states,
             self.weights_proj,
-            tp_mode="colwise",
+            tp_mode="none",
             layer_type="mla",
         )
-        weights = weights.float() * (self.softmax_scale * self.index_n_heads**-0.5)
+        # Raw (unscaled, model-dtype) weights are handed over: the
+        # cached sparse-attention op folds the ``float(w) * scale`` pre-scale
+        # into its decode score kernels' fp32 weight load (bit-identical fp32
+        # multiply) and pre-scales once at prefill entry, dropping the per-layer
+        # cast + scalar-mul launches from the decode graph. The uncached
+        # reference path applies the identical scale in ``select_topk``.
         compressor_kv, compressor_gate = self.compressor.project(hidden_states)
         return q, weights, compressor_kv, compressor_gate
 
@@ -1201,13 +1273,19 @@ class DeepseekV4Indexer(nn.Module):
         seq_len: int,
         offset: int,
     ) -> torch.Tensor:
+        # ``project`` hands over raw model-dtype weights; the
+        # widening + pre-scale moved here so this uncached reference stays
+        # bit-identical to the pre-change chain.
+        weights = weights.float() * (self.softmax_scale * self.index_n_heads**-0.5)
         index_score = torch.matmul(
             q.transpose(1, 2),
             index_k.transpose(1, 2).unsqueeze(1),
         ).transpose(1, 2)
         index_score = index_score.float()
         index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
-        index_score = torch.ops.auto_deploy.all_reduce(index_score, layer_type="mla")
+        # No cross-rank all_reduce: the index projection is replicated (see
+        # DeepseekV4Indexer.project), so ``index_score`` already sums over all
+        # index heads on every rank.
 
         batch_size = q.shape[0]
         compressed_positions = torch.arange(
@@ -1250,9 +1328,12 @@ class DeepseekV4Indexer(nn.Module):
         offset: int,
     ) -> torch.Tensor:
         q, weights, compressor_kv, compressor_gate = self.project(hidden_states, q_lora, cos, sin)
+        # Same widening note as ``DeepseekV4Compressor.forward``: ``project`` returns
+        # raw activation-dtype rows; the standalone indexer path widens
+        # before ``compress_projected`` to keep its math bit-identical.
         index_k = self.compressor.compress_projected(
-            compressor_kv,
-            compressor_gate,
+            compressor_kv.float(),
+            compressor_gate.float(),
             cos_table,
             sin_table,
             position_ids,
@@ -1282,7 +1363,7 @@ class DeepseekV4Attention(nn.Module):
         self.group_head_width = (self.n_heads * self.head_dim) // self.n_groups
 
         self.wq_a = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False)
-        self.q_norm = DeepseekV4RMSNorm(self.q_lora_rank, self.rms_eps)
+        self.q_norm = _DeepseekV4QRMSNorm(self.q_lora_rank, self.rms_eps)
         self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.wkv = nn.Linear(self.hidden_size, self.head_dim, bias=False)
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, self.rms_eps)
@@ -1306,15 +1387,26 @@ class DeepseekV4Attention(nn.Module):
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
         ],
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        cos_base_table, sin_base_table, cos_compress_table, sin_compress_table = position_embeddings
-        cos_base = cos_base_table[position_ids]
-        sin_base = sin_base_table[position_ids]
-        cos_compress = cos_compress_table[position_ids]
-        sin_compress = sin_compress_table[position_ids]
+        # ``position_embeddings`` carries the per-token cos/sin rows gathered
+        # ONCE at the model root (see ``DeepseekV4ForCausalLM.forward``) plus the
+        # compressed-RoPE tables, which the sparse-attention op still needs to
+        # rope compressed rows at their own (non-token) positions. Base vs
+        # compressed is a per-layer Python constant, so no per-layer table
+        # gather kernel is issued here.
+        (
+            cos_base,
+            sin_base,
+            cos_compress,
+            sin_compress,
+            cos_compress_table,
+            sin_compress_table,
+        ) = position_embeddings
         cos = cos_compress if self.compress_ratio else cos_base
         sin = sin_compress if self.compress_ratio else sin_base
 
@@ -1333,29 +1425,42 @@ class DeepseekV4Attention(nn.Module):
             tp_scaled_dim=2,
             layer_type="mla",
         )
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_eps).to(q.dtype)
+        # The per-head weightless Q RMS norm (q *= rsqrt(mean(q^2)+eps)) is folded
+        # into the fused RoPE/concat call below via ``rms_eps`` — see the raw split
+        # views passed there — so it no longer runs as a separate reduction chain.
 
         kv = _linear_module(hidden_states, self.wkv, layer_type="mla")
-        kv = self.kv_norm(kv)
+        # The KV RMS norm (``kv_norm``), the no-PE fake-FP8 block quant, and the
+        # interleaved RoPE/concat are folded into the single
+        # ``deepseek_v4_kv_norm_rope_concat`` kernel below — so ``kv`` stays *raw*
+        # here and the split feeds the kernel the raw (pre-norm) views.
 
         q_nope, q_pe = torch.split(q, [self.nope_head_dim, self.rope_head_dim], dim=-1)
         kv_nope, kv_pe = torch.split(kv, [self.nope_head_dim, self.rope_head_dim], dim=-1)
-        q_pe = _apply_interleaved_rope(q_pe, cos.unsqueeze(2), sin.unsqueeze(2))
-        kv_pe = _apply_interleaved_rope(kv_pe, cos, sin)
-        kv_nope = _fake_fp8_act_quant(kv_nope, block_size=64)
-        q = torch.cat((q_nope, q_pe), dim=-1)
-        kv = torch.cat((kv_nope, kv_pe), dim=-1)
+        # Fused interleaved-RoPE + concat: rotates the pe slice and writes
+        # ``cat((nope, rope(pe)))`` in one kernel — removes the rope elementwise
+        # swarm, the rope ``stack`` and the explicit ``cat`` per call. The main-Q
+        # call also folds the pre-split per-head weightless RMS norm (rms_eps>0),
+        # collapsing its reduction/elementwise/cast chain into this same kernel.
+        q = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(
+            q_nope, q_pe, cos, sin, False, self.rms_eps
+        )
+        # KV front-end fused into one kernel: weighted RMS norm over the full head,
+        # fake-FP8 block quant of the nope slice, then interleaved RoPE on the pe
+        # slice — collapsing the kv_norm reduction/elementwise/cast chain and the
+        # separate fp8 launch into this single call. ``kv_nope``/``kv_pe`` are the
+        # RAW (pre-norm) split views; the kernel reproduces every rounding point.
+        kv = torch.ops.auto_deploy.deepseek_v4_kv_norm_rope_concat(
+            kv_nope, kv_pe, self.kv_norm.weight, cos, sin, self.kv_norm.eps, 64
+        )
 
-        empty_compressor_state = kv.new_empty(batch_size, seq_len, 0)
-        empty_compressor_ape = kv.new_empty(0, 0)
-        empty_compressor_norm_weight = kv.new_empty(0)
-        empty_rope_table = kv.new_empty(0, 0)
-        empty_indexer_q = q.new_empty(batch_size, seq_len, 0, 0)
-        empty_indexer_weights = q.new_empty(batch_size, seq_len, 0)
         if self.compress_ratio:
-            window_idxs = _window_topk_idxs(
-                self.window_size, batch_size, seq_len, hidden_states.device
-            )
+            if self.indexer is None:
+                # Ratio-128: no lightning indexer. The stand-ins are created
+                # BEFORE the compressor projections to keep the exported
+                # graph's node order identical to the pre-refactor layout.
+                indexer_kwargs = _empty_sparse_attention_inputs(q, kv, batch_size, seq_len)
+                compressed_width = self.compressor.max_compressed_len
             compressor_kv, compressor_gate = self.compressor.project(hidden_states)
             if self.indexer is not None:
                 (
@@ -1369,94 +1474,64 @@ class DeepseekV4Attention(nn.Module):
                     cos_compress,
                     sin_compress,
                 )
-                index_k = self.indexer.compressor.compress_projected(
-                    indexer_compressor_kv,
-                    indexer_compressor_gate,
-                    cos_compress_table,
-                    sin_compress_table,
-                    position_ids,
-                    hidden_states.dtype,
+                indexer_kwargs = dict(
+                    indexer_q=indexer_q,
+                    indexer_weights=indexer_weights,
+                    indexer_compressor_kv=indexer_compressor_kv,
+                    indexer_compressor_gate=indexer_compressor_gate,
+                    indexer_compressor_ape=self.indexer.compressor.ape,
+                    indexer_compressor_norm_weight=self.indexer.compressor.norm.weight,
                 )
-                compressed_idxs = self.indexer.select_topk(
-                    indexer_q,
-                    index_k,
-                    indexer_weights,
-                    seq_len,
-                    seq_len,
-                )
-                indexer_compressor_ape = self.indexer.compressor.ape
-                indexer_compressor_norm_weight = self.indexer.compressor.norm.weight
-            else:
-                indexer_q = empty_indexer_q
-                indexer_weights = empty_indexer_weights
-                indexer_compressor_kv = empty_compressor_state
-                indexer_compressor_gate = empty_compressor_state
-                indexer_compressor_ape = empty_compressor_ape
-                indexer_compressor_norm_weight = empty_compressor_norm_weight
-                compressed_idxs = _compress_topk_idxs(
-                    self.compress_ratio,
-                    batch_size,
-                    seq_len,
-                    seq_len,
-                    self.compressor.max_compressed_len,
-                    hidden_states.device,
-                )
-            topk_idxs = torch.cat((window_idxs, compressed_idxs), dim=-1).to(torch.int64)
+                compressed_width = self.indexer.index_topk
+            # Width-only top-k placeholder; see the _sparse_attention docstring.
+            topk_idxs = hidden_states.new_empty(
+                batch_size, seq_len, self.window_size + compressed_width, dtype=torch.int64
+            )
             attn_output = _sparse_attention(
                 q,
                 kv,
                 self.attn_sink,
                 topk_idxs,
-                compressor_kv,
-                compressor_gate,
-                self.compressor.ape,
-                self.compressor.norm.weight,
-                cos_compress_table,
-                sin_compress_table,
-                position_ids,
-                indexer_q,
-                indexer_weights,
-                indexer_compressor_kv,
-                indexer_compressor_gate,
-                indexer_compressor_ape,
-                indexer_compressor_norm_weight,
-                self.softmax_scale,
-                self.layer_idx,
-                self.window_size,
-                self.compress_ratio,
-                self.compressor.max_compressed_len,
-                self.rope_head_dim,
-                self.rms_eps,
+                compressor_kv=compressor_kv,
+                compressor_gate=compressor_gate,
+                compressor_ape=self.compressor.ape,
+                compressor_norm_weight=self.compressor.norm.weight,
+                cos_compress_table=cos_compress_table,
+                sin_compress_table=sin_compress_table,
+                position_ids=position_ids,
+                softmax_scale=self.softmax_scale,
+                layer_idx=self.layer_idx,
+                window_size=self.window_size,
+                compress_ratio=self.compress_ratio,
+                max_compressed_len=self.compressor.max_compressed_len,
+                rope_dim=self.rope_head_dim,
+                rms_norm_eps=self.rms_eps,
+                **indexer_kwargs,
             )
         else:
-            topk_idxs = _window_topk_idxs(
-                self.window_size, batch_size, seq_len, hidden_states.device
-            ).to(torch.int64)
+            # Window-only layer: every compressor/indexer input is an empty
+            # stand-in.
+            empty_kwargs = _empty_sparse_attention_inputs(
+                q, kv, batch_size, seq_len, include_compressor=True
+            )
+            # Width-only top-k placeholder; see the _sparse_attention docstring.
+            topk_idxs = hidden_states.new_empty(
+                batch_size, seq_len, self.window_size, dtype=torch.int64
+            )
             attn_output = _sparse_attention(
                 q,
                 kv,
                 self.attn_sink,
                 topk_idxs,
-                empty_compressor_state,
-                empty_compressor_state,
-                empty_compressor_ape,
-                empty_compressor_norm_weight,
-                empty_rope_table,
-                empty_rope_table,
-                position_ids,
-                empty_indexer_q,
-                empty_indexer_weights,
-                empty_compressor_state,
-                empty_compressor_state,
-                empty_compressor_ape,
-                empty_compressor_norm_weight,
-                self.softmax_scale,
-                self.layer_idx,
-                self.window_size,
-                self.compress_ratio,
-                None,
-                None,
-                self.rms_eps,
+                position_ids=position_ids,
+                softmax_scale=self.softmax_scale,
+                layer_idx=self.layer_idx,
+                window_size=self.window_size,
+                compress_ratio=self.compress_ratio,
+                max_compressed_len=None,
+                rope_dim=None,
+                rms_norm_eps=self.rms_eps,
+                **empty_kwargs,
             )
 
         out_nope, out_pe = torch.split(
@@ -1464,8 +1539,9 @@ class DeepseekV4Attention(nn.Module):
             [self.nope_head_dim, self.rope_head_dim],
             dim=-1,
         )
-        out_pe = _apply_interleaved_rope(out_pe, cos.unsqueeze(2), sin.unsqueeze(2), inverse=True)
-        attn_output = torch.cat((out_nope, out_pe), dim=-1)
+        attn_output = torch.ops.auto_deploy.deepseek_v4_fused_rope_concat(
+            out_nope, out_pe, cos, sin, True
+        )
         attn_output = torch.ops.auto_deploy.view(
             attn_output,
             [batch_size, seq_len, self.n_groups, self.group_head_width],
@@ -1501,6 +1577,10 @@ class DeepseekV4Block(nn.Module):
         self.norm_eps = config.rms_norm_eps
         self.attn = DeepseekV4Attention(config, layer_idx)
         self.ffn = DeepseekV4MoE(config, layer_idx)
+        # Learned-router FFN sites consume the HC-pre combine kernel's fp32
+        # mirror of its output (== y.float()), replacing the per-step
+        # bf16->fp32 router-input copy; hash-router layers keep the plain op.
+        self.ffn_router_fp32 = not self.ffn.gate.hash_routing
         self.attn_norm = DeepseekV4RMSNorm(config.hidden_size, self.norm_eps)
         self.ffn_norm = DeepseekV4RMSNorm(config.hidden_size, self.norm_eps)
 
@@ -1528,21 +1608,42 @@ class DeepseekV4Block(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        original_shape = x.shape
-        flat = x.flatten(2).float()
-        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = _linear(flat, hc_fn) * rsqrt
-        pre, post, comb = _hc_split_sinkhorn(
-            mixes,
+        norm: "DeepseekV4RMSNorm",
+        hc_partials: Optional[torch.Tensor] = None,
+        emit_fp32: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
+        # Fully fused HC-pre (mix front + sinkhorn composition + weighted-combine
+        # + block RMSNorm); bit-identical to the previous composition +
+        # deepseek_v4_hc_combine_rmsnorm two-op sequence on every path; see
+        # hc_composition.py. When ``hc_partials`` is given (every site except
+        # layer 0's attn), the preceding fused ``_hc_post`` seam op already
+        # produced this site's split-D partials, so the decode path skips even
+        # the partials launch (seam partials match the standalone launch to
+        # ~1-2 fp32 ULP; see deepseek_v4_hc_post.py). With ``emit_fp32``
+        # (learned-router FFN sites) the return is a 4-tuple
+        # ``(y, y32, post, comb)`` with ``y32 == y.float()`` bit-for-bit,
+        # absorbing the router's bf16->fp32 boundary copy.
+        common_args = (
+            x.flatten(2),
+            hc_fn,
             hc_scale,
             hc_base,
+            norm.weight,
             self.hc_mult,
             self.hc_sinkhorn_iters,
             self.hc_eps,
+            self.norm_eps,
+            norm.eps,
+            x.dtype,
         )
-        y = torch.sum(pre.unsqueeze(-1) * flat.view(original_shape), dim=2)
-        return y.to(x.dtype), post, comb
+        if hc_partials is None:
+            return torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine(*common_args)
+        op = (
+            torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine_partials_y32
+            if emit_fp32
+            else torch.ops.auto_deploy.deepseek_v4_hc_pre_mix_combine_partials
+        )
+        return op(hc_partials, *common_args)
 
     @staticmethod
     def _hc_post(
@@ -1550,10 +1651,19 @@ class DeepseekV4Block(nn.Module):
         residual: torch.Tensor,
         post: torch.Tensor,
         comb: torch.Tensor,
-    ) -> torch.Tensor:
-        y = post.unsqueeze(-1) * x.unsqueeze(-2)
-        y = y + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
-        return y.to(x.dtype)
+        next_hc_fn: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Fused residual-stream composition collapsing the two broadcast-muls +
+        # M-axis sum + add + bf16 cast into one Triton launch, and skipping the
+        # [N, hc_mult, hc_mult, H] fp32 intermediate. Bit-faithful (fp32
+        # accumulate, single bf16 store); see deepseek_v4_hc_post.py.
+        #   y[n, o, :] = post[n, o] * x[n, :] + sum_m comb[n, m, o] * residual[n, m, :]
+        # The seam-fused op additionally emits the NEXT HC site's split-D
+        # partials (against ``next_hc_fn``) from the composed stream while it is
+        # still in registers, replacing that site's partials launch + HBM re-read.
+        return torch.ops.auto_deploy.deepseek_v4_hc_post_next_partials(
+            x, residual, post, comb, next_hc_fn
+        )
 
     def forward(
         self,
@@ -1563,31 +1673,53 @@ class DeepseekV4Block(nn.Module):
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
         ],
         position_ids: torch.Tensor,
         input_ids: torch.Tensor,
-    ) -> torch.Tensor:
+        next_hc_fn: torch.Tensor,
+        hc_partials: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
+        # _hc_pre now returns the post-combine hidden states already normalized by
+        # attn_norm (fused), so the explicit norm call is dropped here.
         hidden_states, post, comb = self._hc_pre(
             hidden_states,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
+            self.attn_norm,
+            hc_partials,
         )
-        hidden_states = self.attn_norm(hidden_states)
         hidden_states = self.attn(hidden_states, position_embeddings, position_ids)
-        hidden_states = self._hc_post(hidden_states, residual, post, comb)
+        hidden_states, hc_partials = self._hc_post(
+            hidden_states, residual, post, comb, self.hc_ffn_fn
+        )
 
         residual = hidden_states
-        hidden_states, post, comb = self._hc_pre(
+        # Learned-router layers (``ffn_router_fp32``, a per-layer Python
+        # constant): the fused HC-pre also emits the fp32 mirror of its output
+        # for the router GEMV, replacing the per-step bf16->fp32 boundary copy
+        # (values are bit-identical to the copy).
+        hc_out = self._hc_pre(
             hidden_states,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
+            self.ffn_norm,
+            hc_partials,
+            emit_fp32=self.ffn_router_fp32,
         )
-        hidden_states = self.ffn_norm(hidden_states)
-        hidden_states = self.ffn(hidden_states, input_ids)
-        return self._hc_post(hidden_states, residual, post, comb)
+        if self.ffn_router_fp32:
+            hidden_states, router_states_fp32, post, comb = hc_out
+        else:
+            hidden_states, post, comb = hc_out
+            router_states_fp32 = None
+        hidden_states = self.ffn(hidden_states, input_ids, router_states_fp32)
+        # ``next_hc_fn`` belongs to the next consumer of the residual stream:
+        # the next layer's ``hc_attn_fn``, or ``hc_head_fn`` after the last layer.
+        return self._hc_post(hidden_states, residual, post, comb, next_hc_fn)
 
 
 class DeepseekV4PreTrainedModel(PreTrainedModel):
@@ -1656,7 +1788,16 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             [DeepseekV4Block(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = DeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # LM-head weight dtype is fp32: ``_load_checkpoint`` copy-casts the
+        # bf16 checkpoint tensor into the fp32 param once (no ``assign=True``),
+        # so values equal ``bf16(W).float()`` and the fp32 logits GEMM is
+        # bit-identical to a per-step recast.
+        self.head = nn.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            dtype=torch.float32,
+        )
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.hc_mult = config.hc_mult
         hc_dim = config.hc_mult * config.hidden_size
@@ -1680,15 +1821,26 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self
 
-    def _hc_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        original_dtype = hidden_states.dtype
-        original_shape = hidden_states.shape
-        flat = hidden_states.flatten(2).float()
-        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
-        mixes = _linear(flat, self.hc_head_fn) * rsqrt
-        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.config.hc_eps
-        hidden_states = torch.sum(pre.unsqueeze(-1) * flat.view(original_shape), dim=2)
-        return hidden_states.to(original_dtype)
+    def _hc_head_norm(self, hidden_states: torch.Tensor, hc_partials: torch.Tensor) -> torch.Tensor:
+        # Fused model-tail HC seam: the eager _hc_head chain (fp32 boundary cast,
+        # RMS statistic, hc_head_fn GEMV, sigmoid gate, weighted combine) + the
+        # final ``norm`` RMSNorm + the ``.float()`` cast feeding the fp32 lm-head
+        # GEMV, collapsed into ONE kernel at decode. ``hc_partials`` comes from
+        # the last layer's fused ``_hc_post`` seam op (produced against
+        # ``hc_head_fn``); every bf16 rounding point of the eager chain is
+        # preserved and the fp32 widen happens at the store. See hc_composition.py.
+        flat = hidden_states.flatten(2)
+        return torch.ops.auto_deploy.deepseek_v4_hc_head_norm(
+            hc_partials,
+            flat,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+            self.norm.weight,
+            self.config.hc_eps,
+            self.config.rms_norm_eps,
+            self.norm.eps,
+        )
 
     def forward(
         self,
@@ -1699,13 +1851,57 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         assert position_ids is not None, "position_ids is required"
 
         hidden_states = self.embed(input_ids)
-        position_embeddings = self.rotary_emb()
+        # Hoisted RoPE row lookup: gather the base and compressed cos/sin rows
+        # for the dynamic ``position_ids`` ONCE here instead of re-issuing the
+        # same table gathers inside every decoder layer (two live index kernels
+        # per layer per step). Layers receive the four gathered rows plus the
+        # compressed tables (still consumed by the sparse-attention op for
+        # compressed-row positions) and select base vs compressed via a
+        # per-layer Python constant.
+        (
+            cos_base_table,
+            sin_base_table,
+            cos_compress_table,
+            sin_compress_table,
+        ) = self.rotary_emb()
+        position_embeddings = (
+            cos_base_table[position_ids],
+            sin_base_table[position_ids],
+            cos_compress_table[position_ids],
+            sin_compress_table[position_ids],
+            cos_compress_table,
+            sin_compress_table,
+        )
         hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, self.hc_mult, -1)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, position_embeddings, position_ids, input_ids)
-        hidden_states = self._hc_head(hidden_states)
-        hidden_states = self.norm(hidden_states)
-        logits = _linear(hidden_states.float(), self.head.weight.float(), None).float()
+        # Each layer's final fused ``_hc_post`` emits the split-D partials for
+        # the NEXT consumer of the residual stream (the next layer's attn HC-pre,
+        # or the HC head after the last layer), threading them across the layer
+        # boundary so every HC site but the first skips its partials launch.
+        num_layers = len(self.layers)
+        hc_partials: Optional[torch.Tensor] = None
+        for layer_idx, layer in enumerate(self.layers):
+            next_hc_fn = (
+                self.layers[layer_idx + 1].hc_attn_fn
+                if layer_idx + 1 < num_layers
+                else self.hc_head_fn
+            )
+            hidden_states, hc_partials = layer(
+                hidden_states,
+                position_embeddings,
+                position_ids,
+                input_ids,
+                next_hc_fn,
+                hc_partials,
+            )
+        # ``layer_type="lm_head"`` tags this vocab projection so
+        # ``apply_sharding_hints`` column-splits ``head.weight`` (vocab dim) +
+        # all_gathers the logits under TP, instead of replicating the full
+        # [vocab, hidden] GEMM on every rank. Exact: output columns are
+        # independent, and the gather + trailing ``.float()`` are dtype-agnostic.
+        hidden_states = self._hc_head_norm(hidden_states, hc_partials)
+        # The fused HC head op returns fp32 (bf16-rounded values widened): fp32
+        # GEMM against the load-time-widened fp32 weight, no per-step casts.
+        logits = _linear(hidden_states, self.head.weight, None, layer_type="lm_head").float()
         return DeepseekV4CausalLMOutput(logits=logits)
 
 

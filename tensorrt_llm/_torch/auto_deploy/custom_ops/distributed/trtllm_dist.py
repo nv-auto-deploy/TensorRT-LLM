@@ -29,12 +29,26 @@ from tensorrt_llm._torch.distributed.symm_mem_allgather import SymmetricMemoryAl
 from tensorrt_llm._torch.modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
-from ...distributed.common import ReduceOp, get_rank_world_size, get_world_size, is_ompi
+from ...distributed.common import (
+    ONESHOT_SMALL_STRATEGY,
+    ReduceOp,
+    get_rank_world_size,
+    get_world_size,
+    is_ompi,
+)
 
 # Cache AllReduce modules to avoid recreating on every call
 # This is critical for CUDA graph compatibility - recreating modules during
 # warmup causes hangs due to workspace allocation with CPU synchronization
 _allreduce_cache = {}
+
+
+def resolve_oneshot_small_strategy(numel: int) -> str:
+    """Resolve the ``ONESHOT_SMALL`` token per call: ONESHOT up to one decode token
+    (measured ~5.5x faster than NCCL on single-node TP4), else NCCL."""
+    max_numel = 4096  # one decode token x hidden_size 4096
+    return "ONESHOT" if numel <= max_numel else "NCCL"
+
 
 # SymmetricMemoryAllGather instances keyed on (rank, world_size, workspace_id).
 # workspace_id == 0 uses the default TP process group. Higher workspace_ids
@@ -155,6 +169,18 @@ def trtllm_dist_all_reduce(t: torch.Tensor, strategy: str) -> torch.Tensor:
 
     This op always uses TRT-LLM's optimized allreduce and is used in MPI mode.
     """
+    if strategy == ONESHOT_SMALL_STRATEGY:
+        # Warm the cache for both variants (mirrors trtllm_allreduce): the first call is
+        # an eager warmup call, so the ONESHOT workspace allocation stays out of capture.
+        rank, world_size = get_rank_world_size()
+        for warm_enum in (AllReduceStrategy.ONESHOT, AllReduceStrategy.NCCL):
+            cache_key = (rank, world_size, t.dtype, warm_enum)
+            if cache_key not in _allreduce_cache:
+                p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+                _allreduce_cache[cache_key] = AllReduce(
+                    mapping=p_config, strategy=warm_enum, dtype=t.dtype
+                )
+        strategy = resolve_oneshot_small_strategy(t.numel())
     return trtllm_allreduce(t, op=ReduceOp.SUM, strategy=strategy)
 
 

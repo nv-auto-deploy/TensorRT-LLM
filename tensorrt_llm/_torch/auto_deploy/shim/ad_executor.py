@@ -62,6 +62,7 @@ from ..transform.optimizer import InferenceOptimizer
 from ..utils.cuda_graph import BypassCapturedGraphs
 from ..utils.dist_config import DistConfig
 from ..utils.logger import ad_logger
+from .ad_sampler import ADGreedyDecodeTorchSampler
 from .interface import CachedSequenceInterface, GetInferenceModel
 
 _ATTENTION_TYPE_TO_CPP = {
@@ -148,6 +149,23 @@ def maybe_pad_for_cuda_graph(func):
             # baked from local total at capture, vs cross-rank max read fresh in eager).
             with BypassCapturedGraphs():
                 return _call_func()
+
+        # Piecewise CUDA graphs own token-bucket selection and padding for context
+        # and mixed batches inside DualModeCapturedGraph. Sending those batches
+        # through the decode-only outer padding gate would mark them ineligible and
+        # force BypassCapturedGraphs(), so the successfully captured piecewise
+        # segments would never replay. Attention-DP still requires the cross-rank
+        # agreement path below because different ranks may have different batch
+        # compositions and runtime scalar metadata.
+        # _piecewise_cuda_graph_used already implies cuda_graph_used (see __init__).
+        can_run_piecewise = (
+            self._piecewise_cuda_graph_used
+            and scheduled_requests.num_context_requests > 0
+            and not self.enable_attention_dp
+            and self.spec_config is None
+        )
+        if can_run_piecewise:
+            return _call_func()
 
         # check conditions for current rank
         can_run_cuda_graph = self.cuda_graph_used and scheduled_requests.can_run_cuda_graph
@@ -514,9 +532,14 @@ class ADEngine(ModelEngine):
         # TODO: better mechanism to retrieve this information when we refactor LlmArgs
         if ad_config is None:
             self.cuda_graph_used = False
+            self._piecewise_cuda_graph_used = False
             self.cuda_graph_batch_sizes = []
         else:
             self.cuda_graph_used = ad_config.is_cuda_graph_enabled()
+            compile_model_config = ad_config.transforms.get("compile_model", {})
+            self._piecewise_cuda_graph_used = bool(
+                self.cuda_graph_used and compile_model_config.get("piecewise_enabled", False)
+            )
             cg_config = ad_config.cuda_graph_config
             self.cuda_graph_batch_sizes = (
                 cg_config.batch_sizes if cg_config is not None and cg_config.batch_sizes else []
@@ -549,6 +572,7 @@ class ADEngine(ModelEngine):
                         cudagraphs.clear()
                     module._cuda_graph_mem_pool = None
                     module._input_buffers = []
+                    module._input_views_cache = {}
                     module._out_buffer_flat = None
 
                 if module.__class__.__name__ == "PiecewiseCapturedGraph":
@@ -1121,7 +1145,9 @@ def instantiate_sampler(
         sampler_type = SamplerType.TorchSampler
 
     if sampler_type == SamplerType.TorchSampler:
-        # Regular TorchSampler for non-speculative decoding.
+        # PP ranks broadcast only the base SampleStateTorch payload, so the
+        # AutoDeploy fast-state discriminator is currently safe only for PP1.
+        # Other configurations retain the regular TorchSampler unchanged.
         sampler_args = TorchSampler.Args(
             max_seq_len=ad_config.max_seq_len,
             max_draft_len=max_draft_len,
@@ -1130,7 +1156,8 @@ def instantiate_sampler(
             max_beam_width=ad_config.max_beam_width,
             disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         )
-        sampler = TorchSampler(sampler_args)
+        sampler_cls = ADGreedyDecodeTorchSampler if dist_mapping.pp_size == 1 else TorchSampler
+        sampler = sampler_cls(sampler_args)
 
     elif sampler_type == SamplerType.TRTLLMSampler:
         vocab_size_padded: int = engine.cache_seq_interface.info.vocab_size_padded

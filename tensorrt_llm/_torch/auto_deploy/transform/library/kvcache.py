@@ -185,13 +185,28 @@ class _InsertCachedOperator(BaseTransform):
 
         return meta_nodes_extra
 
+    def _get_prepare_extra_metadata_info(
+        self, any_source_attn_node: Node, cm: CachedSequenceInterface
+    ):
+        """Resolve the descriptor's prepare-extra-metadata op.
+
+        Backends that need page geometry (e.g. ``tokens_per_block`` for a
+        paged write-address prepare op) opt in by declaring a ``sequence_info``
+        parameter; this forwards ``cm.info`` to them.  Backends keeping the
+        original single-argument contract are called unchanged.
+        """
+        fn = self.attn_descriptor.get_prepare_extra_metadata_info
+        if "sequence_info" in inspect.signature(fn).parameters:
+            return fn(any_source_attn_node, sequence_info=cm.info)
+        return fn(any_source_attn_node)
+
     def _process_metadata_extra(
         self, gm: GraphModule, cm: CachedSequenceInterface, any_source_attn_node: Node
     ) -> List[Node]:
         """Process the get_metadata function into an op and return node references."""
         # get the metadata op for extra metadata and number of return values
-        prep_meta_op, num_meta_out, const_args = (
-            self.attn_descriptor.get_prepare_extra_metadata_info(any_source_attn_node)
+        prep_meta_op, num_meta_out, const_args = self._get_prepare_extra_metadata_info(
+            any_source_attn_node, cm
         )
 
         # if there is no extra metadata op or no return values, we can return early
@@ -586,8 +601,8 @@ class _InsertCachedOperator(BaseTransform):
             # group's swappable inputs so each non-zero group's downstream
             # consumers (e.g. update_paged_kv_cache write positions) reflect
             # the window-capped view.  Skipped when the backend has no extra-op.
-            prep_meta_op, num_meta_out, const_args_extra = (
-                self.attn_descriptor.get_prepare_extra_metadata_info(source_attn_nodes[0])
+            prep_meta_op, num_meta_out, const_args_extra = self._get_prepare_extra_metadata_info(
+                source_attn_nodes[0], cm
             )
             if prep_meta_op is not None and num_meta_out > 0:
                 op_arg_names = [

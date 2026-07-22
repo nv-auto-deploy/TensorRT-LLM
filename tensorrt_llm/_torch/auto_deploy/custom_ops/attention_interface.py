@@ -792,6 +792,9 @@ class SequenceInfo:
         self._extra_args: Dict[str, Optional[torch.Tensor]] = {}
         ############################################################################################
 
+        # lazily-built host arange reused for token_gather_indices on the decode path
+        self._arange_host: Optional[torch.Tensor] = None
+
         # VSWA WINDOW GROUPS #######################################################################
         self._window_groups: List[int] = []
         self._window_group_map: Dict[int, int] = {}
@@ -1472,11 +1475,16 @@ class SequenceInfo:
             # position_ids for each sequence is in the range [input_pos, input_pos + seq_len - 1]
             ip_np = ip_host.numpy()
             sl_np = sl_host.numpy()
-            base = np.repeat(ip_np, sl_np)
-            group_starts = np.repeat(np.cumsum(sl_np) - sl_np, sl_np)
-            offsets = np.arange(sl_np.sum()) - group_starts
-            position_ids = torch.from_numpy(base + offsets)  # zero-copy back
-            self._stage_arg("position_ids", position_ids, reset_val=0)
+            if bool((sl_np == 1).all()):
+                # generate-only: one token per sequence, so position_ids == input_pos.
+                # Skips the repeat/cumsum machinery on the per-token decode path.
+                self._stage_arg("position_ids", ip_host, reset_val=0)
+            else:
+                base = np.repeat(ip_np, sl_np)
+                group_starts = np.repeat(np.cumsum(sl_np) - sl_np, sl_np)
+                offsets = np.arange(sl_np.sum()) - group_starts
+                position_ids = torch.from_numpy(base + offsets)  # zero-copy back
+                self._stage_arg("position_ids", position_ids, reset_val=0)
 
         # update cumulative number of pages
         if self._is_required("pages_per_seq"):
@@ -1532,7 +1540,11 @@ class SequenceInfo:
 
         total = self.total_num_tokens
         if gather_context_logits or num_prefill == 0:
-            token_gather_indices = torch.arange(total, dtype=torch.long)
+            # reuse a lazily-built arange so the per-decode-step path avoids a fresh
+            # allocation; values are constant so a prefix view is always correct
+            if self._arange_host is None or self._arange_host.numel() < total:
+                self._arange_host = torch.arange(max(total, self.max_num_tokens), dtype=torch.long)
+            token_gather_indices = self._arange_host[:total]
             self._stage_arg("token_gather_indices", token_gather_indices)
             self.batch_info.update_tokens_gather_info(total, False)
         else:
@@ -1576,11 +1588,27 @@ class SequenceInfo:
 
         This function will assume that we are in a generate-only batch.
         """
+        out = self.get_arg("input_ids", truncate=True, unflatten=False)
+        # Small-batch decode steady state: the overlap scheduler emits identity
+        # gather/scatter indices (token i comes from new_tokens slot i and lands at
+        # input position i). ``out[mask[i]] = ungathered[gather[i]]`` then degenerates
+        # to a prefix copy, which avoids the triton launch (~70us host dispatch per
+        # decode step) on the inter-token critical path. Checked on the pinned host
+        # mirrors so no device sync is introduced.
+        n = self._input_buffer.get_current_length("_gather_idx")
+        if 0 < n <= 16 and n == self._input_buffer.get_current_length("_mask_scatter_indices"):
+            identity = list(range(n))
+            if (
+                self.get_arg("_gather_idx_host", truncate=True).tolist() == identity
+                and self.get_arg("_mask_scatter_indices_host", truncate=True).tolist() == identity
+            ):
+                out[:n].copy_(ungathered_input_ids[:n], non_blocking=True)
+                return
         torch.ops.auto_deploy.triton_utils_fused_gather_scatter(
             ungathered_input=ungathered_input_ids,
             gather_ids=self.get_arg("_gather_idx", truncate=True),
             mask_indices=self.get_arg("_mask_scatter_indices", truncate=True),
-            out=self.get_arg("input_ids", truncate=True, unflatten=False),
+            out=out,
         )
 
     # TODO: remove once https://github.com/NVIDIA/TensorRT-LLM/issues/9878 is fixed and

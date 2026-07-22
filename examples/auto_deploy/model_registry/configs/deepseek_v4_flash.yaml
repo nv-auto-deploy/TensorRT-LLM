@@ -26,6 +26,15 @@ cuda_graph_config:
 transforms:
   load_weights:
     disable_preload: true
+  # Collapse shared-input quantized and replicated-bf16 projections, then fuse the
+  # shared-expert SwiGLU activation-quantization chain.
+  fuse_gemms_mixed_children:
+    enabled: true
+    quantized_only: true
+  fuse_replicated_bf16_linear:
+    enabled: true
+  fuse_fp8_swiglu_act_quant:
+    enabled: true
   fuse_rmsnorm:
     rmsnorm_backend: torch
   detect_sharding:
@@ -35,8 +44,8 @@ transforms:
   apply_sharding_hints:
     enabled: true
     dist_mapping:
-      tp: 8
-      moe_ep: 8
+      tp: 4
+      moe_ep: 4
       moe_tp: 1
       moe_cluster: 1
     enable_attention_dp: false
@@ -47,5 +56,3 @@ transforms:
     enabled: true
   compile_model:
     piecewise_enabled: false
-  multi_stream_moe:
-    enabled: false

@@ -199,6 +199,10 @@ class CapturedGraph(nn.Module):
         self._in_spec = None
         self._out_spec = None
 
+        # Pre-narrowed input-buffer views per captured combined_shape so replay does a
+        # single _foreach_copy_ instead of num_batched_inputs narrow+copy_ dispatches.
+        self._input_views_cache: Dict[Tuple[int, ...], List[torch.Tensor]] = {}
+
     def _get_hash(self, flat_args: List[Any]) -> Tuple[int, ...]:
         static_hash = []
         for arg in flat_args:
@@ -329,6 +333,8 @@ class CapturedGraph(nn.Module):
 
         # store the input buffers for the largest batch size
         self._input_buffers = [a.clone() for a in args_batched]
+        # input views from a previous capture generation would alias stale buffers
+        self._input_views_cache.clear()
 
         # create new args, kwargs with the input buffers and static args
         args, kwargs = self._in_spec.unflatten(self._input_buffers + args_static)
@@ -403,11 +409,15 @@ class CapturedGraph(nn.Module):
         if cuda_graph_state.in_bypass():
             return self.model(*args, **kwargs)
 
-        args, kwargs = self._normalize_args_kwargs(args, kwargs)
         assert self.num_batched_inputs is not None, "Graphs must be captured before replay."
 
-        # flatten args, kwargs
-        all_args_flat = _args_kwargs_flatten_spec(self._in_spec, *args, **kwargs)
+        # AutoDeploy decode passes leaf-only kwargs in capture order. Consume their
+        # values directly instead of traversing the pytree on every token.
+        if args:
+            args, kwargs = self._normalize_args_kwargs(args, kwargs)
+            all_args_flat = _args_kwargs_flatten_spec(self._in_spec, *args, **kwargs)
+        else:
+            all_args_flat = list(kwargs.values())
 
         # extract the batched input tensors
         args_batched = all_args_flat[: self.num_batched_inputs]
@@ -445,11 +455,18 @@ class CapturedGraph(nn.Module):
         ):
             return self.model(*args, **kwargs)
 
-        # copy inputs to input buffers along their respective dynamic dims
-        for i, input_tensor in enumerate(args_batched):
-            dim_i = self.dynamic_dims[i]
-            size_i = input_tensor.shape[dim_i]
-            self._input_buffers[i].narrow(dim_i, 0, size_i).copy_(input_tensor, non_blocking=True)
+        # copy inputs to input buffers along their respective dynamic dims. The
+        # narrowed destination views are cached per captured combined_shape and the
+        # copies are batched through one _foreach_copy_ dispatch — per-token host
+        # cost, not GPU math.
+        input_views = self._input_views_cache.get(combined_shape)
+        if input_views is None:
+            input_views = [
+                buf.narrow(self.dynamic_dims[i], 0, args_batched[i].shape[self.dynamic_dims[i]])
+                for i, buf in enumerate(self._input_buffers)
+            ]
+            self._input_views_cache[combined_shape] = input_views
+        torch._foreach_copy_(input_views, args_batched, non_blocking=True)
 
         # run forward pass via graph
         self.cudagraphs[combined_shape].replay()

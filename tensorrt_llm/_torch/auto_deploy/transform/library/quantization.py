@@ -1017,13 +1017,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
         for scale_name, scale in self.default_scales(lin_weight.tensor.shape, context).items():
             lin_weight.submod.register_buffer(scale_name, scale)
 
-        gm._register_load_state_dict_pre_hook(
-            partial(
-                self.load_hook,
-                weight_name=lin_weight.node_key,
-                **(load_hook_kwargs or {}),
-            )
-        )
+        self._register_load_hook(gm, lin_weight.node_key, load_hook_kwargs)
         if self.post_load_hook:
             gm.register_load_state_dict_post_hook(
                 partial(self.post_load_hook, weight_name=lin_weight.node_key)
@@ -1114,13 +1108,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
             else:
                 submod.register_buffer(scale_name, scale)
 
-        gm._register_load_state_dict_pre_hook(
-            partial(
-                self.load_hook,
-                weight_name=weight_name,
-                **(load_hook_kwargs or {}),
-            )
-        )
+        self._register_load_hook(gm, weight_name, load_hook_kwargs)
 
         scale_name = self.scale_names(context)[0]
         scale_target = f"{modname}.{scale_name}" if modname else scale_name
@@ -1187,6 +1175,17 @@ class FineGrainedFP8LinearQuantization(Quantization):
         if prefix and not name.startswith(prefix):
             return prefix + name
         return name
+
+    def _register_load_hook(
+        self,
+        gm: GraphModule,
+        weight_name: str,
+        load_hook_kwargs: Optional[Dict[str, object]] = None,
+    ) -> None:
+        """Register the FineGrained FP8 load hook."""
+        load_hook_kwargs = load_hook_kwargs or {}
+        hook = partial(self.load_hook, weight_name=weight_name, **load_hook_kwargs)
+        gm._register_load_state_dict_pre_hook(hook)
 
     def load_hook(self, state_dict, prefix, *args, weight_name: str, checkpoint_layout=None):
         """Load hook to handle FineGrainedFP8 checkpoint format.

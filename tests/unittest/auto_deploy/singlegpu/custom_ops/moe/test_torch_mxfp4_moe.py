@@ -13,11 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""MXFP4 MoE custom-op tests.
+
+Covers the torch reference and trtllm-gen from-routing paths, the ``torch_moe``
+swiglu_limit clamp, and the quantize_mxfp4_moe transform helpers.
+"""
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: E402, F401
+import tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.mxfp4_moe as mxfp4_moe_mod  # noqa: E402
+from tensorrt_llm._torch.auto_deploy._compat import ActivationType, is_sm_100f  # noqa: E402
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.deepseek_v4_routing import (  # noqa: E402
+    _localize_routing_eager,
+)
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (  # noqa: E402
     DeepseekV4PackedMxfp4ExpertsCheckpointLayout,
     build_deepseek_v4_packed_mxfp4_experts_layout,
@@ -545,64 +556,20 @@ def test_torch_mxfp4_moe_ep_partitions_experts_and_sums_to_full_output() -> None
     torch.testing.assert_close(partial_sum, expected_sum, rtol=1e-5, atol=1e-5)
 
 
+@pytest.fixture
+def force_torch_reference_from_routing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the pure-torch reference branch (on SM100 the op auto-dispatches to trtllm-gen)."""
+    monkeypatch.setattr(mxfp4_moe_mod, "is_sm_100f", lambda: False)
+
+
+@pytest.mark.usefixtures("force_torch_reference_from_routing")
 def test_torch_mxfp4_moe_from_routing_matches_deepseek_layout_reference() -> None:
     num_experts = 3
     hidden_size = 32
     intermediate_size = 32
     alpha = 1.0
     limit = 0.75
-    x = torch.linspace(-0.3, 0.35, steps=4 * hidden_size, dtype=torch.float32).reshape(
-        4, hidden_size
-    )
-    selected_experts = torch.tensor(
-        [[0, 0], [2, 1], [1, 2], [2, 2]],
-        dtype=torch.int64,
-    )
-    routing_weights = torch.tensor(
-        [[0.2, 0.35], [0.6, 0.1], [0.25, 0.45], [0.4, 0.15]],
-        dtype=torch.float32,
-    )
-    packed, w1_weight, w2_weight, w3_weight = _deepseek_packed_params_from_layout(num_experts)
-    gate_up_bias = torch.zeros((num_experts, 2 * intermediate_size), dtype=torch.float32)
-    down_bias = torch.zeros((num_experts, hidden_size), dtype=torch.float32)
-
-    actual = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
-        x,
-        selected_experts,
-        routing_weights,
-        packed.gate_up_blocks,
-        gate_up_bias,
-        packed.gate_up_scales,
-        alpha,
-        limit,
-        packed.down_blocks,
-        down_bias,
-        packed.down_scales,
-        "up_gate",
-        "deepseek",
-    )
-    expected = _dense_deepseek_routing_reference(
-        x,
-        selected_experts,
-        routing_weights,
-        w1_weight,
-        w2_weight,
-        w3_weight,
-        alpha=alpha,
-        limit=limit,
-    )
-
-    assert expected.abs().max() > 0
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
-
-
-def test_torch_mxfp4_moe_from_routing_matches_reference_across_token_chunks() -> None:
-    num_experts = 3
-    hidden_size = 32
-    intermediate_size = 32
-    alpha = 1.0
-    limit = 0.75
-    num_tokens = 20
+    num_tokens = 20  # > _TORCH_MXFP4_ROUTED_MOE_TOKEN_CHUNK: two token chunks
     x = torch.linspace(-0.3, 0.35, steps=num_tokens * hidden_size, dtype=torch.float32).reshape(
         num_tokens, hidden_size
     )
@@ -610,6 +577,10 @@ def test_torch_mxfp4_moe_from_routing_matches_reference_across_token_chunks() ->
     selected_experts = torch.stack(
         (token_ids % num_experts, (token_ids + 1) % num_experts),
         dim=1,
+    )
+    selected_experts[:4] = torch.tensor(
+        [[0, 0], [2, 1], [1, 2], [2, 2]],
+        dtype=torch.int64,
     )
     routing_weights = torch.stack(
         (
@@ -648,9 +619,11 @@ def test_torch_mxfp4_moe_from_routing_matches_reference_across_token_chunks() ->
         limit=limit,
     )
 
+    assert expected.abs().max() > 0
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.usefixtures("force_torch_reference_from_routing")
 def test_torch_mxfp4_moe_from_routing_ep_partitions_deepseek_layout_experts() -> None:
     num_experts = 5
     ep_size = 3
@@ -712,6 +685,7 @@ def test_torch_mxfp4_moe_from_routing_ep_partitions_deepseek_layout_experts() ->
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for CUDA graph capture")
+@pytest.mark.usefixtures("force_torch_reference_from_routing")
 def test_torch_mxfp4_moe_from_routing_ep_allows_cuda_graph_capture() -> None:
     num_experts = 2
     hidden_size = 32
@@ -754,13 +728,6 @@ def test_torch_mxfp4_moe_from_routing_ep_allows_cuda_graph_capture() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
-
-
-def test_mxfp4_transform_backend_selector_respects_explicit_triton() -> None:
-    config = MXFP4MLPConfig(stage=Stages.PATTERN_MATCHER, backend="triton")
-    transform = InsertMXFP4MLP(config)
-
-    assert transform._resolve_backend() == "triton"
 
 
 def test_mxfp4_target_names_from_node_uses_op_schema_names_for_kwargs() -> None:
@@ -828,8 +795,216 @@ def test_mxfp4_transform_rejects_expert_dims_not_divisible_by_block_size(
     expected_name: str,
 ) -> None:
     gm = torch.fx.symbolic_trace(_DenseMoeTransformModule(hidden_size, intermediate_size))
-    transform = InsertMXFP4MLP(MXFP4MLPConfig(stage=Stages.PATTERN_MATCHER))
+    # The divisibility validation under test lives in the triton packing path.
+    transform = InsertMXFP4MLP(MXFP4MLPConfig(stage=Stages.PATTERN_MATCHER, backend="triton"))
+    assert transform._resolve_backend() == "triton"  # explicit backend must win over the SM default
     factory = _QuantConfigFactory({"quant_method": "mxfp4", "expert_block_size": 32})
 
     with pytest.raises(ValueError, match=f"{expected_name}.*divisible.*32"):
         transform._apply(gm, cm=None, factory=factory, shared_config=None)
+
+
+def test_prepare_trtllm_gen_weights_rejects_unknown_gate_up_order() -> None:
+    from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.prepare_trtllm_gen_moe_mxfp4_weights import (  # noqa: E501
+        prepare_trtllm_gen_moe_mxfp4_weights,
+    )
+
+    with pytest.raises(ValueError, match="gate_up_order"):
+        prepare_trtllm_gen_moe_mxfp4_weights(
+            torch.zeros((1, 64, 1, 16), dtype=torch.uint8),
+            torch.zeros((1, 64, 1), dtype=torch.uint8),
+            torch.zeros((1, 64), dtype=torch.float32),
+            torch.zeros((1, 32, 1, 16), dtype=torch.uint8),
+            torch.zeros((1, 32, 1), dtype=torch.uint8),
+            torch.zeros((1, 32), dtype=torch.float32),
+            hidden_size=32,
+            intermediate_size=32,
+            gate_up_order="gate_up",
+        )
+
+
+# ---------------------------------------------------------------------------
+# trtllm-gen from-routing path (W4A8 mxfp8-act, SM100): parity vs torch reference
+# ---------------------------------------------------------------------------
+
+# Short-circuit keeps is_sm_100f() (which queries the device) off CUDA-less hosts.
+requires_sm100 = pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_sm_100f(),
+    reason="trtllm-gen MXFP4 runners require CUDA + SM100 (Blackwell)",
+)
+
+
+def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
+    return torch.nn.functional.cosine_similarity(
+        a.reshape(-1).float(), b.reshape(-1).float(), dim=0
+    ).item()
+
+
+def _make_trtllm_gen_case(batch: int, dev: str = "cuda"):
+    """Scaled-down DSV4-Flash per-rank EP MoE shapes with EP-remote routes."""
+    torch.manual_seed(0)
+    H = 512
+    INTER = 256
+    E_LOCAL = 8
+    TOP_K = 4
+    EXPERT_START = 8  # rank>0: routing spans local [8,16) and remote experts
+    BLK = 32
+    GU = 2 * INTER
+
+    gu_blocks = torch.randint(0, 256, (E_LOCAL, GU, H // BLK, 16), dtype=torch.uint8, device=dev)
+    gu_scales = torch.randint(124, 131, (E_LOCAL, GU, H // BLK), dtype=torch.uint8, device=dev)
+    gu_bias = (torch.randn(E_LOCAL, GU, device=dev) * 0.05).to(torch.float32)
+    dn_blocks = torch.randint(0, 256, (E_LOCAL, H, INTER // BLK, 16), dtype=torch.uint8, device=dev)
+    dn_scales = torch.randint(124, 131, (E_LOCAL, H, INTER // BLK), dtype=torch.uint8, device=dev)
+    dn_bias = (torch.randn(E_LOCAL, H, device=dev) * 0.05).to(torch.float32)
+
+    x = torch.randn(batch, H, dtype=torch.bfloat16, device=dev) * 0.1
+    # First route per token pinned local (keeps cosine well-defined); when batch > 1 the last
+    # token is forced FULLY remote to assert the exact-zero EP partial-sum invariant.
+    sel = torch.randint(0, 4 * E_LOCAL, (batch, TOP_K), dtype=torch.int32, device=dev)
+    sel[:, 0] = torch.randint(EXPERT_START, EXPERT_START + E_LOCAL, (batch,), device=dev)
+    if batch > 1:
+        sel[-1] = torch.randint(0, EXPERT_START, (TOP_K,), device=dev)
+    rw = torch.softmax(torch.randn(batch, TOP_K, device=dev), dim=-1) * 1.5
+
+    ALPHA, LIMIT = 1.0, 10.0  # DSV4: alpha=1.0, swiglu_limit=10.0
+    weights = (gu_blocks, gu_bias, gu_scales, dn_blocks, dn_bias, dn_scales)
+    return x, sel, rw, weights, EXPERT_START, ALPHA, LIMIT, H
+
+
+def _run_from_routing_ep(x, sel, rw, weights, expert_start, alpha, limit, routing_localized=False):
+    gu_blocks, gu_bias, gu_scales, dn_blocks, dn_bias, dn_scales = weights
+    return torch.ops.auto_deploy.torch_mxfp4_moe_from_routing_ep(
+        x,
+        sel,
+        rw,
+        gu_blocks,
+        gu_bias,
+        gu_scales,
+        alpha,
+        limit,
+        dn_blocks,
+        dn_bias,
+        dn_scales,
+        "up_gate",
+        "deepseek",
+        expert_start=expert_start,
+        routing_localized=routing_localized,
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("batch", [1, 8])
+def test_trtllm_gen_mxfp4_from_routing_matches_torch_ref(batch):
+    x, sel, rw, weights, expert_start, alpha, limit, H = _make_trtllm_gen_case(batch)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(mxfp4_moe_mod, "is_sm_100f", lambda *a, **k: False)
+        out_ref = _run_from_routing_ep(x, sel, rw, weights, expert_start, alpha, limit)
+    out_trt = _run_from_routing_ep(x, sel, rw, weights, expert_start, alpha, limit)
+
+    assert out_trt.shape == out_ref.shape == (batch, H)
+    assert out_trt.dtype == x.dtype
+    assert torch.isfinite(out_trt).all()
+    if batch > 1:
+        # Any nonzero here would double-count through the EP all_reduce.
+        assert (out_ref[-1] == 0).all()
+        assert (out_trt[-1] == 0).all()
+    cos = _cos(out_trt, out_ref)
+    # Reduced-precision kernel vs fp32 reference on pathological random mxfp4 weights.
+    assert cos > 0.85, f"trtllm-gen vs torch-ref cosine too low: {cos:.4f} (batch={batch})"
+
+
+@requires_sm100
+def test_trtllm_gen_mxfp4_from_routing_localized_matches_global():
+    batch = 8
+    x, sel, rw, weights, expert_start, alpha, limit, _ = _make_trtllm_gen_case(batch)
+    e_local = weights[0].shape[0]
+
+    # Pre-localized int32/bf16 gate outputs (the fuse_moe_routing_localization contract) must
+    # be consumed verbatim: byte-equal to localizing eagerly inside the op.
+    out_global = _run_from_routing_ep(x, sel, rw, weights, expert_start, alpha, limit)
+    local_idx, local_w = _localize_routing_eager(sel, rw, expert_start, e_local)
+    out_localized = _run_from_routing_ep(
+        x, local_idx, local_w, weights, expert_start, alpha, limit, routing_localized=True
+    )
+    assert torch.equal(out_localized, out_global)
+
+    # Global (int64/fp32) routing with routing_localized=True would mis-route experts.
+    with pytest.raises(TypeError, match="routing_localized"):
+        _run_from_routing_ep(
+            x,
+            sel.to(torch.int64),
+            rw,
+            weights,
+            expert_start,
+            alpha,
+            limit,
+            routing_localized=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# torch_moe swiglu_limit clamp
+# ---------------------------------------------------------------------------
+
+
+def _swiglu_moe_inputs():
+    x = torch.tensor([[2.0, -1.0], [-3.0, 0.5], [1.5, 2.0]], dtype=torch.float32)
+    selected_experts = torch.tensor([[0, 1], [1, 0], [0, 1]], dtype=torch.int64)
+    routing_weights = torch.tensor([[0.75, 0.25], [0.5, 0.5], [0.25, 0.75]], dtype=torch.float32)
+    w1_weight = [
+        torch.tensor([[2.0, -1.0], [0.5, 1.0]], dtype=torch.float32),
+        torch.tensor([[-1.0, 1.5], [2.0, 0.25]], dtype=torch.float32),
+    ]
+    w2_weight = [
+        torch.tensor([[1.0, -0.5], [0.25, 1.5]], dtype=torch.float32),
+        torch.tensor([[-0.75, 1.25], [1.0, 0.5]], dtype=torch.float32),
+    ]
+    w3_weight = [
+        torch.tensor([[-2.0, 0.5], [1.5, -1.0]], dtype=torch.float32),
+        torch.tensor([[1.0, -2.0], [-1.5, 0.75]], dtype=torch.float32),
+    ]
+    return x, selected_experts, routing_weights, w1_weight, w2_weight, w3_weight
+
+
+def _reference_torch_moe_swiglu(swiglu_limit: float) -> torch.Tensor:
+    x, selected_experts, routing_weights, w1_weight, w2_weight, w3_weight = _swiglu_moe_inputs()
+    output = torch.zeros_like(x)
+    for token_idx, token in enumerate(x):
+        token_input = token.unsqueeze(0)
+        for route_idx, expert_idx_tensor in enumerate(selected_experts[token_idx]):
+            expert_idx = int(expert_idx_tensor.item())
+            gate_out = F.linear(token_input, w1_weight[expert_idx])
+            up_out = F.linear(token_input, w3_weight[expert_idx])
+            if swiglu_limit > 0.0:
+                gate_out = gate_out.clamp(max=swiglu_limit)
+                up_out = up_out.clamp(min=-swiglu_limit, max=swiglu_limit)
+            expert_out = F.linear(F.silu(gate_out) * up_out, w2_weight[expert_idx])
+            output[token_idx] += expert_out.squeeze(0) * routing_weights[token_idx, route_idx]
+    return output
+
+
+def _run_torch_moe_swiglu(swiglu_limit: float | None = None) -> torch.Tensor:
+    x, selected_experts, routing_weights, w1_weight, w2_weight, w3_weight = _swiglu_moe_inputs()
+    kwargs = {"is_gated_mlp": True, "act_fn": int(ActivationType.Silu)}
+    if swiglu_limit is not None:
+        kwargs["swiglu_limit"] = swiglu_limit
+    return torch.ops.auto_deploy.torch_moe(
+        x, selected_experts, routing_weights, w1_weight, w2_weight, w3_weight, **kwargs
+    )
+
+
+def test_torch_moe_swiglu_non_positive_limit_preserves_default() -> None:
+    default_output = _run_torch_moe_swiglu()
+    for swiglu_limit in (0.0, -1.0):
+        actual = _run_torch_moe_swiglu(swiglu_limit)
+        torch.testing.assert_close(actual, _reference_torch_moe_swiglu(swiglu_limit))
+        torch.testing.assert_close(actual, default_output)
+
+
+def test_torch_moe_swiglu_positive_limit_matches_reference_and_changes_output() -> None:
+    unlimited_output = _run_torch_moe_swiglu(0.0)
+    limited_output = _run_torch_moe_swiglu(1.0)
+
+    torch.testing.assert_close(limited_output, _reference_torch_moe_swiglu(1.0))
+    assert not torch.allclose(limited_output, unlimited_output)

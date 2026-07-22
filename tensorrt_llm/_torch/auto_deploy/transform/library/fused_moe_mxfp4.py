@@ -21,7 +21,7 @@ import torch.nn as nn
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
-from ..._compat import get_sm_version
+from ..._compat import get_sm_version, is_sm_100f
 from ...models.quant_checkpoint_layout import (
     PackedMXFP4ExpertCheckpointLayout,
     load_packed_mxfp4_expert_tensors,
@@ -341,17 +341,19 @@ def _register_mxfp4_expert_layout_hook(
             "MXFP4 expert runtime buffers should be at least rank 4, got "
             f"{gate_up_blocks.shape} and {down_blocks.shape}."
         )
-    gm._register_load_state_dict_pre_hook(
-        partial(
-            _load_mxfp4_expert_layout_hook,
-            checkpoint_layout=checkpoint_layout,
-            target_names=target_names,
-            layer=layer,
-            num_experts=int(gate_up_blocks.shape[0]),
-            hidden_size=int(down_blocks.shape[1]),
-            intermediate_size=int(gate_up_blocks.shape[1] // 2),
-        )
+    num_experts = int(gate_up_blocks.shape[0])
+    hidden_size = int(down_blocks.shape[1])
+    intermediate_size = int(gate_up_blocks.shape[1] // 2)
+    hook = partial(
+        _load_mxfp4_expert_layout_hook,
+        checkpoint_layout=checkpoint_layout,
+        target_names=target_names,
+        layer=layer,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
     )
+    gm._register_load_state_dict_pre_hook(hook)
     return True
 
 
@@ -957,12 +959,9 @@ class QuantizeMXFP4MOE(BaseTransform):
         moe_tp_rank = int(getattr(dc, "moe_tp_rank", 0)) if dc is not None else 0
         moe_ep_size = int(getattr(dc, "moe_ep_size", 1)) if dc is not None else 1
         moe_ep_rank = int(getattr(dc, "moe_ep_rank", 0)) if dc is not None else 0
-        # Cover MoE-EP as well: any distributed case (tp_size>1) needs the
-        # configured strategy. ``moe_tp_size > 1`` alone would miss EP-only.
-        _tp_size = int(getattr(dc, "tp_size", 1)) if dc is not None else 1
-        allreduce_strategy = (
-            str(dc.allreduce_strategy) if dc is not None and _tp_size > 1 else "NCCL"
-        )
+        # The allreduce strategy is resolved per node at the AR insertion site
+        # below (covers MoE-EP as well: any distributed case with tp_size > 1
+        # gets an AR with the configured — or small-message-qualified — strategy).
 
         # Single op handles both activation precisions via the ``act_dtype`` arg:
         # ``"bf16"`` → W4A16 (bf16 MoE runner), ``"mxfp8"`` → W4A8 (mxfp8_quantize +
@@ -1206,9 +1205,15 @@ class QuantizeMXFP4MOE(BaseTransform):
             # 88.02%).
             tp_size = int(getattr(dc, "tp_size", 1)) if dc is not None else 1
             if tp_size > 1:
-                from .sharding import _get_dist_ops
+                from .sharding import _get_dist_ops, qualify_small_oneshot_allreduce
 
                 _, all_reduce_op = _get_dist_ops("auto")
+                # Qualify the small-message ONESHOT upgrade from the fused op's
+                # static contract (bf16 activations, full hidden size) — the
+                # anchor may be a freshly created node without meta.
+                strategy = qualify_small_oneshot_allreduce(
+                    dc, all_reduce_op, torch.bfloat16, int(valid_hidden_size)
+                )
                 view_node = next(
                     (
                         u
@@ -1221,7 +1226,7 @@ class QuantizeMXFP4MOE(BaseTransform):
                 with gm.graph.inserting_after(anchor):
                     red = gm.graph.call_function(
                         all_reduce_op,
-                        args=(anchor, allreduce_strategy),
+                        args=(anchor, strategy),
                     )
                     anchor.replace_all_uses_with(red)
                     red.replace_input_with(red, anchor)
@@ -1560,5 +1565,158 @@ class FuseMXFP4Moe(BaseTransform):
             num_matches=num_matches,
             is_clean=False,
             has_valid_shapes=True,
+        )
+        return gm, info
+
+
+# ============================================================================
+# DeepSeek-V4 EP routing-localization fusion (batch-one direct dispatch)
+# ============================================================================
+
+
+_LOCALIZED_GATE_TARGETS = {
+    torch.ops.auto_deploy.deepseek_v4_routing.default: (
+        torch.ops.auto_deploy.deepseek_v4_routing_localized.default
+    ),
+    torch.ops.auto_deploy.deepseek_v4_hash_routing.default: (
+        torch.ops.auto_deploy.deepseek_v4_hash_routing_localized.default
+    ),
+}
+
+
+def _num_local_experts(gm: GraphModule, blocks_arg) -> Optional[int]:
+    """Local expert count = dim 0 of the (EP-sliced) ``gate_up_blocks`` arg."""
+    if not isinstance(blocks_arg, Node):
+        return None
+    val = blocks_arg.meta.get("val")
+    if val is not None and getattr(val, "ndim", 0) >= 1:
+        return int(val.shape[0])
+    if blocks_arg.op == "get_attr":
+        mod_name, _, attr_name = str(blocks_arg.target).rpartition(".")
+        submod = gm.get_submodule(mod_name) if mod_name else gm
+        tensor = getattr(submod, attr_name, None)
+        if isinstance(tensor, torch.Tensor) and tensor.ndim >= 1:
+            return int(tensor.shape[0])
+    return None
+
+
+def _sole_getitem_pair(gate: Node, sel: Node, rw: Node, moe: Node) -> bool:
+    """True iff ``sel``/``rw`` are ``getitem(gate, 0/1)`` consumed ONLY by ``moe``.
+
+    The rewrite changes the gate outputs' dtype contract (int64/fp32 ->
+    int32/bf16), so it is only sound when this MoE node is the single consumer
+    of both tuple elements and nothing else reads the gate.
+    """
+    for got, idx in ((sel, 0), (rw, 1)):
+        if got.op != "call_function" or got.target is not operator.getitem:
+            return False
+        if got.args[0] is not gate or got.args[1] != idx:
+            return False
+        if set(got.users) != {moe}:
+            return False
+    return set(gate.users) == {sel, rw}
+
+
+@TransformRegistry.register("fuse_moe_routing_localization")
+class FuseMoeRoutingLocalization(BaseTransform):
+    """Fold the EP global->local routing localization into the DSV4 router gate ops.
+
+    On the trtllm-gen MXFP4 path every ``torch_mxfp4_moe_from_routing[_ep]`` call
+    runs a standalone EP localization step (once per MoE layer per
+    decode step) to convert the gate's GLOBAL ``(int64 ids, fp32 weights)`` pair
+    into the runner's LOCAL dispatch contract: int32 local expert ids with the
+    invalid sentinel ``local_experts`` for off-rank routes + zero-masked bf16
+    weights. Both DSV4 gate kernels already hold the exact fp32 weights and global
+    ids in registers, so that whole conversion is a free tail there.
+
+    This transform rewrites, per MoE node whose routing inputs are the sole-use
+    getitems of a DSV4 gate op:
+
+        deepseek_v4[_hash]_routing -> localize (inside the MoE op)
+        ==> deepseek_v4[_hash]_routing_localized (+ routing_localized=True)
+
+    dropping the standalone localization launch; the gate now dispatches its top-k
+    results directly in local MXFP4 expert coordinates. Bit-exact: the fused tail
+    performs the identical sub/mask/sentinel select and single fp32->bf16 rounding
+    the standalone kernel performed (unit tests assert ``torch.equal``).
+
+    Scoped to the trtllm-gen dispatch (SM100f + ``up_gate``/``deepseek``): on the
+    non-SM100 torch-reference path the op would upcast the (bf16-rounded) weights
+    back to fp32, which is not bit-identical, so those graphs are left untouched.
+    """
+
+    config: TransformConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return TransformConfig
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm,
+        factory,
+        shared_config,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        num_matches = 0
+        if is_sm_100f():
+            moe_ops = (
+                torch.ops.auto_deploy.torch_mxfp4_moe_from_routing,
+                torch.ops.auto_deploy.torch_mxfp4_moe_from_routing_ep,
+            )
+            for node in list(gm.graph.nodes):
+                if not is_op(node, moe_ops):
+                    continue
+                sel, rw, gu_blocks, gate_up_order, swiglu_mode, expert_start = extract_op_args(
+                    node,
+                    "selected_experts",
+                    "routing_weights",
+                    "gate_up_blocks",
+                    "gate_up_order",
+                    "swiglu_mode",
+                    "expert_start",
+                )
+                # Mirror the runtime dispatch: only the trtllm-gen branch consumes the
+                # localized contract losslessly.
+                if gate_up_order != "up_gate" or swiglu_mode != "deepseek":
+                    continue
+                if not isinstance(sel, Node) or not isinstance(rw, Node):
+                    continue
+                gate = sel.args[0] if sel.op == "call_function" and sel.args else None
+                if not isinstance(gate, Node):
+                    continue
+                localized_target = None
+                for base, localized in _LOCALIZED_GATE_TARGETS.items():
+                    if is_op(gate, base):
+                        localized_target = localized
+                        break
+                if localized_target is None:
+                    continue
+                if not _sole_getitem_pair(gate, sel, rw, node):
+                    continue
+                local_experts = _num_local_experts(gm, gu_blocks)
+                if local_experts is None or local_experts <= 0:
+                    continue
+
+                gate.target = localized_target
+                gate.kwargs = {
+                    **gate.kwargs,
+                    "expert_start": int(expert_start or 0),
+                    "local_experts": int(local_experts),
+                }
+                node.kwargs = {**node.kwargs, "routing_localized": True}
+                num_matches += 1
+
+        if num_matches:
+            ad_logger.info(
+                f"fuse_moe_routing_localization: localized {num_matches} DSV4 MoE gate(s); "
+                f"dropped the standalone routing-localization step per MoE call"
+            )
+
+        info = TransformInfo(
+            skipped=(num_matches == 0),
+            num_matches=num_matches,
+            is_clean=(num_matches == 0),
+            has_valid_shapes=(num_matches == 0),
         )
         return gm, info

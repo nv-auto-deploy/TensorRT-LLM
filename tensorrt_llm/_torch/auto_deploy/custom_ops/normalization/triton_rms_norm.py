@@ -24,52 +24,64 @@ def rms_norm_kernel(
     input,
     weight,
     output,
-    input_row_stride: tl.constexpr,
+    input_row_stride,
+    output_row_stride,
     eps: tl.constexpr,
     N_COLS: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Rms norm kernel.
-    Forces weights to be in float32 for the kernel.
-    """
+    """RMSNorm with an fp32 reduction and fp32 weight multiply."""
     prog_id = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_N)
+    mask = offsets < N_COLS
 
-    w = tl.load(weight + offsets, mask=offsets < N_COLS)
-
-    x_ptr = input + prog_id * input_row_stride
-    x = tl.load(x_ptr + offsets, mask=offsets < N_COLS)
+    w = tl.load(weight + offsets, mask=mask)
+    x = tl.load(input + prog_id * input_row_stride + offsets, mask=mask)
     xf = x.to(tl.float32)
 
     var = tl.sum(xf * xf, 0) * float(1.0 / N_COLS)
-    out = xf / tl.sqrt(var + eps)
-    out = (w.to(tl.float32) * out).to(x.dtype)
+    out = (w.to(tl.float32) * (xf / tl.sqrt(var + eps))).to(x.dtype)
 
-    out_ptr = output + prog_id * input_row_stride
-    tl.store(out_ptr + offsets, out, mask=offsets < N_COLS)
+    tl.store(output + prog_id * output_row_stride + offsets, out, mask=mask)
+
+
+def _flattens_to_regular_rows(t: Tensor, feat_size: int) -> bool:
+    """True if ``t`` is a last-dim-contiguous view whose leading dims flatten to
+    uniformly strided, non-overlapping ``feat_size``-wide rows (e.g. a narrow view
+    of a wider fused projection)."""
+    if t.dim() < 2 or t.shape[-1] != feat_size or t.stride(-1) != 1:
+        return False
+    if t.shape[-2] > 1 and t.stride(-2) < feat_size:
+        return False
+    expected = t.shape[-2] * t.stride(-2)
+    for dim in range(t.dim() - 3, -1, -1):
+        if t.shape[dim] > 1 and t.stride(dim) != expected:
+            return False
+        expected *= t.shape[dim]
+    return True
 
 
 def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5):
-    """Rms norm."""
-    # Ensure contiguous: the Triton kernel uses the same stride for both input
-    # and output pointers, but torch.empty_like always produces a contiguous
-    # output. If hidden_states is non-contiguous (e.g. a split_with_sizes view),
-    # input_stride != output_stride → out-of-bounds writes → cudaErrorIllegalAddress.
-    if not hidden_states.is_contiguous():
-        hidden_states = hidden_states.contiguous()
+    """RMSNorm.
+
+    Regularly strided rows (e.g. narrow views) are consumed in place; irregular
+    layouts fall back to one ``contiguous()`` copy. The output is always contiguous.
+    """
     feat_size = weight.shape[0]
+    if not _flattens_to_regular_rows(hidden_states, feat_size):
+        hidden_states = hidden_states.contiguous()
     seq_len = hidden_states.numel() // hidden_states.size(-1)
-    input_stride = hidden_states.stride(-2)
+
+    out = torch.empty(hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
     BLOCK_N = triton.next_power_of_2(feat_size)
-    out = torch.empty_like(hidden_states)
-
     grid = (seq_len,)
     rms_norm_kernel[grid](
         hidden_states,
         weight,
         out,
-        input_row_stride=input_stride,
+        input_row_stride=hidden_states.stride(-2),
+        output_row_stride=out.stride(-2),
         eps=eps,
         N_COLS=feat_size,
         BLOCK_N=BLOCK_N,

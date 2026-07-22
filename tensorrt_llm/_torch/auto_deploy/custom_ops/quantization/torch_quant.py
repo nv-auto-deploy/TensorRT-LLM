@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import triton
@@ -56,18 +56,6 @@ def _dequant_weight_fp8(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     return weight_fp8.to(dtype) * weight_scale
-
-
-def _dequant_block_fp8_weight(
-    weight_fp8: torch.Tensor,
-    weight_scale: torch.Tensor,
-    block_n: int,
-    block_k: int,
-    dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    return dequant_fp8_weight_two_dim_block_grid(
-        weight_fp8, weight_scale, block_n, block_k, dtype=dtype
-    )
 
 
 # The NVFP4 helpers below are adapted from modelopt.torch.quantization.qtensor.nvfp4_tensor.NVFP4QTensor
@@ -490,14 +478,15 @@ def torch_fake_quant_int4_gptq_linear_fake(
     return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)
 
 
+def _use_quant_prologue(input_scale_fmt: str) -> bool:
+    """Use the measured in-kernel quant path for power-of-two activation scales."""
+    return input_scale_fmt.lower() == "ue8m0"
+
+
 @triton.jit
 def _act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, ROUND_SCALE: tl.constexpr):
-    """Block-wise FP8 activation quantization, safe for all-zero blocks.
-
-    Identical to HuggingFace's act_quant_kernel except that the per-block scale
-    is clamped to a minimum of 1e-12 before dividing.  This avoids 0/0 = NaN
-    when every element in a block is zero.
-    """
+    """Block-wise FP8 activation quantization (HF's act_quant_kernel plus a
+    >=1e-12 scale clamp so all-zero blocks produce 0 instead of 0/0 = NaN)."""
     pid = tl.program_id(axis=0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x = tl.load(x_ptr + offs).to(tl.float32)
@@ -516,14 +505,18 @@ def _act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, ROUND_SCALE
     tl.store(s_ptr + pid, s)
 
 
-def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str = "") -> tuple:
-    """Block-wise FP8 activation quantization (CUDA-graph safe).
+@triton.jit
+def _ue8m0_quant_rows(x):
+    """In-register ue8m0 block-FP8 quant of one whole quant group per row of ``x``
+    (identical scale math and rounding to ``_act_quant_kernel``'s ROUND_SCALE path)."""
+    amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
+    s = tl.exp2(tl.ceil(tl.log2(amax / 448.0)))
+    return (x / s[:, None]).to(tl.float8e4nv), s
 
-    Drop-in replacement for ``transformers.integrations.finegrained_fp8.act_quant``
-    that fixes the NaN-on-zero-block bug by clamping the per-block scale inside
-    the Triton kernel itself.  No post-hoc fixup tensors are created, so the
-    op is fully compatible with CUDA graphs.
-    """
+
+def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str = "") -> tuple:
+    """Block-wise FP8 activation quantization (drop-in for HF's ``act_quant``);
+    the NaN fix lives inside the kernel, so no fixup tensors and CUDA-graph safe."""
     assert x.is_contiguous()
     assert x.shape[-1] % block_size == 0
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
@@ -533,13 +526,49 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str
 
     grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)  # noqa: E731
     round_scale = input_scale_fmt.lower() == "ue8m0"
-    _act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size, ROUND_SCALE=round_scale)
+    # num_warps=1: each program is a single 128-elem reduction, so one warp keeps it
+    # intra-warp (no smem barrier); measured faster than the 4-warp default.
+    _act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size, ROUND_SCALE=round_scale, num_warps=1)
     return y, s
 
 
-# Adapted from sgl-project/sglang fp8 block matmul kernel, vendored here to
-# decouple from transformers.integrations.finegrained_fp8 (which removed
-# w8a8_block_fp8_matmul_triton in transformers 5.5.x).
+# Adapted from sgl-project/sglang, vendored because transformers 5.5.x removed
+# w8a8_block_fp8_matmul_triton. BLOCK_SIZE_K is NOT autotuned: it must stay pinned
+# to the quantization group_k or the in-loop scale index straddles a scale block
+# and corrupts the result. Configs measured on B200 over the DSV4 per-rank shapes.
+
+_W8A8_BLOCK_FP8_MATMUL_CONFIGS = [
+    # Decode / small-M: BLOCK_SIZE_N 32 vs 64 selected by the autotuner; num_warps
+    # pinned to 4 (the 4-vs-8 gap is below do_bench resolution -> selection flicker).
+    triton.Config(
+        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=4
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=4
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=3
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1}, num_warps=4, num_stages=3
+    ),
+    # Prefill / large-M: ONLY BLOCK_SIZE_N=128 + num_warps=8. Other large-tile
+    # configs are run-to-run NON-deterministic on sm100 at M>=256/K>=2048 (fp8-MMA
+    # pipelining glitch); do not add faster-but-racy configs — the autotuner
+    # selects on latency only.
+    triton.Config(
+        {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=4
+    ),
+    triton.Config(
+        {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=4
+    ),
+]
+
+
+@triton.autotune(
+    configs=_W8A8_BLOCK_FP8_MATMUL_CONFIGS,
+    key=["M", "N", "K"],
+)
 @triton.jit
 def _w8a8_block_fp8_matmul_kernel(
     A,
@@ -547,6 +576,7 @@ def _w8a8_block_fp8_matmul_kernel(
     C,
     As,
     Bs,
+    R,
     M,
     N,
     K,
@@ -562,10 +592,13 @@ def _w8a8_block_fp8_matmul_kernel(
     stride_As_k,
     stride_Bs_k,
     stride_Bs_n,
+    stride_rm,
+    stride_rn,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -612,16 +645,24 @@ def _w8a8_block_fp8_matmul_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    if HAS_RESIDUAL:
+        # Fused merge add: ``c`` is already rounded to the output dtype, so fp32
+        # widen + add + one rounding reproduces the eager add(matmul_out, residual).
+        r_ptrs = R + stride_rm * offs_cm[:, None] + stride_rn * offs_cn[None, :]
+        r = tl.load(r_ptrs, mask=c_mask, other=0.0)
+        c = (c.to(tl.float32) + r.to(tl.float32)).to(C.dtype.element_ty)
     tl.store(c_ptrs, c, mask=c_mask)
 
 
 def _w8a8_block_fp8_matmul_triton(
     A: torch.Tensor,
     B: torch.Tensor,
-    As: torch.Tensor,
+    As: Optional[torch.Tensor],
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float32,
+    residual: Optional[torch.Tensor] = None,
+    input_scale_fmt: str = "",
 ) -> torch.Tensor:
     if block_size is None:
         block_n, block_k = 128, 128
@@ -630,9 +671,14 @@ def _w8a8_block_fp8_matmul_triton(
         block_n, block_k = block_size[0], block_size[1]
 
     assert A.shape[-1] == B.shape[-1]
-    assert As.numel() != 1, "per-tensor scales unsupported in vendored path"
-    assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
-    assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+    if As is None:
+        # Deferred activation quant: the decode GEMV/split-K kernels fuse the ue8m0
+        # quant into their prologue; other shapes quantize standalone below.
+        assert A.is_contiguous() and A.shape[-1] % block_k == 0
+    else:
+        assert As.numel() != 1, "per-tensor scales unsupported in vendored path"
+        assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
 
     M = A.numel() // A.shape[-1]
     N, K = B.shape
@@ -642,14 +688,37 @@ def _w8a8_block_fp8_matmul_triton(
     assert triton.cdiv(K, block_k) == Bs.shape[1]
 
     C_shape = A.shape[:-1] + (N,)
+
+    if residual is not None:
+        assert residual.shape == C_shape, "residual must match the matmul output shape"
+        assert residual.dtype == output_dtype, "residual must match the matmul output dtype"
+        assert residual.dim() >= 2 and residual.is_contiguous()
+
+    # Dispatch: exact measured M=1 TP4 shapes -> rowwise direct-store GEMV;
+    # small-M/long-K (CTA-starved base grid) -> split-K; else autotuned full-K.
+    if _use_rowwise_gemv(M, N, K, block_n, block_k, A, B, As, Bs):
+        return _w8a8_gemv_rowwise(
+            A, B, As, Bs, block_n, block_k, output_dtype, N, K, residual=residual
+        )
+
+    if _use_splitk_decode(M, N, K):
+        C = _w8a8_block_fp8_matmul_splitk(A, B, As, Bs, block_n, block_k, output_dtype, M, N, K)
+        if residual is not None:
+            # The split-K path materializes its output via an fp32 atomic
+            # accumulator + cast; keep the merge add as a separate elementwise op
+            # there (identical rounding to the unfused sequence).
+            C = C + residual
+        return C
+
+    if As is None:
+        # No fused-prologue decode path for this shape (e.g. prefill).
+        A, As = _safe_act_quant(A, block_k, input_scale_fmt)
+
     C = A.new_empty(C_shape, dtype=output_dtype)
 
-    BLOCK_SIZE_M = 128
-    if M < BLOCK_SIZE_M:
-        BLOCK_SIZE_M = max(triton.next_power_of_2(M), 16)
-    BLOCK_SIZE_K = block_k
-    BLOCK_SIZE_N = block_n
-
+    # BLOCK_SIZE_M / BLOCK_SIZE_N / GROUP_SIZE_M / num_warps / num_stages come from
+    # the @triton.autotune config (keyed on M, N, K). BLOCK_SIZE_K is pinned to the
+    # quantization block size for scale-indexing correctness (see kernel comment).
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
 
@@ -659,6 +728,7 @@ def _w8a8_block_fp8_matmul_triton(
         C,
         As,
         Bs,
+        C if residual is None else residual,
         M,
         N,
         K,
@@ -674,12 +744,417 @@ def _w8a8_block_fp8_matmul_triton(
         As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=8,
+        0 if residual is None else residual.stride(-2),
+        0 if residual is None else residual.stride(-1),
+        BLOCK_SIZE_K=block_k,
+        HAS_RESIDUAL=residual is not None,
     )
     return C
+
+
+# Split-K decode GEMV: at decode M with long K the full-K kernel launches only
+# cdiv(N, BLOCK_N) CTAs and is K-loop-latency-bound. This kernel fans the K
+# reduction out across SPLIT_K CTAs (grid axis 1, strided K-blocks) and
+# tl.atomic_add's fp32 partials into a pre-zeroed accumulator — equal to the
+# serial sum up to fp32 add ordering (~1e-7 rel, far under fp8 quant error).
+# BLOCK_SIZE_K stays pinned to group_k (scale-index correctness).
+@triton.jit
+def _w8a8_block_fp8_matmul_splitk_kernel(
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    M,
+    N,
+    K,
+    group_n,
+    group_k,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_As_m,
+    stride_As_k,
+    stride_Bs_k,
+    stride_Bs_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    QUANT_PROLOGUE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    pid_sk = tl.program_id(axis=1)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    # Start each split at its own K-block; stride by SPLIT_K K-blocks per loop step.
+    a_ptrs = A + (
+        offs_am[:, None] * stride_am + (pid_sk * BLOCK_SIZE_K + offs_k)[None, :] * stride_ak
+    )
+    b_ptrs = B + (
+        (pid_sk * BLOCK_SIZE_K + offs_k)[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    )
+
+    As_ptrs = As + offs_am * stride_As_m
+    offs_bsn = offs_bn // group_n
+    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    num_k = tl.cdiv(K, BLOCK_SIZE_K)
+    for k in range(pid_sk, num_k, SPLIT_K):
+        k_remaining = K - k * BLOCK_SIZE_K
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
+
+        offs_ks = (k * BLOCK_SIZE_K) // group_k
+        if QUANT_PROLOGUE:
+            # A is the raw activation; BLOCK_SIZE_K == group_k makes each tile row
+            # one quant group, so quantize in-register and feed fp8 to tl.dot.
+            x = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0).to(tl.float32)
+            a, a_s = _ue8m0_quant_rows(x)
+        else:
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+            a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        a_ptrs += SPLIT_K * BLOCK_SIZE_K * stride_ak
+        b_ptrs += SPLIT_K * BLOCK_SIZE_K * stride_bk
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
+
+
+# Split-K launch config for the decode GEMV, tuned on B200 over the K=7168 decode
+# projection shapes (N in {256,576,1536,2304}) plus the exact M=1/K=4096
+# DeepSeek-V4-Flash TP4 per-rank shapes (N in {1024,1536}).
+_SPLITK_BLOCK_SIZE_M = 16
+_SPLITK_NUM_STAGES = 3
+# Gate: small M (decode) + long K reduction, where the base grid is CTA-starved.
+_SPLITK_MAX_M = 4
+_SPLITK_MIN_K = 4096
+
+
+def _use_splitk_decode(M: int, N: int, K: int) -> bool:
+    return M <= _SPLITK_MAX_M and K >= _SPLITK_MIN_K
+
+
+def _splitk_schedule(M: int, N: int, K: int) -> Tuple[int, int, int]:
+    """(BLOCK_SIZE_N, SPLIT_K, num_warps) for the split-K decode GEMV.
+
+    Small N is CTA-starved: narrow N-tiles plus a deeper K-split spread work over
+    more CTAs; wide-N shapes prefer fat tiles and a shallower split (fewer
+    atomics). The exact M=1/K=4096 TP4 shapes were re-measured separately: with
+    only 32 K-blocks a 128-wide tile is too coarse (BLOCK_N=64 wins), N=1024
+    wants the balanced SPLIT_K=32 (24 leaves 2-K-block stragglers), and the
+    short per-CTA reduction only needs 2 warps.
+    """
+    if M == 1 and K == 4096 and N in (1024, 1536):
+        return 64, (32 if N == 1024 else 24), 2
+    block_n = 32 if N <= 512 else (64 if N < 1024 else 128)
+    split_k = 48 if N < 1024 else (24 if N <= 1792 else 16)
+    return block_n, split_k, 4
+
+
+def _w8a8_block_fp8_matmul_splitk(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: Optional[torch.Tensor],
+    Bs: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    output_dtype: torch.dtype,
+    M: int,
+    N: int,
+    K: int,
+    *,
+    C_out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Split-K block-FP8 GEMM for the decode GEMV (see kernel comment above).
+
+    ``C_out`` is a pre-zeroed fp32 column slice from the grouped-GEMV path (all
+    groups share one allocation and one finish cast). Atomic accumulation order is
+    nondeterministic: values on a BF16 rounding boundary can differ by one ULP.
+    """
+    block_size_n, split_k, num_warps = _splitk_schedule(M, N, K)
+    if As is None:
+        # Deferred-quant path: the per-row group amax is reduced over one K tile,
+        # so the tile must cover exactly one whole quant group.
+        assert K % block_k == 0, f"quant prologue requires K % block_k == 0 (K={K})"
+    if C_out is not None:
+        C_acc = C_out
+    else:
+        C_shape = A.shape[:-1] + (N,)
+        # fp32 accumulator, pre-zeroed for the atomic reduction across SPLIT_K CTAs.
+        C_acc = A.new_zeros(C_shape, dtype=torch.float32)
+
+    grid = (
+        triton.cdiv(M, _SPLITK_BLOCK_SIZE_M) * triton.cdiv(N, block_size_n),
+        split_k,
+    )
+    _w8a8_block_fp8_matmul_splitk_kernel[grid](
+        A,
+        B,
+        C_acc,
+        A if As is None else As,
+        Bs,
+        M,
+        N,
+        K,
+        block_n,
+        block_k,
+        A.stride(-2),
+        A.stride(-1),
+        B.stride(1),
+        B.stride(0),
+        C_acc.stride(-2),
+        C_acc.stride(-1),
+        0 if As is None else As.stride(-2),
+        0 if As is None else As.stride(-1),
+        Bs.stride(1),
+        Bs.stride(0),
+        BLOCK_SIZE_M=_SPLITK_BLOCK_SIZE_M,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_k,
+        SPLIT_K=split_k,
+        QUANT_PROLOGUE=As is None,
+        num_warps=num_warps,
+        num_stages=_SPLITK_NUM_STAGES,
+    )
+    if output_dtype == torch.float32:
+        return C_acc
+    return C_acc.to(output_dtype)
+
+
+# Rowwise direct-store decode GEMV: gives each CTA a band of B rows and streams
+# whole K segments per row — one kernel (no zero-fill/cast pair), no atomics,
+# deterministic accumulation. Schedules below were measured per exact DSV4-Flash
+# TP4 M=1 shape on B200; non-listed shapes / M>=2 keep the incumbent paths.
+
+# (N, K) -> (BLOCK_N rows/CTA, GROUPS k-groups/iter, num_warps, num_stages)
+_W8A8_TP4_M1_ROWWISE_CFG = {
+    (1536, 4096): (1, 32, 2, 3),  # fused wq_a + wkv          (was split-K 24x24)
+    (1024, 4096): (1, 32, 2, 5),  # shared w1+w3 / wo_a sites (was split-K 16x32)
+    (16384, 1024): (32, 8, 4, 3),  # fused wq_b + indexer.wq_b (was full-K BN128)
+    (8192, 1024): (8, 8, 4, 3),  # wq_b                      (was full-K BN64)
+    (4096, 512): (4, 4, 2, 5),  # shared w2 (+residual)     (was full-K BN32)
+    (4096, 2048): (4, 8, 2, 5),  # wo_b                      (was full-K BN32)
+}
+
+# Fused-quant-prologue variant: the in-kernel quant shifts the register balance,
+# so each shape was re-swept. Key set must match _W8A8_TP4_M1_ROWWISE_CFG
+# (shared _use_rowwise_gemv gate).
+_W8A8_TP4_M1_ROWWISE_PROLOGUE_CFG = {
+    (1536, 4096): (4, 32, 4, 3),  # 4.01 vs 4.08 us pair (BLOCK_N=1 regressed)
+    (1024, 4096): (2, 32, 4, 5),  # 3.53 vs 4.20 us pair
+    (16384, 1024): (32, 8, 4, 3),  # 4.88 vs 5.58 us pair (standalone cfg kept)
+    (8192, 1024): (32, 8, 4, 2),  # 3.51 vs 4.92 us pair
+    (4096, 512): (8, 4, 2, 5),  # 2.34 vs 3.56 us pair
+    (4096, 2048): (4, 16, 4, 2),  # 4.11 vs 5.42 us pair
+}
+
+
+def _rowwise_gemv_cfg(N: int, K: int, prequantized: bool) -> Optional[Tuple[int, int, int, int]]:
+    """(BLOCK_N, GROUPS, num_warps, num_stages) for the rowwise GEMV, or None.
+
+    ``prequantized`` (``As is not None``) selects the standalone-quant table;
+    the deferred-quant prologue variant uses its own re-swept table.
+    """
+    table = _W8A8_TP4_M1_ROWWISE_CFG if prequantized else _W8A8_TP4_M1_ROWWISE_PROLOGUE_CFG
+    return table.get((N, K))
+
+
+def _use_rowwise_gemv(
+    M: int,
+    N: int,
+    K: int,
+    block_n: int,
+    block_k: int,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: Optional[torch.Tensor],
+    Bs: torch.Tensor,
+) -> bool:
+    """Gate the rowwise decode GEMV to the exact measured M=1 TP4 shapes."""
+    if M != 1 or block_n != 128 or block_k != 128:
+        return False
+    cfg = _rowwise_gemv_cfg(N, K, As is not None)
+    if cfg is None:
+        return False
+    block_rows, groups = cfg[0], cfg[1]
+    # Defensive: every table shape satisfies these exactly-divisible tilings.
+    if N % block_rows or K % (groups * block_k):
+        return False
+    # The kernel reads flat contiguous rows (A, As) and row-major B / Bs.
+    # As is None on the deferred-quant path (in-kernel activation-quant prologue).
+    if As is not None and As.stride(-1) != 1:
+        return False
+    return A.stride(-1) == 1 and B.stride(1) == 1 and Bs.stride(1) == 1
+
+
+@triton.jit
+def _w8a8_gemv_rowwise_kernel(
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    R,
+    K,
+    stride_bn,
+    stride_bsn,
+    GROUP_N: tl.constexpr,
+    GROUP_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUPS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    QUANT_PROLOGUE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_g = tl.arange(0, GROUPS)
+    offs_k = tl.arange(0, GROUP_K)
+    num_k_groups = K // GROUP_K
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    bs_row = offs_n // GROUP_N
+    for g0 in range(0, num_k_groups, GROUPS):
+        kk = (g0 + offs_g)[:, None] * GROUP_K + offs_k[None, :]
+        if QUANT_PROLOGUE:
+            # A is the raw model-dtype activation: ue8m0 fp8 round-trip in-register.
+            x = tl.load(A + kk).to(tl.float32)  # (GROUPS, GROUP_K)
+            a, a_s = _ue8m0_quant_rows(x)
+            a = a.to(tl.float32)
+        else:
+            a = tl.load(A + kk).to(tl.float32)  # (GROUPS, GROUP_K)
+            a_s = tl.load(As + g0 + offs_g).to(tl.float32)
+        b = tl.load(B + offs_n[:, None, None] * stride_bn + kk[None, :, :]).to(tl.float32)
+        part = tl.sum(b * a[None, :, :], axis=2)  # (BLOCK_N, GROUPS)
+        b_s = tl.load(Bs + bs_row[:, None] * stride_bsn + (g0 + offs_g)[None, :]).to(tl.float32)
+        # Same scale association as the incumbent kernels: (partial * a_s) * b_s.
+        acc += tl.sum(part * a_s[None, :] * b_s, axis=1)
+
+    c = acc.to(C.dtype.element_ty)
+    if HAS_RESIDUAL:
+        # Mirror the full-K epilogue bit-for-bit: round the accumulator to the
+        # output dtype first, then add the residual in fp32 and round once.
+        r = tl.load(R + offs_n).to(tl.float32)
+        c = (c.to(tl.float32) + r).to(C.dtype.element_ty)
+    tl.store(C + offs_n, c)
+
+
+def _w8a8_gemv_rowwise(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: Optional[torch.Tensor],
+    Bs: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    output_dtype: torch.dtype,
+    N: int,
+    K: int,
+    residual: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Launch the rowwise direct-store decode GEMV (gate via _use_rowwise_gemv).
+
+    ``As is None`` selects the deferred-quant path: ``A`` is the raw model-dtype
+    activation and the kernel quantizes each 128-group in its prologue.
+    """
+    block_rows, groups, num_warps, num_stages = _rowwise_gemv_cfg(N, K, As is not None)
+    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+    grid = (N // block_rows,)
+    _w8a8_gemv_rowwise_kernel[grid](
+        A,
+        B,
+        C,
+        A if As is None else As,
+        Bs,
+        C if residual is None else residual,
+        K,
+        B.stride(0),
+        Bs.stride(0),
+        GROUP_N=block_n,
+        GROUP_K=block_k,
+        BLOCK_N=block_rows,
+        GROUPS=groups,
+        HAS_RESIDUAL=residual is not None,
+        QUANT_PROLOGUE=As is None,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return C
+
+
+_FINEGRAINED_FP8_CANONICAL_BLOCK_N = 128
+
+
+def _finegrained_fp8_block_sizes(
+    weight_quantized: torch.Tensor, weight_scale_inv: torch.Tensor
+) -> Tuple[int, int]:
+    """Infer (block_n, block_k) from the weight and per-block scale shapes.
+
+    Recognize the standard 128-row checkpoint grid before falling back to shape inference,
+    since a partial final N block makes the block size ambiguous from shape alone.
+    """
+    N, K = weight_quantized.shape
+    scale_n, scale_k = weight_scale_inv.shape
+    block_n = (
+        _FINEGRAINED_FP8_CANONICAL_BLOCK_N
+        if scale_n == triton.cdiv(N, _FINEGRAINED_FP8_CANONICAL_BLOCK_N)
+        else triton.cdiv(N, scale_n)
+    )
+    block_k = triton.cdiv(K, scale_k)
+    return block_n, block_k
+
+
+def _finegrained_fp8_matmul(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    out_dtype: torch.dtype,
+    *,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    residual: Optional[torch.Tensor] = None,
+    input_scale_fmt: str = "",
+    allow_quant_prologue: bool = False,
+) -> torch.Tensor:
+    """Shared body of the FineGrained FP8 linear ops: (quantize +) block-FP8 W8A8
+    matmul (+ bias / fused residual add). ``input_scale is None`` means a raw
+    activation — quantized here, or in the decode kernels' prologue when
+    ``allow_quant_prologue``. Block sizes are inferred from the scale shapes."""
+    block_n, block_k = _finegrained_fp8_block_sizes(weight_quantized, weight_scale_inv)
+    if input_scale is not None:
+        qinput, scale = input, input_scale
+    elif allow_quant_prologue and _use_quant_prologue(input_scale_fmt):
+        # Defer the activation quant into the decode kernels' prologue (or the
+        # standalone fallback inside the matmul dispatch for non-decode shapes).
+        qinput, scale = input, None
+    else:
+        qinput, scale = _safe_act_quant(input, block_k, input_scale_fmt)
+    output = _w8a8_block_fp8_matmul_triton(
+        qinput,
+        weight_quantized,
+        scale,
+        weight_scale_inv,
+        [block_n, block_k],
+        output_dtype=out_dtype,
+        residual=None if residual is None else residual.contiguous(),
+        input_scale_fmt=input_scale_fmt,
+    )
+    if bias is not None:
+        output = output + bias
+    return output.to(dtype=out_dtype)
 
 
 @torch.library.custom_op("auto_deploy::torch_fake_quant_finegrained_fp8_linear", mutates_args=())
@@ -702,30 +1177,15 @@ def torch_fake_quant_finegrained_fp8_linear(
     - input_scale, input_zp, weight_zp are unused
     - block_size is inferred from weight and weight_scale_inv shapes
     """
-    weight_scale_inv = weight_scale[0]
-
-    # Infer block_size from weight and weight_scale_inv shapes
-    # weight shape: [N, K], weight_scale_inv shape: [ceil(N/block_n), ceil(K/block_k)]
-    N, K = weight_quantized.shape
-    scale_n, scale_k = weight_scale_inv.shape
-    block_n = triton.cdiv(N, scale_n)
-    block_k = triton.cdiv(K, scale_k)
-    block_size = [block_n, block_k]
-
-    qinput, scale = _safe_act_quant(input, block_size[1], input_scale_fmt)
-    output = _w8a8_block_fp8_matmul_triton(
-        qinput,
+    return _finegrained_fp8_matmul(
+        input,
         weight_quantized,
-        scale,
-        weight_scale_inv,
-        block_size,
-        output_dtype=input.dtype,
+        weight_scale[0],
+        input.dtype,
+        bias=bias,
+        input_scale_fmt=input_scale_fmt,
+        allow_quant_prologue=True,
     )
-
-    if bias is not None:
-        output = output + bias
-
-    return output.to(dtype=input.dtype)
 
 
 @torch_fake_quant_finegrained_fp8_linear.register_fake
@@ -746,6 +1206,186 @@ def _torch_fake_quant_finegrained_fp8_linear_fake(
     """Fake implementation for torch.export tracing."""
     out_features = weight_quantized.shape[0]
     return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
+
+
+@torch.library.custom_op(
+    "auto_deploy::torch_fake_quant_finegrained_fp8_linear_residual_add", mutates_args=()
+)
+def torch_fake_quant_finegrained_fp8_linear_residual_add(
+    input: torch.Tensor,  # [..., K]
+    weight_quantized: torch.Tensor,  # [N, K] float8_e4m3fn
+    bias: Optional[torch.Tensor],  # must be None (the fusion only matches bias-free linears)
+    input_scale: List[torch.Tensor],  # [] for raw input, [scale] for pre-quantized input
+    weight_scale: List[torch.Tensor],  # [weight_scale_inv]
+    input_zp: List[torch.Tensor],  # unused
+    weight_zp: List[torch.Tensor],  # unused
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
+    input_scale_fmt: str = "",
+    residual: Optional[torch.Tensor] = None,  # [..., N] added to the matmul output
+) -> torch.Tensor:
+    """``torch_fake_quant_finegrained_fp8_linear`` with the merge add fused into the
+    matmul epilogue (one kernel instead of matmul + elementwise add); same rounding
+    as the unfused sequence. ``input`` is raw (``input_scale=[]``) or pre-quantized
+    FP8 (``input_scale=[scale]``). Emitted by ``fuse_fp8_linear_allreduce_add`` for
+    the MoE routed+shared merge add feeding an all_reduce.
+    """
+    assert bias is None, "fused residual-add linear only supports bias-free linears"
+    assert residual is not None, "residual tensor is required"
+    activation_scale = input_scale[0] if input_scale else None
+    out_dtype = activation_scale.dtype if activation_scale is not None else input.dtype
+    return _finegrained_fp8_matmul(
+        input,
+        weight_quantized,
+        weight_scale[0],
+        out_dtype,
+        input_scale=activation_scale,
+        residual=residual,
+        input_scale_fmt=input_scale_fmt,
+    )
+
+
+@torch_fake_quant_finegrained_fp8_linear_residual_add.register_fake
+def _torch_fake_quant_finegrained_fp8_linear_residual_add_fake(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    input_scale: List[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    input_zp: List[torch.Tensor],
+    weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
+    input_scale_fmt: str = "",
+    residual: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fake implementation for torch.export tracing."""
+    out_features = weight_quantized.shape[0]
+    out_dtype = input_scale[0].dtype if input_scale else input.dtype
+    return torch.empty((*input.shape[:-1], out_features), dtype=out_dtype, device=input.device)
+
+
+@triton.jit
+def _swiglu_clamp_act_quant_kernel(
+    g_ptr,
+    u_ptr,
+    y_ptr,
+    s_ptr,
+    limit,
+    g_row_stride,
+    u_row_stride,
+    GROUPS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
+    ROUND_SCALE: tl.constexpr,
+):
+    """Fused (clamped) SwiGLU + block-wise FP8 activation quantization.
+
+    One program per quant-group chunk of one row, reproducing the eager chain
+    ``clamp(gate/up) -> silu(gate.f32) * up.f32 -> .to(model_dtype) ->
+    _act_quant_kernel`` with the same rounding points. Clamps use ``tl.where`` so
+    NaN propagates like ``aten.clamp`` (``tl.minimum`` would swallow it), and the
+    product is rounded to the model dtype in-register at the same point the
+    reference stores it.
+    """
+    pid = tl.program_id(axis=0)
+    row = pid // GROUPS
+    grp = pid % GROUPS
+    cols = grp * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    gate = tl.load(g_ptr + row * g_row_stride + cols).to(tl.float32)
+    up = tl.load(u_ptr + row * u_row_stride + cols).to(tl.float32)
+    if HAS_LIMIT:
+        gate = tl.where(gate > limit, limit, gate)
+        up = tl.where(up < -limit, -limit, up)
+        up = tl.where(up > limit, limit, up)
+    hidden = (gate / (1.0 + tl.exp(-gate))) * up
+    hidden = hidden.to(g_ptr.dtype.element_ty).to(tl.float32)
+    amax = tl.max(tl.abs(hidden))
+    if ROUND_SCALE:
+        amax = tl.maximum(amax, 1e-4)
+        s = amax / 448.0
+        s = tl.exp2(tl.ceil(tl.log2(s)))
+    else:
+        s = amax / 448.0
+        # Clamp scale so that all-zero blocks produce 0/eps = 0 instead of 0/0 = NaN.
+        s = tl.maximum(s, 1e-12)
+    y = hidden / s
+    y = y.to(y_ptr.dtype.element_ty)
+    # Outputs are contiguous [M, GROUPS*BLOCK_SIZE] / [M, GROUPS], so the row-major
+    # program id addresses both directly.
+    tl.store(y_ptr + pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), y)
+    tl.store(s_ptr + pid, s)
+
+
+@torch.library.custom_op("auto_deploy::torch_fp8_swiglu_clamp_act_quant", mutates_args=())
+def torch_fp8_swiglu_clamp_act_quant(
+    gate: torch.Tensor,  # [M, I], strided views allowed (stride(-1)==1)
+    up: torch.Tensor,  # [M, I], same shape/dtype as gate
+    limit: Optional[float],  # swiglu clamp bound; None/<=0 disables the clamps
+    block_size: int,  # activation quant group (== matmul block_k)
+    input_scale_fmt: str = "",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused clamped-SwiGLU + block-FP8 activation quant feeding a down projection.
+
+    Computes, in one kernel launch, the DeepSeek-V4 shared-expert epilogue between
+    the merged gate/up projection and the down projection::
+
+        gate = clamp(gate, max=limit)
+        up = clamp(up, min=-limit, max=limit)
+        hidden = (silu(gate.float()) * up.float()).to(gate.dtype)
+        return _safe_act_quant(hidden, block_size, input_scale_fmt)
+
+    ``gate``/``up`` may be strided views (the two narrow halves of one fused
+    gate_up GEMM output), consumed in place without materializing them.
+    """
+    assert gate.dim() == 2 and up.dim() == 2, "expected flattened [tokens, features] inputs"
+    assert gate.shape == up.shape and gate.dtype == up.dtype
+    assert gate.stride(-1) == 1 and up.stride(-1) == 1
+    num_tokens, width = gate.shape
+    assert width % block_size == 0
+    groups = width // block_size
+    y = torch.empty((num_tokens, width), dtype=torch.float8_e4m3fn, device=gate.device)
+    # Keep scale metadata in the model dtype (matches _safe_act_quant).
+    s = torch.empty((num_tokens, groups), dtype=gate.dtype, device=gate.device)
+    has_limit = limit is not None and limit > 0
+    round_scale = input_scale_fmt.lower() == "ue8m0"
+    grid = (num_tokens * groups,)
+    # One quant group per program: a tiny single-reduction workload, one warp
+    # (same rationale as _act_quant_kernel's num_warps=1).
+    _swiglu_clamp_act_quant_kernel[grid](
+        gate,
+        up,
+        y,
+        s,
+        float(limit) if has_limit else 0.0,
+        gate.stride(0),
+        up.stride(0),
+        GROUPS=groups,
+        BLOCK_SIZE=block_size,
+        HAS_LIMIT=has_limit,
+        ROUND_SCALE=round_scale,
+        num_warps=1,
+    )
+    return y, s
+
+
+@torch_fp8_swiglu_clamp_act_quant.register_fake
+def _torch_fp8_swiglu_clamp_act_quant_fake(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    limit: Optional[float],
+    block_size: int,
+    input_scale_fmt: str = "",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    qhidden = torch.empty(gate.shape, dtype=torch.float8_e4m3fn, device=gate.device)
+    scale = torch.empty(
+        (*gate.shape[:-1], gate.shape[-1] // block_size), dtype=gate.dtype, device=gate.device
+    )
+    return qhidden, scale
 
 
 @torch.library.custom_op(
@@ -791,30 +1431,107 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
     scale_n, scale_k = weight_scale_inv.shape
     if scale_n == 0 or scale_k == 0:
         raise ValueError(f"weight_scale has zero dimension {tuple(weight_scale_inv.shape)}")
-    block_n = triton.cdiv(out_rows, scale_n)
-    block_k = triton.cdiv(in_features, scale_k)
+    block_n, block_k = _finegrained_fp8_block_sizes(weight_quantized, weight_scale_inv)
 
     input_contiguous = input.contiguous()
-    qinput, input_scales = _safe_act_quant(input_contiguous, block_k, input_scale_fmt)
-    qinput_blocks = qinput.reshape(*input_contiguous.shape[:-1], -1, block_k)
-    input_dequant = (qinput_blocks.to(input.dtype) * input_scales.unsqueeze(-1)).reshape_as(
-        input_contiguous
-    )
-
-    weight_dequant = _dequant_block_fp8_weight(
-        weight_quantized,
-        weight_scale_inv,
-        block_n,
-        block_k,
-        dtype=input.dtype,
-    )
     rank = out_rows // num_groups
-    weight_grouped = weight_dequant.view(num_groups, rank, in_features)
-    output = torch.matmul(
-        input_dequant.unsqueeze(-2),
-        weight_grouped.transpose(-1, -2),
-    ).squeeze(-2)
-    output = output.flatten(-2)
+    lead_shape = input.shape[:-2]
+
+    if num_groups > 1 and (rank % block_n != 0 or scale_n % num_groups != 0):
+        # The checkpoint scale grid covers the flattened weight. If a scale block crosses a
+        # logical group boundary, it cannot be reshaped into independent per-group grids.
+        qinput, input_scales = _safe_act_quant(input_contiguous, block_k, input_scale_fmt)
+        qinput_blocks = qinput.reshape(*input_contiguous.shape[:-1], -1, block_k)
+        input_dequant = (qinput_blocks.to(input.dtype) * input_scales.unsqueeze(-1)).reshape_as(
+            input_contiguous
+        )
+        weight_dequant = dequant_fp8_weight_two_dim_block_grid(
+            weight_quantized,
+            weight_scale_inv,
+            block_n,
+            block_k,
+            dtype=input.dtype,
+        )
+        weight_grouped = weight_dequant.view(num_groups, rank, in_features)
+        output = torch.matmul(
+            input_dequant.unsqueeze(-2),
+            weight_grouped.transpose(-1, -2),
+        ).squeeze(-2)
+        output = output.flatten(-2)
+        if bias is not None:
+            output = output + bias.reshape(out_rows).to(output.dtype)
+        return output.to(dtype=input.dtype)
+
+    # Direct grouped block-FP8 W8A8 matmul: keep both operands in FP8 and let the
+    # block-FP8 kernel apply the per-block scales in its fp32 accumulator — no
+    # quant round-trip, no bf16 weight dequant (halves the HBM read of this
+    # memory-bound GEMV). Per-rank DSV4 wo_a has num_groups == 1 (a single 2D GEMM);
+    # block-aligned num_groups > 1 launches the same kernel per group.
+    m_tokens = input_contiguous.numel() // (num_groups * in_features)
+    # Deferred activation quant: the decode split-K/GEMV kernels fuse the
+    # ue8m0 quant into their prologue; other branches quantize standalone.
+    defer_quant = _use_quant_prologue(input_scale_fmt) and (
+        num_groups == 1 or _use_splitk_decode(m_tokens, rank, in_features)
+    )
+    if defer_quant:
+        qin = input_contiguous.reshape(m_tokens, num_groups, in_features)
+        sin = None
+    else:
+        qinput, input_scales = _safe_act_quant(input_contiguous, block_k, input_scale_fmt)
+        qin = qinput.reshape(m_tokens, num_groups, in_features)
+        sin = input_scales.reshape(m_tokens, num_groups, input_scales.shape[-1])
+    if num_groups == 1:
+        out2d = _w8a8_block_fp8_matmul_triton(
+            qin[:, 0, :],
+            weight_quantized,
+            None if defer_quant else sin[:, 0, :],
+            weight_scale_inv,
+            [block_n, block_k],
+            output_dtype=input.dtype,
+            input_scale_fmt=input_scale_fmt,
+        )
+        output = out2d.reshape(*lead_shape, out_rows)
+    elif _use_splitk_decode(m_tokens, rank, in_features):
+        # Accumulate every group into ONE pre-zeroed fp32 buffer laid out like the
+        # stacked result (each group writes its disjoint column slice via strides),
+        # then one finish cast — instead of a per-group zero-fill/cast pair plus a
+        # torch.stack copy. Per-group math and launch config are unchanged.
+        weight_grouped = weight_quantized.view(num_groups, rank, in_features)
+        scale_rows = scale_n // num_groups
+        scale_grouped = weight_scale_inv.view(num_groups, scale_rows, scale_k)
+        acc = qin.new_zeros((m_tokens, out_rows), dtype=torch.float32)
+        for g in range(num_groups):
+            _w8a8_block_fp8_matmul_splitk(
+                qin[:, g, :],
+                weight_grouped[g],
+                None if defer_quant else sin[:, g, :],
+                scale_grouped[g],
+                block_n,
+                block_k,
+                torch.float32,
+                m_tokens,
+                rank,
+                in_features,
+                C_out=acc[:, g * rank : (g + 1) * rank],
+            )
+        output = acc.to(input.dtype).reshape(*lead_shape, out_rows)
+    else:
+        weight_grouped = weight_quantized.view(num_groups, rank, in_features)
+        scale_rows = scale_n // num_groups
+        scale_grouped = weight_scale_inv.view(num_groups, scale_rows, scale_k)
+        parts = [
+            _w8a8_block_fp8_matmul_triton(
+                qin[:, g, :].contiguous(),
+                weight_grouped[g].contiguous(),
+                sin[:, g, :].contiguous(),
+                scale_grouped[g].contiguous(),
+                [block_n, block_k],
+                output_dtype=input.dtype,
+            )
+            for g in range(num_groups)
+        ]
+        output = torch.stack(parts, dim=1).reshape(*lead_shape, out_rows)
+
     if bias is not None:
         output = output + bias.reshape(out_rows).to(output.dtype)
     return output.to(dtype=input.dtype)

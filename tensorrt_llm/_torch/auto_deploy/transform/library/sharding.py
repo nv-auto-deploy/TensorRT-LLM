@@ -49,15 +49,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
 from ..._compat import AllReduceStrategy
-
-try:
-    from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
-except (ModuleNotFoundError, ImportError):
-
-    def is_trtllm_op_available():
-        return False
-
-
+from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
+from ...distributed.common import ONESHOT_SMALL_STRATEGY
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import del_attr_by_name, eliminate_dead_code
@@ -1490,6 +1483,55 @@ def validate_allreduce_strategy(v):
     return v  # Let Pydantic handle other types
 
 
+# Static gates for the small-message ONESHOT allreduce upgrade (the measured win:
+# single-node TP4, plain-SUM bf16, hidden 4096); the runtime numel gate is in trtllm_dist.
+_ONESHOT_SMALL_WORLD_SIZE = 4
+_ONESHOT_SMALL_HIDDEN_SIZE = 4096
+
+
+def qualify_small_oneshot_allreduce(
+    dc: DistConfig, all_reduce_op, dtype: torch.dtype, last_dim: int
+) -> str:
+    """Return the strategy for a plain-SUM allreduce given static node facts.
+
+    Upgrades the default NCCL strategy to the size-aware ``ONESHOT_SMALL``
+    token iff every qualification above holds. Any explicitly non-NCCL
+    configured strategy, non-TRT-LLM backend, other topology, dtype, or hidden
+    size keeps the configured strategy unchanged. Unsupported topologies
+    (no P2P/NVLink) additionally fall back to NCCL inside the TRT-LLM runtime.
+    """
+    base = dc.allreduce_strategy
+    if base != "NCCL":
+        return base  # preserve explicit non-default caller choice
+    try:
+        trtllm_ar_op = torch.ops.auto_deploy.trtllm_dist_all_reduce.default
+    except (AttributeError, RuntimeError):
+        return base  # TRT-LLM ops unavailable in this environment
+    if all_reduce_op is not trtllm_ar_op:
+        return base  # torch/demollm backend has no TRT-LLM one-shot kernel
+    if dc.world_size != _ONESHOT_SMALL_WORLD_SIZE or dc.tp_size != _ONESHOT_SMALL_WORLD_SIZE:
+        return base
+    if dtype != torch.bfloat16:
+        return base
+    if not isinstance(last_dim, int) or last_dim != _ONESHOT_SMALL_HIDDEN_SIZE:
+        return base
+    return ONESHOT_SMALL_STRATEGY
+
+
+def resolve_plain_allreduce_strategy(dc: DistConfig, node: Node, all_reduce_op) -> str:
+    """Node-meta wrapper around :func:`qualify_small_oneshot_allreduce`.
+
+    ``node`` carries the tensor value being reduced (the allreduce node itself
+    or the node the allreduce is inserted after). Missing or symbolic meta
+    keeps the configured strategy.
+    """
+    val = node.meta.get("val") if isinstance(node, Node) else None
+    if not isinstance(val, torch.Tensor) or val.dim() == 0:
+        return dc.allreduce_strategy
+    last_dim = val.shape[-1]  # symbolic (SymInt) fails the isinstance-int check
+    return qualify_small_oneshot_allreduce(dc, all_reduce_op, val.dtype, last_dim)
+
+
 def _get_dist_ops(backend: str):
     """Get the (all_gather, all_reduce) op pair for *backend*.
 
@@ -1730,8 +1772,12 @@ def shard_weight_tensor(
         param_key=param_name,
         param_shape=sharded_shape,
     )
-    submod._register_load_state_dict_pre_hook(
-        mark_pipeline_cache_hook(
+    # A custom splitter cannot be reconstructed from the declarative "shard_tp" spec
+    # (the restore path would silently fall back to the even dim-0 chunk), so leave
+    # such hooks unmarked: collect_hook_specs then reports them as unrecognized and
+    # the pipeline-cache save is skipped instead of caching a wrong split.
+    if custom_shard_fn is None:
+        hook = mark_pipeline_cache_hook(
             hook,
             {
                 "type": "shard_tp",
@@ -1744,7 +1790,7 @@ def shard_weight_tensor(
                 "fused_weight_dims": list(fused_weight_dims) if fused_weight_dims else None,
             },
         )
-    )
+    submod._register_load_state_dict_pre_hook(hook)
     param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=requires_grad)
     setattr(submod, param_name, param_new)
 

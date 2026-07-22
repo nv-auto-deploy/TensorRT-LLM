@@ -41,7 +41,11 @@ from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4 import (
 from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4 import (
     QuantizeMXFP4MOEConfig as MXFP4MLPConfig,
 )
-from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _get_dist_ops
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
+    MXFP4EPShardingInfo,
+    ShardingTransformConfig,
+    _get_dist_ops,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args, is_op, shape
@@ -273,6 +277,72 @@ def test_apply_hints(world_size, expect_skipped, expect_up_shape, expect_down_sh
         is_op(n, torch.ops.auto_deploy.torch_dist_all_reduce.default) for n in gm_out.graph.nodes
     )
     assert has_dist_ar == (not expect_skipped)
+
+
+LM_HEAD_VOCAB, LM_HEAD_HIDDEN = 16, 8
+
+
+class LMHeadModule(nn.Module):
+    """DeepSeek-V4-style head: an fp32 weight cast feeding a ``layer_type="lm_head"`` linear."""
+
+    def __init__(self, vocab=LM_HEAD_VOCAB, hidden=LM_HEAD_HIDDEN):
+        super().__init__()
+        self.head = nn.Linear(hidden, vocab, bias=False)
+
+    def forward(self, x):
+        return torch.ops.auto_deploy.torch_linear_simple(
+            x.float(), self.head.weight.float(), None, layer_type="lm_head"
+        ).float()
+
+
+def _export_lm_head():
+    model = LMHeadModule().cuda()
+    x = torch.randn(2, LM_HEAD_HIDDEN, device="cuda")
+    return torch_export_to_gm(model, args=(x,), clone=True), model, x
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "world_size, expect_skipped, expect_head_shape, expect_gather",
+    [
+        (1, True, (LM_HEAD_VOCAB, LM_HEAD_HIDDEN), False),
+        (2, False, (LM_HEAD_VOCAB // 2, LM_HEAD_HIDDEN), True),
+    ],
+)
+def test_apply_hints_lm_head_gather_shards_regardless_of_shard_layers(
+    world_size, expect_skipped, expect_head_shape, expect_gather
+):
+    """A ``layer_type="lm_head"`` linear is gather-sharded (column split + all_gather) under TP.
+
+    Even when ``shard_layers=["mla", "moe"]`` excludes the head (the DeepSeek-V4
+    config), it must still be sharded -- otherwise every rank re-casts and matmuls
+    the full [vocab, hidden] weight each step. The inline ``self.head.weight.float()``
+    cast also shrinks because the parameter itself is physically sharded. Column
+    split + all_gather is mathematically exact (output columns are independent).
+    """
+    gm, _, _ = _export_lm_head()
+    opt = InferenceOptimizer(
+        factory=None,
+        config={"apply_sharding_hints": {"stage": "sharding", "shard_layers": ["mla", "moe"]}},
+    )
+    opt.shared_config = SharedConfig(
+        local_rank=0,
+        world_size=world_size,
+        dist_config=DistConfig(
+            world_size=world_size, rank=0, tp_size=world_size, moe_ep_size=world_size
+        ),
+    )
+    gm_out = opt(None, gm)
+
+    info = gm_out.meta["_autodeploy"]["transform_history"]["apply_sharding_hints"]
+    assert info.skipped is expect_skipped
+
+    assert gm_out.head.weight.shape == expect_head_shape
+
+    has_gather = any(
+        is_op(n, torch.ops.auto_deploy.torch_dist_all_gather.default) for n in gm_out.graph.nodes
+    )
+    assert has_gather == expect_gather
 
 
 def _export_deepseek_v4_contract_block():
@@ -1172,3 +1242,48 @@ def test_stacked_mxfp4_routing_driven_rank1_preserves_expert_start_with_torch_ba
     assert expert_start == 2
     assert len(_call_nodes(gm_out, torch.ops.auto_deploy.torch_dist_all_reduce.default)) == 1
     assert len(_call_nodes(gm_out, torch.ops.auto_deploy.trtllm_dist_all_reduce.default)) == 0
+
+
+@pytest.mark.parametrize(
+    "base_name,ep_name",
+    [("torch_mxfp4_moe", "torch_mxfp4_moe_ep"), ("triton_mxfp4_moe", "triton_mxfp4_moe_ep")],
+)
+def test_mxfp4_ep_sharding_info_rewrites_to_matching_ep_variant(base_name, ep_name):
+    # detect_sharding EP path: MXFP4EPShardingInfo must accept both MXFP4 MoE ops and
+    # rewrite each to its matching *_ep op with runtime expert slices + an all_reduce.
+    from tensorrt_llm.functional import AllReduceStrategy
+
+    base_op = _optional_auto_deploy_default(base_name)
+    ep_op = _optional_auto_deploy_default(ep_name)
+    if base_op is None or ep_op is None:
+        pytest.skip("MXFP4 MoE custom ops are not registered in this environment")
+
+    gm = _make_stacked_mxfp4_graph(base_op, include_optionals=True)
+    node = next(n for n in gm.graph.nodes if is_op(n, base_op))
+    config = ShardingTransformConfig(
+        rank=1,
+        world_size=2,
+        stage="sharding",
+        allreduce_strategy=AllReduceStrategy.AUTO,
+        dist_backend="torch",
+    )
+    info = MXFP4EPShardingInfo(target_node=node.name, config=config)
+
+    non_moe = next(n for n in gm.graph.nodes if n.op == "placeholder")
+    assert not info.validate(gm, non_moe)
+    assert info.validate(gm, node)
+
+    info.apply(gm, node)
+    ep_nodes = _call_nodes(gm, ep_op)
+    assert len(ep_nodes) == 1
+    [ep_size, ep_rank, layer_type] = extract_op_args(
+        ep_nodes[0], "ep_size", "ep_rank", "layer_type"
+    )
+    assert (ep_size, ep_rank) == (2, 1)
+    assert layer_type == "moe"
+    # rank 1 of 2 with 4 experts -> runtime slices [2:4) on all six expert args.
+    expert_args = extract_op_args(ep_nodes[0], *_STACKED_MOE_EXPERT_ARG_NAMES)
+    for arg in expert_args:
+        assert is_op(arg, torch.ops.aten.slice.Tensor)
+        assert arg.args[1:5] == (0, 2, 4, 1)
+    assert len(_call_nodes(gm, torch.ops.auto_deploy.torch_dist_all_reduce.default)) == 1

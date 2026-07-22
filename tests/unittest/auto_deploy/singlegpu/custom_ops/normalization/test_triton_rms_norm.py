@@ -12,63 +12,75 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Tests for the Triton RMSNorm kernel."""
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm import *  # noqa
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_rms_norm import rms_norm
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
-def test_rmsnorm_triton_op():
-    bsz = 2
-    ctx_len = 1024
-    feat_len = 32
-    dtype = torch.float16
-    input = (
-        torch.empty((bsz, ctx_len, feat_len), dtype=dtype, device="cuda")
-        .normal_(mean=0.0, std=0.5)
-        .contiguous()
-    )
-    weight = (
-        torch.empty((feat_len), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).contiguous()
-    )
-    triton_output = rms_norm(input, weight, 1e-6)
-    torch_output = torch.ops.auto_deploy.torch_rmsnorm(input, weight, 1e-6)
-    assert torch.allclose(torch_output, triton_output, atol=1e-2, rtol=0)
+EPS = 1e-6
 
 
 @pytest.mark.parametrize(
     "num_tokens,full_dim,norm_dim",
     [
         (4032, 576, 512),  # DeepSeek-V3-Lite kv_a_layernorm shape
+        (37, 1536, 1024),  # DeepSeek-V4 Q-LoRA narrow of the fused Q/KV projection
         (128, 256, 128),
         (2, 64, 32),
     ],
 )
-def test_rmsnorm_triton_non_contiguous_slice(num_tokens, full_dim, norm_dim):
-    """Non-contiguous input must produce the same result as contiguous input.
-
-    Regression test for a bug where the Triton kernel used a single
-    input_row_stride for both reading and writing.  When the input is a
-    non-contiguous column slice (e.g. tensor[:, :512] from a [N, 576] tensor),
-    input_row_stride > norm_dim causes out-of-bounds writes into the
-    contiguous output buffer allocated by torch.empty_like.
-    """
-    dtype = torch.bfloat16
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_rms_norm_matches_torch_rmsnorm(num_tokens, full_dim, norm_dim, dtype):
+    """Column-slice input: copy-free strided path == contiguous run, both match eager."""
+    torch.manual_seed(0)
     full_tensor = torch.randn(num_tokens, full_dim, dtype=dtype, device="cuda")
     weight = torch.randn(norm_dim, dtype=dtype, device="cuda")
 
     non_contiguous = full_tensor[:, :norm_dim]
     assert not non_contiguous.is_contiguous()
-    assert non_contiguous.stride(0) == full_dim  # stride > norm_dim
 
-    contiguous = non_contiguous.contiguous()
-
-    out_nc = rms_norm(non_contiguous, weight, 1e-5)
-    out_c = rms_norm(contiguous, weight, 1e-5)
+    out_nc = rms_norm(non_contiguous, weight, EPS)
+    out_c = rms_norm(non_contiguous.contiguous(), weight, EPS)
+    ref = torch.ops.auto_deploy.torch_rmsnorm(non_contiguous, weight, EPS)
 
     assert out_nc.shape == (num_tokens, norm_dim)
     assert out_nc.is_contiguous()
-    assert torch.allclose(out_nc, out_c, atol=1e-2, rtol=0), (
-        f"max diff = {(out_nc - out_c).abs().max().item()}"
-    )
+    assert torch.equal(out_nc, out_c)
+    rtol = 2e-2 if dtype == torch.bfloat16 else 4e-3
+    assert torch.allclose(out_nc, ref, rtol=rtol, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "make_input",
+    [
+        # 3D narrow view: leading dims flatten to regular rows -> in-place fast path.
+        lambda: torch.randn(2, 5, 96, dtype=torch.float16, device="cuda")[..., :64],
+        # 3D middle-dim slice: dim-0 stride mismatch -> contiguous() fallback.
+        lambda: torch.randn(2, 5, 64, dtype=torch.float16, device="cuda")[:, :3, :],
+        # Transposed: last dim not unit-stride -> contiguous() fallback.
+        lambda: torch.randn(64, 8, dtype=torch.float16, device="cuda").t(),
+        # Overlapping rows (row stride < feat_size) -> contiguous() fallback.
+        lambda: torch.randn(4 * 64, dtype=torch.float16, device="cuda").as_strided(
+            (4, 64), (32, 1)
+        ),
+    ],
+    ids=["3d_narrow", "3d_sliced", "transposed", "overlapping"],
+)
+def test_rms_norm_irregular_and_3d_layouts(make_input):
+    """Regular 3D views stay copy-free; irregular layouts fall back to contiguous()."""
+    torch.manual_seed(0)
+    x = make_input()
+    weight = torch.randn(x.shape[-1], dtype=x.dtype, device="cuda")
+
+    out = rms_norm(x, weight, EPS)
+    ref = torch.ops.auto_deploy.torch_rmsnorm(x.contiguous(), weight, EPS)
+
+    assert out.shape == x.shape
+    assert out.is_contiguous()
+    assert torch.allclose(out, ref, rtol=4e-3, atol=1e-2)

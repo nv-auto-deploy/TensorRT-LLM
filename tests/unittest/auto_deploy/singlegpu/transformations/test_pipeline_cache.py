@@ -808,7 +808,7 @@ def test_pipeline_cache_restored_graphmodule_rebuilds_weight_node_mapping():
     restored_linears = [node for node in restored.graph.nodes if is_linear_op(node)]
 
     assert "_weight_mapping_computed" not in restored.meta
-    assert _insert_fused_gemm(restored, 0, restored_input, restored_linears)
+    assert _insert_fused_gemm(restored, restored_input, restored_linears)
 
 
 def test_pipeline_cache_drops_consumed_sharding_transforms_from_graphmodule_body():

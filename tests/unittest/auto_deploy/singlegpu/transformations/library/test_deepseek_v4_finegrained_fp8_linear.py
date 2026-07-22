@@ -475,6 +475,25 @@ def test_generic_config_quantized_linear_uses_default_input_scale_fmt() -> None:
     assert quant_nodes[0].kwargs["input_scale_fmt"] == ""
 
 
+@pytest.mark.parametrize("with_bias", (False, True))
+def test_grouped_linear_op_matches_per_group_reference(with_bias: bool) -> None:
+    """``torch_grouped_linear`` == per-group ``aten.linear`` outputs concatenated."""
+    torch.manual_seed(0)
+    batch, seq, groups, rank, width = 2, 3, 4, 8, 16
+    x = torch.randn(batch, seq, groups, width)
+    weight = torch.randn(groups, rank, width)
+    bias = torch.randn(groups * rank) if with_bias else None
+
+    out = torch.ops.auto_deploy.torch_grouped_linear(x, weight, bias)
+
+    per_group = [torch.ops.aten.linear(x[..., g, :], weight[g], None) for g in range(groups)]
+    ref = torch.cat(per_group, dim=-1)
+    if bias is not None:
+        ref = ref + bias
+    assert out.shape == (batch, seq, groups * rank)
+    torch.testing.assert_close(out, ref)
+
+
 def test_generic_fp8_uses_scale_inv_and_does_not_consume_scale_alias() -> None:
     weight_name = "layers.0.attn.wq_a.weight"
     alias_name = "layers.0.attn.wq_a.scale"

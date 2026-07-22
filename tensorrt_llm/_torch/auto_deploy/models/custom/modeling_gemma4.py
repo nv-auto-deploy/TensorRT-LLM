@@ -2156,7 +2156,7 @@ class Gemma4Model(Gemma4PreTrainedModel):
             #     inputs_embeds.std().item(),
             # )
 
-        language_model_kwargs = dict(kwargs)
+        language_model_kwargs = {}
         if batch_info_host is not None:
             language_model_kwargs["batch_info_host"] = batch_info_host
         if cu_seqlen is not None:
@@ -2177,6 +2177,7 @@ class Gemma4Model(Gemma4PreTrainedModel):
             language_model_kwargs["mm_special_offsets"] = mm_special_offsets
         if per_layer_inputs is not None:
             language_model_kwargs["per_layer_inputs"] = per_layer_inputs
+        language_model_kwargs.update(kwargs)
 
         return Gemma4ForConditionalGeneration._call_language_model(
             self.language_model,
@@ -2233,12 +2234,12 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
     ):
         """Call eager modules and exported FX graphs using their expected input structure."""
         if not isinstance(language_model, GraphModule):
-            model_kwargs = dict(kwargs)
-            model_kwargs["position_ids"] = position_ids
+            model_kwargs = {"position_ids": position_ids}
             if inputs_embeds is not None:
                 model_kwargs["inputs_embeds"] = inputs_embeds
             else:
                 model_kwargs["input_ids"] = input_ids
+            model_kwargs.update(kwargs)
             return language_model(**model_kwargs)
 
         available_args = {

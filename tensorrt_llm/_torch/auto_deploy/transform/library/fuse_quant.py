@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import operator
 from typing import Optional, Tuple, Type
 
 import torch
@@ -27,7 +28,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
-from ...utils.node_utils import is_op
+from ...utils.node_utils import extract_op_args, is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import (
     BaseTransform,
@@ -689,6 +690,286 @@ class FuseFineGrainedFP8Linear(BaseTransform):
         # Compile-time dispatch to the UE8M0 fast-path op. Counts toward
         # num_matches so downstream graph invariants get re-checked.
         cnt += _dispatch_trtllm_finegrained_fp8_to_deepgemm(gm)
+
+        info = TransformInfo(
+            skipped=(cnt == 0),
+            num_matches=cnt,
+            is_clean=(cnt == 0),
+            has_valid_shapes=(cnt == 0),
+        )
+        return gm, info
+
+
+# ============================================================================
+# FineGrained FP8 activation-quant helpers
+# ============================================================================
+
+
+def _finegrained_fp8_block_k(
+    gm: GraphModule, weight_node: object, weight_scale_arg: object
+) -> Optional[int]:
+    """Derive the activation-quant block size (block_k) of a FineGrained FP8 linear.
+
+    ``torch_fake_quant_finegrained_fp8_linear`` infers ``block_k = cdiv(K, scale_k)``
+    from the weight ``[N, K]`` and per-block weight scale ``[N/block_n, K/block_k]``
+    shapes and quantizes the activation in groups of that size.
+    ``fuse_fp8_swiglu_act_quant`` uses it to size the fused act-quant kernel.
+    Returns ``None`` when the shapes cannot be resolved (the node is skipped).
+    """
+    if not isinstance(weight_node, Node):
+        return None
+    if not isinstance(weight_scale_arg, (list, tuple)) or len(weight_scale_arg) == 0:
+        return None
+    scale_node = weight_scale_arg[0]
+    weight = _resolve_attr_tensor(gm, weight_node)
+    scale = _resolve_attr_tensor(gm, scale_node)
+    if weight is None or scale is None or weight.dim() != 2 or scale.dim() != 2:
+        return None
+    K = weight.shape[1]
+    scale_k = scale.shape[1]
+    if scale_k == 0:
+        return None
+    return -(-K // scale_k)  # ceil-div
+
+
+# ============================================================================
+# DeepSeek-V4 shared-expert clamped-SwiGLU + down-input act-quant fusion
+# ============================================================================
+
+
+_SWIGLU_CAST_OPS = (
+    torch.ops.aten._to_copy.default,
+    torch.ops.aten.to.dtype,
+)
+_SWIGLU_CLAMP_OPS = (
+    torch.ops.aten.clamp.default,
+    torch.ops.aten.clamp_max.default,
+    torch.ops.aten.clamp_min.default,
+)
+
+
+def _sole_user(node: object) -> bool:
+    return isinstance(node, Node) and len(node.users) == 1
+
+
+def _cast_target_dtype(node: Node) -> Optional[torch.dtype]:
+    """Target dtype of an ``aten._to_copy`` / ``aten.to.dtype`` node."""
+    if "dtype" in node.kwargs:
+        dtype = node.kwargs["dtype"]
+        return dtype if isinstance(dtype, torch.dtype) else None
+    if len(node.args) >= 2 and isinstance(node.args[1], torch.dtype):
+        return node.args[1]
+    return None
+
+
+def _clamp_scalar_bounds(node: Node) -> Tuple[Optional[float], Optional[float]]:
+    """(min, max) python-scalar bounds of a clamp/clamp_min/clamp_max node."""
+
+    def _as_scalar(v: object) -> Optional[float]:
+        return float(v) if isinstance(v, (int, float)) else None
+
+    if is_op(node, torch.ops.aten.clamp_max):
+        mx = node.kwargs.get("max", node.args[1] if len(node.args) > 1 else None)
+        return None, _as_scalar(mx)
+    if is_op(node, torch.ops.aten.clamp_min):
+        mn = node.kwargs.get("min", node.args[1] if len(node.args) > 1 else None)
+        return _as_scalar(mn), None
+    args = list(node.args) + [None, None]
+    mn = node.kwargs.get("min", args[1])
+    mx = node.kwargs.get("max", args[2])
+    return _as_scalar(mn), _as_scalar(mx)
+
+
+def _match_clamped_swiglu_chain(h: object) -> Optional[dict]:
+    """Match the DeepSeek-V4 shared-expert activation chain feeding a down projection.
+
+    Expected producer chain of ``h`` (every intermediate single-user, so the rewrite
+    strands it for dead-code elimination)::
+
+        gate_src -> clamp(max=L)  -> to(f32) -> silu \
+                                                      mul -> to(model_dtype) == h
+        up_src   -> clamp(-L, L)  -> to(f32) ---------/
+
+    ``gate_src`` / ``up_src`` are typically the two ``torch.narrow`` views of one
+    merged gate_up projection (``fuse_gemms_mixed_children``), optionally wrapped in
+    ``.contiguous()`` -- the wrapper is bypassed since the fused kernel reads strided
+    views directly. Returns the fused-op arguments or None if the chain differs.
+    """
+    if not _sole_user(h) or not is_op(h, _SWIGLU_CAST_OPS):
+        return None
+    model_dtype = _cast_target_dtype(h)
+    if model_dtype is None:
+        return None
+    mul = h.args[0]
+    if not _sole_user(mul) or not is_op(mul, torch.ops.aten.mul.Tensor) or len(mul.args) < 2:
+        return None
+    lhs, rhs = mul.args[0], mul.args[1]
+    if isinstance(lhs, Node) and is_op(lhs, torch.ops.aten.silu):
+        silu, up_f32 = lhs, rhs
+    elif isinstance(rhs, Node) and is_op(rhs, torch.ops.aten.silu):
+        silu, up_f32 = rhs, lhs
+    else:
+        return None
+    if not _sole_user(silu) or not _sole_user(up_f32) or not is_op(up_f32, _SWIGLU_CAST_OPS):
+        return None
+    gate_f32 = silu.args[0]
+    if not _sole_user(gate_f32) or not is_op(gate_f32, _SWIGLU_CAST_OPS):
+        return None
+    if _cast_target_dtype(gate_f32) != torch.float32 or _cast_target_dtype(up_f32) != torch.float32:
+        return None
+
+    clamp_g, clamp_u = gate_f32.args[0], up_f32.args[0]
+    if not _sole_user(clamp_g) or not is_op(clamp_g, _SWIGLU_CLAMP_OPS):
+        return None
+    if not _sole_user(clamp_u) or not is_op(clamp_u, _SWIGLU_CLAMP_OPS):
+        return None
+    gate_min, gate_max = _clamp_scalar_bounds(clamp_g)
+    up_min, up_max = _clamp_scalar_bounds(clamp_u)
+    # Gate is clamped from above only; up symmetrically -- both at the same +limit
+    # (the modeling emits torch.clamp(gate, max=L) / torch.clamp(up, -L, L)).
+    if gate_min is not None or gate_max is None or gate_max <= 0:
+        return None
+    limit = gate_max
+    if up_min != -limit or up_max != limit:
+        return None
+
+    def _bypass_contiguous(src: object) -> object:
+        if isinstance(src, Node) and src.op == "call_method" and src.target == "contiguous":
+            return src.args[0]
+        return src
+
+    gate_src = _bypass_contiguous(clamp_g.args[0])
+    up_src = _bypass_contiguous(clamp_u.args[0])
+    if not isinstance(gate_src, Node) or not isinstance(up_src, Node):
+        return None
+    gate_val = gate_src.meta.get("val")
+    up_val = up_src.meta.get("val")
+    if gate_val is None or up_val is None:
+        return None
+    if gate_val.dim() != 2 or tuple(gate_val.shape) != tuple(up_val.shape):
+        return None
+    if gate_val.dtype != model_dtype or up_val.dtype != model_dtype:
+        return None
+    if gate_val.stride(-1) != 1 or up_val.stride(-1) != 1:
+        return None
+    return {"gate": gate_src, "up": up_src, "limit": limit, "width": int(gate_val.shape[-1])}
+
+
+@TransformRegistry.register("fuse_fp8_swiglu_act_quant")
+class FuseFP8SwigluActQuant(BaseTransform):
+    """Fuse the clamped-SwiGLU + down-input act-quant chain into one kernel.
+
+    DeepSeek-V4's shared-expert epilogue between the (merged) gate/up projection and
+    the down projection runs seven tiny elementwise launches per MoE layer --
+    ``clamp(gate)``, ``clamp(up)``, two FP32 casts, ``silu``, ``mul``, a cast back to
+    the model dtype -- plus the down linear's internal ``_act_quant_kernel`` launch.
+    All of them stream the same [tokens, moe_intermediate/tp] activation through HBM
+    again and again. The default SwiGLU matcher cannot span the clamp/FP32-cast nodes
+    (``swiglu_limit=10``), so this chain survives every generic fusion pass.
+
+    This transform rewrites the production residual-add down projection::
+
+        lin_residual_add(to(silu(to_f32(clamp(g))) * to_f32(clamp(u)), dt), w2, ...)
+      ->
+        q, s = torch_fp8_swiglu_clamp_act_quant(g, u, limit, block_k, fmt)
+        lin_residual_add(q, w2, input_scale=[s], ...)
+
+    consuming the gate/up ``torch.narrow`` views of the merged gate_up GEMM in place
+    (any ``.contiguous()`` wrappers are bypassed; the kernel reads strided views).
+    The fused kernel reproduces the aten chain bit for bit -- fp32 opmath, aten's
+    silu formula, NaN-propagating clamps, a model-dtype round at the reference's
+    store point, and ``_act_quant_kernel``'s exact scale math -- so the down matmul
+    consumes byte-identical ``(qfp8, scale)`` inputs.
+
+    Runs in post_load_fusion AFTER ``fuse_fp8_linear_allreduce_add`` so it sees the
+    down projection with the folded merge add and keeps that fusion's
+    collective-input epilogue. The residual remains a data dependency on the
+    rewritten node, preserving the shared/routed merge point that stream-overlap
+    transforms classify. A no-op when linears route to trtllm/deepgemm (those
+    quantize internally).
+    """
+
+    config: TransformConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return TransformConfig
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        ad_ops = torch.ops.auto_deploy
+        residual_lin = ad_ops.torch_fake_quant_finegrained_fp8_linear_residual_add
+        quant_op = ad_ops.torch_fp8_swiglu_clamp_act_quant.default
+
+        graph = gm.graph
+        cnt = 0
+        node_order = {n: i for i, n in enumerate(graph.nodes)}
+        for node in list(graph.nodes):
+            if not is_op(node, residual_lin):
+                continue
+            inp, weight, bias, weight_scale, fmt = extract_op_args(
+                node, "input", "weight_quantized", "bias", "weight_scale", "input_scale_fmt"
+            )
+            if bias is not None:
+                continue
+            matched = _match_clamped_swiglu_chain(inp)
+            if matched is None:
+                continue
+            block_k = _finegrained_fp8_block_k(gm, weight, weight_scale)
+            if block_k is None or matched["width"] % block_k != 0:
+                continue
+            (residual,) = extract_op_args(node, "residual")
+            if not isinstance(residual, Node):
+                continue
+
+            # Insert the fused act-quant chain right after its gate/up sources, NOT
+            # at the down-projection site: with the residual-add form the down node
+            # sits AFTER the routed MoE op (its residual input), and parking the
+            # shared-expert tail there would pull it inside the aux-stream window
+            # that multi_stream_moe brackets around the shared branch, serializing
+            # shared and routed on one stream (see multi_stream_moe.py).
+            anchor = (
+                matched["up"]
+                if node_order.get(matched["up"], 0) >= node_order.get(matched["gate"], 0)
+                else matched["gate"]
+            )
+            with graph.inserting_after(anchor):
+                act = graph.call_function(
+                    quant_op,
+                    args=(
+                        matched["gate"],
+                        matched["up"],
+                        matched["limit"],
+                        int(block_k),
+                        fmt or "",
+                    ),
+                )
+            with graph.inserting_after(act):
+                qfp8 = graph.call_function(operator.getitem, args=(act, 0))
+            with graph.inserting_after(qfp8):
+                qscale = graph.call_function(operator.getitem, args=(act, 1))
+            with graph.inserting_before(node):
+                new_node = graph.call_function(
+                    residual_lin.default,
+                    args=(qfp8, weight, None, [qscale], weight_scale, [], []),
+                    kwargs={"residual": residual},
+                )
+            node.replace_all_uses_with(new_node)
+            graph.erase_node(node)
+            cnt += 1
+
+        if cnt:
+            graph.eliminate_dead_code()
+            gm.recompile()
+            ad_logger.info(
+                f"fuse_fp8_swiglu_act_quant: fused {cnt} clamped-SwiGLU + act-quant chain(s) "
+                "into single-kernel prequantized down projections"
+            )
 
         info = TransformInfo(
             skipped=(cnt == 0),

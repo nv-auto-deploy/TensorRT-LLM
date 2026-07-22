@@ -39,6 +39,11 @@ from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
 
+# Sentinel that ADDeepseekV4Tokenizer pins as its ``chat_template``. Keep in sync
+# with ``_DSV4_CHAT_TEMPLATE_MARKER`` in
+# tensorrt_llm/_torch/auto_deploy/models/custom/modeling_deepseek_v4.py.
+_DSV4_CHAT_TEMPLATE_MARKER = "deepseek_v4_chat"
+
 
 def load_base64_image(parsed_url: str) -> Image.Image:
     data_spec, data = parsed_url.path.split(",", 1)
@@ -260,7 +265,6 @@ async def async_load_audio(
 
 def encode_base64_content_from_url(content_url: str) -> str:
     """Encode a content retrieved from a remote url to base64 format."""
-
     resp = _safe_request_get(content_url, stream=False)
     result = base64.b64encode(resp.content).decode('utf-8')
 
@@ -301,13 +305,12 @@ def ALL_SUPPORTED_AUDIO_MODELS():
 
 def retrieve_multimodal_placeholder(model_type: str, modality: str,
                                     current_count: int) -> Optional[str]:
-    """
-        Get the appropriate placeholder for a given modality and model type.
+    """Get the appropriate placeholder for a given modality and model type.
 
-        Args:
-            model_type: The type of the multimodal model.
-            modality: The modality of the data.
-            current_count: The number of multimodal data already added.
+    Args:
+        model_type: The type of the multimodal model.
+        modality: The modality of the data.
+        current_count: The number of multimodal data already added.
 
     """
     if MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(model_type, modality):
@@ -370,8 +373,9 @@ class MultimodalDataTracker:
         self._embeddings = defaultdict[str, list](list)
         self._placeholder_counts = defaultdict[str, int](int)
         self._placeholder_to_modality: dict[str, str] = {}
-        self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
-        )
+        self._multimodal_server_config = (multimodal_server_config if
+                                          multimodal_server_config is not None
+                                          else MultimodalServerConfig())
         # Per-request override merged with the server default at media-load
         # time; see `BaseMediaIO.merge_kwargs` in `inputs/media_io.py`.
         self._request_media_io_kwargs = request_media_io_kwargs
@@ -550,7 +554,6 @@ def resolve_hf_chat_template(
     tools: Optional[list[dict[str, Any]]],
 ) -> Optional[str]:
     """Resolve the appropriate chat template to use."""
-
     # 1. If chat_template is not None, return it
     if chat_template is not None:
         return chat_template
@@ -651,7 +654,6 @@ def apply_chat_template(
     - OPENAI: reconstructs content as list of dicts for the template to handle
     - STRING: keeps flattened text with pre-inserted placeholders
     """
-
     # Handle DeepSeek V32 tokenizer with custom chat template
     if isinstance(tokenizer, DeepseekV32Tokenizer):
         prompt = tokenizer.apply_chat_template(
@@ -661,6 +663,27 @@ def apply_chat_template(
         )
         if enable_tokenize:
             return tokenizer.encode(prompt)
+        return prompt
+
+    # Handle DeepSeek V4 (AutoDeploy) tokenizer with custom chat template.
+    # Its chat template is custom Python, not a Jinja template, so the
+    # resolve_hf_chat_template path below cannot render it. ADDeepseekV4Tokenizer
+    # pins ``chat_template`` to the sentinel marker below (see
+    # tensorrt_llm/_torch/auto_deploy/models/custom/modeling_deepseek_v4.py), so
+    # dispatch on that marker instead of importing the heavy AD modeling stack.
+    v4_tokenizer = (tokenizer.tokenizer if isinstance(
+        tokenizer, TransformersTokenizer) else tokenizer)
+    if getattr(v4_tokenizer, "chat_template",
+               None) == _DSV4_CHAT_TEMPLATE_MARKER:
+        if tools or documents:
+            logger.warning(
+                "The DeepSeek V4 chat template does not support tools or "
+                "documents; they will be ignored.")
+        prompt = v4_tokenizer.apply_chat_template(conversation, tokenize=False)
+        if enable_tokenize:
+            # The rendered prompt already starts with the BOS marker text, so
+            # encode without special tokens to avoid a double BOS.
+            return v4_tokenizer.encode(prompt, add_special_tokens=False)
         return prompt
 
     # Check for PASSTHROUGH early — before we need tokenizer/processor/template.
@@ -732,14 +755,19 @@ def default_multimodal_input_loader(
             media = [media]
         if modality in ["image", "multiple_image"]:
             if is_embedding:
-                _load = lambda mm: mm
+
+                def _load(mm):
+                    return mm
 
                 # each mm_embedding corresponds to each image placeholder
                 if not isinstance(media, list):
                     media = [media]
             else:
-                _load = lambda mm: load_image(
-                    mm, format=image_data_format, device=device)
+
+                def _load(mm):
+                    return load_image(mm,
+                                      format=image_data_format,
+                                      device=device)
 
             mm_data = [
                 MultimodalData(modality=modality,
