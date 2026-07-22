@@ -13,45 +13,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused Hadamard-rotate + fake-FP4 activation-quant custom op for DeepSeek-V4.
+"""Fused Hadamard rotate + fake-FP4 activation quant for DeepSeek-V4.
 
-Collapses the indexer's eager Hadamard-rotate + fake-FP4 round-trip chain (a
-~30-40-kernel swarm at its two ``modeling_deepseek_v4.py`` sites) into a
-*single* Triton kernel: one program per ``dim``-length row runs the
-Walsh-Hadamard butterfly and the FP4 quant entirely in fp32 registers. The math
-mirrors the eager reference exactly — including the intermediate ``bf16``
-round-trip between the rotate's output cast and the quant's fp32 widening — so
-the result is bit-identical (reference copy: ``test_deepseek_v4_hadamard_fp4.py``).
+Replaces ``fake_fp4_act_quant(hadamard_rotate(x), block_size)`` — log2(dim)
+butterfly stages of reshape/add/sub/cat plus the quant's
+abs/amax/log2/ceil/exp2/clamp/where ladder — with a single Triton kernel that
+keeps the whole row in fp32 registers. Bit-identical to the eager reference
+(``test_deepseek_v4_hadamard_fp4.py``), including the reference's bf16
+round-trip between rotate and quant.
 
-Triton (3.x) loop induction variables are runtime tensors, so the butterfly is
-unrolled with compile-time ``if DIM >= 2**(s+1)`` guards calling a ``constexpr``
-stage helper — that keeps the per-stage reshape shapes ``constexpr[int]``.
+The butterfly is unrolled via ``if DIM >= ...`` constexpr guards: Triton loop
+variables are runtime values, which would make the per-stage reshape shapes
+non-constexpr.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-# FP4 (e2m1) quant constants — the amax -> power-of-two scale recipe pinned by
-# the reference implementation in ``test_deepseek_v4_hadamard_fp4.py``.
+# FP4 (e2m1) fake-quant constants from the reference recipe.
 _FP4_MAX = 6.0
 _FP4_MIN = 6.0 * 2.0**-126
 
 
 @triton.jit
-def _hadamard_stage(x, DIM: tl.constexpr, G: tl.constexpr, W: tl.constexpr):
-    """One Walsh-Hadamard butterfly stage with pair-stride ``W`` on a [DIM] row.
-
-    View the row as ``[G, 2, W]`` (``G = DIM // (2*W)``); the lower half
-    (pair-axis index 0) becomes ``left + right`` and the upper half becomes
-    ``left - right``. ``tl.flip`` along the pair axis swaps the two halves so a
-    single ``where`` produces both.
-    """
-    a = tl.reshape(x, (G, 2, W))
+def _hadamard_stage(x, ROWS: tl.constexpr, DIM: tl.constexpr, G: tl.constexpr, W: tl.constexpr):
+    """One butterfly stage, pair-stride ``W``, on a ``[ROWS, DIM]`` tile: view as
+    ``[ROWS * G, 2, W]``; pair-axis index 0 becomes ``l + r``, index 1 ``l - r``."""
+    a = tl.reshape(x, (ROWS * G, 2, W))
     sw = tl.flip(a, 1)
     lower = (tl.arange(0, 2) == 0)[None, :, None]  # [1, 2, 1]
     a = tl.where(lower, a + sw, sw - a)
-    return tl.reshape(a, (DIM,))
+    return tl.reshape(a, (ROWS, DIM))
 
 
 @triton.jit
@@ -59,6 +52,8 @@ def _hadamard_fp4_kernel(
     x_ptr,  # [R, DIM] contiguous input
     out_ptr,  # [R, DIM] contiguous output
     R,
+    BLOCK_R: tl.constexpr,  # rows per program
+    HAS_TAIL: tl.constexpr,  # last program has out-of-range rows to mask off
     DIM: tl.constexpr,  # power-of-two row width (== Hadamard dim)
     BLOCK_SIZE: tl.constexpr,  # fp4 quant group size (DIM % BLOCK_SIZE == 0)
     NB: tl.constexpr,  # DIM // BLOCK_SIZE
@@ -66,43 +61,43 @@ def _hadamard_fp4_kernel(
     FP4_MAX: tl.constexpr,
     FP4_MIN: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    if row >= R:
-        return
+    # int64 rows: offsets overflow int32 once x.numel() >= 2**31.
+    rows = tl.program_id(0).to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R)
+    offs = rows[:, None] * DIM + tl.arange(0, DIM)[None, :]  # [BLOCK_R, DIM]
+    if HAS_TAIL:
+        mask = rows[:, None] < R
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    else:
+        x = tl.load(x_ptr + offs).to(tl.float32)
 
-    offs = tl.arange(0, DIM)
-    x = tl.load(x_ptr + row * DIM + offs).to(tl.float32)  # [DIM]
-
-    # --- Walsh-Hadamard butterfly (Sylvester order), fp32, unrolled stages ---
-    # Stage s has pair-stride W = 2**s, s = 0 .. log2(DIM)-1.
+    # Walsh-Hadamard butterfly, fp32, unrolled: stage s has pair-stride 2**s.
     if DIM >= 2:
-        x = _hadamard_stage(x, DIM, DIM // 2, 1)
+        x = _hadamard_stage(x, BLOCK_R, DIM, DIM // 2, 1)
     if DIM >= 4:
-        x = _hadamard_stage(x, DIM, DIM // 4, 2)
+        x = _hadamard_stage(x, BLOCK_R, DIM, DIM // 4, 2)
     if DIM >= 8:
-        x = _hadamard_stage(x, DIM, DIM // 8, 4)
+        x = _hadamard_stage(x, BLOCK_R, DIM, DIM // 8, 4)
     if DIM >= 16:
-        x = _hadamard_stage(x, DIM, DIM // 16, 8)
+        x = _hadamard_stage(x, BLOCK_R, DIM, DIM // 16, 8)
     if DIM >= 32:
-        x = _hadamard_stage(x, DIM, DIM // 32, 16)
+        x = _hadamard_stage(x, BLOCK_R, DIM, DIM // 32, 16)
     if DIM >= 64:
-        x = _hadamard_stage(x, DIM, DIM // 64, 32)
+        x = _hadamard_stage(x, BLOCK_R, DIM, DIM // 64, 32)
     if DIM >= 128:
-        x = _hadamard_stage(x, DIM, DIM // 128, 64)
+        x = _hadamard_stage(x, BLOCK_R, DIM, DIM // 128, 64)
     if DIM >= 256:
-        x = _hadamard_stage(x, DIM, DIM // 256, 128)
+        x = _hadamard_stage(x, BLOCK_R, DIM, DIM // 256, 128)
     tl.static_assert(DIM <= 256, "deepseek_v4_hadamard_fp4 supports DIM <= 256")
     x = x * INV_SQRT_DIM
 
-    # The eager reference casts the rotated row to the input dtype (bf16) and
-    # immediately back to fp32 — replicate that round-trip for bit-identity.
+    # Replicate the reference's dtype round-trip between rotate and quant.
     x = x.to(out_ptr.dtype.element_ty).to(tl.float32)
 
-    # --- block fake-FP4 quant ---
-    xb = tl.reshape(x, (NB, BLOCK_SIZE))  # [NB, BLOCK_SIZE]
-    amax = tl.max(tl.abs(xb), axis=1, keep_dims=True)  # [NB, 1]
+    # Block fake-FP4 quant.
+    xb = tl.reshape(x, (BLOCK_R * NB, BLOCK_SIZE))
+    amax = tl.max(tl.abs(xb), axis=1, keep_dims=True)  # [BLOCK_R * NB, 1]
     # ceil_pow2_scale(amax, FP4_MAX, FP4_MIN)
-    scale = tl.exp2(tl.ceil(tl.log2(tl.maximum(amax, FP4_MIN) / FP4_MAX)))  # [NB, 1]
+    scale = tl.exp2(tl.ceil(tl.log2(tl.maximum(amax, FP4_MIN) / FP4_MAX)))
     n = tl.minimum(tl.maximum(xb / scale, -FP4_MAX), FP4_MAX)  # clamp(.,-6,6)
     an = tl.abs(n)
     q = tl.zeros_like(an)
@@ -114,111 +109,18 @@ def _hadamard_fp4_kernel(
     q = tl.where(an > 3.5, 4.0, q)
     q = tl.where(an > 5.0, 6.0, q)
     sign = tl.where(n > 0, 1.0, 0.0) - tl.where(n < 0, 1.0, 0.0)
-    res = (q * sign) * scale  # [NB, BLOCK_SIZE]
+    res = (q * sign) * scale
 
-    res = tl.reshape(res, (DIM,))
-    tl.store(out_ptr + row * DIM + offs, res.to(out_ptr.dtype.element_ty))
-
-
-@triton.jit
-def _hadamard_stage_blocked(
-    x, BR: tl.constexpr, DIM: tl.constexpr, G: tl.constexpr, W: tl.constexpr
-):
-    """``_hadamard_stage`` over a ``[BR, DIM]`` tile (butterfly along the DIM axis).
-
-    Identical math/associativity to the 1-row helper -- the row axis ``BR`` is just
-    a batched outer dimension -- so the result is bit-identical row-for-row.
-    """
-    a = tl.reshape(x, (BR, G, 2, W))
-    sw = tl.flip(a, 2)
-    lower = (tl.arange(0, 2) == 0)[None, None, :, None]  # [1, 1, 2, 1]
-    a = tl.where(lower, a + sw, sw - a)
-    return tl.reshape(a, (BR, DIM))
+    res = tl.reshape(res, (BLOCK_R, DIM)).to(out_ptr.dtype.element_ty)
+    if HAS_TAIL:
+        tl.store(out_ptr + offs, res, mask=mask)
+    else:
+        tl.store(out_ptr + offs, res)
 
 
-@triton.jit
-def _hadamard_fp4_kernel_blocked(
-    x_ptr,  # [R, DIM] contiguous input
-    out_ptr,  # [R, DIM] contiguous output
-    R,
-    BLOCK_R: tl.constexpr,  # rows handled per program
-    DIM: tl.constexpr,  # power-of-two row width (== Hadamard dim)
-    BLOCK_SIZE: tl.constexpr,  # fp4 quant group size (DIM % BLOCK_SIZE == 0)
-    NB: tl.constexpr,  # DIM // BLOCK_SIZE
-    INV_SQRT_DIM: tl.constexpr,  # DIM ** -0.5
-    FP4_MAX: tl.constexpr,
-    FP4_MIN: tl.constexpr,
-):
-    """Row-blocked variant of ``_hadamard_fp4_kernel``.
-
-    The 1-row kernel launches ``R`` single-warp CTAs, each doing a tiny amount of
-    work; at large ``R`` (prefill: indexer-q is ``B*S*index_n_heads_local`` rows)
-    that is dominated by fixed per-CTA scheduling overhead. Handling ``BLOCK_R``
-    rows per program (a ``[BLOCK_R, DIM]`` register tile, butterfly batched over the
-    row axis) amortizes that overhead and lets the warp issue wider work. The math
-    is the same per row, so the result is bit-identical to the 1-row kernel; only
-    the element-to-thread mapping (layout) differs.
-    """
-    pid = tl.program_id(0)
-    rows = pid * BLOCK_R + tl.arange(0, BLOCK_R)  # [BLOCK_R]
-    mask = rows < R
-    offs = tl.arange(0, DIM)  # [DIM]
-    ptr = x_ptr + rows[:, None] * DIM + offs[None, :]  # [BLOCK_R, DIM]
-    x = tl.load(ptr, mask=mask[:, None], other=0.0).to(tl.float32)
-
-    # --- Walsh-Hadamard butterfly (Sylvester order), fp32, unrolled stages ---
-    if DIM >= 2:
-        x = _hadamard_stage_blocked(x, BLOCK_R, DIM, DIM // 2, 1)
-    if DIM >= 4:
-        x = _hadamard_stage_blocked(x, BLOCK_R, DIM, DIM // 4, 2)
-    if DIM >= 8:
-        x = _hadamard_stage_blocked(x, BLOCK_R, DIM, DIM // 8, 4)
-    if DIM >= 16:
-        x = _hadamard_stage_blocked(x, BLOCK_R, DIM, DIM // 16, 8)
-    if DIM >= 32:
-        x = _hadamard_stage_blocked(x, BLOCK_R, DIM, DIM // 32, 16)
-    if DIM >= 64:
-        x = _hadamard_stage_blocked(x, BLOCK_R, DIM, DIM // 64, 32)
-    if DIM >= 128:
-        x = _hadamard_stage_blocked(x, BLOCK_R, DIM, DIM // 128, 64)
-    if DIM >= 256:
-        x = _hadamard_stage_blocked(x, BLOCK_R, DIM, DIM // 256, 128)
-    tl.static_assert(DIM <= 256, "deepseek_v4_hadamard_fp4 supports DIM <= 256")
-    x = x * INV_SQRT_DIM
-
-    # bf16 round-trip mirror (see 1-row kernel).
-    x = x.to(out_ptr.dtype.element_ty).to(tl.float32)
-
-    # --- block fake-FP4 quant (reduce along the BLOCK_SIZE axis) ---
-    xb = tl.reshape(x, (BLOCK_R, NB, BLOCK_SIZE))  # [BLOCK_R, NB, BLOCK_SIZE]
-    amax = tl.max(tl.abs(xb), axis=2, keep_dims=True)  # [BLOCK_R, NB, 1]
-    scale = tl.exp2(tl.ceil(tl.log2(tl.maximum(amax, FP4_MIN) / FP4_MAX)))
-    n = tl.minimum(tl.maximum(xb / scale, -FP4_MAX), FP4_MAX)
-    an = tl.abs(n)
-    q = tl.zeros_like(an)
-    q = tl.where(an > 0.25, 0.5, q)
-    q = tl.where(an > 0.75, 1.0, q)
-    q = tl.where(an > 1.25, 1.5, q)
-    q = tl.where(an > 1.75, 2.0, q)
-    q = tl.where(an > 2.5, 3.0, q)
-    q = tl.where(an > 3.5, 4.0, q)
-    q = tl.where(an > 5.0, 6.0, q)
-    sign = tl.where(n > 0, 1.0, 0.0) - tl.where(n < 0, 1.0, 0.0)
-    res = (q * sign) * scale  # [BLOCK_R, NB, BLOCK_SIZE]
-
-    res = tl.reshape(res, (BLOCK_R, DIM))
-    tl.store(
-        out_ptr + rows[:, None] * DIM + offs[None, :],
-        res.to(out_ptr.dtype.element_ty),
-        mask=mask[:, None],
-    )
-
-
-# Row-blocking only pays off once enough rows exist to amortize the extra per-program
-# masking/index arithmetic. Below this many rows the minimal 1-warp 1-row kernel is
-# fastest (decode: indexer-q is R=8, latency-bound); at/above it the BLOCK_R=2 tile
-# wins (microbenched: R=1024 -5%, R=2048 -11%, R=4096 -26%, R=8000 -35%). BLOCK_R=2
-# beats 4/8/16 (which over-subscribe registers at num_warps=1).
+# Microbenched: below this row count BLOCK_R=1 wins (decode is latency-bound);
+# at/above it BLOCK_R=2 wins (-5% at R=1024 to -35% at R=8000). BLOCK_R>2
+# over-subscribes registers at num_warps=1.
 _BLOCKED_ROW_THRESHOLD = 1024
 _BLOCK_R = 2
 
@@ -246,46 +148,24 @@ def deepseek_v4_hadamard_fp4(x: torch.Tensor, block_size: int = 32) -> torch.Ten
     x2 = x.reshape(R, dim)
     out2 = out.reshape(R, dim)
 
-    # Occupancy: one warp per program. Each program handles a
-    # single DIM<=256 row (or BLOCK_R such rows below), so a single warp covers
-    # it with intra-warp shuffles for the FP4 block reductions; extra warps add
-    # cross-warp smem barriers. num_stages=1 is a zero-cost guard: the kernel is
-    # loop-free so there is nothing to pipeline (nw*/default == nw*/s1, inert).
-    if R >= _BLOCKED_ROW_THRESHOLD:
-        # Layout: at large R the 1-row kernel's R single-warp CTAs are
-        # dominated by per-CTA scheduling overhead. A [BLOCK_R, DIM] tile per
-        # program amortizes it -- bit-identical, but the element-to-thread mapping
-        # changes. Big win on the prefill indexer-q path (R = B*S*n_heads_local).
-        _hadamard_fp4_kernel_blocked[(triton.cdiv(R, _BLOCK_R),)](
-            x2,
-            out2,
-            R,
-            BLOCK_R=_BLOCK_R,
-            DIM=dim,
-            BLOCK_SIZE=block_size,
-            NB=dim // block_size,
-            INV_SQRT_DIM=float(dim**-0.5),
-            FP4_MAX=_FP4_MAX,
-            FP4_MIN=_FP4_MIN,
-            num_warps=1,
-            num_stages=1,
-        )
-    else:
-        # Decode / small-R: the minimal 1-row kernel is fastest (R=8 indexer-q is
-        # latency-bound -- extra masking/index arithmetic regresses it ~11%).
-        _hadamard_fp4_kernel[(R,)](
-            x2,
-            out2,
-            R,
-            DIM=dim,
-            BLOCK_SIZE=block_size,
-            NB=dim // block_size,
-            INV_SQRT_DIM=float(dim**-0.5),
-            FP4_MAX=_FP4_MAX,
-            FP4_MIN=_FP4_MIN,
-            num_warps=1,
-            num_stages=1,
-        )
+    block_r = _BLOCK_R if R >= _BLOCKED_ROW_THRESHOLD else 1
+    # num_warps=1: one warp covers a DIM<=256 row with intra-warp reductions;
+    # extra warps only add smem barriers. Loop-free kernel, so num_stages is inert.
+    _hadamard_fp4_kernel[(triton.cdiv(R, block_r),)](
+        x2,
+        out2,
+        R,
+        BLOCK_R=block_r,
+        HAS_TAIL=(R % block_r != 0),
+        DIM=dim,
+        BLOCK_SIZE=block_size,
+        NB=dim // block_size,
+        INV_SQRT_DIM=float(dim**-0.5),
+        FP4_MAX=_FP4_MAX,
+        FP4_MIN=_FP4_MIN,
+        num_warps=1,
+        num_stages=1,
+    )
     return out
 
 
