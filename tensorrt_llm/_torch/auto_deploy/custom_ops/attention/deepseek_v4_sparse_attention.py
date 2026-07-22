@@ -3097,21 +3097,21 @@ if _HAS_TRITON:
         # --- hadamard rotate + fake-fp4 quant (== deepseek_v4_hadamard_fp4) ---
         x = tl.reshape(had_in, (BLOCK_D,)).to(tl.float32)
         if BLOCK_D >= 2:
-            x = _hadamard_stage(x, BLOCK_D, BLOCK_D // 2, 1)
+            x = _hadamard_stage(x, 1, BLOCK_D, BLOCK_D // 2, 1)
         if BLOCK_D >= 4:
-            x = _hadamard_stage(x, BLOCK_D, BLOCK_D // 4, 2)
+            x = _hadamard_stage(x, 1, BLOCK_D, BLOCK_D // 4, 2)
         if BLOCK_D >= 8:
-            x = _hadamard_stage(x, BLOCK_D, BLOCK_D // 8, 4)
+            x = _hadamard_stage(x, 1, BLOCK_D, BLOCK_D // 8, 4)
         if BLOCK_D >= 16:
-            x = _hadamard_stage(x, BLOCK_D, BLOCK_D // 16, 8)
+            x = _hadamard_stage(x, 1, BLOCK_D, BLOCK_D // 16, 8)
         if BLOCK_D >= 32:
-            x = _hadamard_stage(x, BLOCK_D, BLOCK_D // 32, 16)
+            x = _hadamard_stage(x, 1, BLOCK_D, BLOCK_D // 32, 16)
         if BLOCK_D >= 64:
-            x = _hadamard_stage(x, BLOCK_D, BLOCK_D // 64, 32)
+            x = _hadamard_stage(x, 1, BLOCK_D, BLOCK_D // 64, 32)
         if BLOCK_D >= 128:
-            x = _hadamard_stage(x, BLOCK_D, BLOCK_D // 128, 64)
+            x = _hadamard_stage(x, 1, BLOCK_D, BLOCK_D // 128, 64)
         if BLOCK_D >= 256:
-            x = _hadamard_stage(x, BLOCK_D, BLOCK_D // 256, 128)
+            x = _hadamard_stage(x, 1, BLOCK_D, BLOCK_D // 256, 128)
         tl.static_assert(BLOCK_D <= 256, "fused index-k hadamard supports HEAD_DIM <= 256")
         x = x * INV_SQRT_DIM
         # bf16 round-trip mirror of the eager hadamard/fake-fp4 chain's dtype casts.
@@ -3625,7 +3625,7 @@ if _HAS_TRITON:
 
         The exact math of the historical standalone stage-2 rope/fp8/masked-store
         kernel (retained byte-for-byte as the frozen reference in
-        ``test_deepseek_v4_compressed_row_update.py``) operating on an in-register
+        ``test_deepseek_v4_compressor.py``) operating on an in-register
         ``[BLOCK_D]`` post-rmsnorm row instead of a materialized ``[N, HEAD_DIM]``
         tensor, so producing kernels can run it as their final stage and skip the
         separate stage-2 launch.  The fake-fp8 block quant on the
