@@ -27,7 +27,7 @@ remove_unused_variables = true
 
 
 ####################################################################################################
-#########################  AUTO DEPLOY LINTING AND TESTING CONFIGURATION  ##########################
+####################################  RUFF CONFIGURATION  ##########################################
 ####################################################################################################
 [tool.ruff]
 line-length = 100 # Line length limit for code
@@ -868,7 +868,6 @@ exclude = [
     "tests/integration/defs/accuracy/scripts/compute_theta_and_thresholds.py",
     "tests/integration/defs/accuracy/test_cli_flow.py",
     "tests/integration/defs/accuracy/test_disaggregated_serving.py",
-    "tests/integration/defs/accuracy/test_llm_api_autodeploy.py",
     "tests/integration/defs/accuracy/test_llm_api_pytorch_ray.py",
     "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
     "tests/integration/defs/accuracy/test_llm_api.py",
@@ -891,7 +890,6 @@ exclude = [
     "tests/integration/defs/examples/run_llm_quickstart_atexit.py",
     "tests/integration/defs/examples/serve/test_serve_negative.py",
     "tests/integration/defs/examples/serve/test_serve.py",
-    "tests/integration/defs/examples/test_ad_guided_decoding.py",
     "tests/integration/defs/examples/test_bert.py",
     "tests/integration/defs/examples/test_bindings.py",
     "tests/integration/defs/examples/test_chatglm.py",
@@ -1447,7 +1445,6 @@ extend-ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "F403"]
-"tests/_torch/auto_deploy/*" = ["D", "E402"]
 "*/_[a-zA-Z]*" = ["D"]                       # Private packages (_abc/*.py) or modules (_xyz.py)
 
 
@@ -1466,36 +1463,3 @@ split-on-trailing-comma = false
 
 [tool.ruff.lint.pylint]
 max-args = 10
-
-
-[tool.mypy]
-files = ["**/auto_deploy/**"]
-install_types = true
-non_interactive = true
-show_error_codes = true
-disable_error_code = [
-    "import",
-    "assignment",
-    "operator",
-    "has-type",
-    "var-annotated",
-    "operator",
-    "call-arg",
-]
-explicit_package_bases = true
-namespace_packages = true
-# strict checks
-strict = true
-disallow_subclassing_any = false
-disallow_untyped_decorators = false
-disallow_any_generics = false
-disallow_untyped_calls = false
-disallow_incomplete_defs = false
-disallow_untyped_defs = false
-warn_return_any = false
-exclude = []
-
-
-[[tool.mypy.overrides]]
-module = ["tests.*"]
-ignore_errors = true

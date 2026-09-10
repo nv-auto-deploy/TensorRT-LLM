@@ -110,7 +110,7 @@ class BaseWorker(GenerationExecutor):
         self._client_id_to_request_id: Dict[int, int] = {}
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
-        self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
+        self._is_pytorch_backend = self._backend == "pytorch"
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
 
         if global_mpi_size() > 1:
@@ -201,15 +201,6 @@ class BaseWorker(GenerationExecutor):
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
                 args["tokenizer"] = self._tokenizer
-            elif self._backend == "_autodeploy":
-                from tensorrt_llm._torch.auto_deploy.llm_args import \
-                    LlmArgs as ADLlmArgs
-                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
-                    create_autodeploy_executor
-                create_executor = create_autodeploy_executor
-                assert isinstance(self.llm_args, ADLlmArgs)
-                args["ad_config"] = self.llm_args
-                args["tokenizer"] = self._tokenizer
             else:
                 raise ValueError(f"Unsupported backend config: {self._backend}")
 
@@ -220,7 +211,7 @@ class BaseWorker(GenerationExecutor):
                 from tensorrt_llm._torch.pyexecutor.model_loader import \
                     _construct_checkpoint_loader
                 self.checkpoint_loader = _construct_checkpoint_loader(
-                    self.llm_args.backend, self.llm_args.checkpoint_loader,
+                    self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format)
 
             self.max_seq_len = self.llm_args.max_seq_len

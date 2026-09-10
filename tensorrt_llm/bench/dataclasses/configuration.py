@@ -33,7 +33,7 @@ class RuntimeConfig(BaseModel):
     mapping: Dict[str, Any]
     decoding_config: Optional[DecodingConfig] = None
     performance_options: PerformanceOptions
-    backend: Literal["pytorch", "_autodeploy", None] = None
+    backend: Literal["pytorch", None] = None
     extra_llm_api_options: Optional[str] = None
     iteration_log: Optional[Path] = None
 
@@ -75,7 +75,6 @@ class RuntimeConfig(BaseModel):
 
         backend_config_map = {
             "pytorch": self.performance_options.get_pytorch_perf_config,
-            "_autodeploy": self.performance_options.get_autodeploy_perf_config
         }
 
         if self.backend in backend_config_map:
@@ -128,11 +127,6 @@ class PerformanceOptions:
 
     def get_pytorch_perf_config(self):
         return self.pytorch_config
-
-    def get_autodeploy_perf_config(self) -> Dict:
-        AutoDeployPerfConfig = dict
-        ad_config = AutoDeployPerfConfig()
-        return ad_config
 
 
 class DecodingConfig(BaseModel):

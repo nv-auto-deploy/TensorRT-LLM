@@ -156,8 +156,7 @@ class PyTorchModelEngine(ModelEngine):
         self.max_beam_width = max_beam_width
 
         checkpoint_loader = _construct_checkpoint_loader(
-            llm_args.backend, llm_args.checkpoint_loader,
-            llm_args.checkpoint_format)
+            llm_args.checkpoint_loader, llm_args.checkpoint_format)
 
         self.mapping = mapping
         if mapping.has_pp():

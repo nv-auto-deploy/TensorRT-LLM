@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1037,11 +1037,6 @@ class PerfTestConfig:
         num_gpus: int = 1,
         # only for torch-backend currently
         extra: bool = False,
-        # _autodeploy backend specific parameters
-        ad_compile_backend: str = "torch-opt",
-        free_mem_ratio: float = 0.9,
-        extra_runtime: str = "trtllm",
-        skip_loading_weights: bool = False,
     ):
         # The model name.
         self.model_name = model_name
@@ -1097,11 +1092,6 @@ class PerfTestConfig:
         self.num_gpus = num_gpus
         # Extra flag to enable pytorch_model_config reading for TRT backend
         self.extra = extra
-        # _autodeploy backend specific parameters
-        self.ad_compile_backend = ad_compile_backend
-        self.free_mem_ratio = free_mem_ratio
-        self.extra_runtime = extra_runtime
-        self.skip_loading_weights = skip_loading_weights
         # Just build engines
         self.build_only = False
 
@@ -1164,7 +1154,7 @@ class PerfTestConfig:
         # First, add the model name.
         entries = [self.model_name]
 
-        # Add device subtype if provided (for autodeploy tests)
+        # Add device subtype if provided.
         if device_subtype:
             entries.append(f"subtype:{device_subtype}")
 
@@ -1182,8 +1172,6 @@ class PerfTestConfig:
             entries.append(f"bench")
             if self.backend == 'pytorch':
                 entries.append(f"pytorch")
-            elif self.backend == '_autodeploy':
-                entries.append(f"_autodeploy")
             if self.streaming == "streaming":
                 entries.append(f"streaming")
         elif self.runtime == "disagg_server":  # trtllm-serve
@@ -1363,7 +1351,7 @@ class PerfTestConfig:
 
         self.model_name = labels.pop(0)
 
-        # Check if device subtype is present (for autodeploy tests)
+        # Check if device subtype is present.
         self.device_subtype = None
         if len(labels) > 0 and labels[0].startswith("subtype:"):
             self.device_subtype = labels.pop(0).replace("subtype:", "")
@@ -1376,8 +1364,7 @@ class PerfTestConfig:
             return self._load_from_str_disagg(labels)
 
         self.api = labels.pop(0) if labels[0] == "exe" else ""
-        self.backend = labels.pop(0) if labels[0] in ["pytorch", "_autodeploy"
-                                                      ] else ""
+        self.backend = labels.pop(0) if labels[0] == "pytorch" else ""
         self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
         self.static_batching = labels.pop(
             0) if labels[0] == "static_batching" else ""
@@ -2007,8 +1994,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         ]
         if self._config.backend == "pytorch":
             benchmark_cmd += ["--backend=pytorch"]
-        elif self._config.backend == "_autodeploy":
-            benchmark_cmd += ["--backend=_autodeploy"]
         else:
             benchmark_cmd += [
                 f"--backend=tensorrt", f"--engine_dir={engine_dir}"
@@ -2045,31 +2030,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 # If guided_decoding_backend is set, we need to initialize tokenizer
                 if config.get('guided_decoding_backend') is not None:
                     benchmark_cmd += ["--no_skip_tokenizer_init"]
-        elif self._config.backend == "_autodeploy":
-            autodeploy_config_path = os.path.join(engine_dir,
-                                                  "extra_llm_api_options.yaml")
-            if not os.path.exists(autodeploy_config_path):
-                os.makedirs(os.path.dirname(autodeploy_config_path),
-                            exist_ok=True)
-
-            # Create _autodeploy specific configuration
-            autodeploy_config = {
-                'transforms': {
-                    'compile_model': {
-                        'backend': self._config.ad_compile_backend
-                    },
-                    'resize_kv_cache': {
-                        'free_mem_ratio': self._config.free_mem_ratio
-                    },
-                },
-                'runtime': self._config.extra_runtime,
-                'skip_loading_weights': self._config.skip_loading_weights
-            }
-
-            print_info(f"_autodeploy model config: {autodeploy_config}")
-            with open(autodeploy_config_path, 'w') as f:
-                yaml.dump(autodeploy_config, f, default_flow_style=False)
-            benchmark_cmd += [f"--config={autodeploy_config_path}"]
         # for sampler options
         sampler_options_path = os.path.join(engine_dir, "sampler_options.yml")
         if not os.path.exists(sampler_options_path):
@@ -2149,8 +2109,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         engine_dir = self._get_engine_dir()
         build_cmd = []
         if self._config.runtime == "bench":
-            if self._config.backend in ["pytorch", "_autodeploy"]:
-                # Skip building process as it is pytorch or _autodeploy backend")
+            if self._config.backend == "pytorch":
+                # Skip building process for the PyTorch backend.
                 pass
             else:
                 build_cmd = self.get_trtllm_bench_build_command(engine_dir)
@@ -2615,7 +2575,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         # Build command is the first command.
         cmd_idx = 0 if self._config.runtime != "bench" else 1
         if self._config.runtime == "bench":
-            if self._config.backend in ["pytorch", "_autodeploy"]:
+            if self._config.backend == "pytorch":
                 print_info(
                     f"Skip building process for {self._config.model_name} as it is {self._config.backend} backend"
                 )
@@ -2689,15 +2649,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         Construct the metric name for given metric_type, bs, input_len, and output_len.
         """
 
-        # Get device subtype for autodeploy tests
-        device_subtype = None
-        if (hasattr(self, '_gpu_clock_lock') and self._gpu_clock_lock
-                and self._config.backend == "_autodeploy"):
-            device_subtype = self._gpu_clock_lock.get_device_subtype()
-
         if metric_type in BUILDER_METRICS:
             # We build one engine for all benchmark runs, so add all bs and seq lens to the metric name.
-            metric_label = self._config.to_string(device_subtype=device_subtype)
+            metric_label = self._config.to_string()
         elif self._config.runtime == "aggr_server":
             metric_label = self._config.to_string(
                 custom_server_name=server_name,
@@ -2712,7 +2666,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 custom_bs=bs,
                 custom_input_len=input_len,
                 custom_output_len=output_len,
-                device_subtype=device_subtype,
             )
         metric_name = f"test_perf_metric_{metric_type.lower()}"
         return self._test_domain_name + "::" + metric_name + "[" + metric_label + "]"

@@ -149,14 +149,13 @@ class BaseLLM:
                     # Propagate to args construction
                     kwargs["orchestrator_type"] = "ray"
 
-            elif backend == '_autodeploy':
-                logger.info("Using LLM with AutoDeploy backend")
-                from .._torch.auto_deploy.llm_args import \
-                    LlmArgs as AutoDeployLlmArgs
-                llm_args_cls = AutoDeployLlmArgs
-            else:
+            elif backend in (None, "tensorrt", "trt"):
                 logger.info("Using LLM with TensorRT backend")
                 llm_args_cls = TrtLlmArgs
+            else:
+                raise ValueError(
+                    f"Unsupported backend: {backend!r}. Supported backends are "
+                    "'pytorch' and 'tensorrt'.")
 
             # check the kwargs and raise ValueError directly
             valid_keys = set(
@@ -630,7 +629,7 @@ class BaseLLM:
             )
 
         # auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.
-        if self.args.backend not in ["pytorch", "_autodeploy"]:
+        if self.args.backend != "pytorch":
             if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
                 sampling_params.return_context_logits = True
                 sampling_params._context_logits_auto_enabled = True
@@ -648,7 +647,7 @@ class BaseLLM:
                          sampling_params: SamplingParams,
                          is_gen_only: bool) -> None:
 
-        if self.args.backend in ["pytorch", "_autodeploy"]:
+        if self.args.backend == "pytorch":
             # Check prompt length and query length against max_num_tokens to filter illegal requests.
             # Skip check for gen-only requests
             if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
@@ -735,9 +734,8 @@ class BaseLLM:
 
         # TODO smor- need to refine what is the desired behavior if lora is enabled
         # in terms of the tokenizer initialization process
-        if hasattr(self.args, "backend") and self.args.backend in [
-                "pytorch", "_autodeploy"
-        ] and self.args.lora_config is not None:
+        if (hasattr(self.args, "backend") and self.args.backend == "pytorch"
+                and self.args.lora_config is not None):
             num_lora_dirs = len(self.args.lora_config.lora_dir)
             if num_lora_dirs == 1:
                 tokenizer_path = self.args.lora_config.lora_dir[0]

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -897,9 +897,8 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             self.max_beam_width,
             self.max_seq_len + (0 if args.disable_overlap_scheduler else 1),
         )
-        # AutoDeploy build creates the sampler in inference mode,
-        # which would disallow in-place mutating of new_tokens.
-        # So, we temporarily exit inference mode.
+        # The sampler can be created in inference mode, which disallows
+        # in-place mutation of new_tokens. Temporarily exit inference mode.
         with torch.inference_mode(False):
             self.store = self._create_store()
             # Helper tensors for finish_reasons:

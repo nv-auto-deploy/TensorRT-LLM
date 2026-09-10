@@ -188,12 +188,6 @@ def launch_server(
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
             llm = PyTorchLLM(**llm_args)
-        elif backend == '_autodeploy':
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-
-            # AutoDeploy does not support build_config
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
         elif backend == 'tensorrt' or backend == 'trt':
             llm_args.pop("backend")
             llm = LLM(**llm_args)
@@ -279,8 +273,7 @@ class ChoiceWithAlias(click.Choice):
 @click.option("--port", type=int, default=8000, help="Port of the server.")
 @click.option(
     "--backend",
-    type=ChoiceWithAlias(["pytorch", "tensorrt", "_autodeploy"],
-                         {"trt": "tensorrt"}),
+    type=ChoiceWithAlias(["pytorch", "tensorrt"], {"trt": "tensorrt"}),
     default="pytorch",
     help="The backend to use to serve the model. Default is pytorch backend.")
 @click.option(

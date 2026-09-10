@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -126,15 +126,8 @@ else:
     ]
 
 package_data += [
-    'bindings.pyi',
-    'bindings/*.pyi',
-    'tools/plugin_gen/templates/*',
-    'bench/build/benchmark_config.yml',
-    'evaluate/lm_eval_tasks/**/*',
-    "_torch/auto_deploy/config/*.yaml",
-    # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
-    '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
-    '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*'
+    'bindings.pyi', 'bindings/*.pyi', 'tools/plugin_gen/templates/*',
+    'bench/build/benchmark_config.yml', 'evaluate/lm_eval_tasks/**/*'
 ]
 
 

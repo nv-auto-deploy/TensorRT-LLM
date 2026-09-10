@@ -827,7 +827,6 @@ common-files: &common_files |
         tests/integration/defs/accuracy/scripts/compute_theta_and_thresholds.py |
         tests/integration/defs/accuracy/test_cli_flow.py |
         tests/integration/defs/accuracy/test_disaggregated_serving.py |
-        tests/integration/defs/accuracy/test_llm_api_autodeploy.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch_ray.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch.py |
         tests/integration/defs/accuracy/test_llm_api.py |
@@ -850,7 +849,6 @@ common-files: &common_files |
         tests/integration/defs/examples/run_llm_quickstart_atexit.py |
         tests/integration/defs/examples/serve/test_serve_negative.py |
         tests/integration/defs/examples/serve/test_serve.py |
-        tests/integration/defs/examples/test_ad_guided_decoding.py |
         tests/integration/defs/examples/test_bert.py |
         tests/integration/defs/examples/test_bindings.py |
         tests/integration/defs/examples/test_chatglm.py |
@@ -1403,18 +1401,6 @@ repos:
     -   id: trailing-whitespace
         exclude: '\.(patch|md)$'
     -   id: check-toml
-    -   id: mixed-line-ending
-        args: [--fix=lf]
-        files: ".*/auto_deploy/.*"
-    -   id: debug-statements
-        files: ".*/auto_deploy/.*"
-    -   id: check-json
-        files: ".*/auto_deploy/.*"
-        exclude: >
-          (?x)^(
-            .*\.vscode/.*\.json | # vscode files can take comments
-            .*\.devcontainer/.*\.json # devcontainer json files can take comments
-          )$
 -   repo: https://github.com/PyCQA/autoflake
     rev: v2.3.1
     hooks:
@@ -1448,13 +1434,6 @@ repos:
     -   id: ruff
         args: [--fix, --exit-non-zero-on-fix]
     -   id: ruff-format
--   repo: https://github.com/executablebooks/mdformat
-    rev: 0.7.17
-    hooks:
-    -   id: mdformat
-        additional_dependencies:
-        - mdformat_frontmatter
-        files: ".*/auto_deploy/.*"
 -   repo: local
     hooks:
     -   id: test lists format

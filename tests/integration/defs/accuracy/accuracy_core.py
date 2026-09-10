@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,7 +26,6 @@ import yaml
 import tensorrt_llm.evaluate
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
@@ -182,7 +181,7 @@ class AccuracyTask:
                                        self.HIGHER_IS_BETTER))
 
     def evaluate(self,
-                 llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
+                 llm: Union[LLM, PyTorchLLM],
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,

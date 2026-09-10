@@ -1797,7 +1797,7 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
     LLM_CLASS = LLM
     llm_args_extra = {}
     kv_cache_args_extra = {}
-    if backend in ["pytorch", "autodeploy"]:
+    if backend == "pytorch":
         LLM_CLASS = LLM_torch
         if streaming:
             # need this so that context_logits / prompt_logprobs are not dropped
@@ -2524,7 +2524,7 @@ def run_llm_with_postprocess_parallel_and_result_handler(
     post_proc_params = PostprocParams(post_processor=chat_stream_post_processor,
                                       postproc_args=post_proc_args)
     kwargs = {}
-    if backend not in ["pytorch", "autodeploy"]:
+    if backend != "pytorch":
         kwargs["fast_build"] = True
         LLM_CLASS = LLM
     else:

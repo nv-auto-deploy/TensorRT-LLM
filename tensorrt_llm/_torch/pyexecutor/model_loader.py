@@ -155,11 +155,8 @@ def get_rank_model_storage(model):
 
 
 def _construct_checkpoint_loader(
-        backend: str, checkpoint_loader: Optional[BaseCheckpointLoader],
+        checkpoint_loader: Optional[BaseCheckpointLoader],
         checkpoint_format: Optional[str]) -> Optional[BaseCheckpointLoader]:
-    if backend == "_autodeploy":
-        return None
-
     from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
         BaseCheckpointLoader
     from tensorrt_llm._torch.models.modeling_utils import (

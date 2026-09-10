@@ -804,7 +804,7 @@ class MedusaDecodingConfig(DecodingBaseConfig):
     decoding_type: ClassVar[str] = "Medusa"
 
     def supports_backend(self, backend: str) -> bool:
-        return backend not in ("pytorch", "_autodeploy")
+        return backend != "pytorch"
 
 
 class EagleDecodingConfig(DecodingBaseConfig):
@@ -1041,7 +1041,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: ClassVar[str] = "Draft_Target"
 
     def supports_backend(self, backend: str) -> bool:
-        return backend == "pytorch" or backend == "_autodeploy"
+        return backend == "pytorch"
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -1531,7 +1531,7 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
                                         self.max_verification_set_size)
 
     def supports_backend(self, backend: str) -> bool:
-        return backend not in ("pytorch", "_autodeploy")
+        return backend != "pytorch"
 
     decoding_type: ClassVar[str] = "Lookahead"
 
@@ -2255,9 +2255,8 @@ class BaseLlmArgs(StrictBaseModel):
                     "lora_dir is empty, so custom embedding or lm head will not be applied."
                 )
 
-        if self.enable_lora and self.lora_config is not None and self.backend in [
-                'pytorch', '_autodeploy'
-        ]:
+        if (self.enable_lora and self.lora_config is not None
+                and self.backend == 'pytorch'):
             logger.warning(
                 f"enable_lora is ignored when lora_config is provided for {self.backend} backend."
             )
@@ -2568,9 +2567,7 @@ class TrtLlmArgs(BaseLlmArgs):
         '''
         model_obj = _ModelWrapper(self.model)
 
-        if model_obj.is_local_model and self.backend not in [
-                'pytorch', '_autodeploy'
-        ]:
+        if model_obj.is_local_model and self.backend != 'pytorch':
             # Load parallel_config from the engine.
             model_format = get_model_format(
                 self.model, trust_remote_code=self.trust_remote_code)
